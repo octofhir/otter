@@ -23,7 +23,7 @@
 //! - `crate::template::code` for metadata ownership.
 //! - `otter_vm::jit_runtime_ops` for the safe typed VM operations.
 
-use otter_vm::VmError;
+use otter_vm::{VmError, native_abi::NativeResultStatus};
 
 use super::JitCtx;
 
@@ -36,10 +36,10 @@ pub(crate) use vm_ops::*;
 
 fn park_result(ctx: &mut JitCtx, result: Result<(), VmError>) -> u64 {
     match result {
-        Ok(()) => 0,
+        Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            NativeResultStatus::Throw as u64
         }
     }
 }
@@ -51,10 +51,6 @@ pub(super) fn decode_register(raw: u64) -> Result<u16, VmError> {
 
 fn complete_add(ctx: &mut JitCtx, dst: u16, lhs: u16, rhs: u16) -> Result<(), VmError> {
     ctx.runtime_call()?.add(dst, lhs, rhs)
-}
-
-fn complete_neg(ctx: &mut JitCtx, dst: u16, src: u16) -> Result<(), VmError> {
-    ctx.runtime_call()?.neg(dst, src)
 }
 
 fn complete_new_array(ctx: &mut JitCtx, dst: u16, source_regs: &[u16]) -> Result<(), VmError> {
@@ -86,21 +82,6 @@ pub(super) extern "C" fn jit_store_upvalue_checked_stub(
         let src = decode_register(src)?;
         let idx = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)? as i32;
         ctx.runtime_call()?.store_upvalue_checked(src, idx)
-    })();
-    park_result(ctx, result)
-}
-
-pub(super) extern "C" fn jit_load_string_stub(
-    ctx: *mut JitCtx,
-    function_id: u64,
-    dst: u64,
-    constant_index: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = (|| {
-        ctx.runtime_call()?
-            .load_string(function_id as u32, dst as u16, constant_index as u32)
     })();
     park_result(ctx, result)
 }
@@ -141,13 +122,6 @@ pub(super) extern "C" fn jit_load_builtin_error_stub(
         ctx.runtime_call()?
             .load_builtin_error(dst as u16, kind_index as u32)
     })();
-    park_result(ctx, result)
-}
-
-pub(super) extern "C" fn jit_neg_stub(ctx: *mut JitCtx, dst: u64, src: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = (|| complete_neg(ctx, decode_register(dst)?, decode_register(src)?))();
     park_result(ctx, result)
 }
 

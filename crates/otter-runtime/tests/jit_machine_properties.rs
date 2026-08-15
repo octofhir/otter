@@ -420,13 +420,13 @@ fn assert_machine_property_artifact(
     for (minimum, stub_id, stub, signature) in [
         (
             minimum_loads,
-            19u64,
+            18u64,
             "jit_load_property_value",
             "reentrantNamedLoad",
         ),
         (
             minimum_stores,
-            20u64,
+            19u64,
             "jit_store_property_value",
             "reentrantNamedStore",
         ),

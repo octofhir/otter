@@ -27,6 +27,11 @@
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
 //!   into `ExecutionContext`, `CodeBlock`, or interpreter frames.
+//! - A `JitCompileSnapshot` is stable across moving collection: it contains no
+//!   untraced moving `Value` or GC handle. Heap identities are compressed
+//!   offsets rooted elsewhere, permanent cells, or address-stable traced
+//!   cells; process-local addresses name only allocations with isolate-long
+//!   lifetime.
 //! - No unsafe is required here. Native entry pointers, executable mappings, and
 //!   call ABI details remain encapsulated by the JIT implementation crate.
 //! - Baseline code uses the interpreter frame register array as its precise root
@@ -136,6 +141,9 @@ pub struct JitClosureCallLayout {
     pub upvalue_base_byte: u32,
     /// Byte offset of [`crate::closure::ClosureCallHeader::upvalue_count`].
     pub upvalue_count_byte: u32,
+    /// Byte offset of the nullable compressed
+    /// [`crate::closure::ClosureCallHeader::eval_env`] handle.
+    pub eval_env_byte: u32,
     /// Byte offset of canonical [`crate::closure::JsClosureBody::bound_this`].
     pub bound_this_byte: u32,
     /// Byte offset of canonical
@@ -214,19 +222,25 @@ pub(crate) struct JitConstructorFieldTransitionPlan {
     pub(crate) slot: u16,
 }
 
-const _: [(); 36] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 40] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
 const _: [(); 8] = [(); std::mem::offset_of!(JitClosureCallLayout, upvalue_base_byte)];
 const _: [(); 12] = [(); std::mem::offset_of!(JitClosureCallLayout, upvalue_count_byte)];
-const _: [(); 16] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_byte)];
-const _: [(); 20] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte)];
-const _: [(); 24] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_flag)];
-const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag)];
-const _: [(); 32] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags)];
+const _: [(); 16] = [(); std::mem::offset_of!(JitClosureCallLayout, eval_env_byte)];
+const _: [(); 20] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_byte)];
+const _: [(); 24] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte)];
+const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_flag)];
+const _: [(); 32] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag)];
+const _: [(); 36] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags)];
 
-/// Owned snapshot of one executable function body.
+/// Owned, moving-GC-stable snapshot of one executable function body.
+///
+/// The DTO may remain live while nested target preparation allocates and moves
+/// the heap. It therefore carries only immutable code, scalar layout data,
+/// compressed offsets rooted by the VM, and addresses of permanent or traced
+/// stable cells. A raw moving `Value` or GC handle must never be added here.
 #[derive(Debug, Clone)]
 pub struct JitCompileSnapshot {
     /// Exact immutable executable body this feedback overlay decorates.
@@ -371,10 +385,10 @@ pub struct JitCompileSnapshot {
     /// each non-moving cell; generated code reads its current value and takes
     /// the semantic stub only for a TDZ hole.
     pub global_lexical_loads: rustc_hash::FxHashMap<u32, JitGlobalLexicalLoad>,
-    /// Direct reads of address-stable, GC-traced primitive-string constant
-    /// cells keyed by `Op::LoadString` byte PC. Only already-materialized
-    /// literals are published; a cold literal keeps its runtime transition.
-    pub string_constant_loads: rustc_hash::FxHashMap<u32, JitStringConstantLoad>,
+    /// Prepared address-stable, GC-traced primitive-string constant cells
+    /// keyed by `Op::LoadString` byte PC. Every site is a leaf load and remains
+    /// valid for the lifetime of every code object carrying its relocation.
+    pub string_constant_cells: rustc_hash::FxHashMap<u32, JitStringConstantCell>,
     /// Guarded own-data reads from the global object record keyed by the
     /// `Op::LoadGlobalOrThrow` byte-PC. Generated code validates both the live
     /// global-declarative epoch and the global object's hidden class before
@@ -887,13 +901,22 @@ pub struct JitGlobalLexicalLoad {
     pub cell_offset: u32,
 }
 
-/// One prepared primitive-string constant available to generated code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JitStringConstantLoad {
+/// One primitive-string constant cell available to generated code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct JitStringConstantCell {
     /// Process-local address of the isolate-owned, GC-traced `Value` cell.
     /// The cell allocation is stable and outlives every code object in the
     /// isolate; artifacts retain only function/byte-PC identity.
     pub cell_addr: usize,
+}
+
+impl std::fmt::Debug for JitStringConstantCell {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "JitStringConstantCell {{ cell_addr: <redacted> }}"
+        )
+    }
 }
 
 /// One guarded own-data load from the global object record.
@@ -1341,7 +1364,7 @@ impl JitCompileSnapshot {
             native_ref_byte: 0,
             instructions,
             global_lexical_loads: rustc_hash::FxHashMap::default(),
-            string_constant_loads: rustc_hash::FxHashMap::default(),
+            string_constant_cells: rustc_hash::FxHashMap::default(),
             global_object_loads: rustc_hash::FxHashMap::default(),
             static_native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),
@@ -1564,11 +1587,6 @@ pub struct VmRuntimeActivation {
     pub(crate) context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
     frame_index: usize,
-    /// Exact lexical `new.target` copied from the materialized cold sidecar at
-    /// the interpreter-to-native boundary.
-    new_target: crate::Value,
-    /// Derived-constructor semantic bit for the entered frame.
-    is_derived_constructor: bool,
 }
 
 impl VmRuntimeActivation {
@@ -1579,22 +1597,11 @@ impl VmRuntimeActivation {
         context: &crate::ExecutionContext,
         frame_index: usize,
     ) -> Self {
-        let (new_target, is_derived_constructor) = stack
-            .get(frame_index)
-            .and_then(|frame| vm.frame_cold(frame))
-            .map_or((crate::Value::undefined(), false), |cold| {
-                (
-                    cold.new_target.unwrap_or_else(crate::Value::undefined),
-                    cold.is_derived_constructor,
-                )
-            });
         Self {
             vm,
             stack,
             context,
             frame_index,
-            new_target,
-            is_derived_constructor,
         }
     }
 
@@ -1619,20 +1626,90 @@ impl VmRuntimeActivation {
 
     /// Executing frame index.
     #[must_use]
-    pub const fn frame_index(self) -> usize {
+    pub const fn frame_index(&self) -> usize {
         self.frame_index
     }
 
-    /// Exact lexical `new.target` for the entered frame.
-    #[must_use]
-    pub const fn new_target(self) -> crate::Value {
-        self.new_target
+    /// Mirror non-lexical materialized call state into a fresh native frame.
+    ///
+    /// This is the sole materialized-entry bridge. The activation stores no
+    /// tagged or compressed GC handles: it re-reads the materialized frame's
+    /// cold call state immediately before the caller publishes `native_frame`.
+    /// Direct-eval environment ownership is transferred separately by
+    /// [`Self::with_native_eval_env_owner`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::VmError::InvalidOperand`] when the frozen activation
+    /// pointers or function identity do not match the destination frame.
+    #[doc(hidden)]
+    pub fn initialize_native_frame_state(
+        &self,
+        native_frame: &mut crate::native_abi::NativeFrame,
+    ) -> Result<(), crate::VmError> {
+        // SAFETY: `VmRuntimeActivation::new` stores live, frozen VM and stack
+        // pointers for this entry transaction.
+        let vm = unsafe { self.vm.as_ref() }.ok_or(crate::VmError::InvalidOperand)?;
+        let stack = unsafe { self.stack.as_ref() }.ok_or(crate::VmError::InvalidOperand)?;
+        let frame = stack
+            .get(self.frame_index)
+            .ok_or(crate::VmError::InvalidOperand)?;
+        if frame.header.function_id != native_frame.header.function_id {
+            return Err(crate::VmError::InvalidOperand);
+        }
+        if let Some(cold) = vm.frame_cold(frame) {
+            native_frame.set_new_target(cold.new_target.unwrap_or_else(crate::Value::undefined));
+            if cold.is_derived_constructor {
+                native_frame.set_derived_constructor();
+            }
+        }
+        Ok(())
     }
 
-    /// Whether the entered frame is a derived constructor.
-    #[must_use]
-    pub const fn is_derived_constructor(self) -> bool {
-        self.is_derived_constructor
+    /// Transfer the materialized frame's direct-eval environment to its
+    /// published native frame for exactly one compiled dynamic extent.
+    ///
+    /// The materialized slot is null while generated code can allocate. A
+    /// normal return, side exit, throw, or fatal status restores the surviving
+    /// native handle before the activation is unpublished. Cold deopt paths
+    /// may instead move that handle into a temporary materialized continuation;
+    /// in that case both outer slots remain null when `operation` returns.
+    ///
+    /// # Safety
+    ///
+    /// `native_frame` must be the live frame just published for this exact
+    /// activation. `operation` may access it only through the generated-code
+    /// ABI and must return before the stack frame or native record is reclaimed.
+    #[doc(hidden)]
+    pub unsafe fn with_native_eval_env_owner<T>(
+        &self,
+        native_frame: *mut crate::native_abi::NativeFrame,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, crate::VmError> {
+        let stack = unsafe { self.stack.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
+        let frame = stack
+            .get_mut(self.frame_index)
+            .ok_or(crate::VmError::InvalidOperand)?;
+        let native = unsafe { native_frame.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
+        if frame.header.function_id != native.header.function_id || !native.eval_env.is_null() {
+            return Err(crate::VmError::InvalidOperand);
+        }
+        std::mem::swap(&mut frame.eval_env, &mut native.eval_env);
+
+        let result = operation();
+
+        // Re-resolve both owners after generated execution: nested calls and
+        // deopt continuations may grow the ActivationStack backing vector.
+        let stack = unsafe { self.stack.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
+        let frame = stack
+            .get_mut(self.frame_index)
+            .ok_or(crate::VmError::InvalidOperand)?;
+        let native = unsafe { native_frame.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
+        if frame.header.function_id != native.header.function_id || !frame.eval_env.is_null() {
+            return Err(crate::VmError::InvalidOperand);
+        }
+        std::mem::swap(&mut frame.eval_env, &mut native.eval_env);
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -1642,20 +1719,16 @@ impl VmRuntimeActivation {
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),
             frame_index: 0,
-            new_target: crate::Value::UNDEFINED,
-            is_derived_constructor: false,
         }
     }
 }
 
-const _: [(); 48] = [(); std::mem::size_of::<VmRuntimeActivation>()];
+const _: [(); 32] = [(); std::mem::size_of::<VmRuntimeActivation>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmRuntimeActivation>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmRuntimeActivation, vm)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmRuntimeActivation, stack)];
 const _: [(); 16] = [(); std::mem::offset_of!(VmRuntimeActivation, context)];
 const _: [(); 24] = [(); std::mem::offset_of!(VmRuntimeActivation, frame_index)];
-const _: [(); 32] = [(); std::mem::offset_of!(VmRuntimeActivation, new_target)];
-const _: [(); 40] = [(); std::mem::offset_of!(VmRuntimeActivation, is_derived_constructor)];
 
 /// Outcome of executing compiled code for one function entry.
 ///
@@ -1672,8 +1745,11 @@ pub enum JitExecOutcome {
     /// VM resumes the interpreter at the carried byte-PC — the exact
     /// instruction, so committed side effects are preserved.
     Bailed(u32),
-    /// A re-entered VM operation (recursive call) raised; propagate the error.
-    Threw(crate::run_control::VmError),
+    /// A generated callee propagated one pure JavaScript exception value.
+    Throw(crate::Value),
+    /// A structural engine failure escaped generated code. The exception
+    /// payload channel is never used for this outcome.
+    Fatal(crate::run_control::VmError),
 }
 
 /// Type-erased compiled-code handle owned by the JIT implementation.
@@ -1971,7 +2047,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 36);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 40);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -1987,24 +2063,35 @@ mod layout_tests {
             12
         );
         assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, bound_this_byte),
+            std::mem::offset_of!(JitClosureCallLayout, eval_env_byte),
             16
         );
         assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte),
+            std::mem::offset_of!(JitClosureCallLayout, bound_this_byte),
             20
         );
         assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, bound_this_flag),
+            std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte),
             24
         );
         assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag),
+            std::mem::offset_of!(JitClosureCallLayout, bound_this_flag),
             28
         );
         assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
+            std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag),
             32
         );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
+            36
+        );
+    }
+
+    #[test]
+    fn runtime_activation_is_only_the_four_word_owner_link() {
+        assert_eq!(std::mem::size_of::<VmRuntimeActivation>(), 32);
+        assert_eq!(std::mem::align_of::<VmRuntimeActivation>(), 8);
+        assert_eq!(std::mem::offset_of!(VmRuntimeActivation, frame_index), 24);
     }
 }

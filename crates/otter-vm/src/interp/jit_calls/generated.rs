@@ -37,7 +37,7 @@ impl Interpreter {
         caller_code_object_id: u64,
         callee_code_object_id: u64,
         call_kind: JitDirectCallKind,
-        callee: NativeFrame,
+        callee: &NativeFrame,
     ) -> Result<(), VmError> {
         if caller_code_object_id == 0
             || callee_code_object_id == 0
@@ -45,7 +45,6 @@ impl Interpreter {
                 .header
                 .flags
                 .contains(NativeFrameFlags::STACK_REGISTERS)
-            || callee.header.flags.contains(NativeFrameFlags::MATERIALIZED)
         {
             return Err(VmError::InvalidOperand);
         }

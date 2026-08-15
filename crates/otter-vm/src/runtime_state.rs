@@ -114,7 +114,7 @@ impl<'a> RuntimeState<'a> {
         // Primitive string constants materialized from bytecode constant pools.
         // Immutable strings can be reused across executions, but cached GC
         // handles must move with the heap.
-        for value in interp.string_constants_for_trace() {
+        for value in interp.string_constant_cells_for_trace() {
             value.trace_value_slots(visitor);
         }
         // Cached small-integer decimal strings (`SmallStrings`-style). Immutable

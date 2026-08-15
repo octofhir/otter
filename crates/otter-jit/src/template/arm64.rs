@@ -93,10 +93,9 @@ use crate::artifact::{
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
     NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-    NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, Unsupported,
-    VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
-    reg_offset,
+    NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
+    VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_INTERRUPT_CELL_OFFSET, reg_offset,
 };
 use otter_vm::native_abi as abi;
 
@@ -213,7 +212,10 @@ pub(super) fn compile(
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let bail = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
+    let committed_throw = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
+    let propagate_throw = ops.new_dynamic_label();
+    let fatal = ops.new_dynamic_label();
     let labels: BTreeMap<u32, DynamicLabel> = plan
         .instructions
         .iter()
@@ -277,7 +279,7 @@ pub(super) fn compile(
             TemplateOp::Jump { target, back_edge } => {
                 let tgt = labels[&target];
                 if back_edge {
-                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw);
+                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw, fatal);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt);
             }
@@ -302,7 +304,7 @@ pub(super) fn compile(
                         dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw);
+                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw, fatal);
                     dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
                 } else if when_truthy {
                     dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -328,7 +330,7 @@ pub(super) fn compile(
                 let fallthrough = ops.new_dynamic_label();
                 dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
                 if back_edge {
-                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw);
+                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw, fatal);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
             }
@@ -402,6 +404,7 @@ pub(super) fn compile(
                     negate,
                     bail,
                     threw,
+                    fatal,
                 )?;
             }
             TemplateOp::IntBitwise {
@@ -445,6 +448,7 @@ pub(super) fn compile(
                     rhs,
                     concat_safepoint,
                     threw,
+                    fatal,
                 )?;
             }
             TemplateOp::LoadThis { dst } => {
@@ -484,6 +488,7 @@ pub(super) fn compile(
                     dst,
                     constant,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::MakeClosure {
@@ -501,20 +506,8 @@ pub(super) fn compile(
                     plan.index_tail(parents),
                     parents,
                     threw,
+                    fatal,
                 );
-            }
-            TemplateOp::LoadString { dst, constant } => {
-                transitions::emit_load_string(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    code_block_id,
-                    instr.byte_pc,
-                    dst,
-                    constant,
-                    threw,
-                )?;
             }
             TemplateOp::LoadRegExp { dst, constant } => {
                 transitions::emit_load_regexp(
@@ -524,6 +517,7 @@ pub(super) fn compile(
                     dst,
                     constant,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::LoadGlobal { dst, name } => {
@@ -537,6 +531,7 @@ pub(super) fn compile(
                     code_block_id,
                     instr.byte_pc,
                     threw,
+                    fatal,
                 )?;
             }
             TemplateOp::LoadBuiltinError { dst, constant } => {
@@ -547,10 +542,18 @@ pub(super) fn compile(
                     dst,
                     constant,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::NewObject { dst } => {
-                transitions::emit_new_object(&mut ops, &mut relocations, transitions, dst, threw);
+                transitions::emit_new_object(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    threw,
+                    fatal,
+                );
             }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
@@ -561,6 +564,7 @@ pub(super) fn compile(
                     plan.register_tail(elements),
                     elements,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::FreshUpvalue { index } => {
@@ -570,6 +574,7 @@ pub(super) fn compile(
                     transitions,
                     index,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::DefineDataProperty { object, key, value } => {
@@ -581,6 +586,7 @@ pub(super) fn compile(
                     key,
                     value,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::DefineOwnProperty {
@@ -596,6 +602,7 @@ pub(super) fn compile(
                     key,
                     descriptor,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::LoadElement {
@@ -612,7 +619,8 @@ pub(super) fn compile(
                     receiver,
                     index,
                     instr.byte_pc,
-                    threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::StoreElement {
@@ -629,7 +637,8 @@ pub(super) fn compile(
                     index,
                     value,
                     instr.byte_pc,
-                    threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::LoadUpvalue { dst, index } => {
@@ -641,6 +650,7 @@ pub(super) fn compile(
                     dst,
                     index,
                     threw,
+                    fatal,
                 )?;
             }
             TemplateOp::StoreUpvalue { src, index } => {
@@ -652,6 +662,7 @@ pub(super) fn compile(
                     index,
                     false,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::StoreUpvalueChecked { src, index } => {
@@ -663,6 +674,7 @@ pub(super) fn compile(
                     index,
                     true,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::LoadProperty {
@@ -690,7 +702,8 @@ pub(super) fn compile(
                     cell_addr,
                     cell_ordinal,
                     view.property_loads.get(&instr.byte_pc).map(Vec::as_slice),
-                    threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::StoreProperty {
@@ -716,7 +729,8 @@ pub(super) fn compile(
                     cell_addr,
                     cell_ordinal,
                     view.property_stores.get(&instr.byte_pc).map(Vec::as_slice),
-                    threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::Call {
@@ -742,6 +756,8 @@ pub(super) fn compile(
                     byte_pc,
                     bail,
                     threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::Construct {
@@ -772,20 +788,19 @@ pub(super) fn compile(
                     byte_pc,
                     bail,
                     threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::MethodCall {
                 dst,
                 receiver,
-                name,
-                site: _,
-                argc,
-                packed_args,
+                arguments,
                 byte_pc,
                 arg0,
                 arg1,
             } => {
-                let argument_registers = plan.call_argument_registers(argc, packed_args);
+                let argument_registers = plan.register_tail(arguments);
                 calls::emit_method_call(
                     &mut ops,
                     &mut relocations,
@@ -795,15 +810,15 @@ pub(super) fn compile(
                     code_map.as_mut(),
                     dst,
                     receiver,
-                    name,
-                    argc,
-                    &argument_registers,
+                    argument_registers,
                     instr.pc,
                     byte_pc,
                     arg0,
                     arg1,
                     bail,
                     threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::EnterTry {
@@ -821,7 +836,8 @@ pub(super) fn compile(
                     u64::from(exception_register),
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::LeaveTry => {
@@ -835,7 +851,8 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::Throw { src } => {
@@ -849,7 +866,8 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::TdzError { local_index } => {
@@ -863,7 +881,8 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::EndFinally => {
@@ -877,7 +896,8 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::PopParkedFinally { count } => {
@@ -891,7 +911,8 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::JumpViaFinally { target, floor } => {
@@ -905,7 +926,8 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
-                    threw,
+                    committed_throw,
+                    fatal,
                 );
             }
             TemplateOp::IteratorNext {
@@ -923,6 +945,7 @@ pub(super) fn compile(
                     u64::from(iterator),
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::IteratorClose { iterator } => {
@@ -936,6 +959,7 @@ pub(super) fn compile(
                     0,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::IteratorCloseStart { iterator } => {
@@ -949,6 +973,7 @@ pub(super) fn compile(
                     0,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::IteratorCloseEnd { iterator } => {
@@ -962,6 +987,7 @@ pub(super) fn compile(
                     0,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::BindFunction {
@@ -983,6 +1009,7 @@ pub(super) fn compile(
                     packed_args,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::GlobalOp {
@@ -1001,25 +1028,26 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
-            TemplateOp::ObjectProtocolOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
+            TemplateOp::ObjectProtocolValue {
+                operation,
+                result,
+                value0,
+                value1,
             } => {
-                protocol::emit_object_protocol_op(
+                protocol::emit_object_protocol_value(
                     &mut ops,
                     &mut relocations,
                     transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                );
+                    operation,
+                    result,
+                    value0,
+                    value1,
+                    committed_throw,
+                    fatal,
+                )?;
             }
             TemplateOp::DeleteOp {
                 opcode,
@@ -1037,26 +1065,30 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
-            TemplateOp::ScalarOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
+            TemplateOp::ScalarValue {
+                operation,
+                result,
+                value0,
+                value1,
             } => {
-                scalar::emit_scalar_op(
+                scalar::emit_scalar_value(
                     &mut ops,
                     &mut relocations,
                     transitions,
                     view,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
+                    operation,
+                    result,
+                    value0,
+                    value1,
+                    committed_throw,
+                    fatal,
                 )?;
+            }
+            TemplateOp::LoadStringConstant { dst } => {
+                scalar::emit_string_constant(&mut ops, &mut relocations, view, instr.byte_pc, dst)?;
             }
             TemplateOp::SuperOp {
                 opcode,
@@ -1074,6 +1106,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::PrivateOp {
@@ -1092,6 +1125,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::ValueLoadOp {
@@ -1110,6 +1144,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::ConstructOp {
@@ -1128,6 +1163,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::StructuralOp { opcode, arg0, arg1 } => {
@@ -1140,6 +1176,7 @@ pub(super) fn compile(
                     arg1,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::ClassOp {
@@ -1158,6 +1195,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::ArrayConstruct {
@@ -1190,6 +1228,7 @@ pub(super) fn compile(
                     packed_args,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::StaticCallOp {
@@ -1208,6 +1247,7 @@ pub(super) fn compile(
                     packed_args,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::ControlOp {
@@ -1226,6 +1266,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::SpreadCallOp {
@@ -1249,6 +1290,8 @@ pub(super) fn compile(
                     instr.byte_pc,
                     bail,
                     threw,
+                    committed_throw,
+                    fatal,
                 )?;
             }
             TemplateOp::ClassValueOp {
@@ -1267,6 +1310,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::ModuleOp {
@@ -1285,6 +1329,7 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::NoOp => {}
@@ -1299,6 +1344,7 @@ pub(super) fn compile(
                     0,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::GetAsyncIterator { dst, src } => {
@@ -1312,6 +1358,7 @@ pub(super) fn compile(
                     0,
                     bail,
                     threw,
+                    fatal,
                 );
             }
             TemplateOp::Return { src } => {
@@ -1356,8 +1403,8 @@ pub(super) fn compile(
             &mut relocations,
             transitions,
             numeric_slow_paths,
-            bail,
             threw,
+            fatal,
         );
         emit_coercion_slow_paths(
             &mut ops,
@@ -1365,6 +1412,7 @@ pub(super) fn compile(
             transitions,
             coercion_slow_paths,
             threw,
+            fatal,
         );
         if let Some(code_map) = code_map.as_mut() {
             code_map.record(CodeRegion::structural(
@@ -1380,7 +1428,7 @@ pub(super) fn compile(
     dynasm!(ops
         ; .arch aarch64
         ; =>returned
-        ; movz x1, STATUS_RETURNED as u32
+        ; movz x1, abi::NativeResultStatus::Success as u32
     );
     emit_epilogue(&mut ops);
     if let Some(code_map) = code_map.as_mut() {
@@ -1391,14 +1439,14 @@ pub(super) fn compile(
         ));
     }
 
-    // Shared exact-side-exit epilogue: status = bailed, value = 0. The frame
-    // PC stamped at the exiting instruction names the uncommitted opcode.
+    // Shared exact-side-exit epilogue. The payload repeats the frame PC so the
+    // VM can assert that machine result and published state are identical.
     let bail_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
         ; =>bail
-        ; movz x0, #0
-        ; movz x1, STATUS_BAILED as u32
+        ; ldr w0, [x21, NATIVE_FRAME_PC_OFFSET]
+        ; movz x1, abi::NativeResultStatus::SideExit as u32
     );
     emit_epilogue(&mut ops);
     if let Some(code_map) = code_map.as_mut() {
@@ -1408,12 +1456,42 @@ pub(super) fn compile(
             ops.offset().0,
         ));
     }
-    // Shared throw epilogue: a transition parked the error in the context.
-    // Before propagating, deliver it to this frame's own structured-exception
-    // handlers so a `try` in the same compiled function catches a
-    // property/element/global/loose-equality/coercion throw. The resolver bails
-    // to the published catch/finally PC when a local handler takes it, and
-    // otherwise re-parks the error for the propagating throw.
+    // Pure exceptions carry their exact JavaScript value in x0 and no parked
+    // side channel. A materialized Template handler may select its PC; an
+    // escaping throw returns the same x0 unchanged.
+    let committed_throw_start = ops.offset().0;
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>committed_throw
+        ; mov x1, x0
+        ; mov x0, x20
+    );
+    emit_load_runtime_stub(
+        &mut ops,
+        &mut relocations,
+        16,
+        transitions.entry(abi::STUB_JIT_ROUTE_THROW),
+        abi::STUB_JIT_ROUTE_THROW,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x1, abi::NativeResultStatus::SideExit as u32
+        ; b.eq =>bail
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>propagate_throw
+        ; b =>fatal
+    );
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "committedThrowRouter",
+            committed_throw_start,
+            ops.offset().0,
+        ));
+    }
+    // A status-word runtime operation parked an error in the context. Finish
+    // it once at the compiled-frame boundary, producing the same canonical
+    // Bail/Throw/Fatal result domain as every generated callee.
     let threw_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
@@ -1424,17 +1502,27 @@ pub(super) fn compile(
         &mut ops,
         &mut relocations,
         16,
-        transitions.entry(abi::STUB_JIT_RESOLVE_THREW),
-        abi::STUB_JIT_RESOLVE_THREW,
+        transitions.entry(abi::STUB_JIT_FINISH_ERROR),
+        abi::STUB_JIT_FINISH_ERROR,
     );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cmp x0, STATUS_BAILED as u32
+        ; cmp x1, abi::NativeResultStatus::SideExit as u32
         ; b.eq =>bail
-        ; movz x0, #0
-        ; movz x1, STATUS_THREW as u32
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>propagate_throw
+        ; b =>fatal
+        ; =>propagate_throw
+        ; movz x1, abi::NativeResultStatus::Throw as u32
     );
+    emit_epilogue(&mut ops);
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>fatal
+    );
+    emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; movz x1, abi::NativeResultStatus::Fatal as u32);
     emit_epilogue(&mut ops);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
@@ -1678,7 +1766,6 @@ fn emit_truthiness_bool(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; and x1, x1, #0xff
         ; cbnz x1, =>bail
         ; mov x9, x0                            // boolean Value from the probe
         ; b =>done
@@ -1707,13 +1794,14 @@ fn emit_truthiness_bool(
 /// Inline cooperative poll at a back edge: read the interrupt byte and
 /// decrement the fuel counter, re-entering the poll stub only when the
 /// interrupt is set or the counter reaches zero. `poll_entry` is the
-/// descriptor-resolved poll transition; a nonzero status branches to the
-/// throw epilogue.
+/// descriptor-resolved poll transition; unknown status words branch directly
+/// to the fatal epilogue.
 fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     poll_entry: u64,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
@@ -1738,10 +1826,7 @@ fn emit_backedge_poll(
         poll_entry,
         abi::STUB_JIT_BACKEDGE_POLL,
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbnz x0, =>threw
-        ; =>cont
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    transitions::emit_status_word_result(ops, None, threw, fatal);
+    dynasm!(ops ; .arch aarch64 ; =>cont);
 }

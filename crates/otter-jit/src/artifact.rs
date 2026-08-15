@@ -453,31 +453,6 @@ impl CodeRegion {
         region.inline_scratch_layout = Some(layout);
         region
     }
-
-    pub(crate) fn deopt(start: usize, end: usize, exit_id: u32, logical_pc: u32) -> Self {
-        let mut region = Self::structural("deoptExit", start, end);
-        region.logical_pc = Some(logical_pc);
-        region.deopt_exit_id = Some(exit_id);
-        region
-    }
-
-    pub(crate) fn block(kind: &'static str, start: usize, end: usize, block: u32) -> Self {
-        let mut region = Self::structural(kind, start, end);
-        region.block = Some(block);
-        region
-    }
-
-    pub(crate) fn edge(
-        kind: &'static str,
-        start: usize,
-        end: usize,
-        block: u32,
-        target_block: u32,
-    ) -> Self {
-        let mut region = Self::block(kind, start, end, block);
-        region.target_block = Some(target_block);
-        region
-    }
 }
 
 /// One loop-header native entry.

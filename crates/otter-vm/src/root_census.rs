@@ -170,9 +170,9 @@ impl Interpreter {
             }),
         );
         push(
-            "string_constant_cache",
+            "string_constant_cells",
             count(|v| {
-                for value in self.string_constants_for_trace() {
+                for value in self.string_constant_cells_for_trace() {
                     value.trace_value_slots(v);
                 }
             }),

@@ -187,6 +187,106 @@ fn optimized_literal_cell_survives_cache_rehash_and_full_gc() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
+fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
+    use otter_runtime::{JitArtifactFileName, JitDebugRequest};
+
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(4)
+        .jit_debug(JitDebugRequest::artifacts())
+        .build()
+        .expect("nested literal runtime");
+    let setup = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                function nestedLiteralTarget(cold) {
+                  if (cold) return "nested-eager-literal";
+                  return 7;
+                }
+                function nestedLiteralCaller(cold, limit) {
+                  const result = nestedLiteralTarget(cold);
+                  let checksum = 0;
+                  for (let index = 0; index < limit; index++) checksum += index;
+                  return result;
+                }
+                function machineLiteralTarget() {
+                  return "machine-direct-literal";
+                }
+
+                // The first caller reaches OSR after one target observation.
+                // Its snapshot therefore exists while eager direct-target
+                // preparation canonicalizes the target's cold literal. Under
+                // OTTER_GC_STRESS this allocation forces the moving-GC order
+                // guarded by the VM regression.
+                const first = nestedLiteralCaller(false, 64);
+                for (let warm = 0; warm < 4010; warm++) {
+                  nestedLiteralCaller(false, 1);
+                  machineLiteralTarget();
+                }
+                JSON.stringify([
+                  first,
+                  nestedLiteralCaller(false, 1),
+                  machineLiteralTarget()
+                ]);
+                "#,
+            ),
+            "nested-eager-literal-setup.js",
+        )
+        .expect("compile caller and nested literal target");
+    assert_eq!(
+        setup.completion_string(),
+        r#"[7,7,"machine-direct-literal"]"#
+    );
+    assert!(
+        runtime.execution_stats().jit_optimized_entries > 0,
+        "fixture must execute optimized code"
+    );
+
+    let artifacts = setup.jit_artifacts().expect("literal artifacts");
+    let relocations = artifacts
+        .bundles()
+        .iter()
+        .filter_map(|bundle| bundle.file(JitArtifactFileName::Relocations))
+        .map(|file| std::str::from_utf8(file.contents()).expect("relocations are UTF-8"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        relocations.contains("stringConstantCell"),
+        "nested literal must use a symbolic traced-cell relocation: {relocations}"
+    );
+    let code_maps = artifacts
+        .bundles()
+        .iter()
+        .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
+        .map(|file| std::str::from_utf8(file.contents()).expect("code maps are UTF-8"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code_maps.contains("machineStringConstantLoad"),
+        "prepared LoadString must stay inside Machine IR: {code_maps}"
+    );
+    drop(setup);
+
+    runtime
+        .force_gc()
+        .expect("move every live literal after compilation");
+    let cold = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "JSON.stringify([nestedLiteralCaller(true, 1), machineLiteralTarget()])",
+            ),
+            "nested-eager-literal-after-gc.js",
+        )
+        .expect("execute cold literal through retained generated code");
+    assert_eq!(
+        cold.completion_string(),
+        r#"["nested-eager-literal","machine-direct-literal"]"#
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
 fn optimizing_string_artifacts_have_no_replaced_leaf_relocations() {
     use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier};
 

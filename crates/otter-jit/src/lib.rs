@@ -2,18 +2,18 @@
 //!
 //! The baseline compiler is a Sparkplug-style template macro-assembler that
 //! lowers Otter register bytecode directly to native machine code with no
-//! register allocation or deopt. Backend-independent optimizing analyses are
-//! consumed by the optimizing emitter. Native execution reuses the
-//! interpreter's frame array and explicit safepoint records for moving-GC
-//! rooting. The dynasm-backed [`CompiledCode`] remains the sole W^X
-//! executable-memory owner.
+//! register allocation or deopt. The optimizing tier has one implementation:
+//! typed scalar HIR lowers to target-neutral [`machine`] IR, regalloc2 assigns
+//! physical homes, and the AArch64 encoder consumes that allocation. The
+//! dynasm-backed [`CompiledCode`] remains the sole W^X executable-memory owner.
 //!
 //! # Contents
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
-//! - [`ir`] — backend-independent analysis structures for optimizing compilers.
-//! - [`optimizing`] — the production-wired reducible numeric/element tier with
-//!   function and loop-header OSR entries.
+//! - [`machine`] — verified target-neutral instructions, descriptors,
+//!   allocation, safepoints, and deoptimization metadata.
+//! - [`optimizing`] — the production-wired Machine compiler and finalized code
+//!   objects with function and loop-header OSR entries.
 //! - Default-off owned artifact sidecars containing tier input, exact code,
 //!   code maps, deopt metadata, and safepoints for outer-host persistence.
 //!
@@ -23,11 +23,11 @@
 //!   machine code requires W^X mappings and fn-pointer transmutes. All `unsafe`
 //!   stays behind this crate's safe API; `otter-vm` keeps the ban and reaches
 //!   the JIT through a runtime-wired trait hook (no dependency cycle).
-//! - **Canonical GC roots.** Compiled code keeps live JS values in the reused
-//!   interpreter frame array (already a `FrameRoots` provider), publishes an
-//!   explicit safepoint record for allocating calls, and reloads derived object
-//!   pointers after every safepoint. A value cached only in a machine register
-//!   across a safepoint would be a use-after-move bug.
+//! - **Canonical GC roots.** Template code roots its published register window.
+//!   Machine code derives native root slots and stack maps from final allocator
+//!   locations and reloads moving values after every safepoint. A value cached
+//!   only in an unreported machine location across a safepoint would be a
+//!   use-after-move bug.
 //! - **One runtime stack.** The optimizing tier and template baseline share the
 //!   VM-owned hook, registry, frame array, and fallback interpreter; neither is
 //!   a parallel engine/runtime stack.
@@ -48,7 +48,6 @@ mod arm64;
 mod artifact;
 mod code;
 mod entry;
-pub mod ir;
 pub mod machine;
 pub mod optimizing;
 mod template;
@@ -61,7 +60,7 @@ pub use template::{TemplateCode, compile};
 /// Native-tier policy selected by the embedding runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitTierPolicy {
-    /// Run the optimizing tier before falling back to template compilation.
+    /// Enable the Machine optimizing tier alongside the template baseline.
     ProductionTiered,
     /// Compile only with the template tier.
     TemplateOnly,
@@ -187,7 +186,6 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             return Ok(otter_vm::JitCompileStatus::Unavailable);
         }
         let fid = request.snapshot.code_block.id;
-        let capture_events = request.debug.events_enabled();
         let artifact_request = request
             .debug
             .artifacts_enabled()
@@ -208,7 +206,6 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             request.code_object_id,
             &self.transitions,
             artifact_request,
-            capture_events,
         );
         #[cfg(not(target_arch = "aarch64"))]
         let compiled = {

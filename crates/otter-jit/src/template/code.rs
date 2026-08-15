@@ -7,7 +7,7 @@
 //!
 //! # Invariants
 //! - The executable mapping and the entry pointer share one owner; entries run
-//!   only through the frozen `JitCtx`/`JitRet` contract.
+//!   only through the frozen `JitCtx`/`NativeResultPair` contract.
 //! - Allocating runtime calls name a concrete code-object-owned safepoint;
 //!   the sorted record table resolves ids for the moving collector.
 //! - Installed code uses the single in-process VM layout.

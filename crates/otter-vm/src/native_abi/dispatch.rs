@@ -1,256 +1,360 @@
-//! Fixed status/result contracts for tier and runtime-stub dispatch.
+//! One fixed native result contract for compiled code and runtime stubs.
 //!
 //! # Contents
-//! - [`DispatchStatus`] and [`DispatchResult`] cross compiled-entry boundaries.
-//! - [`RuntimeStubStatus`] and result records cross runtime-stub boundaries.
+//! - [`NativeResultPair`] is the sole two-register result carrier.
+//! - [`NativeResultStatus`] is the sole machine-observed status alphabet.
+//! - [`NativeResultDomain`] validates the status subset and payload semantics
+//!   owned by each native boundary.
 //!
 //! # Invariants
-//! - JavaScript exceptions never unwind through native frames; `Throw` means a
-//!   rooted exception is published on [`super::VmThread`].
-//! - Every non-success condition has an explicit discriminant and payload.
+//! - The pair is always exactly `x0 = payload_bits`, `x1 = status`; there is no
+//!   packed auxiliary payload and no second result layout.
+//! - JavaScript exceptions never unwind through native frames. Compiled,
+//!   structured-exception, and committed domains carry a pure boxed exception
+//!   in `x0`; the probe domain reports a pending exception with canonical zero
+//!   payload instead.
+//! - A compiled or structured-exception [`NativeResultStatus::SideExit`]
+//!   payload is the exact instruction-index PC of an uncommitted instruction.
+//!   A probe-domain side exit is a guard miss and has canonical zero payload.
+//! - Every Rust consumer validates the externally known domain before reading
+//!   status-specific payload semantics. Unknown words and statuses outside the
+//!   selected domain are rejected, never silently rewritten as `Fatal`.
 //! - Records are fixed-width C-layout values suitable for two-register returns.
-//! - A `SideExit` payload is the exact instruction-index PC of an uncommitted
-//!   instruction. All earlier instructions are committed, frame registers are
-//!   materialized, and the interpreter must continue at (not after) that PC.
-//! - A runtime operation that has started observable work either completes its
-//!   opcode or reports `Throw`; it cannot return a resumable side exit that
-//!   would repeat the operation.
 //!
 //! # See also
-//! - [`super::runtime_stubs`] for descriptor-side status classification.
+//! - [`super::runtime_stubs`] for descriptor-side result-domain ownership.
 
-use super::FrameStateId;
-
-/// Result of interpreter or compiled dispatch.
-#[repr(u32)]
+/// The one machine-observed native result status alphabet.
+///
+/// Domains deliberately give shared status words their local meaning:
+/// `SideExit` is a compiled/exception `Bail` or a probe `Miss`, while
+/// `Success` is a compiled `Return` or a runtime-stub `Ok`.
+#[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchStatus {
-    /// Function returned; `value_bits` is the completion value.
-    Return = 0,
-    /// Resume the interpreter at `payload` logical PC.
+pub enum NativeResultStatus {
+    /// The selected native operation completed normally.
+    Success = 0,
+    /// Leave the selected generated/fast path before its source effect.
     SideExit = 1,
-    /// A rooted pending exception is stored on [`super::VmThread`].
+    /// JavaScript abrupt completion.
     Throw = 2,
-    /// Interrupt/budget handling is required at `payload` logical PC.
-    Interrupt = 3,
-    /// Fatal allocation failure.
+    /// A structured exception transition committed and generated fallthrough
+    /// remains authoritative.
+    Continue = 3,
+    /// A probe/allocation boundary could not allocate.
     OutOfMemory = 4,
+    /// Structural engine failure parked in the active runtime context.
+    Fatal = 6,
 }
 
-/// Fixed two-word result shared by interpreter and compiled entries.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DispatchResult {
-    /// Dispatch action.
-    pub status: DispatchStatus,
-    /// Logical PC, reason id, or zero depending on `status`.
-    pub payload: u32,
-    /// Boxed completion value bits for [`DispatchStatus::Return`].
-    pub value_bits: u64,
-}
-
-impl DispatchResult {
-    /// Normal return.
-    #[must_use]
-    pub const fn returned(value_bits: u64) -> Self {
-        Self {
-            status: DispatchStatus::Return,
-            payload: 0,
-            value_bits,
-        }
-    }
-
-    /// Exact logical-PC side exit.
-    #[must_use]
-    pub const fn side_exit(logical_pc: u32) -> Self {
-        Self {
-            status: DispatchStatus::SideExit,
-            payload: logical_pc,
-            value_bits: 0,
-        }
-    }
-
-    /// Throw with the exception rooted in the VM thread.
-    #[must_use]
-    pub const fn thrown() -> Self {
-        Self {
-            status: DispatchStatus::Throw,
-            payload: 0,
-            value_bits: 0,
-        }
-    }
-}
-
-/// Status code returned by a runtime stub.
+/// Semantic owner of one [`NativeResultPair`].
+///
+/// `None` is a descriptor sentinel for machine signatures that return a word,
+/// raw value, or float instead of a pair; it is never a valid pair domain.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeStubStatus {
-    /// Stub completed and `value_bits` carries the JS result.
-    Ok = 0,
-    /// Guarded fast path was not applicable.
-    Miss = 1,
-    /// Stub threw and published a rooted pending exception.
-    Throw = 2,
-    /// Stub requests an exact frame-state exit.
-    Deopt = 3,
-    /// Allocation failed.
-    OutOfMemory = 4,
-    /// Runtime interrupt or budget stop.
-    Interrupt = 5,
+pub enum NativeResultDomain {
+    /// This descriptor does not return a [`NativeResultPair`].
+    None = 0,
+    /// Whole compiled-function entry/exit.
+    Compiled = 1,
+    /// Structured exception-region transition.
+    ExceptionTransition = 2,
+    /// Effect-once JavaScript semantic boundary.
+    Committed = 3,
+    /// Pre-effect leaf/allocation probe.
+    Probe = 4,
 }
 
-/// Rust-facing fixed-width runtime-stub result.
+/// The sole fixed two-register native result.
+///
+/// The domain is owned by the compiled-entry signature or runtime-stub
+/// descriptor, not duplicated in this carrier. This keeps every machine call
+/// on one physical ABI while [`Self::validate`] prevents a caller from
+/// interpreting a status outside that boundary's state machine.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeStubResult {
-    /// Result status.
-    pub status: RuntimeStubStatus,
-    /// Raw boxed value bits when status is `Ok`.
-    pub value_bits: u64,
-    /// Status-specific payload.
-    pub payload: u64,
+pub struct NativeResultPair {
+    payload_bits: u64,
+    status: u64,
 }
 
-impl RuntimeStubResult {
-    /// Successful result from boxed value bits.
+impl NativeResultPair {
+    /// Encode a normal boxed-value completion.
     #[must_use]
-    pub const fn ok_bits(value_bits: u64) -> Self {
+    pub const fn success(value: crate::Value) -> Self {
+        Self::success_bits(value.to_abi_bits())
+    }
+
+    /// Encode a normal completion from already boxed ABI bits.
+    #[must_use]
+    pub const fn success_bits(payload_bits: u64) -> Self {
         Self {
-            status: RuntimeStubStatus::Ok,
-            value_bits,
-            payload: 0,
+            payload_bits,
+            status: NativeResultStatus::Success as u64,
         }
     }
 
-    /// Successful result from a VM value.
+    /// Encode a pre-effect side exit.
+    ///
+    /// Compiled and structured-exception domains pass an exact logical PC;
+    /// probes pass zero for a guard miss. Domain validation enforces both.
     #[must_use]
-    pub(crate) const fn ok_value(value: crate::Value) -> Self {
-        Self::ok_bits(value.to_abi_bits())
+    pub const fn side_exit(payload_bits: u64) -> Self {
+        Self {
+            payload_bits,
+            status: NativeResultStatus::SideExit as u64,
+        }
     }
 
-    /// Guard miss.
+    /// Encode a pure boxed JavaScript exception.
+    ///
+    /// Valid only for compiled, structured-exception, and committed domains.
+    #[must_use]
+    pub const fn throw_value(exception: crate::Value) -> Self {
+        Self {
+            payload_bits: exception.to_abi_bits(),
+            status: NativeResultStatus::Throw as u64,
+        }
+    }
+
+    /// Report a JavaScript exception already parked by a probe boundary.
+    ///
+    /// Unlike [`Self::throw_value`], the payload is canonical zero and carries
+    /// no moving GC value.
+    #[must_use]
+    pub const fn throw_pending() -> Self {
+        Self {
+            payload_bits: 0,
+            status: NativeResultStatus::Throw as u64,
+        }
+    }
+
+    /// Report a probe miss with no committed source effect.
     #[must_use]
     pub const fn miss() -> Self {
-        Self {
-            status: RuntimeStubStatus::Miss,
-            value_bits: 0,
-            payload: 0,
-        }
+        Self::side_exit(0)
     }
 
-    /// JavaScript exception already parked by the active runtime context.
+    /// Keep generated fallthrough after a committed structured transition.
     #[must_use]
-    pub const fn thrown() -> Self {
+    pub const fn continue_generated() -> Self {
         Self {
-            status: RuntimeStubStatus::Throw,
-            value_bits: 0,
-            payload: 0,
+            payload_bits: 0,
+            status: NativeResultStatus::Continue as u64,
         }
     }
 
-    /// Exact frame-state exit.
-    #[must_use]
-    pub const fn deopt(frame_state: FrameStateId) -> Self {
-        Self {
-            status: RuntimeStubStatus::Deopt,
-            value_bits: 0,
-            payload: frame_state as u64,
-        }
-    }
-
-    /// Allocation failure.
+    /// Report allocation failure from a probe/allocation boundary.
     #[must_use]
     pub const fn out_of_memory() -> Self {
         Self {
-            status: RuntimeStubStatus::OutOfMemory,
-            value_bits: 0,
-            payload: 0,
+            payload_bits: 0,
+            status: NativeResultStatus::OutOfMemory as u64,
         }
     }
 
-    /// Extract a successful VM value.
+    /// Encode an engine failure parked in the active runtime context.
+    #[doc(hidden)]
     #[must_use]
-    pub(crate) const fn into_value(self) -> Option<crate::Value> {
-        match self.status {
-            RuntimeStubStatus::Ok => Some(crate::Value::from_abi_bits(self.value_bits)),
-            _ => None,
-        }
-    }
-}
-
-/// Two-register machine runtime-stub result.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeStubResultPair {
-    /// Raw boxed value bits when status is `Ok`.
-    pub value_bits: u64,
-    /// Low byte is status; high 56 bits are payload.
-    pub status_payload: u64,
-}
-
-impl RuntimeStubResultPair {
-    /// Pack a Rust-facing result.
-    #[must_use]
-    pub const fn from_result(result: RuntimeStubResult) -> Self {
+    pub const fn fatal_internal() -> Self {
         Self {
-            value_bits: result.value_bits,
-            status_payload: ((result.payload & 0x00ff_ffff_ffff_ffff) << 8) | result.status as u64,
+            payload_bits: crate::Value::UNDEFINED.to_abi_bits(),
+            status: NativeResultStatus::Fatal as u64,
         }
     }
 
-    /// Decode status.
+    /// Validate this pair against its externally owned result domain.
+    ///
+    /// The returned status may be used to select the matching payload accessor.
+    /// No unknown status word and no status outside the selected state machine
+    /// is accepted.
     #[must_use]
-    pub const fn status(self) -> RuntimeStubStatus {
-        match (self.status_payload & 0xff) as u8 {
-            0 => RuntimeStubStatus::Ok,
-            1 => RuntimeStubStatus::Miss,
-            2 => RuntimeStubStatus::Throw,
-            3 => RuntimeStubStatus::Deopt,
-            4 => RuntimeStubStatus::OutOfMemory,
-            _ => RuntimeStubStatus::Interrupt,
-        }
+    pub const fn validate(self, domain: NativeResultDomain) -> Option<NativeResultStatus> {
+        let status = match self.status {
+            0 => NativeResultStatus::Success,
+            1 => NativeResultStatus::SideExit,
+            2 => NativeResultStatus::Throw,
+            3 => NativeResultStatus::Continue,
+            4 => NativeResultStatus::OutOfMemory,
+            6 => NativeResultStatus::Fatal,
+            _ => return None,
+        };
+        let valid = match domain {
+            NativeResultDomain::None => false,
+            NativeResultDomain::Compiled => match status {
+                NativeResultStatus::Success | NativeResultStatus::Throw => true,
+                NativeResultStatus::SideExit => self.payload_bits <= u32::MAX as u64,
+                NativeResultStatus::Fatal => {
+                    self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
+                }
+                NativeResultStatus::Continue | NativeResultStatus::OutOfMemory => false,
+            },
+            NativeResultDomain::ExceptionTransition => match status {
+                NativeResultStatus::Success | NativeResultStatus::Throw => true,
+                NativeResultStatus::SideExit => self.payload_bits <= u32::MAX as u64,
+                NativeResultStatus::Continue => self.payload_bits == 0,
+                NativeResultStatus::Fatal => {
+                    self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
+                }
+                NativeResultStatus::OutOfMemory => false,
+            },
+            NativeResultDomain::Committed => match status {
+                NativeResultStatus::Success | NativeResultStatus::Throw => true,
+                NativeResultStatus::Fatal => {
+                    self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
+                }
+                NativeResultStatus::SideExit
+                | NativeResultStatus::Continue
+                | NativeResultStatus::OutOfMemory => false,
+            },
+            NativeResultDomain::Probe => match status {
+                NativeResultStatus::Success => true,
+                NativeResultStatus::SideExit
+                | NativeResultStatus::Throw
+                | NativeResultStatus::OutOfMemory => self.payload_bits == 0,
+                NativeResultStatus::Fatal => {
+                    self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
+                }
+                NativeResultStatus::Continue => false,
+            },
+        };
+        if valid { Some(status) } else { None }
     }
 
-    /// Decode payload.
+    /// Raw `x0` payload bits.
     #[must_use]
-    pub const fn payload(self) -> u64 {
-        self.status_payload >> 8
+    pub const fn payload_bits(self) -> u64 {
+        self.payload_bits
     }
 
-    /// Convert to the Rust-facing record.
+    /// Decode a validated Success or pure Throw payload as a boxed value.
     #[must_use]
-    pub const fn into_result(self) -> RuntimeStubResult {
-        RuntimeStubResult {
-            status: self.status(),
-            value_bits: self.value_bits,
-            payload: self.payload(),
+    pub const fn payload_value(self) -> crate::Value {
+        crate::Value::from_abi_bits(self.payload_bits)
+    }
+
+    /// Decode a validated compiled/exception side-exit payload as a logical PC.
+    #[must_use]
+    pub const fn logical_pc(self) -> Option<u32> {
+        if self.payload_bits <= u32::MAX as u64 {
+            Some(self.payload_bits as u32)
+        } else {
+            None
         }
     }
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<DispatchResult>()];
-const _: [(); 8] = [(); std::mem::align_of::<DispatchResult>()];
-const _: [(); 24] = [(); std::mem::size_of::<RuntimeStubResult>()];
-const _: [(); 16] = [(); std::mem::size_of::<RuntimeStubResultPair>()];
-const _: [(); 8] = [(); std::mem::align_of::<RuntimeStubResultPair>()];
-const _: [(); 8] = [(); std::mem::offset_of!(DispatchResult, value_bits)];
+const _: [(); 16] = [(); std::mem::size_of::<NativeResultPair>()];
+const _: [(); 8] = [(); std::mem::align_of::<NativeResultPair>()];
+const _: [(); 0] = [(); std::mem::offset_of!(NativeResultPair, payload_bits)];
+const _: [(); 8] = [(); std::mem::offset_of!(NativeResultPair, status)];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn pair_round_trips_status_and_payload() {
-        let result = RuntimeStubResult::deopt(17);
+    fn one_pair_validates_every_domain_subset() {
+        let value = crate::Value::number_i32(42);
+        let success = NativeResultPair::success(value);
+        for domain in [
+            NativeResultDomain::Compiled,
+            NativeResultDomain::ExceptionTransition,
+            NativeResultDomain::Committed,
+            NativeResultDomain::Probe,
+        ] {
+            assert_eq!(success.validate(domain), Some(NativeResultStatus::Success));
+            assert_eq!(success.payload_value(), value);
+        }
+
+        let side_exit = NativeResultPair::side_exit(17);
         assert_eq!(
-            RuntimeStubResultPair::from_result(result).into_result(),
-            result
+            side_exit.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
+        assert_eq!(side_exit.logical_pc(), Some(17));
+        assert_eq!(
+            side_exit.validate(NativeResultDomain::ExceptionTransition),
+            Some(NativeResultStatus::SideExit)
+        );
+        assert_eq!(side_exit.validate(NativeResultDomain::Committed), None);
+        assert_eq!(side_exit.validate(NativeResultDomain::Probe), None);
+
+        let miss = NativeResultPair::miss();
+        assert_eq!(
+            miss.validate(NativeResultDomain::Probe),
+            Some(NativeResultStatus::SideExit)
         );
     }
 
     #[test]
-    fn successful_value_round_trips() {
-        let value = crate::Value::number_i32(42);
-        assert_eq!(RuntimeStubResult::ok_value(value).into_value(), Some(value));
+    fn pure_and_pending_throw_payloads_are_domain_checked() {
+        let exception = crate::Value::number_i32(9);
+        let pure = NativeResultPair::throw_value(exception);
+        for domain in [
+            NativeResultDomain::Compiled,
+            NativeResultDomain::ExceptionTransition,
+            NativeResultDomain::Committed,
+        ] {
+            assert_eq!(pure.validate(domain), Some(NativeResultStatus::Throw));
+            assert_eq!(pure.payload_value(), exception);
+        }
+        assert_eq!(pure.validate(NativeResultDomain::Probe), None);
+
+        let pending = NativeResultPair::throw_pending();
+        assert_eq!(
+            pending.validate(NativeResultDomain::Probe),
+            Some(NativeResultStatus::Throw)
+        );
+        assert_eq!(pending.payload_bits(), 0);
+    }
+
+    #[test]
+    fn continue_and_out_of_memory_are_domain_exclusive() {
+        let continued = NativeResultPair::continue_generated();
+        assert_eq!(
+            continued.validate(NativeResultDomain::ExceptionTransition),
+            Some(NativeResultStatus::Continue)
+        );
+        for domain in [
+            NativeResultDomain::Compiled,
+            NativeResultDomain::Committed,
+            NativeResultDomain::Probe,
+            NativeResultDomain::None,
+        ] {
+            assert_eq!(continued.validate(domain), None);
+        }
+
+        let oom = NativeResultPair::out_of_memory();
+        assert_eq!(
+            oom.validate(NativeResultDomain::Probe),
+            Some(NativeResultStatus::OutOfMemory)
+        );
+        assert_eq!(oom.validate(NativeResultDomain::Compiled), None);
+    }
+
+    #[test]
+    fn malformed_status_and_payload_words_are_rejected() {
+        let unknown = NativeResultPair {
+            payload_bits: 0,
+            status: 5,
+        };
+        let widened_status = NativeResultPair {
+            payload_bits: 0,
+            status: 1 << 8,
+        };
+        let wide_pc = NativeResultPair::side_exit(u64::from(u32::MAX) + 1);
+        for domain in [
+            NativeResultDomain::Compiled,
+            NativeResultDomain::ExceptionTransition,
+            NativeResultDomain::Committed,
+            NativeResultDomain::Probe,
+        ] {
+            assert_eq!(unknown.validate(domain), None);
+            assert_eq!(widened_status.validate(domain), None);
+        }
+        assert_eq!(wide_pc.validate(NativeResultDomain::Compiled), None);
+        assert_eq!(wide_pc.validate(NativeResultDomain::Probe), None);
     }
 }

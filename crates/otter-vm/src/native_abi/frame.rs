@@ -17,7 +17,7 @@
 //! # See also
 //! - [`super::safepoints`] for precise root maps.
 
-use crate::Value;
+use crate::{Value, eval_env::EvalEnvHandle};
 
 /// Stable VM-thread fields visible to native code.
 #[repr(C, align(8))]
@@ -87,21 +87,19 @@ pub struct NativeFrameFlags(u8);
 impl NativeFrameFlags {
     /// Frame has precise safepoint maps for tagged machine locations.
     pub const HAS_SAFEPOINTS: u8 = 1 << 0;
-    /// `activation_id` names a materialized interpreter activation. Without
-    /// this bit the word is unused.
-    pub const MATERIALIZED: u8 = 1 << 1;
     /// `register_base` points into generated code's native stack instead of
     /// the VM register arena. The published native activation therefore owns
     /// precise tracing and in-place rewriting of this register window.
     ///
-    /// Stack-owned frames have no `activation_id` owner. Their generated call
-    /// sequence owns synchronous-depth and native-stack-byte accounting until
-    /// return, throw, or cold deoptimization completes.
-    pub const STACK_REGISTERS: u8 = 1 << 2;
+    /// Their generated call sequence owns synchronous-depth and
+    /// native-stack-byte accounting until return, throw, or cold
+    /// deoptimization completes. Frames without this bit use the materialized
+    /// activation named by [`crate::jit::VmRuntimeActivation`].
+    pub const STACK_REGISTERS: u8 = 1 << 1;
     /// Activation uses derived-constructor return and `this` binding
     /// semantics. The bit is representation-neutral: materialized entries and
     /// generated stack calls publish the same fact.
-    pub const DERIVED_CONSTRUCTOR: u8 = 1 << 3;
+    pub const DERIVED_CONSTRUCTOR: u8 = 1 << 2;
 
     /// Empty flag set.
     #[must_use]
@@ -134,8 +132,6 @@ impl NativeFrameFlags {
 pub struct VmFrameHeader {
     /// Global VM function id.
     pub function_id: u32,
-    /// Immutable code-block id.
-    pub code_block_id: u32,
     /// Canonical instruction-index resume PC.
     pub pc: u32,
     /// Number of initialized tagged register slots.
@@ -152,7 +148,6 @@ impl VmFrameHeader {
     pub const fn interpreter(function_id: u32, register_count: u16) -> Self {
         Self {
             function_id,
-            code_block_id: function_id,
             pc: 0,
             register_count,
             kind: NativeFrameKind::Interpreter,
@@ -168,7 +163,7 @@ impl VmFrameHeader {
 /// ownership. A [`crate::Frame`] exists only for interpreter execution or a
 /// cold native bailout that has explicitly transferred ownership.
 #[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct NativeFrame {
     /// Common tier-independent header.
     pub header: VmFrameHeader,
@@ -185,16 +180,19 @@ pub struct NativeFrame {
     pub self_value_bits: u64,
     /// Number of initialized handles at `upvalue_base`.
     pub upvalue_count: u32,
-    /// Interpreter activation index when `MATERIALIZED` is set; unused for
-    /// `STACK_REGISTERS`.
-    pub activation_id: u32,
+    /// Nullable compressed direct-eval environment handle.
+    ///
+    /// This is an ordinary traced frame slot and the sole owner while the
+    /// native activation is published. Materialization moves the handle into
+    /// the replacement [`crate::Frame`]; it never copies the root.
+    pub eval_env: EvalEnvHandle,
 }
 
 impl NativeFrame {
     /// Construct the common state of a live native JS call.
     ///
-    /// Upvalues and activation identity are published through the intent-level
-    /// setters below before execution.
+    /// Upvalues and register-window ownership are published through the
+    /// intent-level setters below before execution.
     #[must_use]
     pub const fn new(
         header: VmFrameHeader,
@@ -210,7 +208,7 @@ impl NativeFrame {
             new_target_bits: Value::UNDEFINED.to_abi_bits(),
             self_value_bits: self_value.to_abi_bits(),
             upvalue_count: 0,
-            activation_id: 0,
+            eval_env: EvalEnvHandle::null(),
         }
     }
 
@@ -256,14 +254,19 @@ impl NativeFrame {
         self.upvalue_count = count;
     }
 
-    /// Mark this frame as the compiled view of an existing interpreter
-    /// activation.
-    pub fn set_materialized_activation(&mut self, activation_id: u32) {
-        self.activation_id = activation_id;
-        self.header.flags = NativeFrameFlags::from_bits(
-            (self.header.flags.bits() | NativeFrameFlags::MATERIALIZED)
-                & !NativeFrameFlags::STACK_REGISTERS,
-        );
+    /// Direct-eval environment inherited by this activation, if any.
+    #[must_use]
+    pub const fn eval_env(&self) -> Option<EvalEnvHandle> {
+        if self.eval_env.is_null() {
+            None
+        } else {
+            Some(self.eval_env)
+        }
+    }
+
+    /// Publish one nullable direct-eval environment handle.
+    pub fn set_eval_env(&mut self, eval_env: Option<EvalEnvHandle>) {
+        self.eval_env = eval_env.unwrap_or_else(EvalEnvHandle::null);
     }
 
     /// Mark the register window as generated-code stack storage.
@@ -272,10 +275,8 @@ impl NativeFrame {
     /// interpreter continuation can allocate. Publication makes every tagged
     /// slot in the window a precise, rewriteable collector root.
     pub fn set_stack_registers(&mut self) {
-        self.activation_id = 0;
         self.header.flags = NativeFrameFlags::from_bits(
-            (self.header.flags.bits() | NativeFrameFlags::STACK_REGISTERS)
-                & !NativeFrameFlags::MATERIALIZED,
+            self.header.flags.bits() | NativeFrameFlags::STACK_REGISTERS,
         );
     }
 
@@ -297,7 +298,11 @@ impl NativeFrame {
     /// Switch this activation to interpreter dispatch without moving or
     /// copying its register/upvalue windows.
     pub fn enter_interpreter(&mut self) -> bool {
-        if !self.header.flags.contains(NativeFrameFlags::MATERIALIZED) {
+        if self
+            .header
+            .flags
+            .contains(NativeFrameFlags::STACK_REGISTERS)
+        {
             return false;
         }
         self.header.kind = NativeFrameKind::Interpreter;
@@ -316,21 +321,11 @@ impl NativeFrame {
         self.header.kind = kind;
         true
     }
-
-    /// Published interpreter activation index, when this frame entered native
-    /// execution from the interpreter.
-    #[must_use]
-    pub fn materialized_frame_index(&self) -> Option<u32> {
-        self.header
-            .flags
-            .contains(NativeFrameFlags::MATERIALIZED)
-            .then_some(self.activation_id)
-    }
 }
 
 const _: [(); 72] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
-const _: [(); 16] = [(); std::mem::size_of::<VmFrameHeader>()];
+const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 64] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
@@ -339,16 +334,16 @@ const _: [(); 40] = [(); std::mem::offset_of!(VmThread, gc_heap)];
 const _: [(); 48] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
 const _: [(); 56] = [(); std::mem::offset_of!(VmThread, global_lexical_epoch_cell)];
 const _: [(); 64] = [(); std::mem::offset_of!(VmThread, marking_flag_cell)];
-const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
-const _: [(); 12] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
-const _: [(); 15] = [(); std::mem::offset_of!(VmFrameHeader, flags)];
+const _: [(); 4] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
+const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
+const _: [(); 11] = [(); std::mem::offset_of!(VmFrameHeader, flags)];
 const _: [(); 16] = [(); std::mem::offset_of!(NativeFrame, register_base)];
 const _: [(); 24] = [(); std::mem::offset_of!(NativeFrame, upvalue_base)];
 const _: [(); 32] = [(); std::mem::offset_of!(NativeFrame, this_value_bits)];
 const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, new_target_bits)];
 const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, self_value_bits)];
 const _: [(); 56] = [(); std::mem::offset_of!(NativeFrame, upvalue_count)];
-const _: [(); 60] = [(); std::mem::offset_of!(NativeFrame, activation_id)];
+const _: [(); 60] = [(); std::mem::offset_of!(NativeFrame, eval_env)];
 
 #[cfg(test)]
 mod tests {
@@ -371,7 +366,6 @@ mod tests {
     fn interpreter_header_uses_common_layout() {
         let header = VmFrameHeader::interpreter(7, 23);
         assert_eq!(header.function_id, 7);
-        assert_eq!(header.code_block_id, 7);
         assert_eq!(header.pc, 0);
         assert_eq!(header.register_count, 23);
         assert_eq!(header.kind, NativeFrameKind::Interpreter);
@@ -379,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn native_frame_identity_distinguishes_stack_from_materialized() {
+    fn native_frame_identity_marks_stack_storage() {
         let mut frame = NativeFrame::new(
             VmFrameHeader::interpreter(7, 3),
             0x1000,
@@ -390,17 +384,8 @@ mod tests {
         assert_eq!(frame.this_value(), Value::number_i32(4));
         assert_eq!(frame.new_target(), Value::undefined());
         frame.set_stack_registers();
-        assert_eq!(frame.materialized_frame_index(), None);
         assert!(
             frame
-                .header
-                .flags
-                .contains(NativeFrameFlags::STACK_REGISTERS)
-        );
-        frame.set_materialized_activation(4);
-        assert_eq!(frame.materialized_frame_index(), Some(4));
-        assert!(
-            !frame
                 .header
                 .flags
                 .contains(NativeFrameFlags::STACK_REGISTERS)
@@ -414,7 +399,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 7,
-                code_block_id: 7,
                 pc: 11,
                 register_count: slots.len() as u16,
                 kind: NativeFrameKind::Baseline,
@@ -424,7 +408,6 @@ mod tests {
             Value::function(7),
             Value::undefined(),
         );
-        frame.set_materialized_activation(3);
         assert!(frame.enter_interpreter());
         assert_eq!(frame.header.kind, NativeFrameKind::Interpreter);
         assert_eq!(frame.register_base, base);
@@ -437,11 +420,12 @@ mod tests {
     }
 
     #[test]
-    fn native_frame_is_one_cache_line() {
+    fn native_frame_layout_includes_traced_eval_env_slot() {
+        assert_eq!(std::mem::size_of::<VmFrameHeader>(), 12);
         assert_eq!(std::mem::size_of::<NativeFrame>(), 64);
         assert_eq!(std::mem::offset_of!(NativeFrame, register_base), 16);
         assert_eq!(std::mem::offset_of!(NativeFrame, upvalue_base), 24);
         assert_eq!(std::mem::offset_of!(NativeFrame, self_value_bits), 48);
-        assert_eq!(std::mem::offset_of!(NativeFrame, activation_id), 60);
+        assert_eq!(std::mem::offset_of!(NativeFrame, eval_env), 60);
     }
 }

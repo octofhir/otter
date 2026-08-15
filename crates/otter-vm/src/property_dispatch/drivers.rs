@@ -356,33 +356,6 @@ impl Interpreter {
         }
     }
 
-    /// Drive one tick of [`Op::Instanceof`] through ECMA-262 §13.10.2
-    /// `InstanceofOperator(V, target)`. The previous foundation path
-    /// only walked `OrdinaryHasInstance`; this version honours
-    /// `target[@@hasInstance]` per spec.
-    ///
-    /// Returns `Ok(false)` only when the right-hand operand is one
-    /// of the legacy "raw prototype object as rhs" shapes the older
-    /// fixtures pass — those still fall through to the in-frame
-    /// fast path's prototype-walk fallback.
-    pub(crate) fn drive_instanceof(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, VmError> {
-        let dst = register_operand(operands.first())?;
-        let lhs_reg = register_operand(operands.get(1))?;
-        let rhs_reg = register_operand(operands.get(2))?;
-        let top_idx = stack.len() - 1;
-        let lhs = *read_register(&stack[top_idx], lhs_reg)?;
-        let rhs = *read_register(&stack[top_idx], rhs_reg)?;
-        let result = self.instanceof_operator(stack, context, &lhs, &rhs)?;
-        stack[top_idx].advance_pc()?;
-        write_register(&mut stack[top_idx], dst, Value::boolean(result))?;
-        Ok(true)
-    }
-
     /// Drive one tick of [`Op::LoadElement`] for computed ordinary
     /// object/proxy reads whose resolved descriptor is an accessor.
     pub(crate) fn drive_load_element(
@@ -1321,104 +1294,6 @@ impl Interpreter {
         }
     }
 
-    /// §7.3.10 HasProperty — ordinary objects may have Proxy
-    /// objects in their prototype chain, so the interpreter owns
-    /// the trap-aware walk instead of delegating to `object::lookup`.
-    pub(crate) fn drive_has_property_proxy(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, VmError> {
-        let dst = register_operand(operands.first())?;
-        let lhs_reg = register_operand(operands.get(1))?;
-        let rhs_reg = register_operand(operands.get(2))?;
-        let top_idx = stack.len() - 1;
-        let lhs = *read_register(&stack[top_idx], lhs_reg)?;
-        let rhs = *read_register(&stack[top_idx], rhs_reg)?;
-        if !(rhs.is_object() || rhs.is_proxy()) {
-            return Ok(false);
-        };
-        // §6.2.12 — private-name presence checks on a Proxy answer
-        // from its own [[PrivateElements]]; the has trap never fires.
-        if let (Some(p), Some(sym)) = (rhs.as_proxy(), lhs.as_symbol(&self.gc_heap))
-            && sym.is_private_name()
-        {
-            let present = self.proxy_private_find(&p, sym).is_some();
-            Self::finish_property_fast_path_value(
-                &mut stack[top_idx],
-                dst,
-                Value::boolean(present),
-            )?;
-            return Ok(true);
-        }
-        // The has-property IC is a pure fast-path optimization keyed by the
-        // interpreter's per-site pc. A compiled frame completing `in` through
-        // this driver has no such site, so an absent site simply skips the IC
-        // and falls through to the spec funnel below.
-        if let (Some(obj), Some(key_string), Some(site)) = (
-            rhs.as_object(),
-            lhs.as_string(&self.gc_heap),
-            context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc),
-        ) {
-            let mut site_disabled = self
-                .feedback_directory
-                .property_is_megamorphic(site, PropertyIcKind::Has)
-                .unwrap_or(true);
-            let entries_len = self
-                .feedback_directory
-                .property_entry_count(site, PropertyIcKind::Has)
-                .unwrap_or_default();
-            if self
-                .feedback_directory
-                .probe_has(site, obj, &self.gc_heap, key_string)
-            {
-                self.feedback_directory
-                    .record_property_hit(PropertyIcKind::Has);
-                Self::finish_property_fast_path_value(
-                    &mut stack[top_idx],
-                    dst,
-                    Value::boolean(true),
-                )?;
-                return Ok(true);
-            }
-            if entries_len > 0 {
-                site_disabled = self
-                    .feedback_directory
-                    .record_property_guard_miss(site, PropertyIcKind::Has)
-                    .unwrap_or(true);
-            } else {
-                self.feedback_directory
-                    .record_property_uncached_miss(site, PropertyIcKind::Has);
-            }
-            if !site_disabled
-                && let Some(ic) = cache_ir::CacheStub::install_has(obj, &self.gc_heap, key_string)
-            {
-                self.feedback_directory
-                    .install_property_stub(site, PropertyIcKind::Has, ic);
-                Self::finish_property_fast_path_value(
-                    &mut stack[top_idx],
-                    dst,
-                    Value::boolean(true),
-                )?;
-                return Ok(true);
-            }
-            self.feedback_directory
-                .disable_property(site, PropertyIcKind::Has);
-        }
-        let key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-            VmPropertyKey::Symbol(sym)
-        } else if let Some(s) = lhs.as_string(&self.gc_heap) {
-            VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-        } else {
-            VmPropertyKey::OwnedString(lhs.display_string(&self.gc_heap))
-        };
-        stack[top_idx].advance_pc()?;
-        let present = self.ordinary_has_property_value(stack, context, rhs, &key, 0)?;
-        write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
-        Ok(true)
-    }
-
     /// §28.2.4.10 Proxy.[[Delete]] — invoke the `deleteProperty`
     /// trap when the receiver of `delete obj.x` is a Proxy.
     pub(crate) fn drive_delete_property_proxy(
@@ -1481,63 +1356,6 @@ impl Interpreter {
             return Err(self.err_type(("Cannot delete property".to_string()).into()));
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
-        Ok(true)
-    }
-
-    /// §28.2.4.1 Proxy.[[GetPrototypeOf]] — invoke the
-    /// `getPrototypeOf` trap when the source is a Proxy.
-    pub(crate) fn drive_get_prototype_proxy(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, VmError> {
-        let dst = register_operand(operands.first())?;
-        let src = register_operand(operands.get(1))?;
-        let top_idx = stack.len() - 1;
-        let value = *read_register(&stack[top_idx], src)?;
-        if !value.is_proxy() {
-            return Ok(false);
-        };
-        stack[top_idx].advance_pc()?;
-        let result = self.ordinary_get_prototype_value(stack, context, value, 0)?;
-        write_register(&mut stack[top_idx], dst, result)?;
-        Ok(true)
-    }
-
-    /// §28.2.4.2 Proxy.[[SetPrototypeOf]] — invoke the
-    /// `setPrototypeOf` trap when the receiver is a Proxy.
-    pub(crate) fn drive_set_prototype_proxy(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, VmError> {
-        let obj_reg = register_operand(operands.first())?;
-        let proto_reg = register_operand(operands.get(1))?;
-        let top_idx = stack.len() - 1;
-        let recv = *read_register(&stack[top_idx], obj_reg)?;
-        if !recv.is_proxy() {
-            return Ok(false);
-        };
-        let proto_val = *read_register(&stack[top_idx], proto_reg)?;
-        let proto_obj = if proto_val.is_object() || proto_val.is_proxy() || proto_val.is_null() {
-            proto_val
-        } else if let Some(c) = proto_val.as_class_constructor() {
-            Value::object(c.statics(&self.gc_heap))
-        } else {
-            return Err(VmError::TypeMismatch);
-        };
-        stack[top_idx].advance_pc()?;
-        // §10.5.7 — dispatch through the value-level helper so
-        // nested proxies fall through correctly and §10.5.7 invariants
-        // apply on the trap result.
-        let ok = self.set_prototype_value_proxy_aware(stack, context, &recv, &proto_obj)?;
-        if !ok {
-            // Object.setPrototypeOf throws when [[SetPrototypeOf]]
-            // returns false (§20.1.2.21 step 4 DefinePropertyOrThrow).
-            return Err(self.err_type(("Object.setPrototypeOf failed".to_string()).into()));
-        }
         Ok(true)
     }
 }

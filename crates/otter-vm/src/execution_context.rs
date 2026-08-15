@@ -291,7 +291,10 @@ impl ExecutionContext {
     ///
     /// The returned DTO carries rewritten byte-PC branch deltas and dense
     /// property-IC site ids, matching the interpreter's executable view without
-    /// exposing mutable VM execution state.
+    /// exposing mutable VM execution state. It is safe to retain across nested
+    /// compilation and moving collection: all heap identities are pinned
+    /// offsets, permanent cells, or address-stable traced-cell addresses, never
+    /// an untraced moving `Value` or GC handle.
     #[must_use]
     pub fn jit_compile_snapshot(&self, function_id: u32) -> Option<crate::jit::JitCompileSnapshot> {
         let mut view = self.code_block_arc(function_id)?.jit_compile_snapshot();
@@ -1061,116 +1064,6 @@ mod tests {
         assert_eq!(stats.load_hits, 1);
         assert_eq!(stats.load_misses, 1);
         assert_eq!(stats.load_installs, 1);
-    }
-
-    #[test]
-    fn property_ic_stats_record_has_property_hit_after_warmup() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(
-                    1,
-                    Op::LoadString,
-                    [Operand::Register(7), Operand::ConstIndex(0)],
-                ),
-                instr(2, Op::LoadTrue, [Operand::Register(1)]),
-                instr(
-                    3,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(8),
-                    ],
-                ),
-                instr(
-                    4,
-                    Op::HasProperty,
-                    [
-                        Operand::Register(4),
-                        Operand::Register(7),
-                        Operand::Register(0),
-                    ],
-                ),
-                instr(5, Op::Return, [Operand::Register(4)]),
-            ],
-            vec![string_constant("foo")],
-            9,
-        ));
-        let mut interp = Interpreter::new();
-
-        assert_eq!(
-            interp.run(&context).expect("first run"),
-            Value::boolean(true)
-        );
-        assert_eq!(
-            interp.run(&context).expect("second run"),
-            Value::boolean(true)
-        );
-
-        let stats = interp.property_ic_stats();
-        assert_eq!(stats.has_hits, 1);
-        assert_eq!(stats.has_misses, 1);
-        assert_eq!(stats.has_installs, 1);
-    }
-
-    #[test]
-    fn property_ic_stats_record_direct_prototype_has_property_hit_after_warmup() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(
-                    1,
-                    Op::LoadString,
-                    [Operand::Register(7), Operand::ConstIndex(0)],
-                ),
-                instr(2, Op::LoadTrue, [Operand::Register(1)]),
-                instr(
-                    3,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(8),
-                    ],
-                ),
-                instr(4, Op::NewObject, [Operand::Register(3)]),
-                instr(
-                    5,
-                    Op::SetPrototype,
-                    [Operand::Register(3), Operand::Register(0)],
-                ),
-                instr(
-                    6,
-                    Op::HasProperty,
-                    [
-                        Operand::Register(4),
-                        Operand::Register(7),
-                        Operand::Register(3),
-                    ],
-                ),
-                instr(7, Op::Return, [Operand::Register(4)]),
-            ],
-            vec![string_constant("foo")],
-            9,
-        ));
-        let mut interp = Interpreter::new();
-
-        assert_eq!(
-            interp.run(&context).expect("first run"),
-            Value::boolean(true)
-        );
-        assert_eq!(
-            interp.run(&context).expect("second run"),
-            Value::boolean(true)
-        );
-
-        let stats = interp.property_ic_stats();
-        assert_eq!(stats.has_hits, 1);
-        assert_eq!(stats.has_misses, 1);
-        assert_eq!(stats.has_installs, 1);
     }
 
     #[test]

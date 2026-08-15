@@ -53,7 +53,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
     CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, VmFrameHeader,
-    abstract_ops, cold_frame::ColdFrameIdx, upvalue_source::UpvalueSource,
+    abstract_ops, cold_frame::ColdFrameIdx, eval_env::EvalEnvHandle, upvalue_source::UpvalueSource,
 };
 
 pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
@@ -104,6 +104,13 @@ impl OwnedRegisterSnapshot {
 pub struct Frame {
     /// Common interpreter/baseline machine-visible frame prefix.
     pub header: VmFrameHeader,
+    /// Nullable direct-eval environment owned by this materialized activation.
+    ///
+    /// The handle occupies the common header's existing tail padding, so the
+    /// register window retains its machine-observed offset. Ownership moves to
+    /// a published native frame only for that frame's generated-code dynamic
+    /// extent.
+    pub(crate) eval_env: EvalEnvHandle,
     /// Register window for this frame.
     pub registers: RegisterWindow,
     /// Captured upvalues for this call. Empty for non-closure
@@ -142,6 +149,7 @@ pub struct Frame {
 #[derive(Debug)]
 pub struct ParkedFrameState {
     pub header: VmFrameHeader,
+    eval_env: EvalEnvHandle,
     registers: OwnedRegisterSnapshot,
     pub upvalues: UpvalueSpine,
     pub self_value: Value,
@@ -150,6 +158,7 @@ pub struct ParkedFrameState {
 }
 
 const _: [(); 0] = [(); std::mem::offset_of!(Frame, header)];
+const _: [(); 12] = [(); std::mem::offset_of!(Frame, eval_env)];
 const _: [(); 16] = [(); std::mem::offset_of!(Frame, registers)];
 
 impl std::ops::Deref for Frame {
@@ -568,6 +577,7 @@ impl Frame {
         );
         Self {
             header: VmFrameHeader::interpreter(function.id, total as u16),
+            eval_env: EvalEnvHandle::null(),
             registers: window,
             return_register,
             upvalues,
@@ -596,6 +606,7 @@ impl Frame {
         );
         Self {
             header: VmFrameHeader::interpreter(function.id, function.register_count),
+            eval_env: EvalEnvHandle::null(),
             registers: window,
             return_register,
             upvalues,
@@ -617,6 +628,13 @@ impl Frame {
         }
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
+        if !self.eval_env.is_null() {
+            visitor(
+                std::ptr::from_ref(&self.eval_env)
+                    .cast_mut()
+                    .cast::<RawGc>(),
+            );
+        }
         // Cold-record GC slots (pending_to_primitive / pending_bind_function /
         // pending_iterator_next) are traced separately by the caller through
         // [`crate::cold_frame::ColdFrame::trace_cold_slots`] when
@@ -634,6 +652,7 @@ impl ParkedFrameState {
         (
             Self {
                 header: frame.header,
+                eval_env: frame.eval_env,
                 registers,
                 upvalues: frame.upvalues,
                 self_value: frame.self_value,
@@ -651,6 +670,7 @@ impl ParkedFrameState {
         window.copy_from_slice(&self.registers.0);
         let Self {
             header,
+            eval_env,
             registers: _,
             upvalues,
             self_value,
@@ -659,6 +679,7 @@ impl ParkedFrameState {
         } = self;
         Frame {
             header,
+            eval_env,
             registers: window,
             upvalues,
             self_value,
@@ -681,6 +702,13 @@ impl ParkedFrameState {
         }
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
+        if !self.eval_env.is_null() {
+            visitor(
+                std::ptr::from_ref(&self.eval_env)
+                    .cast_mut()
+                    .cast::<RawGc>(),
+            );
+        }
     }
 
     #[cfg(test)]

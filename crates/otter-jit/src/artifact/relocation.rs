@@ -115,7 +115,7 @@ pub(crate) enum RelocationTarget {
         function_id: u32,
         byte_pc: u32,
     },
-    /// Address-stable GC-traced cell for one materialized string literal.
+    /// Address-stable GC-traced cell for one eagerly prepared string literal.
     StringConstantCell {
         function_id: u32,
         byte_pc: u32,
@@ -165,12 +165,17 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::AllocValue3 => "allocValue3",
         RuntimeStubSignature::Poll1 => "poll1",
         RuntimeStubSignature::Variadic => "variadic",
+        RuntimeStubSignature::ContextWords => "contextWords",
         RuntimeStubSignature::MutatingLeafValue2 => "mutatingLeafValue2",
         RuntimeStubSignature::MutatingLeafValue3 => "mutatingLeafValue3",
         RuntimeStubSignature::ReentrantValue2 => "reentrantValue2",
         RuntimeStubSignature::ReentrantValue3 => "reentrantValue3",
         RuntimeStubSignature::ReentrantNamedLoad => "reentrantNamedLoad",
         RuntimeStubSignature::ReentrantNamedStore => "reentrantNamedStore",
+        RuntimeStubSignature::ReentrantValueSpan => "reentrantValueSpan",
+        RuntimeStubSignature::CommittedValue2 => "committedValue2",
+        RuntimeStubSignature::RouteThrow1 => "routeThrow1",
+        RuntimeStubSignature::AcknowledgeCaughtThrow0 => "acknowledgeCaughtThrow0",
     }
 }
 
@@ -1331,7 +1336,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
             RelocationTarget::RuntimeStub {
-                id: 19,
+                id: 18,
                 name: "jit_load_property_value",
                 signature: "reentrantNamedLoad",
             }
@@ -1339,9 +1344,17 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
             RelocationTarget::RuntimeStub {
-                id: 20,
+                id: 19,
                 name: "jit_store_property_value",
                 signature: "reentrantNamedStore",
+            }
+        );
+        assert_eq!(
+            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_METHOD_VALUE),
+            RelocationTarget::RuntimeStub {
+                id: 93,
+                name: "jit_call_method_value",
+                signature: "reentrantValueSpan",
             }
         );
     }

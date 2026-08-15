@@ -1,4 +1,4 @@
-// Tagged values cross the replacement scalar pipeline unchanged through entry,
+// Tagged values cross the Machine pipeline unchanged through entry,
 // branch phis, ordinary returns, and the native frame's `this` binding.
 
 function scalarIdentity(value) {

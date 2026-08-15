@@ -8,9 +8,11 @@
 //!   resolution through the same environment helpers.
 //!
 //! # Invariants
-//! - Every transition delegates to the same `run_*_reg` helper the interpreter
-//!   dispatches, so accessor globals fire identical getters/setters and both
-//!   tiers observe identical global-record state.
+//! - Every transition delegates to the interpreter's register helper or its
+//!   shared value-level kernel, so accessor globals fire identical
+//!   getters/setters and both tiers observe identical global-record state.
+//! - Dynamic-scope operations resolve the eval environment from the published
+//!   native frame; the parked materialized frame is not a second root owner.
 //! - Accessor getter/setter reentry runs through the shared ActivationStack/VmThread
 //!   path; a committed global effect is never replayed by an exact side exit.
 //!
@@ -20,7 +22,9 @@
 
 use otter_bytecode::Op;
 
-use crate::{ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack};
+use crate::{
+    ActiveFrameMut, ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack,
+};
 
 impl Interpreter {
     /// Complete one global-access opcode for a published compiled frame.
@@ -28,11 +32,12 @@ impl Interpreter {
     /// Operand words are decoded by the template lowering: `arg0`/`arg1`/`arg2`
     /// name the destination/value register, the constant name index, and the
     /// opcode-specific strictness flag or `exists` register.
-    pub fn jit_runtime_global_op(
+    pub(crate) fn jit_runtime_global_op(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         opcode: u8,
         arg0: u64,
         arg1: u64,
@@ -43,6 +48,7 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         let saved_pc = stack[frame_index].pc;
+        let saved_native_pc = frame.pc();
         match opcode {
             value if value == Op::LoadGlobalThis as u8 => {
                 self.run_load_global_this_reg(&mut stack[frame_index], arg0 as u16)?;
@@ -77,13 +83,31 @@ impl Interpreter {
                 )?;
             }
             value if value == Op::LoadDynamic as u8 => {
-                self.run_load_dynamic_reg(context, stack, frame_index, arg0 as u16, arg1 as u32)?;
+                let value = self.load_dynamic_value(
+                    context,
+                    stack,
+                    frame.function_id(),
+                    frame.eval_env(),
+                    arg1 as u32,
+                )?;
+                frame.write(arg0 as u16, value)?;
+                frame.advance_pc()?;
             }
             value if value == Op::StoreDynamic as u8 => {
-                self.run_store_dynamic_reg(context, stack, frame_index, arg0 as u16, arg1 as u32)?;
+                let value = frame.read(arg0 as u16)?;
+                self.store_dynamic_value(context, stack, frame.eval_env(), value, arg1 as u32)?;
+                frame.advance_pc()?;
             }
             value if value == Op::TypeofDynamic as u8 => {
-                self.run_typeof_dynamic_reg(context, stack, frame_index, arg0 as u16, arg1 as u32)?;
+                let value = self.typeof_dynamic_value(
+                    context,
+                    stack,
+                    frame.function_id(),
+                    frame.eval_env(),
+                    arg1 as u32,
+                )?;
+                frame.write(arg0 as u16, value)?;
+                frame.advance_pc()?;
             }
             value if value == Op::DeclareGlobalVar as u8 => {
                 self.run_declare_global_var_reg(
@@ -145,6 +169,7 @@ impl Interpreter {
             _ => return Err(VmError::InvalidOperand),
         }
         stack[frame_index].pc = saved_pc;
+        frame.set_pc(saved_native_pc);
         Ok(())
     }
 }

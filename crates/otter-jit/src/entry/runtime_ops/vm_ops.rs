@@ -2,23 +2,28 @@
 //!
 //! # Contents
 //! - Self-patching property IC cells and miss handlers.
+//! - Effect-once boxed-span method-call completion.
 //! - Element/global/upvalue/object runtime operations.
-//! - Write-barrier entries.
 //!
 //! # Invariants
 //! Register-index operands address the published JIT window. Computed element
 //! and named-property entries instead receive fixed boxed-value operands and
-//! return a status pair. Named operations derive their immutable property name
-//! and feedback site from the published function/logical-PC identity.
-//! Allocating or throwing operations keep precise roots live and park failures
-//! in the shared error slot.
+//! return a committed value/exception pair. Method calls copy their complete receiver/argument
+//! packet before reentry. Named operations derive their immutable property
+//! name and feedback site from the published function/logical-PC identity.
+//! Allocating or throwing operations keep precise roots live. Committed
+//! JavaScript throws travel in the pair payload; only structural failures use
+//! the shared error slot.
 //!
 //! # See also
 //! - `otter_vm::jit_runtime_ops` — safe VM-side implementations.
 
-use super::super::{JitCtx, JitRet, STATUS_RETURNED, STATUS_THREW};
-use super::park_jit_error;
-use otter_vm::{RuntimeStubResult, RuntimeStubResultPair, Value};
+use super::super::JitCtx;
+use super::{committed_vm_result, park_jit_error};
+use otter_vm::{
+    Value, VmError,
+    native_abi::{NativeResultPair, NativeResultStatus},
+};
 
 /// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
 /// always misses to the stub. Four matches the polymorphism most real sites
@@ -98,13 +103,14 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIc
 ///
 /// The native frame supplies function/logical-PC identity; the VM validates
 /// the opcode and derives its property name and feedback site. Success returns
-/// the loaded value and may patch `cell`. Failure parks the error and returns
-/// `Throw`; this boundary never requests replay or exact deoptimization.
+/// the loaded value and may patch `cell`. Failure returns either a pure
+/// JavaScript exception or a structural Fatal; this boundary never requests
+/// replay or exact deoptimization.
 pub(crate) extern "C" fn jit_load_property_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
     cell: *mut WhiskerIcCell,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = ctx
@@ -120,12 +126,9 @@ pub(crate) extern "C" fn jit_load_property_stub(
                     whisker_ic_fill(cell, way);
                 }
             }
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
+            NativeResultPair::success(value)
         }
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
-        }
+        Err(err) => committed_vm_result(ctx, Err(err)),
     }
 }
 
@@ -133,14 +136,14 @@ pub(crate) extern "C" fn jit_load_property_stub(
 /// operands.
 ///
 /// A successful return means the full store committed once and may patch
-/// `cell`; a setter/proxy exception is parked and returned as `Throw` without
-/// replay.
+/// `cell`; a setter/proxy exception is returned as a pure exception value
+/// without replay.
 pub(crate) extern "C" fn jit_store_property_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
     value_bits: u64,
     cell: *mut WhiskerIcCell,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     // SAFETY: as `jit_load_property_stub`.
     let ctx = unsafe { &mut *ctx };
     let result = ctx.runtime_call().and_then(|mut runtime| {
@@ -159,71 +162,70 @@ pub(crate) extern "C" fn jit_store_property_stub(
                     whisker_ic_fill(cell, way);
                 }
             }
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(
-                Value::undefined().to_bits(),
-            ))
+            NativeResultPair::success(Value::undefined())
         }
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
-        }
+        Err(err) => committed_vm_result(ctx, Err(err)),
     }
 }
 
-/// Runtime stub: run the GC write barrier for an inline `StoreProperty` whose
-/// stored value is a heap pointer. The emitted fast path skips this for
-/// primitive values (the common case); a pointer store calls here so an
-/// old→young edge marks the parent object's card. Always returns `0`.
-pub(crate) extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u64 {
+/// Complete the exact published `CallMethodValue` from boxed SSA values.
+///
+/// `packet[0]` is the receiver and the remaining `count - 1` values are every
+/// actual argument. The packet is copied before binding the VM runtime call so
+/// no pointer into generated stack storage survives allocation or JavaScript
+/// reentry. The published frame supplies exact function/PC identity, precise
+/// roots, and the immutable bytecode declaration of method name and argc.
+pub(crate) extern "C" fn jit_call_method_value_stub(
+    ctx: *mut JitCtx,
+    packet: *const Value,
+    count: u32,
+) -> NativeResultPair {
+    let copied = if count == 0
+        || packet.is_null()
+        || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
+    {
+        Err(VmError::InvalidOperand)
+    } else {
+        let count = count as usize;
+        // SAFETY: generated code passes one live, naturally aligned span of
+        // `count` initialized Value words. `u32 * size_of::<Value>()` fits the
+        // addressable-object bound on every supported 64-bit target. Copying
+        // ends the machine-memory borrow before any runtime operation begins.
+        let values = unsafe { std::slice::from_raw_parts(packet, count) };
+        Ok(smallvec::SmallVec::<[Value; 8]>::from_slice(values))
+    };
+
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let mut runtime = match ctx.runtime_call() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return 1;
-        }
-    };
-    let result = runtime.write_barrier(obj as u16, src as u16);
-    match result {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
+    let result = copied.and_then(|values| {
+        ctx.runtime_call()
+            .and_then(|mut runtime| runtime.call_method_values(values.as_slice()))
+    });
+    committed_vm_result(ctx, result)
 }
 
 /// Complete computed `[[Get]]` from fixed boxed-value operands.
 ///
 /// The active native frame supplies the exact function/PC feedback identity
-/// and precise roots. Success returns the loaded value. Failure parks the
-/// error and returns `Throw`; this entry never requests replay or deopt.
+/// and precise roots. Success returns the loaded value. Failure returns either
+/// a pure JavaScript exception or a structural Fatal; this entry never requests
+/// replay or deopt.
 pub(crate) extern "C" fn jit_load_element_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = ctx.runtime_call().and_then(|mut runtime| {
         runtime.load_element_value(Value::from_bits(receiver_bits), Value::from_bits(key_bits))
     });
-    match result {
-        Ok(value) => {
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
-        }
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
-        }
-    }
+    committed_vm_result(ctx, result)
 }
 
 /// Runtime stub: perform a `LoadGlobalOrThrow` from compiled code through
-/// the safe [`Interpreter::jit_runtime_load_global`]. Returns `0` on success,
-/// `1` when the read threw (unbound identifier / throwing accessor; error
-/// parked in `ctx`).
+/// the safe [`Interpreter::jit_runtime_load_global`]. Returns `Success` or
+/// parks an unbound-identifier/accessor error and returns `Throw`.
 pub(crate) extern "C" fn jit_load_global_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -236,23 +238,23 @@ pub(crate) extern "C" fn jit_load_global_stub(
         Ok(runtime) => runtime,
         Err(err) => {
             park_jit_error(ctx, err);
-            return 1;
+            return NativeResultStatus::Throw as u64;
         }
     };
     let result = runtime.load_global(function_id as u32, dst as u16, name_idx as u32);
     match result {
-        Ok(()) => 0,
+        Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            NativeResultStatus::Throw as u64
         }
     }
 }
 
 /// Runtime stub: perform a `LoadUpvalue` (captured-binding read) from compiled
 /// code, delegating to [`Interpreter::jit_runtime_load_upvalue`]. `idx` carries
-/// the bytecode's signed upvalue index. Returns `0` on success, `1` on throw
-/// (TDZ `ReferenceError`, error parked in `ctx`).
+/// the bytecode's signed upvalue index. A TDZ `ReferenceError` is parked and
+/// reported as `Throw`.
 pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -260,15 +262,15 @@ pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: 
         Ok(runtime) => runtime,
         Err(err) => {
             park_jit_error(ctx, err);
-            return 1;
+            return NativeResultStatus::Throw as u64;
         }
     };
     let result = runtime.load_upvalue(dst as u16, idx as u32 as i32);
     match result {
-        Ok(()) => 0,
+        Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            NativeResultStatus::Throw as u64
         }
     }
 }
@@ -277,33 +279,18 @@ pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: 
 pub(crate) extern "C" fn jit_load_upvalue_value_stub(
     ctx: *mut JitCtx,
     idx: u64,
-    _reserved0: u64,
-    _reserved1: u64,
-    _reserved2: u64,
-) -> JitRet {
+) -> NativeResultPair {
     // SAFETY: the live `JitCtx` entry contract.
     let ctx = unsafe { &mut *ctx };
-    match ctx
+    let result = ctx
         .runtime_call()
-        .and_then(|call| call.load_upvalue_value(idx as u32 as i32))
-    {
-        Ok(value) => JitRet {
-            value: value.to_bits(),
-            status: STATUS_RETURNED,
-        },
-        Err(error) => {
-            park_jit_error(ctx, error);
-            JitRet {
-                value: 0,
-                status: STATUS_THREW,
-            }
-        }
-    }
+        .and_then(|call| call.load_upvalue_value(idx as u32 as i32));
+    committed_vm_result(ctx, result)
 }
 
 /// Runtime stub: perform a `StoreUpvalue` (captured-binding write) from compiled
-/// code, delegating to [`Interpreter::jit_runtime_store_upvalue`]. Returns `0`
-/// on success, `1` on throw (error parked in `ctx`).
+/// code, delegating to [`Interpreter::jit_runtime_store_upvalue`]. Returns
+/// `Success` or parks the error and returns `Throw`.
 pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -311,15 +298,15 @@ pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx:
         Ok(runtime) => runtime,
         Err(err) => {
             park_jit_error(ctx, err);
-            return 1;
+            return NativeResultStatus::Throw as u64;
         }
     };
     let result = runtime.store_upvalue(src as u16, idx as u32 as i32);
     match result {
-        Ok(()) => 0,
+        Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            NativeResultStatus::Throw as u64
         }
     }
 }
@@ -334,21 +321,21 @@ pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 
         Ok(runtime) => runtime,
         Err(err) => {
             park_jit_error(ctx, err);
-            return 1;
+            return NativeResultStatus::Throw as u64;
         }
     };
     let result = runtime.new_object(dst as u16);
     match result {
-        Ok(()) => 0,
+        Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            NativeResultStatus::Throw as u64
         }
     }
 }
 
 /// Materialize a regex literal (`Op::LoadRegExp`) into the frame's
-/// destination register. Allocating; a bad pattern reports status 1.
+/// destination register. Allocating; a bad pattern reports `Throw`.
 pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -356,29 +343,30 @@ pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u
         Ok(runtime) => runtime,
         Err(err) => {
             park_jit_error(ctx, err);
-            return 1;
+            return NativeResultStatus::Throw as u64;
         }
     };
     let result = runtime.load_regexp(dst as u16, idx as u32);
     match result {
-        Ok(()) => 0,
+        Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
-            1
+            NativeResultStatus::Throw as u64
         }
     }
 }
 
 /// Complete computed `[[Set]]` from fixed boxed-value operands.
 ///
-/// Success returns `undefined`. Failure parks the error and returns `Throw`;
-/// the committed operation is never replayed or converted into a deopt miss.
+/// Success returns `undefined`. Failure returns either a pure JavaScript
+/// exception or a structural Fatal; the committed operation is never replayed
+/// or converted into a deopt miss.
 pub(crate) extern "C" fn jit_store_element_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
     key_bits: u64,
     value_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = ctx.runtime_call().and_then(|mut runtime| {
@@ -388,44 +376,35 @@ pub(crate) extern "C" fn jit_store_element_stub(
             Value::from_bits(value_bits),
         )
     });
-    match result {
-        Ok(()) => RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(
-            Value::undefined().to_bits(),
-        )),
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult::thrown())
-        }
-    }
+    committed_vm_result(ctx, result.map(|()| Value::undefined()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use otter_vm::{
-        RuntimeStubStatus, VmError,
-        native_abi::{NativeFrame, NativeFrameKind, VmFrameHeader, VmThread},
+        VmError,
+        native_abi::{
+            NativeFrame, NativeFrameKind, NativeResultDomain, NativeResultStatus, VmFrameHeader,
+            VmThread,
+        },
     };
 
     #[test]
-    fn named_property_entries_use_fixed_pair_abi_and_park_boundary_errors() {
-        let _load_abi: extern "C" fn(
-            *mut JitCtx,
-            u64,
-            *mut WhiskerIcCell,
-        ) -> RuntimeStubResultPair = jit_load_property_stub;
+    fn named_property_entries_use_fixed_committed_pair_abi() {
+        let _load_abi: extern "C" fn(*mut JitCtx, u64, *mut WhiskerIcCell) -> NativeResultPair =
+            jit_load_property_stub;
         let _store_abi: extern "C" fn(
             *mut JitCtx,
             u64,
             u64,
             *mut WhiskerIcCell,
-        ) -> RuntimeStubResultPair = jit_store_property_stub;
+        ) -> NativeResultPair = jit_store_property_stub;
 
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 0,
                 register_count: 1,
                 kind: NativeFrameKind::Optimizing,
@@ -456,7 +435,10 @@ mod tests {
         let mut cell = WhiskerIcCell::default();
 
         let loaded = jit_load_property_stub(&mut ctx, Value::undefined().to_bits(), &mut cell);
-        assert_eq!(loaded.status(), RuntimeStubStatus::Throw);
+        assert_eq!(
+            loaded.validate(NativeResultDomain::Committed),
+            Some(NativeResultStatus::Fatal)
+        );
         assert!(matches!(error, Some(VmError::InvalidOperand)));
 
         error = None;
@@ -466,7 +448,64 @@ mod tests {
             Value::number_i32(33).to_bits(),
             &mut cell,
         );
-        assert_eq!(stored.status(), RuntimeStubStatus::Throw);
+        assert_eq!(
+            stored.validate(NativeResultDomain::Committed),
+            Some(NativeResultStatus::Fatal)
+        );
+        assert!(matches!(error, Some(VmError::InvalidOperand)));
+    }
+
+    #[test]
+    fn method_call_entry_uses_owned_value_span_pair_abi() {
+        let _method_abi: extern "C" fn(*mut JitCtx, *const Value, u32) -> NativeResultPair =
+            jit_call_method_value_stub;
+
+        let mut registers = [Value::undefined()];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                pc: 0,
+                register_count: 1,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        let mut thread = VmThread::empty();
+        thread.current_frame = std::ptr::addr_of_mut!(frame) as u64;
+        let mut error = None;
+        let mut ctx = JitCtx {
+            thread: std::ptr::addr_of_mut!(thread),
+            native_frame: std::ptr::addr_of_mut!(frame),
+            error: std::ptr::addr_of_mut!(error),
+            activation_base: std::ptr::null_mut(),
+            activation_top_ptr: std::ptr::null_mut(),
+            activation_limit: 0,
+            global_this_offset: std::ptr::null(),
+            native_stack_limit: 0,
+            generated_feedback_clean: 1,
+            machine_roots_ptr: std::ptr::null_mut(),
+            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            runtime_stats: std::ptr::null_mut(),
+        };
+        let packet = [Value::number_i32(7), Value::number_i32(11)];
+
+        let result = jit_call_method_value_stub(&mut ctx, packet.as_ptr(), packet.len() as u32);
+        assert_eq!(
+            result.validate(NativeResultDomain::Committed),
+            Some(NativeResultStatus::Fatal)
+        );
+        assert!(matches!(error, Some(VmError::InvalidOperand)));
+
+        error = None;
+        let result = jit_call_method_value_stub(&mut ctx, std::ptr::null(), 0);
+        assert_eq!(
+            result.validate(NativeResultDomain::Committed),
+            Some(NativeResultStatus::Fatal)
+        );
         assert!(matches!(error, Some(VmError::InvalidOperand)));
     }
 

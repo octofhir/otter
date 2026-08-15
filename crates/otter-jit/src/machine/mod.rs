@@ -13,8 +13,8 @@
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
 //! - [`MachineOpcode`] — scalar operations, guarded element accesses, control
 //!   flow, and descriptor-backed calls.
-//! - [`CallDescriptor`], [`DirectCallCandidate`], and [`DirectCallKind`] —
-//!   complete semantic target chains, guards, ABI, effects, and
+//! - [`CallDescriptor`], [`CallTarget`], [`DirectCallCandidate`], and
+//!   [`DirectCallKind`] — complete semantic targets, guards, ABI, effects, and
 //!   normal/exceptional exits.
 //! - [`TargetRegisterFile`] — complete allocatable target register inventory.
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
@@ -28,10 +28,20 @@
 //!   branch or return instruction.
 //! - Metadata values are ordinary late uses. Calls therefore cannot leave a
 //!   live GC/deopt value in a clobbered register.
+//! - Every tagged SSA value live across a GC safepoint appears exactly once as
+//!   `TaggedRoot`. Compiler selection derives missing roots from the completed
+//!   Machine CFG before allocation, then verification proves the same liveness
+//!   independently of deoptimization metadata or the lowering path that
+//!   selected the call.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
 //!   and constructor targets remain monomorphic. A cold call exit owns no
 //!   inputs, effects, clobbers, roots, or safepoint and must carry an exact
 //!   pre-call deoptimization state.
+//! - Committed runtime calls own zero to two true tagged inputs, one tagged
+//!   completion value, a GC safepoint, and an explicit throw edge. Their typed
+//!   ABI cannot report a guard miss or request deoptimization/replay. Trailing
+//!   `TaggedRoot` metadata contains every true input plus the complete live
+//!   tagged state and may therefore be a strict superset of semantic operands.
 //! - Root and deopt maps are built from the same per-operand allocation table
 //!   consumed by the emitter; there is no pre-allocation location fallback.
 //! - OSR sources are immutable entry metadata aligned with ordinary late-use
@@ -46,7 +56,7 @@
 //!   no synthetic constant register budget.
 //!
 //! # See also
-//! - [`crate::optimizing`] — current semantic lowering being replaced.
+//! - [`crate::optimizing`] — the production Machine compilation entry.
 
 mod deopt;
 mod frame;
@@ -491,9 +501,25 @@ pub enum DirectCallArgumentMode {
 pub enum CallTarget {
     /// VM-owned runtime entry with one statically declared ABI.
     RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
+    /// Effect-once JavaScript semantic completion through the fixed boxed-value
+    /// ABI. The physical entry always receives two values; operands beyond the
+    /// semantic arity are canonical `undefined` and are not Machine inputs.
+    /// Trailing `TaggedRoot` operands independently publish the complete live
+    /// moving state, including unrelated values at a zero-arity operation.
+    CommittedRuntime {
+        /// Typed VM-owned completion entry.
+        target: otter_vm::native_abi::RuntimeStubDescriptor,
+        /// Canonical source instruction index published before reentry.
+        logical_pc: u32,
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Number of true boxed-value operands, in the range zero through two.
+        semantic_arity: u8,
+    },
     /// VM-planned JavaScript callee chain entered through generated stack-owned
     /// linkage. Plain and constructor calls remain monomorphic; guarded methods
-    /// may carry one complete dense bounded chain.
+    /// may carry one complete dense bounded chain. A zero-candidate method is
+    /// an attempted site whose canonical runtime miss owns lookup and call.
     Direct {
         /// Plain or receiver-bound method entry through the shared linkage.
         kind: DirectCallKind,
@@ -539,6 +565,14 @@ pub struct CallDescriptor {
     pub exceptional: ExceptionalEdge,
     /// GC interaction.
     pub safepoint: SafepointKind,
+}
+
+fn is_caught_throw_acknowledgement_target(descriptor: &CallDescriptor) -> bool {
+    matches!(
+        descriptor.target,
+        CallTarget::RuntimeStub(target)
+            if target.id == otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW.id
+    )
 }
 
 /// Target-neutral name of a selected machine operation.
@@ -674,6 +708,14 @@ pub enum MachineOpcode {
         /// Source bytecode offset used by artifacts and exact deoptimization.
         byte_pc: u32,
     },
+    /// Read one eagerly prepared primitive string from its address-stable,
+    /// GC-traced constant cell. The relocation contains no moving handle.
+    StringConstantCellLoad {
+        /// Source bytecode offset used by artifacts.
+        byte_pc: u32,
+        /// Stable traced-cell target copied from the compile snapshot.
+        target: otter_vm::jit::JitStringConstantCell,
+    },
     /// Read one VM-baked permanent global-declarative cell, deoptimizing at
     /// the source operation if the live value is still in TDZ.
     GlobalLexicalLoad {
@@ -690,10 +732,14 @@ pub enum MachineOpcode {
         /// Complete epoch, shape, dictionary, and slot guard program.
         target: otter_vm::jit::JitGlobalObjectLoad,
     },
-    /// Guard and load one VM-baked indexed element, deoptimizing on any miss.
+    /// Guard and load one VM-baked indexed element. Every guard, bounds, or
+    /// hole miss boxes a scalar index only on the cold sibling and completes
+    /// once through the canonical reentrant element boundary; the source
+    /// operation is never exact-deopted and replayed.
     ElementLoad(u32),
-    /// Guard and store one VM-baked indexed element, deoptimizing before the
-    /// first effect on any miss.
+    /// Guard and store one VM-baked indexed element. Every miss branches before
+    /// the first effect to the canonical committed store boundary; a scalar
+    /// index boxes only after that branch.
     ElementStore(u32),
     /// Guard and directly load one ordinary Array PackedDouble element.
     PackedDoubleElementLoad {
@@ -862,6 +908,10 @@ pub enum VerificationError {
     InvalidMetadataOperand(MachineInstructionId, MachineValue),
     /// Root metadata does not match the value representation.
     InvalidRootRepresentation(MachineInstructionId, MachineValue),
+    /// A tagged SSA value live across a GC safepoint is not rooted there.
+    MissingLiveTaggedRoot(MachineInstructionId, MachineValue),
+    /// One tagged value appears more than once in a safepoint root set.
+    DuplicateTaggedRoot(MachineInstructionId, MachineValue),
     /// Safepoint metadata appears without a safepoint identity.
     RootWithoutSafepoint(MachineInstructionId),
     /// Deopt metadata appears without a deopt identity.
@@ -880,6 +930,12 @@ pub enum VerificationError {
     CallSafepointMismatch(MachineInstructionId),
     /// A call's exceptional target does not exist or is not a CFG successor.
     InvalidExceptionalEdge(MachineInstructionId, MachineBlock),
+    /// A local exception edge does not enter a dedicated acknowledgement
+    /// block exactly once before reaching its catch body.
+    InvalidCaughtThrowLanding(MachineBlock),
+    /// The caught-throw acknowledgement leaf appears outside its dedicated
+    /// local-exception edge block or violates its no-result/no-throw contract.
+    InvalidCaughtThrowAcknowledgement(MachineInstructionId),
     /// Physical clobber is repeated on one instruction.
     DuplicateClobber(MachineInstructionId, PhysicalRegister),
 }
@@ -929,6 +985,35 @@ impl InstructionSequence {
             packed_double_view_cache_count,
         };
         sequence.verify()?;
+        Ok(sequence)
+    }
+
+    /// Finalize one compiler-selected sequence from its complete CFG.
+    ///
+    /// Individual instruction selection cannot know which tagged values remain
+    /// live through a later call or around a loop backedge. The complete CFG is
+    /// therefore the sole authority for adding missing late root uses. Public
+    /// construction still requires callers to provide exact root metadata and
+    /// is verified without repair.
+    pub(super) fn new_selected_with_packed_double_view_caches(
+        entry: MachineBlock,
+        representations: Vec<MachineRepresentation>,
+        call_descriptors: Vec<CallDescriptor>,
+        blocks: Vec<MachineBlockData>,
+        instructions: Vec<MachineInstruction>,
+        packed_double_view_cache_count: u8,
+    ) -> Result<Self, VerificationError> {
+        let mut sequence = Self {
+            entry,
+            representations,
+            call_descriptors,
+            blocks,
+            instructions,
+            packed_double_view_cache_count,
+        };
+        sequence.verify_structure()?;
+        sequence.complete_gc_root_liveness();
+        sequence.verify_gc_root_liveness()?;
         Ok(sequence)
     }
 
@@ -1062,7 +1147,209 @@ impl InstructionSequence {
         value
     }
 
-    pub(super) fn verify(&self) -> Result<(), VerificationError> {
+    fn exceptional_target(&self, instruction: &MachineInstruction) -> Option<MachineBlock> {
+        let MachineOpcode::Call(descriptor_index) = instruction.opcode else {
+            return None;
+        };
+        match self
+            .call_descriptors
+            .get(descriptor_index as usize)?
+            .exceptional
+        {
+            ExceptionalEdge::LandingPad(target) => Some(target),
+            ExceptionalEdge::None | ExceptionalEdge::Propagate => None,
+        }
+    }
+
+    fn live_values_on_edge(
+        &self,
+        predecessor: usize,
+        successor_index: usize,
+        block_live_in: &[Vec<bool>],
+    ) -> Vec<bool> {
+        let block = &self.blocks[predecessor];
+        let successor = block.successors[successor_index];
+        let successor_block = &self.blocks[successor.0 as usize];
+        let mut live = block_live_in[successor.0 as usize].clone();
+        for (&parameter, &argument) in successor_block
+            .parameters
+            .iter()
+            .zip(&block.successor_arguments[successor_index])
+        {
+            let parameter_is_live = live[parameter.0 as usize];
+            live[parameter.0 as usize] = false;
+            if parameter_is_live {
+                live[argument.0 as usize] = true;
+            }
+        }
+        live
+    }
+
+    fn normal_live_out(&self, block_index: usize, block_live_in: &[Vec<bool>]) -> Vec<bool> {
+        let block = &self.blocks[block_index];
+        let exceptional_targets = (block.first.0..block.end.0)
+            .filter_map(|instruction_index| {
+                self.exceptional_target(&self.instructions[instruction_index as usize])
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut live = vec![false; self.representations.len()];
+        for (successor_index, successor) in block.successors.iter().enumerate() {
+            if exceptional_targets.contains(successor) {
+                continue;
+            }
+            for (destination, source) in live.iter_mut().zip(self.live_values_on_edge(
+                block_index,
+                successor_index,
+                block_live_in,
+            )) {
+                *destination |= source;
+            }
+        }
+        live
+    }
+
+    fn live_before_instruction(
+        &self,
+        block_index: usize,
+        instruction: &MachineInstruction,
+        block_live_in: &[Vec<bool>],
+        mut live: Vec<bool>,
+    ) -> Vec<bool> {
+        if let Some(target) = self.exceptional_target(instruction) {
+            let successor_index = self.blocks[block_index]
+                .successors
+                .iter()
+                .position(|successor| *successor == target)
+                .expect("verified exceptional edge must name a stored successor");
+            for (destination, source) in live.iter_mut().zip(self.live_values_on_edge(
+                block_index,
+                successor_index,
+                block_live_in,
+            )) {
+                *destination |= source;
+            }
+        }
+        for operand in &instruction.operands {
+            if operand.role == OperandRole::Definition && operand.purpose == OperandPurpose::Output
+            {
+                live[operand.value.0 as usize] = false;
+            }
+        }
+        for operand in &instruction.operands {
+            if operand.role == OperandRole::Use
+                && matches!(
+                    operand.purpose,
+                    OperandPurpose::Input | OperandPurpose::Deopt
+                )
+            {
+                live[operand.value.0 as usize] = true;
+            }
+        }
+        live
+    }
+
+    fn live_tagged_values_at_gc_safepoints(
+        &self,
+    ) -> Vec<(MachineInstructionId, Vec<MachineValue>)> {
+        if self
+            .instructions
+            .iter()
+            .all(|instruction| instruction.safepoint.is_none())
+        {
+            return Vec::new();
+        }
+        let mut block_live_in = vec![vec![false; self.representations.len()]; self.blocks.len()];
+        loop {
+            let mut changed = false;
+            for block_index in (0..self.blocks.len()).rev() {
+                let block = &self.blocks[block_index];
+                let mut live = self.normal_live_out(block_index, &block_live_in);
+                for instruction_index in (block.first.0..block.end.0).rev() {
+                    live = self.live_before_instruction(
+                        block_index,
+                        &self.instructions[instruction_index as usize],
+                        &block_live_in,
+                        live,
+                    );
+                }
+                if live != block_live_in[block_index] {
+                    block_live_in[block_index] = live;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut safepoints = Vec::new();
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let mut live = self.normal_live_out(block_index, &block_live_in);
+            for instruction_index in (block.first.0..block.end.0).rev() {
+                let id = MachineInstructionId(instruction_index);
+                let instruction = &self.instructions[instruction_index as usize];
+                live = self.live_before_instruction(block_index, instruction, &block_live_in, live);
+                if instruction.safepoint.is_none() {
+                    continue;
+                }
+                let live_tagged = self
+                    .representations
+                    .iter()
+                    .zip(&live)
+                    .enumerate()
+                    .filter_map(|(value, (&representation, &is_live))| {
+                        (representation == MachineRepresentation::Tagged && is_live)
+                            .then_some(MachineValue(value as u32))
+                    })
+                    .collect();
+                safepoints.push((id, live_tagged));
+            }
+        }
+        safepoints
+    }
+
+    fn complete_gc_root_liveness(&mut self) {
+        for (id, live_tagged) in self.live_tagged_values_at_gc_safepoints() {
+            let instruction = &mut self.instructions[id.0 as usize];
+            let mut roots = instruction
+                .operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                .map(|operand| operand.value)
+                .collect::<std::collections::BTreeSet<_>>();
+            for value in live_tagged {
+                if roots.insert(value) {
+                    instruction
+                        .operands
+                        .push(MachineOperand::tagged_root(value));
+                }
+            }
+        }
+    }
+
+    fn verify_gc_root_liveness(&self) -> Result<(), VerificationError> {
+        for (id, live_tagged) in self.live_tagged_values_at_gc_safepoints() {
+            let instruction = &self.instructions[id.0 as usize];
+            let mut roots = std::collections::BTreeSet::new();
+            for root in instruction
+                .operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+            {
+                if !roots.insert(root.value) {
+                    return Err(VerificationError::DuplicateTaggedRoot(id, root.value));
+                }
+            }
+            for value in live_tagged {
+                if !roots.contains(&value) {
+                    return Err(VerificationError::MissingLiveTaggedRoot(id, value));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_structure(&self) -> Result<(), VerificationError> {
         if usize::from(self.packed_double_view_cache_count) > MAX_PACKED_DOUBLE_VIEW_CACHES {
             return Err(VerificationError::TooManyPackedDoubleViewCaches(
                 self.packed_double_view_cache_count,
@@ -1083,6 +1370,30 @@ impl InstructionSequence {
                 predecessors.push(MachineBlock(predecessor as u32));
             }
         }
+        let mut landing_pad_uses = vec![Vec::new(); self.blocks.len()];
+        for (source_index, block) in self.blocks.iter().enumerate() {
+            if block.first.0 >= block.end.0 || block.end.0 as usize > self.instructions.len() {
+                continue;
+            }
+            for instruction_index in block.first.0..block.end.0 {
+                let instruction = &self.instructions[instruction_index as usize];
+                let MachineOpcode::Call(descriptor_index) = instruction.opcode else {
+                    continue;
+                };
+                let Some(descriptor) = self.call_descriptors.get(descriptor_index as usize) else {
+                    continue;
+                };
+                let ExceptionalEdge::LandingPad(target) = descriptor.exceptional else {
+                    continue;
+                };
+                if let Some(uses) = landing_pad_uses.get_mut(target.0 as usize) {
+                    uses.push((
+                        MachineInstructionId(instruction_index),
+                        MachineBlock(source_index as u32),
+                    ));
+                }
+            }
+        }
         for (block_index, block) in self.blocks.iter().enumerate() {
             let block_id = MachineBlock(block_index as u32);
             if block.predecessors != expected_predecessors[block_index] {
@@ -1093,6 +1404,31 @@ impl InstructionSequence {
             }
             if block.first.0 >= block.end.0 || block.end.0 as usize > self.instructions.len() {
                 return Err(VerificationError::InvalidBlockRange(block_id));
+            }
+            let acknowledgements = (block.first.0..block.end.0)
+                .filter_map(|instruction_index| {
+                    let instruction = &self.instructions[instruction_index as usize];
+                    let MachineOpcode::Call(descriptor_index) = instruction.opcode else {
+                        return None;
+                    };
+                    self.call_descriptors
+                        .get(descriptor_index as usize)
+                        .is_some_and(is_caught_throw_acknowledgement_target)
+                        .then_some(MachineInstructionId(instruction_index))
+                })
+                .collect::<Vec<_>>();
+            if let Some(&(_, source)) = landing_pad_uses[block_index].first() {
+                if landing_pad_uses[block_index].len() != 1
+                    || acknowledgements.as_slice() != [MachineInstructionId(block.first.0)]
+                    || block.predecessors.as_slice() != [source]
+                    || block.successors.len() != 1
+                {
+                    return Err(VerificationError::InvalidCaughtThrowLanding(block_id));
+                }
+            } else if let Some(&acknowledgement) = acknowledgements.first() {
+                return Err(VerificationError::InvalidCaughtThrowAcknowledgement(
+                    acknowledgement,
+                ));
             }
             expected_first = block.end.0;
             for &other in block.predecessors.iter().chain(&block.successors) {
@@ -1199,6 +1535,25 @@ impl InstructionSequence {
                         return Err(VerificationError::InvalidValue(operand.value));
                     }
                 }
+                if let MachineOpcode::StringConstantCellLoad { target, .. } = instruction.opcode {
+                    let [output] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let output_is_tagged_register = *output
+                        == MachineOperand::register_output(output.value)
+                        && self.representations[output.value.0 as usize]
+                            == MachineRepresentation::Tagged;
+                    if !output_is_tagged_register
+                        || target.cell_addr == 0
+                        || target.cell_addr % std::mem::align_of::<otter_vm::Value>() != 0
+                        || instruction.clobbers
+                            != [PhysicalRegister::integer(9), PhysicalRegister::integer(13)]
+                        || instruction.deopt.is_some()
+                        || instruction.safepoint.is_some()
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
                 if matches!(
                     instruction.opcode,
                     MachineOpcode::GlobalLexicalLoad { .. }
@@ -1268,6 +1623,102 @@ impl InstructionSequence {
                         || instruction.deopt.is_none()
                         || instruction.safepoint.is_some()
                         || instruction.clobbers != [PhysicalRegister::integer(16)]
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::ElementLoad(..) | MachineOpcode::ElementStore(..)
+                ) {
+                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(3)
+                    else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let receiver = ordinary[0];
+                    let fast_index = ordinary[1];
+                    let payload = ordinary[2];
+                    let receiver_is_tagged_location = receiver
+                        == MachineOperand::location_input(receiver.value)
+                        && self.representations[receiver.value.0 as usize]
+                            == MachineRepresentation::Tagged;
+                    let fast_index_representation =
+                        self.representations[fast_index.value.0 as usize];
+                    let fast_index_is_location = fast_index
+                        == MachineOperand::location_input(fast_index.value)
+                        && matches!(
+                            fast_index_representation,
+                            MachineRepresentation::Tagged
+                                | MachineRepresentation::Int32
+                                | MachineRepresentation::Uint32
+                        );
+                    let payload_signature = match instruction.opcode {
+                        MachineOpcode::ElementLoad(..) => {
+                            payload == MachineOperand::register_output(payload.value)
+                                && self.representations[payload.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                        }
+                        MachineOpcode::ElementStore(..) => {
+                            payload == MachineOperand::location_input(payload.value)
+                                && self.representations[payload.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                        }
+                        _ => false,
+                    };
+                    let metadata_shape = metadata.iter().all(|operand| {
+                        *operand == MachineOperand::tagged_root(operand.value)
+                            || *operand == MachineOperand::deopt(operand.value)
+                    });
+                    let root_values = metadata
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                        .map(|operand| operand.value)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let root_count = metadata
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                        .count();
+                    let roots_are_tagged = metadata
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                        .all(|operand| {
+                            self.representations[operand.value.0 as usize]
+                                == MachineRepresentation::Tagged
+                        });
+                    let mut deopt_values = std::collections::BTreeSet::new();
+                    let deopts_are_unique = metadata
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::Deopt)
+                        .all(|operand| deopt_values.insert(operand.value));
+                    let deopt_tagged_values_are_rooted = metadata
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::Deopt)
+                        .filter(|operand| {
+                            self.representations[operand.value.0 as usize]
+                                == MachineRepresentation::Tagged
+                        })
+                        .all(|operand| root_values.contains(&operand.value));
+                    let required_roots = root_values.contains(&receiver.value)
+                        && (fast_index_representation != MachineRepresentation::Tagged
+                            || root_values.contains(&fast_index.value))
+                        && (!matches!(instruction.opcode, MachineOpcode::ElementStore(..))
+                            || root_values.contains(&payload.value));
+                    if !receiver_is_tagged_location
+                        || !fast_index_is_location
+                        || !payload_signature
+                        || !metadata_shape
+                        || root_count != root_values.len()
+                        || !roots_are_tagged
+                        || !deopts_are_unique
+                        || !deopt_tagged_values_are_rooted
+                        || !required_roots
+                        || instruction.clobbers
+                            != std::iter::once(PhysicalRegister::integer(9))
+                                .chain((11..=16).map(PhysicalRegister::integer))
+                                .collect::<Vec<_>>()
+                        || instruction.deopt.is_none()
+                        || instruction.safepoint.is_none()
+                        || instruction.control != ControlFlow::None
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
@@ -1465,14 +1916,79 @@ impl InstructionSequence {
                         ));
                     };
                     let valid_target = match &descriptor.target {
+                        CallTarget::RuntimeStub(target)
+                            if target.id
+                                == otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW.id =>
+                        {
+                            *target == otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW
+                                && descriptor.arguments.is_empty()
+                                && descriptor.result.is_none()
+                                && descriptor.effects == CallEffects::WRITES_HEAP
+                                && descriptor.clobbers
+                                    == TargetRegisterFile::aarch64_scalar_call_clobbers()
+                                && descriptor.exceptional == ExceptionalEdge::None
+                                && descriptor.safepoint == SafepointKind::None
+                                && instruction.operands.is_empty()
+                                && instruction.safepoint.is_none()
+                                && instruction.deopt.is_none()
+                        }
                         CallTarget::RuntimeStub(_) => true,
+                        CallTarget::CommittedRuntime {
+                            target,
+                            semantic_arity,
+                            ..
+                        } => {
+                            let semantic_arity = usize::from(*semantic_arity);
+                            let complete_effects = CallEffects::READS_HEAP
+                                .union(CallEffects::WRITES_HEAP)
+                                .union(CallEffects::INVALIDATES_SHAPES)
+                                .union(CallEffects::REENTRANT);
+                            let input_values = instruction
+                                .operands
+                                .iter()
+                                .filter(|operand| operand.purpose == OperandPurpose::Input)
+                                .map(|operand| operand.value)
+                                .collect::<Vec<_>>();
+                            let roots = instruction
+                                .operands
+                                .iter()
+                                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                                .map(|operand| operand.value)
+                                .collect::<std::collections::BTreeSet<_>>();
+                            semantic_arity <= 2
+                                && target.signature
+                                    == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
+                                && target.argument_count == 2
+                                && target.result_abi
+                                    == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
+                                && target.result_domain
+                                    == otter_vm::native_abi::NativeResultDomain::Committed
+                                && target.safepoint
+                                    == otter_vm::native_abi::RuntimeStubSafepoint::Required
+                                && target.exception
+                                    == otter_vm::native_abi::RuntimeStubException::Status
+                                && descriptor.arguments.len() == semantic_arity
+                                && descriptor.arguments.iter().all(|representation| {
+                                    *representation == MachineRepresentation::Tagged
+                                })
+                                && descriptor.result == Some(MachineRepresentation::Tagged)
+                                && descriptor.effects == complete_effects
+                                && descriptor.clobbers
+                                    == TargetRegisterFile::aarch64_scalar_call_clobbers()
+                                && descriptor.safepoint == SafepointKind::Gc
+                                && descriptor.exceptional != ExceptionalEdge::None
+                                && instruction.deopt.is_none()
+                                && input_values.len() == semantic_arity
+                                && input_values.iter().all(|value| roots.contains(value))
+                        }
                         CallTarget::Direct {
                             kind, candidates, ..
                         } => {
                             let method = *kind == DirectCallKind::Method;
                             let count = candidates.len();
                             let valid_count = if method {
-                                (1..=MAX_MACHINE_DIRECT_METHOD_TARGETS).contains(&count)
+                                !descriptor.arguments.is_empty()
+                                    && count <= MAX_MACHINE_DIRECT_METHOD_TARGETS
                             } else {
                                 count == 1
                             };
@@ -1599,11 +2115,85 @@ impl InstructionSequence {
         }
         Ok(())
     }
+
+    pub(super) fn verify(&self) -> Result<(), VerificationError> {
+        self.verify_structure()?;
+        self.verify_gc_root_liveness()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn committed_runtime_sequence(semantic_arity: u8) -> InstructionSequence {
+        assert!(semantic_arity <= 2);
+        let inputs = (0..u32::from(semantic_arity))
+            .map(MachineValue)
+            .collect::<Vec<_>>();
+        let result = MachineValue(u32::from(semantic_arity));
+        let mut instructions = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                MachineInstruction::plain(
+                    MachineOpcode::EntryValue(index as u16),
+                    vec![MachineOperand::register_output(value)],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut operands = inputs
+            .iter()
+            .copied()
+            .map(MachineOperand::location_input)
+            .collect::<Vec<_>>();
+        operands.push(MachineOperand::register_output(result));
+        operands.extend(inputs.iter().copied().map(MachineOperand::tagged_root));
+        let mut call = MachineInstruction::plain(MachineOpcode::Call(0), operands);
+        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.safepoint = Some(SafepointId(0));
+        instructions.push(call);
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(result)],
+        );
+        ret.control = ControlFlow::Return;
+        instructions.push(ret);
+        let complete_effects = CallEffects::READS_HEAP
+            .union(CallEffects::WRITES_HEAP)
+            .union(CallEffects::INVALIDATES_SHAPES)
+            .union(CallEffects::REENTRANT);
+        let instruction_count = instructions.len() as u32;
+
+        InstructionSequence::new(
+            MachineBlock(0),
+            vec![MachineRepresentation::Tagged; usize::from(semantic_arity) + 1],
+            vec![CallDescriptor {
+                target: CallTarget::CommittedRuntime {
+                    target: otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
+                    logical_pc: 19,
+                    byte_pc: 41,
+                    semantic_arity,
+                },
+                arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
+                result: Some(MachineRepresentation::Tagged),
+                effects: complete_effects,
+                clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                exceptional: ExceptionalEdge::Propagate,
+                safepoint: SafepointKind::Gc,
+            }],
+            vec![MachineBlockData {
+                first: MachineInstructionId(0),
+                end: MachineInstructionId(instruction_count),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                successor_arguments: Vec::new(),
+            }],
+            instructions,
+        )
+        .expect("valid committed-runtime sequence")
+    }
 
     #[test]
     fn packed_double_view_cache_ids_bound_raw_frame_words() {
@@ -1617,6 +2207,256 @@ mod tests {
         assert_eq!(
             MAX_PACKED_DOUBLE_VIEW_CACHES * PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
             64
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_direct_method_without_receiver_argument() {
+        let result = MachineValue(0);
+        let descriptor = CallDescriptor {
+            target: CallTarget::Direct {
+                kind: DirectCallKind::Method,
+                argument_mode: DirectCallArgumentMode::Fixed,
+                candidates: Vec::new(),
+                caller_function_id: 0,
+                logical_pc: 0,
+                byte_pc: 0,
+            },
+            arguments: Vec::new(),
+            result: Some(MachineRepresentation::Tagged),
+            effects: CallEffects::REENTRANT,
+            clobbers: Vec::new(),
+            exceptional: ExceptionalEdge::Propagate,
+            safepoint: SafepointKind::None,
+        };
+        let call = MachineInstruction::plain(
+            MachineOpcode::Call(0),
+            vec![MachineOperand::register_output(result)],
+        );
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(result)],
+        );
+        ret.control = ControlFlow::Return;
+
+        assert_eq!(
+            InstructionSequence::new(
+                MachineBlock(0),
+                vec![MachineRepresentation::Tagged],
+                vec![descriptor],
+                vec![MachineBlockData {
+                    first: MachineInstructionId(0),
+                    end: MachineInstructionId(2),
+                    predecessors: Vec::new(),
+                    successors: Vec::new(),
+                    parameters: Vec::new(),
+                    successor_arguments: Vec::new(),
+                }],
+                vec![call, ret],
+            ),
+            Err(VerificationError::InvalidCallTarget(MachineInstructionId(
+                0
+            )))
+        );
+    }
+
+    #[test]
+    fn verifier_accepts_zero_to_two_true_committed_runtime_inputs() {
+        for semantic_arity in 0..=2 {
+            let sequence = committed_runtime_sequence(semantic_arity);
+            assert!(sequence.verify().is_ok());
+            assert!(
+                sequence
+                    .normalized()
+                    .contains(&format!("semantic_arity: {semantic_arity}"))
+            );
+        }
+    }
+
+    #[test]
+    fn zero_arity_committed_runtime_keeps_unrelated_live_tagged_roots() {
+        let unrelated = MachineValue(0);
+        let result = MachineValue(1);
+        let mut call = MachineInstruction::plain(
+            MachineOpcode::Call(0),
+            vec![
+                MachineOperand::register_output(result),
+                MachineOperand::tagged_root(unrelated),
+            ],
+        );
+        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.safepoint = Some(SafepointId(0));
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(unrelated)],
+        );
+        ret.control = ControlFlow::Return;
+        let descriptor = committed_runtime_sequence(0).call_descriptors[0].clone();
+        let sequence = InstructionSequence::new(
+            MachineBlock(0),
+            vec![MachineRepresentation::Tagged; 2],
+            vec![descriptor],
+            vec![MachineBlockData {
+                first: MachineInstructionId(0),
+                end: MachineInstructionId(3),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                successor_arguments: Vec::new(),
+            }],
+            vec![
+                MachineInstruction::plain(
+                    MachineOpcode::EntryValue(0),
+                    vec![MachineOperand::register_output(unrelated)],
+                ),
+                call,
+                ret,
+            ],
+        )
+        .expect("zero-arity committed call with unrelated root");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("zero-arity committed allocation");
+        let safepoints =
+            lower_safepoints(&sequence, &allocation).expect("zero-arity committed safepoints");
+        assert_eq!(
+            safepoints
+                .site(MachineInstructionId(1))
+                .expect("zero-arity committed site")
+                .roots
+                .iter()
+                .map(|root| root.value)
+                .collect::<Vec<_>>(),
+            [unrelated]
+        );
+
+        let mut duplicate = sequence.clone();
+        duplicate.instructions[1]
+            .operands
+            .push(MachineOperand::tagged_root(unrelated));
+        assert_eq!(
+            duplicate.verify(),
+            Err(VerificationError::DuplicateTaggedRoot(
+                MachineInstructionId(1),
+                unrelated,
+            ))
+        );
+
+        let mut missing = sequence;
+        missing.instructions[1]
+            .operands
+            .retain(|operand| operand.purpose != OperandPurpose::TaggedRoot);
+        assert_eq!(
+            missing.verify(),
+            Err(VerificationError::MissingLiveTaggedRoot(
+                MachineInstructionId(1),
+                unrelated,
+            ))
+        );
+    }
+
+    #[test]
+    fn completed_selection_derives_only_the_unrelated_live_tagged_root() {
+        let unrelated = MachineValue(0);
+        let result = MachineValue(1);
+        let mut call = MachineInstruction::plain(
+            MachineOpcode::Call(0),
+            vec![MachineOperand::register_output(result)],
+        );
+        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.safepoint = Some(SafepointId(0));
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(unrelated)],
+        );
+        ret.control = ControlFlow::Return;
+
+        let sequence = InstructionSequence::new_selected_with_packed_double_view_caches(
+            MachineBlock(0),
+            vec![MachineRepresentation::Tagged; 2],
+            vec![committed_runtime_sequence(0).call_descriptors[0].clone()],
+            vec![MachineBlockData {
+                first: MachineInstructionId(0),
+                end: MachineInstructionId(3),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                successor_arguments: Vec::new(),
+            }],
+            vec![
+                MachineInstruction::plain(
+                    MachineOpcode::EntryValue(0),
+                    vec![MachineOperand::register_output(unrelated)],
+                ),
+                call,
+                ret,
+            ],
+            0,
+        )
+        .expect("completed selection roots");
+
+        assert_eq!(
+            sequence.instructions[1]
+                .operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                .map(|operand| operand.value)
+                .collect::<Vec<_>>(),
+            [unrelated]
+        );
+        sequence
+            .verify()
+            .expect("completed roots remain verifiable");
+    }
+
+    #[test]
+    fn verifier_rejects_probe_or_replay_contract_on_committed_runtime_call() {
+        let call_id = MachineInstructionId(2);
+        let mut wrong_signature = committed_runtime_sequence(2);
+        let CallTarget::CommittedRuntime { target, .. } =
+            &mut wrong_signature.call_descriptors[0].target
+        else {
+            panic!("committed target fixture")
+        };
+        *target = otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT;
+        assert_eq!(
+            wrong_signature.verify(),
+            Err(VerificationError::InvalidCallTarget(call_id))
+        );
+
+        let mut too_wide = committed_runtime_sequence(2);
+        let CallTarget::CommittedRuntime { semantic_arity, .. } =
+            &mut too_wide.call_descriptors[0].target
+        else {
+            panic!("committed target fixture")
+        };
+        *semantic_arity = 3;
+        assert_eq!(
+            too_wide.verify(),
+            Err(VerificationError::InvalidCallTarget(call_id))
+        );
+
+        let mut missing_root = committed_runtime_sequence(2);
+        missing_root.instructions[call_id.0 as usize]
+            .operands
+            .retain(|operand| operand != &MachineOperand::tagged_root(MachineValue(1)));
+        assert_eq!(
+            missing_root.verify(),
+            Err(VerificationError::InvalidCallTarget(call_id))
+        );
+
+        let mut local_replay = committed_runtime_sequence(2);
+        local_replay.instructions[call_id.0 as usize].deopt = Some(DeoptId(0));
+        assert_eq!(
+            local_replay.verify(),
+            Err(VerificationError::InvalidCallTarget(call_id))
+        );
+
+        let mut no_throw_edge = committed_runtime_sequence(2);
+        no_throw_edge.call_descriptors[0].exceptional = ExceptionalEdge::None;
+        assert_eq!(
+            no_throw_edge.verify(),
+            Err(VerificationError::InvalidCallTarget(call_id))
         );
     }
 

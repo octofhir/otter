@@ -349,8 +349,8 @@ pub enum FeedbackKind {
     Element,
     /// Call target/arity feedback.
     Call,
-    /// Global or dynamic-environment feedback.
-    Global,
+    /// Global, captured, or dynamic-environment binding feedback.
+    Binding,
 }
 
 /// Current machine-code tier coverage policy.
@@ -635,15 +635,28 @@ pub const fn opcode_schema(op: Op) -> &'static OpcodeSchema {
 /// Return the schema-declared kind at one fixed or variadic operand position.
 #[must_use]
 pub const fn operand_kind_at(op: Op, index: usize) -> Option<OperandKind> {
+    match operand_spec_at(op, index) {
+        Some(spec) => Some(spec.kind),
+        None => None,
+    }
+}
+
+/// Return the authoritative operand kind and register role at one position.
+///
+/// Variadic positions after the fixed prefix use the declared homogeneous
+/// tail. The decoded instruction remains responsible for bounding `index` by
+/// its actual operand count.
+#[must_use]
+pub const fn operand_spec_at(op: Op, index: usize) -> Option<OperandSpec> {
     let shape = opcode_schema(op).operand_shape;
     let Some(prefix) = shape.prefix() else {
         return None;
     };
     if index < prefix.len() {
-        return Some(prefix[index].kind);
+        return Some(prefix[index]);
     }
     match shape.variadic() {
-        Some((_, tail)) => Some(tail.kind),
+        Some((_, tail)) => Some(tail),
         None => None,
     }
 }
@@ -657,15 +670,8 @@ pub const fn operand_kind_at(op: Op, index: usize) -> Option<OperandKind> {
 /// register count, and this is the single declaration of which those are.
 #[must_use]
 pub const fn register_access_at(op: Op, index: usize) -> RegisterAccess {
-    let shape = opcode_schema(op).operand_shape;
-    let Some(prefix) = shape.prefix() else {
-        return RegisterAccess::None;
-    };
-    if index < prefix.len() {
-        return prefix[index].register_access;
-    }
-    match shape.variadic() {
-        Some((_, tail)) => tail.register_access,
+    match operand_spec_at(op, index) {
+        Some(spec) => spec.register_access,
         None => RegisterAccess::None,
     }
 }
@@ -1114,11 +1120,19 @@ const fn feedback(op: Op) -> FeedbackKind {
         | Op::NewSpread
         | Op::SuperConstruct
         | Op::SuperConstructSpread => FeedbackKind::Call,
-        Op::LoadGlobalOrThrow
+        Op::LoadGlobalThis
+        | Op::LoadGlobalOrThrow
         | Op::LoadGlobalOrUndefined
+        | Op::GlobalBindingExists
         | Op::StoreGlobalBinding
+        | Op::StoreGlobalChecked
+        | Op::LoadUpvalue
+        | Op::StoreUpvalue
+        | Op::StoreUpvalueChecked
         | Op::LoadDynamic
-        | Op::StoreDynamic => FeedbackKind::Global,
+        | Op::StoreDynamic
+        | Op::TypeofDynamic
+        | Op::LoadShadowedUpvalue => FeedbackKind::Binding,
         _ => FeedbackKind::None,
     }
 }
@@ -1132,6 +1146,8 @@ const fn effects(op: Op) -> OpcodeEffects {
             | Op::LoadTrue
             | Op::LoadFalse
             | Op::LoadNull
+            | Op::LoadInt32
+            | Op::LoadNumber
             | Op::LoadLocal
             | Op::StoreLocal
             | Op::LoadThis
@@ -1244,6 +1260,31 @@ mod tests {
     }
 
     #[test]
+    fn binding_feedback_covers_the_complete_access_family() {
+        let expected = HashSet::from([
+            Op::LoadGlobalThis,
+            Op::LoadGlobalOrThrow,
+            Op::LoadGlobalOrUndefined,
+            Op::GlobalBindingExists,
+            Op::StoreGlobalBinding,
+            Op::StoreGlobalChecked,
+            Op::LoadUpvalue,
+            Op::StoreUpvalue,
+            Op::StoreUpvalueChecked,
+            Op::LoadDynamic,
+            Op::StoreDynamic,
+            Op::TypeofDynamic,
+            Op::LoadShadowedUpvalue,
+        ]);
+        let actual = OPCODE_SCHEMA
+            .iter()
+            .filter_map(|schema| (schema.feedback == FeedbackKind::Binding).then_some(schema.op))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn exact_shapes_drive_operand_count_and_register_sources() {
         for schema in OPCODE_SCHEMA {
             let Some(operands) = schema.operand_shape.prefix() else {
@@ -1289,6 +1330,14 @@ mod tests {
         );
         assert_eq!(operand_kind_at(Op::MakeClass, 5), None);
         assert_eq!(operand_kind_at(Op::Call, 4), Some(OperandKind::Register));
+        assert_eq!(
+            operand_spec_at(Op::Call, 4),
+            Some(OperandSpec::register(RegisterAccess::Read))
+        );
+        assert_eq!(
+            operand_spec_at(Op::LoadLocal, 1),
+            Some(OperandSpec::local_index(RegisterAccess::Read))
+        );
     }
 
     #[test]

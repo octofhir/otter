@@ -24,7 +24,7 @@
 
 use crate::{
     ActiveFrameMut, ExecutionContext, Interpreter, Value, VmError, abstract_ops,
-    activation_stack::ActivationStack, arithmetic_dispatch::NumericRuntimeOp,
+    arithmetic_dispatch::NumericRuntimeOp,
 };
 
 /// Fully decoded `ToPrimitive` hint used by unary-coercion semantics.
@@ -189,22 +189,6 @@ impl Interpreter {
         self.frame_store_upvalue_checked(frame, src, idx)
     }
 
-    /// Materialize a string constant from the owning function's constant pool.
-    pub fn jit_runtime_load_string(
-        &mut self,
-        context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
-        function_id: u32,
-        dst: u16,
-        constant_index: u32,
-    ) -> Result<(), VmError> {
-        let resolved = context
-            .for_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let value = self.load_string_constant_value(&resolved, constant_index)?;
-        frame.write(dst, value)
-    }
-
     /// Define one object-literal data property from decoded registers.
     pub fn jit_runtime_define_data_property(
         &mut self,
@@ -274,38 +258,12 @@ impl Interpreter {
         self.run_define_own_property_active(stack, context, frame, target, key, descriptor)
     }
 
-    /// Allocate a closure from decoded function and parent-upvalue indices.
-    pub fn jit_runtime_make_closure(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        function_id: u32,
-        dst: u16,
-        function_index: u32,
-        parent_indices: &[u32],
-    ) -> Result<(), VmError> {
-        let resolved = context
-            .for_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_make_closure_regs(
-            &resolved,
-            &mut stack[frame_index],
-            dst,
-            function_index,
-            parent_indices,
-        );
-        stack[frame_index].pc = saved_pc;
-        result
-    }
-
-    /// Allocate a closure directly from a published stack-owned native frame.
+    /// Allocate a closure directly from the published native frame.
     ///
-    /// Direct-call eligibility excludes cold eval/constructor state, so the
-    /// canonical native SELF/`this`/upvalue windows contain the complete source
-    /// state and no interpreter [`Frame`] adapter is required.
-    pub fn jit_runtime_make_closure_native(
+    /// The canonical native SELF/`this`/upvalue windows and traced eval-env
+    /// slot contain the complete source state; no interpreter [`Frame`]
+    /// adapter is required.
+    pub fn jit_runtime_make_closure(
         &mut self,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
@@ -329,7 +287,6 @@ impl Interpreter {
             parent_indices,
             None,
             None,
-            None,
         );
         frame.set_pc(saved_pc);
         result
@@ -338,10 +295,10 @@ impl Interpreter {
     /// Allocate a distinct capture-free function value directly in a
     /// published stack-owned native frame.
     ///
-    /// Direct-call eligibility excludes direct-eval cold state, while the
-    /// native descriptor publishes the exact SELF value needed by named
-    /// self-references. The compiled PC remains owned by generated code.
-    pub fn jit_runtime_make_function_native(
+    /// The native descriptor publishes the exact SELF value and direct-eval
+    /// environment needed by nested function creation. The compiled PC remains
+    /// owned by generated code.
+    pub fn jit_runtime_make_function(
         &mut self,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
@@ -356,7 +313,7 @@ impl Interpreter {
             .for_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         let saved_pc = frame.pc();
-        let result = self.run_make_function_active_reg(&resolved, frame, dst, function_index, None);
+        let result = self.run_make_function_active_reg(&resolved, frame, dst, function_index);
         frame.set_pc(saved_pc);
         result
     }
@@ -423,7 +380,6 @@ mod tests {
         ];
         let header = VmFrameHeader {
             function_id: 7,
-            code_block_id: 7,
             pc: 19,
             register_count: registers.len() as u16,
             kind: NativeFrameKind::Baseline,

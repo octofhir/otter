@@ -233,109 +233,6 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn run_instanceof_legacy_regs(
-        &mut self,
-        frame: &mut Frame,
-        dst: u16,
-        lhs: u16,
-        rhs: u16,
-    ) -> Result<(), VmError> {
-        let lhs = *read_register(frame, lhs)?;
-        let rhs = *read_register(frame, rhs)?;
-        let result = if let (Some(a), Some(target)) = (lhs.as_object(), rhs.as_object()) {
-            match crate::object::get(target, &self.gc_heap, "prototype").and_then(|v| v.as_object())
-            {
-                Some(proto) => crate::object::has_in_proto_chain(a, &self.gc_heap, proto),
-                None => crate::object::has_in_proto_chain(a, &self.gc_heap, target),
-            }
-        } else if let (Some(a), Some(c)) = (lhs.as_object(), rhs.as_class_constructor()) {
-            crate::object::has_in_proto_chain(a, &self.gc_heap, c.prototype(&self.gc_heap))
-        } else {
-            false
-        };
-        write_register(frame, dst, Value::boolean(result))?;
-        frame.advance_pc()?;
-        Ok(())
-    }
-
-    pub(crate) fn run_has_property_regs(
-        &mut self,
-        stack: &mut ActivationStack,
-        top_idx: usize,
-        context: &crate::execution_context::ExecutionContext,
-        dst: u16,
-        lhs: u16,
-        rhs: u16,
-    ) -> Result<(), VmError> {
-        let lhs = *read_register(&stack[top_idx], lhs)?;
-        let rhs = *read_register(&stack[top_idx], rhs)?;
-        let key_name = if let Some(s) = lhs.as_string(&self.gc_heap) {
-            Some(s.to_lossy_string(&self.gc_heap))
-        } else if let Some(n) = lhs.as_number() {
-            Some(n.to_display_string())
-        } else if let Some(b) = lhs.as_boolean() {
-            Some(if b { "true" } else { "false" }.to_string())
-        } else if lhs.is_null() {
-            Some("null".to_string())
-        } else if lhs.is_undefined() {
-            Some("undefined".to_string())
-        } else if let Some(b) = lhs.as_big_int() {
-            Some(b.to_decimal_string(&self.gc_heap))
-        } else {
-            None
-        };
-        let present = if rhs.as_object().is_some() {
-            // §13.10.1 `in` → HasProperty: one spec funnel for ordinary
-            // objects, String exotics, and the prototype chain.
-            let vm_key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-                VmPropertyKey::Symbol(sym)
-            } else if let Some(name) = key_name.as_deref() {
-                VmPropertyKey::String(name)
-            } else {
-                return Err(VmError::TypeMismatch);
-            };
-            self.ordinary_has_property_value(stack, context, rhs, &vm_key, 0)?
-        } else if let Some(arr) = rhs.as_array() {
-            // §13.10.1 `in` → HasProperty → OrdinaryHasProperty: own
-            // elements / named props, then the Array.prototype chain
-            // (inherited indices, `@@iterator`, …). The own-only
-            // `has_array_property` is kept as the symbol-less fallback.
-            if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-                self.ordinary_has_property_value(
-                    stack,
-                    context,
-                    rhs,
-                    &VmPropertyKey::Symbol(sym),
-                    0,
-                )?
-            } else if let Some(name) = key_name.as_deref() {
-                self.ordinary_has_property_value(
-                    stack,
-                    context,
-                    rhs,
-                    &VmPropertyKey::String(name),
-                    0,
-                )?
-            } else {
-                has_array_property(self, arr, &lhs)
-            }
-        } else if rhs.is_object_type() {
-            let key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
-                VmPropertyKey::Symbol(sym)
-            } else if let Some(name) = key_name.as_deref() {
-                VmPropertyKey::String(name)
-            } else {
-                return Err(VmError::TypeMismatch);
-            };
-            self.ordinary_has_property_value(stack, context, rhs, &key, 0)?
-        } else {
-            return Err(VmError::TypeMismatch);
-        };
-        write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
-        stack[top_idx].advance_pc()?;
-        Ok(())
-    }
-
     pub(crate) fn run_delete_property_reg(
         &mut self,
         frame: &mut Frame,
@@ -679,19 +576,6 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn run_get_prototype_regs(
-        &mut self,
-        frame: &mut Frame,
-        dst: u16,
-        src: u16,
-    ) -> Result<(), VmError> {
-        let value = *read_register(frame, src)?;
-        let result = self.get_prototype_for_op(&value)?;
-        write_register(frame, dst, result)?;
-        frame.advance_pc()?;
-        Ok(())
-    }
-
     /// §13.3.5 MakeSuperPropertyReference + §13.3.4 GetValue for a
     /// `super.name` / `super[key]` read. The lookup base is the home
     /// object's prototype, but accessor getters run with the active
@@ -879,74 +763,6 @@ impl Interpreter {
                     return Err(VmError::TypeMismatch);
                 }
             }
-        }
-        stack[top_idx].advance_pc()?;
-        Ok(())
-    }
-
-    pub(crate) fn run_set_prototype_regs(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        top_idx: usize,
-        obj_reg: u16,
-        proto_reg: u16,
-    ) -> Result<(), VmError> {
-        let raw_proto = *read_register(&stack[top_idx], proto_reg)?;
-        let proto = if raw_proto.is_object()
-            || raw_proto.is_proxy()
-            || raw_proto.is_iterator()
-            || raw_proto.is_null()
-        {
-            raw_proto
-        } else if let Some(c) = raw_proto.as_class_constructor() {
-            Value::object(c.statics(&self.gc_heap))
-        } else if raw_proto.is_native_function()
-            || raw_proto.is_function()
-            || raw_proto.is_closure()
-            || raw_proto.is_bound_function()
-        {
-            // §15.7.14 ClassDefinitionEvaluation step 6.b — `class D
-            // extends C` sets D.[[Prototype]] (the static side) to
-            // the parent constructor C verbatim, so static methods on
-            // the parent resolve through the ordinary [[Get]] ladder.
-            // This holds whether C is a native constructor
-            // (`Promise.reject`, `Map[@@species]`, …) or a plain
-            // ECMAScript function used as a base class. Carry the
-            // callable through — the prototype walker in
-            // `ordinary_get_value` knows how to walk a callable
-            // receiver.
-            raw_proto
-        } else {
-            return Err(VmError::TypeMismatch);
-        };
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        if receiver.is_object() {
-            let ok = self.set_prototype_value_proxy_aware(stack, context, &receiver, &proto)?;
-            if !ok {
-                return Err(self.err_type(("Object.setPrototypeOf failed".to_string()).into()));
-            }
-        } else if receiver.is_function()
-            || receiver.is_closure()
-            || receiver.is_bound_function()
-            || receiver.is_native_function()
-        {
-            // no-op
-        } else if receiver.is_boolean()
-            || receiver.is_number()
-            || receiver.is_string()
-            || receiver.is_symbol()
-            || receiver.is_big_int()
-        {
-            // §20.1.2.21 step 4 — `Object.setPrototypeOf(primitive,
-            // proto)` returns the primitive unchanged after the
-            // RequireObjectCoercible / proto-typecheck steps (which
-            // already succeeded for `Boolean / Number / String /
-            // Symbol / BigInt` because they are coercible). Mirror
-            // V8 / JSC and skip the prototype write — the wrapper
-            // would be unreachable.
-        } else {
-            return Err(VmError::TypeMismatch);
         }
         stack[top_idx].advance_pc()?;
         Ok(())
@@ -1144,37 +960,6 @@ pub(crate) fn string_index_property_name(key: &str) -> Option<u32> {
         return None;
     }
     Some(value)
-}
-
-pub(crate) fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> bool {
-    if let Some(n) = key.as_number() {
-        match n.as_smi() {
-            Some(i) if i >= 0 => {
-                crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
-            }
-            _ => {
-                crate::array::get_named_property(arr, &interpreter.gc_heap, &n.to_display_string())
-                    .is_some()
-            }
-        }
-    } else if let Some(s) = key.as_string(&interpreter.gc_heap) {
-        let k = s.to_lossy_string(&interpreter.gc_heap);
-        if k == "length" {
-            return true;
-        }
-        if let Some(i) = crate::object::array_index_property_name(&k)
-            && crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
-        {
-            return true;
-        }
-        // §22.1.4 — surface named-property side table for `in`.
-        crate::array::get_named_property(arr, &interpreter.gc_heap, &k).is_some()
-    } else if let Some(sym) = key.as_symbol(&interpreter.gc_heap) {
-        // §22.1 Array exotic — symbol-keyed own table.
-        crate::array::get_symbol_property(arr, &interpreter.gc_heap, sym).is_some()
-    } else {
-        false
-    }
 }
 
 /// §7.1.16 CanonicalNumericIndexString — `"-0"` maps to `-0`, any

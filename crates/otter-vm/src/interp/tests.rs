@@ -241,16 +241,16 @@ fn load_string_constant_reuses_traced_cache_entry() {
     let context = interp.link_module(module);
 
     assert!(interp.run(&context).unwrap().is_string());
-    assert_eq!(interp.string_constant_cache_len_for_test(), 1);
+    assert_eq!(interp.string_constant_cell_count_for_test(), 1);
 
     interp.force_gc().expect("force GC");
 
     assert!(interp.run(&context).unwrap().is_string());
-    assert_eq!(interp.string_constant_cache_len_for_test(), 1);
+    assert_eq!(interp.string_constant_cell_count_for_test(), 1);
 }
 
 #[test]
-fn load_string_constant_cache_distinguishes_standalone_contexts() {
+fn load_string_constant_cells_distinguish_standalone_contexts() {
     fn module_with_string(name: &str, literal: &str) -> BytecodeModule {
         BytecodeModule {
             module: name.to_string(),
@@ -288,7 +288,7 @@ fn load_string_constant_cache_distinguishes_standalone_contexts() {
 
     assert!(interp.run(&first).unwrap().is_string());
     assert!(interp.run(&second).unwrap().is_string());
-    assert_eq!(interp.string_constant_cache_len_for_test(), 2);
+    assert_eq!(interp.string_constant_cell_count_for_test(), 2);
 }
 
 #[test]
@@ -335,7 +335,7 @@ fn string_constant_cell_stays_address_stable_across_growth_and_gc() {
         let context = interp.link_module(module_with_literal(index));
         assert!(interp.run(&context).expect("materialize churn").is_string());
     }
-    assert_eq!(interp.string_constant_cache_len_for_test(), 257);
+    assert_eq!(interp.string_constant_cell_count_for_test(), 257);
     assert_eq!(
         interp.string_constant_cell_addr_for_test(&anchor, 0),
         Some(before),
@@ -908,24 +908,22 @@ fn bytecode_instanceof_function_prototype_uses_stack_roots() {
     frame.registers[1] = Value::object(lhs);
     frame.registers[2] = Value::function(1);
     stack.push(frame);
-    let operands = vec![
-        Operand::Register(0),
-        Operand::Register(1),
-        Operand::Register(2),
-    ];
-
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    assert!(
-        interp
-            .drive_instanceof(&mut stack, &context, operands.as_slice())
-            .expect("instanceof")
-    );
+    let result = interp
+        .object_protocol_value(
+            &mut stack,
+            &context,
+            crate::ObjectProtocolValueOp::Instanceof,
+            Value::object(lhs),
+            Value::function(1),
+        )
+        .expect("instanceof");
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
         after > before,
         "instanceof should lazily allocate function .prototype through stack roots"
     );
-    assert_eq!(stack[0].registers[0], Value::boolean(false));
+    assert_eq!(result, Value::boolean(false));
     let desc = interp
         .ordinary_function_own_property_descriptor(Some(&context), None, 1, "prototype")
         .unwrap()

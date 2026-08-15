@@ -8,100 +8,108 @@
 
 use smallvec::SmallVec;
 
-use crate::{NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, Value, VmError};
+use crate::{
+    CommittedValueError, NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, Value, VmError,
+};
 
 use super::{RuntimeCall, RuntimeFrameIdentity};
 
 impl RuntimeCall<'_> {
-    /// Bind `super()`'s result into a stack-owned derived constructor without
-    /// materializing an interpreter frame.
-    pub fn bind_derived_this(&mut self, src: u16) -> Result<(), VmError> {
-        if self.identity != RuntimeFrameIdentity::StackOwned {
-            return Err(VmError::InvalidOperand);
-        }
-        let value = self.read(src)?;
-        self.bind_derived_this_value(value)
-    }
-
-    /// Value-form of [`Self::bind_derived_this`] used by Machine IR after the
-    /// `super` result has left its bytecode register identity.
-    pub fn bind_derived_this_value(&mut self, value: Value) -> Result<(), VmError> {
+    /// Bind the boxed `super()` result carried by the committed-value boundary.
+    pub fn bind_derived_this_value(&mut self, value: Value) -> Result<(), CommittedValueError> {
         if let RuntimeFrameIdentity::Materialized(frame_index) = self.identity {
-            let vm = unsafe { &mut *self.vm.as_ptr() };
+            let frame_ptr = self.frame.as_ptr();
             let stack = unsafe { &mut *self.stack.as_ptr() };
-            vm.run_bind_this_value(stack, frame_index as usize, value)?;
-            return self.refresh_materialized_this_value();
+            let vm = unsafe { &mut *self.vm.as_ptr() };
+            vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+            vm.record_jit_derived_this_bind_transition();
+            let bound_this = match vm.bind_this_value(stack, frame_index, value) {
+                Ok(bound_this) => bound_this,
+                Err(error @ VmError::ThisUninitialized) => {
+                    return Err(CommittedValueError::JavaScript(error));
+                }
+                Err(error) => return Err(CommittedValueError::Fatal(error)),
+            };
+            // SAFETY: the descriptor was validated before the non-allocating,
+            // non-reentrant bind and remains published by the RuntimeCall.
+            let mut native = unsafe { crate::ActiveFrameMut::from_native_ptr(frame_ptr) }
+                .expect("published materialized frame remains valid after bind-only kernel");
+            native.set_this_value(bound_this);
+            return Ok(());
         }
         let frame_ptr = self.frame.as_ptr();
-        // SAFETY: RuntimeCall exclusively owns the validated published frame.
+        // SAFETY: RuntimeCall exclusively owns the validated published frame;
+        // validation and frame-kind classification precede semantic entry.
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame_ptr) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
         let flags = frame.header().flags;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         if !flags.contains(crate::NativeFrameFlags::DERIVED_CONSTRUCTOR) {
-            return Err(vm.err_this_uninit(
-                "super called outside a derived constructor"
-                    .to_string()
-                    .into(),
-            ));
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
+        vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        vm.record_jit_derived_this_bind_transition();
         if !frame.this_value().is_hole() {
-            return Err(vm.err_this_uninit(
-                "super constructor may only be called once"
-                    .to_string()
-                    .into(),
+            return Err(CommittedValueError::JavaScript(
+                vm.err_this_uninit(
+                    "super constructor may only be called once"
+                        .to_string()
+                        .into(),
+                ),
             ));
         }
         frame.set_this_value(value);
         Ok(())
     }
 
-    /// Mirror a committed materialized derived-`this` binding into the native
-    /// descriptor used by the rest of the current compiled entry.
-    pub fn refresh_materialized_this_value(&mut self) -> Result<(), VmError> {
-        let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
-            return Ok(());
-        };
-        let stack = unsafe { self.stack.as_ref() };
-        let value = stack
-            .get(frame_index as usize)
-            .ok_or(VmError::InvalidOperand)?
-            .this_value;
-        self.with_frame(|frame| {
-            frame.set_this_value(value);
-            Ok(())
-        })
-    }
-
-    /// Complete a generic method-call guard miss on either physical frame
-    /// representation and commit the result without materializing the caller.
-    pub fn call_method(
-        &mut self,
-        dst: u16,
-        receiver: u16,
-        name_index: u32,
-        argument_regs: &[u16],
-    ) -> Result<(), VmError> {
-        let receiver = self.read(receiver)?;
-        let mut args = SmallVec::with_capacity(argument_regs.len());
-        for &register in argument_regs {
-            args.push(self.read(register)?);
-        }
+    /// Complete the exact published `CallMethodValue` from boxed SSA values.
+    ///
+    /// `values[0]` is the receiver and the remaining values are the complete
+    /// actual argument list. The immutable CodeBlock is authoritative for the
+    /// method name and argument count; validating both before entering the VM
+    /// keeps this boundary effect-once even when lookup or the callee throws.
+    pub fn call_method_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
+        let (receiver, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let function_id = self.function_id();
         let call_pc = self.pc();
+        let context = unsafe { self.context.as_ref() };
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let instruction = function
+            .instr_at_index(call_pc as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        if instruction.instruction_pc != call_pc
+            || function.op(instruction) != otter_bytecode::Op::CallMethodValue
+        {
+            return Err(VmError::InvalidOperand);
+        }
+        let name_index = function
+            .const_index(instruction, 2)
+            .ok_or(VmError::InvalidOperand)?;
+        let argument_count = function
+            .const_index(instruction, 3)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(VmError::InvalidOperand)?;
+        if args.len() != argument_count {
+            return Err(VmError::InvalidOperand);
+        }
+
+        // The native entry has already copied the machine-owned packet. Keep
+        // an owned inline vector for the existing VM anchor so no borrowed JIT
+        // stack memory survives allocation or JavaScript reentry.
+        let args = SmallVec::from_slice(args);
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
-        let result = vm.jit_runtime_method_call_values(
+        vm.jit_runtime_method_call_values(
             context,
             stack,
             function_id,
             call_pc,
-            receiver,
+            *receiver,
             name_index,
             args,
-        )?;
-        self.write(dst, result)
+        )
     }
 
     /// Load one realm builtin error constructor.
@@ -150,27 +158,7 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_define_own_property(stack, context, &mut frame, target, key, descriptor)
     }
 
-    /// Materialize a string constant into the current activation.
-    pub fn load_string(
-        &mut self,
-        function_id: u32,
-        dst: u16,
-        constant_index: u32,
-    ) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall owns the published descriptor for this operation.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_load_string(context, &mut frame, function_id, dst, constant_index)
-    }
-
-    /// Allocate a closure from the current activation's captured-cell window.
-    ///
-    /// Materialized entries retain their cold lexical sidecar. Generated
-    /// stack-owned callees use the canonical native window and never synthesize
-    /// a [`crate::Frame`].
+    /// Allocate a closure from the current published activation.
     pub fn make_closure(
         &mut self,
         function_id: u32,
@@ -180,32 +168,19 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => vm.jit_runtime_make_closure(
-                context,
-                unsafe { &mut *self.stack.as_ptr() },
-                index as usize,
-                function_id,
-                dst,
-                function_index,
-                parent_indices,
-            ),
-            RuntimeFrameIdentity::StackOwned => {
-                let frame = self.frame.as_ptr();
-                // SAFETY: RuntimeCall validated and exclusively owns this
-                // descriptor for the duration of the semantic operation.
-                let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-                    .map_err(|_| VmError::InvalidOperand)?;
-                vm.jit_runtime_make_closure_native(
-                    context,
-                    &mut frame,
-                    function_id,
-                    dst,
-                    function_index,
-                    parent_indices,
-                )
-            }
-        }
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall validated and exclusively owns this descriptor
+        // for the duration of the semantic operation.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_make_closure(
+            context,
+            &mut frame,
+            function_id,
+            dst,
+            function_index,
+            parent_indices,
+        )
     }
 
     /// Allocate one capture-free function value through the current
@@ -218,29 +193,12 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => vm.jit_runtime_make_function(
-                context,
-                unsafe { &mut *self.stack.as_ptr() },
-                index as usize,
-                dst,
-                function_index,
-            ),
-            RuntimeFrameIdentity::StackOwned => {
-                let frame = self.frame.as_ptr();
-                // SAFETY: RuntimeCall exclusively owns the validated published
-                // descriptor for this semantic operation.
-                let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-                    .map_err(|_| VmError::InvalidOperand)?;
-                vm.jit_runtime_make_function_native(
-                    context,
-                    &mut frame,
-                    function_id,
-                    dst,
-                    function_index,
-                )
-            }
-        }
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall exclusively owns the validated published
+        // descriptor for this semantic operation.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_make_function(context, &mut frame, function_id, dst, function_index)
     }
 
     /// Complete generic ECMAScript addition.
@@ -644,6 +602,65 @@ mod tests {
         }
     }
 
+    fn wide_method_module() -> BytecodeModule {
+        BytecodeModule {
+            module: "runtime-value-method-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![
+                Function {
+                    id: 0,
+                    name: "wideMethodBoundary".to_string(),
+                    locals: 7,
+                    code: vec![
+                        Instruction {
+                            pc: 0,
+                            op: Op::CallMethodValue,
+                            operands: vec![
+                                Operand::Register(0),
+                                Operand::Register(1),
+                                Operand::ConstIndex(0),
+                                Operand::ConstIndex(5),
+                                Operand::Register(2),
+                                Operand::Register(3),
+                                Operand::Register(4),
+                                Operand::Register(5),
+                                Operand::Register(6),
+                            ],
+                        },
+                        Instruction {
+                            pc: 1,
+                            op: Op::ReturnUndefined,
+                            operands: Vec::new(),
+                        },
+                    ]
+                    .into(),
+                    ..Function::default()
+                },
+                Function {
+                    id: 1,
+                    name: "methodTarget".to_string(),
+                    code: vec![Instruction {
+                        pc: 0,
+                        op: Op::ReturnUndefined,
+                        operands: Vec::new(),
+                    }]
+                    .into(),
+                    ..Function::default()
+                },
+            ],
+            constants: (0..=5)
+                .map(|index| Constant::String {
+                    utf16: if index == 0 { "run" } else { "unused" }
+                        .encode_utf16()
+                        .collect(),
+                })
+                .collect(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        }
+    }
+
     #[test]
     fn stack_owned_value_elements_use_published_feedback_identity() {
         let context = element_context();
@@ -659,7 +676,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 1,
                 register_count: 3,
                 kind: NativeFrameKind::Optimizing,
@@ -744,7 +760,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 1,
                 register_count: 4,
                 kind: NativeFrameKind::Optimizing,
@@ -792,6 +807,95 @@ mod tests {
         assert!(matches!(
             call.load_property_value(receiver),
             Err(VmError::InvalidOperand)
+        ));
+    }
+
+    #[test]
+    fn stack_owned_wide_method_span_decodes_count_and_records_exact_target() {
+        let mut vm = Interpreter::new();
+        let context = vm.link_module(wide_method_module());
+        vm.ensure_property_ic_capacity(&context);
+        let mut receiver = vm
+            .allocate_object_literal_value()
+            .expect("ordinary method receiver");
+        {
+            let mut setup_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: `receiver` outlives the scope and is re-read after the
+            // potentially allocating hidden-class transition.
+            unsafe {
+                setup_roots.add_value(&mut receiver);
+            }
+            vm.set_property(
+                receiver.as_object().expect("method receiver object"),
+                "run",
+                Value::function(1),
+            )
+            .expect("install bytecode method");
+        }
+
+        let mut stack = ActivationStack::new();
+        let mut registers = [
+            Value::undefined(),
+            receiver,
+            Value::number_i32(10),
+            Value::number_i32(20),
+            Value::number_i32(30),
+            Value::number_i32(40),
+            Value::number_i32(50),
+        ];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                pc: 0,
+                register_count: 7,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        let packet = [
+            registers[1],
+            registers[2],
+            registers[3],
+            registers[4],
+            registers[5],
+            registers[6],
+        ];
+        vm.with_runtime_turn(&mut stack, |turn| {
+            let (vm, stack) = turn.into_parts();
+            let mut activation = VmRuntimeActivation::new(vm, stack, &context, 0);
+            // SAFETY: activation/frame/register storage and the copied packet
+            // remain live and exclusively owned for this boundary scope. The
+            // exact activation stack is published by this runtime turn.
+            let mut call = unsafe {
+                RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
+            }
+            .expect("stack-owned method runtime call");
+            assert!(
+                call.call_method_values(&packet)
+                    .expect("wide method completion")
+                    .is_undefined()
+            );
+            assert!(matches!(
+                call.call_method_values(&packet[..5]),
+                Err(VmError::InvalidOperand)
+            ));
+            call.set_pc(1);
+            assert!(matches!(
+                call.call_method_values(&packet),
+                Err(VmError::InvalidOperand)
+            ));
+        });
+
+        let feedback_site = context
+            .property_ic_site(0, 0)
+            .expect("method feedback site");
+        assert!(matches!(
+            vm.method_target_feedback(feedback_site),
+            Some(crate::MethodCallFeedback::Mono { method_fid: 1, .. })
         ));
     }
 
@@ -864,7 +968,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 2,
                 register_count: 4,
                 kind: NativeFrameKind::Optimizing,
@@ -999,7 +1102,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 2,
                 register_count: 4,
                 kind: NativeFrameKind::Optimizing,
@@ -1117,7 +1219,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 2,
                 register_count: 4,
                 kind: NativeFrameKind::Optimizing,
@@ -1171,7 +1272,6 @@ mod tests {
         let mut frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 2,
                 register_count: 4,
                 kind: NativeFrameKind::Optimizing,

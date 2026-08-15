@@ -2,11 +2,11 @@
 //!
 //! # Contents
 //! - [`enter_compiled`] — builds the `JitCtx` for one baseline or optimizing
-//!   activation and maps its returned status to a [`JitExecOutcome`].
+//!   activation and maps its `NativeResultPair` to a [`JitExecOutcome`].
 //!
 //! # Invariants
 //! - Entry pointers are called only through the frozen compiled-entry ABI
-//!   (`extern "C" fn(*mut JitCtx) -> JitRet`).
+//!   (`extern "C" fn(*mut JitCtx) -> NativeResultPair`).
 //! - The native frame published here carries the exact register window and
 //!   the isolate-owned stub-table/registry addresses for the full call.
 //!
@@ -15,21 +15,20 @@
 //! - `crate::template::code` and [`crate::optimizing`] own finalized code
 //!   objects that call this.
 
-use super::{
-    JitCtx, JitEntry, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, jit_pop_native_activation_stub,
-    jit_push_native_activation_stub,
-};
+use super::{JitCtx, JitEntry, jit_pop_native_activation_stub, jit_push_native_activation_stub};
 use otter_vm::{
-    ActivationStack, ActiveFrameMut, Interpreter, JitExecOutcome, Value, VmError,
-    VmRuntimeActivation,
-    native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
+    ActivationStack, ActiveFrameMut, Interpreter, JitExecOutcome, VmError, VmRuntimeActivation,
+    native_abi::{
+        NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultDomain, NativeResultStatus,
+        VmFrameHeader, VmThread,
+    },
 };
 
 /// Build the `JitCtx` for `activation` and invoke compiled code at `entry`, mapping
 /// the returned status to a [`JitExecOutcome`].
 ///
 /// Shared across entry kinds: the function-entry and loop-header OSR paths use
-/// the identical [`JitEntry`] ABI (`extern "C" fn(*mut JitCtx) -> JitRet`) and
+/// the identical [`JitEntry`] ABI (`extern "C" fn(*mut JitCtx) -> NativeResultPair`) and
 /// the same `JitCtx` construction, differing only in which instruction the
 /// prologue branches to. Lives free (it uses no compiled-code state) so any
 /// [`JitFunctionCode`](otter_vm::JitFunctionCode) implementation can reuse it.
@@ -99,7 +98,6 @@ pub(crate) unsafe fn enter_compiled(
         let mut native_frame = NativeFrame::new(
             VmFrameHeader {
                 function_id,
-                code_block_id: function_id,
                 pc: 0,
                 register_count,
                 kind,
@@ -110,11 +108,9 @@ pub(crate) unsafe fn enter_compiled(
             this_value,
         );
         native_frame.set_upvalue_window(upvalue_base, upvalue_count);
-        native_frame.set_new_target(activation.new_target());
-        if activation.is_derived_constructor() {
-            native_frame.set_derived_constructor();
+        if let Err(error) = activation.initialize_native_frame_state(&mut native_frame) {
+            return JitExecOutcome::Fatal(error);
         }
-        native_frame.set_materialized_activation(activation.frame_index() as u32);
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.current_code_object_id = code_object_id;
@@ -147,20 +143,71 @@ pub(crate) unsafe fn enter_compiled(
         // `JitEntry` ABI.
         let entry: JitEntry = unsafe { std::mem::transmute(entry) };
         let activation_status = jit_push_native_activation_stub(&mut ctx);
-        if activation_status != 0 {
-            return JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand));
+        if activation_status != NativeResultStatus::Success as u64 {
+            return JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand));
         }
-        let ret = entry(&mut ctx);
-        let _ = jit_pop_native_activation_stub(&mut ctx);
+        let ret =
+            unsafe { activation.with_native_eval_env_owner(ctx.native_frame, || entry(&mut ctx)) };
+        let pop_status = jit_pop_native_activation_stub(&mut ctx);
+        if pop_status != NativeResultStatus::Success as u64 {
+            return JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand));
+        }
+        let ret = match ret {
+            Ok(ret) => ret,
+            Err(error) => return JitExecOutcome::Fatal(error),
+        };
+        let status = ret.validate(NativeResultDomain::Compiled);
+        // Generated-feedback reconciliation can compile and collect after the
+        // native activation is unpublished. Keep boxed Return/Throw payloads
+        // in the interpreter's traced temporary-root arena across that cold
+        // work, then read the collector-rewritten value back.
+        let payload_root = if error.is_none()
+            && matches!(
+                status,
+                Some(NativeResultStatus::Success | NativeResultStatus::Throw)
+            ) {
+            // SAFETY: `vm` remains the exclusively borrowed interpreter for
+            // this entry transaction.
+            Some(unsafe { (*vm).jit_push_generated_result_root(ret.payload_value()) })
+        } else {
+            None
+        };
         unsafe {
             (*vm).jit_note_generated_feedback(ctx.generated_feedback_clean == 0);
             (*vm).jit_reconcile_generated_feedback(&*activation.context_ptr());
         }
-        match ret.status {
-            STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
-            STATUS_BAILED => JitExecOutcome::Bailed(native_frame.header.pc),
-            STATUS_THREW => JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand)),
-            _ => JitExecOutcome::Threw(VmError::InvalidOperand),
+        let payload = payload_root.map(|root| unsafe { (*vm).jit_generated_result_root(root) });
+        let outcome = match status {
+            Some(NativeResultStatus::Success) if error.is_none() => {
+                JitExecOutcome::Returned(payload.expect("return payload rooted"))
+            }
+            Some(NativeResultStatus::SideExit) if error.is_none() => match ret.logical_pc() {
+                Some(pc) if pc == native_frame.header.pc => {
+                    debug_assert_eq!(pc, native_frame.header.pc);
+                    JitExecOutcome::Bailed(pc)
+                }
+                Some(_) | None => JitExecOutcome::Fatal(VmError::InvalidOperand),
+            },
+            Some(NativeResultStatus::Throw) if error.is_none() => {
+                JitExecOutcome::Throw(payload.expect("throw payload rooted"))
+            }
+            Some(NativeResultStatus::Fatal) => {
+                JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand))
+            }
+            Some(
+                NativeResultStatus::Success
+                | NativeResultStatus::SideExit
+                | NativeResultStatus::Throw
+                | NativeResultStatus::Continue
+                | NativeResultStatus::OutOfMemory,
+            )
+            | None => JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand)),
+        };
+        if let Some(root) = payload_root {
+            // SAFETY: LIFO token was created above on this interpreter and no
+            // caller can observe it before `enter_compiled` returns.
+            unsafe { (*vm).jit_release_generated_result_root(root) };
         }
+        outcome
     }
 }

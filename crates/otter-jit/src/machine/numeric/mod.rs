@@ -5,15 +5,18 @@
 //!   guarded property and element accesses, typed array construction, explicit
 //!   reentrant calls, and catch landing pads.
 //! - `arm64` — allocation-driven AArch64 emission.
-//! - [`try_compile`] — production optimizing-tier entry for this vertical slice.
+//! - [`try_compile`] — the sole production optimizing-tier entry.
 //!
 //! # Invariants
 //! - Bytecode is inspected only while building HIR; Machine IR and the emitter
 //!   contain no bytecode operations.
 //! - Parameter guards bail at logical PC zero before observable effects.
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
-//! - Reducible loop headers publish one representation-checked OSR trampoline
-//!   that fills only live block parameters and never mutates the VM window.
+//! - Reducible loop headers outside active exception regions publish one
+//!   representation-checked OSR trampoline that fills only live block
+//!   parameters and never mutates the VM window. A protected header remains in
+//!   the Machine body but cannot be entered without its materialized handler
+//!   stack.
 //! - Empty arithmetic feedback keeps tagged inputs and selects guarded Number
 //!   operations; it never becomes an unconditional exit. Heterogeneous phi
 //!   edges perform only lossless numeric widening or scalar boxing in explicit
@@ -21,17 +24,18 @@
 //! - Every representation-changing CFG edge is split. Lossless widening or
 //!   boxing executes after any exact backedge poll and before the successor's
 //!   phi moves; deopt state retains the original HIR values.
-//! - Settled element accesses consume late allocator locations, perform no
-//!   allocation or reentry on the generated path, and deopt before effects on
-//!   any receiver, index, bounds, layout, or representation miss. Ordinary
-//!   packed-double arrays keep their payload and scalar index unboxed through
-//!   an exact Float64-to-Uint32 index guard; other families retain the tagged
-//!   value and tagged Float64-index path. Missing or incompatible direct
-//!   metadata selects the canonical reentrant boxed-value call, which roots
-//!   every live tagged value and completes the operation exactly once without
-//!   deoptimization or replay. Generic accesses inside local catch regions
-//!   remain on a materialized backend until Machine committed-throw landing is
-//!   explicit.
+//! - Settled element accesses consume late allocator locations and perform no
+//!   allocation or reentry on the generated hit. Ordinary packed-double arrays
+//!   keep payload and scalar index unboxed through an exact
+//!   Float64-to-Uint32 index guard; every miss remains a pre-effect deopt.
+//!   Other prepared families retain an allocation-free fast index. Tagged and
+//!   Number indices are already exact rooted Values; raw Int32/Uint32 indices
+//!   remain in allocator-owned late homes and box only inside the cold sibling.
+//!   Any receiver, index, bounds, layout, or hole miss calls the same canonical
+//!   reentrant boxed-value boundary selected for missing direct metadata, with
+//!   precise moving roots and effect-once completion. Tagged and generic
+//!   committed accesses inside local catch regions remain materialized until
+//!   Machine committed-throw landing is explicit.
 //! - Settled own-data property accesses likewise consume tagged late locations;
 //!   metadata and shape misses deopt at the original operation before effects.
 //!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
@@ -42,6 +46,9 @@
 //! - Prepared global lexical and object reads carry their complete immutable
 //!   guard metadata into Machine IR. Their generated hits are non-allocating,
 //!   safepoint-free tagged loads with exact pre-operation deopt state.
+//! - Eagerly prepared string literals lower to one symbolic stable-cell
+//!   relocation and tagged load. No moving string handle, safepoint, deopt
+//!   state, or runtime-fill boundary survives selection.
 //! - Tagged loose equality against a static nullish literal classifies
 //!   immediates directly but exits before its Boolean definition for any cell,
 //!   preserving canonical HTMLDDA semantics without a generated call.
@@ -51,26 +58,32 @@
 //! - Zero-argument and one-Int32-argument `ArrayConstruct` operations call the
 //!   stack-owned allocating boundary directly with fixed ABI registers. Wider
 //!   or non-Int32 forms remain outside this pipeline.
-//! - Complete one-to-four-target guarded method chains, monomorphic plain calls,
-//!   and fixed/spread base/derived/super construction share one typed descriptor
-//!   and generated linkage emitter. A never-attempted unplanned plain/method call
-//!   selects a pure, root-free, safepoint-free exact deopt boundary.
+//! - Complete one-to-four-target guarded method chains, zero-candidate attempted
+//!   methods, monomorphic plain calls, and fixed/spread base/derived/super
+//!   construction share one typed descriptor and generated linkage emitter.
+//!   Method arity is independent of guarded target count. Every method's
+//!   receiver-plus-argument packet fits one frame-wide untraced raw window used
+//!   only by its canonical final miss. A never-attempted unplanned plain/method
+//!   call selects a pure, root-free, safepoint-free exact deopt boundary.
 //!   Spread lowering consumes the compiler-created dense argument array;
 //!   eligible callees cannot observe discarded arguments through rest or the
 //!   `arguments` object.
-//!   Calls inside supported catch regions own explicit exceptional CFG
-//!   successors rather than leaving compiled code.
+//!   Fixed committed boxed-value calls inside supported catch regions own
+//!   explicit exceptional CFG successors. Generated JavaScript-call linkage
+//!   remains outside local catches until it returns a pure exception value
+//!   instead of a pending VM exception side channel.
 
 mod arm64;
 mod hir;
+mod semantics;
 
 use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
-        STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BIND_DERIVED_THIS,
-        STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
+        STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL,
+        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL,
+        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
         STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
         STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
@@ -79,9 +92,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{
     NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
-    NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFunction, NumericNode,
-    NumericPackedDoubleViewCachePlan, NumericTerminator, NumericType,
+    NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFrameStatePurpose,
+    NumericFunction, NumericNode, NumericPackedDoubleViewCachePlan, NumericTerminator, NumericType,
 };
+use self::semantics::CommittedValueOperation;
 use super::{
     CallDescriptor, CallEffects, CallTarget, ColdCallKind, ControlFlow, DeoptId,
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
@@ -97,15 +111,59 @@ use crate::{
     optimizing::{OptimizedCode, OptimizedMetadata},
 };
 
+/// Frame-wide untraced packet used by a method call's canonical final miss.
+///
+/// Packed-double caches own the raw prefix. The packet starts immediately
+/// after that prefix and is sized for the widest selected Method descriptor;
+/// descriptor arguments include the receiver in word zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MethodValuePacketFrame {
+    pub(super) raw_start: u16,
+    pub(super) raw_words: u16,
+}
+
+pub(super) fn method_value_packet_frame(
+    sequence: &InstructionSequence,
+) -> Result<MethodValuePacketFrame, Unsupported> {
+    let cache_words = u16::try_from(PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS)
+        .map_err(|_| Unsupported::OperandShape("scalar raw-cache word count"))?;
+    let raw_start = u16::from(sequence.packed_double_view_cache_count())
+        .checked_mul(cache_words)
+        .ok_or(Unsupported::OperandShape(
+            "scalar packed-double view-cache frame",
+        ))?;
+    let raw_words = sequence
+        .call_descriptors()
+        .iter()
+        .filter(|descriptor| {
+            matches!(
+                &descriptor.target,
+                CallTarget::Direct {
+                    kind: DirectCallKind::Method,
+                    ..
+                }
+            )
+        })
+        .map(|descriptor| descriptor.arguments.len())
+        .max()
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| Unsupported::OperandShape("scalar method-value packet frame"))?
+        .unwrap_or(0);
+    Ok(MethodValuePacketFrame {
+        raw_start,
+        raw_words,
+    })
+}
+
 pub(crate) fn try_compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
     artifact_request: Option<ArtifactRequest>,
-) -> Result<Option<NativeCompileOutput<OptimizedCode>>, Unsupported> {
-    let Some(hir) = NumericFunction::build(view) else {
-        return Ok(None);
-    };
+) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
+    let hir = NumericFunction::build(view)
+        .ok_or(Unsupported::OperandShape("function outside Machine HIR"))?;
     let packed_double_view_caches = hir.plan_packed_double_view_caches(view);
     let sequence = select_with_packed_double_view_caches(&hir, &packed_double_view_caches)
         .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
@@ -133,13 +191,15 @@ pub(crate) fn try_compile(
             .frame_states
             .iter()
             .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
+    let method_packet = method_value_packet_frame(&sequence)?;
     let frame = arm64::frame_layout_with_raw_slots(
         &allocation,
         machine_safepoints.root_slot_count(),
-        u16::from(sequence.packed_double_view_cache_count())
-            .checked_mul(PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS as u16)
+        method_packet
+            .raw_start
+            .checked_add(method_packet.raw_words)
             .ok_or(Unsupported::OperandShape(
-                "scalar packed-double view-cache frame",
+                "scalar method-value packet frame",
             ))?,
     )?;
     let deopt_table = lower_deopt_table(
@@ -176,6 +236,7 @@ pub(crate) fn try_compile(
         frame,
         &deopt_runtime,
         &machine_safepoints,
+        transitions,
         transitions.entry(STUB_JIT_BACKEDGE_POLL),
         transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
         transitions.entry(STUB_JIT_DEOPT_STACK_CALL),
@@ -185,7 +246,6 @@ pub(crate) fn try_compile(
         transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
         transitions.entry(STUB_JIT_COPY_SPREAD_ARGUMENTS),
         transitions.entry(STUB_JIT_INITIALIZE_UPVALUES),
-        transitions.entry(STUB_JIT_BIND_DERIVED_THIS),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -205,6 +265,7 @@ pub(crate) fn try_compile(
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT),
         transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
+        transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
         &mut load_ic_cells,
         &mut store_ic_cells,
         view.code_block.register_count,
@@ -213,8 +274,6 @@ pub(crate) fn try_compile(
     let machine_register_count = u8::try_from(allocation.used_register_count())
         .map_err(|_| Unsupported::OperandShape("scalar machine register count"))?;
     let safepoints = machine_safepoints.records().to_vec().into_boxed_slice();
-    let frame_maps = Box::default();
-    let frame_map_bitmap_words = Box::default();
 
     let arm64::Emission {
         code: emitted_code,
@@ -279,8 +338,6 @@ pub(crate) fn try_compile(
         Some(generated_stack_frame_bytes),
         deopt_runtime,
         safepoints,
-        frame_maps,
-        frame_map_bitmap_words,
         osr_entries,
         Box::default(),
         load_ic_cells,
@@ -292,18 +349,18 @@ pub(crate) fn try_compile(
             register_count: view.code_block.register_count,
             parameter_prefix_entry,
             machine_register_count,
-            linear_scan_spill_slot_count: allocation.spill_slots(),
+            allocator_spill_slot_count: allocation.spill_slots(),
             spill_slot_count: allocation
                 .spill_slots()
                 .saturating_add(u32::from(machine_safepoints.root_slot_count()))
                 .saturating_add(u32::from(frame.raw_slots())),
         },
     );
-    Ok(Some(NativeCompileOutput {
+    Ok(NativeCompileOutput {
         code,
         artifact,
         diagnostics: Box::default(),
-    }))
+    })
 }
 
 fn select_with_packed_double_view_caches(
@@ -362,6 +419,18 @@ fn select_with_packed_double_view_caches(
             else {
                 unreachable!("selected block is original or split edge")
             };
+            if is_exceptional_hir_edge(hir, predecessor, edge) {
+                let descriptor_index = intern_call_descriptor(
+                    &mut call_descriptors,
+                    caught_throw_acknowledgement_descriptor(),
+                );
+                let mut acknowledgement = MachineInstruction::plain(
+                    MachineOpcode::Call(descriptor_index as u32),
+                    Vec::new(),
+                );
+                acknowledgement.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                instructions.push(acknowledgement);
+            }
             if successor <= predecessor {
                 let point = NumericFramePoint::Backedge { predecessor, edge };
                 let deopt = frame_state_ids[&point];
@@ -423,10 +492,11 @@ fn select_with_packed_double_view_caches(
                 ));
             }
         }
-        if block
-            .predecessors
-            .iter()
-            .any(|&predecessor| predecessor >= block_index)
+        if block.osr_entry_allowed
+            && block
+                .predecessors
+                .iter()
+                .any(|&predecessor| predecessor >= block_index)
         {
             debug_assert_eq!(block.parameters.len(), block.parameter_registers.len());
             let inputs = block
@@ -584,6 +654,14 @@ fn select_with_packed_double_view_caches(
                     load.clobbers = upvalue_load_clobbers();
                     load
                 }
+                NumericNode::StringConstantCell { byte_pc, target } => {
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::StringConstantCellLoad { byte_pc, target },
+                        vec![MachineOperand::register_output(result)],
+                    );
+                    load.clobbers = string_constant_cell_load_clobbers();
+                    load
+                }
                 NumericNode::GlobalLexicalLoad { byte_pc, target } => {
                     let mut load = MachineInstruction::plain(
                         MachineOpcode::GlobalLexicalLoad { byte_pc, target },
@@ -600,38 +678,71 @@ fn select_with_packed_double_view_caches(
                     load.clobbers = global_object_load_clobbers();
                     load
                 }
-                NumericNode::BindThis {
-                    source,
-                    logical_pc: _,
-                    byte_pc: _,
+                NumericNode::CommittedValue {
+                    operation,
+                    inputs,
+                    logical_pc,
+                    byte_pc,
                     exceptional_edge,
                 } => {
-                    let source = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        source,
-                    );
+                    if inputs[0].is_none() && inputs[1].is_some() {
+                        return Err(super::VerificationError::OpcodeSignatureMismatch(
+                            MachineInstructionId(instructions.len() as u32),
+                        ));
+                    }
+                    let inputs = inputs
+                        .into_iter()
+                        .flatten()
+                        .map(|input| {
+                            tagged_call_argument(
+                                hir,
+                                &values,
+                                &mut representations,
+                                &mut instructions,
+                                input,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let semantic_arity = u8::try_from(inputs.len()).map_err(|_| {
+                        super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
+                            instructions.len() as u32,
+                        ))
+                    })?;
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
-                        bind_derived_this_descriptor(exceptional_edge.map(|edge| {
-                            let edge = usize::from(edge);
-                            selection_cfg
-                                .split_edges
-                                .get(&(block_index, edge))
-                                .copied()
-                                .unwrap_or_else(|| selection_cfg.originals[block.successors[edge]])
-                        })),
+                        committed_value_descriptor(
+                            operation,
+                            logical_pc,
+                            byte_pc,
+                            semantic_arity,
+                            exceptional_edge.map(|edge| {
+                                let edge = usize::from(edge);
+                                selection_cfg
+                                    .split_edges
+                                    .get(&(block_index, edge))
+                                    .copied()
+                                    .unwrap_or_else(|| {
+                                        selection_cfg.originals[block.successors[edge]]
+                                    })
+                            }),
+                        ),
                     );
+                    let mut operands = inputs
+                        .iter()
+                        .copied()
+                        .map(MachineOperand::location_input)
+                        .collect::<Vec<_>>();
+                    operands.push(MachineOperand::register_output(result));
+                    append_unique_tagged_roots(&mut operands, inputs);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
-                        vec![
-                            MachineOperand::register_input(source),
-                            MachineOperand::register_output(result),
-                        ],
+                        operands,
                     );
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
                     call
                 }
                 NumericNode::ConstructorFieldStore {
@@ -691,24 +802,49 @@ fn select_with_packed_double_view_caches(
                     {
                         return Err(super::VerificationError::InvalidValue(index));
                     }
-                    let mut load = MachineInstruction::plain(
-                        match access {
-                            NumericElementAccess::Tagged => MachineOpcode::ElementLoad(byte_pc),
-                            NumericElementAccess::PackedDouble => {
+                    let receiver = machine_value(&values, receiver);
+                    match access {
+                        NumericElementAccess::Tagged => {
+                            let mut operands = vec![
+                                MachineOperand::location_input(receiver),
+                                MachineOperand::location_input(index),
+                                MachineOperand::register_output(result),
+                            ];
+                            append_unique_tagged_roots(
+                                &mut operands,
+                                [receiver].into_iter().chain(
+                                    (representations[index.0 as usize]
+                                        == MachineRepresentation::Tagged)
+                                        .then_some(index),
+                                ),
+                            );
+                            let mut load = MachineInstruction::plain(
+                                MachineOpcode::ElementLoad(byte_pc),
+                                operands,
+                            );
+                            load.clobbers = element_clobbers();
+                            load.safepoint = Some(super::SafepointId(next_safepoint));
+                            next_safepoint = next_safepoint
+                                .checked_add(1)
+                                .expect("bounded scalar function safepoint count");
+                            load
+                        }
+                        NumericElementAccess::PackedDouble => {
+                            let mut load = MachineInstruction::plain(
                                 MachineOpcode::PackedDoubleElementLoad {
                                     byte_pc,
                                     cache: packed_double_view_caches.cache_for(node_value),
-                                }
-                            }
-                        },
-                        vec![
-                            MachineOperand::location_input(machine_value(&values, receiver)),
-                            MachineOperand::location_input(index),
-                            MachineOperand::register_output(result),
-                        ],
-                    );
-                    load.clobbers = element_clobbers();
-                    load
+                                },
+                                vec![
+                                    MachineOperand::location_input(receiver),
+                                    MachineOperand::location_input(index),
+                                    MachineOperand::register_output(result),
+                                ],
+                            );
+                            load.clobbers = element_clobbers();
+                            load
+                        }
+                    }
                 }
                 NumericNode::ElementStore {
                     receiver,
@@ -755,28 +891,49 @@ fn select_with_packed_double_view_caches(
                     {
                         return Err(super::VerificationError::InvalidValue(index));
                     }
-                    let mut store = MachineInstruction::plain(
-                        match access {
-                            NumericElementAccess::Tagged => MachineOpcode::ElementStore(byte_pc),
-                            NumericElementAccess::PackedDouble => {
+                    let receiver = machine_value(&values, receiver);
+                    match access {
+                        NumericElementAccess::Tagged => {
+                            let mut operands = vec![
+                                MachineOperand::location_input(receiver),
+                                MachineOperand::location_input(index),
+                                MachineOperand::location_input(value),
+                            ];
+                            append_unique_tagged_roots(
+                                &mut operands,
+                                [receiver, value].into_iter().chain(
+                                    (representations[index.0 as usize]
+                                        == MachineRepresentation::Tagged)
+                                        .then_some(index),
+                                ),
+                            );
+                            let mut store = MachineInstruction::plain(
+                                MachineOpcode::ElementStore(byte_pc),
+                                operands,
+                            );
+                            store.clobbers = element_clobbers();
+                            store.safepoint = Some(super::SafepointId(next_safepoint));
+                            next_safepoint = next_safepoint
+                                .checked_add(1)
+                                .expect("bounded scalar function safepoint count");
+                            store
+                        }
+                        NumericElementAccess::PackedDouble => {
+                            let mut store = MachineInstruction::plain(
                                 MachineOpcode::PackedDoubleElementStore {
                                     byte_pc,
                                     cache: packed_double_view_caches.cache_for(node_value),
-                                }
-                            }
-                        },
-                        vec![
-                            MachineOperand::location_input(machine_value(&values, receiver)),
-                            MachineOperand::location_input(index),
-                            if access == NumericElementAccess::PackedDouble {
-                                MachineOperand::register_input(value)
-                            } else {
-                                MachineOperand::location_input(value)
-                            },
-                        ],
-                    );
-                    store.clobbers = element_clobbers();
-                    store
+                                },
+                                vec![
+                                    MachineOperand::location_input(receiver),
+                                    MachineOperand::location_input(index),
+                                    MachineOperand::register_input(value),
+                                ],
+                            );
+                            store.clobbers = element_clobbers();
+                            store
+                        }
+                    }
                 }
                 NumericNode::GenericElementLoad {
                     receiver, index, ..
@@ -802,15 +959,15 @@ fn select_with_packed_double_view_caches(
                             2,
                         ),
                     );
+                    let mut operands = vec![
+                        MachineOperand::register_input(receiver),
+                        MachineOperand::register_input(index),
+                        MachineOperand::register_output(result),
+                    ];
+                    append_unique_tagged_roots(&mut operands, [receiver, index]);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
-                        vec![
-                            MachineOperand::register_input(receiver),
-                            MachineOperand::register_input(index),
-                            MachineOperand::register_output(result),
-                            MachineOperand::tagged_root(receiver),
-                            MachineOperand::tagged_root(index),
-                        ],
+                        operands,
                     );
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call.safepoint = Some(super::SafepointId(next_safepoint));
@@ -853,16 +1010,15 @@ fn select_with_packed_double_view_caches(
                             3,
                         ),
                     );
+                    let mut operands = vec![
+                        MachineOperand::register_input(receiver),
+                        MachineOperand::register_input(index),
+                        MachineOperand::register_input(value),
+                    ];
+                    append_unique_tagged_roots(&mut operands, [receiver, index, value]);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
-                        vec![
-                            MachineOperand::register_input(receiver),
-                            MachineOperand::register_input(index),
-                            MachineOperand::register_input(value),
-                            MachineOperand::tagged_root(receiver),
-                            MachineOperand::tagged_root(index),
-                            MachineOperand::tagged_root(value),
-                        ],
+                        operands,
                     );
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call.safepoint = Some(super::SafepointId(next_safepoint));
@@ -1371,9 +1527,12 @@ fn select_with_packed_double_view_caches(
                     );
                     let (argument_mode, arguments) = match arguments {
                         NumericDirectCallArguments::Fixed { start, count } => {
-                            let argument_start = usize::from(start);
+                            let argument_start = usize::try_from(start)
+                                .map_err(|_| super::VerificationError::InvalidValue(result))?;
+                            let argument_count = usize::try_from(count)
+                                .map_err(|_| super::VerificationError::InvalidValue(result))?;
                             let argument_end = argument_start
-                                .checked_add(usize::from(count))
+                                .checked_add(argument_count)
                                 .ok_or(super::VerificationError::InvalidValue(result))?;
                             let arguments = hir
                                 .direct_call_arguments
@@ -1421,36 +1580,36 @@ fn select_with_packed_double_view_caches(
                         ));
                         receiver
                     });
-                    let descriptor_index = intern_call_descriptor(
-                        &mut call_descriptors,
-                        direct_call_descriptor(
-                            target,
-                            hir,
-                            logical_pc,
-                            byte_pc,
-                            argument_mode,
-                            arguments.len(),
-                            exceptional_edge.map(|edge| {
-                                let edge = usize::from(edge);
-                                selection_cfg
-                                    .split_edges
-                                    .get(&(block_index, edge))
-                                    .copied()
-                                    .unwrap_or_else(|| {
-                                        selection_cfg.originals[block.successors[edge]]
-                                    })
-                            }),
-                        ),
-                    );
-                    let argument_roots = arguments.clone();
+                    let descriptor = direct_call_descriptor(
+                        target,
+                        hir,
+                        logical_pc,
+                        byte_pc,
+                        argument_mode,
+                        arguments.len(),
+                        exceptional_edge.map(|edge| {
+                            let edge = usize::from(edge);
+                            selection_cfg
+                                .split_edges
+                                .get(&(block_index, edge))
+                                .copied()
+                                .unwrap_or_else(|| selection_cfg.originals[block.successors[edge]])
+                        }),
+                    )
+                    .ok_or(super::VerificationError::InvalidValue(result))?;
+                    let descriptor_index =
+                        intern_call_descriptor(&mut call_descriptors, descriptor);
+                    let mut call_roots = BTreeSet::new();
+                    call_roots.insert(source_value);
+                    call_roots.extend(arguments.iter().copied());
                     let mut operands = Vec::with_capacity(arguments.len() + 2);
                     operands.push(MachineOperand::register_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::register_input));
                     operands.push(MachineOperand::register_output(result));
                     if let Some(receiver) = construct_receiver {
-                        operands.push(MachineOperand::tagged_root(receiver));
+                        call_roots.insert(receiver);
                     }
-                    operands.extend(argument_roots.into_iter().map(MachineOperand::tagged_root));
+                    operands.extend(call_roots.into_iter().map(MachineOperand::tagged_root));
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -1534,7 +1693,20 @@ fn select_with_packed_double_view_caches(
                 }
             };
             if let Some(&deopt) = frame_state_ids.get(&NumericFramePoint::Node(node_value)) {
-                attach_frame_state(hir, &values, deopt, &mut instruction);
+                match node.frame_state_purpose() {
+                    Some(NumericFrameStatePurpose::TaggedRoots) => {
+                        attach_frame_state_tagged_roots(hir, &values, deopt, &mut instruction);
+                    }
+                    Some(
+                        NumericFrameStatePurpose::ExactDeopt
+                        | NumericFrameStatePurpose::RuntimeMetadata,
+                    ) => attach_frame_state(hir, &values, deopt, &mut instruction),
+                    None => {
+                        return Err(super::VerificationError::OpcodeSignatureMismatch(
+                            MachineInstructionId(instructions.len() as u32),
+                        ));
+                    }
+                }
             }
             attach_safepoint_roots(&representations, &mut instruction);
             instructions.push(instruction);
@@ -1618,7 +1790,7 @@ fn select_with_packed_double_view_caches(
         ));
     }
 
-    InstructionSequence::new_with_packed_double_view_caches(
+    InstructionSequence::new_selected_with_packed_double_view_caches(
         selection_cfg.originals[0],
         representations,
         call_descriptors,
@@ -1680,6 +1852,10 @@ fn global_lexical_load_clobbers() -> Vec<PhysicalRegister> {
         .collect()
 }
 
+fn string_constant_cell_load_clobbers() -> Vec<PhysicalRegister> {
+    [9, 13].into_iter().map(PhysicalRegister::integer).collect()
+}
+
 fn global_object_load_clobbers() -> Vec<PhysicalRegister> {
     [9, 11, 12, 13, 14, 15]
         .into_iter()
@@ -1733,6 +1909,20 @@ fn array_construct_call_descriptor() -> CallDescriptor {
     }
 }
 
+fn caught_throw_acknowledgement_descriptor() -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW),
+        arguments: Vec::new(),
+        result: None,
+        // This leaf mutates VM-owned diagnostic provenance. Describe it as a
+        // write so it cannot be treated as a freely movable pure computation.
+        effects: CallEffects::WRITES_HEAP,
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::None,
+    }
+}
+
 fn generic_element_call_descriptor(
     target: otter_vm::native_abi::RuntimeStubDescriptor,
     argument_count: usize,
@@ -1764,8 +1954,9 @@ fn direct_call_descriptor(
     argument_mode: DirectCallArgumentMode,
     argument_count: usize,
     landing_pad: Option<MachineBlock>,
-) -> CallDescriptor {
-    CallDescriptor {
+) -> Option<CallDescriptor> {
+    let packet_words = argument_count.checked_add(1)?;
+    Some(CallDescriptor {
         target: CallTarget::Direct {
             kind: match target.kind {
                 NumericDirectCallKind::Plain => DirectCallKind::Plain,
@@ -1792,7 +1983,7 @@ fn direct_call_descriptor(
             logical_pc,
             byte_pc,
         },
-        arguments: vec![MachineRepresentation::Tagged; argument_count + 1],
+        arguments: vec![MachineRepresentation::Tagged; packet_words],
         result: Some(MachineRepresentation::Tagged),
         effects: CallEffects::READS_HEAP
             .union(CallEffects::WRITES_HEAP)
@@ -1803,7 +1994,7 @@ fn direct_call_descriptor(
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
         safepoint: SafepointKind::Gc,
-    }
+    })
 }
 
 fn cold_call_exit_descriptor(
@@ -1834,17 +2025,37 @@ fn cold_call_exit_descriptor(
     }
 }
 
-fn bind_derived_this_descriptor(landing_pad: Option<MachineBlock>) -> CallDescriptor {
+fn committed_value_descriptor(
+    operation: CommittedValueOperation,
+    logical_pc: u32,
+    byte_pc: u32,
+    semantic_arity: u8,
+    landing_pad: Option<MachineBlock>,
+) -> CallDescriptor {
+    let target = match operation {
+        CommittedValueOperation::ObjectProtocol(_) => {
+            otter_vm::native_abi::STUB_JIT_OBJECT_PROTOCOL_VALUE
+        }
+        CommittedValueOperation::Scalar(_) => otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
+    };
     CallDescriptor {
-        target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_BIND_DERIVED_THIS),
-        arguments: vec![MachineRepresentation::Tagged],
+        target: CallTarget::CommittedRuntime {
+            target,
+            logical_pc,
+            byte_pc,
+            semantic_arity,
+        },
+        arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
         result: Some(MachineRepresentation::Tagged),
-        effects: CallEffects::WRITES_HEAP,
+        effects: CallEffects::READS_HEAP
+            .union(CallEffects::WRITES_HEAP)
+            .union(CallEffects::INVALIDATES_SHAPES)
+            .union(CallEffects::REENTRANT),
         clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
-        safepoint: SafepointKind::None,
+        safepoint: SafepointKind::Gc,
     }
 }
 
@@ -1857,6 +2068,22 @@ fn class_super_constructor_descriptor() -> CallDescriptor {
         clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
         exceptional: ExceptionalEdge::None,
         safepoint: SafepointKind::None,
+    }
+}
+
+fn append_unique_tagged_roots(
+    operands: &mut Vec<MachineOperand>,
+    values: impl IntoIterator<Item = MachineValue>,
+) {
+    let mut roots = operands
+        .iter()
+        .filter(|operand| operand.purpose == super::OperandPurpose::TaggedRoot)
+        .map(|operand| operand.value)
+        .collect::<BTreeSet<_>>();
+    for value in values {
+        if roots.insert(value) {
+            operands.push(MachineOperand::tagged_root(value));
+        }
     }
 }
 
@@ -1963,6 +2190,25 @@ fn attach_frame_state(
     instruction.deopt = Some(deopt);
 }
 
+fn attach_frame_state_tagged_roots(
+    hir: &NumericFunction,
+    values: &[MachineValue],
+    state_id: DeoptId,
+    instruction: &mut MachineInstruction,
+) {
+    let state = &hir.frame_states[state_id.0 as usize];
+    append_unique_tagged_roots(
+        &mut instruction.operands,
+        state.slots.iter().filter_map(|slot| {
+            let hir::NumericFrameSlot::Value(value) = *slot else {
+                return None;
+            };
+            (hir.nodes[value.0].value_type() == NumericType::Tagged)
+                .then_some(machine_value(values, value))
+        }),
+    );
+}
+
 fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
     hir.frame_states
         .iter()
@@ -2013,6 +2259,7 @@ impl SelectionCfg {
             for (predecessor, edge) in incoming_edges(hir, successor) {
                 if is_critical_edge(hir, predecessor, successor)
                     || successor <= predecessor
+                    || is_exceptional_hir_edge(hir, predecessor, edge)
                     || edge_requires_representation_conversion(hir, predecessor, edge, successor)
                     || packed_double_view_caches
                         .caches
@@ -2037,6 +2284,24 @@ impl SelectionCfg {
             split_edges,
         }
     }
+}
+
+fn is_exceptional_hir_edge(hir: &NumericFunction, predecessor: usize, edge: usize) -> bool {
+    hir.blocks[predecessor].nodes.iter().any(|value| {
+        let exceptional_edge = match hir.nodes[value.0] {
+            NumericNode::CommittedValue {
+                exceptional_edge, ..
+            }
+            | NumericNode::DirectCall {
+                exceptional_edge, ..
+            }
+            | NumericNode::ColdCallExit {
+                exceptional_edge, ..
+            } => exceptional_edge,
+            _ => None,
+        };
+        exceptional_edge.is_some_and(|exceptional_edge| usize::from(exceptional_edge) == edge)
+    })
 }
 
 fn incoming_edges(hir: &NumericFunction, successor: usize) -> Vec<(usize, usize)> {
@@ -2207,18 +2472,29 @@ mod tests {
         JitDirectCallThisMode, JitDirectCallee, JitFunctionCode, JitInlinePropertyLoad, Value,
         jit::{JitDirectCallPlan, JitMethodGuard, JitTestInstruction},
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
-        native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
+        native_abi::{
+            NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultDomain, NativeResultPair,
+            NativeResultStatus, VmFrameHeader, VmThread,
+        },
         value::tag,
     };
 
     use super::*;
-    use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
+    use crate::entry::{JitCtx, JitEntry};
     use crate::machine::{
         AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, SafepointId,
         VerificationError, lower_deopt_table,
     };
 
     const POLL_BATCH: i32 = crate::arm64::GENERATED_POLL_BATCH as i32;
+
+    fn compiled_payload_bits(result: NativeResultPair) -> u64 {
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        result.payload_bits()
+    }
 
     fn edge_conversion_hir(
         source_type: NumericType,
@@ -2262,6 +2538,7 @@ mod tests {
                 blocks: vec![
                     hir::NumericBlock {
                         logical_pc: 0,
+                        osr_entry_allowed: true,
                         predecessors: Vec::new(),
                         successors: vec![1],
                         parameters: Vec::new(),
@@ -2272,6 +2549,7 @@ mod tests {
                     },
                     hir::NumericBlock {
                         logical_pc: 1,
+                        osr_entry_allowed: true,
                         predecessors: vec![0],
                         successors: Vec::new(),
                         parameters: vec![parameter],
@@ -2305,6 +2583,7 @@ mod tests {
             blocks: vec![
                 hir::NumericBlock {
                     logical_pc: 0,
+                    osr_entry_allowed: true,
                     predecessors: Vec::new(),
                     successors: vec![1],
                     parameters: Vec::new(),
@@ -2315,6 +2594,7 @@ mod tests {
                 },
                 hir::NumericBlock {
                     logical_pc: 1,
+                    osr_entry_allowed: true,
                     predecessors: vec![0, 2],
                     successors: vec![2],
                     parameters: vec![value(1)],
@@ -2325,6 +2605,7 @@ mod tests {
                 },
                 hir::NumericBlock {
                     logical_pc: 2,
+                    osr_entry_allowed: true,
                     predecessors: vec![1],
                     successors: vec![1],
                     parameters: Vec::new(),
@@ -2391,6 +2672,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -2435,6 +2717,62 @@ mod tests {
         }
     }
 
+    fn generic_wide_method_call_selection_hir(argument_count: u32) -> NumericFunction {
+        let value = hir::NumericValue;
+        NumericFunction {
+            function_id: 152,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::DirectCall {
+                    source: value(0),
+                    target: 0,
+                    arguments: NumericDirectCallArguments::Fixed {
+                        start: 0,
+                        count: argument_count,
+                    },
+                    logical_pc: 6,
+                    byte_pc: 48,
+                    exceptional_edge: None,
+                },
+            ],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                osr_entry_allowed: true,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0), value(1)],
+                terminator: NumericTerminator::Return(value(1)),
+            }],
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(1)),
+                function_id: 152,
+                byte_pc: 48,
+                slots: vec![
+                    hir::NumericFrameSlot::Value(value(0)),
+                    hir::NumericFrameSlot::Undefined,
+                ],
+            }],
+            direct_call_targets: vec![NumericDirectCallTarget {
+                kind: NumericDirectCallKind::Method,
+                candidates: Vec::new(),
+            }],
+            direct_call_arguments: vec![
+                value(0);
+                usize::try_from(argument_count)
+                    .expect("test argument count")
+            ],
+            parameter_count: 1,
+            register_count: 2,
+            arithmetic_op_count: 0,
+        }
+    }
+
     fn cold_call_selection_hir() -> NumericFunction {
         let value = hir::NumericValue;
         NumericFunction {
@@ -2454,6 +2792,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -2493,6 +2832,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -2514,6 +2854,103 @@ mod tests {
             direct_call_arguments: Vec::new(),
             parameter_count: 0,
             register_count: 2,
+            arithmetic_op_count: 0,
+        }
+    }
+
+    fn committed_value_selection_hir(local_catch: bool) -> NumericFunction {
+        let value = hir::NumericValue;
+        let committed = NumericNode::CommittedValue {
+            operation: CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::SameValue),
+            inputs: [Some(value(0)), Some(value(1))],
+            logical_pc: 6,
+            byte_pc: 48,
+            exceptional_edge: local_catch.then_some(1),
+        };
+        let mut nodes = vec![
+            NumericNode::Parameter {
+                register: 0,
+                value_type: NumericType::Tagged,
+            },
+            NumericNode::Parameter {
+                register: 1,
+                value_type: NumericType::Tagged,
+            },
+            NumericNode::Parameter {
+                register: 2,
+                value_type: NumericType::Tagged,
+            },
+            committed,
+        ];
+        let blocks = if local_catch {
+            nodes.push(NumericNode::BlockParameter(NumericType::Tagged));
+            vec![
+                hir::NumericBlock {
+                    logical_pc: 6,
+                    osr_entry_allowed: false,
+                    predecessors: Vec::new(),
+                    successors: vec![1, 2],
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: vec![Vec::new(), vec![value(3)]],
+                    nodes: vec![value(0), value(1), value(2), value(3)],
+                    terminator: NumericTerminator::Jump,
+                },
+                hir::NumericBlock {
+                    logical_pc: 7,
+                    osr_entry_allowed: true,
+                    predecessors: vec![0],
+                    successors: Vec::new(),
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: Vec::new(),
+                    nodes: Vec::new(),
+                    terminator: NumericTerminator::Return(value(3)),
+                },
+                hir::NumericBlock {
+                    logical_pc: 9,
+                    osr_entry_allowed: true,
+                    predecessors: vec![0],
+                    successors: Vec::new(),
+                    parameters: vec![value(4)],
+                    parameter_registers: vec![3],
+                    successor_arguments: Vec::new(),
+                    nodes: vec![value(4)],
+                    terminator: NumericTerminator::Return(value(4)),
+                },
+            ]
+        } else {
+            vec![hir::NumericBlock {
+                logical_pc: 0,
+                osr_entry_allowed: true,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0), value(1), value(2), value(3)],
+                terminator: NumericTerminator::Return(value(3)),
+            }]
+        };
+        NumericFunction {
+            function_id: 153,
+            nodes,
+            blocks,
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(3)),
+                function_id: 153,
+                byte_pc: 48,
+                slots: vec![
+                    hir::NumericFrameSlot::Value(value(0)),
+                    hir::NumericFrameSlot::Value(value(1)),
+                    hir::NumericFrameSlot::Value(value(2)),
+                    hir::NumericFrameSlot::Undefined,
+                ],
+            }],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 3,
+            register_count: 4,
             arithmetic_op_count: 0,
         }
     }
@@ -4349,10 +4786,13 @@ mod tests {
     ) -> NativeCompileOutput<OptimizedCode> {
         try_compile(view, 7001, transitions, artifact_request)
             .expect("numeric Machine IR code generation")
-            .expect("eligible numeric function")
     }
 
-    fn execute(code: &OptimizedCode, args: &[u64], initial_pc: u32) -> (JitRet, Vec<u64>, u32) {
+    fn execute(
+        code: &OptimizedCode,
+        args: &[u64],
+        initial_pc: u32,
+    ) -> (NativeResultPair, Vec<u64>, u32) {
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
         let result = execute_with_poll_cells(
@@ -4378,7 +4818,7 @@ mod tests {
         initial_pc: u32,
         interrupt: *const u8,
         fuel: &mut u64,
-    ) -> (JitRet, Vec<u64>, u32) {
+    ) -> (NativeResultPair, Vec<u64>, u32) {
         assert!(args.len() <= code.metadata().register_count as usize);
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let mut frame = vec![Value::undefined().to_bits(); code.metadata().register_count as usize];
@@ -4392,7 +4832,7 @@ mod tests {
         frame: Vec<u64>,
         interrupt: *const u8,
         fuel: &mut u64,
-    ) -> (JitRet, Vec<u64>, u32) {
+    ) -> (NativeResultPair, Vec<u64>, u32) {
         // SAFETY: the code object owns the recorded trampoline throughout the call.
         let entry = unsafe {
             code.osr_entry_ptr_for_test(logical_pc)
@@ -4410,7 +4850,7 @@ mod tests {
         initial_pc: u32,
         interrupt: *const u8,
         fuel: &mut u64,
-    ) -> (JitRet, Vec<u64>, u32) {
+    ) -> (NativeResultPair, Vec<u64>, u32) {
         let register_count = code.metadata().register_count;
         let (result, frame, pc, _) = execute_at_with_register_count(
             code,
@@ -4434,7 +4874,7 @@ mod tests {
         this_value: Value,
         interrupt: *const u8,
         fuel: &mut u64,
-    ) -> (JitRet, Vec<u64>, u32, u16) {
+    ) -> (NativeResultPair, Vec<u64>, u32, u16) {
         let heap = otter_gc::GcHeap::new().expect("execution-test heap");
         execute_at_with_heap(
             code,
@@ -4460,13 +4900,12 @@ mod tests {
         heap: *const otter_gc::GcHeap,
         interrupt: *const u8,
         fuel: &mut u64,
-    ) -> (JitRet, Vec<u64>, u32, u16) {
+    ) -> (NativeResultPair, Vec<u64>, u32, u16) {
         assert_eq!(frame.len(), code.metadata().register_count as usize);
         let metadata = code.metadata();
         let mut native_frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: metadata.function_id,
-                code_block_id: metadata.function_id,
                 pc: initial_pc,
                 register_count: initialized_register_count,
                 kind: NativeFrameKind::Optimizing,
@@ -4476,7 +4915,6 @@ mod tests {
             Value::undefined(),
             this_value,
         );
-        native_frame.set_materialized_activation(0);
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.current_code_object_id = metadata.code_object_id;
@@ -4553,6 +4991,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -4616,6 +5055,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -4684,6 +5124,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -4746,6 +5187,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -4797,6 +5239,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -4863,6 +5306,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -4901,6 +5345,34 @@ mod tests {
         }
     }
 
+    fn string_constant_selection_hir() -> NumericFunction {
+        let value = |index| hir::NumericValue(index);
+        NumericFunction {
+            function_id: 96,
+            nodes: vec![NumericNode::StringConstantCell {
+                byte_pc: 24,
+                target: otter_vm::jit::JitStringConstantCell { cell_addr: 0x1238 },
+            }],
+            blocks: vec![hir::NumericBlock {
+                logical_pc: 0,
+                osr_entry_allowed: true,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0)],
+                terminator: NumericTerminator::Return(value(0)),
+            }],
+            frame_states: Vec::new(),
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 0,
+            register_count: 1,
+            arithmetic_op_count: 0,
+        }
+    }
+
     fn tagged_nullish_selection_hir(equal: bool) -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
@@ -4918,6 +5390,7 @@ mod tests {
             ],
             blocks: vec![hir::NumericBlock {
                 logical_pc: 0,
+                osr_entry_allowed: true,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
                 parameters: Vec::new(),
@@ -5029,8 +5502,8 @@ mod tests {
                 .iter()
                 .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
                 .count(),
-            1,
-            "the shared argument root must not be multiplied by candidate count"
+            2,
+            "receiver and argument roots must not be multiplied by candidate count"
         );
         assert_eq!(
             sequence
@@ -5050,6 +5523,72 @@ mod tests {
             1,
             "argument boxing is shared by the whole chain"
         );
+    }
+
+    #[test]
+    fn selects_wide_generic_methods_with_deduplicated_alias_roots_and_raw_packet() {
+        for argument_count in [5_u32, 8, 300] {
+            let mut sequence = select(&generic_wide_method_call_selection_hir(argument_count))
+                .expect("wide generic method Machine IR");
+            let call = sequence
+                .instructions()
+                .iter()
+                .find(|instruction| matches!(instruction.opcode, MachineOpcode::Call(_)))
+                .expect("wide method call");
+            let MachineOpcode::Call(descriptor_index) = call.opcode else {
+                unreachable!("selected call")
+            };
+            let descriptor = &sequence.call_descriptors()[descriptor_index as usize];
+            let CallTarget::Direct {
+                kind,
+                argument_mode,
+                candidates,
+                ..
+            } = &descriptor.target
+            else {
+                panic!("generic direct method target")
+            };
+            assert_eq!(*kind, DirectCallKind::Method);
+            assert_eq!(*argument_mode, DirectCallArgumentMode::Fixed);
+            assert!(candidates.is_empty());
+            assert_eq!(descriptor.arguments.len(), argument_count as usize + 1);
+
+            let roots = call
+                .operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                .map(|operand| operand.value)
+                .collect::<Vec<_>>();
+            assert_eq!(roots, [MachineValue(0)]);
+            assert_eq!(roots.iter().copied().collect::<BTreeSet<_>>().len(), 1);
+
+            if argument_count == 8 {
+                let allocation = sequence
+                    .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                    .expect("wide generic method allocation");
+                let safepoints = lower_safepoints(&sequence, &allocation)
+                    .expect("deduplicated method safepoints");
+                let call_id = sequence
+                    .instructions()
+                    .iter()
+                    .position(|instruction| matches!(instruction.opcode, MachineOpcode::Call(_)))
+                    .map(|index| MachineInstructionId(index as u32))
+                    .expect("wide method call identity");
+                assert_eq!(
+                    safepoints
+                        .site(call_id)
+                        .expect("call safepoint")
+                        .roots
+                        .len(),
+                    1
+                );
+            }
+
+            sequence.packed_double_view_cache_count = 3;
+            let packet = method_value_packet_frame(&sequence).expect("method packet frame");
+            assert_eq!(packet.raw_start, 6);
+            assert_eq!(packet.raw_words, argument_count as u16 + 1);
+        }
     }
 
     #[test]
@@ -5121,6 +5660,91 @@ mod tests {
             .zip([2_u8, 3, 4, 0].map(PhysicalRegister::integer))
         {
             assert_eq!(location, AllocatedLocation::Register(register));
+        }
+    }
+
+    #[test]
+    fn committed_value_selection_has_pure_landing_and_complete_tagged_roots() {
+        for local_catch in [false, true] {
+            let sequence = select(&committed_value_selection_hir(local_catch))
+                .expect("committed value Machine IR");
+            let descriptor = sequence
+                .call_descriptors()
+                .iter()
+                .find(|descriptor| matches!(descriptor.target, CallTarget::CommittedRuntime { .. }))
+                .expect("committed descriptor");
+            assert_eq!(
+                descriptor.target,
+                CallTarget::CommittedRuntime {
+                    target: otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
+                    logical_pc: 6,
+                    byte_pc: 48,
+                    semantic_arity: 2,
+                }
+            );
+            if local_catch {
+                assert!(matches!(
+                    descriptor.exceptional,
+                    ExceptionalEdge::LandingPad(_)
+                ));
+                let acknowledgement_descriptor = sequence
+                    .call_descriptors()
+                    .iter()
+                    .position(|candidate| {
+                        candidate.target
+                            == CallTarget::RuntimeStub(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW)
+                    })
+                    .expect("caught-throw acknowledgement descriptor");
+                let acknowledgements = sequence
+                    .instructions()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, instruction)| {
+                        matches!(
+                            instruction.opcode,
+                            MachineOpcode::Call(descriptor)
+                                if descriptor as usize == acknowledgement_descriptor
+                        )
+                        .then_some(MachineInstructionId(index as u32))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(acknowledgements.len(), 1);
+                let acknowledgement = acknowledgements[0];
+                let acknowledgement_block = sequence
+                    .blocks()
+                    .iter()
+                    .find(|block| {
+                        block.first.0 <= acknowledgement.0 && acknowledgement.0 < block.end.0
+                    })
+                    .expect("dedicated acknowledgement block");
+                assert_eq!(acknowledgement_block.first, acknowledgement);
+                assert_eq!(acknowledgement_block.predecessors.len(), 1);
+                assert_eq!(acknowledgement_block.successors.len(), 1);
+            } else {
+                assert_eq!(descriptor.exceptional, ExceptionalEdge::Propagate);
+            }
+            let call = sequence
+                .instructions()
+                .iter()
+                .find(|instruction| {
+                    matches!(instruction.opcode, MachineOpcode::Call(index)
+                        if sequence.call_descriptors()[index as usize] == *descriptor)
+                })
+                .expect("committed call");
+            assert_eq!(call.deopt, None);
+            assert_eq!(call.safepoint, Some(SafepointId(0)));
+            let roots = call
+                .operands
+                .iter()
+                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                .map(|operand| operand.value)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                roots,
+                BTreeSet::from([MachineValue(0), MachineValue(1), MachineValue(2)]),
+                "the unrelated live tagged value is rooted with both semantic inputs"
+            );
+            sequence.verify().expect("committed sequence verification");
         }
     }
 
@@ -5206,8 +5830,16 @@ mod tests {
                 );
             };
 
-        assert_invalid(valid.clone(), &|_, candidates| {
+        let mut generic = valid.clone();
+        let CallTarget::Direct { candidates, .. } = &mut generic.call_descriptors[0].target else {
+            panic!("direct method target")
+        };
+        candidates.clear();
+        assert_eq!(generic.verify(), Ok(()));
+
+        assert_invalid(valid.clone(), &|kind, candidates| {
             candidates.clear();
+            *kind = DirectCallKind::Plain;
         });
         assert_invalid(valid.clone(), &|_, candidates| {
             candidates[1].target_index = 2;
@@ -5348,6 +5980,69 @@ mod tests {
         sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("global-load allocation");
+    }
+
+    #[test]
+    fn selects_prepared_string_as_a_pure_relocation_load() {
+        let sequence = select(&string_constant_selection_hir()).expect("string-cell Machine IR");
+        let load_id = sequence
+            .instructions()
+            .iter()
+            .position(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    MachineOpcode::StringConstantCellLoad {
+                        byte_pc: 24,
+                        target: otter_vm::jit::JitStringConstantCell { cell_addr: 0x1238 }
+                    }
+                )
+            })
+            .expect("selected string-cell load");
+        let load = &sequence.instructions()[load_id];
+        assert_eq!(
+            load.operands,
+            [MachineOperand::register_output(MachineValue(0))]
+        );
+        assert_eq!(load.clobbers, string_constant_cell_load_clobbers());
+        assert_eq!(load.deopt, None);
+        assert_eq!(load.safepoint, None);
+        assert_eq!(sequence.representations()[0], MachineRepresentation::Tagged);
+        assert!(sequence.normalized().contains("StringConstantCellLoad"));
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("string-cell allocation");
+
+        let mut malformed = sequence;
+        malformed.instructions[load_id].clobbers.clear();
+        assert_eq!(
+            malformed.verify(),
+            Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
+                MachineInstructionId(load_id as u32)
+            ))
+        );
+
+        for invalid_addr in [0, 1] {
+            let mut malformed =
+                select(&string_constant_selection_hir()).expect("fresh string-cell Machine IR");
+            let MachineOpcode::StringConstantCellLoad { byte_pc, .. } =
+                malformed.instructions[load_id].opcode
+            else {
+                unreachable!("selected string-cell load")
+            };
+            malformed.instructions[load_id].opcode = MachineOpcode::StringConstantCellLoad {
+                byte_pc,
+                target: otter_vm::jit::JitStringConstantCell {
+                    cell_addr: invalid_addr,
+                },
+            };
+            assert_eq!(
+                malformed.verify(),
+                Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
+                    MachineInstructionId(load_id as u32)
+                )),
+                "invalid cell address {invalid_addr:#x}"
+            );
+        }
     }
 
     #[test]
@@ -5745,7 +6440,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_guarded_elements_with_late_locations_and_exact_deopt_state() {
+    fn selects_guarded_elements_with_committed_miss_keys_and_precise_roots() {
         let hir = element_selection_hir(true);
         let sequence = select(&hir).expect("element Machine IR");
         let load = sequence
@@ -5762,7 +6457,15 @@ mod tests {
             ]
         );
         assert_eq!(load.clobbers, element_clobbers());
+        assert_eq!(load.safepoint, Some(SafepointId(0)));
         assert_eq!(load.deopt, Some(DeoptId(0)));
+        let load_roots = load
+            .operands
+            .iter()
+            .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+            .map(|operand| operand.value)
+            .collect::<Vec<_>>();
+        assert_eq!(load_roots, [MachineValue(0), MachineValue(1)]);
 
         let number_decode = sequence
             .instructions()
@@ -5811,7 +6514,28 @@ mod tests {
             MachineRepresentation::Tagged
         );
         assert_eq!(store.clobbers, element_clobbers());
+        assert_eq!(store.safepoint, Some(SafepointId(1)));
         assert_eq!(store.deopt, Some(DeoptId(3)));
+        let store_roots = store
+            .operands
+            .iter()
+            .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+            .map(|operand| operand.value)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store_roots.iter().copied().collect::<BTreeSet<_>>().len(),
+            store_roots.len(),
+            "aliased receiver/index/value roots are emitted once per value"
+        );
+        assert_eq!(
+            store_roots.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                MachineValue(0),
+                MachineValue(1),
+                MachineValue(2),
+                boxed_value,
+            ])
+        );
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::BoxBoolean
                 && instruction.operands.last().map(|operand| operand.value) == Some(boxed_value)
@@ -5884,6 +6608,133 @@ mod tests {
         sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("generic element allocation");
+    }
+
+    #[test]
+    fn verifier_rejects_malformed_committed_element_operands_and_roots() {
+        let sequence = select(&element_selection_hir(true)).expect("committed element Machine IR");
+        let load_id = sequence
+            .instructions()
+            .iter()
+            .position(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
+            .expect("committed element load");
+        let store_id = sequence
+            .instructions()
+            .iter()
+            .position(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
+            .expect("committed element store");
+        let expected = |index| {
+            Err(VerificationError::OpcodeSignatureMismatch(
+                MachineInstructionId(index as u32),
+            ))
+        };
+
+        let mut wrong_payload = sequence.clone();
+        wrong_payload.instructions[load_id].operands[2] =
+            MachineOperand::location_input(MachineValue(0));
+        assert_eq!(wrong_payload.verify(), expected(load_id));
+
+        let mut missing_index_root = sequence.clone();
+        missing_index_root.instructions[load_id]
+            .operands
+            .retain(|operand| {
+                !(operand.purpose == OperandPurpose::TaggedRoot && operand.value == MachineValue(1))
+            });
+        assert_eq!(missing_index_root.verify(), expected(load_id));
+
+        let mut duplicate_root = sequence.clone();
+        duplicate_root.instructions[load_id]
+            .operands
+            .push(MachineOperand::tagged_root(MachineValue(0)));
+        assert_eq!(duplicate_root.verify(), expected(load_id));
+
+        let store_value = sequence.instructions[store_id].operands[2].value;
+        let mut missing_store_value_root = sequence.clone();
+        missing_store_value_root.instructions[store_id]
+            .operands
+            .retain(|operand| {
+                !(operand.purpose == OperandPurpose::TaggedRoot && operand.value == store_value)
+            });
+        assert_eq!(missing_store_value_root.verify(), expected(store_id));
+
+        let mut missing_safepoint = sequence.clone();
+        missing_safepoint.instructions[load_id].safepoint = None;
+        assert_eq!(missing_safepoint.verify(), expected(load_id));
+
+        let mut partial_clobbers = sequence;
+        partial_clobbers.instructions[store_id].clobbers.pop();
+        assert_eq!(partial_clobbers.verify(), expected(store_id));
+    }
+
+    #[test]
+    fn committed_element_aliases_share_one_precise_root_home() {
+        let mut hir = element_selection_hir(true);
+        let NumericNode::ElementLoad { index, .. } = &mut hir.nodes[2] else {
+            panic!("element load fixture")
+        };
+        *index = hir::NumericValue(0);
+        let NumericNode::ElementStore { index, value, .. } = &mut hir.nodes[6] else {
+            panic!("element store fixture")
+        };
+        *index = hir::NumericValue(0);
+        *value = hir::NumericValue(0);
+        for state in &mut hir.frame_states {
+            if !matches!(
+                state.point,
+                NumericFramePoint::Node(hir::NumericValue(2) | hir::NumericValue(6))
+            ) {
+                continue;
+            }
+            for slot in &mut state.slots {
+                if matches!(
+                    *slot,
+                    hir::NumericFrameSlot::Value(hir::NumericValue(1) | hir::NumericValue(5))
+                ) {
+                    *slot = hir::NumericFrameSlot::Value(hir::NumericValue(0));
+                }
+            }
+        }
+
+        let sequence = select(&hir).expect("aliased committed element Machine IR");
+        let element_ids = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .filter(|(_, instruction)| {
+                matches!(
+                    instruction.opcode,
+                    MachineOpcode::ElementLoad(..) | MachineOpcode::ElementStore(..)
+                )
+            })
+            .map(|(index, instruction)| {
+                let roots = instruction
+                    .operands
+                    .iter()
+                    .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                    .map(|operand| operand.value)
+                    .collect::<Vec<_>>();
+                let live_through = match instruction.opcode {
+                    MachineOpcode::ElementLoad(..) => MachineValue(1),
+                    MachineOpcode::ElementStore(..) => MachineValue(2),
+                    _ => unreachable!("filtered committed element operation"),
+                };
+                assert_eq!(roots, [MachineValue(0), live_through]);
+                MachineInstructionId(index as u32)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(element_ids.len(), 2);
+
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("aliased committed element allocation");
+        let safepoints =
+            lower_safepoints(&sequence, &allocation).expect("aliased committed element safepoints");
+        for id in element_ids {
+            assert_eq!(
+                safepoints.site(id).expect("element safepoint").roots.len(),
+                2
+            );
+        }
     }
 
     #[test]
@@ -6139,10 +6990,17 @@ mod tests {
             .iter()
             .find(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
             .expect("Number-index element store");
-        for boxed_index in [load.operands[1].value, store.operands[1].value] {
+        for instruction in [load, store] {
+            let boxed_index = instruction.operands[1].value;
             assert_eq!(
                 sequence.representations()[boxed_index.0 as usize],
                 MachineRepresentation::Tagged
+            );
+            assert!(
+                instruction
+                    .operands
+                    .iter()
+                    .any(|operand| { operand == &MachineOperand::tagged_root(boxed_index) })
             );
             assert!(sequence.instructions().iter().any(|instruction| {
                 instruction.opcode == MachineOpcode::BoxNumber
@@ -6175,6 +7033,130 @@ mod tests {
                     .repr,
                 otter_vm::deopt::DeoptRepr::Float64
             );
+        }
+    }
+
+    #[test]
+    fn scalar_element_indices_box_only_in_the_committed_cold_sibling() {
+        for (value_type, representation) in [
+            (NumericType::Int32, MachineRepresentation::Int32),
+            (NumericType::Uint32, MachineRepresentation::Uint32),
+        ] {
+            let mut hir = element_selection_hir(true);
+            let fast_index = if value_type == NumericType::Uint32 {
+                let left = hir::NumericValue(hir.nodes.len());
+                hir.nodes.push(NumericNode::IntegerConstant(8));
+                let right = hir::NumericValue(hir.nodes.len());
+                hir.nodes.push(NumericNode::IntegerConstant(0));
+                let index = hir::NumericValue(hir.nodes.len());
+                hir.nodes
+                    .push(NumericNode::IntegerShiftRightLogical(left, right));
+                let NumericNode::ElementLoad {
+                    index: load_index, ..
+                } = &mut hir.nodes[2]
+                else {
+                    panic!("element load fixture")
+                };
+                *load_index = index;
+                let NumericNode::ElementStore {
+                    index: store_index, ..
+                } = &mut hir.nodes[6]
+                else {
+                    panic!("element store fixture")
+                };
+                *store_index = index;
+                hir.blocks[0].nodes = [
+                    hir::NumericValue(0),
+                    hir::NumericValue(1),
+                    left,
+                    right,
+                    index,
+                    hir::NumericValue(2),
+                    hir::NumericValue(3),
+                    hir::NumericValue(4),
+                    hir::NumericValue(5),
+                    hir::NumericValue(6),
+                ]
+                .into();
+                index
+            } else {
+                hir.nodes[1] = NumericNode::Parameter {
+                    register: 1,
+                    value_type,
+                };
+                hir::NumericValue(1)
+            };
+            let sequence = select(&hir).expect("scalar-index element Machine IR");
+            let allocation = sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .expect("scalar-index committed element allocation");
+            for opcode in [
+                MachineOpcode::ElementLoad(24),
+                MachineOpcode::ElementStore(40),
+            ] {
+                let (instruction_index, instruction) = sequence
+                    .instructions()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, instruction)| instruction.opcode == opcode)
+                    .expect("scalar-index element instruction");
+                let selected_fast_index = instruction.operands[1].value;
+                assert_eq!(instruction.clobbers, element_clobbers());
+                assert_eq!(selected_fast_index, MachineValue(fast_index.0 as u32));
+                assert_eq!(
+                    sequence.representations()[selected_fast_index.0 as usize],
+                    representation
+                );
+                assert!(
+                    instruction
+                        .operands
+                        .iter()
+                        .all(|operand| operand
+                            != &MachineOperand::tagged_root(selected_fast_index)),
+                    "a scalar key is not a moving GC root"
+                );
+                assert!(
+                    sequence.instructions().iter().all(|definition| {
+                        !matches!(
+                            definition.opcode,
+                            MachineOpcode::BoxInt32 | MachineOpcode::BoxUint32
+                        ) || definition.operands.first().map(|operand| operand.value)
+                            != Some(selected_fast_index)
+                    }),
+                    "the hot Machine path must not materialize a boxed scalar key"
+                );
+
+                let locations = allocation
+                    .instruction_locations(MachineInstructionId(instruction_index as u32))
+                    .expect("committed element allocation coverage");
+                match locations[1] {
+                    AllocatedLocation::Register(register) => assert!(
+                        register.is_integer() && !element_clobbers().contains(&register),
+                        "late scalar key home must survive the fast guard clobbers"
+                    ),
+                    AllocatedLocation::Stack(_) => {}
+                }
+            }
+            let load_id = sequence
+                .instructions()
+                .iter()
+                .position(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
+                .expect("scalar-index element load");
+            let scalar_index = sequence.instructions()[load_id].operands[1].value;
+            let mut falsely_rooted = sequence.clone();
+            falsely_rooted.instructions[load_id]
+                .operands
+                .push(MachineOperand::tagged_root(scalar_index));
+            assert_eq!(
+                falsely_rooted.verify(),
+                Err(VerificationError::OpcodeSignatureMismatch(
+                    MachineInstructionId(load_id as u32)
+                )),
+                "a raw scalar late home must never enter the moving-root table"
+            );
+            sequence
+                .verify()
+                .expect("valid committed element key contract");
         }
     }
 
@@ -6218,20 +7200,35 @@ mod tests {
         let identity = compile_output(&identity_view(), None).code;
         for value in [f64::INFINITY, f64::NEG_INFINITY, -0.0_f64] {
             let (ret, _, _) = execute(&identity, &[boxed_f64(value)], 0);
-            assert_eq!(ret.status, STATUS_RETURNED);
-            assert_eq!(unbox_number(ret.value).to_bits(), value.to_bits());
+            assert_eq!(
+                ret.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                unbox_number(compiled_payload_bits(ret)).to_bits(),
+                value.to_bits()
+            );
         }
         let (nan, _, _) = execute(&identity, &[boxed_f64(f64::NAN)], 0);
-        assert_eq!(nan.status, STATUS_RETURNED);
-        assert!(unbox_number(nan.value).is_nan());
+        assert_eq!(
+            nan.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert!(unbox_number(compiled_payload_bits(nan)).is_nan());
 
         let overflow = compile_output(&overflow_view(), None).code;
         let (ret, _, _) = execute(&overflow, &[tag::box_int32(i32::MAX)], 0);
-        assert_eq!(ret.status, STATUS_RETURNED);
-        assert_eq!(unbox_number(ret.value), f64::from(i32::MAX) + 8.0);
+        assert_eq!(
+            ret.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(
+            unbox_number(compiled_payload_bits(ret)),
+            f64::from(i32::MAX) + 8.0
+        );
 
         let (canonical_int, _, _) = execute(&identity, &[tag::box_int32(42)], 0);
-        assert_eq!(canonical_int.value, tag::box_int32(42));
+        assert_eq!(compiled_payload_bits(canonical_int), tag::box_int32(42));
     }
 
     #[test]
@@ -6240,8 +7237,11 @@ mod tests {
         assert!(code.metadata().parameter_prefix_entry);
         let (ret, _, _) = execute(&code, &[tag::box_int32(9)], 0);
 
-        assert_eq!(ret.status, STATUS_RETURNED);
-        assert_eq!(ret.value, tag::box_int32(-9));
+        assert_eq!(
+            ret.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(ret), tag::box_int32(-9));
     }
 
     #[test]
@@ -6270,8 +7270,11 @@ mod tests {
         let code = compile_output(&view, None).code;
         for value in [Value::undefined(), Value::null(), Value::boolean(true)] {
             let (result, _, _) = execute(&code, &[value.to_bits()], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, value.to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), value.to_bits());
         }
     }
 
@@ -6283,15 +7286,21 @@ mod tests {
         ] {
             let code = compile_output(&tagged_immediate_view(op), None).code;
             let (result, _, _) = execute(&code, &[], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, expected.to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), expected.to_bits());
         }
 
         let bare_return = numeric_view(0, 0, vec![(Op::ReturnUndefined, vec![])]);
         let code = compile_output(&bare_return, None).code;
         let (result, _, _) = execute(&code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, Value::undefined().to_bits());
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), Value::undefined().to_bits());
 
         let code = compile_output(&tagged_this_view(), None).code;
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
@@ -6307,8 +7316,11 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, Value::null().to_bits());
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), Value::null().to_bits());
     }
 
     #[test]
@@ -6342,8 +7354,11 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(left.status, STATUS_RETURNED);
-        assert_eq!(left.value, Value::null().to_bits());
+        assert_eq!(
+            left.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(left), Value::null().to_bits());
 
         let (right, _, _) = execute(
             &code,
@@ -6355,8 +7370,11 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(right.status, STATUS_RETURNED);
-        assert_eq!(right.value, Value::undefined().to_bits());
+        assert_eq!(
+            right.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(right), Value::undefined().to_bits());
     }
 
     #[test]
@@ -6382,8 +7400,11 @@ mod tests {
 
         let code = compile_output(&view, None).code;
         let (normal, _, _) = execute(&code, &[Value::null().to_bits(), tag::box_int32(4)], 0);
-        assert_eq!(normal.status, STATUS_RETURNED);
-        assert_eq!(normal.value, Value::null().to_bits());
+        assert_eq!(
+            normal.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(normal), Value::null().to_bits());
 
         let loop_limit = POLL_BATCH + 4;
         let mut frame = vec![Value::undefined().to_bits(); 5];
@@ -6400,15 +7421,21 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(osr.status, STATUS_RETURNED);
-        assert_eq!(osr.value, Value::boolean(true).to_bits());
+        assert_eq!(
+            osr.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(osr), Value::boolean(true).to_bits());
         assert_eq!(after, frame);
 
         let interrupt = 1_u8;
         let mut fuel = i64::MAX as u64;
         let (bail, after, pc) =
             execute_osr_with_poll_cells(&code, 2, frame, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(
+            bail.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 2);
         assert_eq!(
             after,
@@ -6500,8 +7527,11 @@ mod tests {
             boxed_f64(2.5),
         ] {
             let (result, _, _) = execute(&code, &[condition, selected, rejected], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, selected);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), selected);
         }
         for condition in [
             Value::boolean(false).to_bits(),
@@ -6512,8 +7542,11 @@ mod tests {
             boxed_f64(f64::NAN),
         ] {
             let (result, _, _) = execute(&code, &[condition, selected, rejected], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, rejected);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), rejected);
         }
 
         let logical_not = compile_output(&tagged_logical_not_view(), None).code;
@@ -6523,8 +7556,14 @@ mod tests {
             (tag::box_int32(7), false),
         ] {
             let (result, _, _) = execute(&logical_not, &[condition], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, Value::boolean(expected).to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                Value::boolean(expected).to_bits()
+            );
         }
 
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
@@ -6542,7 +7581,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(register_count, code.metadata().register_count);
         assert_eq!(after, frame);
@@ -6632,19 +7674,37 @@ mod tests {
             (Value::boolean(true).to_bits(), tag::box_int32(1), false),
         ] {
             let (result, _, _) = execute(&code, &[left, right], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, Value::boolean(expected).to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                Value::boolean(expected).to_bits()
+            );
         }
 
         let not_equal = compile_output(&tagged_strict_equality_view(Op::NotEqual), None).code;
         let (result, _, _) = execute(&not_equal, &[tag::box_int32(7), boxed_f64(8.0)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, Value::boolean(true).to_bits());
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(
+            compiled_payload_bits(result),
+            Value::boolean(true).to_bits()
+        );
 
         let mixed = compile_output(&tagged_mixed_strict_equality_view(), None).code;
         let (result, _, _) = execute(&mixed, &[boxed_f64(7.0)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, Value::boolean(true).to_bits());
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(
+            compiled_payload_bits(result),
+            Value::boolean(true).to_bits()
+        );
 
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let frame = vec![
@@ -6665,7 +7725,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(register_count, code.metadata().register_count);
         assert_eq!(after, frame);
@@ -6826,11 +7889,17 @@ mod tests {
 
         let code = compile_output(&view, None).code;
         let (result, _, _) = execute(&code, &[tag::box_int32(2), tag::box_int32(2)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-7));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-7));
 
         let (bail, frame, pc) = execute(&code, &[boxed_f64(2.5), tag::box_int32(2)], 77);
-        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(
+            bail.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(frame[0], boxed_f64(2.5));
         assert_eq!(frame[1], tag::box_int32(2));
@@ -6852,8 +7921,11 @@ mod tests {
             &[tag::box_int32(41)],
             0,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(42));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(42));
 
         let bitwise = NumericFunction::build(&float_bitwise_view(Op::BitwiseAnd))
             .expect("bitwise numeric HIR");
@@ -6881,7 +7953,10 @@ mod tests {
         let code = compile_output(&typed_parameter_overflow_view(), None).code;
         let (result, frame, pc) =
             execute(&code, &[tag::box_int32(i32::MAX), tag::box_int32(1)], 91);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(
             frame,
@@ -6911,8 +7986,11 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-9));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-9));
         assert_eq!(register_count, guard.metadata().param_count);
         assert_eq!(frame[1], 0xdead_beef_dead_beef);
 
@@ -6926,7 +8004,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(register_count, guard.metadata().register_count);
         assert_eq!(frame[1], Value::undefined().to_bits());
@@ -6948,7 +8029,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(register_count, overflow.metadata().register_count);
         assert_eq!(
@@ -6990,8 +8074,11 @@ mod tests {
 
         let code = compile_output(&view, None).code;
         let (result, _, _) = execute(&code, &[Value::undefined().to_bits(), tag::box_int32(9)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-9));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-9));
     }
 
     #[test]
@@ -7012,8 +8099,11 @@ mod tests {
 
         let code = compile_output(&view, None).code;
         let (result, _, _) = execute(&code, &[tag::box_int32(10), tag::box_int32(3)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(30));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(30));
         // SAFETY: the code object remains alive for the pointer lookup.
         assert!(unsafe { code.osr_entry_ptr_for_test(2) }.is_some());
     }
@@ -7178,11 +8268,17 @@ mod tests {
         );
 
         let (ret, _, _) = execute(&code, &[tag::box_int32(0)], 0);
-        assert_eq!(ret.status, STATUS_RETURNED);
-        assert_eq!(ret.value, tag::box_int32(528));
+        assert_eq!(
+            ret.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(ret), tag::box_int32(528));
 
         let (bail, frame, pc) = execute(&code, &[Value::undefined().to_bits()], 77);
-        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(
+            bail.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(frame[0], Value::undefined().to_bits());
     }
@@ -7209,31 +8305,43 @@ mod tests {
         let code = compile_output(&view, None).code;
 
         let (taken, _, _) = execute(&code, &[tag::box_int32(1), tag::box_int32(3)], 0);
-        assert_eq!(taken.status, STATUS_RETURNED);
-        assert_eq!(taken.value, tag::box_int32(4));
+        assert_eq!(
+            taken.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(taken), tag::box_int32(4));
 
         let (fallthrough, _, _) = execute(&code, &[tag::box_int32(3), tag::box_int32(1)], 0);
-        assert_eq!(fallthrough.status, STATUS_RETURNED);
-        assert_eq!(fallthrough.value, tag::box_int32(2));
+        assert_eq!(
+            fallthrough.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(fallthrough), tag::box_int32(2));
 
         let (unordered, _, _) = execute(&code, &[boxed_f64(f64::NAN), tag::box_int32(1)], 0);
-        assert_eq!(unordered.status, STATUS_RETURNED);
-        assert!(unbox_number(unordered.value).is_nan());
+        assert_eq!(
+            unordered.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert!(unbox_number(compiled_payload_bits(unordered)).is_nan());
 
         let (bail, frame, pc) = execute(
             &code,
             &[tag::box_int32(1), Value::undefined().to_bits()],
             19,
         );
-        assert_eq!(bail.status, STATUS_BAILED);
+        assert_eq!(
+            bail.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(frame[1], Value::undefined().to_bits());
 
         let branch_true = compile_output(&diamond_view(Op::JumpIfTrue), None).code;
         let (true_edge, _, _) = execute(&branch_true, &[tag::box_int32(1), tag::box_int32(3)], 0);
-        assert_eq!(true_edge.value, tag::box_int32(-2));
+        assert_eq!(compiled_payload_bits(true_edge), tag::box_int32(-2));
         let (false_edge, _, _) = execute(&branch_true, &[tag::box_int32(3), tag::box_int32(1)], 0);
-        assert_eq!(false_edge.value, tag::box_int32(4));
+        assert_eq!(compiled_payload_bits(false_edge), tag::box_int32(4));
     }
 
     #[test]
@@ -7261,12 +8369,18 @@ mod tests {
 
         let code = compile_output(&view, None).code;
         let (direct_edge, _, _) = execute(&code, &[tag::box_int32(3), tag::box_int32(1)], 0);
-        assert_eq!(direct_edge.status, STATUS_RETURNED);
-        assert_eq!(direct_edge.value, tag::box_int32(3));
+        assert_eq!(
+            direct_edge.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(direct_edge), tag::box_int32(3));
 
         let (arm_edge, _, _) = execute(&code, &[tag::box_int32(1), tag::box_int32(3)], 0);
-        assert_eq!(arm_edge.status, STATUS_RETURNED);
-        assert_eq!(arm_edge.value, tag::box_int32(4));
+        assert_eq!(
+            arm_edge.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(arm_edge), tag::box_int32(4));
     }
 
     #[test]
@@ -7303,8 +8417,11 @@ mod tests {
         assert!(!code.metadata().parameter_prefix_entry);
         for (input, expected) in [(-2, 1), (0, 1), (1, 1), (3, 3)] {
             let (result, _, _) = execute(&code, &[tag::box_int32(input)], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, tag::box_int32(expected));
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), tag::box_int32(expected));
         }
     }
 
@@ -7443,8 +8560,11 @@ mod tests {
         for (limit, expected) in [(1, 2), (2, -12), (5, -22)] {
             let code = compile_output(&branch_phi_loop_view_with(0, 0, limit, 1), None).code;
             let (result, _, _) = execute(&code, &[], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, tag::box_int32(expected));
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), tag::box_int32(expected));
         }
 
         let transitions = TransitionTable::resolve();
@@ -7460,7 +8580,6 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
-            false,
         )
         .expect("production optimizing selector compiles exact branch-phi");
         let artifact = exact.artifact.expect("exact branch-phi artifact");
@@ -7482,8 +8601,11 @@ mod tests {
         .expect("UTF-8 branch-phi code map");
         assert!(code_map.contains("\"logicalPc\": 3"));
         let (result, _, _) = execute(&exact.code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-6_000_000));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-6_000_000));
     }
 
     #[test]
@@ -7524,7 +8646,6 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
-            false,
         )
         .expect("production optimizing selector compiles countdown loop");
         let optimized_ir = std::str::from_utf8(
@@ -7540,8 +8661,11 @@ mod tests {
         assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(15));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(15));
     }
 
     #[test]
@@ -7596,7 +8720,6 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
-            false,
         )
         .expect("production optimizing selector compiles bitwise loop");
         let optimized_ir = std::str::from_utf8(
@@ -7618,8 +8741,11 @@ mod tests {
             let right = expected >> 31;
             expected = !(((left ^ right) | index) & i32::MAX);
         }
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(expected));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(expected));
     }
 
     #[test]
@@ -7640,19 +8766,28 @@ mod tests {
         ] {
             let code = compile_output(&float_bitwise_view(Op::BitwiseOr), None).code;
             let (result, _, _) = execute(&code, &[boxed_f64(value), tag::box_int32(0)], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, tag::box_int32(expected));
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(compiled_payload_bits(result), tag::box_int32(expected));
         }
 
         let code = compile_output(&float_bitwise_view(Op::Ushr), None).code;
         let (result, _, _) = execute(&code, &[boxed_f64(-1.9), tag::box_int32(0)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(unbox_number(result.value), 4_294_967_295.0);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(unbox_number(compiled_payload_bits(result)), 4_294_967_295.0);
 
         let code = compile_output(&float_bitwise_view(Op::Shl), None).code;
         let (result, _, _) = execute(&code, &[boxed_f64(1.9), boxed_f64(33.9)], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(2));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(2));
 
         let view = boolean_bitwise_view();
         let hir = NumericFunction::build(&view).expect("Boolean constants numeric HIR");
@@ -7662,8 +8797,11 @@ mod tests {
                 .any(|node| matches!(node, NumericNode::BooleanToInt32(..)))
         );
         let (result, _, _) = execute(&compile_output(&view, None).code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(1));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(1));
     }
 
     #[test]
@@ -7673,7 +8811,10 @@ mod tests {
         let register = compile_output(&checked_binary_view(Op::Sub, i32::MIN, 1), None).code;
         let (result, frame, pc) =
             execute_with_poll_cells(&register, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 2);
         assert_eq!(
             frame,
@@ -7688,7 +8829,10 @@ mod tests {
             compile_output(&checked_immediate_view(Op::SubImm, i32::MAX, -1), None).code;
         let (result, frame, pc) =
             execute_with_poll_cells(&immediate, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 1);
         assert_eq!(
             frame,
@@ -7699,7 +8843,10 @@ mod tests {
             compile_output(&checked_immediate_view(Op::Increment, i32::MAX, 1), None).code;
         let (result, frame, pc) =
             execute_with_poll_cells(&increment, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 1);
         assert_eq!(
             frame,
@@ -7711,8 +8858,11 @@ mod tests {
     fn checked_integer_multiply_deopts_on_overflow_and_negative_zero() {
         let success = compile_output(&checked_binary_view(Op::Mul, 12_345, -17), None).code;
         let (result, _, _) = execute(&success, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-209_865));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-209_865));
 
         let interrupt = 0_u8;
         for (left, right) in [(i32::MAX, 2), (0, -1)] {
@@ -7720,7 +8870,10 @@ mod tests {
             let mut fuel = i64::MAX as u64;
             let (result, frame, pc) =
                 execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-            assert_eq!(result.status, STATUS_BAILED);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::SideExit)
+            );
             assert_eq!(pc, 2);
             assert_eq!(
                 frame,
@@ -7737,8 +8890,11 @@ mod tests {
     fn checked_integer_negation_deopts_on_overflow_and_negative_zero() {
         let success = compile_output(&checked_neg_view(17), None).code;
         let (result, _, _) = execute(&success, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-17));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-17));
 
         let interrupt = 0_u8;
         for source in [0, i32::MIN] {
@@ -7746,7 +8902,10 @@ mod tests {
             let mut fuel = i64::MAX as u64;
             let (result, frame, pc) =
                 execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-            assert_eq!(result.status, STATUS_BAILED);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::SideExit)
+            );
             assert_eq!(pc, 1);
             assert_eq!(
                 frame,
@@ -7771,30 +8930,48 @@ mod tests {
         ] {
             let code = compile_output(&float_binary_view(op), None).code;
             let (result, _, _) = execute(&code, &[boxed_f64(left), boxed_f64(right)], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(unbox_number(result.value), expected);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(unbox_number(compiled_payload_bits(result)), expected);
         }
 
         let rem = compile_output(&float_binary_view(Op::Rem), None).code;
         let (result, _, _) = execute(&rem, &[boxed_f64(-4.0), boxed_f64(2.0)], 0);
-        assert_eq!(unbox_number(result.value).to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(
+            unbox_number(compiled_payload_bits(result)).to_bits(),
+            (-0.0_f64).to_bits()
+        );
 
         let pow = compile_output(&float_binary_view(Op::Pow), None).code;
         let (result, _, _) = execute(&pow, &[boxed_f64(-1.0), boxed_f64(f64::INFINITY)], 0);
-        assert!(unbox_number(result.value).is_nan());
+        assert!(unbox_number(compiled_payload_bits(result)).is_nan());
 
         let truthiness = compile_output(&float_truthiness_view(), None).code;
         for (input, expected) in [(0.0, true), (-0.0, true), (f64::NAN, true), (3.5, false)] {
             let (result, _, _) = execute(&truthiness, &[boxed_f64(input)], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, Value::boolean(expected).to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                Value::boolean(expected).to_bits()
+            );
         }
 
         for (input, expected) in [(0, true), (-1, false)] {
             let code = compile_output(&integer_truthiness_view(input), None).code;
             let (result, _, _) = execute(&code, &[], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, Value::boolean(expected).to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                Value::boolean(expected).to_bits()
+            );
         }
     }
 
@@ -7807,14 +8984,23 @@ mod tests {
         ] {
             let code = compile_output(&ushr_view(left, shift), None).code;
             let (result, _, _) = execute(&code, &[], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(unbox_number(result.value), expected);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(unbox_number(compiled_payload_bits(result)), expected);
         }
 
         let comparison = compile_output(&ushr_comparison_view(), None).code;
         let (result, _, _) = execute(&comparison, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, Value::boolean(true).to_bits());
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(
+            compiled_payload_bits(result),
+            Value::boolean(true).to_bits()
+        );
 
         let view = ushr_backedge_view();
         let hir = NumericFunction::build(&view).expect("uint32-loop numeric HIR");
@@ -7834,7 +9020,10 @@ mod tests {
         let mut fuel = i64::MAX as u64;
         let (result, frame, pc) =
             execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 6);
         assert_eq!(
             frame,
@@ -7877,7 +9066,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 5);
         assert_eq!(frame[0], tag::box_int32(i32::MAX));
         assert_eq!(frame[5], tag::box_int32(1));
@@ -7895,8 +9087,14 @@ mod tests {
         ] {
             let code = compile_output(&integer_comparison_view(op, left, right), None).code;
             let (result, _, _) = execute(&code, &[], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, Value::boolean(expected).to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                Value::boolean(expected).to_bits()
+            );
         }
 
         for (op, left, right, expected) in [
@@ -7909,8 +9107,14 @@ mod tests {
         ] {
             let code = compile_output(&float_comparison_view(op), None).code;
             let (result, _, _) = execute(&code, &[boxed_f64(left), boxed_f64(right)], 0);
-            assert_eq!(result.status, STATUS_RETURNED);
-            assert_eq!(result.value, Value::boolean(expected).to_bits());
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success)
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                Value::boolean(expected).to_bits()
+            );
         }
     }
 
@@ -7960,7 +9164,6 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
-            false,
         )
         .expect("production selector compiles integer-scalar loop");
         let optimized_ir = std::str::from_utf8(
@@ -7976,8 +9179,11 @@ mod tests {
         assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(unbox_number(result.value), 1725.0);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(unbox_number(compiled_payload_bits(result)), 1725.0);
     }
 
     #[test]
@@ -8049,7 +9255,6 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
-            false,
         )
         .expect("production selector compiles float leaf loop");
         let optimized_ir = std::str::from_utf8(
@@ -8068,8 +9273,11 @@ mod tests {
         assert!(!optimized_ir.contains("FloatLeafResult"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(199_999));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(199_999));
 
         let interrupt = 1_u8;
         let mut fuel = i64::MAX as u64;
@@ -8080,7 +9288,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 6);
         let mut expected = vec![Value::undefined().to_bits(); 19];
         expected[0] = boxed_f64(12.073_463_237_907_212);
@@ -8143,7 +9354,6 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
-            false,
         )
         .expect("production selector compiles float bitwise loop");
         let optimized_ir = std::str::from_utf8(
@@ -8161,8 +9371,11 @@ mod tests {
         assert!(!optimized_ir.contains("IntegerLeafResult"));
 
         let (result, _, _) = execute(&output.code, &[], 0);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(120_790));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(120_790));
 
         let interrupt = 1_u8;
         let mut fuel = i64::MAX as u64;
@@ -8173,7 +9386,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 4);
         let mut expected = vec![Value::undefined().to_bits(); 12];
         expected[0] = boxed_f64(4_294_967_321.75);
@@ -8193,7 +9409,10 @@ mod tests {
         let mut fuel = i64::MAX as u64;
         let (result, frame, pc) =
             execute_with_poll_cells(&add, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 13);
         assert_eq!(frame[0], tag::box_int32(i32::MAX));
         assert_eq!(frame[1], tag::box_int32(0));
@@ -8209,10 +9428,136 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 15);
         assert_eq!(frame[0], tag::box_int32(-14));
         assert_eq!(frame[1], tag::box_int32(1));
+    }
+
+    #[test]
+    fn protected_inner_loop_has_no_osr_entry_while_outer_header_remains_available() {
+        let value = hir::NumericValue;
+        let block = |logical_pc: u32,
+                     osr_entry_allowed: bool,
+                     predecessors: Vec<usize>,
+                     successors: Vec<usize>,
+                     nodes: Vec<hir::NumericValue>,
+                     terminator: NumericTerminator| {
+            hir::NumericBlock {
+                logical_pc,
+                osr_entry_allowed,
+                predecessors,
+                successor_arguments: vec![Vec::new(); successors.len()],
+                successors,
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                nodes,
+                terminator,
+            }
+        };
+        let hir = NumericFunction {
+            function_id: 190,
+            nodes: vec![
+                NumericNode::TaggedConstant(Value::undefined().to_bits()),
+                NumericNode::BooleanConstant(true),
+                NumericNode::BooleanConstant(true),
+            ],
+            blocks: vec![
+                block(
+                    0,
+                    true,
+                    Vec::new(),
+                    vec![1],
+                    vec![value(0)],
+                    NumericTerminator::Jump,
+                ),
+                block(
+                    1,
+                    true,
+                    vec![0, 4],
+                    vec![2, 5],
+                    vec![value(1)],
+                    NumericTerminator::Branch {
+                        condition: value(1),
+                        when_true: true,
+                    },
+                ),
+                block(
+                    2,
+                    false,
+                    vec![1, 3],
+                    vec![3, 4],
+                    vec![value(2)],
+                    NumericTerminator::Branch {
+                        condition: value(2),
+                        when_true: true,
+                    },
+                ),
+                block(
+                    3,
+                    false,
+                    vec![2],
+                    vec![2],
+                    Vec::new(),
+                    NumericTerminator::Jump,
+                ),
+                block(
+                    4,
+                    true,
+                    vec![2],
+                    vec![1],
+                    Vec::new(),
+                    NumericTerminator::Jump,
+                ),
+                block(
+                    5,
+                    true,
+                    vec![1],
+                    Vec::new(),
+                    Vec::new(),
+                    NumericTerminator::Return(value(0)),
+                ),
+            ],
+            frame_states: vec![
+                hir::NumericFrameState {
+                    point: NumericFramePoint::Backedge {
+                        predecessor: 3,
+                        edge: 0,
+                    },
+                    function_id: 190,
+                    byte_pc: 16,
+                    slots: Vec::new(),
+                },
+                hir::NumericFrameState {
+                    point: NumericFramePoint::Backedge {
+                        predecessor: 4,
+                        edge: 0,
+                    },
+                    function_id: 190,
+                    byte_pc: 8,
+                    slots: Vec::new(),
+                },
+            ],
+            direct_call_targets: Vec::new(),
+            direct_call_arguments: Vec::new(),
+            parameter_count: 0,
+            register_count: 0,
+            arithmetic_op_count: 0,
+        };
+        let sequence = select(&hir).expect("nested-loop Machine body");
+        let osr_pcs = sequence
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction.opcode {
+                MachineOpcode::OsrEntry { logical_pc, .. } => Some(logical_pc),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(osr_pcs, [1]);
+        sequence.verify().expect("nested-loop Machine verification");
     }
 
     #[test]
@@ -8230,8 +9575,11 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-22));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-22));
         assert_eq!(after, frame, "successful OSR must keep VM slots untouched");
         assert_eq!(pc, 3);
 
@@ -8240,7 +9588,10 @@ mod tests {
         let mut fuel = i64::MAX as u64;
         let (result, after, pc) =
             execute_osr_with_poll_cells(&code, 3, frame, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 3);
         assert_eq!(after, rejected, "OSR representation reject must be atomic");
     }
@@ -8260,7 +9611,10 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 13);
         assert_eq!(frame[0], tag::box_int32(i32::MAX));
         assert_eq!(frame[1], tag::box_int32(0));
@@ -8275,7 +9629,10 @@ mod tests {
         let mut fuel = i64::MAX as u64;
         let (result, frame, pc) =
             execute_osr_with_poll_cells(&code, 3, frame, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 3);
         let mut expected = vec![Value::undefined().to_bits(); 12];
         expected[0] = tag::box_int32(-94);
@@ -8338,8 +9695,11 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(120_790));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(120_790));
         assert_eq!(after, float_frame);
 
         let view = mixed_osr_loop_view();
@@ -8383,8 +9743,11 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(536_870_911));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(536_870_911));
         assert_eq!(after, frame);
 
         frame[1] = tag::box_int32(1);
@@ -8392,7 +9755,10 @@ mod tests {
         let mut fuel = i64::MAX as u64;
         let (result, after, pc) =
             execute_osr_with_poll_cells(&code, 6, frame, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 6);
         assert_eq!(after, rejected);
     }
@@ -8440,8 +9806,11 @@ mod tests {
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(465));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(465));
         assert_eq!(after, original);
     }
 
@@ -8453,7 +9822,7 @@ mod tests {
                 let thread = &*(*ctx).thread;
                 *(thread.backedge_fuel_cell as *mut u64) = 100;
             }
-            0
+            NativeResultStatus::Success as u64
         }
 
         let mut transitions = TransitionTable::resolve();
@@ -8469,15 +9838,21 @@ mod tests {
         let mut fuel = 1_u64;
         let (result, _, _) =
             execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_RETURNED);
-        assert_eq!(result.value, tag::box_int32(-190));
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::Success)
+        );
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(-190));
         assert_eq!(fuel, 84);
 
         let interrupt = 1_u8;
         let mut fuel = i64::MAX as u64;
         let (result, frame, pc) =
             execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
-        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 3);
         let mut expected = vec![Value::undefined().to_bits(); 12];
         expected[0] = tag::box_int32(-96);
@@ -8494,7 +9869,10 @@ mod tests {
         let input = Value::undefined().to_bits();
         let (ret, frame, pc) = execute(&code, &[input], 91);
 
-        assert_eq!(ret.status, STATUS_BAILED);
+        assert_eq!(
+            ret.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
         assert_eq!(pc, 0);
         assert_eq!(frame[0], input);
     }

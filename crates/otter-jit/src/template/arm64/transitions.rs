@@ -12,8 +12,9 @@
 //!   consumed without that check.
 //! - Register-window reentrant transitions receive the entry context and report
 //!   status in `x0`. Computed element transitions use the fixed boxed-value
-//!   result-pair ABI (`x0` value, low byte of `x1` status); either form branches
-//!   to the shared throw epilogue on nonzero status.
+//!   `NativeResultPair` ABI (`x0` payload, canonical whole-word `x1` status);
+//!   Status-word calls decode the sole `NativeResultStatus` alphabet; unknown
+//!   words go directly to the structural fatal epilogue.
 //! - Allocating calls build the frozen call-packet layout on the machine
 //!   stack, name a concrete safepoint, and are followed by no derived-pointer
 //!   reuse — operands re-load from the rooted frame window.
@@ -55,21 +56,49 @@ use crate::entry::{
 };
 use crate::template::TemplateTail;
 
-/// `blr` to a resolved transition entry and branch to `threw` on a nonzero
-/// status in `x0`. Argument registers must already be set.
+/// Decode the sole status-word alphabet after a runtime call. Unknown words
+/// are structural ABI failures and go directly to the compiled fatal exit.
+pub(super) fn emit_status_word_result(
+    ops: &mut Assembler,
+    side_exit: Option<DynamicLabel>,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    let success = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x0, abi::NativeResultStatus::Success as u32
+        ; b.eq =>success
+    );
+    if let Some(side_exit) = side_exit {
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x0, abi::NativeResultStatus::SideExit as u32
+            ; b.eq =>side_exit
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x0, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>threw
+        ; b =>fatal
+        ; =>success
+    );
+}
+
+/// `blr` to a resolved transition entry and validate its Success/Throw result.
+/// Argument registers must already be set.
 fn emit_transition_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     entry: u64,
     descriptor: abi::RuntimeStubDescriptor,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_load_runtime_stub(ops, relocations, 16, entry, descriptor);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbnz x0, =>threw
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    emit_status_word_result(ops, None, threw, fatal);
 }
 
 fn emit_operand_slice_address(
@@ -107,6 +136,7 @@ pub(super) fn emit_make_function(
     dst: u16,
     constant: u32,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
@@ -117,6 +147,7 @@ pub(super) fn emit_make_function(
         table.variadic_entry(abi::STUB_JIT_MAKE_FN),
         abi::STUB_JIT_MAKE_FN,
         threw,
+        fatal,
     );
 }
 
@@ -131,6 +162,7 @@ pub(super) fn emit_make_closure(
     parents: &[u32],
     parents_tail: TemplateTail,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     emit_load_u64(ops, 1, u64::from(code_block_id));
@@ -152,47 +184,8 @@ pub(super) fn emit_make_closure(
         table.variadic_entry(abi::STUB_JIT_MAKE_CLOSURE),
         abi::STUB_JIT_MAKE_CLOSURE,
         threw,
+        fatal,
     );
-}
-
-pub(super) fn emit_load_string(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    view: &JitCompileSnapshot,
-    code_block_id: u32,
-    byte_pc: u32,
-    dst: u16,
-    constant: u32,
-    threw: DynamicLabel,
-) -> Result<(), Unsupported> {
-    if let Some(target) = view.string_constant_loads.get(&byte_pc) {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            13,
-            target.cell_addr as u64,
-            RelocationTarget::StringConstantCell {
-                function_id: code_block_id,
-                byte_pc,
-            },
-        );
-        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
-        emit_store_reg(ops, 9, dst)?;
-        return Ok(());
-    }
-    emit_ctx_arg(ops);
-    emit_load_u64(ops, 1, u64::from(code_block_id));
-    dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
-    emit_load_u64(ops, 3, u64::from(constant));
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_LOAD_STRING),
-        abi::STUB_JIT_LOAD_STRING,
-        threw,
-    );
-    Ok(())
 }
 
 pub(super) fn emit_load_regexp(
@@ -202,6 +195,7 @@ pub(super) fn emit_load_regexp(
     dst: u16,
     constant: u32,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
@@ -212,6 +206,7 @@ pub(super) fn emit_load_regexp(
         table.variadic_entry(abi::STUB_JIT_LOAD_REGEXP),
         abi::STUB_JIT_LOAD_REGEXP,
         threw,
+        fatal,
     );
 }
 
@@ -225,6 +220,7 @@ pub(super) fn emit_load_global(
     code_block_id: u32,
     byte_pc: u32,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -318,6 +314,7 @@ pub(super) fn emit_load_global(
         table.variadic_entry(abi::STUB_JIT_LOAD_GLOBAL),
         abi::STUB_JIT_LOAD_GLOBAL,
         threw,
+        fatal,
     );
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
@@ -330,6 +327,7 @@ pub(super) fn emit_load_builtin_error(
     dst: u16,
     constant: u32,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
@@ -340,6 +338,7 @@ pub(super) fn emit_load_builtin_error(
         table.variadic_entry(abi::STUB_JIT_LOAD_BUILTIN_ERROR),
         abi::STUB_JIT_LOAD_BUILTIN_ERROR,
         threw,
+        fatal,
     );
 }
 
@@ -349,6 +348,7 @@ pub(super) fn emit_new_object(
     table: &TransitionTable,
     dst: u16,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
@@ -358,6 +358,7 @@ pub(super) fn emit_new_object(
         table.variadic_entry(abi::STUB_JIT_NEW_OBJECT),
         abi::STUB_JIT_NEW_OBJECT,
         threw,
+        fatal,
     );
 }
 
@@ -369,6 +370,7 @@ pub(super) fn emit_new_array(
     elements: &[u16],
     elements_tail: TemplateTail,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
@@ -388,6 +390,7 @@ pub(super) fn emit_new_array(
         table.variadic_entry(abi::STUB_JIT_NEW_ARRAY),
         abi::STUB_JIT_NEW_ARRAY,
         threw,
+        fatal,
     );
 }
 
@@ -397,6 +400,7 @@ pub(super) fn emit_fresh_upvalue(
     table: &TransitionTable,
     index: i32,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     emit_load_u64(ops, 1, u64::from(index as u32));
@@ -406,6 +410,7 @@ pub(super) fn emit_fresh_upvalue(
         table.variadic_entry(abi::STUB_JIT_FRESH_UPVALUE),
         abi::STUB_JIT_FRESH_UPVALUE,
         threw,
+        fatal,
     );
 }
 
@@ -417,6 +422,7 @@ pub(super) fn emit_define_data_property(
     key: u16,
     value: u16,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops
@@ -431,6 +437,7 @@ pub(super) fn emit_define_data_property(
         table.variadic_entry(abi::STUB_JIT_DEFINE_DATA_PROPERTY),
         abi::STUB_JIT_DEFINE_DATA_PROPERTY,
         threw,
+        fatal,
     );
 }
 
@@ -442,6 +449,7 @@ pub(super) fn emit_define_own_property(
     key: u16,
     descriptor: u16,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops
@@ -456,6 +464,7 @@ pub(super) fn emit_define_own_property(
         table.variadic_entry(abi::STUB_JIT_DEFINE_OWN_PROPERTY),
         abi::STUB_JIT_DEFINE_OWN_PROPERTY,
         threw,
+        fatal,
     );
 }
 
@@ -468,7 +477,8 @@ pub(super) fn emit_load_element(
     receiver: u16,
     index: u16,
     byte_pc: u32,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -501,7 +511,16 @@ pub(super) fn emit_load_element(
         table.entry(abi::STUB_JIT_LOAD_ELEMENT),
         abi::STUB_JIT_LOAD_ELEMENT,
     );
-    dynasm!(ops ; .arch aarch64 ; blr x16 ; and x1, x1, #0xff ; cbnz x1, =>threw);
+    let completed = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cbz x1, =>completed
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
+        ; =>completed
+    );
     emit_store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
@@ -516,7 +535,8 @@ pub(super) fn emit_store_element(
     index: u16,
     value: u16,
     byte_pc: u32,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -552,7 +572,14 @@ pub(super) fn emit_store_element(
         table.entry(abi::STUB_JIT_STORE_ELEMENT),
         abi::STUB_JIT_STORE_ELEMENT,
     );
-    dynasm!(ops ; .arch aarch64 ; blr x16 ; and x1, x1, #0xff ; cbnz x1, =>threw);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cbz x1, =>done
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
+    );
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
@@ -565,6 +592,7 @@ pub(super) fn emit_load_upvalue(
     dst: u16,
     index: i32,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -611,6 +639,7 @@ pub(super) fn emit_load_upvalue(
         table.variadic_entry(abi::STUB_JIT_LOAD_UPVALUE),
         abi::STUB_JIT_LOAD_UPVALUE,
         threw,
+        fatal,
     );
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
@@ -624,6 +653,7 @@ pub(super) fn emit_store_upvalue(
     index: i32,
     checked: bool,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, src as u32);
@@ -639,6 +669,7 @@ pub(super) fn emit_store_upvalue(
         table.variadic_entry(descriptor),
         descriptor,
         threw,
+        fatal,
     );
 }
 
@@ -651,6 +682,7 @@ pub(super) fn emit_add_delegate(
     lhs: u16,
     rhs: u16,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_ctx_arg(ops);
     dynasm!(ops
@@ -665,6 +697,7 @@ pub(super) fn emit_add_delegate(
         table.variadic_entry(abi::STUB_JIT_ADD),
         abi::STUB_JIT_ADD,
         threw,
+        fatal,
     );
 }
 
@@ -712,7 +745,6 @@ pub(super) fn emit_string_concat_alloc_call(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; and x1, x1, #0xff
         ; mov x5, x1
         ; add sp, sp, ALLOC_CTX_STACK_SIZE
         ; cbnz x5, =>miss
@@ -764,7 +796,7 @@ pub(super) fn emit_array_construct_alloc_call(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; and x5, x1, #0xff
+        ; mov x5, x1
         ; add sp, sp, ALLOC_CTX_STACK_SIZE
         ; cbnz x5, =>bail
     );

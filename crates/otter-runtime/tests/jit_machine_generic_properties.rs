@@ -9,8 +9,9 @@
 //!   canonical store boundary without object corruption.
 //! - Same-layout descriptor invalidation after cell fill: a data load becomes
 //!   an accessor and a writable store becomes non-writable.
-//! - A local `try`/`catch` fixture that stays on the materialized backend until
-//!   Machine committed-throw landing is explicit.
+//! - A local `try`/`catch` fixture that stays on Template until the property
+//!   fast probe and committed cold call are explicit Machine CFG before
+//!   register allocation.
 //!
 //! # Invariants
 //! - A cold named-property site stays in the complete Machine body; its first
@@ -652,8 +653,8 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
         .as_array()
         .expect("relocation entries");
     for (stub_id, stub, signature) in [
-        (19u64, "jit_load_property_value", "reentrantNamedLoad"),
-        (20u64, "jit_store_property_value", "reentrantNamedStore"),
+        (18u64, "jit_load_property_value", "reentrantNamedLoad"),
+        (19u64, "jit_store_property_value", "reentrantNamedStore"),
     ] {
         assert!(
             relocations.iter().any(|relocation| {

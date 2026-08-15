@@ -945,20 +945,6 @@ impl Interpreter {
             &self.gc_heap,
         ))
     }
-
-    pub(crate) fn run_same_value_regs(
-        &self,
-        frame: &mut Frame,
-        dst: u16,
-        lhs: u16,
-        rhs: u16,
-    ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        let result = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
-        write_register(frame, dst, Value::boolean(result))?;
-        frame.advance_pc_fast();
-        Ok(())
-    }
 }
 
 fn binop_values(

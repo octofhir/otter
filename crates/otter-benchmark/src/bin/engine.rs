@@ -1403,20 +1403,6 @@ fn run_kernel(
                 .saturating_sub(property_before.store_disables),
         ),
         (
-            "property-ic-has-hits",
-            MetricUnit::Count,
-            property_after
-                .has_hits
-                .saturating_sub(property_before.has_hits),
-        ),
-        (
-            "property-ic-has-misses",
-            MetricUnit::Count,
-            property_after
-                .has_misses
-                .saturating_sub(property_before.has_misses),
-        ),
-        (
             "call-feedback-retained-observations",
             MetricUnit::Count,
             call_after
@@ -1981,7 +1967,7 @@ fn run_jit_compile(
                 .join(",");
             return fail(
                 RunFailureKind::Validation,
-                format!("optimizing compile escaped to the legacy backend; feedback={feedback}"),
+                format!("optimizing artifact is not Machine IR; feedback={feedback}"),
             );
         }
         "otter-machine-ir"

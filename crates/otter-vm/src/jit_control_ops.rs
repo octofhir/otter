@@ -8,6 +8,8 @@
 //! # Invariants
 //! - Shadow names are resolved from the executing frame's function-owned
 //!   constant pool, including cross-chunk callees.
+//! - Shadowing walks the same nearest-first GC-owned eval environment as every
+//!   other dynamic binding operation; no frame-local mirror exists.
 //! - The JIT transition calls the same register helper as interpreter dispatch;
 //!   dynamic-scope semantics are not duplicated in machine-code support.
 //!
@@ -16,7 +18,7 @@
 
 use otter_bytecode::Op;
 
-use crate::{ExecutionContext, Frame, Interpreter, VmError, activation_stack::ActivationStack};
+use crate::{ActiveFrameMut, ExecutionContext, Frame, Interpreter, VmError};
 
 impl Interpreter {
     /// Read a captured binding unless a direct-eval `var` shadows it in the
@@ -29,24 +31,31 @@ impl Interpreter {
         name_idx: u32,
         uv_idx: usize,
     ) -> Result<(), VmError> {
-        let cell = if let Some(name) =
-            context.string_constant_str_for_function(frame.function_id, name_idx)
-            && let Some(cell) = self
-                .frame_cold(frame)
-                .and_then(|cold| cold.eval_vars.as_ref())
-                .and_then(|map| map.get(name))
-                .copied()
-        {
+        let mut frame = ActiveFrameMut::materialized(frame);
+        self.run_load_shadowed_upvalue_active_reg(context, &mut frame, dst, name_idx, uv_idx)
+    }
+
+    fn run_load_shadowed_upvalue_active_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        name_idx: u32,
+        uv_idx: usize,
+    ) -> Result<(), VmError> {
+        let dynamic_cell = context
+            .string_constant_str_for_function(frame.function_id(), name_idx)
+            .and_then(|name| {
+                let env = frame.eval_env()?;
+                crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, name)
+            });
+        let cell = if let Some(cell) = dynamic_cell {
             cell
         } else {
-            frame
-                .upvalues
-                .get(uv_idx)
-                .copied()
-                .ok_or(VmError::InvalidOperand)?
+            frame.upvalue(u32::try_from(uv_idx).map_err(|_| VmError::InvalidOperand)?)?
         };
         let value = crate::read_upvalue(&self.gc_heap, cell);
-        crate::write_register(frame, dst, value)?;
+        frame.write(dst, value)?;
         frame.advance_pc()?;
         Ok(())
     }
@@ -57,23 +66,19 @@ impl Interpreter {
     pub fn jit_runtime_control_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         opcode: u8,
         arg0: u64,
         arg1: u64,
         arg2: u64,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
-        }
-        let saved_pc = stack[frame_index].pc;
+        let saved_pc = frame.pc();
         match opcode {
             value if value == Op::LoadShadowedUpvalue as u8 => {
-                self.run_load_shadowed_upvalue_reg(
+                self.run_load_shadowed_upvalue_active_reg(
                     context,
-                    &mut stack[frame_index],
+                    frame,
                     arg0 as u16,
                     arg1 as u32,
                     arg2 as usize,
@@ -81,7 +86,7 @@ impl Interpreter {
             }
             _ => return Err(VmError::InvalidOperand),
         }
-        stack[frame_index].pc = saved_pc;
+        frame.set_pc(saved_pc);
         Ok(())
     }
 }

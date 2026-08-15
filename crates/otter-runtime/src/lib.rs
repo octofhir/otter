@@ -883,14 +883,6 @@ pub struct RuntimeExecutionStats {
     pub property_store_installs: u64,
     /// `StoreProperty` IC disables / megamorphic transitions.
     pub property_store_disables: u64,
-    /// `HasProperty` IC fast-path hits.
-    pub property_has_hits: u64,
-    /// `HasProperty` IC misses or absent entries.
-    pub property_has_misses: u64,
-    /// `HasProperty` IC installs.
-    pub property_has_installs: u64,
-    /// `HasProperty` IC disables / megamorphic transitions.
-    pub property_has_disables: u64,
     /// Runtime reduction units executed.
     pub reductions_executed: u64,
     /// Bytecode calls observed by runtime budget stats.
@@ -4127,10 +4119,6 @@ impl Runtime {
             property_store_misses: ic.store_misses,
             property_store_installs: ic.store_installs,
             property_store_disables: ic.store_disables,
-            property_has_hits: ic.has_hits,
-            property_has_misses: ic.has_misses,
-            property_has_installs: ic.has_installs,
-            property_has_disables: ic.has_disables,
             reductions_executed: budget.reductions_executed,
             bytecode_calls: budget.bytecode_calls,
             native_calls: budget.native_calls,

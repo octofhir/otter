@@ -18,10 +18,11 @@ use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, NO_FRAME_STATE, SafepointId, SafepointRecord};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Largest argument count a `CallMethodValue` site passes inline.
+/// Register indices that fit in one packed fixed-operand metadata word.
 ///
-/// Argument register indices occupy one 16-bit lane each in a single word.
-pub(crate) const MAX_METHOD_ARGS: usize = 4;
+/// This compact encoding remains for unrelated fixed-arity template helpers;
+/// method calls use the boxed-value-span ABI and never consume these lanes.
+pub(crate) const PACKED_REGISTER_LANES: usize = 4;
 
 /// Why a function could not be native-compiled by a selected JIT tier.
 ///
@@ -1206,29 +1207,29 @@ fn slice_range<T>(storage: &[T], range: OperandRange) -> Result<&[T], Unsupporte
         .ok_or(Unsupported::OperandShape("lowered operand range"))
 }
 
-/// Pack method-call argument register indices into one word.
-pub(crate) fn pack_method_arg_regs(arg_regs: &[u16]) -> u64 {
+/// Pack fixed-operand register indices into one word.
+pub(crate) fn pack_register_lanes(registers: &[u16]) -> u64 {
     let mut packed = 0u64;
-    for (slot, &areg) in arg_regs.iter().take(MAX_METHOD_ARGS).enumerate() {
-        packed |= u64::from(areg) << (16 * slot);
+    for (slot, &register) in registers.iter().take(PACKED_REGISTER_LANES).enumerate() {
+        packed |= u64::from(register) << (16 * slot);
     }
     packed
 }
 
 /// Decode a call's argument-register list from its packed word.
 ///
-/// Up to [`MAX_METHOD_ARGS`] registers travel inline as four u16 lanes; a
+/// Up to [`PACKED_REGISTER_LANES`] registers travel inline as four u16 lanes; a
 /// longer list travels as the address of a register table inside the
 /// executing code object's decoded-operand buffer, which stays alive for the
 /// code's whole lifetime (the emitter bakes the address after the buffer is
 /// frozen).
-pub(crate) fn decode_packed_arg_regs(
+pub(crate) fn decode_register_list(
     argc: usize,
     packed: u64,
-    inline: &mut [u16; MAX_METHOD_ARGS],
+    inline: &mut [u16; PACKED_REGISTER_LANES],
 ) -> &[u16] {
-    if argc <= MAX_METHOD_ARGS {
-        *inline = unpack_method_arg_regs(packed);
+    if argc <= PACKED_REGISTER_LANES {
+        *inline = unpack_register_lanes(packed);
         &inline[..argc]
     } else {
         // SAFETY: emitted code passes the baked address of an `argc`-length
@@ -1237,8 +1238,8 @@ pub(crate) fn decode_packed_arg_regs(
     }
 }
 
-/// Unpack method-call argument register indices from one word.
-pub(crate) fn unpack_method_arg_regs(packed: u64) -> [u16; MAX_METHOD_ARGS] {
+/// Unpack fixed-operand register indices from one word.
+pub(crate) fn unpack_register_lanes(packed: u64) -> [u16; PACKED_REGISTER_LANES] {
     [
         (packed & 0xffff) as u16,
         ((packed >> 16) & 0xffff) as u16,

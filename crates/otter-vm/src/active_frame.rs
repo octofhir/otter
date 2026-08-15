@@ -43,6 +43,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
     Frame, UpvalueCell, Value, VmError,
+    eval_env::EvalEnvHandle,
     native_abi::{NativeFrame, NativeFrameKind, VmFrameHeader},
 };
 
@@ -330,6 +331,18 @@ impl<'a> ActiveFrameRef<'a> {
         }
     }
 
+    /// Direct-eval environment inherited by this activation, if any.
+    #[must_use]
+    pub fn eval_env(&self) -> Option<EvalEnvHandle> {
+        match &self.inner {
+            ActiveFrameRefInner::Materialized { frame, .. } => {
+                (!frame.eval_env.is_null()).then_some(frame.eval_env)
+            }
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().eval_env() },
+        }
+    }
+
     /// Number of captured upvalue handles in this activation.
     #[must_use]
     pub fn upvalue_count(&self) -> usize {
@@ -392,7 +405,9 @@ impl<'a> ActiveFrameRef<'a> {
     /// generated stack windows are handled separately by
     /// [`Self::trace_stack_register_slots`]. This method owns SELF, `this`,
     /// `new.target`, and upvalue handles for a native activation; an interpreter
-    /// frame delegates to its established frame tracer.
+    /// frame delegates to its established frame tracer. The native frame's
+    /// nullable eval-environment handle is visited and rewritten here as the
+    /// slot's single tracing authority.
     pub(crate) fn trace_non_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => frame.trace_frame_slots(visitor),
@@ -416,6 +431,13 @@ impl<'a> ActiveFrameRef<'a> {
                     // this activation; no Rust slice/reference is retained.
                     let slot = unsafe { native.upvalues.base.as_ptr().add(index) };
                     visitor(slot.cast::<RawGc>());
+                }
+                // The nullable compressed eval-environment field is a real
+                // frame-owned GC slot. Visit and rewrite the field itself so
+                // generated closures never retain a pre-move handle.
+                let eval_env = unsafe { std::ptr::addr_of_mut!((*frame).eval_env) };
+                if !unsafe { (*eval_env).is_null() } {
+                    visitor(eval_env.cast::<RawGc>());
                 }
             }
         }
@@ -651,6 +673,18 @@ impl<'a> ActiveFrameMut<'a> {
         }
     }
 
+    /// Direct-eval environment inherited by this activation, if any.
+    #[must_use]
+    pub fn eval_env(&self) -> Option<EvalEnvHandle> {
+        match &self.inner {
+            ActiveFrameMutInner::Materialized { frame, .. } => {
+                (!frame.eval_env.is_null()).then_some(frame.eval_env)
+            }
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().eval_env() },
+        }
+    }
+
     /// Number of captured upvalue handles in this activation.
     #[must_use]
     pub fn upvalue_count(&self) -> usize {
@@ -801,7 +835,6 @@ mod tests {
     fn header(register_count: u16) -> VmFrameHeader {
         VmFrameHeader {
             function_id: 7,
-            code_block_id: 11,
             pc: 3,
             register_count,
             kind: NativeFrameKind::Baseline,
@@ -812,6 +845,7 @@ mod tests {
     fn materialized_frame(slots: &mut [Value]) -> Frame {
         Frame {
             header: header(slots.len() as u16),
+            eval_env: EvalEnvHandle::null(),
             registers: crate::RegisterWindow::attached(slots.as_mut_ptr(), slots.len(), 0),
             upvalues: Frame::empty_upvalues(),
             self_value: Value::function(7),
@@ -831,7 +865,6 @@ mod tests {
             Value::function(7),
             Value::number_i32(9),
         );
-        native.set_materialized_activation(0);
         {
             // SAFETY: `native` and `native_slots` remain exclusively live for
             // the view and match the published descriptors above.
@@ -899,12 +932,65 @@ mod tests {
     }
 
     #[test]
-    fn materialized_self_survives_park_and_resume() {
+    fn native_eval_env_slot_is_visited_and_rewritten_in_place() {
+        let mut slots = [Value::undefined()];
+        let mut native = NativeFrame::new(
+            header(slots.len() as u16),
+            slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        // SAFETY: fixture offsets are never dereferenced; they model the
+        // collector's compressed-handle rewrite contract only.
+        let before = unsafe { EvalEnvHandle::from_offset(0x1000) };
+        let after = unsafe { EvalEnvHandle::from_offset(0x2000) };
+        native.set_eval_env(Some(before));
+        // SAFETY: frame and its initialized register window remain live for
+        // the complete trace operation.
+        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
+        assert_eq!(active.eval_env(), Some(before));
+        let mut rewrites = 0;
+        active.trace_non_register_slots(&mut |slot| unsafe {
+            if (*slot).0 == before.offset() {
+                slot.write(after.raw());
+                rewrites += 1;
+            }
+        });
+        assert_eq!(rewrites, 1);
+        assert_eq!(native.eval_env(), Some(after));
+    }
+
+    #[test]
+    fn materialized_eval_env_has_one_root_across_park_and_resume() {
         let mut slots = [Value::number_i32(5)];
         let mut frame = materialized_frame(&mut slots);
         frame.self_value = Value::function(41);
+        // SAFETY: fixture offsets model collector rewrites and are never
+        // dereferenced as heap addresses.
+        let before = unsafe { EvalEnvHandle::from_offset(0x1000) };
+        let parked_value = unsafe { EvalEnvHandle::from_offset(0x2000) };
+        let after = unsafe { EvalEnvHandle::from_offset(0x3000) };
+        frame.eval_env = before;
+        let active = ActiveFrameRef::materialized(&frame);
+        let mut materialized_rewrites = 0;
+        active.trace_non_register_slots(&mut |slot| unsafe {
+            if (*slot).0 == before.offset() {
+                slot.write(parked_value.raw());
+                materialized_rewrites += 1;
+            }
+        });
+        assert_eq!(materialized_rewrites, 1);
         let (parked, window) = crate::frame_state::ParkedFrameState::copy_from_active(frame);
+        let mut parked_rewrites = 0;
+        parked.trace_slots(&mut |slot| unsafe {
+            if (*slot).0 == parked_value.offset() {
+                slot.write(after.raw());
+                parked_rewrites += 1;
+            }
+        });
+        assert_eq!(parked_rewrites, 1);
         let restored = parked.into_active(window);
+        assert_eq!(restored.eval_env, after);
         assert_eq!(restored.self_value, Value::function(41));
         assert_eq!(restored.registers[0], Value::number_i32(5));
     }

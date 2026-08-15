@@ -25,16 +25,19 @@
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
 //! - Indexed loads and stores use a baked VM element program plus the GC cage
-//!   when one is available. An ordinary packed-double array produces and consumes unboxed
-//!   Number values. Its scalar Number index is converted to an exact Uint32
-//!   before the address guard, while a still-tagged index retains the ordinary
-//!   exact int32-tag proof. Neither form boxes an already-scalar payload.
-//!   Other prepared families retain the tagged-value contract. Missing or
-//!   incompatible direct metadata becomes a reentrant boxed-value call that
-//!   owns canonical `[[Get]]`/`[[Set]]` completion; a generic operation inside
-//!   a local catch conservatively keeps the whole function materialized.
+//!   when one is available. An ordinary packed-double array produces and
+//!   consumes unboxed Number values. Its scalar Number index is converted to an
+//!   exact Uint32 before the address guard, while a still-tagged index retains
+//!   the ordinary exact int32-tag proof. Neither form boxes an already-scalar
+//!   payload, and every miss remains an exact pre-effect exit. Other prepared
+//!   families retain a distinct fast index and exact boxed key: their fast hit
+//!   is direct, while every miss completes once through the same canonical
+//!   reentrant `[[Get]]`/`[[Set]]` boundary as an unprepared access. Every
+//!   schema-declared may-throw operation inside a local catch must publish its
+//!   committed exception SSA value; otherwise the function stays on the
+//!   Template baseline.
 //!   Every conversion and access frame state describes the exact pre-access
-//!   register window; every side exit precedes the load or effect-only store.
+//!   register window.
 //! - Ordinary property nodes exist independently of settled shape/slot
 //!   metadata. Selection either emits a guarded hit or exact-deoptimizes at the
 //!   original bytecode. Named `.length` loads retain their exotic fast-path
@@ -44,34 +47,42 @@
 //!   frame state so an invalid spine or TDZ hole resumes canonically.
 //! - Prepared global loads retain copied lexical-cell or guarded global-object
 //!   metadata plus an exact pre-load frame state. An absent prepared target
-//!   keeps the whole function on the legacy backend.
+//!   keeps the whole function on the Template baseline.
 //! - Loose numeric equality reuses the guarded numeric path. A tagged value may
 //!   compare directly with a static nullish literal, but the node retains an
 //!   exact pre-operation state so every Cell can deopt for HTMLDDA semantics.
 //! - `ArrayConstruct` accepts only zero arguments or one exact Int32 length.
 //!   The allocating operation and any required tagged decode retain the same
-//!   exact pre-construction frame state; all wider arities stay on the legacy
-//!   backend.
-//! - A protected instruction's deopt state retains values used only by its
-//!   innermost catch. This implicit liveness is solved with normal CFG
-//!   liveness; element and scalar guards do not become generated throw edges.
+//!   exact pre-construction frame state; all wider arities stay on the Template
+//!   baseline.
+//! - Register reads, writes, and potential implicit exception exits come only
+//!   from the bytecode opcode schema. A protected may-throw instruction ends
+//!   its HIR block, and its pre-state retains values used only by the innermost
+//!   catch. Selection must explicitly return the `NativeResultPair` exception value;
+//!   it is never inferred from an operand position.
 //! - Reentrant plain/constructor calls remain monomorphic. Guarded methods
 //!   accept only a complete dense one-to-four-target VM plan and carry one exact
 //!   pre-call FrameState for the whole chain. A never-attempted unplanned plain
-//!   or method call becomes an exact pre-effect cold exit; an attempted
-//!   unplanned site keeps the whole function on the legacy backend. Supported
-//!   catch regions become explicit exceptional CFG edges whose landing state
-//!   receives the thrown value.
+//!   or method call becomes an exact pre-effect cold exit. An attempted
+//!   unplanned method becomes a zero-candidate direct-method node whose final
+//!   miss owns the canonical call; an attempted unplanned plain call keeps the
+//!   whole function on the Template baseline. Fixed committed boxed-value and
+//!   generated JavaScript calls enter supported catch regions through explicit
+//!   exceptional CFG edges that receive the returned pure exception SSA value.
 //! - All other tagged coercions/equality use declared leaf stubs; primitive
 //!   string concatenation uses the allocating stub family.
 //! - Register merges become typed block parameters. Only loop-header OSR
 //!   metadata retains the aligned VM-register sources needed at the entry ABI.
 //!   Heterogeneous numeric inputs join as Number, while any tagged or Boolean
 //!   mixture joins as Tagged. Constructor-transition functions conservatively
-//!   retain the legacy backend when such a heterogeneous join is required.
+//!   retain the Template baseline when such a heterogeneous join is required.
+//!   A catch body reached only after an exact deopt is absent from generated
+//!   CFG: handler reconstruction resumes it in the interpreter. A committed
+//!   pure-exception edge keeps the same catch body reachable in Machine HIR.
 //! - Loop headers receive explicit parameters for every numeric value live from
 //!   a forward predecessor; backedge arguments are attached after all blocks
-//!   are lowered.
+//!   are lowered. Headers inside an active exception region remain ordinary
+//!   Machine blocks but never publish OSR entry metadata.
 //! - Packed-double view caches are planned only for reducible innermost loops
 //!   without allocation, JavaScript reentry, or incompatible stores. A cached
 //!   receiver is defined outside the loop or passes through an exact identity
@@ -81,10 +92,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use otter_bytecode::opcode_schema::{OperandKind, RegisterAccess, RegisterSource, operand_spec_at};
 use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, JitElementBase, JitElementRepr, JitInstructionMetadata};
 
 use super::super::{MAX_PACKED_DOUBLE_VIEW_CACHES, PackedDoubleViewCacheId};
+use super::semantics::{
+    CommittedValueOperation, InstructionSemantics, classify_snapshot,
+    packed_double_element_access_is_exact,
+};
 
 const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
 const MAX_FUNCTION_PARAMETERS: u16 = 16;
@@ -126,6 +142,10 @@ pub(super) enum NumericNode {
         index: i32,
         byte_pc: u32,
     },
+    StringConstantCell {
+        byte_pc: u32,
+        target: otter_vm::jit::JitStringConstantCell,
+    },
     GlobalLexicalLoad {
         byte_pc: u32,
         target: otter_vm::jit::JitGlobalLexicalLoad,
@@ -134,8 +154,9 @@ pub(super) enum NumericNode {
         byte_pc: u32,
         target: otter_vm::jit::JitGlobalObjectLoad,
     },
-    BindThis {
-        source: NumericValue,
+    CommittedValue {
+        operation: CommittedValueOperation,
+        inputs: [Option<NumericValue>; 2],
         logical_pc: u32,
         byte_pc: u32,
         exceptional_edge: Option<u16>,
@@ -261,7 +282,7 @@ pub(super) enum NumericNode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum NumericDirectCallArguments {
-    Fixed { start: u16, count: u8 },
+    Fixed { start: u32, count: u32 },
     Spread(NumericValue),
 }
 
@@ -338,6 +359,25 @@ fn method_direct_call_target(
     })
 }
 
+fn generic_method_call_target() -> NumericDirectCallTarget {
+    NumericDirectCallTarget {
+        kind: NumericDirectCallKind::Method,
+        candidates: Vec::new(),
+    }
+}
+
+fn append_direct_call_arguments(
+    storage: &mut Vec<NumericValue>,
+    arguments: impl IntoIterator<Item = NumericValue>,
+) -> Option<(u32, u32)> {
+    let start = u32::try_from(storage.len()).ok()?;
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let count = u32::try_from(arguments.len()).ok()?;
+    start.checked_add(count)?;
+    storage.extend(arguments);
+    Some((start, count))
+}
+
 fn intern_direct_call_target(
     targets: &mut Vec<NumericDirectCallTarget>,
     target: NumericDirectCallTarget,
@@ -365,6 +405,7 @@ fn lower_cold_call_exit(
     frame_states: &mut Vec<NumericFrameState>,
     function_id: u32,
     live_in: &[bool],
+    exceptional_value: &mut Option<NumericValue>,
 ) -> Option<()> {
     let value = push(
         nodes,
@@ -384,7 +425,19 @@ fn lower_cold_call_exit(
         registers,
         live_in,
     );
+    record_exceptional_value(exceptional_value, exceptional_edge, value)?;
     write(registers, destination, RegisterState::Value(value))
+}
+
+fn record_exceptional_value(
+    exceptional_value: &mut Option<NumericValue>,
+    exceptional_edge: Option<usize>,
+    value: NumericValue,
+) -> Option<()> {
+    if exceptional_edge.is_some() && exceptional_value.replace(value).is_some() {
+        return None;
+    }
+    Some(())
 }
 
 impl NumericNode {
@@ -394,9 +447,10 @@ impl NumericNode {
             | Self::This
             | Self::ClassSuperConstructor(..)
             | Self::Upvalue { .. }
+            | Self::StringConstantCell { .. }
             | Self::GlobalLexicalLoad { .. }
             | Self::GlobalObjectLoad { .. }
-            | Self::BindThis { .. }
+            | Self::CommittedValue { .. }
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
             | Self::PropertyStore { .. }
@@ -475,6 +529,42 @@ impl NumericNode {
             | Self::Neg(..) => NumericType::Number,
         }
     }
+
+    /// Authoritative selection use of an attached frame state.
+    pub(super) const fn frame_state_purpose(self) -> Option<NumericFrameStatePurpose> {
+        match self {
+            Self::CommittedValue { .. } => Some(NumericFrameStatePurpose::TaggedRoots),
+            Self::GenericElementLoad { .. } | Self::GenericElementStore { .. } => {
+                Some(NumericFrameStatePurpose::RuntimeMetadata)
+            }
+            Self::ColdCallExit { .. }
+            | Self::TaggedToNumber(..)
+            | Self::TaggedToInt32(..)
+            | Self::GlobalLexicalLoad { .. }
+            | Self::GlobalObjectLoad { .. }
+            | Self::Upvalue { .. }
+            | Self::ClassSuperConstructor(..)
+            | Self::ConstructorFieldStore { .. }
+            | Self::PropertyLoad { .. }
+            | Self::PropertyStore { .. }
+            | Self::ElementLoad { .. }
+            | Self::ElementStore { .. }
+            | Self::CheckedFloat64ToElementIndex { .. }
+            | Self::ArrayConstruct { .. }
+            | Self::DirectCall { .. }
+            | Self::TaggedToBoolean(..)
+            | Self::TaggedStrictEqual(..)
+            | Self::TaggedNullishEqual { .. }
+            | Self::TaggedStringConcat(..)
+            | Self::IntegerAdd(..)
+            | Self::IntegerSub(..)
+            | Self::IntegerMul(..)
+            | Self::IntegerNeg(..)
+            | Self::IntegerAddImmediate(..)
+            | Self::IntegerSubImmediate(..) => Some(NumericFrameStatePurpose::ExactDeopt),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,6 +586,8 @@ pub(super) enum NumericTerminator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericBlock {
     pub(super) logical_pc: u32,
+    /// Whether selection may publish an OSR trampoline at this block.
+    pub(super) osr_entry_allowed: bool,
     pub(super) predecessors: Vec<usize>,
     pub(super) successors: Vec<usize>,
     pub(super) parameters: Vec<NumericValue>,
@@ -576,6 +668,17 @@ pub(super) struct NumericFrameState {
 pub(super) enum NumericFramePoint {
     Node(NumericValue),
     Backedge { predecessor: usize, edge: usize },
+}
+
+/// How selection consumes a HIR frame state attached to one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericFrameStatePurpose {
+    /// A reachable pre-effect exact-deopt exit reconstructs the VM window.
+    ExactDeopt,
+    /// A committed effect needs complete live tagged roots but no deopt.
+    TaggedRoots,
+    /// An effect-once emitter uses the state only to publish source identity.
+    RuntimeMetadata,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -739,16 +842,25 @@ impl NumericFunction {
             return None;
         }
 
-        let raw_blocks = build_raw_blocks(view)?;
+        let instruction_semantics = classify_snapshot(view)?;
+        let raw_blocks = build_raw_blocks(view, &instruction_semantics)?;
         let parameter_types =
             infer_parameter_types(view, &raw_blocks, parameter_count, register_count)?;
-        let exception_handlers = build_instruction_exception_handlers(view, &raw_blocks)?;
-        let live_in = build_liveness(view, &raw_blocks, &exception_handlers, register_count)?;
+        let exception_handlers =
+            build_instruction_exception_handlers(view, &raw_blocks, &instruction_semantics)?;
+        let live_in = build_liveness(
+            view,
+            &raw_blocks,
+            &exception_handlers,
+            &instruction_semantics,
+            register_count,
+        )?;
         let instruction_live_in = build_instruction_liveness(
             view,
             &raw_blocks,
             &live_in,
             &exception_handlers,
+            &instruction_semantics,
             register_count,
         )?;
         let mut nodes = Vec::with_capacity(view.instructions.len() + register_count as usize);
@@ -841,6 +953,7 @@ impl NumericFunction {
             block_nodes.extend(parameters.iter().copied());
             let terminal_pc = raw.end.checked_sub(1)?;
             let mut exceptional_pre_state = None;
+            let mut exceptional_value = None;
             for (pc, instruction_live) in instruction_live_in
                 .iter()
                 .enumerate()
@@ -882,14 +995,17 @@ impl NumericFunction {
                     &view.direct_methods,
                     &view.constructor_field_transitions,
                     &view.element_accesses,
+                    &view.string_constant_cells,
                     &view.global_lexical_loads,
                     &view.global_object_loads,
                     view.cage_base != 0,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
+                    instruction_semantics[pc],
                     (pc == terminal_pc)
                         .then_some(raw.exceptional_edge)
                         .flatten(),
+                    &mut exceptional_value,
                 )?;
             }
 
@@ -927,21 +1043,32 @@ impl NumericFunction {
                 }
             };
 
-            let exceptional_state = if let (Some(mut state), Some(exception_register)) =
-                (exceptional_pre_state, raw.exception_register)
-            {
-                let destination = register(terminal, code, 0)?;
-                let result = read_state(&registers, destination)?;
-                state[usize::from(destination)] = RegisterState::Unset;
-                state[usize::from(exception_register)] = result;
-                Some(state)
-            } else {
-                None
+            let exceptional_state = match (
+                raw.exceptional_edge,
+                exceptional_pre_state,
+                raw.exception_register,
+                exceptional_value,
+            ) {
+                (None, None, None, None) => None,
+                (Some(_), Some(mut state), Some(exception_register), Some(value)) => {
+                    state[usize::from(exception_register)] = RegisterState::Value(value);
+                    Some(state)
+                }
+                // Schema establishes the potential catch edge. Selection must
+                // explicitly publish the `NativeResultPair` exception value; guessing
+                // it from operand zero aliases stores and other non-result
+                // operations with an unrelated receiver.
+                (Some(_), Some(_), Some(_), None) => return None,
+                _ => return None,
             };
             out_states.push(registers);
             exceptional_out_states.push(exceptional_state);
             blocks.push(NumericBlock {
                 logical_pc: u32::try_from(raw.start).ok()?,
+                osr_entry_allowed: code
+                    .control_flow()
+                    .enclosing_exception_region(u32::try_from(raw.start).ok()?)
+                    .is_none(),
                 predecessors: raw.predecessors.clone(),
                 successors: raw.successors.clone(),
                 parameters,
@@ -1158,7 +1285,7 @@ fn packed_double_cache_loop_is_safe(
                             | NumericNode::ColdCallExit { .. }
                             | NumericNode::ArrayConstruct { .. }
                             | NumericNode::TaggedStringConcat(..)
-                            | NumericNode::BindThis { .. }
+                            | NumericNode::CommittedValue { .. }
                             | NumericNode::ClassSuperConstructor(..)
                             | NumericNode::ConstructorFieldStore { .. }
                             | NumericNode::PropertyStore { .. }
@@ -1328,158 +1455,86 @@ fn infer_instruction_parameters(
     int32_parameters: &mut u16,
     number_parameters: &mut u16,
 ) -> Option<()> {
-    let read = |register: u16| origins.get(usize::from(register)).copied();
     let op = instruction.op(code);
+    let (reads, writes) = instruction_accesses(instruction, code)?;
+    let read = |index: usize| origins.get(usize::from(*reads.get(index)?)).copied();
+    for &register in &reads {
+        let _ = origins.get(usize::from(register))?;
+    }
+    for &register in &writes {
+        let _ = origins.get(usize::from(register))?;
+    }
+
+    // Every schema-declared write kills parameter provenance unless one of the
+    // representation-sensitive transfers below proves an exact value copy.
+    // This is deliberately the default: adding a semantic opcode to the
+    // bytecode schema must not require another admission mirror here.
+    let mut preserved_write = None;
     match op {
-        Op::StoreLocal => {
-            let source = read(register(instruction, code, 0)?)?;
-            *origins.get_mut(usize::from(local_index(instruction, code, 1)?))? = source;
-        }
-        Op::LoadLocal => {
-            let source = read(local_index(instruction, code, 1)?)?;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
-        }
-        Op::LoadUndefined
-        | Op::LoadNull
-        | Op::LoadTrue
-        | Op::LoadFalse
-        | Op::LoadInt32
-        | Op::LoadNumber
-        | Op::LoadThis
-        | Op::LoadUpvalue
-        | Op::LoadGlobalOrThrow => {
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::GetPrototype => {
-            let _ = read(register(instruction, code, 1)?)?;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::BindThisValue => {
-            let _ = read(register(instruction, code, 0)?)?;
-        }
-        Op::LoadProperty => {
-            let _ = read(register(instruction, code, 1)?)?;
-            let _ = instruction.const_index(code, 2)?;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::StoreProperty => {
-            let _ = read(register(instruction, code, 0)?)?;
-            let _ = instruction.const_index(code, 1)?;
-            let _ = read(register(instruction, code, 2)?)?;
-            *origins.get_mut(usize::from(register(instruction, code, 3)?))? = 0;
-        }
-        Op::LoadElement => {
-            let _ = read(register(instruction, code, 1)?)?;
-            let _ = read(register(instruction, code, 2)?)?;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::StoreElement => {
-            let _ = read(register(instruction, code, 0)?)?;
-            let _ = read(register(instruction, code, 1)?)?;
-            let _ = read(register(instruction, code, 2)?)?;
-        }
-        Op::Call | Op::New | Op::SuperConstruct => {
-            let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
-            for index in 0..count {
-                let _ = read(register(instruction, code, 3 + index)?)?;
-            }
-            let _ = read(register(instruction, code, 1)?)?;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::CallSpread | Op::NewSpread | Op::SuperConstructSpread => {
-            let _ = read(register(instruction, code, 1)?)?;
-            let _ = read(register(instruction, code, 2)?)?;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::CallMethodValue => {
-            let count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
-            let _ = instruction.const_index(code, 2)?;
-            let _ = read(register(instruction, code, 1)?)?;
-            for index in 0..count {
-                let _ = read(register(instruction, code, 4 + index)?)?;
-            }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+        Op::StoreLocal | Op::LoadLocal => {
+            preserved_write = Some((*writes.first()?, read(0)?));
         }
         Op::ArrayConstruct => {
-            let count = usize::try_from(instruction.const_index(code, 1)?).ok()?;
-            match count {
-                0 => {}
-                1 => {
-                    *int32_parameters |= read(register(instruction, code, 2)?)?;
-                }
-                _ => return None,
+            if reads.len() == 1 {
+                *int32_parameters |= read(0)?;
             }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
-            let source = read(register(instruction, code, 1)?)?;
+            let source = read(0)?;
             *number_parameters |= source;
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
+            preserved_write = Some((*writes.first()?, source));
         }
         Op::Neg | Op::Increment | Op::AddImm | Op::SubImm => {
-            let source = read(register(instruction, code, 1)?)?;
+            let source = read(0)?;
             if !instruction.arith_feedback().is_empty() {
                 *number_parameters |= source;
             }
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= source;
-                *origins.get_mut(usize::from(register(instruction, code, 0)?))? = source;
-            } else {
-                *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
+                preserved_write = Some((*writes.first()?, source));
             }
         }
         Op::Add
             if instruction
                 .arith_feedback()
-                .is_primitive_string_concat_only() =>
-        {
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
+                .is_primitive_string_concat_only() => {}
         Op::Add | Op::Sub | Op::Mul => {
-            let left = read(register(instruction, code, 1)?)?;
-            let right = read(register(instruction, code, 2)?)?;
+            let left = read(0)?;
+            let right = read(1)?;
             if !instruction.arith_feedback().is_empty() {
                 *number_parameters |= left | right;
             }
-            let destination = usize::from(register(instruction, code, 0)?);
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= left | right;
-                *origins.get_mut(destination)? = left | right;
-            } else {
-                *origins.get_mut(destination)? = 0;
+                preserved_write = Some((*writes.first()?, left | right));
             }
         }
         Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual => {
-            let inputs =
-                read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            let inputs = read(0)? | read(1)?;
             if instruction.arith_feedback().is_numeric_only() {
                 *number_parameters |= inputs;
                 if instruction.arith_feedback().is_int32_only() {
                     *int32_parameters |= inputs;
                 }
             }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
-            let inputs =
-                read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            let inputs = read(0)? | read(1)?;
             if !instruction.arith_feedback().is_empty() {
                 *number_parameters |= inputs;
             }
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= inputs;
             }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
-            let source = read(register(instruction, code, 1)?)?;
+            let source = read(0)?;
             if !instruction.arith_feedback().is_empty() {
                 *number_parameters |= source;
             }
             if instruction.arith_feedback().is_int32_only() {
                 *int32_parameters |= source;
             }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::Div
         | Op::Rem
@@ -1490,38 +1545,32 @@ fn infer_instruction_parameters(
         | Op::Shl
         | Op::Shr
         | Op::Ushr => {
-            let inputs =
-                read(register(instruction, code, 1)?)? | read(register(instruction, code, 2)?)?;
+            let inputs = read(0)? | read(1)?;
             if !instruction.arith_feedback().is_empty() {
                 *number_parameters |= inputs;
             }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
-        }
-        Op::ToBoolean | Op::LogicalNot => {
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
         Op::BitwiseNot | Op::BitwiseAndImm => {
-            let source = read(register(instruction, code, 1)?)?;
+            let source = read(0)?;
             if !instruction.arith_feedback().is_empty() {
                 *number_parameters |= source;
             }
-            *origins.get_mut(usize::from(register(instruction, code, 0)?))? = 0;
         }
-        Op::JumpIfTrue
-        | Op::JumpIfFalse
-        | Op::EnterTry
-        | Op::LeaveTry
-        | Op::Return
-        | Op::ReturnValue
-        | Op::ReturnUndefined
-        | Op::Nop
-        | Op::Jump => {}
-        _ => return None,
+        _ => {}
+    }
+    for register in writes {
+        *origins.get_mut(usize::from(register))? = 0;
+    }
+    if let Some((register, origin)) = preserved_write {
+        *origins.get_mut(usize::from(register))? = origin;
     }
     Some(())
 }
 
-fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
+fn build_raw_blocks(
+    view: &JitCompileSnapshot,
+    instruction_semantics: &[InstructionSemantics],
+) -> Option<Vec<RawBlock>> {
     let code = view.code_block.as_ref();
     let mut starts = code
         .block_starts()
@@ -1530,20 +1579,14 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
         .collect::<std::collections::BTreeSet<_>>();
     for (pc, instruction) in view.instructions.iter().enumerate() {
         let pc = u32::try_from(pc).ok()?;
-        if matches!(
-            instruction.op(code),
-            Op::Call
-                | Op::CallMethodValue
-                | Op::CallSpread
-                | Op::New
-                | Op::NewSpread
-                | Op::SuperConstruct
-                | Op::SuperConstructSpread
-        ) && code
-            .control_flow()
-            .enclosing_exception_region(pc)
-            .and_then(|region| region.catch_pc)
-            .is_some()
+        if instruction_semantics
+            .get(pc as usize)?
+            .has_implicit_exception_side_exit(instruction.op(code))
+            && code
+                .control_flow()
+                .enclosing_exception_region(pc)
+                .and_then(|region| region.catch_pc)
+                .is_some()
             && usize::try_from(pc + 1).ok()? < view.instructions.len()
         {
             starts.insert(pc + 1);
@@ -1585,19 +1628,12 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
             Op::ReturnUndefined => (Vec::new(), RawTerminator::ReturnUndefined),
             _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
         };
-        let exceptional = matches!(
-            op,
-            Op::Call
-                | Op::CallMethodValue
-                | Op::CallSpread
-                | Op::New
-                | Op::NewSpread
-                | Op::SuperConstruct
-                | Op::SuperConstructSpread
-        )
-        .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
-        .flatten()
-        .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
+        let exceptional = instruction_semantics
+            .get(terminal_pc as usize)?
+            .has_implicit_exception_side_exit(op)
+            .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
+            .flatten()
+            .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
         let (exceptional_edge, exception_register) = if let Some((handler, register)) = exceptional
         {
             let edge = successors.len();
@@ -1616,25 +1652,62 @@ fn build_raw_blocks(view: &JitCompileSnapshot) -> Option<Vec<RawBlock>> {
             terminator,
         });
     }
-    for predecessor in 0..blocks.len() {
-        for successor in blocks[predecessor].successors.clone() {
-            blocks.get_mut(successor)?.predecessors.push(predecessor);
-        }
-    }
-    if blocks
-        .iter()
-        .skip(1)
-        .any(|block| block.predecessors.is_empty())
-    {
+    retain_reachable_raw_blocks(blocks)
+}
+
+/// Remove bytecode blocks that can only be entered after leaving generated
+/// code through exact deoptimization. In particular, a catch body with no
+/// committed pure-exception predecessor resumes in the interpreter after the
+/// materialized handler stack is reconstructed; manufacturing a Machine edge
+/// would require an exception value that the generated operation never owns.
+fn retain_reachable_raw_blocks(blocks: Vec<RawBlock>) -> Option<Vec<RawBlock>> {
+    if blocks.is_empty() {
         return None;
     }
-    Some(blocks)
+    let mut reachable = vec![false; blocks.len()];
+    let mut pending = vec![0usize];
+    while let Some(block) = pending.pop() {
+        let reached = reachable.get_mut(block)?;
+        if *reached {
+            continue;
+        }
+        *reached = true;
+        pending.extend(blocks.get(block)?.successors.iter().copied());
+    }
+
+    let mut remap = vec![None; blocks.len()];
+    let mut next = 0usize;
+    for (block, &is_reachable) in reachable.iter().enumerate() {
+        if is_reachable {
+            remap[block] = Some(next);
+            next += 1;
+        }
+    }
+
+    let mut retained = Vec::with_capacity(next);
+    for (old_index, mut block) in blocks.into_iter().enumerate() {
+        if !reachable[old_index] {
+            continue;
+        }
+        block.predecessors.clear();
+        for successor in &mut block.successors {
+            *successor = remap.get(*successor).copied().flatten()?;
+        }
+        retained.push(block);
+    }
+    for predecessor in 0..retained.len() {
+        for successor in retained[predecessor].successors.clone() {
+            retained.get_mut(successor)?.predecessors.push(predecessor);
+        }
+    }
+    Some(retained)
 }
 
 fn build_liveness(
     view: &JitCompileSnapshot,
     blocks: &[RawBlock],
     exception_handlers: &[Option<InstructionExceptionHandler>],
+    instruction_semantics: &[InstructionSemantics],
     register_count: u16,
 ) -> Option<Vec<Vec<bool>>> {
     let code = view.code_block.as_ref();
@@ -1651,6 +1724,7 @@ fn build_liveness(
                     code,
                     exception_handlers.get(pc).copied().flatten(),
                     &live_in,
+                    *instruction_semantics.get(pc)?,
                     &mut next,
                 )?;
             }
@@ -1670,6 +1744,7 @@ fn build_instruction_liveness(
     blocks: &[RawBlock],
     block_live_in: &[Vec<bool>],
     exception_handlers: &[Option<InstructionExceptionHandler>],
+    instruction_semantics: &[InstructionSemantics],
     register_count: u16,
 ) -> Option<Vec<Vec<bool>>> {
     let code = view.code_block.as_ref();
@@ -1683,6 +1758,7 @@ fn build_instruction_liveness(
                 code,
                 exception_handlers.get(pc).copied().flatten(),
                 block_live_in,
+                *instruction_semantics.get(pc)?,
                 &mut live,
             )?;
             instruction_live_in[pc] = live.clone();
@@ -1694,6 +1770,7 @@ fn build_instruction_liveness(
 fn build_instruction_exception_handlers(
     view: &JitCompileSnapshot,
     blocks: &[RawBlock],
+    instruction_semantics: &[InstructionSemantics],
 ) -> Option<Vec<Option<InstructionExceptionHandler>>> {
     let code = view.code_block.as_ref();
     let blocks_by_pc = blocks
@@ -1703,6 +1780,13 @@ fn build_instruction_exception_handlers(
         .collect::<Option<BTreeMap<_, _>>>()?;
     let mut handlers = vec![None; view.instructions.len()];
     for (pc, handler) in handlers.iter_mut().enumerate() {
+        let instruction = view.instructions.get(pc)?;
+        if !instruction_semantics
+            .get(pc)?
+            .has_implicit_exception_side_exit(instruction.op(code))
+        {
+            continue;
+        }
         let pc = u32::try_from(pc).ok()?;
         let Some(region) = code.control_flow().enclosing_exception_region(pc) else {
             continue;
@@ -1744,6 +1828,7 @@ fn transfer_instruction_liveness(
     code: &otter_vm::CodeBlock,
     exception_handler: Option<InstructionExceptionHandler>,
     block_live_in: &[Vec<bool>],
+    semantics: InstructionSemantics,
     live: &mut [bool],
 ) -> Option<()> {
     let (reads, writes) = instruction_accesses(instruction, code)?;
@@ -1753,7 +1838,7 @@ fn transfer_instruction_liveness(
     for read in reads {
         *live.get_mut(usize::from(read))? = true;
     }
-    if instruction_has_implicit_exception_side_exit(instruction.op(code))
+    if semantics.has_implicit_exception_side_exit(instruction.op(code))
         && let Some(handler) = exception_handler
     {
         for (register, &handler_live) in block_live_in.get(handler.block)?.iter().enumerate() {
@@ -1765,211 +1850,40 @@ fn transfer_instruction_liveness(
     Some(())
 }
 
-fn instruction_has_implicit_exception_side_exit(op: Op) -> bool {
-    matches!(
-        op,
-        Op::GetPrototype
-            | Op::LoadUpvalue
-            | Op::LoadGlobalOrThrow
-            | Op::BindThisValue
-            | Op::LoadProperty
-            | Op::StoreProperty
-            | Op::LoadElement
-            | Op::StoreElement
-            | Op::ArrayConstruct
-            | Op::ToPrimitive
-            | Op::ToNumeric
-            | Op::ToNumber
-            | Op::ToBoolean
-            | Op::LogicalNot
-            | Op::Neg
-            | Op::Increment
-            | Op::BitwiseNot
-            | Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Rem
-            | Op::Pow
-            | Op::BitwiseAnd
-            | Op::BitwiseOr
-            | Op::BitwiseXor
-            | Op::Shl
-            | Op::Shr
-            | Op::Ushr
-            | Op::Equal
-            | Op::NotEqual
-            | Op::LooseEqual
-            | Op::LooseNotEqual
-            | Op::LessThan
-            | Op::LessEq
-            | Op::GreaterThan
-            | Op::GreaterEq
-            | Op::AddImm
-            | Op::SubImm
-            | Op::BitwiseAndImm
-            | Op::LessThanImm
-            | Op::EqualImm
-            | Op::NotEqualImm
-            | Op::JumpIfTrue
-            | Op::JumpIfFalse
-    )
-}
-
 fn instruction_accesses(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
 ) -> Option<(Vec<u16>, Vec<u16>)> {
-    match instruction.op(code) {
-        Op::StoreLocal => Some((
-            vec![register(instruction, code, 0)?],
-            vec![local_index(instruction, code, 1)?],
-        )),
-        Op::LoadLocal => Some((
-            vec![local_index(instruction, code, 1)?],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::LoadUndefined
-        | Op::LoadNull
-        | Op::LoadTrue
-        | Op::LoadFalse
-        | Op::LoadInt32
-        | Op::LoadNumber
-        | Op::LoadThis
-        | Op::LoadUpvalue
-        | Op::LoadGlobalOrThrow => {
-            if instruction.op(code) == Op::LoadGlobalOrThrow {
-                let _ = instruction.const_index(code, 1)?;
+    let op = instruction.op(code);
+    let operands = instruction.operand_view(code);
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for index in 0..operands.len() {
+        let spec = operand_spec_at(op, index)?;
+        let operand = operands.get(index)?;
+        if OperandKind::of(&operand) != spec.kind {
+            return None;
+        }
+        if spec.register_access == RegisterAccess::None {
+            if spec.register_source.is_some() {
+                return None;
             }
-            Some((Vec::new(), vec![register(instruction, code, 0)?]))
+            continue;
         }
-        Op::GetPrototype => Some((
-            vec![register(instruction, code, 1)?],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::BindThisValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
-        Op::LoadProperty => {
-            let _ = instruction.const_index(code, 2)?;
-            Some((
-                vec![register(instruction, code, 1)?],
-                vec![register(instruction, code, 0)?],
-            ))
-        }
-        Op::StoreProperty => {
-            let _ = instruction.const_index(code, 1)?;
-            Some((
-                vec![
-                    register(instruction, code, 0)?,
-                    register(instruction, code, 2)?,
-                ],
-                vec![register(instruction, code, 3)?],
-            ))
-        }
-        Op::LoadElement => Some((
-            vec![
-                register(instruction, code, 1)?,
-                register(instruction, code, 2)?,
-            ],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::StoreElement => Some((
-            vec![
-                register(instruction, code, 0)?,
-                register(instruction, code, 1)?,
-                register(instruction, code, 2)?,
-            ],
-            Vec::new(),
-        )),
-        Op::Call | Op::New | Op::SuperConstruct => {
-            let count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
-            let mut reads = Vec::with_capacity(count + 1);
-            reads.push(register(instruction, code, 1)?);
-            for index in 0..count {
-                reads.push(register(instruction, code, 3 + index)?);
+        let register = match (spec.register_source, operand) {
+            (Some(RegisterSource::RegisterOperand), Operand::Register(register)) => register,
+            (Some(RegisterSource::Imm32RegisterIndex), Operand::Imm32(register)) => {
+                u16::try_from(register).ok()?
             }
-            Some((reads, vec![register(instruction, code, 0)?]))
+            _ => return None,
+        };
+        match spec.register_access {
+            RegisterAccess::Read => reads.push(register),
+            RegisterAccess::Write => writes.push(register),
+            RegisterAccess::None => unreachable!(),
         }
-        Op::CallSpread | Op::NewSpread | Op::SuperConstructSpread => Some((
-            vec![
-                register(instruction, code, 1)?,
-                register(instruction, code, 2)?,
-            ],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::CallMethodValue => {
-            let count = usize::try_from(instruction.const_index(code, 3)?).ok()?;
-            let _ = instruction.const_index(code, 2)?;
-            let mut reads = Vec::with_capacity(count + 1);
-            reads.push(register(instruction, code, 1)?);
-            for index in 0..count {
-                reads.push(register(instruction, code, 4 + index)?);
-            }
-            Some((reads, vec![register(instruction, code, 0)?]))
-        }
-        Op::ArrayConstruct => {
-            let count = usize::try_from(instruction.const_index(code, 1)?).ok()?;
-            let reads = match count {
-                0 => Vec::new(),
-                1 => vec![register(instruction, code, 2)?],
-                _ => return None,
-            };
-            Some((reads, vec![register(instruction, code, 0)?]))
-        }
-        Op::ToPrimitive
-        | Op::ToNumeric
-        | Op::ToNumber
-        | Op::ToBoolean
-        | Op::LogicalNot
-        | Op::Neg
-        | Op::Increment
-        | Op::BitwiseNot => Some((
-            vec![register(instruction, code, 1)?],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::Add
-        | Op::Sub
-        | Op::Mul
-        | Op::Div
-        | Op::Rem
-        | Op::Pow
-        | Op::BitwiseAnd
-        | Op::BitwiseOr
-        | Op::BitwiseXor
-        | Op::Shl
-        | Op::Shr
-        | Op::Ushr
-        | Op::Equal
-        | Op::NotEqual
-        | Op::LooseEqual
-        | Op::LooseNotEqual
-        | Op::LessThan
-        | Op::LessEq
-        | Op::GreaterThan
-        | Op::GreaterEq => Some((
-            vec![
-                register(instruction, code, 1)?,
-                register(instruction, code, 2)?,
-            ],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::AddImm
-        | Op::SubImm
-        | Op::BitwiseAndImm
-        | Op::LessThanImm
-        | Op::EqualImm
-        | Op::NotEqualImm => Some((
-            vec![register(instruction, code, 1)?],
-            vec![register(instruction, code, 0)?],
-        )),
-        Op::JumpIfTrue | Op::JumpIfFalse => {
-            Some((vec![register(instruction, code, 1)?], Vec::new()))
-        }
-        Op::Return | Op::ReturnValue => Some((vec![register(instruction, code, 0)?], Vec::new())),
-        Op::ReturnUndefined | Op::Nop | Op::Jump | Op::EnterTry | Op::LeaveTry => {
-            Some((Vec::new(), Vec::new()))
-        }
-        _ => None,
     }
+    Some((reads, writes))
 }
 
 fn target_block(
@@ -2150,6 +2064,59 @@ struct NumericDecodeSite<'a> {
     byte_pc: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_committed_value(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    operation: CommittedValueOperation,
+    semantics: InstructionSemantics,
+    registers: &mut [RegisterState],
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    live_in: &[bool],
+    frame_states: &mut Vec<NumericFrameState>,
+    function_id: u32,
+    logical_pc: u32,
+    exceptional_edge: Option<usize>,
+    exceptional_value: &mut Option<NumericValue>,
+) -> Option<()> {
+    if !semantics.is_committed_runtime() || semantics.committed_value != Some(operation) {
+        return None;
+    }
+    let (reads, writes) = instruction_accesses(instruction, code)?;
+    if reads.len() > 2 || writes.len() > 1 {
+        return None;
+    }
+    let mut inputs = [None, None];
+    for (input, register) in inputs.iter_mut().zip(reads) {
+        *input = Some(read_value(registers, register)?);
+    }
+    let value = push(
+        nodes,
+        NumericNode::CommittedValue {
+            operation,
+            inputs,
+            logical_pc,
+            byte_pc: instruction.byte_pc,
+            exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+        },
+    );
+    block_nodes.push(value);
+    push_frame_state(
+        frame_states,
+        NumericFramePoint::Node(value),
+        function_id,
+        instruction.byte_pc,
+        registers,
+        live_in,
+    );
+    record_exceptional_value(exceptional_value, exceptional_edge, value)?;
+    if let Some(destination) = writes.first().copied() {
+        write(registers, destination, RegisterState::Value(value))?;
+    }
+    Some(())
+}
+
 fn lower_instruction(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
@@ -2170,14 +2137,53 @@ fn lower_instruction(
         otter_vm::jit::JitConstructorFieldTransition,
     >,
     element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
+    string_constant_cells: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitStringConstantCell>,
     global_lexical_loads: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitGlobalLexicalLoad>,
     global_object_loads: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitGlobalObjectLoad>,
     cage_available: bool,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
+    semantics: InstructionSemantics,
     exceptional_edge: Option<usize>,
+    exceptional_value: &mut Option<NumericValue>,
 ) -> Option<()> {
     let op = instruction.op(code);
+    let local_handler = has_local_exception_handler(code, logical_pc);
+    let expects_exceptional_edge = local_handler && semantics.has_implicit_exception_side_exit(op);
+    if exceptional_edge.is_some() != expects_exceptional_edge {
+        return None;
+    }
+    let pure_exception_value = semantics.committed_value.is_some()
+        || matches!(
+            op,
+            Op::Call
+                | Op::CallSpread
+                | Op::CallMethodValue
+                | Op::New
+                | Op::NewSpread
+                | Op::SuperConstruct
+                | Op::SuperConstructSpread
+        );
+    if exceptional_edge.is_some() && !pure_exception_value {
+        return None;
+    }
+    if let Some(operation) = semantics.committed_value {
+        return lower_committed_value(
+            instruction,
+            code,
+            operation,
+            semantics,
+            registers,
+            nodes,
+            block_nodes,
+            live_in,
+            frame_states,
+            function_id,
+            logical_pc,
+            exceptional_edge,
+            exceptional_value,
+        );
+    }
     let decode_site = NumericDecodeSite {
         registers,
         live_in,
@@ -2199,6 +2205,13 @@ fn lower_instruction(
         Op::LoadUndefined => NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
         Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
         Op::LoadThis => NumericNode::This,
+        Op::LoadString => {
+            let _ = instruction.const_index(code, 1)?;
+            NumericNode::StringConstantCell {
+                byte_pc: instruction.byte_pc,
+                target: *string_constant_cells.get(&instruction.byte_pc)?,
+            }
+        }
         Op::LoadGlobalOrThrow => {
             let _ = instruction.const_index(code, 1)?;
             let node = if let Some(target) = global_lexical_loads.get(&instruction.byte_pc) {
@@ -2286,28 +2299,6 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::BindThisValue => {
-            let source = read_value(registers, register(instruction, code, 0)?)?;
-            let value = push(
-                nodes,
-                NumericNode::BindThis {
-                    source,
-                    logical_pc,
-                    byte_pc: instruction.byte_pc,
-                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
-                },
-            );
-            block_nodes.push(value);
-            push_frame_state(
-                frame_states,
-                NumericFramePoint::Node(value),
-                function_id,
-                instruction.byte_pc,
-                registers,
-                live_in,
-            );
-            return Some(());
-        }
         Op::StoreProperty if constructor_field_transitions.contains_key(&instruction.byte_pc) => {
             let _ = instruction.const_index(code, 1)?;
             let value = push(
@@ -2339,9 +2330,9 @@ fn lower_instruction(
             // A runtime-backed named-property miss can invoke getters, proxies,
             // and user coercion before throwing. Machine landing pads do not
             // yet reconstruct a committed exceptional state, so keep local
-            // handlers on the materialized backend instead of replaying the
+            // handlers on the Template baseline instead of replaying the
             // original operation after an observable effect.
-            if has_local_exception_handler(code, logical_pc) {
+            if exceptional_edge.is_some() {
                 return None;
             }
             let value = push(
@@ -2370,7 +2361,7 @@ fn lower_instruction(
         }
         Op::StoreProperty => {
             let _ = instruction.const_index(code, 1)?;
-            if has_local_exception_handler(code, logical_pc) {
+            if exceptional_edge.is_some() {
                 return None;
             }
             let value = push(
@@ -2412,7 +2403,10 @@ fn lower_instruction(
                         | NumericType::Number
                 );
             let Some(access) = access.filter(|_| direct) else {
-                if has_local_exception_handler(code, logical_pc) {
+                // A committed generic miss may throw after performing
+                // canonical lookup. Until Machine owns a committed-throw
+                // landing contract, keep it out of a local catch.
+                if exceptional_edge.is_some() {
                     return None;
                 }
                 let value = push(
@@ -2440,6 +2434,9 @@ fn lower_instruction(
                 )?;
                 return Some(());
             };
+            if access == NumericElementAccess::Tagged && exceptional_edge.is_some() {
+                return None;
+            }
             if access == NumericElementAccess::PackedDouble
                 && value_type(nodes, index)? == NumericType::Number
             {
@@ -2514,7 +2511,10 @@ fn lower_instruction(
             let Some(access) = access
                 .filter(|_| receiver_type == NumericType::Tagged && direct_index && direct_value)
             else {
-                if has_local_exception_handler(code, logical_pc) {
+                // Keep generic stores under the same all-or-nothing exception
+                // boundary as loads: canonical reentry cannot exact-deopt into
+                // a local handler after the operation has started.
+                if exceptional_edge.is_some() {
                     return None;
                 }
                 let value = push(
@@ -2538,6 +2538,9 @@ fn lower_instruction(
                 );
                 return Some(());
             };
+            if access == NumericElementAccess::Tagged && exceptional_edge.is_some() {
+                return None;
+            }
             if access == NumericElementAccess::PackedDouble
                 && value_type(nodes, index)? == NumericType::Number
             {
@@ -2669,10 +2672,11 @@ fn lower_instruction(
                     frame_states,
                     function_id,
                     live_in,
+                    exceptional_value,
                 );
             };
-            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
-            direct_call_arguments.extend(arguments);
+            let (argument_start, argument_count) =
+                append_direct_call_arguments(direct_call_arguments, arguments)?;
             let target = intern_direct_call_target(
                 direct_call_targets,
                 monomorphic_direct_call_target(NumericDirectCallKind::Plain, callee),
@@ -2684,7 +2688,7 @@ fn lower_instruction(
                     target,
                     arguments: NumericDirectCallArguments::Fixed {
                         start: argument_start,
-                        count: u8::try_from(argument_count).ok()?,
+                        count: argument_count,
                     },
                     logical_pc,
                     byte_pc: instruction.byte_pc,
@@ -2700,6 +2704,7 @@ fn lower_instruction(
                 registers,
                 live_in,
             );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -2718,13 +2723,11 @@ fn lower_instruction(
             };
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
-            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
-            for index in 0..argument_count {
-                direct_call_arguments.push(read_value(
-                    registers,
-                    register(instruction, code, 3 + index)?,
-                )?);
-            }
+            let arguments = (0..argument_count)
+                .map(|index| read_value(registers, register(instruction, code, 3 + index)?))
+                .collect::<Option<Vec<_>>>()?;
+            let (argument_start, argument_count) =
+                append_direct_call_arguments(direct_call_arguments, arguments)?;
             let target = intern_direct_call_target(
                 direct_call_targets,
                 monomorphic_direct_call_target(kind, callee),
@@ -2736,7 +2739,7 @@ fn lower_instruction(
                     target,
                     arguments: NumericDirectCallArguments::Fixed {
                         start: argument_start,
-                        count: u8::try_from(argument_count).ok()?,
+                        count: argument_count,
                     },
                     logical_pc,
                     byte_pc: instruction.byte_pc,
@@ -2752,6 +2755,7 @@ fn lower_instruction(
                 registers,
                 live_in,
             );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -2804,6 +2808,7 @@ fn lower_instruction(
                 registers,
                 live_in,
             );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -2818,27 +2823,28 @@ fn lower_instruction(
             let arguments = (0..argument_count)
                 .map(|index| read_value(registers, register(instruction, code, 4 + index)?))
                 .collect::<Option<Vec<_>>>()?;
-            let Some(methods) = direct_methods.get(&instruction.byte_pc) else {
-                if instruction.call_attempted {
-                    return None;
+            let target = match direct_methods.get(&instruction.byte_pc) {
+                Some(methods) => method_direct_call_target(methods)?,
+                None if instruction.call_attempted => generic_method_call_target(),
+                None => {
+                    return lower_cold_call_exit(
+                        NumericColdCallKind::Method,
+                        register(instruction, code, 0)?,
+                        logical_pc,
+                        instruction.byte_pc,
+                        exceptional_edge,
+                        registers,
+                        nodes,
+                        block_nodes,
+                        frame_states,
+                        function_id,
+                        live_in,
+                        exceptional_value,
+                    );
                 }
-                return lower_cold_call_exit(
-                    NumericColdCallKind::Method,
-                    register(instruction, code, 0)?,
-                    logical_pc,
-                    instruction.byte_pc,
-                    exceptional_edge,
-                    registers,
-                    nodes,
-                    block_nodes,
-                    frame_states,
-                    function_id,
-                    live_in,
-                );
             };
-            let target = method_direct_call_target(methods)?;
-            let argument_start = u16::try_from(direct_call_arguments.len()).ok()?;
-            direct_call_arguments.extend(arguments);
+            let (argument_start, argument_count) =
+                append_direct_call_arguments(direct_call_arguments, arguments)?;
             let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
@@ -2847,7 +2853,7 @@ fn lower_instruction(
                     target,
                     arguments: NumericDirectCallArguments::Fixed {
                         start: argument_start,
-                        count: u8::try_from(argument_count).ok()?,
+                        count: argument_count,
                     },
                     logical_pc,
                     byte_pc: instruction.byte_pc,
@@ -2863,6 +2869,7 @@ fn lower_instruction(
                 registers,
                 live_in,
             );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
             write(
                 registers,
                 register(instruction, code, 0)?,
@@ -3407,10 +3414,6 @@ fn element_access_kind(
     }
 }
 
-pub(super) fn packed_double_element_access_is_exact(access: &otter_vm::JitElementAccess) -> bool {
-    access.is_packed_double_array()
-}
-
 fn push(nodes: &mut Vec<NumericNode>, node: NumericNode) -> NumericValue {
     let value = NumericValue(nodes.len());
     nodes.push(node);
@@ -3610,7 +3613,8 @@ mod tests {
         JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
         jit::{
             JitConstructorFieldTransition, JitDirectCallPlan, JitDirectMethod,
-            JitGlobalLexicalLoad, JitGlobalObjectLoad, JitMethodGuard, JitTestInstruction,
+            JitGlobalLexicalLoad, JitGlobalObjectLoad, JitMethodGuard, JitStringConstantCell,
+            JitTestInstruction,
         },
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
         native_abi::NativeFrameKind,
@@ -3651,42 +3655,51 @@ mod tests {
         }
     }
 
-    fn call_view(method: bool) -> JitCompileSnapshot {
+    fn call_view_with_arguments(method: bool, argument_registers: &[u16]) -> JitCompileSnapshot {
+        let destination = argument_registers
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("test destination register");
+        let argument_count = u32::try_from(argument_registers.len()).expect("test argument count");
         let call = if method {
-            JitTestInstruction::new(
-                Op::CallMethodValue,
-                0,
-                0,
-                vec![
-                    Operand::Register(2),
-                    Operand::Register(0),
-                    Operand::ConstIndex(0),
-                    Operand::ConstIndex(1),
-                    Operand::Register(1),
-                ],
-            )
+            let mut operands = vec![
+                Operand::Register(destination),
+                Operand::Register(0),
+                Operand::ConstIndex(0),
+                Operand::ConstIndex(argument_count),
+            ];
+            operands.extend(argument_registers.iter().copied().map(Operand::Register));
+            JitTestInstruction::new(Op::CallMethodValue, 0, 0, operands)
         } else {
-            JitTestInstruction::new(
-                Op::Call,
-                0,
-                0,
-                vec![
-                    Operand::Register(2),
-                    Operand::Register(0),
-                    Operand::ConstIndex(1),
-                    Operand::Register(1),
-                ],
-            )
+            let mut operands = vec![
+                Operand::Register(destination),
+                Operand::Register(0),
+                Operand::ConstIndex(argument_count),
+            ];
+            operands.extend(argument_registers.iter().copied().map(Operand::Register));
+            JitTestInstruction::new(Op::Call, 0, 0, operands)
         };
         JitCompileSnapshot::without_feedback(
             110,
-            2,
-            3,
+            destination,
+            destination.checked_add(1).expect("test register count"),
             vec![
                 call,
-                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+                JitTestInstruction::new(
+                    Op::ReturnValue,
+                    1,
+                    8,
+                    vec![Operand::Register(destination)],
+                ),
             ],
         )
+    }
+
+    fn call_view(method: bool) -> JitCompileSnapshot {
+        call_view_with_arguments(method, &[1])
     }
 
     fn array_construct_view(argument_count: u32) -> JitCompileSnapshot {
@@ -3910,6 +3923,7 @@ mod tests {
             blocks: vec![
                 NumericBlock {
                     logical_pc: 0,
+                    osr_entry_allowed: true,
                     predecessors: Vec::new(),
                     successors: vec![1],
                     parameters: Vec::new(),
@@ -3920,6 +3934,7 @@ mod tests {
                 },
                 NumericBlock {
                     logical_pc: 1,
+                    osr_entry_allowed: true,
                     predecessors: vec![0, 2],
                     successors: vec![2, 3],
                     parameters: vec![value(1)],
@@ -3933,6 +3948,7 @@ mod tests {
                 },
                 NumericBlock {
                     logical_pc: 2,
+                    osr_entry_allowed: true,
                     predecessors: vec![1],
                     successors: vec![1],
                     parameters: Vec::new(),
@@ -3943,6 +3959,7 @@ mod tests {
                 },
                 NumericBlock {
                     logical_pc: 3,
+                    osr_entry_allowed: true,
                     predecessors: vec![1],
                     successors: Vec::new(),
                     parameters: Vec::new(),
@@ -4128,7 +4145,38 @@ mod tests {
         )
     }
 
-    fn catch_liveness_view() -> JitCompileSnapshot {
+    fn catch_liveness_view_with_element_store(store: bool) -> JitCompileSnapshot {
+        let element = if store {
+            (
+                Op::StoreElement,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::Register(5),
+                ],
+            )
+        } else {
+            (
+                Op::LoadElement,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            )
+        };
+        let after_element = if store {
+            (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(1)])
+        } else {
+            (
+                Op::Mul,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(3),
+                    Operand::Register(8),
+                ],
+            )
+        };
         let instructions = vec![
             (
                 Op::EnterTry,
@@ -4154,22 +4202,8 @@ mod tests {
             (Op::Jump, vec![Operand::Imm32(0)]),
             (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
             (Op::LoadInt32, vec![Operand::Register(8), Operand::Imm32(2)]),
-            (
-                Op::LoadElement,
-                vec![
-                    Operand::Register(3),
-                    Operand::Register(1),
-                    Operand::Register(2),
-                ],
-            ),
-            (
-                Op::Mul,
-                vec![
-                    Operand::Register(4),
-                    Operand::Register(3),
-                    Operand::Register(8),
-                ],
-            ),
+            element,
+            after_element,
             (Op::LeaveTry, Vec::new()),
             (Op::ReturnValue, vec![Operand::Register(4)]),
             (Op::ReturnValue, vec![Operand::Register(5)]),
@@ -4216,6 +4250,45 @@ mod tests {
                 ..JitElementAccess::default()
             },
         );
+        view
+    }
+
+    fn catch_liveness_view() -> JitCompileSnapshot {
+        catch_liveness_view_with_element_store(false)
+    }
+
+    fn direct_call_catch_view() -> JitCompileSnapshot {
+        let mut view = JitCompileSnapshot::without_feedback(
+            128,
+            1,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::EnterTry,
+                    0,
+                    0,
+                    vec![
+                        Operand::Imm32(3),
+                        Operand::Imm32(NO_HANDLER_OFFSET),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::Call,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(1)]),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(2)]),
+            ],
+        );
+        view.direct_callees.insert(8, direct_callee(129));
         view
     }
 
@@ -4391,15 +4464,60 @@ mod tests {
     }
 
     #[test]
-    fn attempted_unplanned_plain_and_method_calls_reject_machine_hir() {
-        for method in [false, true] {
-            let mut view = call_view(method);
+    fn attempted_unplanned_plain_rejects_but_method_owns_a_generic_final_miss() {
+        let mut plain = call_view(false);
+        plain.seed_call_attempted_for_test(0);
+        assert!(
+            NumericFunction::build(&plain).is_none(),
+            "attempted unplanned plain call still needs a direct callee"
+        );
+
+        let mut method = call_view_with_arguments(true, &[1, 1, 1, 1, 1, 1, 1, 1]);
+        method.seed_call_attempted_for_test(0);
+        let hir = NumericFunction::build(&method).expect("attempted generic method HIR");
+        let target = &hir.direct_call_targets[0];
+        assert_eq!(target.kind, NumericDirectCallKind::Method);
+        assert!(target.candidates.is_empty());
+        assert!(
+            hir.nodes
+                .iter()
+                .all(|node| !matches!(node, NumericNode::ColdCallExit { .. }))
+        );
+        assert!(hir.nodes.iter().any(|node| matches!(
+            node,
+            NumericNode::DirectCall {
+                arguments: NumericDirectCallArguments::Fixed { count: 8, .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn method_argument_metadata_is_u32_and_independent_of_target_count() {
+        for argument_registers in [vec![1, 2, 3, 4, 5], (1..=8).collect::<Vec<_>>()] {
+            let mut view = call_view_with_arguments(true, &argument_registers);
             view.seed_call_attempted_for_test(0);
-            assert!(
-                NumericFunction::build(&view).is_none(),
-                "attempted unplanned call must keep the whole function legacy"
-            );
+            view.direct_methods
+                .insert(0, vec![direct_method(0, 1, 150)]);
+            let hir = NumericFunction::build(&view).expect("wide planned method HIR");
+            assert!(hir.nodes.iter().any(|node| matches!(
+                node,
+                NumericNode::DirectCall {
+                    arguments: NumericDirectCallArguments::Fixed { count, .. },
+                    ..
+                } if *count == argument_registers.len() as u32
+            )));
+            assert_eq!(hir.direct_call_targets[0].candidates.len(), 1);
         }
+
+        // Wordcode itself bounds one instruction's operand vector to u8, but
+        // HIR metadata is deliberately not coupled to that serialization
+        // detail. Exercise the checked aggregate representation directly.
+        let mut storage = Vec::new();
+        let (start, count) =
+            append_direct_call_arguments(&mut storage, std::iter::repeat_n(NumericValue(0), 300))
+                .expect("argc > u8 HIR metadata");
+        assert_eq!((start, count, storage.len()), (0, 300, 300));
     }
 
     #[test]
@@ -4512,7 +4630,7 @@ mod tests {
 
         assert!(
             NumericFunction::build(&array_construct_view(2)).is_none(),
-            "wider Array construction must retain the legacy backend"
+            "wider Array construction must retain the Template baseline"
         );
     }
 
@@ -4617,11 +4735,58 @@ mod tests {
     }
 
     #[test]
+    fn prepared_string_literal_builds_a_pure_tagged_cell_load() {
+        let target = JitStringConstantCell { cell_addr: 0x1234 };
+        let mut view = JitCompileSnapshot::without_feedback(
+            42,
+            0,
+            1,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadString,
+                    0,
+                    24,
+                    vec![Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 32, vec![Operand::Register(0)]),
+            ],
+        );
+        assert!(
+            NumericFunction::build(&view).is_none(),
+            "an unprepared literal must keep the function on Template"
+        );
+
+        view.string_constant_cells.insert(24, target);
+        let hir = NumericFunction::build(&view).expect("prepared string HIR");
+        let literal = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::StringConstantCell {
+                        byte_pc: 24,
+                        target: copied,
+                    } if *copied == target
+                )
+            })
+            .map(NumericValue)
+            .expect("string stable-cell node");
+        assert_eq!(hir.nodes[literal.0].value_type(), NumericType::Tagged);
+        assert!(
+            hir.frame_states
+                .iter()
+                .all(|state| state.point != NumericFramePoint::Node(literal)),
+            "a leaf stable-cell load owns neither deopt state nor GC roots"
+        );
+    }
+
+    #[test]
     fn global_load_requires_prepared_metadata_and_prefers_lexical_binding() {
         let mut view = global_load_view();
         assert!(
             NumericFunction::build(&view).is_none(),
-            "an unprepared global load must keep the whole function legacy"
+            "an unprepared global load must keep the whole function on the Template baseline"
         );
 
         let lexical_target = JitGlobalLexicalLoad { cell_offset: 0x90 };
@@ -4680,6 +4845,7 @@ mod tests {
         let mut catch_live = vec![false; 3];
         catch_live[0] = true;
         catch_live[2] = true;
+        let semantics = classify_snapshot(&view).expect("global-load semantics");
         transfer_instruction_liveness(
             &view.instructions[0],
             code,
@@ -4688,15 +4854,190 @@ mod tests {
                 exception_register: 2,
             }),
             &[catch_live],
+            semantics[0],
             &mut live,
         )
         .expect("implicit global-load exception liveness");
-        assert!(instruction_has_implicit_exception_side_exit(
-            Op::LoadGlobalOrThrow
-        ));
+        assert!(semantics[0].has_implicit_exception_side_exit(Op::LoadGlobalOrThrow));
         assert!(live[0], "catch-only state remains live at the exact exit");
         assert!(!live[1], "the destination is killed before the operation");
         assert!(!live[2], "the catch supplies its exception register");
+    }
+
+    #[test]
+    fn schema_only_value_ops_use_the_generic_admission_transfer() {
+        let view = JitCompileSnapshot::without_feedback(
+            122,
+            2,
+            4,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadString,
+                    0,
+                    0,
+                    vec![Operand::Register(2), Operand::ConstIndex(0)],
+                ),
+                JitTestInstruction::new(
+                    Op::Instanceof,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::StoreGlobalBinding,
+                    2,
+                    16,
+                    vec![
+                        Operand::Register(3),
+                        Operand::ConstIndex(1),
+                        Operand::Imm32(0),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::StoreUpvalueChecked,
+                    3,
+                    24,
+                    vec![Operand::Register(0), Operand::Imm32(0)],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
+            ],
+        );
+        let code = view.code_block.as_ref();
+        assert_eq!(
+            instruction_accesses(&view.instructions[0], code),
+            Some((Vec::new(), vec![2]))
+        );
+        assert_eq!(
+            instruction_accesses(&view.instructions[1], code),
+            Some((vec![0, 1], vec![3]))
+        );
+        assert_eq!(
+            instruction_accesses(&view.instructions[2], code),
+            Some((vec![3], Vec::new()))
+        );
+        assert_eq!(
+            instruction_accesses(&view.instructions[3], code),
+            Some((vec![0], Vec::new()))
+        );
+
+        let mut origins = [1, 2, 4, 8];
+        let mut int32_parameters = 0;
+        let mut number_parameters = 0;
+        for instruction in &view.instructions[..4] {
+            infer_instruction_parameters(
+                instruction,
+                code,
+                &mut origins,
+                &mut int32_parameters,
+                &mut number_parameters,
+            )
+            .expect("schema-declared value operation must not need an inference mirror");
+        }
+        assert_eq!(origins, [1, 2, 0, 0]);
+        assert_eq!(int32_parameters, 0);
+        assert_eq!(number_parameters, 0);
+    }
+
+    #[test]
+    fn committed_value_family_is_admitted_by_one_schema_driven_lowering() {
+        let cases = vec![
+            (
+                Op::Instanceof,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+                Some(2),
+                2,
+            ),
+            (
+                Op::HasProperty,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+                Some(2),
+                2,
+            ),
+            (
+                Op::GetPrototype,
+                vec![Operand::Register(2), Operand::Register(0)],
+                Some(2),
+                1,
+            ),
+            (
+                Op::SetPrototype,
+                vec![Operand::Register(0), Operand::Register(1)],
+                None,
+                2,
+            ),
+            (
+                Op::ToObject,
+                vec![Operand::Register(2), Operand::Register(0)],
+                Some(2),
+                1,
+            ),
+            (
+                Op::ToPropertyKey,
+                vec![Operand::Register(2), Operand::Register(0)],
+                Some(2),
+                1,
+            ),
+            (
+                Op::TypeOf,
+                vec![Operand::Register(2), Operand::Register(0)],
+                Some(2),
+                1,
+            ),
+            (Op::LoadNewTarget, vec![Operand::Register(2)], Some(2), 0),
+            (
+                Op::SameValue,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+                Some(2),
+                2,
+            ),
+            (Op::BindThisValue, vec![Operand::Register(0)], None, 1),
+        ];
+        for (op, operands, destination, expected_arity) in cases {
+            let tail = destination.map_or_else(
+                || JitTestInstruction::new(Op::ReturnUndefined, 1, 8, Vec::new()),
+                |destination| {
+                    JitTestInstruction::new(
+                        Op::ReturnValue,
+                        1,
+                        8,
+                        vec![Operand::Register(destination)],
+                    )
+                },
+            );
+            let view = JitCompileSnapshot::without_feedback(
+                124,
+                2,
+                3,
+                vec![JitTestInstruction::new(op, 0, 0, operands), tail],
+            );
+            let hir = NumericFunction::build(&view)
+                .unwrap_or_else(|| panic!("{op:?} must enter generic committed HIR"));
+            let committed = hir
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    NumericNode::CommittedValue { inputs, .. } => Some(inputs),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{op:?} committed node"));
+            assert_eq!(committed.iter().flatten().count(), expected_arity, "{op:?}");
+        }
     }
 
     #[test]
@@ -4898,7 +5239,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_equality_accesses_and_exception_liveness_are_exact() {
+    fn loose_equality_snapshot_path_has_no_semantic_exception_edge() {
         let view = loose_nullish_view(Op::LooseEqual, Op::LoadNull, false);
         let code = view.code_block.as_ref();
         let comparison = &view.instructions[1];
@@ -4924,6 +5265,7 @@ mod tests {
         let mut catch_live = vec![false; 5];
         catch_live[3] = true;
         catch_live[4] = true;
+        let semantics = classify_snapshot(&view).expect("loose-equality semantics");
         transfer_instruction_liveness(
             comparison,
             code,
@@ -4932,14 +5274,18 @@ mod tests {
                 exception_register: 3,
             }),
             &[catch_live],
+            semantics[1],
             &mut live,
         )
-        .expect("implicit loose-equality exception liveness");
-        assert!(instruction_has_implicit_exception_side_exit(Op::LooseEqual));
+        .expect("snapshot-aware loose-equality liveness");
+        assert!(!semantics[1].has_implicit_exception_side_exit(Op::LooseEqual));
         assert!(live[0] && live[1], "both operands are ordinary reads");
         assert!(!live[2], "destination is killed before the operation");
         assert!(!live[3], "the catch supplies its exception register");
-        assert!(live[4], "catch-only state survives the exact deopt exit");
+        assert!(
+            !live[4],
+            "a proved pre-effect path does not fabricate a semantic throw edge"
+        );
     }
 
     #[test]
@@ -5190,7 +5536,7 @@ mod tests {
     }
 
     #[test]
-    fn unprepared_elements_use_generic_value_calls_but_local_catches_stay_legacy() {
+    fn unprepared_elements_use_generic_value_calls_but_local_catches_stay_on_template_baseline() {
         let mut view = number_index_element_view();
         view.element_accesses.clear();
         let hir = NumericFunction::build(&view).expect("generic element HIR");
@@ -5237,8 +5583,307 @@ mod tests {
         caught.element_accesses.clear();
         assert!(
             NumericFunction::build(&caught).is_none(),
-            "a generic value call inside a local catch stays on the materialized backend"
+            "a generic value call inside a local catch stays on the Template baseline"
         );
+
+        for store in [false, true] {
+            let mut caught = catch_liveness_view_with_element_store(store);
+            assert!(
+                NumericFunction::build(&caught).is_none(),
+                "a prepared tagged element committed miss inside a local catch stays on the Template baseline"
+            );
+
+            let byte_pc = caught.instructions[7].byte_pc;
+            caught
+                .element_accesses
+                .insert(byte_pc, JitElementAccess::packed_double_array());
+            assert!(
+                NumericFunction::build(&caught).is_none(),
+                "a may-throw element needs an explicit committed exception value before entering a local catch"
+            );
+        }
+    }
+
+    #[test]
+    fn may_throw_store_receiver_is_never_used_as_the_exception_value() {
+        let mut caught = catch_liveness_view_with_element_store(true);
+        let byte_pc = caught.instructions[7].byte_pc;
+        caught
+            .element_accesses
+            .insert(byte_pc, JitElementAccess::packed_double_array());
+        assert!(
+            NumericFunction::build(&caught).is_none(),
+            "StoreElement operand zero is its receiver, not a NativeResultPair exception result"
+        );
+    }
+
+    #[test]
+    fn committed_bind_this_publishes_its_status_value_to_the_catch() {
+        let view = JitCompileSnapshot::without_feedback(
+            123,
+            1,
+            2,
+            vec![
+                JitTestInstruction::new(
+                    Op::EnterTry,
+                    0,
+                    0,
+                    vec![
+                        Operand::Imm32(3),
+                        Operand::Imm32(NO_HANDLER_OFFSET),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::BindThisValue, 1, 8, vec![Operand::Register(0)]),
+                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(0)]),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(1)]),
+            ],
+        );
+        let hir = NumericFunction::build(&view).expect("committed BindThis catch HIR");
+        let bind = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::CommittedValue {
+                        operation: CommittedValueOperation::Scalar(
+                            otter_vm::ScalarValueOp::BindThisValue
+                        ),
+                        ..
+                    }
+                )
+            })
+            .map(NumericValue)
+            .expect("BindThis NativeResultPair value");
+        let source = hir
+            .blocks
+            .iter()
+            .position(|block| block.nodes.contains(&bind))
+            .expect("BindThis source block");
+        let handler = hir
+            .blocks
+            .iter()
+            .position(|block| block.logical_pc == 4)
+            .expect("catch block");
+        let edge = hir.blocks[source]
+            .successors
+            .iter()
+            .position(|&successor| successor == handler)
+            .expect("BindThis exceptional edge");
+        assert!(matches!(
+            hir.nodes[bind.0],
+            NumericNode::CommittedValue {
+                exceptional_edge: Some(exceptional_edge),
+                ..
+            } if usize::from(exceptional_edge) == edge
+        ));
+        assert_eq!(
+            hir.blocks[handler].terminator,
+            NumericTerminator::Return(bind),
+            "a single-predecessor catch consumes the committed exception value directly"
+        );
+    }
+
+    #[test]
+    fn committed_instanceof_publishes_a_pure_exception_ssa_landing() {
+        let view = JitCompileSnapshot::without_feedback(
+            125,
+            2,
+            4,
+            vec![
+                JitTestInstruction::new(
+                    Op::EnterTry,
+                    0,
+                    0,
+                    vec![
+                        Operand::Imm32(3),
+                        Operand::Imm32(NO_HANDLER_OFFSET),
+                        Operand::Register(3),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::Instanceof,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(2)]),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
+            ],
+        );
+        let hir = NumericFunction::build(&view).expect("committed Instanceof catch HIR");
+        let instanceof = hir
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    node,
+                    NumericNode::CommittedValue {
+                        operation: CommittedValueOperation::ObjectProtocol(
+                            otter_vm::ObjectProtocolValueOp::Instanceof
+                        ),
+                        exceptional_edge: Some(_),
+                        ..
+                    }
+                )
+            })
+            .map(NumericValue)
+            .expect("Instanceof committed NativeResultPair");
+        let source = hir
+            .blocks
+            .iter()
+            .position(|block| block.nodes.contains(&instanceof))
+            .expect("Instanceof source block");
+        let handler = hir
+            .blocks
+            .iter()
+            .position(|block| block.logical_pc == 4)
+            .expect("catch block");
+        let edge = hir.blocks[source]
+            .successors
+            .iter()
+            .position(|&successor| successor == handler)
+            .expect("pure exceptional edge");
+        assert!(matches!(
+            hir.nodes[instanceof.0],
+            NumericNode::CommittedValue {
+                exceptional_edge: Some(exceptional_edge),
+                ..
+            } if usize::from(exceptional_edge) == edge
+        ));
+        assert_eq!(
+            hir.blocks[handler].terminator,
+            NumericTerminator::Return(instanceof),
+            "a single-predecessor catch consumes the pure exception SSA value directly"
+        );
+    }
+
+    #[test]
+    fn generated_direct_call_inside_local_catch_has_a_pure_exception_ssa_edge() {
+        let hir = NumericFunction::build(&direct_call_catch_view())
+            .expect("generated direct calls feed catch-only handlers through pure SSA");
+        let direct_call = hir
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::DirectCall { .. }))
+            .map(NumericValue)
+            .expect("prepared direct call");
+        let source = hir
+            .blocks
+            .iter()
+            .position(|block| block.nodes.contains(&direct_call))
+            .expect("direct-call source block");
+        let handler = hir
+            .blocks
+            .iter()
+            .position(|block| block.logical_pc == 4)
+            .expect("catch block");
+        let edge = hir.blocks[source]
+            .successors
+            .iter()
+            .position(|&successor| successor == handler)
+            .expect("direct-call exceptional edge");
+        assert!(matches!(
+            hir.nodes[direct_call.0],
+            NumericNode::DirectCall {
+                exceptional_edge: Some(exceptional_edge),
+                ..
+            } if usize::from(exceptional_edge) == edge
+        ));
+        assert_eq!(
+            hir.blocks[handler].terminator,
+            NumericTerminator::Return(direct_call),
+            "the catch consumes only the direct call's returned exception value"
+        );
+    }
+
+    #[test]
+    fn guarded_warm_int32_operation_inside_catch_region_is_machine_eligible() {
+        let mut view = JitCompileSnapshot::without_feedback(
+            126,
+            2,
+            4,
+            vec![
+                JitTestInstruction::new(
+                    Op::EnterTry,
+                    0,
+                    0,
+                    vec![
+                        Operand::Imm32(3),
+                        Operand::Imm32(NO_HANDLER_OFFSET),
+                        Operand::Register(3),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::Add,
+                    1,
+                    8,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(2)]),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
+            ],
+        );
+        view.seed_arith_feedback_for_test(1, ArithFeedback::from_bits(ARITH_INT32));
+        let hir = NumericFunction::build(&view)
+            .expect("catch-only handlers are reconstructed after an exact numeric deopt");
+        assert!(hir.nodes.iter().any(|node| {
+            matches!(
+                node.frame_state_purpose(),
+                Some(NumericFrameStatePurpose::ExactDeopt)
+            )
+        }));
+    }
+
+    #[test]
+    fn metadata_only_frame_state_is_not_misclassified_as_exact_deopt() {
+        let view = JitCompileSnapshot::without_feedback(
+            127,
+            0,
+            1,
+            vec![
+                JitTestInstruction::new(
+                    Op::EnterTry,
+                    0,
+                    0,
+                    vec![
+                        Operand::Imm32(3),
+                        Operand::Imm32(NO_HANDLER_OFFSET),
+                        Operand::Register(0),
+                    ],
+                ),
+                JitTestInstruction::new(Op::Nop, 1, 8, Vec::new()),
+                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::ReturnUndefined, 3, 24, Vec::new()),
+                JitTestInstruction::new(Op::ReturnUndefined, 4, 32, Vec::new()),
+            ],
+        );
+        let node = NumericNode::GenericElementLoad {
+            receiver: NumericValue(1),
+            index: NumericValue(2),
+            logical_pc: 1,
+            byte_pc: 8,
+        };
+        assert_eq!(
+            node.frame_state_purpose(),
+            Some(NumericFrameStatePurpose::RuntimeMetadata)
+        );
+        let hir = NumericFunction::build(&view).expect("metadata-only protected frame state");
+        assert!(hir.nodes.iter().all(|node| {
+            node.frame_state_purpose() != Some(NumericFrameStatePurpose::ExactDeopt)
+        }));
     }
 
     #[test]
@@ -5322,6 +5967,7 @@ mod tests {
     fn packed_double_view_cache_plans_only_innermost_natural_loops() {
         let block = |predecessors: Vec<usize>, successors: Vec<usize>| NumericBlock {
             logical_pc: 0,
+            osr_entry_allowed: true,
             predecessors,
             successor_arguments: vec![Vec::new(); successors.len()],
             successors,
@@ -5493,7 +6139,7 @@ mod tests {
         );
         assert!(
             NumericFunction::build(&constructor).is_none(),
-            "mixed representations must keep constructor transitions on the legacy backend"
+            "mixed representations must keep constructor transitions on the Template baseline"
         );
     }
 
@@ -5544,6 +6190,7 @@ mod tests {
         let mut catch_live = vec![false; 6];
         catch_live[4] = true;
         catch_live[5] = true;
+        let semantics = classify_snapshot(&one).expect("ArrayConstruct semantics");
         transfer_instruction_liveness(
             &one.instructions[0],
             one_code,
@@ -5552,30 +6199,36 @@ mod tests {
                 exception_register: 4,
             }),
             &[catch_live],
+            semantics[0],
             &mut live,
         )
-        .expect("implicit ArrayConstruct exception liveness");
-        assert!(instruction_has_implicit_exception_side_exit(
-            Op::ArrayConstruct
-        ));
+        .expect("snapshot-aware ArrayConstruct liveness");
+        assert!(!semantics[0].has_implicit_exception_side_exit(Op::ArrayConstruct));
         assert!(live[0], "length is an ordinary read");
         assert!(!live[2], "destination is killed before the operation");
         assert!(!live[4], "the catch supplies its exception register");
-        assert!(live[5], "catch-only state remains live at the exact exit");
+        assert!(!live[5], "the allocation path cannot throw semantically");
 
         let two = array_construct_view(2);
         let two_code = two.code_block.as_ref();
-        assert!(instruction_accesses(&two.instructions[0], two_code).is_none());
-        assert!(
-            infer_instruction_parameters(
-                &two.instructions[0],
-                two_code,
-                &mut [1, 2, 4],
-                &mut 0,
-                &mut 0,
-            )
-            .is_none()
+        assert_eq!(
+            instruction_accesses(&two.instructions[0], two_code),
+            Some((vec![0, 1], vec![2]))
         );
+        let mut origins = [1, 2, 4];
+        let mut int32_parameters = 0;
+        let mut number_parameters = 0;
+        infer_instruction_parameters(
+            &two.instructions[0],
+            two_code,
+            &mut origins,
+            &mut int32_parameters,
+            &mut number_parameters,
+        )
+        .expect("multi-value ArrayConstruct uses the generic schema transfer");
+        assert_eq!(origins, [1, 2, 0]);
+        assert_eq!(int32_parameters, 0);
+        assert_eq!(number_parameters, 0);
     }
 
     #[test]
@@ -5733,15 +6386,27 @@ mod tests {
     #[test]
     fn load_property_implicit_exception_exit_keeps_catch_only_values_live() {
         let view = property_catch_liveness_view();
-        let raw_blocks = build_raw_blocks(&view).expect("exception-aware raw blocks");
-        let handlers = build_instruction_exception_handlers(&view, &raw_blocks)
+        let semantics = classify_snapshot(&view).expect("property semantics");
+        let raw_blocks = build_raw_blocks(&view, &semantics).expect("exception-aware raw blocks");
+        let handlers = build_instruction_exception_handlers(&view, &raw_blocks, &semantics)
             .expect("per-instruction catch handlers");
-        let live_in = build_liveness(&view, &raw_blocks, &handlers, 8)
+        let live_in = build_liveness(&view, &raw_blocks, &handlers, &semantics, 8)
             .expect("exception-aware block liveness");
         let property_block = raw_blocks
             .iter()
             .position(|block| block.start == 5)
             .expect("property block after normal boundary");
+        let property_exception_edge = raw_blocks[property_block]
+            .exceptional_edge
+            .expect("schema may-throw property terminates with a catch edge");
+        let handler = raw_blocks
+            .iter()
+            .position(|block| block.start == 11)
+            .expect("catch block");
+        assert_eq!(
+            raw_blocks[property_block].successors[property_exception_edge],
+            handler
+        );
         assert!(
             live_in[property_block][5],
             "LoadProperty may throw to the catch that reads the redefined value"
@@ -5749,17 +6414,18 @@ mod tests {
 
         assert!(
             NumericFunction::build(&view).is_none(),
-            "a runtime-backed property operation inside a local catch stays on the materialized backend"
+            "a runtime-backed property operation inside a local catch stays on the Template baseline"
         );
     }
 
     #[test]
-    fn catch_only_definition_survives_later_element_and_decode_deopts() {
+    fn catch_only_definition_remains_live_at_rejected_committed_element() {
         let view = catch_liveness_view();
-        let raw_blocks = build_raw_blocks(&view).expect("exception-aware raw blocks");
-        let handlers = build_instruction_exception_handlers(&view, &raw_blocks)
+        let semantics = classify_snapshot(&view).expect("element semantics");
+        let raw_blocks = build_raw_blocks(&view, &semantics).expect("exception-aware raw blocks");
+        let handlers = build_instruction_exception_handlers(&view, &raw_blocks, &semantics)
             .expect("per-instruction catch handlers");
-        let live_in = build_liveness(&view, &raw_blocks, &handlers, 9)
+        let live_in = build_liveness(&view, &raw_blocks, &handlers, &semantics, 9)
             .expect("exception-aware block liveness");
         let after_call = raw_blocks
             .iter()
@@ -5778,42 +6444,9 @@ mod tests {
             "the later catch side exit must retain the redefined value across the boundary"
         );
 
-        let hir = NumericFunction::build(&view).expect("exception-aware numeric HIR");
-        let catch_value = hir
-            .nodes
-            .iter()
-            .position(|node| *node == NumericNode::IntegerConstant(41))
-            .map(NumericValue)
-            .expect("post-call catch-only definition");
-        let element = hir
-            .nodes
-            .iter()
-            .position(|node| matches!(node, NumericNode::ElementLoad { .. }))
-            .map(NumericValue)
-            .expect("element load node");
-        let decode = hir
-            .nodes
-            .iter()
-            .position(|node| matches!(node, NumericNode::TaggedToInt32(_)))
-            .map(NumericValue)
-            .expect("tagged Int32 decode node");
-
-        for point in [element, decode] {
-            let state = hir
-                .frame_states
-                .iter()
-                .find(|state| state.point == NumericFramePoint::Node(point))
-                .expect("exact pre-operation frame state");
-            assert_eq!(
-                state.slots[5],
-                NumericFrameSlot::Value(catch_value),
-                "catch-only redefinition must survive at {point:?}"
-            );
-            assert_eq!(
-                state.slots[7],
-                NumericFrameSlot::Undefined,
-                "the handler supplies the exception register"
-            );
-        }
+        assert!(
+            NumericFunction::build(&view).is_none(),
+            "a prepared tagged element miss cannot enter a local catch before committed-throw landing exists"
+        );
     }
 }

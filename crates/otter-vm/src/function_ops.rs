@@ -32,7 +32,9 @@ use crate::{
     VmGetOutcome, VmIntrinsicFunction, VmPropertyKey, abstract_ops, array, function_metadata,
     object, object_statics,
     operand_decode::{const_operand, register_operand},
-    read_register, symbol, to_length, write_register,
+    read_register,
+    rooting::RootScopeExt,
+    symbol, to_length, write_register,
 };
 
 pub(crate) enum BindMetadataGet {
@@ -50,25 +52,23 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
-        let eval_env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
         let mut active = ActiveFrameMut::materialized(frame);
-        self.run_make_function_active_reg(context, &mut active, dst, idx, eval_env)
+        self.run_make_function_active_reg(context, &mut active, dst, idx)
     }
 
     /// Representation-neutral capture-free function construction.
     ///
-    /// Materialized frames supply their optional direct-eval environment.
-    /// Frameless direct-call owners are ineligible when that cold state exists,
-    /// so their published SELF and register window are the complete source of
-    /// truth and no interpreter [`Frame`] needs to be synthesized.
+    /// Materialized frames and stack-owned direct callees expose the same
+    /// nullable direct-eval handle through [`ActiveFrameMut`]; construction
+    /// never consults a second closure-tail field or fabricates `None`.
     pub(crate) fn run_make_function_active_reg(
         &mut self,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         idx: u32,
-        eval_env: Option<crate::eval_env::EvalEnvHandle>,
     ) -> Result<(), VmError> {
+        let eval_env = frame.eval_env();
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -158,9 +158,9 @@ impl Interpreter {
         function_index: u32,
         parent_indices: &[u32],
     ) -> Result<(), VmError> {
-        let (new_target, bound_derived_this, eval_env) =
-            self.frame_cold(frame).map_or((None, None, None), |cold| {
-                (cold.new_target, cold.derived_this_cell, cold.eval_env)
+        let (new_target, bound_derived_this) =
+            self.frame_cold(frame).map_or((None, None), |cold| {
+                (cold.new_target, cold.derived_this_cell)
             });
         let mut active = ActiveFrameMut::materialized_with_new_target(
             frame,
@@ -174,16 +174,14 @@ impl Interpreter {
             parent_indices,
             new_target,
             bound_derived_this,
-            eval_env,
         )
     }
 
     /// Representation-neutral closure construction for a published activation.
     ///
     /// Native direct callees use this path without materializing an interpreter
-    /// [`Frame`]. Materialized callers pass their cold lexical sidecar fields;
-    /// direct-call eligibility guarantees those fields are absent for a native
-    /// owner, while SELF, `this`, and the upvalue window remain available through
+    /// [`Frame`]. Materialized callers pass cold `new.target` / derived-`this`
+    /// state while both representations source the eval environment from
     /// [`ActiveFrameMut`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_make_closure_active_regs(
@@ -195,8 +193,8 @@ impl Interpreter {
         parent_indices: &[u32],
         lexical_new_target: Option<Value>,
         bound_derived_this: Option<UpvalueCell>,
-        eval_env: Option<crate::eval_env::EvalEnvHandle>,
     ) -> Result<(), VmError> {
+        let eval_env = frame.eval_env();
         let function_id = context
             .function_id_constant(function_index)
             .ok_or(VmError::InvalidOperand)?;
@@ -654,8 +652,8 @@ impl Interpreter {
     ///
     /// `packed_meta` carries `dst | callee<<16 | this<<32 | argc<<48`; the low
     /// `argc` 16-bit lanes of `packed_args` name the bound-argument registers.
-    /// The lowering guarantees `argc <= MAX_METHOD_ARGS`, so the four lanes are
-    /// sufficient.
+    /// The lowering guarantees the fixed-operand count fits the four lanes, so
+    /// they are sufficient.
     pub fn jit_runtime_bind_function(
         &mut self,
         context: &ExecutionContext,
@@ -871,26 +869,43 @@ impl Interpreter {
         c: &Value,
         o: &Value,
     ) -> Result<bool, VmError> {
-        if !self.is_callable_runtime(c) {
+        let mut constructor = *c;
+        let mut object = *o;
+        let mut prototype = Value::undefined();
+        let mut bound_target = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: every registered local precedes `roots` and stays stationary
+        // through all getter, Proxy, @@hasInstance, and recursive calls below.
+        unsafe {
+            roots.add_value(&mut constructor);
+            roots.add_value(&mut object);
+            roots.add_value(&mut prototype);
+            roots.add_value(&mut bound_target);
+        }
+
+        if !self.is_callable_runtime(&constructor) {
             return Ok(false);
         }
-        if let Some(bound) = c.as_bound_function() {
-            let (target, _, _) = bound.parts(&self.gc_heap);
-            return self.instanceof_operator(stack, context, o, &target);
+        if let Some(bound) = constructor.as_bound_function() {
+            (bound_target, _, _) = bound.parts(&self.gc_heap);
+            return self.instanceof_operator(stack, context, &object, &bound_target);
         }
-        if !o.is_object_type() {
+        if !object.is_object_type() {
             return Ok(false);
         }
-        let Some(prototype) = self.instanceof_target_prototype(stack, context, c)? else {
+        let Some(resolved_prototype) =
+            self.instanceof_target_prototype(stack, context, &constructor)?
+        else {
             return Ok(false);
         };
+        prototype = resolved_prototype;
         if !(prototype.is_object_type() || prototype.is_proxy()) {
             return Err(self.err_type(
                 ("Function has non-object prototype 'undefined' in instanceof check".to_string())
                     .into(),
             ));
         }
-        self.value_has_proxy_aware_prototype(stack, context, *o, &prototype)
+        self.value_has_proxy_aware_prototype(stack, context, object, &prototype)
     }
 
     /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
@@ -904,16 +919,29 @@ impl Interpreter {
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
+        let mut value = *v;
+        let mut target = *target;
+        let mut handler = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: these locals precede `roots` and remain stationary until the
+        // full `instanceof` operation, including observable getters/calls,
+        // commits or throws.
+        unsafe {
+            roots.add_value(&mut value);
+            roots.add_value(&mut target);
+            roots.add_value(&mut handler);
+        }
+
         if !target.is_object_type() {
             return Err(self
                 .err_type(("Right-hand side of instanceof is not an object".to_string()).into()));
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
-        let handler = match self.ordinary_get_value(stack, context, *target, *target, &key, 0)? {
+        handler = match self.ordinary_get_value(stack, context, target, target, &key, 0)? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, *target, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, target, SmallVec::new())?
             }
         };
         if !handler.is_nullish() {
@@ -926,19 +954,19 @@ impl Interpreter {
                     VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
                 )
             {
-                return self.ordinary_has_instance(stack, context, target, v);
+                return self.ordinary_has_instance(stack, context, &target, &value);
             }
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(*v);
-            let result = self.run_callable_sync_rooted(stack, context, &handler, *target, args)?;
+            args.push(value);
+            let result = self.run_callable_sync_rooted(stack, context, &handler, target, args)?;
             return Ok(result.to_boolean(&self.gc_heap));
         }
-        if !self.is_callable_runtime(target) {
+        if !self.is_callable_runtime(&target) {
             return Err(
                 self.err_type(("Right-hand side of instanceof is not callable".to_string()).into())
             );
         }
-        self.ordinary_has_instance(stack, context, target, v)
+        self.ordinary_has_instance(stack, context, &target, &value)
     }
 
     /// Direct argv read for an untouched `arguments` object.

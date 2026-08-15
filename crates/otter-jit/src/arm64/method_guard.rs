@@ -9,7 +9,9 @@
 //! - The guard re-reads every mutable heap fact immediately before use.
 //! - Every miss branches to the caller's pre-effect deopt exit.
 //! - Accepted closures have the expected function id and carry neither runtime
-//!   call setup nor bound-`this` state.
+//!   call setup nor bound-`this` state. Callers choose whether a non-null
+//!   direct-eval environment can be propagated by a following generated frame
+//!   build or must be rejected for frameless inlining.
 //! - The returned callable is a full tagged `Value`, never a compressed slot.
 //! - One materialized cage base in `x12` serves the receiver and every
 //!   prototype hop; `x13` advances through the guarded object chain.
@@ -51,6 +53,7 @@ pub(crate) fn emit_method_guard(
     site: MethodGuardSite<'_>,
     callable_register: u8,
     receiver_body_register: Option<u8>,
+    allow_eval_env: bool,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_load_reg(ops, 9, site.receiver)?;
@@ -62,6 +65,7 @@ pub(crate) fn emit_method_guard(
         9,
         callable_register,
         receiver_body_register,
+        allow_eval_env,
         bail,
     )
 }
@@ -80,6 +84,7 @@ pub(crate) fn emit_method_guard_from_tagged_register(
     tagged_receiver_register: u8,
     callable_register: u8,
     receiver_body_register: Option<u8>,
+    allow_eval_env: bool,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
     if view.cage_base == 0 {
@@ -162,6 +167,16 @@ pub(crate) fn emit_method_guard_from_tagged_register(
         ; .arch aarch64
         ; tst w11, w12
         ; b.ne =>bail
+    );
+    if !allow_eval_env {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr w11, [X(callable_register), view.closure_call_layout.eval_env_byte]
+            ; cbnz w11, =>bail
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
         ; ldr w11, [X(callable_register), view.closure_call_layout.function_id_byte]
     );
     emit_load_u64(ops, 12, u64::from(guard.method_fid));

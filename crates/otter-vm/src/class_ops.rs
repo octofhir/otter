@@ -1,13 +1,12 @@
 //! Interpreter-owned class-construction helpers.
 //!
 //! # Contents
-//! - Single-implementation value/register helpers for `BindThisValue`,
-//!   `ClassCheck`, and `SetFunctionName`, shared by interpreter and compiled
-//!   dispatch.
+//! - Bind-only and register-dispatch helpers for `BindThisValue`.
+//! - Interpreter class checks and function-name installation.
 //!
 //! # Invariants
-//! - Compiled activations use [`crate::RuntimeCall::class_op`] and never recover
-//!   a materialized frame index through this module.
+//! - Compiled `BindThisValue` uses the committed scalar-value boundary; the
+//!   bind-only kernel never advances the caller-owned logical PC.
 //! - A committed binding/name effect is never replayed by an exact side exit.
 //!
 //! # See also
@@ -28,17 +27,21 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let value = *read_register(&stack[top_idx], src)?;
-        self.run_bind_this_value(stack, top_idx, value)
+        self.bind_this_value(stack, top_idx, value)?;
+        stack[top_idx].advance_pc()
     }
 
-    /// Value-form of [`Self::run_bind_this_value_reg`] for Machine IR, where
-    /// `super()` has already produced an SSA value.
-    pub(crate) fn run_bind_this_value(
+    /// Bind-only value kernel shared with committed generated callers.
+    ///
+    /// The caller owns logical-PC advancement. This kernel either publishes
+    /// the derived `this` value once or returns the semantic double-bind /
+    /// missing-derived-binding error without changing the PC.
+    pub(crate) fn bind_this_value(
         &mut self,
         stack: &mut ActivationStack,
         top_idx: usize,
         value: crate::Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<crate::Value, VmError> {
         let target = (0..=top_idx).rev().find(|&i| {
             self.frame_cold(&stack[i])
                 .is_some_and(|c| c.is_derived_constructor)
@@ -77,8 +80,7 @@ impl Interpreter {
             }
             crate::store_upvalue(&mut self.gc_heap, cell, value);
         }
-        stack[top_idx].advance_pc()?;
-        Ok(())
+        Ok(value)
     }
 
     /// §15.7.14 class-definition validation: heritage IsConstructor (`kind == 0`)

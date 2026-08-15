@@ -194,8 +194,6 @@ pub enum IcSiteKind {
     Load,
     /// `StoreProperty` site.
     Store,
-    /// `HasProperty` site.
-    Has,
 }
 
 /// Lifecycle state of one inline-cache site.
@@ -466,56 +464,6 @@ pub(crate) fn snapshot_store_state(
                             key: None,
                             slot: None,
                             to_shape_id: Some(t.to_shape_id.raw()),
-                        }
-                    } else {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::OwnData,
-                            receiver_shape_id: 0,
-                            key: None,
-                            slot: None,
-                            to_shape_id: None,
-                        }
-                    }
-                })
-                .collect();
-            IcSiteState::Polymorphic {
-                entries: mapped,
-                misses: u32::from(*misses),
-            }
-        }
-    }
-}
-
-/// Build the [`IcSiteState`] DTO from one
-/// [`crate::property_ic::PropertyIcEntry`] holding a
-/// [`crate::cache_ir::CacheStub`].
-#[must_use]
-pub(crate) fn snapshot_has_state(
-    entry: &crate::property_ic::PropertyIcEntry<crate::cache_ir::CacheStub>,
-) -> IcSiteState {
-    use crate::property_ic::PropertyIcEntry;
-    match entry {
-        PropertyIcEntry::Empty => IcSiteState::Empty,
-        PropertyIcEntry::Megamorphic { .. } => IcSiteState::Megamorphic,
-        PropertyIcEntry::Polymorphic { entries, misses } => {
-            let mapped = entries
-                .iter()
-                .map(|ic| {
-                    if let Some(hit) = ic.has_own_slot_hit() {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::OwnData,
-                            receiver_shape_id: hit.shape_id.raw(),
-                            key: None,
-                            slot: Some(hit.slot),
-                            to_shape_id: None,
-                        }
-                    } else if let Some((receiver_shape_id, hit)) = ic.has_direct_prototype() {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::DirectPrototypeData,
-                            receiver_shape_id: receiver_shape_id.raw(),
-                            key: None,
-                            slot: Some(hit.slot),
-                            to_shape_id: None,
                         }
                     } else {
                         IcEntrySnapshot {

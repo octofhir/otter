@@ -731,7 +731,10 @@ mod tests {
             Some(0),
             "Move { dst: 1, src: 0 }".to_string(),
         ));
-        code_map.record(CodeRegion::deopt(4, 8, 0, 3));
+        let mut deopt_region = CodeRegion::structural("deoptExit", 4, 8);
+        deopt_region.logical_pc = Some(3);
+        deopt_region.deopt_exit_id = Some(0);
+        code_map.record(deopt_region);
         code_map.record_osr(2, 4, 8);
         let deopt = DeoptTable::from_states(vec![FrameState {
             frames: vec![DeoptFrame {

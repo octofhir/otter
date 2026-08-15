@@ -96,25 +96,21 @@ pub struct CodeEntryCell {
     pub entry_addr: AtomicU64,
     /// Immutable isolate-local code-object identity.
     pub code_object_id: u64,
-    /// Immutable bytecode function identity.
-    pub function_id: u32,
-    /// Formal parameter count used by frame construction.
-    pub param_count: u16,
-    /// Full tagged register-window capacity.
-    pub register_count: u16,
     /// Static properties of this compiled generation.
     pub flags: u32,
     /// Persistent native-stack bytes reserved by the target after entry, or
     /// zero when this generation cannot accept stack-owned generated calls.
     pub generated_stack_frame_bytes: u32,
+    /// Explicit leases that may outlive a native-activation retirement epoch.
+    pub active_count: AtomicU32,
+    /// Consecutive generated native bails since the last return/throw.
+    pub generated_bail_streak: Cell<u32>,
     /// Ready-to-copy frame header for stack-owned generated calls.
     ///
     /// Function identity, register shape, tier, and safepoint capability are
     /// immutable for this generation. Packing them once removes per-entry
     /// metadata decoding from generated call linkage.
     pub native_frame_header: VmFrameHeader,
-    /// Explicit leases that may outlive a native-activation retirement epoch.
-    pub active_count: AtomicU32,
     /// Generated native entries observed for tiering/introspection. Normal
     /// returns are derived as `entries - deopts - throws` during cold
     /// reconciliation, so the hot path owns no redundant return counter.
@@ -127,8 +123,6 @@ pub struct CodeEntryCell {
     pub generated_deopts: Cell<u64>,
     /// Generated entries that propagated a throw status.
     pub generated_throws: Cell<u64>,
-    /// Consecutive generated native bails since the last return/throw.
-    pub generated_bail_streak: Cell<u32>,
 }
 
 impl CodeEntryCell {
@@ -163,24 +157,20 @@ impl CodeEntryCell {
         Self {
             entry_addr: AtomicU64::new(entry_addr as u64),
             code_object_id,
-            function_id,
-            param_count,
-            register_count,
             flags,
             generated_stack_frame_bytes,
+            active_count: AtomicU32::new(0),
+            generated_bail_streak: Cell::new(0),
             native_frame_header: VmFrameHeader {
                 function_id,
-                code_block_id: function_id,
                 pc: 0,
                 register_count: initialized_register_count,
                 kind,
                 flags: frame_flags,
             },
-            active_count: AtomicU32::new(0),
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
             generated_throws: Cell::new(0),
-            generated_bail_streak: Cell::new(0),
         }
     }
 
@@ -285,18 +275,18 @@ const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
 
-const _: [(); 88] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
-const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
-const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes)];
+const _: [(); 16] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
+const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes)];
+const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
 const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
-const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
-const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
-const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
 
 #[cfg(test)]
 mod tests {
@@ -344,7 +334,14 @@ mod tests {
     #[test]
     fn parameter_prefix_generation_publishes_only_formals() {
         let cell = CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_PARAMETER_PREFIX, 64);
-        assert_eq!(cell.register_count, 12);
         assert_eq!(cell.native_frame_header.register_count, 2);
+    }
+
+    #[test]
+    fn generation_cell_keeps_one_function_identity_in_a_compact_layout() {
+        let cell = cell();
+        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 72);
+        assert_eq!(cell.native_frame_header.function_id, 9);
+        assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 32);
     }
 }

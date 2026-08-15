@@ -1,59 +1,65 @@
-//! Object property-protocol transition emission.
+//! Committed object property-protocol value emission.
 //!
 //! # Contents
-//! - Reentrant calls to the VM-owned property-protocol driver/fast-path helper.
-//! - Uniform success, throw, and exact pre-effect bailout routing.
+//! - Fixed boxed-value calls to the VM-owned property-protocol kernels.
+//! - Normal-result commit and rooted JavaScript-throw routing.
 //!
 //! # Invariants
-//! - The VM helper commits every supported protocol opcode before returning
-//!   success, so generated code only falls through once.
-//! - A missing published activation is the sole bailout case and occurs before
-//!   any observable Proxy trap or `@@hasInstance` call.
+//! - The published function/PC selects semantics; no opcode, destination,
+//!   register index, or materialized-frame identity crosses the ABI.
+//! - Once semantic entry begins, the VM returns `Ok(value)` or
+//!   `Throw(exception)`. Pre-entry `Fatal` bypasses local JS handlers and
+//!   propagates the parked structural error. Proxy traps and `@@hasInstance`
+//!   are never replayed.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_object_protocol_op`
+//! - `otter_vm::RuntimeCall::object_protocol_values`
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
-use super::values::{emit_load_runtime_stub, emit_load_u64};
+use super::values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg};
 use crate::artifact::relocation::RelocationCapture;
-use crate::entry::{STATUS_BAILED, STATUS_THREW};
+use crate::entry::{Unsupported, VALUE_UNDEFINED};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_object_protocol_op(
+pub(super) fn emit_object_protocol_value(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
-    opcode: u8,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-) {
-    let done = ops.new_dynamic_label();
+    _operation: otter_vm::ObjectProtocolValueOp,
+    result: Option<u16>,
+    value0: u16,
+    value1: Option<u16>,
+    committed_throw: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-    emit_load_u64(ops, 1, u64::from(opcode));
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 3, arg1);
-    emit_load_u64(ops, 4, arg2);
+    emit_load_reg(ops, 1, value0)?;
+    if let Some(value1) = value1 {
+        emit_load_reg(ops, 2, value1)?;
+    } else {
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
+    }
     emit_load_runtime_stub(
         ops,
         relocations,
         16,
-        transitions.variadic_entry(abi::STUB_JIT_OBJECT_PROTOCOL_OP),
-        abi::STUB_JIT_OBJECT_PROTOCOL_OP,
+        transitions.entry(abi::STUB_JIT_OBJECT_PROTOCOL_VALUE),
+        abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
     );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cbz x0, =>done
-        ; cmp x0, STATUS_BAILED as u32
-        ; b.eq =>bail
-        ; cmp x0, STATUS_THREW as u32
-        ; b.eq =>threw
-        ; b =>threw
-        ; =>done
+        ; mov x15, x1
+        ; cbz x15, >normal
+        ; cmp x15, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>committed_throw
+        ; b =>fatal
+        ; normal:
     );
+    if let Some(result) = result {
+        emit_store_reg(ops, 0, result)?;
+    }
+    Ok(())
 }

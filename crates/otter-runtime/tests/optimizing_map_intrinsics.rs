@@ -153,18 +153,6 @@ fn optimizing_map_artifacts_expose_frame_free_machine_hits() {
         !relocations.contains("collection_map_set_mutating"),
         "existing-key Map.set must complete without the Rust leaf ABI: {relocations}"
     );
-    let optimized_ir = optimizing
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::OptimizedIr))
-        .map(|file| std::str::from_utf8(file.contents()).expect("optimized IR is UTF-8"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        optimized_ir.contains("copy-webs=")
-            && optimized_ir.contains("coalesced-values=")
-            && optimized_ir.contains("inactive-values="),
-        "legacy optimizing artifacts must expose allocation-plan pressure: {optimized_ir}"
-    );
     let machine_intrinsics = optimizing
         .iter()
         .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))

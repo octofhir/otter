@@ -1,7 +1,7 @@
 //! Shared native-compilation infrastructure for compiled tiers.
 //!
 //! Owns everything the machine backend consumes that is not itself a code
-//! tiers: the frozen compiled-entry ABI (`JitCtx`/`JitRet` and their field
+//! tiers: the frozen compiled-entry ABI (`JitCtx`/`NativeResultPair` and its
 //! offsets), the boxed-value encoding constants, the backend-neutral typed
 //! lowering plan, the classified runtime-stub entries, and the shared VM
 //! entry path ([`enter_compiled`]).
@@ -18,10 +18,10 @@
 //!   that inventory for O(1) compile-time address baking.
 //!
 //! # Invariants
-//! - Compiled functions are `extern "C" fn(*mut JitCtx) -> JitRet`. A normal
-//!   return yields `status: 0`; a failed guard yields `status: 1` (the VM
-//!   resumes on the interpreter at the exact published PC); a re-entered VM
-//!   call that threw yields `status: 2` with the error parked in `ctx.error`.
+//! - Compiled functions return the VM-owned two-word `NativeResultPair`.
+//!   `Return` carries a value, `Bail` carries the exact published logical PC,
+//!   `Throw` carries a pure exception value, and only `Fatal` consults
+//!   `ctx.error`.
 //! - Interpreter-visible registers remain in the published frame window at
 //!   every side exit and allocating/reentrant call; no movable JS pointer is
 //!   kept only in a machine register across a safepoint.
@@ -43,8 +43,8 @@ pub(crate) use abi::*;
 pub(crate) use code::enter_compiled;
 pub use lowering::{BackendFailure, Unsupported};
 pub(crate) use lowering::{
-    BaselinePlan, MAX_METHOD_ARGS, decode_packed_arg_regs, pack_method_arg_regs, reg_offset,
-    unpack_method_arg_regs,
+    BaselinePlan, PACKED_REGISTER_LANES, decode_register_list, pack_register_lanes, reg_offset,
+    unpack_register_lanes,
 };
 use runtime_ops::*;
 pub(crate) use runtime_ops::{
@@ -129,21 +129,6 @@ impl TransitionTable {
         let slot = &mut self.entries[descriptor.id as usize - 1];
         *slot = (entry_addr as u64, Some(descriptor.signature));
     }
-
-    /// Replace one variadic entry in backend execution fixtures.
-    #[cfg(test)]
-    pub(crate) fn replace_variadic_entry_for_test(
-        &mut self,
-        descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
-        entry_addr: usize,
-    ) {
-        assert_eq!(
-            descriptor.signature,
-            otter_vm::native_abi::RuntimeStubSignature::Variadic
-        );
-        assert_ne!(entry_addr, 0);
-        self.entries[descriptor.id as usize - 1] = (entry_addr as u64, Some(descriptor.signature));
-    }
 }
 
 /// JIT-owned runtime transitions installed into the isolate entry table at
@@ -162,13 +147,66 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             entry_addr,
         }
     };
+    macro_rules! context_words_binding {
+        ($descriptor:expr, $entry:path, 1) => {{
+            const _: () = assert!(matches!(
+                $descriptor.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            const _: () = assert!($descriptor.argument_count == 1);
+            let typed: extern "C" fn(*mut JitCtx, u64) -> otter_vm::native_abi::NativeResultPair =
+                $entry;
+            binding($descriptor, typed as *const () as usize)
+        }};
+        ($descriptor:expr, $entry:path, 2) => {{
+            const _: () = assert!(matches!(
+                $descriptor.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            const _: () = assert!($descriptor.argument_count == 2);
+            let typed: extern "C" fn(
+                *mut JitCtx,
+                u64,
+                u64,
+            ) -> otter_vm::native_abi::NativeResultPair = $entry;
+            binding($descriptor, typed as *const () as usize)
+        }};
+        ($descriptor:expr, $entry:path, 3) => {{
+            const _: () = assert!(matches!(
+                $descriptor.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            const _: () = assert!($descriptor.argument_count == 3);
+            let typed: extern "C" fn(
+                *mut JitCtx,
+                u64,
+                u64,
+                u64,
+            ) -> otter_vm::native_abi::NativeResultPair = $entry;
+            binding($descriptor, typed as *const () as usize)
+        }};
+        ($descriptor:expr, $entry:path, 4) => {{
+            const _: () = assert!(matches!(
+                $descriptor.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            const _: () = assert!($descriptor.argument_count == 4);
+            let typed: extern "C" fn(
+                *mut JitCtx,
+                u64,
+                u64,
+                u64,
+                u64,
+            ) -> otter_vm::native_abi::NativeResultPair = $entry;
+            binding($descriptor, typed as *const () as usize)
+        }};
+    }
     vec![
         binding(
             abi::STUB_JIT_BACKEDGE_POLL,
             jit_backedge_poll_stub as *const () as usize,
         ),
         binding(abi::STUB_JIT_ADD, jit_add_stub as *const () as usize),
-        binding(abi::STUB_JIT_NEG, jit_neg_stub as *const () as usize),
         binding(
             abi::STUB_JIT_LOAD_GLOBAL,
             jit_load_global_stub as *const () as usize,
@@ -198,12 +236,20 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_store_property_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_DEFINE_DATA_PROPERTY,
-            jit_define_data_property_stub as *const () as usize,
+            abi::STUB_JIT_CALL_METHOD_VALUE,
+            jit_call_method_value_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_LOAD_STRING,
-            jit_load_string_stub as *const () as usize,
+            abi::STUB_JIT_ROUTE_THROW,
+            jit_route_throw_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
+            jit_acknowledge_caught_throw_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_DEFINE_DATA_PROPERTY,
+            jit_define_data_property_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_LOAD_BUILTIN_ERROR,
@@ -241,9 +287,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_LOAD_UPVALUE,
             jit_load_upvalue_stub as *const () as usize,
         ),
-        binding(
+        context_words_binding!(
             abi::STUB_JIT_LOAD_UPVALUE_VALUE,
-            jit_load_upvalue_value_stub as *const () as usize,
+            jit_load_upvalue_value_stub,
+            1
         ),
         binding(
             abi::STUB_JIT_STORE_UPVALUE,
@@ -252,10 +299,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_STORE_UPVALUE_CHECKED,
             jit_store_upvalue_checked_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_WRITE_BARRIER_WINDOW,
-            jit_write_barrier_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_INLINE_CLOSURE_UPVALUES,
@@ -273,21 +316,20 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_CONSTRUCT,
             jit_construct_stub as *const () as usize,
         ),
-        binding(
+        context_words_binding!(
             abi::STUB_JIT_PREPARE_BASE_CONSTRUCT,
-            jit_prepare_base_construct_stub as *const () as usize,
+            jit_prepare_base_construct_stub,
+            3
         ),
-        binding(
+        context_words_binding!(
             abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
-            jit_try_prepare_base_construct_stub as *const () as usize,
+            jit_try_prepare_base_construct_stub,
+            4
         ),
-        binding(
+        context_words_binding!(
             abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-            jit_derived_construct_result_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_BIND_DERIVED_THIS,
-            jit_bind_derived_this_stub as *const () as usize,
+            jit_derived_construct_result_stub,
+            2
         ),
         binding(
             abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
@@ -297,9 +339,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
             jit_copy_spread_arguments_stub as *const () as usize,
         ),
-        binding(
+        context_words_binding!(
             abi::STUB_JIT_INITIALIZE_UPVALUES,
-            jit_initialize_upvalues_stub as *const () as usize,
+            jit_initialize_upvalues_stub,
+            3
         ),
         binding(
             abi::STUB_JIT_COERCE_UNARY,
@@ -326,16 +369,16 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_global_op_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_OBJECT_PROTOCOL_OP,
-            jit_object_protocol_op_stub as *const () as usize,
+            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+            jit_object_protocol_value_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_DELETE_OP,
             jit_delete_op_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_SCALAR_OP,
-            jit_scalar_op_stub as *const () as usize,
+            abi::STUB_JIT_SCALAR_VALUE,
+            jit_scalar_value_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_SUPER_OP,
@@ -390,8 +433,8 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_resolve_direct_entry_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_RESOLVE_THREW,
-            jit_resolve_threw_stub as *const () as usize,
+            abi::STUB_JIT_FINISH_ERROR,
+            jit_finish_error_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_DEOPT_WRITEBACK,

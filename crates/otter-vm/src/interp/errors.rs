@@ -136,6 +136,11 @@ impl Interpreter {
         )
     }
 
+    /// Raise a failed system call, carrying the properties Node stamps on it.
+    pub(crate) fn err_syscall(&self, payload: run_control::VmSyscallError) -> VmError {
+        self.raise(run_control::ErrorDetail::Syscall(payload), VmError::Coded)
+    }
+
     /// Clone the in-flight error's dynamic detail, set by the `err_*` helpers.
     /// Read at the surfacing boundary paired with the `Copy` [`VmError`].
     pub fn error_detail(&self) -> Option<run_control::ErrorDetail> {
@@ -189,6 +194,7 @@ impl Interpreter {
             },
             VmError::Coded => match detail.as_ref() {
                 Some(ErrorDetail::Coded(p)) => p.message.clone(),
+                Some(ErrorDetail::Syscall(p)) => p.message.clone(),
                 _ => err.to_string(),
             },
             other => other.to_string(),

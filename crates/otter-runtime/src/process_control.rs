@@ -107,30 +107,60 @@ fn chdir_call(capabilities: &CapabilitySet, cwd: &WorkingDirectory) -> NativeCal
         };
 
         if !capabilities.read.matches_path(&target) {
-            return Err(NativeError::Coded {
-                kind: ErrorKind::Error,
-                code: "EACCES",
-                message: format!(
-                    "EACCES: permission denied, chdir '{}' -> '{directory}'",
-                    current.display()
-                ),
-            });
+            return Err(chdir_failure(
+                "EACCES",
+                "permission denied",
+                access_denied_errno(),
+                &current,
+                &directory,
+            ));
         }
 
-        std::env::set_current_dir(&target).map_err(|error| NativeError::Coded {
-            kind: ErrorKind::Error,
-            code: errno_code(&error),
-            message: format!(
-                "{}: {}, chdir '{}' -> '{directory}'",
+        std::env::set_current_dir(&target).map_err(|error| {
+            chdir_failure(
                 errno_code(&error),
                 errno_description(&error),
-                current.display()
-            ),
+                error.raw_os_error().unwrap_or(0),
+                &current,
+                &directory,
+            )
         })?;
         cwd.set(std::env::current_dir().unwrap_or(target));
         Ok(Value::undefined())
     });
     NativeCall::Dynamic(call)
+}
+
+/// Shape a failed `chdir` the way Node does: the message names both operands
+/// and the error carries `syscall`, `path`, and `dest` for a caller to read.
+fn chdir_failure(
+    code: &'static str,
+    description: &str,
+    errno: i32,
+    current: &std::path::Path,
+    directory: &str,
+) -> NativeError {
+    NativeError::Syscall {
+        code,
+        message: format!(
+            "{code}: {description}, chdir '{}' -> '{directory}'",
+            current.display()
+        ),
+        syscall: "chdir",
+        path: Some(current.display().to_string()),
+        dest: Some(directory.to_string()),
+        errno: -errno,
+    }
+}
+
+#[cfg(unix)]
+fn access_denied_errno() -> i32 {
+    nix::errno::Errno::EACCES as i32
+}
+
+#[cfg(not(unix))]
+fn access_denied_errno() -> i32 {
+    13
 }
 
 /// `process.kill(pid[, signal])` — validate, resolve the signal name, and hand

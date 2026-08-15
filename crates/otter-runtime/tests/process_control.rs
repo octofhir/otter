@@ -68,6 +68,25 @@ fn chdir_reports_a_missing_directory_as_enoent() {
 }
 
 #[test]
+fn a_failed_chdir_carries_the_system_error_properties() {
+    run(r#"
+        let thrown;
+        try {
+            process.chdir("this-directory-does-not-exist");
+        } catch (error) {
+            thrown = error;
+        }
+        if (thrown.syscall !== "chdir") throw new Error("syscall was " + thrown.syscall);
+        if (thrown.dest !== "this-directory-does-not-exist") {
+            throw new Error("dest was " + thrown.dest);
+        }
+        if (thrown.path !== process.cwd()) throw new Error("path was " + thrown.path);
+        if (thrown.errno !== -2) throw new Error("errno was " + thrown.errno);
+        "#)
+    .expect("a failed chdir reports errno, syscall, path, and dest");
+}
+
+#[test]
 fn chdir_rejects_a_non_string_directory() {
     run(r#"
         let thrown;

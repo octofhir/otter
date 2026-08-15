@@ -50,6 +50,24 @@ pub struct VmCodedError {
     pub message: String,
 }
 
+/// Failed-system-call payload kept out of [`VmError`]. Materializes as the own
+/// properties Node stamps on a system error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmSyscallError {
+    /// Node error code for the failure (`"ENOENT"`).
+    pub code: &'static str,
+    /// Rendered message.
+    pub message: String,
+    /// Name of the call that failed.
+    pub syscall: &'static str,
+    /// Primary path operand.
+    pub path: Option<String>,
+    /// Secondary path operand.
+    pub dest: Option<String>,
+    /// Platform errno, negated the way Node reports it.
+    pub errno: i32,
+}
+
 /// Boxed type-mismatch payload kept out of [`VmError`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VmTypeMismatchAt {
@@ -131,6 +149,8 @@ pub enum ErrorDetail {
     Json(VmJsonError),
     /// Node-style coded failure payload.
     Coded(VmCodedError),
+    /// Failed system call payload.
+    Syscall(VmSyscallError),
 }
 
 /// Runtime errors raised by the interpreter.
@@ -379,6 +399,7 @@ impl RunError {
             }
             (_, Some(ErrorDetail::Json(p))) => p.message.clone(),
             (_, Some(ErrorDetail::Coded(p))) => p.message.clone(),
+            (_, Some(ErrorDetail::Syscall(p))) => p.message.clone(),
             (error, None) => error.to_string(),
         }
     }

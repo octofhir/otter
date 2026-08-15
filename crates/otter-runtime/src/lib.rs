@@ -75,6 +75,7 @@ pub mod module_loader;
 mod module_records;
 mod package_graph_resolver;
 mod process;
+mod process_control;
 mod process_env;
 mod process_events;
 mod process_flags;
@@ -2606,6 +2607,9 @@ impl Runtime {
         let worker_host = config
             .install_worker_global
             .then(|| Arc::new(worker::WorkerHostState::new(config.clone())));
+        // One cell for this restore: the resolved `cwd` closure and the
+        // freshly installed `chdir` must observe the same directory.
+        let working_directory = process_control::WorkingDirectory::new(config.process_cwd.clone());
         let reattach_ctx = DynamicNativeReattachCtx {
             capabilities: &config.capabilities,
             task_spawner: runtime_task_spawner.clone(),
@@ -2617,7 +2621,7 @@ impl Runtime {
                 return Some(payload);
             }
             if config.install_process_global
-                && let Some(payload) = process::dynamic_native_payload(name, &config.process_cwd)
+                && let Some(payload) = process::dynamic_native_payload(name, &working_directory)
             {
                 return Some(payload);
             }
@@ -2635,6 +2639,7 @@ impl Runtime {
             &runtime.config.process_env_overlay,
             &runtime.config.capabilities,
             &runtime.config.hooks,
+            &working_directory,
         )
         .ok()?;
         Some(runtime)

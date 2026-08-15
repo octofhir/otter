@@ -1515,6 +1515,16 @@ impl std::fmt::Debug for TracerFactory {
     }
 }
 
+/// Render a compile failure as the message a JS `SyntaxError` carries. The
+/// parser's own diagnostics are the message; the error type's `syntax:` prefix
+/// belongs in host logs, not in `error.message`.
+fn compile_error_message(error: otter_compiler::CompileError) -> String {
+    match error {
+        otter_compiler::CompileError::Syntax { messages, .. } => messages.join("; "),
+        other => other.to_string(),
+    }
+}
+
 /// The one eval/`new Function` compile path every isolate shares.
 /// The closure is reusable across calls; each invocation builds a
 /// fresh `BytecodeModule`.
@@ -1529,7 +1539,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
                 SourceKind::JavaScript,
                 "<evalScript>",
             )
-            .map_err(|e| format!("compile error: {e:?}"));
+            .map_err(compile_error_message);
         }
         // §19.2.1.3 — a direct eval inside a function carries
         // its caller variable environment binding list.
@@ -1557,7 +1567,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
             options.in_class_field_initializer,
             options.super_property_allowed,
         )
-        .map_err(|e| format!("compile error: {e:?}"))
+        .map_err(compile_error_message)
     })
 }
 
@@ -1978,11 +1988,18 @@ fn promise_settle_string_to_error(err: otter_vm::NativeError) -> OtterError {
 /// carried context once at this outermost boundary (a thrown JS value is
 /// preserved intact through nested `require`s and only stringified here).
 fn commonjs_native_to_error(err: otter_vm::NativeError) -> OtterError {
+    // A module that fails to compile is a syntax error in that file, not a
+    // loader failure: report it under the code the CLI renders as one.
+    if let otter_vm::NativeError::SyntaxError { reason, .. } = err {
+        return OtterError::Internal {
+            code: DiagnosticCode::SyntaxError.as_str().to_string(),
+            message: reason,
+        };
+    }
     let message = match err {
         otter_vm::NativeError::Thrown { message, .. } => message,
         otter_vm::NativeError::TypeError { reason, .. }
         | otter_vm::NativeError::RangeError { reason, .. }
-        | otter_vm::NativeError::SyntaxError { reason, .. }
         | otter_vm::NativeError::ReferenceError { reason, .. }
         | otter_vm::NativeError::URIError { reason, .. } => reason,
         other => other.to_string(),
@@ -5288,10 +5305,18 @@ impl Runtime {
             {
                 return self.run_commonjs_file(path, source);
             }
-            let looks_module = with_program(&source.text, source.kind, |program| {
+            // Only a source that parses as a module is one. A source that does
+            // not parse under the module grammar is CommonJS: its body runs
+            // inside the wrapper function, where constructs the module grammar
+            // rejects — a top-level `return`, chiefly — are legal. Routing it
+            // to the wrapper is also what reports a genuine syntax error, since
+            // the wrapper compiles the same text.
+            let looks_module = match with_program(&source.text, source.kind, |program| {
                 Ok::<bool, OtterError>(program_looks_like_module(program))
-            })
-            .map_err(|err| map_syntax_error(err, &specifier))??;
+            }) {
+                Ok(looks_module) => looks_module?,
+                Err(_) => false,
+            };
             if looks_module {
                 return self.run_module_with_context(path);
             }

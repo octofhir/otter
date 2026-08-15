@@ -142,12 +142,10 @@ pub(crate) fn install_global(
                 let allowed_flags = crate::process_flags::build(&mut scope)?;
                 scope.set(process, "allowedNodeEnvironmentFlags", allowed_flags)?;
 
+                let working_directory =
+                    crate::process_control::WorkingDirectory::new(process_cwd.to_path_buf());
                 for (name, length, call) in [
-                    (
-                        "cwd",
-                        0,
-                        cwd_call(process_cwd.to_string_lossy().to_string()),
-                    ),
+                    ("cwd", 0, cwd_call(working_directory.clone())),
                     ("exit", 1, NativeCall::Static(process_exit)),
                     ("nextTick", 1, NativeCall::Static(process_next_tick)),
                     ("binding", 1, NativeCall::Static(process_binding)),
@@ -178,6 +176,12 @@ pub(crate) fn install_global(
                     NativeCall::Static(process_umask),
                 )?;
 
+                crate::process_control::install(
+                    &mut scope,
+                    process,
+                    capabilities,
+                    &working_directory,
+                )?;
                 crate::process_events::install(&mut scope, process)?;
 
                 let config = scope.bare_object()?;
@@ -375,7 +379,7 @@ fn stdio_return_this(
     Ok(*ctx.this_value())
 }
 
-fn define_process_method(
+pub(crate) fn define_process_method(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
     name: &'static str,
@@ -409,6 +413,7 @@ pub(crate) fn reattach_after_restore(
     process_env_overlay: &std::collections::BTreeMap<String, String>,
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
+    working_directory: &crate::process_control::WorkingDirectory,
 ) -> Result<(), OtterError> {
     let snapshot = runtime_process_snapshot();
     let global_object = *interp.global_this();
@@ -454,6 +459,15 @@ pub(crate) fn reattach_after_restore(
                     hooks,
                 )?;
                 scope.set(process, "env", env)?;
+                // `chdir` carries this process's capabilities and shares the
+                // restored `cwd` closure's cell, so it is rebuilt here rather
+                // than restored from the donor.
+                crate::process_control::install(
+                    &mut scope,
+                    process,
+                    capabilities,
+                    working_directory,
+                )?;
                 Ok(())
             })
         },
@@ -471,11 +485,11 @@ pub(crate) fn reattach_after_restore(
 /// `cwd` reads the restoring configuration, not the captured one.
 pub(crate) fn dynamic_native_payload(
     name: &str,
-    process_cwd: &Path,
+    working_directory: &crate::process_control::WorkingDirectory,
 ) -> Option<otter_vm::snapshot::DynamicNativePayload> {
     let snapshot = runtime_process_snapshot();
     let call = match name {
-        "cwd" => cwd_call(process_cwd.to_string_lossy().to_string()),
+        "cwd" => cwd_call(working_directory.clone()),
         "uptime" => uptime_call(Instant::now(), snapshot.run_time_secs),
         "hrtime" => hrtime_call(Instant::now()),
         "bigint" => hrtime_bigint_call(Instant::now()),
@@ -487,12 +501,17 @@ pub(crate) fn dynamic_native_payload(
     }
 }
 
-fn cwd_call(cwd: String) -> NativeCall {
+/// `process.cwd()` reads the same cell `process.chdir()` writes, so a move is
+/// visible to the very next call.
+fn cwd_call(cwd: crate::process_control::WorkingDirectory) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
+        let current = cwd.get();
         Ok(otter_vm::Value::string(
-            JsString::from_str(&cwd, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
-                name: "process.cwd",
-                reason: err.to_string(),
+            JsString::from_str(&current.to_string_lossy(), ctx.heap_mut()).map_err(|err| {
+                NativeError::TypeError {
+                    name: "process.cwd",
+                    reason: err.to_string(),
+                }
             })?,
         ))
     });

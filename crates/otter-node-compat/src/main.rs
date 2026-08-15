@@ -33,6 +33,11 @@ struct Cli {
     /// Override timeout per test in seconds
     #[arg(long)]
     timeout_secs: Option<u64>,
+
+    /// Workers for the test/parallel phase (defaults to the machine's cores
+    /// minus two)
+    #[arg(long)]
+    jobs: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -45,6 +50,7 @@ fn main() -> Result<()> {
     options.substring_filter = cli.filter;
     options.timeout_secs = cli.timeout_secs;
     options.otter_bin = cli.otter_bin;
+    options.jobs = cli.jobs;
 
     let full_corpus = options.is_full_corpus();
     let report = otter_node_compat::run(options)?;

@@ -15,6 +15,15 @@
 //! - Every child runs in its own process group and is terminated by the
 //!   external watchdog on timeout.
 //! - Configured commands use owned strings and never cross VM/GC boundaries.
+//! - `test/sequential` files and configured commands run one at a time and
+//!   never overlap the concurrent phase; only `test/parallel` files, which Node
+//!   itself declares safe to run side by side, are spread across workers.
+//! - Every child receives the `TEST_SERIAL_ID` and `TEST_PARALLEL` variables
+//!   Node's own harness reads, so concurrent tests get private temporary
+//!   directories and a `common.PORT` access is reported instead of silently
+//!   binding a shared port.
+//! - Results are reported in corpus order regardless of completion order, so
+//!   the generated documents diff cleanly between runs.
 //!
 //! # See also
 //! - `node_compat_config.toml`
@@ -25,6 +34,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -63,6 +74,9 @@ pub struct RunOptions {
     pub substring_filter: Option<String>,
     pub timeout_secs: Option<u64>,
     pub otter_bin: Option<PathBuf>,
+    /// Worker count for the `test/parallel` phase. `None` derives it from the
+    /// machine, leaving headroom so the host stays responsive during a run.
+    pub jobs: Option<usize>,
 }
 
 impl RunOptions {
@@ -83,7 +97,21 @@ impl RunOptions {
             substring_filter: None,
             timeout_secs: None,
             otter_bin: None,
+            jobs: None,
         }
+    }
+
+    /// Worker count for the concurrent phase. Two cores are held back: one for
+    /// the runner's own bookkeeping and one so the machine stays usable, which
+    /// also keeps timing-sensitive Node tests off a fully saturated scheduler.
+    fn worker_count(&self) -> usize {
+        self.jobs
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(|cores| cores.get().saturating_sub(2))
+                    .unwrap_or(1)
+            })
+            .max(1)
     }
 }
 
@@ -155,6 +183,10 @@ struct PlannedTest {
     display_path: String,
     kind: PlannedTestKind,
     timeout_secs: Option<u64>,
+    /// `test/parallel` is Node's own declaration that a file tolerates
+    /// neighbours: those tests take a private temporary directory and refuse
+    /// `common.PORT`. Everything else runs alone.
+    concurrent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -184,17 +216,8 @@ pub fn run(options: RunOptions) -> Result<RunReport> {
     }
 
     let started_at = Instant::now();
-    let mut results = Vec::with_capacity(tests.len());
     let timeout_secs = options.timeout_secs.unwrap_or(config.timeout_secs);
-
-    for test in tests {
-        results.push(run_one_test(
-            &options.workspace_root,
-            &otter_bin,
-            timeout_secs,
-            &test,
-        )?);
-    }
+    let results = run_tests(&options, &otter_bin, timeout_secs, &tests)?;
 
     let report = RunReport {
         timestamp: Utc::now(),
@@ -212,6 +235,147 @@ pub fn run(options: RunOptions) -> Result<RunReport> {
         write_site_data(&options.workspace_root, &report)?;
     }
     Ok(report)
+}
+
+/// Execute the plan in two phases: everything that owns shared process state
+/// (`test/sequential`, configured commands) runs alone first, then the
+/// `test/parallel` files run across workers. Keeping the phases apart means a
+/// concurrent child never competes with a test that assumes it owns the port,
+/// the working directory, or the machine's timing.
+fn run_tests(
+    options: &RunOptions,
+    otter_bin: &Path,
+    timeout_secs: u64,
+    tests: &[PlannedTest],
+) -> Result<Vec<TestResult>> {
+    let total = tests.len();
+    let progress = AtomicUsize::new(0);
+    let mut results: Vec<Option<TestResult>> = (0..total).map(|_| None).collect();
+
+    for (index, test) in tests
+        .iter()
+        .enumerate()
+        .filter(|(_, test)| !test.concurrent)
+    {
+        let result = run_one_test(
+            &options.workspace_root,
+            otter_bin,
+            timeout_secs,
+            test,
+            index,
+        )?;
+        report_progress(&progress, total, &result);
+        results[index] = Some(result);
+    }
+
+    let concurrent: Vec<(usize, &PlannedTest)> = tests
+        .iter()
+        .enumerate()
+        .filter(|(_, test)| test.concurrent)
+        .collect();
+    if !concurrent.is_empty() {
+        let workers = options.worker_count().min(concurrent.len());
+        eprintln!(
+            "node-compat: {} concurrent tests across {workers} workers",
+            concurrent.len()
+        );
+        for (index, result) in run_concurrent_phase(
+            options,
+            otter_bin,
+            timeout_secs,
+            &concurrent,
+            workers,
+            &progress,
+        )? {
+            results[index] = Some(result);
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|result| result.expect("every planned test produces a result"))
+        .collect())
+}
+
+/// Hand out the concurrent tests through a shared cursor so a slow file never
+/// stalls a worker that could be running the next one. Results carry their
+/// planned index back, which is what keeps the report in corpus order.
+fn run_concurrent_phase(
+    options: &RunOptions,
+    otter_bin: &Path,
+    timeout_secs: u64,
+    tests: &[(usize, &PlannedTest)],
+    workers: usize,
+    progress: &AtomicUsize,
+) -> Result<Vec<(usize, TestResult)>> {
+    let total = progress.load(Ordering::Relaxed) + tests.len();
+    let cursor = AtomicUsize::new(0);
+    let collected: Mutex<Vec<(usize, TestResult)>> = Mutex::new(Vec::with_capacity(tests.len()));
+    let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if failure
+                        .lock()
+                        .expect("failure slot is not poisoned")
+                        .is_some()
+                    {
+                        return;
+                    }
+                    let next = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((index, test)) = tests.get(next) else {
+                        return;
+                    };
+                    match run_one_test(
+                        &options.workspace_root,
+                        otter_bin,
+                        timeout_secs,
+                        test,
+                        *index,
+                    ) {
+                        Ok(result) => {
+                            report_progress(progress, total, &result);
+                            collected
+                                .lock()
+                                .expect("result collector is not poisoned")
+                                .push((*index, result));
+                        }
+                        Err(error) => {
+                            *failure.lock().expect("failure slot is not poisoned") = Some(error);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(error) = failure.into_inner().expect("failure slot is not poisoned") {
+        return Err(error);
+    }
+    Ok(collected
+        .into_inner()
+        .expect("result collector is not poisoned"))
+}
+
+/// Report a finished test as soon as it lands. Passing files print nothing but
+/// the counter, so a long run stays readable and every failure is visible while
+/// the run is still going.
+fn report_progress(progress: &AtomicUsize, total: usize, result: &TestResult) {
+    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+    let label = match result.outcome {
+        Outcome::Pass => return eprintln!("[{done}/{total}] {}", result.path),
+        Outcome::Fail => "FAIL",
+        Outcome::Skipped => "SKIP",
+        Outcome::Timeout => "TIMEOUT",
+        Outcome::Crashed => "CRASH",
+    };
+    eprintln!(
+        "[{done}/{total}] {label} {} ({} ms)",
+        result.path, result.duration_ms
+    );
 }
 
 /// Resolve the checked-out revision of a repository so every reported test can
@@ -313,6 +477,7 @@ fn collect_tests(
                 timeout_secs: config.module_timeouts.get(&module).copied(),
                 module,
                 kind: PlannedTestKind::NodeJs(path.clone()),
+                concurrent: suite == "parallel",
             });
         }
     }
@@ -334,6 +499,7 @@ fn collect_tests(
                 args: integration.args.clone(),
             },
             timeout_secs: integration.timeout_secs,
+            concurrent: false,
         });
     }
 
@@ -362,12 +528,13 @@ fn run_one_test(
     otter_bin: &Path,
     timeout_secs: u64,
     test: &PlannedTest,
+    serial_id: usize,
 ) -> Result<TestResult> {
     let started = Instant::now();
     let test_timeout_secs = test.timeout_secs.unwrap_or(timeout_secs);
     let watchdog_timeout = Duration::from_secs(emergency_watchdog_timeout_secs(test_timeout_secs));
-    let stdout_path = temp_output_path("stdout");
-    let stderr_path = temp_output_path("stderr");
+    let stdout_path = temp_output_path("stdout", serial_id);
+    let stderr_path = temp_output_path("stderr", serial_id);
     let stdout_file = File::create(&stdout_path).with_context(|| {
         format!(
             "failed to create stdout capture for '{}'",
@@ -391,10 +558,22 @@ fn run_one_test(
                 // `// Flags:`. Otter is a different engine, so disable that
                 // flag-reexec path.
                 .env("NODE_SKIP_FLAG_CHECK", "1")
+                // `common/tmpdir.js` names its scratch directory
+                // `.tmp.${TEST_SERIAL_ID}`, so a unique id per test is what
+                // stops concurrent `tmpdir.refresh()` calls from wiping each
+                // other's files.
+                .env("TEST_SERIAL_ID", serial_id.to_string())
                 // Color-control variables are test inputs in util/TTY.
                 .env_remove("NO_COLOR")
                 .env_remove("NODE_DISABLE_COLORS")
                 .env_remove("FORCE_COLOR");
+            if test.concurrent {
+                // `common.PORT` is a fixed shared port; Node's harness throws on
+                // it under this variable rather than letting two concurrent
+                // tests bind it. A test that trips this belongs in
+                // `test/sequential` upstream, and the thrown error names it.
+                command.env("TEST_PARALLEL", "1");
+            }
             command
         }
         PlannedTestKind::Command { program, args } => {
@@ -459,11 +638,15 @@ fn emergency_watchdog_timeout_secs(timeout_secs: u64) -> u64 {
         .max(timeout_secs.saturating_add(WATCHDOG_MIN_GRACE_SECS))
 }
 
-fn temp_output_path(stream: &str) -> PathBuf {
+/// Capture files are named after the test's plan index as well as the clock:
+/// two workers can start inside the same nanosecond, and a shared capture file
+/// would attribute one child's output to another.
+fn temp_output_path(stream: &str, serial_id: usize) -> PathBuf {
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     std::env::temp_dir().join(format!(
-        "otter-node-compat-{}-{}-{}.log",
+        "otter-node-compat-{}-{}-{}-{}.log",
         std::process::id(),
+        serial_id,
         now,
         stream
     ))
@@ -886,6 +1069,96 @@ mod tests {
         assert!(
             !workspace.join("NODE_CONFORMANCE.md").exists(),
             "a module-scoped run must not publish a conformance baseline"
+        );
+    }
+
+    #[test]
+    fn concurrent_phase_keeps_corpus_order_and_isolates_children() {
+        let workspace = temp_test_root("concurrent");
+        std::fs::create_dir_all(workspace.join("tests/node-compat/node/test/sequential"))
+            .expect("sequential suite should exist");
+        std::fs::write(
+            workspace.join("node_compat_config.toml"),
+            "timeout_secs = 5\n",
+        )
+        .expect("config should write");
+        for name in ["test-fs-a.js", "test-fs-b.js", "test-fs-c.js"] {
+            std::fs::write(
+                workspace
+                    .join("tests/node-compat/node/test/parallel")
+                    .join(name),
+                "// synthetic test\n",
+            )
+            .expect("parallel test should write");
+        }
+        std::fs::write(
+            workspace.join("tests/node-compat/node/test/sequential/test-fs-port.js"),
+            "// synthetic test\n",
+        )
+        .expect("sequential test should write");
+
+        // Reports the isolation variables the child actually received, so the
+        // assertions below check the environment rather than the plan.
+        let fake_otter = workspace.join("fake-otter.sh");
+        std::fs::write(
+            &fake_otter,
+            "#!/bin/sh\necho \"serial=$TEST_SERIAL_ID parallel=${TEST_PARALLEL:-0}\" >&2\nexit 1\n",
+        )
+        .expect("fake otter should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&fake_otter)
+                .expect("fake otter metadata should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_otter, permissions)
+                .expect("fake otter should be executable");
+        }
+
+        let mut options = RunOptions::new(workspace.clone());
+        options.otter_bin = Some(fake_otter);
+        options.jobs = Some(3);
+        let report = run(options).expect("node-compat run should complete");
+
+        let paths: Vec<&str> = report
+            .results
+            .iter()
+            .map(|result| result.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "parallel/test-fs-a.js",
+                "parallel/test-fs-b.js",
+                "parallel/test-fs-c.js",
+                "sequential/test-fs-port.js",
+            ],
+            "results must follow corpus order, not completion order"
+        );
+
+        let mut serial_ids = Vec::new();
+        for result in &report.results {
+            let error = result.error.as_deref().expect("child reported its env");
+            let expected_parallel = if result.path.starts_with("parallel/") {
+                "parallel=1"
+            } else {
+                "parallel=0"
+            };
+            assert!(
+                error.contains(expected_parallel),
+                "{} ran with the wrong parallel marker: {error}",
+                result.path
+            );
+            serial_ids.push(error.to_string());
+        }
+        serial_ids.sort();
+        serial_ids.dedup();
+        assert_eq!(
+            serial_ids.len(),
+            report.results.len(),
+            "every child needs its own TEST_SERIAL_ID"
         );
     }
 

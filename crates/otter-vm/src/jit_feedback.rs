@@ -462,9 +462,6 @@ impl TypedFeedbackSlot {
             Op::StoreProperty => {
                 Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Store)))
             }
-            Op::HasProperty => {
-                Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Has)))
-            }
             Op::CallMethodValue => Self::Method,
             Op::Call
             | Op::CallSpread
@@ -477,7 +474,7 @@ impl TypedFeedbackSlot {
     }
 }
 
-/// Typed view over one `LoadProperty` / `StoreProperty` / `HasProperty` cache.
+/// Typed view over one `LoadProperty` or `StoreProperty` cache.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PropertyFeedbackSlot<'a> {
     feedback: &'a AtomicPropertyFeedback,
@@ -499,7 +496,6 @@ impl PropertyFeedbackSlot<'_> {
                     let hit = match self.feedback.kind {
                         PropertyIcKind::Load => stub.own_data_hit(),
                         PropertyIcKind::Store => stub.store_own_data_hit(),
-                        PropertyIcKind::Has => None,
                     };
                     hit.map_or(PropertyFeedbackState::Polymorphic, |hit| {
                         PropertyFeedbackState::MonomorphicOwnData {
@@ -1216,6 +1212,14 @@ mod tests {
             slot.state(),
             PropertyFeedbackState::MonomorphicOwnData { slot: 0, .. }
         ));
+    }
+
+    #[test]
+    fn has_property_owns_no_typed_property_feedback_slot() {
+        let vector = FeedbackVector::for_instruction_ops([Op::HasProperty]);
+
+        assert!(vector.property_slot(0, PropertyIcKind::Load).is_none());
+        assert!(vector.property_slot(0, PropertyIcKind::Store).is_none());
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub(crate) const ACCUMULATOR_DREG: u8 = 16;
 const MAX_CHAIN_LEAVES: usize = 15;
 
 use crate::entry::{
-    BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, unpack_method_arg_regs,
+    BaselinePlan, PACKED_REGISTER_LANES, Unsupported, pack_register_lanes, unpack_register_lanes,
     value_tag,
 };
 
@@ -112,6 +112,8 @@ pub(crate) struct FusedChainStep {
 pub(crate) enum TemplateOp {
     /// Store the boxed `Value` bit pattern into frame register `dst`.
     LoadImmediate { dst: u16, bits: u64 },
+    /// Read one prepared primitive-string literal from its stable traced cell.
+    LoadStringConstant { dst: u16 },
     /// Copy frame register `src` into frame register `dst`.
     Move { dst: u16, src: u16 },
     /// Unconditional branch to the canonical instruction PC `target`.
@@ -223,8 +225,6 @@ pub(crate) enum TemplateOp {
         function: u32,
         parents: TemplateTail,
     },
-    /// `r<dst> = constants[constant]` (string constant).
-    LoadString { dst: u16, constant: u32 },
     /// Materialize a regex literal from the constant pool.
     LoadRegExp { dst: u16, constant: u32 },
     /// `r<dst> = global[name]` or throw.
@@ -304,18 +304,15 @@ pub(crate) enum TemplateOp {
         /// Serialized byte PC used to resolve the immutable construct link.
         byte_pc: u32,
     },
-    /// `r<dst> = r<receiver>.name(args…)` through the guarded collection
-    /// fast paths, the collection-method IC, and the direct-method prepare
-    /// transition. `byte_pc` keys the snapshot's per-site collection-method
-    /// metadata; `arg0`/`arg1` are the first argument registers for the
-    /// guarded typed-entry calls.
+    /// `r<dst> = r<receiver>.name(args…)` through guarded native/inlined
+    /// layers, generated method linkage, and one canonical boxed-value-span
+    /// miss. `arguments` is a normal plan-owned operand tail; method calls do
+    /// not use the legacy packed-u16 register ABI. `arg0`/`arg1` are the first
+    /// argument registers for guarded typed-entry calls.
     MethodCall {
         dst: u16,
         receiver: u16,
-        name: u32,
-        site: u64,
-        argc: u16,
-        packed_args: u64,
+        arguments: TemplateTail,
         byte_pc: u32,
         arg0: Option<u16>,
         arg1: Option<u16>,
@@ -387,16 +384,15 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
-    /// Complete one object property-protocol query (`Instanceof`,
-    /// `HasProperty`, `GetPrototype`, `SetPrototype`) through the shared
-    /// reentrant transition. Proxy `has`/`getPrototypeOf`/`setPrototypeOf` and
-    /// `@@hasInstance` traps fire in the VM. `arg0`/`arg1`/`arg2` name the
-    /// operand registers per opcode.
-    ObjectProtocolOp {
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
+    /// Complete one object-protocol operation through the fixed boxed-value
+    /// committed boundary. `operation` is compile-time-only; the VM decodes
+    /// the authoritative operation from the published function/PC. `result`
+    /// is absent for `SetPrototype`.
+    ObjectProtocolValue {
+        operation: otter_vm::ObjectProtocolValueOp,
+        result: Option<u16>,
+        value0: u16,
+        value1: Option<u16>,
     },
     /// Complete one `delete` (`DeleteProperty`, `DeleteElement`,
     /// `DeleteDynamic`) through the shared reentrant delete transition. Proxy
@@ -409,17 +405,15 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
-    /// Complete one scalar value-query/coercion opcode (`ToObject`,
-    /// `ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
-    /// `ArrayLength`, `LoadLength`) through guarded native fast paths where
-    /// exact and the shared reentrant scalar fallback otherwise.
-    /// `arg0`/`arg1`/`arg2` name the destination and source (or left/right)
-    /// registers per opcode.
-    ScalarOp {
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
+    /// Complete one scalar value operation through guarded native fast paths
+    /// where exact and the fixed boxed-value committed boundary otherwise.
+    /// This includes derived-`this` binding; the operation kind is never
+    /// passed to the VM entry.
+    ScalarValue {
+        operation: otter_vm::ScalarValueOp,
+        result: u16,
+        value0: Option<u16>,
+        value1: Option<u16>,
     },
     /// Complete one `super` property access (`LoadSuperProperty`,
     /// `LoadSuperElement`, `SetSuperProperty`, `SetSuperElement`) through the
@@ -466,7 +460,7 @@ pub(crate) enum TemplateOp {
     /// `CopyDataProperties`) through the shared reentrant structural transition.
     /// `arg0`/`arg1` name the destination/target and source registers.
     StructuralOp { opcode: u8, arg0: u64, arg1: u64 },
-    /// Complete one class-construction opcode (`BindThisValue`, `ClassCheck`,
+    /// Complete one class-construction opcode (`ClassCheck` or
     /// `SetFunctionName`) through the shared reentrant class transition.
     ClassOp {
         opcode: u8,
@@ -592,18 +586,27 @@ pub(crate) struct TemplatePlan {
     pub(crate) osr_only: bool,
 }
 
-/// Pack a call's argument registers inline (up to [`MAX_METHOD_ARGS`] u16
+/// Pack a call's argument registers inline (up to [`PACKED_REGISTER_LANES`] u16
 /// lanes) or spill a longer list into the plan's decoded register buffer,
 /// returning the spill start index. `argc` discriminates the two encodings
 /// end-to-end: the emitter rewrites a spilled index into the frozen buffer's
 /// baked address, and runtime stubs decode by the same rule.
 fn pack_or_spill_arg_regs(arguments: &[u16], register_operands: &mut Vec<u16>) -> u64 {
-    if arguments.len() <= MAX_METHOD_ARGS {
-        pack_method_arg_regs(arguments)
+    if arguments.len() <= PACKED_REGISTER_LANES {
+        pack_register_lanes(arguments)
     } else {
         let start = register_operands.len() as u64;
         register_operands.extend_from_slice(arguments);
         start
+    }
+}
+
+fn append_register_operands(arguments: &[u16], register_operands: &mut Vec<u16>) -> TemplateTail {
+    let start = register_operands.len();
+    register_operands.extend_from_slice(arguments);
+    TemplateTail {
+        start,
+        len: arguments.len(),
     }
 }
 
@@ -641,7 +644,7 @@ impl TemplatePlan {
     }
 
     /// Resolve a call's packed-argument word for emission: a spilled list
-    /// (`argc > MAX_METHOD_ARGS`) becomes the baked address of its table in
+    /// (`argc > PACKED_REGISTER_LANES`) becomes the baked address of its table in
     /// the frozen decoded-operand buffer and returns its stable logical range
     /// for relocation metadata; an inline pack passes through without a range.
     pub(crate) fn resolve_packed_args(
@@ -649,7 +652,7 @@ impl TemplatePlan {
         argc: u16,
         packed_args: u64,
     ) -> (u64, Option<TemplateTail>) {
-        if usize::from(argc) > MAX_METHOD_ARGS {
+        if usize::from(argc) > PACKED_REGISTER_LANES {
             let tail = TemplateTail {
                 start: packed_args as usize,
                 len: usize::from(argc),
@@ -663,14 +666,14 @@ impl TemplatePlan {
     /// Decode one call site's immutable caller-register operands for generated
     /// native frame construction.
     pub(crate) fn call_argument_registers(&self, argc: u16, packed_args: u64) -> Vec<u16> {
-        if usize::from(argc) > MAX_METHOD_ARGS {
+        if usize::from(argc) > PACKED_REGISTER_LANES {
             let tail = TemplateTail {
                 start: packed_args as usize,
                 len: usize::from(argc),
             };
             return self.register_tail(tail).to_vec();
         }
-        let unpacked = unpack_method_arg_regs(packed_args);
+        let unpacked = unpack_register_lanes(packed_args);
         unpacked[..usize::from(argc)].to_vec()
     }
 
@@ -926,10 +929,7 @@ impl TemplatePlan {
                 },
                 Op::LoadString => {
                     let operands = lowered.constant_operands()?;
-                    TemplateOp::LoadString {
-                        dst: operands.dst,
-                        constant: operands.constant,
-                    }
+                    TemplateOp::LoadStringConstant { dst: operands.dst }
                 }
                 Op::LoadRegExp => {
                     let operands = lowered.constant_operands()?;
@@ -1072,7 +1072,7 @@ impl TemplatePlan {
                 Op::CallWithThis => {
                     let operands = lowered.call_with_this_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
+                    if arguments.len() > PACKED_REGISTER_LANES {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
@@ -1087,7 +1087,7 @@ impl TemplatePlan {
                             | (u64::from(operands.callee) << 16)
                             | (u64::from(operands.this_value) << 32)
                             | ((arguments.len() as u64) << 48),
-                        arg1: pack_method_arg_regs(arguments),
+                        arg1: pack_register_lanes(arguments),
                         arg2: 0,
                     }
                 }
@@ -1145,16 +1145,10 @@ impl TemplatePlan {
                 Op::CallMethodValue => {
                     let operands = lowered.method_call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    let site = meta
-                        .property_ic_site(view.code_block.as_ref())
-                        .unwrap_or(usize::MAX) as u64;
                     TemplateOp::MethodCall {
                         dst: operands.dst,
                         receiver: operands.receiver,
-                        name: operands.name,
-                        site,
-                        argc: arguments.len() as u16,
-                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
+                        arguments: append_register_operands(arguments, &mut register_operands),
                         byte_pc: lowered.byte_pc,
                         arg0: arguments.first().copied(),
                         arg1: arguments.get(1).copied(),
@@ -1163,7 +1157,7 @@ impl TemplatePlan {
                 Op::BindFunction => {
                     let operands = lowered.bind_function_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
+                    if arguments.len() > PACKED_REGISTER_LANES {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
@@ -1177,7 +1171,7 @@ impl TemplatePlan {
                         callee: operands.callee,
                         bound_this: operands.bound_this,
                         argc: arguments.len() as u16,
-                        packed_args: pack_method_arg_regs(arguments),
+                        packed_args: pack_register_lanes(arguments),
                     }
                 }
                 Op::EnterTry => {
@@ -1410,7 +1404,7 @@ impl TemplatePlan {
                             safepoint,
                         }
                     } else {
-                        if arguments.len() > MAX_METHOD_ARGS {
+                        if arguments.len() > PACKED_REGISTER_LANES {
                             osr_only = true;
                             instructions.push(TemplateInstr {
                                 pc,
@@ -1423,14 +1417,14 @@ impl TemplatePlan {
                             opcode: lowered.op as u8,
                             prefix: operands.dst,
                             argc: arguments.len() as u16,
-                            packed_args: pack_method_arg_regs(arguments),
+                            packed_args: pack_register_lanes(arguments),
                         }
                     }
                 }
                 Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = lowering.register_tail(operands.elements)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
+                    if arguments.len() > PACKED_REGISTER_LANES {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
@@ -1443,7 +1437,7 @@ impl TemplatePlan {
                         opcode: lowered.op as u8,
                         prefix: operands.dst,
                         argc: arguments.len() as u16,
-                        packed_args: pack_method_arg_regs(arguments),
+                        packed_args: pack_register_lanes(arguments),
                     }
                 }
                 Op::ArrayBufferCall
@@ -1452,7 +1446,7 @@ impl TemplatePlan {
                 | Op::DataViewCall => {
                     let operands = lowered.static_call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
+                    if arguments.len() > PACKED_REGISTER_LANES {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
@@ -1465,10 +1459,19 @@ impl TemplatePlan {
                         opcode: lowered.op as u8,
                         packed_head: u64::from(operands.dst) | ((arguments.len() as u64) << 16),
                         method: u64::from(operands.method),
-                        packed_args: pack_method_arg_regs(arguments),
+                        packed_args: pack_register_lanes(arguments),
                     }
                 }
-                Op::BindThisValue | Op::ClassCheck | Op::SetFunctionName => {
+                Op::BindThisValue => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::ScalarValue {
+                        operation: otter_vm::ScalarValueOp::BindThisValue,
+                        result: operands.value,
+                        value0: Some(operands.value),
+                        value1: None,
+                    }
+                }
+                Op::ClassCheck | Op::SetFunctionName => {
                     let operands = lowered.global_store_operands()?;
                     TemplateOp::ClassOp {
                         opcode: lowered.op as u8,
@@ -1492,7 +1495,7 @@ impl TemplatePlan {
                 Op::NewFunction => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = lowering.register_tail(operands.elements)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
+                    if arguments.len() > PACKED_REGISTER_LANES {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
@@ -1504,7 +1507,7 @@ impl TemplatePlan {
                     TemplateOp::ClassValueOp {
                         opcode: Op::NewFunction as u8,
                         arg0: u64::from(operands.dst) | ((arguments.len() as u64) << 16),
-                        arg1: pack_method_arg_regs(arguments),
+                        arg1: pack_register_lanes(arguments),
                         arg2: 0,
                     }
                 }
@@ -1574,11 +1577,15 @@ impl TemplatePlan {
                 Op::Nop => TemplateOp::NoOp,
                 Op::Instanceof | Op::HasProperty => {
                     let operands = lowered.triple_operands()?;
-                    TemplateOp::ObjectProtocolOp {
-                        opcode: lowered.op as u8,
-                        arg0: u64::from(operands.first),
-                        arg1: u64::from(operands.second),
-                        arg2: u64::from(operands.third),
+                    TemplateOp::ObjectProtocolValue {
+                        operation: if lowered.op == Op::Instanceof {
+                            otter_vm::ObjectProtocolValueOp::Instanceof
+                        } else {
+                            otter_vm::ObjectProtocolValueOp::HasProperty
+                        },
+                        result: Some(operands.first),
+                        value0: operands.second,
+                        value1: Some(operands.third),
                     }
                 }
                 Op::GetPrototype if view.derived_constructor => {
@@ -1590,11 +1597,19 @@ impl TemplatePlan {
                 }
                 Op::GetPrototype | Op::SetPrototype => {
                     let operands = lowered.unary_operands()?;
-                    TemplateOp::ObjectProtocolOp {
-                        opcode: lowered.op as u8,
-                        arg0: u64::from(operands.dst),
-                        arg1: u64::from(operands.src),
-                        arg2: 0,
+                    TemplateOp::ObjectProtocolValue {
+                        operation: if lowered.op == Op::GetPrototype {
+                            otter_vm::ObjectProtocolValueOp::GetPrototype
+                        } else {
+                            otter_vm::ObjectProtocolValueOp::SetPrototype
+                        },
+                        result: (lowered.op == Op::GetPrototype).then_some(operands.dst),
+                        value0: if lowered.op == Op::GetPrototype {
+                            operands.src
+                        } else {
+                            operands.dst
+                        },
+                        value1: (lowered.op == Op::SetPrototype).then_some(operands.src),
                     }
                 }
                 Op::DeleteProperty => {
@@ -1631,29 +1646,38 @@ impl TemplatePlan {
                 | Op::ArrayLength
                 | Op::LoadLength => {
                     let operands = lowered.unary_operands()?;
-                    TemplateOp::ScalarOp {
-                        opcode: lowered.op as u8,
-                        arg0: u64::from(operands.dst),
-                        arg1: u64::from(operands.src),
-                        arg2: 0,
+                    let operation = match lowered.op {
+                        Op::ToObject => otter_vm::ScalarValueOp::ToObject,
+                        Op::ToPropertyKey => otter_vm::ScalarValueOp::ToPropertyKey,
+                        Op::TypeOf => otter_vm::ScalarValueOp::TypeOf,
+                        Op::IsArray => otter_vm::ScalarValueOp::IsArray,
+                        Op::ArrayLength => otter_vm::ScalarValueOp::ArrayLength,
+                        Op::LoadLength => otter_vm::ScalarValueOp::LoadLength,
+                        _ => unreachable!("scalar unary opcode group"),
+                    };
+                    TemplateOp::ScalarValue {
+                        operation,
+                        result: operands.dst,
+                        value0: Some(operands.src),
+                        value1: None,
                     }
                 }
                 Op::LoadNewTarget => {
                     let dst = lowered.destination_operands()?.dst;
-                    TemplateOp::ScalarOp {
-                        opcode: Op::LoadNewTarget as u8,
-                        arg0: u64::from(dst),
-                        arg1: 0,
-                        arg2: 0,
+                    TemplateOp::ScalarValue {
+                        operation: otter_vm::ScalarValueOp::LoadNewTarget,
+                        result: dst,
+                        value0: None,
+                        value1: None,
                     }
                 }
                 Op::SameValue => {
                     let operands = lowered.triple_operands()?;
-                    TemplateOp::ScalarOp {
-                        opcode: Op::SameValue as u8,
-                        arg0: u64::from(operands.first),
-                        arg1: u64::from(operands.second),
-                        arg2: u64::from(operands.third),
+                    TemplateOp::ScalarValue {
+                        operation: otter_vm::ScalarValueOp::SameValue,
+                        result: operands.first,
+                        value0: Some(operands.second),
+                        value1: Some(operands.third),
                     }
                 }
                 Op::LessThan
@@ -2508,12 +2532,12 @@ mod tests {
             TemplateOp::MethodCall {
                 dst,
                 receiver,
-                name,
-                argc,
+                arguments,
                 arg0,
                 ..
             } => {
-                assert_eq!((dst, receiver, name, argc), (4, 1, 7, 1));
+                assert_eq!((dst, receiver), (4, 1));
+                assert_eq!(plan.register_tail(arguments), [2]);
                 assert_eq!(arg0, Some(2));
             }
             other => panic!("expected MethodCall, got {other:?}"),

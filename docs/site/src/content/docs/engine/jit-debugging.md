@@ -45,9 +45,10 @@ that fires before the isolate replies may have no partial batch to write.
 
 `compilePrepared.globalLoadSites` counts all analyzed global reads.
 `globalLexicalLoads` counts permanent global-declarative cells available for
-direct generated reads, `stringConstantLoads` counts already-materialized
-primitive literals with address-stable traced cells, while `globalObjectLoads`
-counts guarded global-object dictionary slots. `directCallees`, `directConstructs`,
+direct generated reads, and `stringConstantCells` counts eagerly prepared
+stable traced literal cells available as relocation loads.
+`globalObjectLoads` counts guarded global-object dictionary slots.
+`directCallees`, `directConstructs`,
 `directMethodSites`, and `directMethodTargets` report stable function links
 whose current generations were available for generated plain, base-construct,
 and bounded polymorphic method linkage,
@@ -172,12 +173,13 @@ read live. Entry and OSR initialize the slot to empty. Every intrinsic or
 generated read miss clears all raw global and method caches before generic
 lookup, allocation, moving GC, or JavaScript reentry.
 
-Prepared `LoadString` sites expose a `stringConstantCell` relocation keyed by
+Every `LoadString` site exposes a `stringConstantCell` relocation keyed by
 function id and byte PC. The process address is redacted. The cell is rooted,
-address-stable across constant-cache growth, and rewritten in place by moving
-GC; generated code reads the current `Value` and never embeds the moving string
-handle. A literal without a materialized cell retains the canonical template
-transition and makes an optimizing body ineligible until later recompilation.
+address-stable across cell-table growth, and rewritten in place by moving GC;
+generated code reads the current `Value` and never embeds the moving string
+handle. Cold literals are canonicalized before the compile snapshot; failure to do so
+declines optional compilation. Every published cell is therefore a direct leaf
+load with no deoptimization, runtime fill, or recompilation loop.
 
 Ordinary `Op::Call` feedback uses one typed target population for bytecode
 callees and static-native operations. When that population is monomorphic for
@@ -266,7 +268,7 @@ size, and explicit `filesPresent` / `filesAbsent` inventories.
 | --- | --- |
 | `bytecode.txt` | Deterministic logical-PC and encoded-byte-PC listing. |
 | `template-plan.txt` | The already-built template lowering plan and its decoded operand side buffers. |
-| `optimized-ir.txt` | Deterministic optimizing input: the legacy reverse-postorder unit or normalized Machine IR plus allocation for switched functions. |
+| `optimized-ir.txt` | Deterministic normalized Machine IR plus allocation for an optimizing code object. |
 | `code.bin` | Exact finalized executable bytes for this runtime process. |
 | `code-normalized.bin` | Non-executable semantic instruction stream with symbolic relocations and logical branch targets. |
 | `asm.txt` | Annotated AArch64 assembly over the exact bytes in `code.bin`. |
@@ -286,17 +288,12 @@ executable addresses. A range must satisfy
 `code-map.json` contains typed structural regions and validates every native
 range against the matching code object.
 
-Inspect the first line of `optimized-ir.txt` before interpreting the payload.
-The replacement scalar-function path starts with `; backend=otter-machine-ir
-scalar-function`, followed by normalized Machine IR and exact regalloc2 output;
-its `code-map.json` owns one `machineScalarFunction` structural region. Functions
-not yet switched retain the legacy optimized-unit banner. Its second line names
-`copy-webs`, `coalesced-values`, and `inactive-values` before reporting raw and
-post-deopt spill counts. A copy web assigns one machine home to exact-bit
-`LoadLocal` / `StoreLocal` / `Reuse` aliases. Inactive values are unread block
-heads reconstructed as literals on deoptimization, so they consume no emitted
-machine state. Both IR families are payloads of the one current artifact bundle,
-not separate artifact formats.
+Every optimizing `optimized-ir.txt` starts with
+`; backend=otter-machine-ir scalar-function`, followed by normalized Machine IR
+and exact regalloc2 output; its `code-map.json` owns one
+`machineScalarFunction` structural region. If Machine rejects a function, the
+VM keeps the Template code object instead of invoking a second optimizing IR,
+allocator, or emitter.
 
 Scalar Machine bundles attribute direct data access with
 `machineElementLoad`, `machineElementStore`, `machinePropertyLoad`, and
@@ -313,7 +310,9 @@ current transition program supports null prototypes and a fast direct terminal
 prototype; dictionary-backed `%Object.prototype%` additions remain canonical.
 Success or throw commits once; named-property misses do not exact-deopt and
 replay the source operation. A property operation with a local catch stays on
-the materialized backend until Machine can commit a throw into handler SSA.
+Template until its fast probe and committed cold call are explicit Machine CFG
+before register allocation. The boundary already returns a pure exception
+value.
 Indexed element regions similarly guard a baked dense layout before direct
 access.
 Packed-double Array regions additionally prove the ordinary receiver's exotic
@@ -326,10 +325,11 @@ Missing or incompatible direct element metadata does not reject the surrounding
 Machine function. `machineGenericElementLoad` and
 `machineGenericElementStore` identify a fixed boxed-value runtime call with
 precise moving roots and source `bytePc`. The call performs canonical
-`[[Get]]` / `[[Set]]` exactly once and returns either success or a parked throw;
+`[[Get]]` / `[[Set]]` exactly once and returns either success or a throw;
 there is no post-call deopt that could replay a proxy trap, getter, setter, or
-key coercion. A local-catch generic access currently retains the materialized
-backend so the handler cannot observe stale Machine SSA homes.
+key coercion. A local-catch generic access currently stays on Template until
+the fast probe and committed cold call are explicit Machine CFG before register
+allocation; the fixed boundary already returns a pure exception value.
 When a reducible non-reentrant loop has an invariant packed-double receiver,
 the normalized header reports `packed-double-view-caches=<N>` and packed access
 opcodes name `cache: Some(...)`. The first access proves the complete receiver
@@ -372,8 +372,8 @@ clobbers, or effects and unconditionally takes the source opcode's exact deopt
 exit. The VM records a real call attempt before semantic work and invalidates
 the obsolete caller generation, so a newly reached cold branch executes once
 canonically and cannot remain in a generated deopt loop. An already-attempted
-site without a complete generated plan makes the whole function use the legacy
-fallback instead of being mislabeled cold.
+site without a complete generated plan keeps the whole function on Template
+instead of being mislabeled cold.
 
 ### Optimizing frame-free method intrinsics
 

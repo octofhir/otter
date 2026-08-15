@@ -54,7 +54,8 @@ pub(super) fn emit_load_property(
     cell_addr: usize,
     cell_ordinal: u32,
     settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
     let miss = ops.new_dynamic_label();
@@ -132,8 +133,12 @@ pub(super) fn emit_load_property(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; and x15, x1, #0xff
-        ; cbnz x15, =>threw
+        ; mov x15, x1
+        ; cbz x15, >property_load_completed
+        ; cmp x15, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
+        ; property_load_completed:
     );
     emit_store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done);
@@ -154,7 +159,8 @@ pub(super) fn emit_store_property(
     cell_addr: usize,
     cell_ordinal: u32,
     settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
     let miss = ops.new_dynamic_label();
@@ -226,8 +232,11 @@ pub(super) fn emit_store_property(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; and x15, x1, #0xff
-        ; cbnz x15, =>threw
+        ; mov x15, x1
+        ; cbz x15, =>done
+        ; cmp x15, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
         ; =>done
     );
     Ok(())

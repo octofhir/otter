@@ -186,28 +186,28 @@ impl Interpreter {
 
     pub(crate) fn record_jit_alloc_value_stub_status(
         &mut self,
-        status: native_abi::RuntimeStubStatus,
+        status: native_abi::NativeResultStatus,
     ) {
         match status {
-            native_abi::RuntimeStubStatus::Ok => {
+            native_abi::NativeResultStatus::Success => {
                 self.jit_runtime_stats.alloc_value_stub_ok =
                     self.jit_runtime_stats.alloc_value_stub_ok.saturating_add(1);
             }
-            native_abi::RuntimeStubStatus::Miss => {
+            native_abi::NativeResultStatus::SideExit => {
                 self.jit_runtime_stats.alloc_value_stub_miss = self
                     .jit_runtime_stats
                     .alloc_value_stub_miss
                     .saturating_add(1);
             }
-            native_abi::RuntimeStubStatus::OutOfMemory => {
+            native_abi::NativeResultStatus::OutOfMemory => {
                 self.jit_runtime_stats.alloc_value_stub_out_of_memory = self
                     .jit_runtime_stats
                     .alloc_value_stub_out_of_memory
                     .saturating_add(1);
             }
-            native_abi::RuntimeStubStatus::Throw
-            | native_abi::RuntimeStubStatus::Deopt
-            | native_abi::RuntimeStubStatus::Interrupt => {
+            native_abi::NativeResultStatus::Throw
+            | native_abi::NativeResultStatus::Continue
+            | native_abi::NativeResultStatus::Fatal => {
                 self.jit_runtime_stats.alloc_value_stub_other = self
                     .jit_runtime_stats
                     .alloc_value_stub_other

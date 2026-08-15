@@ -124,7 +124,7 @@ impl Interpreter {
             global_load_sites: u32::try_from(global_load_sites).unwrap_or(u32::MAX),
             global_lexical_loads: u32::try_from(view.global_lexical_loads.len())
                 .unwrap_or(u32::MAX),
-            string_constant_loads: u32::try_from(view.string_constant_loads.len())
+            string_constant_cells: u32::try_from(view.string_constant_cells.len())
                 .unwrap_or(u32::MAX),
             global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
@@ -361,6 +361,7 @@ impl Interpreter {
         if !hook.optimizing_tier_enabled() {
             return None;
         }
+        self.prewarm_string_constant_cells(context, fid)?;
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&snapshot);
         // The optimizing tier consumes the same baked compile inputs as the
@@ -369,7 +370,7 @@ impl Interpreter {
         // there is nothing to inline.
         Self::bake_typed_array_layout(&mut snapshot);
         Self::bake_string_layout(&mut snapshot);
-        self.bake_string_constant_loads(&mut snapshot, context, fid);
+        self.bake_string_constant_cells(&mut snapshot, context, fid)?;
         self.bake_global_lexical_loads(&mut snapshot, context, fid);
         self.bake_inline_callees(
             &mut snapshot,
@@ -531,11 +532,13 @@ impl Interpreter {
         osr_pc: Option<u32>,
         eager_direct_target_depth: u8,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        let hook = self.jit_hook.as_ref()?.clone();
+        self.prewarm_string_constant_cells(context, fid)?;
         let mut view = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
-        self.bake_string_constant_loads(&mut view, context, fid);
+        self.bake_string_constant_cells(&mut view, context, fid)?;
         self.bake_global_lexical_loads(&mut view, context, fid);
         self.bake_inline_callees(
             &mut view,
@@ -559,7 +562,6 @@ impl Interpreter {
             &view,
         );
         let function = view.code_block.clone();
-        let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let artifact_identity =
             self.jit_debug
@@ -1289,40 +1291,75 @@ impl Interpreter {
         }
     }
 
-    /// Bake direct reads of primitive-string literals already materialized in
-    /// this isolate's constant cache.
+    /// Canonicalize every string literal needed by `fid` before snapshotting.
     ///
-    /// The cache owns boxed `Value` cells: hash-table growth may move a box but
-    /// never its allocation, and root tracing rewrites the cell after moving
-    /// collection. A cold literal has no cell and retains the canonical
-    /// allocating transition until later feedback recompiles the body.
-    fn bake_string_constant_loads(
+    /// Existing canonical cells and functions without string literals are
+    /// allocation-free and need no active frame-root provider. The first cold
+    /// literal may allocate and therefore requires the current activation stack
+    /// to be registered with the collector. Allocation failure only declines
+    /// this optional compile; it does not publish a pending JavaScript throw or
+    /// retain an error for later execution.
+    fn prewarm_string_constant_cells(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<()> {
+        let owner = context.for_function(fid)?;
+        let function = owner.exec_function(fid)?;
+        let mut instruction_index = 0usize;
+        while let Some(instruction) = function.instr_at_index(instruction_index) {
+            instruction_index = instruction_index.checked_add(1)?;
+            if function.op(instruction) != Op::LoadString {
+                continue;
+            }
+            let constant = function.const_index(instruction, 1)?;
+            let key = owner.constant_cache_key(constant);
+            if let Some(cell) = self.string_constant_cells.get(&key) {
+                if !cell.is_string() {
+                    return None;
+                }
+                continue;
+            }
+            if !self.gc_heap.has_frame_root_providers() {
+                return None;
+            }
+            let value = self.load_string_constant_value(&owner, constant).ok()?;
+            debug_assert!(value.is_string(), "prewarmed literal must be a string");
+        }
+        Some(())
+    }
+
+    /// Publish direct reads of already-canonical primitive-string literals.
+    ///
+    /// The isolate owns boxed `Value` cells: hash-table growth may move a box
+    /// but never its allocation, and root tracing rewrites the cell after a
+    /// moving collection. Every published site is therefore a leaf relocation
+    /// load; cold materialization was completed before the snapshot existed.
+    fn bake_string_constant_cells(
         &self,
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
-    ) {
-        let Some(owner) = context.for_function(fid) else {
-            return;
-        };
+    ) -> Option<()> {
+        let owner = context.for_function(fid)?;
         for instruction in &view.instructions {
             if instruction.op(&view.code_block) != Op::LoadString {
                 continue;
             }
-            let Some(constant) = instruction.const_index(&view.code_block, 1) else {
-                continue;
-            };
+            let constant = instruction.const_index(&view.code_block, 1)?;
             let key = owner.constant_cache_key(constant);
-            let Some(cell) = self.string_constant_cache.get(&key) else {
-                continue;
-            };
-            view.string_constant_loads.insert(
+            let cell = self.string_constant_cells.get(&key)?;
+            if !cell.is_string() {
+                return None;
+            }
+            view.string_constant_cells.insert(
                 instruction.byte_pc,
-                jit::JitStringConstantLoad {
+                jit::JitStringConstantCell {
                     cell_addr: std::ptr::from_ref::<Value>(cell.as_ref()) as usize,
                 },
             );
         }
+        Some(())
     }
 
     /// Bake one spliced body's own compile inputs.
@@ -1339,11 +1376,12 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
     ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
+        self.prewarm_string_constant_cells(context, fid)?;
         let mut body = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&body);
         Self::bake_typed_array_layout(&mut body);
         Self::bake_string_layout(&mut body);
-        self.bake_string_constant_loads(&mut body, context, fid);
+        self.bake_string_constant_cells(&mut body, context, fid)?;
         self.bake_global_lexical_loads(&mut body, context, fid);
         self.bake_call_site_plans(&mut body, context, fid, tier, 0, false);
         self.bake_guarded_method_calls(&mut body);
@@ -2059,12 +2097,204 @@ fn reserve_guarded_entry_safepoint(
 
 #[cfg(test)]
 mod tests {
-    use crate::Interpreter;
+    use otter_bytecode::{
+        BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind,
+    };
+
+    use crate::{ActivationStack, Interpreter, Value};
 
     #[test]
     fn fresh_interpreter_has_no_executable_code_residency() {
         let interpreter = Interpreter::new();
         assert_eq!(interpreter.jit_code_residency().code_bytes, 0);
         assert_eq!(interpreter.jit_code_residency().unique_code_objects, 0);
+    }
+
+    #[test]
+    fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
+        let module = BytecodeModule {
+            module: "lazy-string-cell.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "literal".to_string(),
+                locals: 2,
+                code: vec![
+                    Instruction {
+                        pc: 0,
+                        op: Op::LoadString,
+                        operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
+                    },
+                    Instruction {
+                        pc: 1,
+                        op: Op::LoadString,
+                        operands: vec![Operand::Register(1), Operand::ConstIndex(0)],
+                    },
+                    Instruction {
+                        pc: 2,
+                        op: Op::ReturnValue,
+                        operands: vec![Operand::Register(1)],
+                    },
+                ]
+                .into(),
+                ..Function::default()
+            }],
+            constants: vec![Constant::String {
+                utf16: "cold literal".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interpreter = Interpreter::new();
+        let context = interpreter.link_module(module);
+        assert!(
+            interpreter
+                .prewarm_string_constant_cells(&context, 0)
+                .is_none(),
+            "a cold allocation without published frame roots must decline"
+        );
+        assert_eq!(interpreter.string_constant_cells.len(), 0);
+
+        let mut stack = ActivationStack::new();
+        interpreter.with_runtime_turn(&mut stack, |turn| {
+            let (interpreter, _) = turn.into_parts();
+            interpreter
+                .prewarm_string_constant_cells(&context, 0)
+                .expect("rooted prewarm");
+        });
+        assert!(
+            interpreter
+                .prewarm_string_constant_cells(&context, 0)
+                .is_some(),
+            "an already-prepared function needs no active root provider"
+        );
+
+        let mut snapshot = context.jit_compile_snapshot(0).expect("snapshot");
+        interpreter
+            .bake_string_constant_cells(&mut snapshot, &context, 0)
+            .expect("prepared bake");
+        assert_eq!(snapshot.string_constant_cells.len(), 2);
+        let cells = snapshot
+            .string_constant_cells
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        let first = cells[0];
+        let second = cells[1];
+        assert_eq!(first.cell_addr, second.cell_addr);
+        assert!(unsafe { *(first.cell_addr as *const Value) }.is_string());
+
+        interpreter.force_gc().expect("move the prepared literal");
+        assert!(unsafe { *(first.cell_addr as *const Value) }.is_string());
+        assert!(
+            snapshot
+                .string_constant_cells
+                .values()
+                .all(|cell| cell.cell_addr == first.cell_addr)
+        );
+
+        // No production path inserts a cell before successful allocation. If
+        // corrupt state nevertheless exposes a hole, preparation and baking
+        // both decline instead of publishing that state to generated code.
+        **interpreter
+            .string_constant_cells
+            .get_mut(&context.constant_cache_key(0))
+            .expect("prepared cell") = Value::hole();
+        assert!(
+            interpreter
+                .prewarm_string_constant_cells(&context, 0)
+                .is_none()
+        );
+        let mut invalid = context
+            .jit_compile_snapshot(0)
+            .expect("invalid snapshot input");
+        assert!(
+            interpreter
+                .bake_string_constant_cells(&mut invalid, &context, 0)
+                .is_none()
+        );
+        assert!(invalid.string_constant_cells.is_empty());
+    }
+
+    #[test]
+    fn caller_snapshot_survives_forced_gc_then_nested_target_prewarm() {
+        let literal_function = |id, constant, name: &str| Function {
+            id,
+            name: name.to_string(),
+            locals: 1,
+            code: vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadString,
+                    operands: vec![Operand::Register(0), Operand::ConstIndex(constant)],
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::ReturnValue,
+                    operands: vec![Operand::Register(0)],
+                },
+            ]
+            .into(),
+            ..Function::default()
+        };
+        let module = BytecodeModule {
+            module: "nested-prewarm-gc.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![
+                literal_function(0, 0, "caller"),
+                literal_function(1, 1, "nestedTarget"),
+            ],
+            constants: vec![
+                Constant::String {
+                    utf16: "caller literal".encode_utf16().collect(),
+                },
+                Constant::String {
+                    utf16: "nested target literal".encode_utf16().collect(),
+                },
+            ],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interpreter = Interpreter::new();
+        let context = interpreter.link_module(module);
+        let mut stack = ActivationStack::new();
+        let (caller, nested) = interpreter.with_runtime_turn(&mut stack, |turn| {
+            let (interpreter, _) = turn.into_parts();
+            interpreter
+                .prewarm_string_constant_cells(&context, 0)
+                .expect("caller prewarm");
+            let mut caller = context.jit_compile_snapshot(0).expect("caller snapshot");
+            interpreter
+                .bake_string_constant_cells(&mut caller, &context, 0)
+                .expect("caller bake");
+            let caller_cell = caller.string_constant_cells[&0].cell_addr;
+
+            // Direct-target baking owns this ordering: the caller snapshot is
+            // already live when preparing a nested body may move the heap.
+            // Snapshot state is GC-stable and its literal cell is traced and
+            // rewritten in place.
+            interpreter.collect_minor_tracing_runtime_roots();
+            assert!(unsafe { *(caller_cell as *const Value) }.is_string());
+
+            interpreter
+                .prewarm_string_constant_cells(&context, 1)
+                .expect("nested target prewarm after moving GC");
+            let mut nested = context.jit_compile_snapshot(1).expect("nested snapshot");
+            interpreter
+                .bake_string_constant_cells(&mut nested, &context, 1)
+                .expect("nested target bake");
+            assert_eq!(caller.string_constant_cells[&0].cell_addr, caller_cell);
+            assert!(unsafe { *(caller_cell as *const Value) }.is_string());
+            (caller, nested)
+        });
+
+        assert_eq!(caller.string_constant_cells.len(), 1);
+        assert_eq!(nested.string_constant_cells.len(), 1);
+        let result = interpreter
+            .run(&context)
+            .expect("caller executes after snapshot/GC/nested prewarm");
+        assert!(result.is_string());
     }
 }

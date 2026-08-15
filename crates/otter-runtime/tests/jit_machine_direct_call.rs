@@ -12,7 +12,7 @@
 //!
 //! # Invariants
 //! - The fixture must execute through the Machine IR backend; semantic equality
-//!   alone may not be satisfied by the legacy optimizing fallback.
+//!   alone does not prove generated linkage.
 //! - Generated linkage must be observed on the native hit path.
 //! - An already-started callee is resumed after deopt and never replayed.
 //! - Every throw restores the caller publication before later native reuse.
@@ -28,6 +28,8 @@
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
+
+const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
 
 const DIRECT_RETURN: &str = r#"
 function target(value) {
@@ -90,6 +92,62 @@ try {
 }
 const recovered = caller(target, 41);
 JSON.stringify([caught, recovered]);
+"#;
+
+const DIRECT_DEOPT_THEN_LOCAL_CATCH: &str = r#"
+let effects = 0;
+let catches = 0;
+
+function target(value) {
+  try {
+    effects++;
+    const widened = value + 1;
+    if (value === 2147483647) throw "after-stack-deopt";
+    return widened;
+  } catch (error) {
+    catches++;
+    return error;
+  }
+}
+
+function caller(fn, value) {
+  return fn(value);
+}
+
+for (let i = 0; i < 5000; i++) {
+  target(i);
+  caller(target, i);
+}
+
+const effectsBefore = effects;
+const catchesBefore = catches;
+JSON.stringify([
+  caller(target, 2147483647),
+  effects - effectsBefore,
+  catches - catchesBefore,
+  caller(target, 41)
+]);
+"#;
+
+const EVAL_ENV_DIRECT_CALL: &str = r#"
+function evalEnvFactory() {
+  const target = function evalEnvTarget(delta) {
+    return dynamicBinding + delta;
+  };
+  eval("var dynamicBinding = 40;");
+  return target;
+}
+
+globalThis.evalEnvTarget = evalEnvFactory();
+globalThis.evalEnvCaller = function evalEnvCaller(fn, delta) {
+  return fn(delta);
+};
+
+for (let i = 0; i < 5000; i++) {
+  evalEnvTarget(i & 1);
+  evalEnvCaller(evalEnvTarget, i & 1);
+}
+JSON.stringify([evalEnvCaller(evalEnvTarget, 2), evalEnvTarget(3)]);
 "#;
 
 const NESTED_GC_SETUP: &str = r#"
@@ -203,8 +261,15 @@ spillCaller(spillReceiver, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 "#;
 
 const METHOD_LANDING_PAD: &str = r#"
+let landingEffects = 0;
+let landingThrown = undefined;
 function landingMethod(value) {
-  if (value < 0) throw "landing-boom";
+  landingEffects++;
+  if (value < 0) {
+    const thrown = { kind: "landing-boom", value };
+    landingThrown = thrown;
+    throw thrown;
+  }
   return value + 1;
 }
 
@@ -213,17 +278,19 @@ function landingCaller(receiver, value) {
   let result = undefined;
   try {
     result = receiver.method(value);
-  } catch {
-    result = undefined;
+  } catch (error) {
+    result = [error === landingThrown, error.kind, error.value];
   }
   return result;
 }
 
 for (let i = 0; i < 5000; i++) landingCaller(landingReceiver, i);
+const landingEffectsBefore = landingEffects;
 JSON.stringify([
   landingCaller(landingReceiver, 7),
   landingCaller(landingReceiver, -5),
-  landingCaller(landingReceiver, 41)
+  landingCaller(landingReceiver, 41),
+  landingEffects - landingEffectsBefore
 ]);
 "#;
 
@@ -725,6 +792,7 @@ struct RunResult {
     stats: RuntimeExecutionStats,
     used_machine_direct_call: bool,
     used_machine_method_call: bool,
+    used_machine_method_landing_ack: bool,
     used_machine_construct: bool,
     used_generated_construct: bool,
     used_fast_construct_prepare: bool,
@@ -794,6 +862,29 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
     let used_machine_direct_call = artifact_has("directCallEntryCell", true);
     let used_machine_method_call = artifact_has("\"callKind\": \"method\"", true)
         || artifact_has("\"callKind\":\"method\"", true);
+    let used_machine_method_landing_ack = result.jit_artifacts().is_some_and(|batch| {
+        batch.bundles().iter().any(|bundle| {
+            bundle.manifest().function_name() == "landingCaller"
+                && bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+                && bundle
+                    .file(JitArtifactFileName::Relocations)
+                    .is_some_and(|file| {
+                        std::str::from_utf8(file.contents()).is_ok_and(|text| {
+                            text.contains("jit_acknowledge_caught_throw")
+                                && (text.contains("\"callKind\": \"method\"")
+                                    || text.contains("\"callKind\":\"method\""))
+                        })
+                    })
+                && bundle
+                    .file(JitArtifactFileName::CodeMap)
+                    .is_some_and(|file| {
+                        std::str::from_utf8(file.contents())
+                            .is_ok_and(|text| text.contains("directCallNativeEntry"))
+                    })
+        })
+    });
     let used_machine_construct = artifact_has("\"callKind\": \"construct\"", true)
         || artifact_has("\"callKind\":\"construct\"", true);
     let used_generated_construct = artifact_has("\"callKind\": \"construct\"", false)
@@ -830,6 +921,7 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         stats: runtime.execution_stats(),
         used_machine_direct_call,
         used_machine_method_call,
+        used_machine_method_landing_ack,
         used_machine_construct,
         used_generated_construct,
         used_fast_construct_prepare,
@@ -1229,6 +1321,77 @@ fn callee_throw_restores_publication_and_caller_is_reusable() {
 }
 
 #[test]
+fn stack_callee_deopt_rebuilds_local_catch_without_replaying_effects() {
+    let oracle = run(
+        DIRECT_DEOPT_THEN_LOCAL_CATCH,
+        "jit-machine-direct-deopt-local-catch.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        DIRECT_DEOPT_THEN_LOCAL_CATCH,
+        "jit-machine-direct-deopt-local-catch.js",
+        JitSelection::ProductionTiered,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, r#"["after-stack-deopt",1,1,42]"#);
+    assert_machine_direct_call(&compiled);
+    assert!(
+        compiled.stats.jit_generated_call_deopts > 0,
+        "the stack-owned callee must deopt before the local throw"
+    );
+}
+
+#[test]
+fn generated_call_carries_closure_eval_env_after_factory_frame_and_full_gc() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_osr_threshold(u32::MAX)
+        .jit_debug(JitDebugRequest::artifacts())
+        .build()
+        .expect("eval-env direct-call runtime");
+    let setup = runtime
+        .run_script(
+            SourceInput::from_javascript(EVAL_ENV_DIRECT_CALL),
+            "jit-machine-eval-env-direct-call.js",
+        )
+        .expect("eval-env direct-call setup");
+    assert_eq!(setup.completion_string(), "[42,43]");
+    let used_machine_direct_call = setup.jit_artifacts().is_some_and(|batch| {
+        batch.bundles().iter().any(|bundle| {
+            bundle
+                .file(JitArtifactFileName::OptimizedIr)
+                .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+                && bundle
+                    .file(JitArtifactFileName::Relocations)
+                    .is_some_and(|file| {
+                        std::str::from_utf8(file.contents())
+                            .is_ok_and(|text| text.contains("directCallEntryCell"))
+                    })
+        })
+    });
+    assert!(
+        used_machine_direct_call,
+        "evalEnvCaller must use generated linkage for the non-null env closure"
+    );
+
+    runtime.force_gc().expect("full GC over captured eval env");
+    let stats_before = runtime.execution_stats();
+    let reused = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "JSON.stringify([evalEnvCaller(evalEnvTarget, 4), evalEnvTarget(5)]);",
+            ),
+            "jit-machine-eval-env-direct-call-reuse.js",
+        )
+        .expect("eval-env closure survives factory frame and full GC")
+        .completion_string()
+        .to_owned();
+    assert_eq!(reused, "[44,45]");
+    assert!(runtime.execution_stats().jit_generated_calls > stats_before.jit_generated_calls);
+}
+
+#[test]
 fn nested_machine_calls_rewrite_live_roots_during_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
@@ -1384,8 +1547,12 @@ fn method_throw_enters_explicit_machine_landing_pad() {
     );
 
     assert_eq!(compiled.completion, oracle.completion);
-    assert_eq!(compiled.completion, "[8,null,42]");
+    assert_eq!(compiled.completion, r#"[8,[true,"landing-boom",-5],42,3]"#);
     assert_machine_method_call(&compiled);
+    assert!(
+        compiled.used_machine_method_landing_ack,
+        "landingCaller must own the generated method linkage and its dedicated caught-throw acknowledgement"
+    );
 }
 
 #[test]

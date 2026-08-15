@@ -1,7 +1,7 @@
 //! Template compiler built on backend-neutral [`TemplatePlan`] operations.
 //!
 //! The production native compiler over the frozen entry contract
-//! (`JitCtx`/`JitRet`, `otter_vm::native_abi`). It compiles constants,
+//! (`JitCtx`/`NativeResultPair`, `otter_vm::native_abi`). It compiles constants,
 //! register moves, branches, tagged truthiness, the full tagged
 //! numeric/comparison/bitwise set, `+` with allocating string concat,
 //! descriptor-resolved runtime transitions, ordinary and method calls with
@@ -96,17 +96,21 @@ pub fn compile(
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     //! Execution tests for the template subset. They drive compiled code
-    //! through a `JitCtx` whose `vm`/`stack`/`context` are null — valid
-    //! because this subset never re-enters the VM — and a `regs` pointer at a
-    //! local register array.
+    //! through an isolate-less `JitCtx` and a local register window. Pure
+    //! generated paths execute normally; an outlined semantic transition that
+    //! needs the absent runtime finishes as an exact pre-effect side exit.
 
     use super::TemplateCode;
     use crate::entry::{
-        JitCtx, JitEntry, JitRet, STATUS_RETURNED, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
-        VALUE_UNDEFINED, value_tag,
+        JitCtx, JitEntry, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+        value_tag,
     };
     use otter_bytecode::{Op, Operand};
-    use otter_vm::{JitCompileSnapshot, JitFunctionCode, jit::JitTestInstruction};
+    use otter_vm::{
+        JitCompileSnapshot, JitFunctionCode,
+        jit::JitTestInstruction,
+        native_abi::{NativeResultDomain, NativeResultPair, NativeResultStatus},
+    };
 
     const STRIDE: u32 = 4;
 
@@ -161,7 +165,6 @@ mod tests {
             otter_vm::Value::undefined(),
             otter_vm::Value::undefined(),
         );
-        native_frame.set_materialized_activation(0);
         let mut thread = otter_vm::native_abi::VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.current_code_object_id = 1;
@@ -181,19 +184,43 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
         };
-        // SAFETY: subset code never re-enters the VM; the entry was emitted
-        // with the shared compiled-entry ABI and its mapping outlives the call.
+        // SAFETY: the fixture owns every published context record, and the
+        // entry's executable mapping outlives the complete call.
         let entry: JitEntry = unsafe { std::mem::transmute(entry_ptr) };
-        let JitRet { value, status } = entry(&mut ctx);
-        if status == STATUS_RETURNED {
-            Exit::Returned(value)
+        let result = entry(&mut ctx);
+        if result.validate(NativeResultDomain::Compiled) == Some(NativeResultStatus::Success) {
+            Exit::Returned(result.payload_bits())
         } else {
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::SideExit)
+            );
+            assert_eq!(result.logical_pc(), Some(native_frame.header.pc));
             Exit::Bailed(native_frame.header.pc)
         }
     }
 
+    extern "C" fn finish_fixture_error_as_side_exit(ctx: *mut JitCtx) -> NativeResultPair {
+        // SAFETY: `exec_entry` owns both records for the complete native call.
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else {
+            return NativeResultPair::fatal_internal();
+        };
+        let Some(pc) = (unsafe { ctx.native_frame.as_ref() }).map(|frame| frame.header.pc) else {
+            return NativeResultPair::fatal_internal();
+        };
+        if ctx.error.is_null() || unsafe { (*ctx.error).take() }.is_none() {
+            return NativeResultPair::fatal_internal();
+        }
+        NativeResultPair::side_exit(u64::from(pc))
+    }
+
     fn compile(view: &JitCompileSnapshot) -> Result<TemplateCode, super::Unsupported> {
-        super::compile(view, 1, &crate::entry::TransitionTable::resolve())
+        let mut transitions = crate::entry::TransitionTable::resolve();
+        transitions.replace_entry_for_test(
+            otter_vm::native_abi::STUB_JIT_FINISH_ERROR,
+            finish_fixture_error_as_side_exit as *const () as usize,
+        );
+        super::compile(view, 1, &transitions)
     }
 
     fn run(view: &JitCompileSnapshot, regs: &mut [u64]) -> Exit {
@@ -495,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn method_call_uses_full_packed_argument_abi() {
+    fn method_call_uses_value_span_for_wide_arguments() {
         let four_args = view(&[
             (
                 Op::CallMethodValue,
@@ -514,29 +541,32 @@ mod tests {
         ]);
         assert!(
             compile(&four_args).is_ok(),
-            "the compiler must accept every argument representable by the shared packed ABI"
+            "the compiler accepts four explicit method arguments"
         );
 
-        let five_args = view(&[
+        let eight_args = view(&[
             (
                 Op::CallMethodValue,
                 vec![
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::ConstIndex(0),
-                    Operand::ConstIndex(5),
+                    Operand::ConstIndex(8),
                     Operand::Register(2),
                     Operand::Register(3),
                     Operand::Register(4),
                     Operand::Register(5),
                     Operand::Register(6),
+                    Operand::Register(7),
+                    Operand::Register(2),
+                    Operand::Register(3),
                 ],
             ),
             (Op::ReturnValue, vec![Operand::Register(0)]),
         ]);
         assert!(
-            compile(&five_args).is_ok(),
-            "argument lists beyond the inline lanes spill into the code object's register table"
+            compile(&eight_args).is_ok(),
+            "wide methods build one boxed value span without packed register metadata"
         );
     }
 

@@ -50,6 +50,27 @@ mod deopt;
 mod generated;
 
 impl Interpreter {
+    /// Route a pure exception returned by generated code through the canonical
+    /// rooted interpreter unwind. Nested-call provenance survives propagation
+    /// and is cleared only when this unwind actually lands in a local handler
+    /// (or an async frame absorbs the throw).
+    pub(crate) fn unwind_compiled_throw_above(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+        thrown: Value,
+    ) -> Result<(), VmError> {
+        if self.pending_uncaught_frames.is_none() {
+            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+        }
+        let unwind = self.unwind_throw_above(context, stack, floor, thrown);
+        if unwind.is_ok() {
+            self.pending_uncaught_frames = None;
+        }
+        unwind
+    }
+
     /// After a call pushed a fresh bytecode callee frame as the new top of
     /// `stack`, try to run it as compiled baseline code instead of interpreting.
     ///
@@ -141,52 +162,15 @@ impl Interpreter {
                 let popped = self.return_running_finally_above(stack, floor, value)?;
                 Ok(Some(popped))
             }
-            jit::JitExecOutcome::Threw(err) => {
-                if matches!(err, VmError::Uncaught)
-                    && let Some(thrown) = self.pending_uncaught_throw.take()
-                {
-                    if self.pending_uncaught_frames.is_none() {
-                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                    }
-                    let unwind = self.unwind_throw_above(context, stack, floor, thrown);
-                    if unwind.is_ok() {
-                        self.pending_uncaught_frames = None;
-                    } else {
-                        self.pending_uncaught_throw = Some(thrown);
-                    }
-                    unwind?;
-                    return if stack.is_at_floor(floor) {
-                        Ok(Some(Some(Value::undefined())))
-                    } else {
-                        Ok(None)
-                    };
+            jit::JitExecOutcome::Throw(thrown) => {
+                self.unwind_compiled_throw_above(context, stack, floor, thrown)?;
+                if stack.is_at_floor(floor) {
+                    Ok(Some(Some(Value::undefined())))
+                } else {
+                    Ok(None)
                 }
-                if let Some(thrown) =
-                    self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
-                {
-                    let uncaught =
-                        if matches!(err, VmError::OutOfMemory { .. } | VmError::JsonError) {
-                            Some(err)
-                        } else {
-                            None
-                        };
-                    if self.pending_uncaught_frames.is_none() {
-                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                    }
-                    let unwind = self
-                        .unwind_throw_with_uncaught_above(context, stack, floor, thrown, uncaught);
-                    if unwind.is_ok() {
-                        self.pending_uncaught_frames = None;
-                    }
-                    unwind?;
-                    return if stack.is_at_floor(floor) {
-                        Ok(Some(Some(Value::undefined())))
-                    } else {
-                        Ok(None)
-                    };
-                }
-                Err(err)
             }
+            jit::JitExecOutcome::Fatal(err) => Err(err),
         }
     }
 
@@ -347,7 +331,15 @@ impl Interpreter {
                 let popped = self.return_running_finally_above(stack, floor, value)?;
                 Ok(Some(popped))
             }
-            jit::JitExecOutcome::Threw(err) => Err(err),
+            jit::JitExecOutcome::Throw(thrown) => {
+                self.unwind_compiled_throw_above(context, stack, floor, thrown)?;
+                if stack.is_at_floor(floor) {
+                    Ok(Some(Some(Value::undefined())))
+                } else {
+                    Ok(None)
+                }
+            }
+            jit::JitExecOutcome::Fatal(err) => Err(err),
         }
     }
 
@@ -672,7 +664,11 @@ impl Interpreter {
                 }
                 Ok(Some(value))
             }
-            jit::JitExecOutcome::Threw(err) => Err(err),
+            jit::JitExecOutcome::Throw(thrown) => {
+                self.unwind_compiled_throw_above(context, stack, ActivationFloor::ROOT, thrown)?;
+                Ok(None)
+            }
+            jit::JitExecOutcome::Fatal(err) => Err(err),
         }
     }
 
@@ -935,6 +931,30 @@ impl Interpreter {
         }
     }
 
+    /// Root a boxed Return/Throw payload across generated-feedback repair.
+    ///
+    /// The returned index is a LIFO token consumed by
+    /// [`Self::jit_release_generated_result_root`]. This is a short-lived GC
+    /// root only; it is not an exception propagation channel.
+    #[doc(hidden)]
+    pub fn jit_push_generated_result_root(&mut self, value: Value) -> usize {
+        self.push_iteration_anchor(value) - 1
+    }
+
+    /// Read a collector-rewritten generated-result payload root.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn jit_generated_result_root(&self, index: usize) -> Value {
+        self.iteration_anchor(index)
+    }
+
+    /// Release one generated-result payload root and any newer temporary
+    /// anchors owned by the same entry transaction.
+    #[doc(hidden)]
+    pub fn jit_release_generated_result_root(&mut self, index: usize) {
+        self.pop_iteration_anchors_to(index);
+    }
+
     /// Advance the shared function-entry hotness counter by one cold batch.
     #[inline]
     pub(crate) fn note_jit_function_entries(&mut self, fid: u32, entries: u64) -> u32 {
@@ -1038,7 +1058,7 @@ impl Interpreter {
             .map_or(u32::MAX, |frame| frame.function_id);
         let resolved = match context.for_function(fid) {
             Some(resolved) => resolved,
-            None => return jit::JitExecOutcome::Threw(VmError::InvalidOperand),
+            None => return jit::JitExecOutcome::Fatal(VmError::InvalidOperand),
         };
         // SAFETY: the raw pointers are formed from this method's own live
         // borrows (`self`, `stack`, `resolved`) and are valid for the duration
@@ -1071,7 +1091,10 @@ impl Interpreter {
             return None;
         }
         let header = closure.call_header(&self.gc_heap);
-        if header.upvalue_count == 0 || header.upvalue_base == 0 || header.requires_runtime_setup()
+        if header.upvalue_count == 0
+            || header.upvalue_base == 0
+            || header.requires_runtime_setup()
+            || !header.eval_env.is_null()
         {
             return None;
         }
@@ -1200,33 +1223,5 @@ impl Interpreter {
             *caller_regs.add(dst_reg as usize) = Value::boolean(eq ^ negate);
         }
         Ok(())
-    }
-
-    /// Build the closure for a compiled `MakeFunction`,
-    /// writing it into register `dst` of frame `frame_index` (self-reference
-    /// capture and upvalue binding go through the normal interpreter path).
-    ///
-    /// # Errors
-    /// Propagates closure-construction errors and `InvalidOperand` for an
-    /// out-of-range frame index.
-    pub fn jit_runtime_make_function(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        dst: u16,
-        idx: u32,
-    ) -> Result<(), VmError> {
-        // `self` and `stack` are disjoint, so the two `&mut` are non-aliasing.
-        let frame = stack
-            .get_mut(frame_index)
-            .ok_or_else(|| VmError::InvalidOperand)?;
-        // `idx` is a constant-pool index of the COMPILED function's chunk;
-        // in a multi-script runtime the ambient context may belong to a
-        // different chunk, so resolve the owner before decoding.
-        let resolved = context
-            .for_function(frame.function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        self.run_make_function_reg(&resolved, frame, dst, idx)
     }
 }

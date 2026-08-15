@@ -1417,27 +1417,30 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        if let Some(stub_id) = target.leaf_stub_id
-            && let Some(value) = self
-                .dispatch_collection_builtin_leaf_no_alloc(stub_id, recv, args)
-                .into_value()
-        {
-            return Ok(value);
+        if let Some(stub_id) = target.leaf_stub_id {
+            let result = self.dispatch_collection_builtin_leaf_no_alloc(stub_id, recv, args);
+            if result.validate(crate::native_abi::NativeResultDomain::Probe)
+                == Some(crate::native_abi::NativeResultStatus::Success)
+            {
+                return Ok(result.payload_value());
+            }
         }
         // An in-place write cannot allocate either, so it runs the same way
         // with a mutable heap and no rooting packet. A key the map does not
         // hold misses and the rooted path appends.
-        if let Some(stub_id) = target.op.mutating_stub_id()
-            && let Some(value) = crate::runtime_stubs::invoke_mutating_leaf_stub3(
+        if let Some(stub_id) = target.op.mutating_stub_id() {
+            let result = crate::runtime_stubs::invoke_mutating_leaf_stub3(
                 &mut self.gc_heap,
                 stub_id,
                 recv,
                 args.first().copied().unwrap_or_else(Value::undefined),
                 args.get(1).copied().unwrap_or_else(Value::undefined),
-            )
-            .into_value()
-        {
-            return Ok(value);
+            );
+            if result.validate(crate::native_abi::NativeResultDomain::Probe)
+                == Some(crate::native_abi::NativeResultStatus::Success)
+            {
+                return Ok(result.payload_value());
+            }
         }
         self.dispatch_collection_builtin_rooted(target.op, recv, args)
     }
@@ -1453,7 +1456,7 @@ impl Interpreter {
         stub_id: RuntimeStubId,
         recv: Value,
         args: &[Value],
-    ) -> crate::native_abi::RuntimeStubResult {
+    ) -> crate::native_abi::NativeResultPair {
         let key = args.first().copied().unwrap_or_else(Value::undefined);
         crate::runtime_stubs::invoke_leaf_no_alloc_stub2(&self.gc_heap, stub_id, recv, key)
     }

@@ -510,7 +510,14 @@ impl Interpreter {
         }
 
         let display = self.render_thrown(&value);
-        let payload = value;
+        let mut payload = value;
+        let mut payload_root = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: `payload` precedes the scope and remains stationary until
+        // throw routing completes. IteratorClose may reenter JavaScript and
+        // collect before the value reaches a catch slot or pending-throw root.
+        unsafe {
+            crate::rooting::RootScopeExt::add_value(&mut payload_root, &mut payload);
+        }
         loop {
             if stack.is_at_floor(floor) {
                 if uncaught_error.is_none() {

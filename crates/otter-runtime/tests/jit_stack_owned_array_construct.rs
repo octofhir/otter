@@ -22,10 +22,8 @@
 #![cfg(target_arch = "aarch64")]
 
 use otter_runtime::{
-    JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest,
-    JitDebugTarget, JitDebugTier, JitDirectCallKind, JitDirectCallLoweringOutcome,
-    JitDirectCallLoweringRejectionReason, JitSelection, Runtime, RuntimeExecutionStats,
-    SourceInput,
+    JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTarget,
+    JitDebugTier, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
 
 const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
@@ -941,7 +939,7 @@ JSON.stringify([value.a, value.b, value.c, value.d, Object.keys(value).join(",")
 }
 
 #[test]
-fn tiny_base_constructor_uses_the_compact_canonical_optimizing_boundary() {
+fn tiny_base_constructor_uses_machine_or_template_without_a_legacy_optimizer() {
     const MODULE: &str = "jit-tiny-construct-cost-model.js";
     let mut runtime = runtime();
     let setup = runtime
@@ -953,69 +951,42 @@ fn tiny_base_constructor_uses_the_compact_canonical_optimizing_boundary() {
     let artifacts = setup
         .jit_artifacts()
         .expect("tiny constructor cost-model artifacts");
-    let caller_function_id = function_id(artifacts, MODULE, "makeTinyConstructCost");
-    let callee_function_id = function_id(artifacts, MODULE, "TinyConstructCost");
+    let caller_bundles = artifacts
+        .bundles()
+        .iter()
+        .filter(|bundle| {
+            let manifest = bundle.manifest();
+            manifest.module() == MODULE
+                && manifest.function_name() == "makeTinyConstructCost"
+                && manifest.entry() == JitDebugTarget::Entry
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        caller_bundles
+            .iter()
+            .any(|bundle| bundle.manifest().tier() == JitDebugTier::Template),
+        "tiny constructor caller must retain a Template baseline"
+    );
+    assert!(
+        caller_bundles.iter().all(|bundle| {
+            bundle.manifest().tier() != JitDebugTier::Optimizing
+                || bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+        }),
+        "every optimizing artifact must come from Machine IR"
+    );
+    drop(setup);
 
-    let mut optimizing_bundles = 0;
-    let mut canonical_construct = false;
-    let mut generated_tiny_construct = false;
-    for bundle in artifacts.bundles().iter().filter(|bundle| {
-        let manifest = bundle.manifest();
-        manifest.module() == MODULE
-            && manifest.function_name() == "makeTinyConstructCost"
-            && manifest.tier() == JitDebugTier::Optimizing
-            && manifest.entry() == JitDebugTarget::Entry
-    }) {
-        optimizing_bundles += 1;
-        let optimized_ir = bundle
-            .file(JitArtifactFileName::OptimizedIr)
-            .expect("optimizing caller IR");
-        assert!(
-            !optimized_ir.contents().starts_with(MACHINE_IR_HEADER),
-            "the regression must exercise the legacy optimizing construct cost model"
-        );
-        let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
-        for relocation in relocations["relocations"]
-            .as_array()
-            .expect("tiny constructor relocations")
-        {
-            canonical_construct |= relocation["target"]["kind"] == "runtimeStub"
-                && relocation["target"]["name"] == "jit_construct";
-            generated_tiny_construct |= relocation["target"]["kind"] == "directCallEntryCell"
-                && relocation["target"]["directCall"]["targetFunctionId"].as_u64()
-                    == Some(u64::from(callee_function_id));
-        }
-    }
-    assert!(optimizing_bundles > 0, "missing optimizing caller artifact");
-    assert!(
-        canonical_construct,
-        "the tiny constructor must retain the compact canonical transition"
+    let result = run(
+        &mut runtime,
+        r#"
+const value = makeTinyConstructCost();
+JSON.stringify([value.items.length, Object.keys(value).join(",")]);
+"#,
+        "jit-tiny-construct-policy-probe.js",
     );
-    assert!(
-        !generated_tiny_construct,
-        "fixed generated linkage must not dominate the tiny constructor body"
-    );
-
-    let events = setup
-        .jit_debug_report()
-        .expect("tiny constructor cost-model events");
-    assert!(
-        events.events().iter().any(|event| matches!(
-            event,
-            JitDebugEvent::DirectCallLowered {
-                call_kind: JitDirectCallKind::Construct,
-                caller_function_id: event_caller,
-                callee_function_id: event_callee,
-                tier: JitDebugTier::Optimizing,
-                outcome: JitDirectCallLoweringOutcome::Rejected {
-                    reason: JitDirectCallLoweringRejectionReason::Unprofitable,
-                },
-                ..
-            } if *event_caller == caller_function_id && *event_callee == callee_function_id
-        )),
-        "the event stream must name the deliberate cost-model rejection: {:?}",
-        events.events()
-    );
+    assert_eq!(result, r#"[0,"items"]"#);
 }
 
 #[test]

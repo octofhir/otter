@@ -18,6 +18,8 @@
 //!   error path can synthesize a `ReferenceError`.
 //! - Identifier assignment routes through descriptor-aware object `[[Set]]`;
 //!   raw property writes are reserved for declaration/bootstrap paths.
+//! - Dynamic bindings have one authority: the executing frame's traced
+//!   [`crate::eval_env::EvalEnvHandle`] chain. The nearest record wins.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -26,8 +28,9 @@
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey,
-    activation_stack::ActivationStack, object, write_register,
+    ActiveFrameMut, ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome,
+    VmPropertyKey, activation_stack::ActivationStack, eval_env::EvalEnvHandle, object,
+    write_register,
 };
 
 /// Guarded own-data slot for one global object-record load site.
@@ -199,9 +202,23 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
-        let frame = &stack[top_idx];
+        let function_id = stack[top_idx].function_id;
+        let value = self.load_global_or_undefined_value(context, stack, function_id, name_idx)?;
+        let frame = &mut stack[top_idx];
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    fn load_global_or_undefined_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        name_idx: u32,
+    ) -> Result<Value, VmError> {
         let name = context
-            .string_constant_str_for_function(frame.function_id, name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         // §13.5.3 — `typeof` still raises ReferenceError for a
         // lexical binding read inside its TDZ; only *unresolvable*
@@ -229,10 +246,7 @@ impl Interpreter {
                 }
             }
         };
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(value)
     }
 
     /// Read a binding from the global declarative record. `Ok(None)`
@@ -412,16 +426,30 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
+        let function_id = frame.function_id;
+        let eval_env = (!frame.eval_env.is_null()).then_some(frame.eval_env);
+        let value = self.load_dynamic_value(context, stack, function_id, eval_env, name_idx)?;
+        write_register(&mut stack[top_idx], dst, value)?;
+        stack[top_idx].advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_dynamic_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        eval_env: Option<EvalEnvHandle>,
+        name_idx: u32,
+    ) -> Result<Value, VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(cell) = self.frame_eval_var(&stack[top_idx], name) {
-            let value = crate::read_upvalue(&self.gc_heap, cell);
-            write_register(&mut stack[top_idx], dst, value)?;
-            stack[top_idx].advance_pc()?;
-            return Ok(());
+        if let Some(cell) = self.eval_env_var(eval_env, name) {
+            return Ok(crate::read_upvalue(&self.gc_heap, cell));
         }
-        self.run_load_global_or_throw_reg(context, stack, top_idx, dst, name_idx)
+        self.load_global_or_throw_value(stack, context, function_id, name_idx)
     }
 
     /// `Op::StoreDynamic` — §10.2.4.2 PutValue counterpart of
@@ -436,18 +464,32 @@ impl Interpreter {
         value_reg: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let value = *crate::read_register(&stack[top_idx], value_reg)?;
+        let frame = &stack[top_idx];
+        let eval_env = (!frame.eval_env.is_null()).then_some(frame.eval_env);
+        self.store_dynamic_value(context, stack, eval_env, value, name_idx)?;
+        stack[top_idx].advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn store_dynamic_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        eval_env: Option<EvalEnvHandle>,
+        value: Value,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = *crate::read_register(&stack[top_idx], value_reg)?;
-        if let Some(cell) = self.frame_eval_var(&stack[top_idx], name) {
+        if let Some(cell) = self.eval_env_var(eval_env, name) {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
-            stack[top_idx].advance_pc()?;
             return Ok(());
         }
         // Fall through to the full global SetMutableBinding so
         // realm-wide lexical bindings stay visible (sloppy mode).
-        self.run_store_global_binding_reg(context, stack, top_idx, value_reg, name_idx, false)
+        self.store_global_binding_value(context, stack, value, name_idx, false)
     }
 
     /// `Op::TypeofDynamic` — `typeof` flavour of
@@ -461,24 +503,38 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
+        let function_id = frame.function_id;
+        let eval_env = (!frame.eval_env.is_null()).then_some(frame.eval_env);
+        let value = self.typeof_dynamic_value(context, stack, function_id, eval_env, name_idx)?;
+        write_register(&mut stack[top_idx], dst, value)?;
+        stack[top_idx].advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn typeof_dynamic_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        eval_env: Option<EvalEnvHandle>,
+        name_idx: u32,
+    ) -> Result<Value, VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(cell) = self.frame_eval_var(&stack[top_idx], name) {
-            let value = crate::read_upvalue(&self.gc_heap, cell);
-            write_register(&mut stack[top_idx], dst, value)?;
-            stack[top_idx].advance_pc()?;
-            return Ok(());
+        if let Some(cell) = self.eval_env_var(eval_env, name) {
+            return Ok(crate::read_upvalue(&self.gc_heap, cell));
         }
-        self.run_load_global_or_undefined_reg(context, stack, top_idx, dst, name_idx)
+        self.load_global_or_undefined_value(context, stack, function_id, name_idx)
     }
 
     /// `Op::DeleteDynamic` — §13.5.1.2 delete of a name that may
     /// resolve to an eval-created var binding (§19.2.1.3
-    /// CreateMutableBinding(vn, true) — deletable). Removes it from
-    /// the frame's eval-var map and the captured eval-env chain
-    /// (adoption writes to both); otherwise falls through to the
-    /// global-object delete, whose result reflects configurability.
+    /// CreateMutableBinding(vn, true) — deletable). Removes it from the
+    /// nearest record in the frame's captured eval-env chain; otherwise falls
+    /// through to the global-object delete, whose result reflects
+    /// configurability.
     pub(crate) fn run_delete_dynamic_reg(
         &mut self,
         context: &ExecutionContext,
@@ -486,38 +542,48 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let mut frame = ActiveFrameMut::materialized(frame);
+        self.run_delete_dynamic_active_reg(context, &mut frame, dst, name_idx)
+    }
+
+    pub(crate) fn run_delete_dynamic_active_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
-        let removed_local = self
-            .frame_cold_mut(frame)
-            .and_then(|cold| cold.eval_vars.as_mut())
-            .is_some_and(|map| map.remove(name).is_some());
-        let removed_env =
-            env.is_some_and(|env| crate::eval_env::eval_env_delete(&mut self.gc_heap, env, name));
-        let removed = if removed_local || removed_env {
+        let removed_env = frame.eval_env().is_some_and(|env| {
+            crate::eval_env::eval_env_delete_chain(&mut self.gc_heap, env, name)
+        });
+        let removed = if removed_env {
             true
+        } else if self.global_lexicals.contains_key(name) {
+            // A global declarative binding is an Environment Record binding,
+            // not a configurable property. Dynamic resolution found it, so
+            // sloppy `delete identifier` must report `false` without falling
+            // through to the unrelated global object record.
+            false
         } else {
             crate::object::delete(self.global_this, &mut self.gc_heap, name)
         };
-        write_register(frame, dst, Value::boolean(removed))?;
+        frame.write(dst, Value::boolean(removed))?;
         frame.advance_pc()?;
         Ok(())
     }
 
-    /// Look up an eval-introduced var binding on `frame`'s cold
-    /// record.
-    fn frame_eval_var(&self, frame: &Frame, name: &str) -> Option<crate::UpvalueCell> {
-        let cold = self.frame_cold(frame)?;
-        if let Some(cell) = cold.eval_vars.as_ref().and_then(|map| map.get(name)) {
-            return Some(*cell);
-        }
-        // §9.1 — eval-introduced bindings of enclosing functions
-        // reach this frame through the closure-captured environment
-        // chain.
-        let env = cold.eval_env?;
-        crate::eval_env::eval_env_lookup(&self.gc_heap, env, name)
+    /// Look up an eval-introduced var binding through `frame`'s complete
+    /// nearest-first environment chain.
+    fn eval_env_var(
+        &self,
+        eval_env: Option<EvalEnvHandle>,
+        name: &str,
+    ) -> Option<crate::UpvalueCell> {
+        let env = eval_env?;
+        crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, name)
     }
 
     /// `Op::DeclareGlobalLex` — §9.1.1.4 CreateMutableBinding /
@@ -709,11 +775,23 @@ impl Interpreter {
         name_idx: u32,
         strict: bool,
     ) -> Result<(), VmError> {
-        let frame = &stack[top_idx];
+        let value = *crate::read_register(&stack[top_idx], value_reg)?;
+        self.store_global_binding_value(context, stack, value, name_idx, strict)?;
+        stack[top_idx].advance_pc()?;
+        Ok(())
+    }
+
+    fn store_global_binding_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        value: Value,
+        name_idx: u32,
+        strict: bool,
+    ) -> Result<(), VmError> {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = *crate::read_register(frame, value_reg)?;
         if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
             if is_const {
                 return Err(
@@ -726,7 +804,6 @@ impl Interpreter {
                 ));
             }
             crate::store_upvalue(&mut self.gc_heap, cell, value);
-            stack[top_idx].advance_pc()?;
             return Ok(());
         }
         // §9.1.1.4.18 object-record SetMutableBinding — strict mode
@@ -744,7 +821,6 @@ impl Interpreter {
         {
             return Err(self.err_type((format!("Cannot assign to property '{name}'")).into()));
         }
-        stack[top_idx].advance_pc()?;
         Ok(())
     }
 }

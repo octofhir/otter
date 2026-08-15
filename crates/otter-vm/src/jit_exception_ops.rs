@@ -3,8 +3,7 @@
 //! # Contents
 //! - Frame-local try-handler installation and removal.
 //! - Throw/finally resumption through the interpreter's canonical unwind code.
-//! - Callee-throw delivery back into a live compiled caller.
-//! - Catchable VM-error materialization for reentrant compiled helpers.
+//! - Pure JavaScript-exception routing through a live compiled frame.
 //! - Abrupt jump/return completion without popping a live compiled frame.
 //! - TDZ `ReferenceError` materialization through the same throwable builder as
 //!   interpreter dispatch.
@@ -17,6 +16,9 @@
 //!   that frame underneath native code.
 //! - Thrown values remain rooted in the published register/cold-frame graph,
 //!   and reentry uses the existing ActivationStack/VmThread activation ABI.
+//! - An unhandled compiled throw is returned as a pure [`Value`]; only
+//!   diagnostic frame provenance remains on the VM until a local catch
+//!   explicitly acknowledges consumption.
 //!
 //! # See also
 //! - [`crate::Interpreter::unwind_throw`]
@@ -41,78 +43,61 @@ pub enum JitExceptionOutcome {
     Resume(u32),
     /// Return normally from the compiled frame.
     Return(Value),
+    /// Propagate one pure JavaScript exception value.
+    Throw(Value),
 }
 
 impl Interpreter {
-    /// Materialize a catchable VM error and deliver it through the current
-    /// compiled frame's structured-exception state.
+    /// Route one already-materialized JavaScript exception through a
+    /// materialized compiled frame.
     ///
-    /// Returns `Ok(None)` for structural/host errors that the interpreter
-    /// would not expose as JavaScript exceptions. A handled JavaScript error
-    /// returns the catch/finally continuation PC; an unhandled one preserves
-    /// the thrown value in `pending_uncaught_throw` and returns
-    /// [`VmError::Uncaught`].
-    pub fn jit_materialize_error_from_compiled(
+    /// `Some(pc)` means this frame's catch/finally handler consumed the value.
+    /// `None` means the unchanged pure exception must propagate in the caller's
+    /// result payload. No pending-throw side channel is populated.
+    pub fn jit_route_throw(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
-        err: VmError,
+        mut value: Value,
     ) -> Result<Option<u32>, VmError> {
-        let Some(value) = self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
-        else {
-            return Ok(None);
-        };
-        match self.jit_throw_from_compiled(context, stack, frame_index, value)? {
-            JitExceptionOutcome::Resume(pc) => Ok(Some(pc)),
-            JitExceptionOutcome::Continue | JitExceptionOutcome::Return(_) => {
+        let mut value_root = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: `value` precedes the scope and remains stationary until
+        // observable IteratorClose/unwind work completes.
+        unsafe {
+            crate::rooting::RootScopeExt::add_value(&mut value_root, &mut value);
+        }
+        match self.jit_throw_from_compiled(context, stack, frame_index, value) {
+            Ok(JitExceptionOutcome::Resume(pc)) => Ok(Some(pc)),
+            Ok(JitExceptionOutcome::Throw(propagated)) => {
+                debug_assert_eq!(propagated, value);
+                Ok(None)
+            }
+            Ok(JitExceptionOutcome::Continue | JitExceptionOutcome::Return(_)) => {
                 Err(VmError::InvalidOperand)
             }
+            Err(err) => Err(err),
         }
     }
 
-    /// Deliver a propagated compiled-callee throw into `frame_index` when that
-    /// caller still owns an active structured-exception handler.
+    /// Acknowledge that a Machine local catch landing absorbed a pure throw.
     ///
-    /// Compiler-generated call linkage uses this before taking the shared
-    /// throw epilogue. A successful unwind updates the caller's canonical frame
-    /// PC; native code publishes that PC and bails so interpreter dispatch resumes
-    /// at the selected catch/finally continuation without replaying the call.
-    pub fn jit_resume_caller_throw(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-    ) -> Result<Option<u32>, VmError> {
-        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
-        let has_handler = self
-            .frame_cold(frame)
-            .is_some_and(|cold| !cold.handlers.is_empty());
-        if !has_handler {
-            return Ok(None);
-        }
-        let Some(value) = self.pending_uncaught_throw.take() else {
-            return Ok(None);
-        };
-
-        match self.unwind_throw(context, stack, value) {
-            Ok(()) => {
-                self.pending_uncaught_frames = None;
-                let pc = stack.get(frame_index).ok_or(VmError::InvalidOperand)?.pc;
-                Ok(Some(pc))
-            }
-            Err(err) => {
-                self.pending_uncaught_throw = Some(value);
-                Err(err)
-            }
-        }
+    /// This is deliberately separate from throw extraction and propagation:
+    /// nested getter/Proxy/callee frame provenance must survive every escaping
+    /// compiled frame, but must not contaminate a later throw from the catch
+    /// body itself.
+    pub fn jit_acknowledge_caught_throw(&mut self) {
+        self.pending_uncaught_frames = None;
+        self.pending_uncaught_throw = None;
+        let _ = self.take_error_detail();
     }
 
     /// Complete one structured-exception opcode for a published compiled frame.
     ///
     /// Arguments are opcode-specific scalar operands already validated by JIT
     /// lowering. Any successful mutation is reported as a committed outcome;
-    /// errors are parked by the machine stub and surface as `STATUS_THREW`.
+    /// the exception-transition boundary returns a pure JavaScript exception
+    /// value or a structural fatal status.
     #[allow(clippy::too_many_arguments)]
     pub fn jit_runtime_exception_op(
         &mut self,
@@ -220,13 +205,10 @@ impl Interpreter {
             .is_some_and(|cold| !cold.handlers.is_empty());
         if has_handler {
             self.unwind_throw(context, stack, value)?;
-            if captured_frames {
-                self.pending_uncaught_frames = None;
-            }
+            self.pending_uncaught_frames = None;
             return Ok(JitExceptionOutcome::Resume(stack[frame_index].pc));
         }
 
-        self.pending_uncaught_throw = Some(value);
-        Err(self.err_uncaught(self.render_thrown(&value).into()))
+        Ok(JitExceptionOutcome::Throw(value))
     }
 }

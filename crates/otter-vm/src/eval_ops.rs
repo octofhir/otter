@@ -19,6 +19,9 @@
 //! - Strict-mode eval inherits the caller function strictness.
 //! - Direct eval re-enters above an activation floor on the caller's stack;
 //!   caller frames remain traced and cannot be consumed by nested dispatch.
+//! - One traced eval-environment chain owns every runtime-introduced binding.
+//!   Compiler snapshots are unique, nearest-wins, and name-sorted; after any
+//!   allocation the live cell is resolved again from that chain.
 //!
 //! # See also
 //! - [`crate::code_space`]
@@ -44,9 +47,9 @@ enum CallerCellSource {
     /// Slot in the caller frame's upvalue array (compile-time
     /// promoted function-scope binding).
     Upvalue(u16),
-    /// Entry in the caller frame's runtime eval-introduced binding
-    /// map (created by an earlier direct eval from the same frame).
-    EvalVar(String),
+    /// Name in the caller frame's traced eval-environment chain. The live cell
+    /// is re-resolved after compilation and upvalue allocation.
+    EvalEnv(String),
 }
 
 /// §20.2.1.1.1 CreateDynamicFunction `kind` parameter: which function
@@ -167,8 +170,8 @@ impl Interpreter {
         frame: &Frame,
         in_param_init: bool,
     ) -> (Vec<EvalCallerBinding>, Vec<CallerCellSource>) {
-        let mut scope: Vec<EvalCallerBinding> = Vec::new();
-        let mut sources: Vec<CallerCellSource> = Vec::new();
+        let mut by_name: std::collections::BTreeMap<String, (EvalCallerBinding, CallerCellSource)> =
+            std::collections::BTreeMap::new();
         if let Some(function) = context.exec_function(frame.function_id) {
             for binding in function.direct_eval_bindings.iter() {
                 // §10.2.11 — body lexical bindings don't exist yet
@@ -177,45 +180,62 @@ impl Interpreter {
                 if in_param_init && binding.lexical {
                     continue;
                 }
-                scope.push(EvalCallerBinding {
-                    name: binding.name.to_string(),
-                    lexical: binding.lexical,
-                    captured: binding.captured,
-                    is_const: binding.is_const,
-                    fn_self_name: binding.fn_self_name,
-                });
-                sources.push(CallerCellSource::Upvalue(binding.upvalue));
+                let name = binding.name.to_string();
+                by_name.insert(
+                    name.clone(),
+                    (
+                        EvalCallerBinding {
+                            name,
+                            lexical: binding.lexical,
+                            captured: binding.captured,
+                            is_const: binding.is_const,
+                            fn_self_name: binding.fn_self_name,
+                        },
+                        CallerCellSource::Upvalue(binding.upvalue),
+                    ),
+                );
             }
         }
-        if let Some(eval_vars) = self
-            .frame_cold(frame)
-            .and_then(|cold| cold.eval_vars.as_deref())
-        {
-            // Deterministic order for the compiled chunk's slot
-            // layout — the map itself is hash-ordered.
-            let mut names: Vec<&String> = eval_vars.keys().collect();
-            names.sort();
-            for name in names {
-                scope.push(EvalCallerBinding {
-                    name: name.clone(),
-                    lexical: false,
-                    captured: false,
-                    is_const: false,
-                    fn_self_name: false,
-                });
-                sources.push(CallerCellSource::EvalVar(name.clone()));
+        if let Some(env) = (!frame.eval_env.is_null()).then_some(frame.eval_env) {
+            for snapshot in crate::eval_env::eval_env_snapshot_chain(&self.gc_heap, env) {
+                debug_assert_eq!(snapshot.current, snapshot.depth == 0);
+                // A current static binding is already the authoritative cell
+                // for this variable environment. A dynamic record does,
+                // however, shadow a passthrough capture from an outer static
+                // scope (the reason LoadShadowedUpvalue exists).
+                let replace = match by_name.get(&snapshot.name) {
+                    Some((binding, _)) => binding.captured,
+                    None => true,
+                };
+                if replace {
+                    let name = snapshot.name;
+                    by_name.insert(
+                        name.clone(),
+                        (
+                            EvalCallerBinding {
+                                name: name.clone(),
+                                lexical: false,
+                                captured: !snapshot.current,
+                                is_const: false,
+                                fn_self_name: false,
+                            },
+                            CallerCellSource::EvalEnv(name),
+                        ),
+                    );
+                }
             }
         }
-        (scope, sources)
+        by_name.into_values().unzip()
     }
 
     /// Execute a direct eval whose caller variable environment is a
     /// function environment (§19.2.1.1 PerformEval with
     /// `direct = true`). The compiled chunk's leading upvalue slots
     /// alias the caller's binding cells; new var-scoped bindings the
-    /// body introduces are adopted into the caller frame's
-    /// eval-binding map before the body runs (hoisting), and `this`
-    /// is inherited from the caller.
+    /// body introduces are adopted into the current eval-environment record
+    /// before the body runs (hoisting), and `this` is inherited from the
+    /// caller. Sloppy eval reuses the caller record; strict eval executes with
+    /// a fresh child record and never leaks its declarations into the caller.
     fn run_direct_eval(
         &mut self,
         value: &Value,
@@ -230,6 +250,22 @@ impl Interpreter {
             return Ok(*value);
         };
         let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
+        let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        // Normal call entry creates this record for every function containing a
+        // direct-eval site. Keep a fallback for synthetic/test entry frames so
+        // the direct-eval boundary itself still establishes one sole authority.
+        if stack[top_idx].eval_env.is_null() {
+            let mut frame_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                stack[top_idx].trace_frame_slots(visitor);
+            };
+            let env = crate::eval_env::alloc_eval_env_with_roots(
+                &mut self.gc_heap,
+                None,
+                &mut frame_roots,
+            )
+            .map_err(crate::oom_to_vm)?;
+            stack[top_idx].eval_env = env;
+        }
         // §19.2.1.3 — only the caller's OWN variable-environment
         // names block adoption; a passthrough CAPTURE of the same
         // name still receives a fresh caller binding.
@@ -244,19 +280,45 @@ impl Interpreter {
         let module = self.compile_escaped_source(&source, options)?;
         let context = self.link_module(module);
         let main = context.exec_main();
-        let mut upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
+        // A strict direct eval owns a private current record whose parent is
+        // the caller record. Root that unpublished handle while the fresh
+        // upvalue spine allocates; sloppy eval simply reuses the traced caller
+        // record and re-reads it after allocation.
+        let mut strict_eval_env = if main.is_strict {
+            let parent = (!stack[top_idx].eval_env.is_null()).then_some(stack[top_idx].eval_env);
+            let mut frame_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                stack[top_idx].trace_frame_slots(visitor);
+            };
+            Some(
+                crate::eval_env::alloc_eval_env_with_roots(
+                    &mut self.gc_heap,
+                    parent,
+                    &mut frame_roots,
+                )
+                .map_err(crate::oom_to_vm)?,
+            )
+        } else {
+            None
+        };
+        let mut env_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            if let Some(env) = &mut strict_eval_env {
+                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut otter_gc::raw::RawGc);
+            }
+        };
+        let mut upvalues = Frame::build_upvalues_for_exec_with_roots(
+            &mut self.gc_heap,
+            main,
+            Frame::empty_upvalues(),
+            &mut env_roots,
+        )?;
         // Splice the caller's cells into the reserved leading slots
         // and adopt the chunk's new var-binding cells into the caller
         // frame. No GC allocation happens from here until the spine
         // is rooted on the entry frame — the cells read below are
         // only current while nothing moves the heap.
-        let top_idx = stack.len() - 1;
         {
             let caller = &stack[top_idx];
-            let cold_eval_vars = self
-                .frame_cold(caller)
-                .and_then(|cold| cold.eval_vars.as_deref());
+            let caller_env = (!caller.eval_env.is_null()).then_some(caller.eval_env);
             for (i, cell_source) in cell_sources.iter().enumerate() {
                 let cell = match cell_source {
                     CallerCellSource::Upvalue(idx) => caller
@@ -264,9 +326,10 @@ impl Interpreter {
                         .get(*idx as usize)
                         .copied()
                         .ok_or(VmError::InvalidOperand)?,
-                    CallerCellSource::EvalVar(name) => cold_eval_vars
-                        .and_then(|map| map.get(name))
-                        .copied()
+                    CallerCellSource::EvalEnv(name) => caller_env
+                        .and_then(|env| {
+                            crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, name)
+                        })
                         .ok_or(VmError::InvalidOperand)?,
                 };
                 *upvalues.get_mut(i).ok_or(VmError::InvalidOperand)? = cell;
@@ -299,39 +362,28 @@ impl Interpreter {
             self.frame_cold(&stack[top_idx])
                 .and_then(|cold| cold.new_target)
         };
-        if !adopted.is_empty() {
-            // §9.1 — adopted bindings land in BOTH stores: the
-            // legacy per-frame map (same-frame dynamic reads) and
-            // the GC-owned eval environment record that closures
-            // created in this frame capture (cross-closure and
-            // outlives-the-frame visibility).
-            let env = self
-                .frame_cold(&stack[top_idx])
-                .and_then(|cold| cold.eval_env);
-            let env = match env {
-                Some(env) => Some(env),
-                None => {
-                    let fresh = crate::eval_env::alloc_eval_env(&mut self.gc_heap, None)
-                        .map_err(crate::oom_to_vm)?;
-                    self.frame_ensure_cold(&mut stack[top_idx]).eval_env = Some(fresh);
-                    Some(fresh)
-                }
-            };
-            for (name, cell) in adopted {
-                {
-                    let cold = self.frame_ensure_cold(&mut stack[top_idx]);
-                    let map = cold.eval_vars.get_or_insert_default();
-                    map.insert(name.clone(), cell);
-                }
-                if let Some(env) = env {
-                    crate::eval_env::eval_env_insert(&mut self.gc_heap, env, name, cell);
-                }
+        let entry_eval_env = strict_eval_env
+            .or_else(|| (!stack[top_idx].eval_env.is_null()).then_some(stack[top_idx].eval_env))
+            .ok_or(VmError::InvalidOperand)?;
+        // §19.2.1.3 step 16.b — insert each newly hoisted binding exactly
+        // once into the current variable-environment record. Sloppy eval uses
+        // the caller's current record; strict eval uses its fresh private
+        // child, so an adopted binding can never leak across that boundary.
+        for (name, cell) in adopted {
+            if !crate::eval_env::eval_env_insert_current(
+                &mut self.gc_heap,
+                entry_eval_env,
+                name,
+                cell,
+            ) {
+                return Err(VmError::InvalidOperand);
             }
         }
         let main = context.exec_main();
         let window = self.alloc_reg_window(main.register_count as usize)?;
         let mut entry =
             Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
+        entry.eval_env = entry_eval_env;
         if caller_new_target.is_some() {
             self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
         }

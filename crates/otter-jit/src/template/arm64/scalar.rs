@@ -1,34 +1,60 @@
 //! Scalar value-query/coercion transition emission.
 //!
 //! # Contents
+//! - Prepared address-stable string-cell leaf loads.
 //! - Native guarded fast paths for string length, array length, and
 //!   `Array.isArray`.
-//! - Reentrant fallback to the VM-owned typed scalar boundary.
-//! - Uniform success, throw, and exact pre-effect bailout routing.
+//! - Fixed boxed-value fallback to the VM-owned typed scalar boundary.
+//! - Normal-result commit and rooted JavaScript-throw routing.
 //!
 //! # Invariants
 //! - Native hits only inspect guarded tags and VM-owned length fields, never
 //!   allocate, and commit the destination after every guard succeeds.
 //! - Proxy, realm-identity, wide-length, and wrong-type cases retain the exact
 //!   VM helper semantics through the shared fallback.
-//! - The VM helper commits every supported scalar opcode before returning
-//!   success, so generated code only falls through once.
-//! - A missing published activation is the sole bailout case and occurs before
-//!   any observable coercion hook or wrapper allocation.
+//! - The VM decodes the authoritative operation from function/PC; no opcode,
+//!   destination, or register index crosses the ABI.
+//! - Once semantic entry begins, the VM returns `Ok(value)` or
+//!   `Throw(exception)`. Pre-entry `Fatal` bypasses local JS handlers.
 //!
 //! # See also
-//! - `otter_vm::RuntimeCall::scalar_op`
+//! - `otter_vm::RuntimeCall::scalar_values`
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, native_abi as abi};
 
 use super::values::{
-    CellTest, emit_box_int32, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_u64,
-    emit_store_reg,
+    CellTest, emit_box_int32, emit_cell_test, emit_load_reg, emit_load_runtime_stub,
+    emit_load_symbol_u64, emit_load_u64, emit_store_reg,
 };
-use crate::artifact::relocation::RelocationCapture;
-use crate::entry::{STATUS_BAILED, STATUS_THREW, Unsupported, VALUE_FALSE, VALUE_TRUE};
+use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
+use crate::entry::{Unsupported, VALUE_FALSE, VALUE_TRUE, VALUE_UNDEFINED};
+
+/// Load one eagerly prepared primitive-string literal through its traced cell.
+pub(super) fn emit_string_constant(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    result: u16,
+) -> Result<(), Unsupported> {
+    let target = view
+        .string_constant_cells
+        .get(&byte_pc)
+        .ok_or(Unsupported::OperandShape("prepared LoadString stable cell"))?;
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        target.cell_addr as u64,
+        RelocationTarget::StringConstantCell {
+            function_id: view.code_block.id,
+            byte_pc,
+        },
+    );
+    dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
+    emit_store_reg(ops, 9, result)
+}
 
 /// Decompress one heap-cell value into `x13`.
 ///
@@ -139,59 +165,64 @@ fn emit_is_array_fast(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_scalar_op(
+pub(super) fn emit_scalar_value(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
-    opcode: u8,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
+    operation: otter_vm::ScalarValueOp,
+    result: u16,
+    value0: Option<u16>,
+    value1: Option<u16>,
+    committed_throw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     if view.cage_base != 0 {
-        let dst = arg0 as u16;
-        let src = arg1 as u16;
-        match opcode {
-            value if value == Op::LoadLength as u8 => {
-                emit_load_length_fast(ops, view, dst, src, slow, done)?;
+        match (operation, value0) {
+            (otter_vm::ScalarValueOp::LoadLength, Some(src)) => {
+                emit_load_length_fast(ops, view, result, src, slow, done)?;
             }
-            value if value == Op::ArrayLength as u8 => {
-                emit_array_length_fast(ops, view, dst, src, slow, done)?;
+            (otter_vm::ScalarValueOp::ArrayLength, Some(src)) => {
+                emit_array_length_fast(ops, view, result, src, slow, done)?;
             }
-            value if value == Op::IsArray as u8 => {
-                emit_is_array_fast(ops, view, dst, src, slow, done)?;
+            (otter_vm::ScalarValueOp::IsArray, Some(src)) => {
+                emit_is_array_fast(ops, view, result, src, slow, done)?;
             }
             _ => {}
         }
     }
     dynasm!(ops ; .arch aarch64 ; =>slow ; mov x0, x20);
-    emit_load_u64(ops, 1, u64::from(opcode));
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 3, arg1);
-    emit_load_u64(ops, 4, arg2);
+    if let Some(value0) = value0 {
+        emit_load_reg(ops, 1, value0)?;
+    } else {
+        emit_load_u64(ops, 1, VALUE_UNDEFINED);
+    }
+    if let Some(value1) = value1 {
+        emit_load_reg(ops, 2, value1)?;
+    } else {
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
+    }
     emit_load_runtime_stub(
         ops,
         relocations,
         16,
-        transitions.variadic_entry(abi::STUB_JIT_SCALAR_OP),
-        abi::STUB_JIT_SCALAR_OP,
+        transitions.entry(abi::STUB_JIT_SCALAR_VALUE),
+        abi::STUB_JIT_SCALAR_VALUE,
     );
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cbz x0, =>done
-        ; cmp x0, STATUS_BAILED as u32
-        ; b.eq =>bail
-        ; cmp x0, STATUS_THREW as u32
-        ; b.eq =>threw
-        ; b =>threw
-        ; =>done
+        ; mov x15, x1
+        ; cbz x15, >normal
+        ; cmp x15, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>committed_throw
+        ; b =>fatal
+        ; normal:
     );
+    emit_store_reg(ops, 0, result)?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 

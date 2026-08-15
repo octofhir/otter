@@ -169,7 +169,6 @@ pub(super) fn emit_binary_arith(
             dynasm!(ops
                 ; .arch aarch64
                 ; blr x16
-                ; and x1, x1, #0xff
                 ; cbnz x1, =>slow
                 ; mov x13, x0
             );
@@ -280,6 +279,7 @@ pub(super) fn emit_add_generic(
     rhs: u16,
     concat_safepoint: otter_vm::SafepointId,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
@@ -319,123 +319,9 @@ pub(super) fn emit_add_generic(
         done,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>delegate_path);
-    emit_add_delegate(ops, relocations, table, dst, lhs, rhs, threw);
+    emit_add_delegate(ops, relocations, table, dst, lhs, rhs, threw, fatal);
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
-}
-
-/// Emit a comparison producing a boolean.
-///
-/// Both operands int32 → signed integer compare. Otherwise the double path
-/// decodes and `fcmp`s with FP condition codes, so an unordered (NaN) compare
-/// yields the ECMAScript result (every relational compare false, `!=` true).
-/// Total strict (in)equality over two tagged values in `x9`/`x10`, leaving the
-/// 0/1 answer in `w13`. Numbers compare numerically (int32 fast path, doubles
-/// via `fcmp`), non-number immediates by raw bit identity, heap cells by
-/// reference identity with distinct cells completing content equality through
-/// the leaf probe. `bail` fires only on the probe's null-heap miss.
-pub(crate) fn emit_strict_eq_tagged(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    negate: bool,
-    bail: DynamicLabel,
-) {
-    let kind = if negate {
-        CompareKind::Ne
-    } else {
-        CompareKind::Eq
-    };
-    let float_path = ops.new_dynamic_label();
-    let have_bool = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x15, NUMBER_TAG_HI16, lsl #48
-        ; and x14, x9, x15
-        ; cmp x14, x15
-        ; b.ne =>float_path
-        ; and x14, x10, x15
-        ; cmp x14, x15
-        ; b.ne =>float_path
-        ; cmp w9, w10
-    );
-    emit_cset(ops, kind, IntCondition);
-    dynasm!(ops ; .arch aarch64 ; b =>have_bool ; =>float_path);
-    {
-        let lhs_non_number = ops.new_dynamic_label();
-        let number_path = ops.new_dynamic_label();
-        let strict_false = ops.new_dynamic_label();
-        let cell_path = ops.new_dynamic_label();
-        let leaf_call = ops.new_dynamic_label();
-        dynasm!(ops
-            ; .arch aarch64
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; tst x9, x11
-            ; b.eq =>lhs_non_number
-            ; tst x10, x11
-            ; b.eq =>strict_false
-            ; b =>number_path
-            ; =>lhs_non_number
-            ; tst x10, x11
-            ; b.ne =>strict_false
-            ; orr x11, x11, #0x2
-            ; tst x9, x11
-            ; b.eq =>cell_path
-            ; tst x10, x11
-            ; b.eq =>cell_path
-            ; cmp x9, x10
-        );
-        emit_cset(ops, kind, IntCondition);
-        dynasm!(ops
-            ; .arch aarch64
-            ; b =>have_bool
-            ; =>cell_path
-            ; cmp x9, x10
-            ; b.ne =>leaf_call
-        );
-        emit_cset(ops, kind, IntCondition);
-        dynasm!(ops
-            ; .arch aarch64
-            ; b =>have_bool
-            ; =>leaf_call
-            ; ldr x0, [x20, THREAD_OFFSET]
-            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-            ; mov x1, x9
-            ; mov x2, x10
-        );
-        emit_load_runtime_stub(
-            ops,
-            relocations,
-            16,
-            otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
-            abi::STUB_STRICT_EQ_LEAF,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; and x1, x1, #0xff
-            ; cbnz x1, =>bail
-        );
-        emit_load_u64(ops, 11, VALUE_TRUE);
-        dynasm!(ops ; .arch aarch64 ; cmp x0, x11);
-        emit_cset(ops, kind, IntCondition);
-        let false_value = match kind {
-            CompareKind::Eq => 0,
-            _ => 1,
-        };
-        dynasm!(ops
-            ; .arch aarch64
-            ; b =>have_bool
-            ; =>strict_false
-            ; movz w13, false_value
-            ; b =>have_bool
-            ; =>number_path
-        );
-    }
-    emit_num_to_double(ops, 9, 0, bail);
-    emit_num_to_double(ops, 10, 1, bail);
-    dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
-    emit_cset(ops, kind, FloatCondition);
-    dynasm!(ops ; .arch aarch64 ; =>have_bool);
 }
 
 /// Strict (in)equality additionally decides non-number immediates by raw bit
@@ -562,7 +448,6 @@ pub(super) fn emit_compare(
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
-            ; and x1, x1, #0xff
             ; cbnz x1, =>bail
         );
         emit_load_u64(ops, 11, VALUE_TRUE);
@@ -648,6 +533,7 @@ pub(super) fn emit_loose_compare(
     negate: bool,
     bail: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
@@ -734,15 +620,9 @@ pub(super) fn emit_loose_compare(
         table.entry(abi::STUB_JIT_LOOSE_EQ),
         abi::STUB_JIT_LOOSE_EQ,
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>bail
-        ; =>done
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    super::transitions::emit_status_word_result(ops, Some(bail), threw, fatal);
+    dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 
@@ -1006,8 +886,8 @@ pub(super) fn emit_numeric_slow_paths(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     slow_paths: Vec<NumericSlowPath>,
-    bail: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     let entry = table.entry(abi::STUB_JIT_NUMERIC_OP);
     for path in slow_paths {
@@ -1029,15 +909,9 @@ pub(super) fn emit_numeric_slow_paths(
         emit_load_u64(ops, 3, rhs_or_delta);
         emit_load_u64(ops, 4, u64::from(opcode as u8));
         emit_load_runtime_stub(ops, relocations, 16, entry, abi::STUB_JIT_NUMERIC_OP);
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x0, #1
-            ; b.eq =>threw
-            ; cmp x0, #2
-            ; b.eq =>bail
-            ; b =>resume
-        );
+        dynasm!(ops ; .arch aarch64 ; blr x16);
+        super::transitions::emit_status_word_result(ops, None, threw, fatal);
+        dynasm!(ops ; .arch aarch64 ; b =>resume);
     }
 }
 
@@ -1050,6 +924,7 @@ pub(super) fn emit_coercion_slow_paths(
     table: &TransitionTable,
     slow_paths: Vec<CoercionSlowPath>,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     let entry = table.entry(abi::STUB_JIT_COERCE_UNARY);
     for path in slow_paths {
@@ -1071,12 +946,8 @@ pub(super) fn emit_coercion_slow_paths(
         );
         emit_load_u64(ops, 4, u64::from(hint));
         emit_load_runtime_stub(ops, relocations, 16, entry, abi::STUB_JIT_COERCE_UNARY);
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x0, #1
-            ; b.eq =>threw
-            ; b =>resume
-        );
+        dynasm!(ops ; .arch aarch64 ; blr x16);
+        super::transitions::emit_status_word_result(ops, None, threw, fatal);
+        dynasm!(ops ; .arch aarch64 ; b =>resume);
     }
 }

@@ -13,12 +13,11 @@
 //! # See also
 //! - `otter_vm::Interpreter::jit_runtime_bind_function`
 
-use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use dynasmrt::{DynamicLabel, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
 use super::values::{emit_load_runtime_stub, emit_load_u64};
 use crate::artifact::relocation::RelocationCapture;
-use crate::entry::{STATUS_BAILED, STATUS_THREW};
 
 /// Emit `Op::BindFunction`. `packed_meta` is `dst | callee<<16 | this<<32 |
 /// argc<<48`; `packed_args` holds the bound-argument registers, one per lane.
@@ -30,8 +29,8 @@ pub(super) fn emit_bind_function(
     packed_args: u64,
     bail: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
-    let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
     emit_load_u64(ops, 1, packed_meta);
     emit_load_u64(ops, 2, packed_args);
@@ -42,15 +41,6 @@ pub(super) fn emit_bind_function(
         transitions.variadic_entry(abi::STUB_JIT_BIND_FUNCTION),
         abi::STUB_JIT_BIND_FUNCTION,
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbz x0, =>done
-        ; cmp x0, STATUS_BAILED as u32
-        ; b.eq =>bail
-        ; cmp x0, STATUS_THREW as u32
-        ; b.eq =>threw
-        ; b =>threw
-        ; =>done
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    super::transitions::emit_status_word_result(ops, Some(bail), threw, fatal);
 }

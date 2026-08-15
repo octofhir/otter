@@ -20,7 +20,8 @@
 use otter_bytecode::{Op, Operand};
 
 use crate::{
-    ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack, read_register,
+    ActiveFrameMut, ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack,
+    read_register,
 };
 
 impl Interpreter {
@@ -28,11 +29,12 @@ impl Interpreter {
     /// `DeleteProperty` `arg1`/`arg2` are the object register and constant name
     /// index; for `DeleteElement` they are the object and key registers; for
     /// `DeleteDynamic` `arg1` is the constant name index.
-    pub fn jit_runtime_delete_op(
+    pub(crate) fn jit_runtime_delete_op(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         opcode: u8,
         arg0: u64,
         arg1: u64,
@@ -43,6 +45,7 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         let saved_pc = stack[frame_index].pc;
+        let saved_native_pc = frame.pc();
         let dst = arg0 as u16;
         let strict = context.function_is_strict(stack[frame_index].function_id);
         match opcode {
@@ -108,11 +111,12 @@ impl Interpreter {
                 }
             }
             value if value == Op::DeleteDynamic as u8 => {
-                self.run_delete_dynamic_reg(context, &mut stack[frame_index], dst, arg1 as u32)?;
+                self.run_delete_dynamic_active_reg(context, frame, dst, arg1 as u32)?;
             }
             _ => return Err(VmError::InvalidOperand),
         }
         stack[frame_index].pc = saved_pc;
+        frame.set_pc(saved_native_pc);
         Ok(())
     }
 }

@@ -36,11 +36,6 @@ pub enum ClassRuntimeOp {
         /// Optional heritage value register.
         parent: Option<u16>,
     },
-    /// Bind the value in `source` as a derived constructor's `this`.
-    BindThis {
-        /// Source register containing the completed `super()` result.
-        source: u16,
-    },
     /// Validate a heritage value or computed static key.
     Check {
         /// Register containing the value to validate.
@@ -156,7 +151,6 @@ impl RuntimeCall<'_> {
                 }
                 Ok(())
             }
-            ClassRuntimeOp::BindThis { source } => self.bind_derived_this_value(self.read(source)?),
             ClassRuntimeOp::Check { register, kind } => {
                 let value = self.read(register)?;
                 if kind == 0 {

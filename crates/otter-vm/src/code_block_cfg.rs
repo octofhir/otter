@@ -5,6 +5,8 @@
 //!   exception-region tables built from verified schema wordcode.
 //! - [`CodeBlockExceptionRegion`] — resolved handler PCs for one `EnterTry`.
 //! - [`CodeBlockControlFlowView`] — borrowed read-only access for JIT consumers.
+//! - [`ActiveCatchRegions`] — exact runtime handler-stack reconstruction for
+//!   catch-only regions.
 //!
 //! # Invariants
 //! - Every PC is a canonical instruction index, never a serialized byte PC.
@@ -12,6 +14,9 @@
 //!   lowering do not reinterpret relative branch or handler operands.
 //! - Tables are sorted and duplicate-free. Exception regions are keyed by the
 //!   `EnterTry` instruction PC and end at the matching `LeaveTry` PC.
+//! - Static handler reconstruction supports catch-only regions. A `finally` or
+//!   catchless active region is rejected instead of manufacturing incomplete
+//!   completion state.
 //!
 //! # See also
 //! - [`crate::CodeBlock`]
@@ -29,7 +34,9 @@ use otter_bytecode::{
 pub struct CodeBlockExceptionRegion {
     /// PC of the `EnterTry` instruction owning this region.
     pub enter_pc: u32,
-    /// Exclusive end of the protected body: the matching `LeaveTry` PC.
+    /// PC of the matching `LeaveTry`. The protected body ends before this
+    /// instruction, but a frame resuming *at* this PC still owns the handler:
+    /// executing `LeaveTry` is what removes it from the runtime stack.
     pub end_pc: u32,
     /// Catch entry PC, absent for `try/finally` without a catch.
     pub catch_pc: Option<u32>,
@@ -37,6 +44,46 @@ pub struct CodeBlockExceptionRegion {
     pub finally_pc: Option<u32>,
     /// Register receiving the thrown value at the catch entry.
     pub exception_register: u16,
+}
+
+/// Why an exact resume PC cannot be reconstructed from static catch metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveCatchRegionError {
+    /// The active region owns a `finally` continuation. Reconstructing it also
+    /// needs the dynamic completion stack, which exact catch-only deopt does
+    /// not synthesize.
+    Finally {
+        /// PC of the `EnterTry` owning the unsupported region.
+        enter_pc: u32,
+    },
+    /// The active region has no catch target. Such a region is necessarily a
+    /// catchless completion handler and cannot be represented as a catch-only
+    /// [`crate::TryHandler`] stack entry.
+    Catchless {
+        /// PC of the `EnterTry` owning the unsupported region.
+        enter_pc: u32,
+    },
+}
+
+/// Outer-to-inner iterator over catch-only handlers active at one exact PC.
+///
+/// Construction validates every lexically active region before iteration, so
+/// consumers never observe a partial prefix followed by an unsupported
+/// `finally`/catchless region.
+#[derive(Debug, Clone)]
+pub struct ActiveCatchRegions<'a> {
+    regions: std::slice::Iter<'a, CodeBlockExceptionRegion>,
+    resume_pc: u32,
+}
+
+impl Iterator for ActiveCatchRegions<'_> {
+    type Item = CodeBlockExceptionRegion;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.regions
+            .find(|region| region_is_active_at(region, self.resume_pc))
+            .copied()
+    }
 }
 
 /// Borrowed access to one CodeBlock's immutable logical control-flow tables.
@@ -84,6 +131,20 @@ impl<'a> CodeBlockControlFlowView<'a> {
     #[must_use]
     pub fn enclosing_exception_region(self, pc: u32) -> Option<CodeBlockExceptionRegion> {
         self.control_flow.enclosing_exception_region(pc)
+    }
+
+    /// Catch-only handler stack active immediately before `resume_pc` runs.
+    ///
+    /// Results are ordered outermost to innermost, matching runtime push
+    /// order. `EnterTry` itself is excluded because it has not executed yet;
+    /// its matching `LeaveTry` is included because that instruction has not
+    /// popped the handler yet. PCs after `LeaveTry`, including the catch body,
+    /// exclude the region.
+    pub fn active_catch_regions(
+        self,
+        resume_pc: u32,
+    ) -> Result<ActiveCatchRegions<'a>, ActiveCatchRegionError> {
+        self.control_flow.active_catch_regions(resume_pc)
     }
 }
 
@@ -213,6 +274,37 @@ impl CodeBlockControlFlow {
             .copied()
             .find(|region| region.enter_pc < pc && pc < region.end_pc)
     }
+
+    fn active_catch_regions(
+        &self,
+        resume_pc: u32,
+    ) -> Result<ActiveCatchRegions<'_>, ActiveCatchRegionError> {
+        for region in self
+            .exception_regions
+            .iter()
+            .filter(|region| region_is_active_at(region, resume_pc))
+        {
+            if region.finally_pc.is_some() {
+                return Err(ActiveCatchRegionError::Finally {
+                    enter_pc: region.enter_pc,
+                });
+            }
+            if region.catch_pc.is_none() {
+                return Err(ActiveCatchRegionError::Catchless {
+                    enter_pc: region.enter_pc,
+                });
+            }
+        }
+        Ok(ActiveCatchRegions {
+            regions: self.exception_regions.iter(),
+            resume_pc,
+        })
+    }
+}
+
+#[inline]
+fn region_is_active_at(region: &CodeBlockExceptionRegion, resume_pc: u32) -> bool {
+    region.enter_pc < resume_pc && resume_pc <= region.end_pc
 }
 
 fn optional_exception_target(
@@ -333,5 +425,98 @@ mod tests {
         assert_eq!(cfg.enclosing_exception_region(2).unwrap().enter_pc, 1);
         assert_eq!(cfg.enclosing_exception_region(5).unwrap().enter_pc, 0);
         assert_eq!(cfg.enclosing_exception_region(6), None);
+    }
+
+    #[test]
+    fn reconstructs_nested_catch_handlers_at_exact_runtime_boundaries() {
+        let mut builder = FunctionCodeBuilder::new();
+        builder.push(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(9),
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Register(0),
+            ],
+        );
+        builder.push(Op::Nop, &[]);
+        builder.push(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(3),
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Register(1),
+            ],
+        );
+        builder.push(Op::Nop, &[]);
+        builder.push(Op::LeaveTry, &[]);
+        builder.push(Op::Jump, &[Operand::Imm32(1)]);
+        builder.push(Op::Nop, &[]); // inner catch body
+        builder.push(Op::Nop, &[]); // after inner try/catch, still in outer try
+        builder.push(Op::LeaveTry, &[]);
+        builder.push(Op::Jump, &[Operand::Imm32(1)]);
+        builder.push(Op::Nop, &[]); // outer catch body
+        builder.push(Op::ReturnUndefined, &[]);
+        let cfg = CodeBlockControlFlow::from_verified_wordcode(&builder.finish());
+
+        let enters = |pc| {
+            cfg.active_catch_regions(pc)
+                .expect("catch-only region")
+                .map(|region| region.enter_pc)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(enters(0), Vec::<u32>::new()); // outer EnterTry has not executed
+        assert_eq!(enters(1), &[0]);
+        assert_eq!(enters(2), &[0]); // inner EnterTry has not executed
+        assert_eq!(enters(3), &[0, 2]);
+        assert_eq!(enters(4), &[0, 2]); // inner LeaveTry has not executed
+        assert_eq!(enters(5), &[0]); // after inner LeaveTry
+        assert_eq!(enters(6), &[0]); // inner catch body excludes its handler
+        assert_eq!(enters(8), &[0]); // outer LeaveTry has not executed
+        assert_eq!(enters(9), Vec::<u32>::new()); // after outer LeaveTry
+        assert_eq!(enters(10), Vec::<u32>::new()); // outer catch body
+    }
+
+    #[test]
+    fn rejects_active_finally_and_catchless_regions_before_iteration() {
+        let mut finally_builder = FunctionCodeBuilder::new();
+        finally_builder.push(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Imm32(2),
+                Operand::Register(0),
+            ],
+        );
+        finally_builder.push(Op::Nop, &[]);
+        finally_builder.push(Op::LeaveTry, &[]);
+        finally_builder.push(Op::EndFinally, &[]);
+        let finally_cfg = CodeBlockControlFlow::from_verified_wordcode(&finally_builder.finish());
+        assert_eq!(
+            finally_cfg.active_catch_regions(1).unwrap_err(),
+            ActiveCatchRegionError::Finally { enter_pc: 0 }
+        );
+
+        // A malformed/catchless static region is rejected explicitly rather
+        // than yielding an incomplete handler. The verified compiler never
+        // emits this shape, but the control-flow API remains total for a
+        // hand-built FunctionCode fixture.
+        let mut catchless_builder = FunctionCodeBuilder::new();
+        catchless_builder.push(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Register(0),
+            ],
+        );
+        catchless_builder.push(Op::Nop, &[]);
+        catchless_builder.push(Op::LeaveTry, &[]);
+        let catchless_cfg =
+            CodeBlockControlFlow::from_verified_wordcode(&catchless_builder.finish());
+        assert_eq!(
+            catchless_cfg.active_catch_regions(1).unwrap_err(),
+            ActiveCatchRegionError::Catchless { enter_pc: 0 }
+        );
     }
 }

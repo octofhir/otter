@@ -1,4 +1,4 @@
-//! Interpreter inline-cache records for property bytecodes.
+//! Interpreter inline-cache records for named property loads and stores.
 //!
 //! This module keeps IC state out of the bytecode format. Caches are
 //! interpreter-local, keyed by compiled function id plus bytecode pc.
@@ -60,7 +60,7 @@ const PIC_GUARD_MISS_THRESHOLD: u8 = 4;
 /// re-probation per budget and returns here; a settled one re-caches and stays.
 const PIC_REPROBATION_MISSES: u16 = 1024;
 
-/// Aggregate inline-cache counters for named property bytecodes.
+/// Aggregate inline-cache counters for named property loads and stores.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PropertyIcStats {
     /// Guarded `LoadProperty` fast-path hits.
@@ -79,14 +79,6 @@ pub struct PropertyIcStats {
     pub store_installs: u64,
     /// `StoreProperty` sites disabled after repeated guard misses.
     pub store_disables: u64,
-    /// Guarded `HasProperty` fast-path hits.
-    pub has_hits: u64,
-    /// `HasProperty` ordinary object receivers that missed or had no IC entry.
-    pub has_misses: u64,
-    /// `HasProperty` IC entries installed or replaced.
-    pub has_installs: u64,
-    /// `HasProperty` sites disabled after repeated guard misses.
-    pub has_disables: u64,
 }
 
 /// Property opcode family for shared IC lifecycle accounting.
@@ -96,8 +88,6 @@ pub(crate) enum PropertyIcKind {
     Load,
     /// `StoreProperty` site.
     Store,
-    /// `HasProperty` site.
-    Has,
 }
 
 impl PropertyIcStats {
@@ -106,7 +96,6 @@ impl PropertyIcStats {
         match kind {
             PropertyIcKind::Load => self.load_hits += 1,
             PropertyIcKind::Store => self.store_hits += 1,
-            PropertyIcKind::Has => self.has_hits += 1,
         }
     }
 
@@ -115,7 +104,6 @@ impl PropertyIcStats {
         match kind {
             PropertyIcKind::Load => self.load_misses += 1,
             PropertyIcKind::Store => self.store_misses += 1,
-            PropertyIcKind::Has => self.has_misses += 1,
         }
     }
 
@@ -124,7 +112,6 @@ impl PropertyIcStats {
         match kind {
             PropertyIcKind::Load => self.load_installs += 1,
             PropertyIcKind::Store => self.store_installs += 1,
-            PropertyIcKind::Has => self.has_installs += 1,
         }
     }
 
@@ -133,7 +120,6 @@ impl PropertyIcStats {
         match kind {
             PropertyIcKind::Load => self.load_disables += 1,
             PropertyIcKind::Store => self.store_disables += 1,
-            PropertyIcKind::Has => self.has_disables += 1,
         }
     }
 }
@@ -221,6 +207,7 @@ impl<T> PropertyIcEntry<T> {
     }
 
     /// Permanently bypass this site for the interpreter lifetime.
+    #[cfg(test)]
     pub(crate) fn disable(&mut self) {
         *self = Self::Megamorphic { absorbed: 0 };
     }
@@ -295,6 +282,7 @@ impl<T> PropertyIcEntry<T> {
     }
 
     /// Disable this site and update counters if it was not already megamorphic.
+    #[cfg(test)]
     pub(crate) fn disable_with_stats(&mut self, stats: &mut PropertyIcStats, kind: PropertyIcKind) {
         if !self.is_megamorphic() {
             self.disable();
@@ -316,9 +304,9 @@ impl PropertyIcEntry<crate::cache_ir::CacheStub> {
 #[cfg(test)]
 mod tests {
     use super::{PropertyIcEntry, PropertyIcKind, PropertyIcStats};
+    use crate::Value;
     use crate::object::{self, PropertyDescriptor};
     use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
-    use crate::{JsString, Value};
 
     fn fresh_heap() -> otter_gc::GcHeap {
         otter_gc::GcHeap::new().expect("init heap")
@@ -438,23 +426,6 @@ mod tests {
         assert!(object::delete(proto, &mut heap, "y"));
 
         assert_eq!(ic.run_load(receiver, &heap, key("x")), None);
-    }
-
-    #[test]
-    fn direct_prototype_has_ic_rejects_dictionary_compatible_prototype() {
-        let mut heap = fresh_heap();
-        let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
-        object::set(&mut proto, &mut heap, "y", Value::null());
-        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(receiver, &mut heap, Some(proto));
-        let key_string = JsString::from_str("x", &mut heap).expect("string");
-        let ic =
-            crate::cache_ir::CacheStub::install_has(receiver, &heap, key_string).expect("has ic");
-
-        assert!(object::delete(proto, &mut heap, "y"));
-
-        assert_eq!(ic.run_has(receiver, &heap, key_string), None);
     }
 
     #[test]

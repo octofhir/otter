@@ -42,7 +42,6 @@ pub(crate) struct FeedbackDirectory {
     method_targets: Vec<Option<MethodCallFeedback>>,
     load_ics: Vec<ExecutablePropertyIc>,
     store_ics: Vec<ExecutablePropertyIc>,
-    has_ics: Vec<ExecutablePropertyIc>,
     method_ics: Vec<Option<MethodCallIc>>,
     property_stats: PropertyIcStats,
     /// Chunks whose slot addresses are already installed. A chunk's sites are
@@ -78,9 +77,6 @@ impl FeedbackDirectory {
         if self.store_ics.len() < site_count {
             self.store_ics.resize(site_count, PropertyIcEntry::Empty);
         }
-        if self.has_ics.len() < site_count {
-            self.has_ics.resize(site_count, PropertyIcEntry::Empty);
-        }
         if self.method_ics.len() < site_count {
             self.method_ics.resize(site_count, None);
         }
@@ -99,7 +95,6 @@ impl FeedbackDirectory {
         match kind {
             PropertyIcKind::Load => &self.load_ics,
             PropertyIcKind::Store => &self.store_ics,
-            PropertyIcKind::Has => &self.has_ics,
         }
     }
 
@@ -110,7 +105,6 @@ impl FeedbackDirectory {
         match kind {
             PropertyIcKind::Load => (&mut self.load_ics, &mut self.property_stats),
             PropertyIcKind::Store => (&mut self.store_ics, &mut self.property_stats),
-            PropertyIcKind::Has => (&mut self.has_ics, &mut self.property_stats),
         }
     }
 
@@ -153,22 +147,6 @@ impl FeedbackDirectory {
                 stubs
                     .iter()
                     .any(|stub| stub.run_store(obj, heap, key, value).is_some())
-            })
-    }
-
-    /// Probe a named `in` site and return whether an installed recipe matched.
-    pub(crate) fn probe_has(
-        &self,
-        site: usize,
-        obj: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-        key: crate::JsString,
-    ) -> bool {
-        self.property_stubs(site, PropertyIcKind::Has)
-            .is_some_and(|stubs| {
-                stubs
-                    .iter()
-                    .any(|stub| stub.run_has(obj, heap, key).is_some())
             })
     }
 
@@ -289,13 +267,6 @@ impl FeedbackDirectory {
         }
     }
 
-    pub(crate) fn disable_property(&mut self, site: usize, kind: PropertyIcKind) {
-        let (bank, stats) = self.property_bank_with_stats_mut(kind);
-        if let Some(entry) = bank.get_mut(site) {
-            entry.disable_with_stats(stats, kind);
-        }
-    }
-
     #[must_use]
     pub(crate) const fn property_stats(&self) -> PropertyIcStats {
         self.property_stats
@@ -375,8 +346,7 @@ impl FeedbackDirectory {
 
     #[must_use]
     pub(crate) fn ic_snapshot(&self) -> Vec<crate::inspect::IcSiteSnapshot> {
-        let mut out =
-            Vec::with_capacity(self.load_ics.len() + self.store_ics.len() + self.has_ics.len());
+        let mut out = Vec::with_capacity(self.load_ics.len() + self.store_ics.len());
         for (index, entry) in self.load_ics.iter().enumerate() {
             out.push(crate::inspect::IcSiteSnapshot {
                 site_index: index as u32,
@@ -389,13 +359,6 @@ impl FeedbackDirectory {
                 site_index: index as u32,
                 kind: crate::inspect::IcSiteKind::Store,
                 state: crate::inspect::snapshot_store_state(entry),
-            });
-        }
-        for (index, entry) in self.has_ics.iter().enumerate() {
-            out.push(crate::inspect::IcSiteSnapshot {
-                site_index: index as u32,
-                kind: crate::inspect::IcSiteKind::Has,
-                state: crate::inspect::snapshot_has_state(entry),
             });
         }
         out
@@ -623,7 +586,6 @@ impl Interpreter {
             let kind = match instruction.op(&view.code_block) {
                 otter_bytecode::Op::LoadProperty => crate::property_ic::PropertyIcKind::Load,
                 otter_bytecode::Op::StoreProperty => crate::property_ic::PropertyIcKind::Store,
-                otter_bytecode::Op::HasProperty => crate::property_ic::PropertyIcKind::Has,
                 _ => continue,
             };
             if let Some(site) = instruction.property_ic_site(&view.code_block) {

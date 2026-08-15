@@ -52,9 +52,9 @@ It already owns:
   one VM-owned `AllocValue3` boundary shared by template and Machine code. The
   safepoint roots the complete generated frame plus allocator spill area; a
   tag, sign, or allocation-status miss resumes the original opcode before any
-  constructor effect. Wider arities retain the canonical variadic path. The
-  legacy optimizing construct cost model also retains the compact canonical
-  call boundary for parameter-free three-register callees, reporting the exact
+  constructor effect. Wider arities retain the canonical variadic path. When
+  Machine declines a compact construct plan for code-size or profitability
+  reasons, the function remains on Template and reports the exact
   `unprofitable` lowering reason instead of a fake layout failure;
 - guarded dense indexed-element and complete miss-capable named-property loads
   and stores in Machine IR. Property operations consume immutable settled
@@ -65,9 +65,10 @@ It already owns:
   first mutation. This first transition program covers null prototypes and a
   fast direct terminal prototype; the dictionary-backed bootstrap
   `%Object.prototype%` remains on the canonical store boundary. Success or
-  throw commits exactly once without deopt replay, while local-catch sites
-  remain on the materialized backend pending an explicit committed-throw
-  landing. Ordinary arrays use Empty, holey-double,
+  throw commits exactly once without deopt replay. Local-catch sites remain on
+  Template until the property fast probe and committed cold call are explicit
+  Machine CFG before register allocation; the boundary already returns a pure
+  exception value. Ordinary arrays use Empty, holey-double,
   packed-double, and terminal tagged physical storage; Machine IR consumes only
   an immutable packed-double snapshot with exact receiver, exotic-state, and
   storage-kind guards. Packed loads produce Float64 and packed stores consume
@@ -83,8 +84,10 @@ It already owns:
   byte length before either a load or a store. Missing or incompatible direct
   element metadata stays within the Machine function through one fixed
   boxed-value reentrant call with precise roots and effect-once success/throw
-  semantics; generic element operations inside local catches remain on the
-  materialized backend pending a committed-throw landing path;
+  semantics. Generic element operations inside local catches remain on
+  Template until their fast probe and committed cold call are explicit Machine
+  CFG before register allocation; the boundary already returns a pure
+  exception value;
 - loop-scoped packed-double view caching in scalar Machine IR. The planner
   selects only innermost reducible loops with an invariant receiver and no
   allocation, reentry, or representation-changing effect. A bounded untraced
@@ -122,7 +125,7 @@ It already owns:
   guard miss deoptimizes before lookup or call effects. A call opcode that has
   never executed may remain in an otherwise native body as a zero-effect cold
   exit; the first real attempt invalidates that body, while attempted sites
-  without a complete plan still select the legacy fallback;
+  without a complete Machine plan keep the function on Template;
 - allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
   fixed leaf ABI operands, and deterministic normalized allocation artifacts;
 - `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
@@ -232,10 +235,12 @@ It already owns:
   reductions/runtime-stub counts, and zero deopts. Native code grew by 120, 60,
   and 132 bytes respectively;
 - primitive string constants now live in address-stable boxed cache cells.
-  Compile snapshots publish only already-materialized traced cells; template
-  and optimizing code read the live `Value` directly, while cold literals keep
-  the canonical transition. Optimized `LoadString` no longer materializes a
-  frame or safepoint, and loop method caches may cross the pure cell read. A
+  Compile preparation eagerly materializes every cold literal under active
+  frame roots before taking a snapshot; failure declines optional compilation
+  without publishing a code object. Template and optimizing code then read the
+  live `Value` directly from prepared cells. Optimized `LoadString` no longer
+  materializes a frame or safepoint, and loop method caches may cross the pure
+  cell read. A
   257-cell VM regression proves address stability across hash growth and full
   GC; a production-tier regression executes compiled literal code after 300
   new eval chunks and moving collection. Typed `stringConstantCell`
@@ -255,7 +260,8 @@ It already owns:
   Math-only kernel by 47.29% and full `native-boundary` by 18.77%, with exact
   checksums, unchanged reductions/stub counts, zero deopts, and native-boundary
   code growing from 6,740 to 7,544 bytes;
-- the legacy optimizing backend now coalesces exact-bit `LoadLocal`,
+- the final legacy-only allocation experiment (the backend is now deleted)
+  coalesced exact-bit `LoadLocal`,
   `StoreLocal`, and `Reuse` SSA copy webs before linear scan, while unread
   uninitialized/undefined/dead-phi heads remain literal-only deopt state. The
   AArch64 allocator reclaims `x19` as a ninth GPR and reloads the root VM window
@@ -267,7 +273,7 @@ It already owns:
   transition-frame construction, VM-PC
   publication, and interpreter-window result round-trips exist only on the
   canonical miss. `optimized-ir.txt` reports copy-web/inactive counts and
-  `code-map.json` exposes `machineMethodIntrinsic`. The final `native-boundary`
+  `code-map.json` exposed `machineMethodIntrinsic`. The final `native-boundary`
   artifact contains 11 copy webs, 23 coalesced values, 44 inactive values, six
   frame-free intrinsic regions, six method caches, and two global caches; raw
   and post-deopt spills fell from 33/48 to 8/12. Exact parent/current/current/
@@ -397,13 +403,15 @@ Do not translate new IR back into legacy SSA or legacy allocation.
   and unrelated source edits;
 - require cross-target verifier and allocation tests for every shared opcode.
 
-### 4. Perform the atomic compiler switch
+### 4. Finish the atomic compiler switch
 
-Once one complete supported-language boundary exists on both targets:
+The legacy optimizing SSA/regalloc/emitter has been deleted. Once one complete
+supported-language boundary exists on both targets:
 
 - make quick and optimizing compilation choose budgets over the same pipeline;
-- delete the template compiler, legacy optimizing SSA/regalloc/emitter, their
-  interpreter-window ABI, duplicated direct emitters, and obsolete artifacts;
+- move quick compilation onto the same Machine pipeline, then delete the
+  Template compiler, its interpreter-window ABI, duplicated direct emitters,
+  and obsolete artifacts;
 - remove caller-visible callee tier/frame assumptions that are no longer part
   of stable dispatch cells;
 - leave the interpreter as the semantic oracle and tier fallback, not as a
@@ -465,8 +473,18 @@ Revise the architecture instead of adding a workaround if any occurs:
   direction and never add `crates-legacy` to the active graph.
 - Do not add compatibility readers, schema versions, adapters, replay paths,
   dual writers, or parallel IR/frame/value formats.
-- Keep GC roots explicit and allocation-driven; native value building uses
-  handle scopes.
+- Keep the generated-code ABI private to `otter-jit` ↔ `otter-vm`. FFI,
+  extensions, and any future Node-facing modules enter through `NativeCtx` and
+  never consume `NativeFrame`, safepoint records, stub ids, or compiled result
+  pairs.
+- Keep one physical native result carrier. Compiled, committed, probe, and
+  exception-transition descriptors validate their distinct legal status
+  subsets over that carrier; they do not own parallel structs, aliases,
+  constructors, decoders, or duplicate ABI tests.
+- Keep GC roots explicit and allocation-driven. Contributor/native value
+  building has one high-level entry through branded `NativeCtx` handle scopes;
+  fixed JIT stubs immediately enter VM-owned scoped rooting and never expose a
+  second raw-GC API.
 - Keep `lib.rs` as a crate map and small glue surface.
 - Use focused tests during development and update this plan only with current
   state, next work, and accepted gates.

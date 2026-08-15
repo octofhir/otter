@@ -1103,9 +1103,9 @@ impl Interpreter {
                 &mut frame_roots,
             )
             .map_err(crate::oom_to_vm)?;
-            self.frame_ensure_cold(frame).eval_env = Some(env);
+            frame.eval_env = env;
         } else if inherited.is_some() {
-            self.frame_ensure_cold(frame).eval_env = inherited;
+            frame.eval_env = inherited.expect("checked inherited eval env");
         }
         Ok(())
     }
@@ -3900,7 +3900,20 @@ impl Interpreter {
                 self.release_frames_above(stack, entry_floor);
                 result
             }
-            crate::jit::JitExecOutcome::Threw(err) => {
+            crate::jit::JitExecOutcome::Throw(thrown) => {
+                let unwind = self.unwind_compiled_throw_above(context, stack, entry_floor, thrown);
+                if unwind.is_ok() && !stack.is_at_floor(entry_floor) {
+                    let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
+                    self.release_frames_above(stack, entry_floor);
+                    return result;
+                }
+                self.release_frames_above(stack, entry_floor);
+                match unwind {
+                    Ok(()) => Ok(Value::undefined()),
+                    Err(err) => Err(err),
+                }
+            }
+            crate::jit::JitExecOutcome::Fatal(err) => {
                 self.release_frames_above(stack, entry_floor);
                 Err(err)
             }

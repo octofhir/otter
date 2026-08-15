@@ -7,7 +7,7 @@
 //! each own their continuation coordinate.
 //!
 //! # Contents
-//! - Representation-neutral SELF, `this`, and `new.target` loads.
+//! - Representation-neutral SELF and `this` loads.
 //! - Representation-neutral upvalue load/store operations.
 //! - Explicit materialized-frame operations for fresh upvalue spines, rest
 //!   arguments, and structured-exception cold state.
@@ -59,16 +59,6 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         let value = frame.self_value();
-        frame.write(dst, value)
-    }
-
-    /// Load the immutable `new.target` binding into `dst`.
-    pub(crate) fn frame_load_new_target(
-        &self,
-        frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let value = frame.new_target_value();
         frame.write(dst, value)
     }
 
@@ -294,7 +284,6 @@ mod tests {
     fn header(register_count: usize) -> VmFrameHeader {
         VmFrameHeader {
             function_id: 7,
-            code_block_id: 11,
             pc: 3,
             register_count: register_count as u16,
             kind: NativeFrameKind::Interpreter,
@@ -310,6 +299,7 @@ mod tests {
     ) -> Frame {
         Frame {
             header: header(slots.len()),
+            eval_env: crate::eval_env::EvalEnvHandle::null(),
             registers: RegisterWindow::attached(slots.as_mut_ptr(), slots.len(), 0),
             upvalues: upvalues.into_boxed_slice(),
             self_value,
@@ -324,33 +314,27 @@ mod tests {
         let interpreter = Interpreter::new();
         let self_value = Value::function(31);
         let this_value = Value::number_i32(17);
-        let new_target = Value::function(43);
 
-        let mut materialized_slots = [Value::undefined(); 3];
+        let mut materialized_slots = [Value::undefined(); 2];
         let mut materialized =
             materialized_frame(&mut materialized_slots, Vec::new(), self_value, this_value);
         {
-            let mut active =
-                ActiveFrameMut::materialized_with_new_target(&mut materialized, new_target);
+            let mut active = ActiveFrameMut::materialized(&mut materialized);
             interpreter
                 .frame_load_this(&mut active, 0)
                 .expect("materialized this");
             interpreter
                 .frame_load_self(&mut active, 1)
                 .expect("materialized SELF");
-            interpreter
-                .frame_load_new_target(&mut active, 2)
-                .expect("materialized new.target");
         }
 
-        let mut native_slots = [Value::undefined(); 3];
+        let mut native_slots = [Value::undefined(); 2];
         let mut native = NativeFrame::new(
             header(native_slots.len()),
             native_slots.as_mut_ptr() as u64,
             self_value,
             this_value,
         );
-        native.set_new_target(new_target);
         {
             // SAFETY: the native frame and its initialized register window
             // remain exclusively live and unmoved for this scoped view.
@@ -362,13 +346,10 @@ mod tests {
             interpreter
                 .frame_load_self(&mut active, 1)
                 .expect("native SELF");
-            interpreter
-                .frame_load_new_target(&mut active, 2)
-                .expect("native new.target");
         }
 
         assert_eq!(materialized_slots, native_slots);
-        assert_eq!(materialized_slots, [this_value, self_value, new_target]);
+        assert_eq!(materialized_slots, [this_value, self_value]);
         assert_eq!(materialized.header.pc, 3);
         assert_eq!(native.header.pc, 3);
     }

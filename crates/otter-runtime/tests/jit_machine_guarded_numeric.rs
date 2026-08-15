@@ -11,7 +11,7 @@
 //! - A packed-double element family whose dynamic index remains tagged,
 //!   including direct int32 hits and exact string/fractional misses.
 //! - A Delta-shaped constructor whose `initialValue || 0` join deliberately
-//!   retains the legacy optimizing backend while field transitions stay live.
+//!   retains its Template baseline while field transitions stay live.
 //!
 //! # Invariants
 //! - Packed-double loads produce Float64 SSA values and stores consume Float64
@@ -27,7 +27,7 @@
 //! - A tagged packed-array index proves an int32 payload in generated code;
 //!   every other property-key representation exits before the indexed effect.
 //! - Constructor field-transition lowering does not force a heterogeneous
-//!   tagged/value join into Machine IR.
+//!   tagged/value join into Machine IR; rejection retains the Template body.
 //!
 //! # See also
 //! - `crates/otter-jit/src/machine/numeric` owns guarded numeric HIR,
@@ -1213,7 +1213,7 @@ fn run_with_delta(runtime: &mut Runtime, source: &str, module: &str) -> (String,
     (result, delta)
 }
 
-fn assert_delta_constructor_is_legacy(artifacts: &JitArtifactBatch) {
+fn assert_delta_constructor_stays_on_template(artifacts: &JitArtifactBatch) {
     let entry_bundle = artifacts
         .bundles()
         .iter()
@@ -1221,9 +1221,10 @@ fn assert_delta_constructor_is_legacy(artifacts: &JitArtifactBatch) {
             let manifest = bundle.manifest();
             manifest.module() == DELTA_MODULE
                 && manifest.function_name() == "DeltaGuarded"
+                && manifest.tier() == JitDebugTier::Template
                 && manifest.entry() == JitDebugTarget::Entry
         })
-        .expect("DeltaGuarded entry artifact");
+        .expect("DeltaGuarded Template entry artifact");
     let bytecode = std::str::from_utf8(
         entry_bundle
             .file(JitArtifactFileName::Bytecode)
@@ -1240,26 +1241,15 @@ fn assert_delta_constructor_is_legacy(artifacts: &JitArtifactBatch) {
         "DeltaGuarded must retain its three ordered constructor fields: {bytecode}"
     );
 
-    let mut optimizing_bundles = 0;
-    for bundle in artifacts.bundles().iter().filter(|bundle| {
-        let manifest = bundle.manifest();
-        manifest.module() == DELTA_MODULE
-            && manifest.function_name() == "DeltaGuarded"
-            && manifest.tier() == JitDebugTier::Optimizing
-            && manifest.entry() == JitDebugTarget::Entry
-    }) {
-        optimizing_bundles += 1;
-        let optimized_ir = bundle
-            .file(JitArtifactFileName::OptimizedIr)
-            .expect("DeltaGuarded optimizing IR");
-        assert!(
-            !optimized_ir.contents().starts_with(MACHINE_IR_HEADER),
-            "mixed initialValue || 0 plus field transitions must remain legacy"
-        );
-    }
     assert!(
-        optimizing_bundles > 0,
-        "missing DeltaGuarded legacy optimizing artifact"
+        artifacts.bundles().iter().all(|bundle| {
+            let manifest = bundle.manifest();
+            manifest.module() != DELTA_MODULE
+                || manifest.function_name() != "DeltaGuarded"
+                || manifest.tier() != JitDebugTier::Optimizing
+                || manifest.entry() != JitDebugTarget::Entry
+        }),
+        "Machine rejection must retain Template without a second optimizing backend"
     );
 }
 
@@ -1548,7 +1538,7 @@ fn tagged_packed_double_indices_hit_int32_and_exact_deopt_other_property_keys() 
 }
 
 #[test]
-fn delta_mixed_default_constructor_remains_legacy_and_preserves_fields() {
+fn delta_mixed_default_constructor_stays_on_template_and_preserves_fields() {
     let mut oracle = runtime(JitSelection::InterpreterOnly, false);
     completion(
         &mut oracle,
@@ -1569,7 +1559,7 @@ fn delta_mixed_default_constructor_remains_legacy_and_preserves_fields() {
     let setup = compiled
         .run_script(SourceInput::from_javascript(DELTA_SETUP), DELTA_MODULE)
         .expect("DeltaGuarded setup");
-    assert_delta_constructor_is_legacy(
+    assert_delta_constructor_stays_on_template(
         setup
             .jit_artifacts()
             .expect("enabled DeltaGuarded artifact batch"),
@@ -1582,8 +1572,8 @@ fn delta_mixed_default_constructor_remains_legacy_and_preserves_fields() {
         "jit-machine-guarded-numeric-delta-probe.js",
     );
     assert_eq!(actual, expected);
-    assert!(
-        delta.optimized_entries >= 3,
-        "all DeltaGuarded probes must enter its legacy optimizing body: {delta:?}"
+    assert_eq!(
+        delta.optimized_entries, 0,
+        "Machine-rejected DeltaGuarded must keep using Template: {delta:?}"
     );
 }

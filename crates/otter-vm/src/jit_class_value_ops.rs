@@ -3,8 +3,8 @@
 //! # Contents
 //! - Shared register helpers for template objects, private names, and the
 //!   direct-eval identity probe.
-//! - Packed compiled dispatch for class creation, dynamic functions, eval,
-//!   and full `ToNumber` coercion.
+//! - Packed compiled dispatch for class creation, dynamic functions, direct
+//!   eval, and full `ToNumber` coercion.
 //!
 //! # Invariants
 //! - Interpreter and JIT dispatch call the same VM helpers; no JavaScript
@@ -153,14 +153,6 @@ impl Interpreter {
                     arg1 as u32,
                 )?;
             }
-            value if value == Op::Eval as u8 => {
-                let operands = [
-                    Operand::Register(lane(arg0, 0)),
-                    Operand::Register(lane(arg0, 1)),
-                    Operand::Imm32(arg1 as u32 as i32),
-                ];
-                self.run_eval_operands(context, stack, operands.as_slice())?;
-            }
             value if value == Op::IsEvalIntrinsic as u8 => {
                 self.run_is_eval_intrinsic_reg(stack, frame_index, lane(arg0, 0), lane(arg0, 1))?;
             }
@@ -171,6 +163,32 @@ impl Interpreter {
         }
         stack[frame_index].pc = saved_pc;
         let _ = arg2;
+        Ok(())
+    }
+
+    /// Complete one direct `Eval` while its materialized caller frame owns the
+    /// eval-environment slot for the complete synchronous VM reentry.
+    pub(crate) fn jit_runtime_eval_op(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+        packed_registers: u64,
+        flags: u64,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        if frame_index + 1 != stack.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        let saved_pc = stack[frame_index].pc;
+        let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
+        let operands = [
+            Operand::Register(lane(packed_registers, 0)),
+            Operand::Register(lane(packed_registers, 1)),
+            Operand::Imm32(flags as u32 as i32),
+        ];
+        self.run_eval_operands(context, stack, operands.as_slice())?;
+        stack[frame_index].pc = saved_pc;
         Ok(())
     }
 }

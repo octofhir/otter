@@ -5,8 +5,8 @@
 //!   while cold computed accesses use the reentrant generic value boundary.
 //! - Ordinary-object, proxy, and observable key-coercion probes with exact
 //!   effect and runtime-transition counts across feedback maturation.
-//! - A local `try`/`catch` fixture that remains on the legacy optimizing
-//!   backend until Machine exceptional continuation is explicit.
+//! - A local `try`/`catch` fixture that retains its Template baseline until
+//!   Machine exceptional continuation is explicit.
 //!
 //! # Invariants
 //! - A never-taken generic branch does not deopt or enter either element stub.
@@ -307,7 +307,7 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
             "mixed function must retain {opcode}: {optimized_ir}"
         );
     }
-    for (stub_id, signature) in [(16, "ReentrantValue2"), (17, "ReentrantValue3")] {
+    for (stub_id, signature) in [(15, "ReentrantValue2"), (16, "ReentrantValue3")] {
         assert!(
             optimized_ir.lines().any(|line| {
                 line.contains(&format!("id: {stub_id}"))
@@ -469,7 +469,7 @@ fn cold_generic_value_calls_preserve_direct_hot_sites_and_execute_effects_once()
 }
 
 #[test]
-fn generic_element_inside_local_catch_remains_legacy_and_catches_key_throw() {
+fn generic_element_inside_local_catch_stays_on_template_and_catches_key_throw() {
     let mut runtime = runtime(JitSelection::ProductionTiered, true);
     let setup = runtime
         .run_script(SourceInput::from_javascript(CATCH_SETUP), CATCH_MODULE)
@@ -486,17 +486,16 @@ fn generic_element_inside_local_catch_remains_legacy_and_catches_key_throw() {
         })
         .collect::<Vec<_>>();
     assert!(
-        !function_bundles.is_empty(),
-        "local-catch fixture must publish a non-Machine native artifact"
+        function_bundles
+            .iter()
+            .any(|bundle| bundle.manifest().tier() == JitDebugTier::Template),
+        "local-catch fixture must retain its Template baseline"
     );
     assert!(
-        function_bundles.iter().all(|bundle| {
-            bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .is_some_and(|file| !file.contents().starts_with(MACHINE_IR_HEADER))
-                || bundle.file(JitArtifactFileName::OptimizedIr).is_none()
-        }),
-        "a propagating generic Machine call must not bypass a local catch"
+        function_bundles
+            .iter()
+            .all(|bundle| bundle.manifest().tier() != JitDebugTier::Optimizing),
+        "Machine rejection must not select a second optimizing backend"
     );
     drop(setup);
 

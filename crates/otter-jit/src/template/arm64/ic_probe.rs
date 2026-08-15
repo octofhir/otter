@@ -254,43 +254,6 @@ where
     Ok(())
 }
 
-/// Read the `[[Prototype]]` of the object `header` names, leaving that
-/// prototype's `GcHeader` address in `dst`.
-///
-/// The prototype lives in the object body, so `setPrototypeOf` moves it while
-/// the receiver's shape stays put: the hop is a run-time read whatever guard
-/// precedes it. A receiver with no prototype, or one carrying a body this path
-/// cannot address, branches to `miss`. Clobbers `w12` and `w14`.
-pub(crate) fn emit_load_prototype(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-    dst: u8,
-    miss: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w12, [X(header), view.jit_proto_byte]
-        ; cbz w12, =>miss
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        14,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add X(dst), x14, x12     // dst = prototype GcHeader ptr
-        ; ldrb w14, [X(dst)]
-        ; cmp w14, OBJECT_BODY_TYPE_TAG
-        ; b.ne =>miss
-    );
-    emit_fast_object_state_guard(ops, view, dst, miss);
-}
-
 /// Prove the holder `header` names still carries the compile-time hidden class
 /// `shape`.
 ///
@@ -669,40 +632,6 @@ pub(crate) fn emit_property_transition_shape_barrier(
     dynasm!(ops
         ; .arch aarch64
         ; ldp x12, x9, [sp], #16
-        ; =>done
-    );
-}
-
-/// Overwrite the own data slot at `value_byte` of the holder `header` names with
-/// the boxed `Value` in `x9`.
-///
-/// The slot stores the runtime `Value` word directly. This helper is used only
-/// for barrier-free primitive stores; cell stores use the guarded write-barrier
-/// path. Clobbers `x13`, `x14`.
-pub(crate) fn emit_store_field(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-    value_byte: u32,
-    miss: DynamicLabel,
-) {
-    if header != 13 {
-        dynasm!(ops ; .arch aarch64 ; mov x13, X(header));
-    }
-    dynasm!(ops ; .arch aarch64 ; mov x12, x13);
-    super::values::emit_slab_base(ops, view, 13, 14);
-    dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
-    let primitive = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, primitive);
-    dynasm!(ops ; .arch aarch64 ; str x9, [x13, value_byte]);
-    super::values::emit_write_barrier(ops, relocations, view, 12, 9);
-    dynasm!(ops
-        ; .arch aarch64
-        ; b =>done
-        ; =>primitive
-        ; str x9, [x13, value_byte]
         ; =>done
     );
 }
@@ -1363,7 +1292,6 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
-            ; and x1, x1, #0xff
             ; cbnz x1, =>bail
         );
         return Ok(());
@@ -1401,7 +1329,6 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; and x1, x1, #0xff
         ; mov x5, x1
         ; add sp, sp, ALLOC_CTX_STACK_SIZE
         ; cbnz x5, =>bail
@@ -1517,107 +1444,6 @@ pub(crate) fn emit_guarded_method_guard(
         miss,
         false,
     )
-}
-
-/// [`emit_guarded_method_guard`] with the tagged receiver already in a machine
-/// register, avoiding a template-frame materialization on optimizing hits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_guarded_method_guard_from_tagged_register(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    call: &JitGuardedMethodCall,
-    receiver: u8,
-    byte_pc: u32,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    emit_guarded_method_guard_impl(
-        ops,
-        relocations,
-        view,
-        call,
-        0,
-        Some(receiver),
-        byte_pc,
-        miss,
-        false,
-    )
-}
-
-/// Preserving method guard over a tagged receiver already in a machine
-/// register. On success `x13` retains the guarded receiver header.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_guarded_method_guard_preserving_receiver_from_tagged_register(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    call: &JitGuardedMethodCall,
-    receiver: u8,
-    byte_pc: u32,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    emit_guarded_method_guard_impl(
-        ops,
-        relocations,
-        view,
-        call,
-        0,
-        Some(receiver),
-        byte_pc,
-        miss,
-        true,
-    )
-}
-
-/// Revalidate only the current exotic receiver after this activation has
-/// already proved the pinned prototype's exact builtin identity.
-///
-/// This is narrower than a complete method guard: changing exotic bodies may
-/// share one immutable realm prototype, but each body must still carry the
-/// expected type and have no own expando/descriptor override. On success the
-/// current receiver header is left in `x13` for generated intrinsic code.
-/// Revalidate an exotic receiver already held as a tagged machine value.
-pub(crate) fn emit_guarded_exotic_method_receiver_preserving_receiver_from_tagged_register(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    call: &JitGuardedMethodCall,
-    receiver: u8,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    emit_guarded_exotic_method_receiver_impl(ops, relocations, view, call, 0, Some(receiver), miss)
-}
-
-fn emit_guarded_exotic_method_receiver_impl(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    call: &JitGuardedMethodCall,
-    receiver: u16,
-    tagged_receiver: Option<u8>,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let JitGuardedReceiver::Exotic {
-        type_tag, guard, ..
-    } = call.receiver
-    else {
-        return Err(Unsupported::OperandShape(
-            "cached method identity requires exotic receiver",
-        ));
-    };
-    emit_receiver_type_guard_impl(
-        ops,
-        relocations,
-        view,
-        receiver,
-        tagged_receiver,
-        u32::from(type_tag),
-        miss,
-    )?;
-    if let Some(guard) = guard {
-        emit_body_guard(ops, guard, miss);
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

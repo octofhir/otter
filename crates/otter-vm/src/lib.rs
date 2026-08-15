@@ -134,6 +134,7 @@ mod jit_construct_ops;
 mod jit_control_ops;
 pub mod jit_debug;
 mod jit_delete_ops;
+mod jit_deopt_handlers;
 mod jit_exception_ops;
 /// Compatibility path for JIT consumers while feedback ownership migrates to
 /// the tier-neutral [`feedback`] API.
@@ -142,7 +143,6 @@ pub use feedback as jit_feedback;
 mod jit_global_ops;
 mod jit_iterator_ops;
 mod jit_module_ops;
-mod jit_object_protocol_ops;
 mod jit_private_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
@@ -194,7 +194,6 @@ pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
 pub mod runtime_stubs;
-mod scalar_ops;
 pub mod snapshot;
 pub mod source_registry;
 mod static_call_ops;
@@ -236,8 +235,8 @@ pub use run_control::{
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
 pub use runtime_activation::{
-    ClassRuntimeOp, IteratorRuntimeOutcome, ObjectProtocolRuntimeOp, RuntimeCall, ScalarRuntimeOp,
-    ValueLoadRuntimeOp,
+    ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome, ObjectProtocolValueOp,
+    RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
 };
 
 #[cfg(test)]
@@ -252,7 +251,9 @@ pub(crate) use error_ops::{
     native_to_vm_error, native_to_vm_error_with_stack, snapshot_frames, symbol_to_vm_error,
     vm_err_to_value,
 };
-pub use executable::code_block_cfg::{CodeBlockControlFlowView, CodeBlockExceptionRegion};
+pub use executable::code_block_cfg::{
+    ActiveCatchRegionError, ActiveCatchRegions, CodeBlockControlFlowView, CodeBlockExceptionRegion,
+};
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
 use operand_decode::{apply_branch, const_operand, register_operand};
 
@@ -265,6 +266,10 @@ pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKe
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
+/// Private VM↔generated-code ABI handle. Native extensions must not interpret
+/// or manufacture its compressed representation.
+#[doc(hidden)]
+pub use eval_env::EvalEnvHandle;
 pub use handles::{HandleArena, Local, ObjectLayout, PendingValue, PendingValues};
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
@@ -299,12 +304,12 @@ pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_abi::{
     FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrame, NativeFrameFlags, NativeFrameKind,
     RuntimeStubAllocContext, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId,
-    RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus, STUB_COLLECTION_MAP_DELETE_ALLOC,
-    STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
-    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
-    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_JIT_BACKEDGE_POLL, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord, TaggedLocation,
-    TaggedLocationKind, VARIADIC_STUB_ARGUMENTS, VmFrameHeader, validate_stub_descriptor,
+    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
+    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_BACKEDGE_POLL, STUB_STRING_CONCAT_ALLOC, SafepointId,
+    SafepointRecord, TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS, VmFrameHeader,
+    validate_stub_descriptor,
 };
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
@@ -838,14 +843,13 @@ pub struct Interpreter {
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
     template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
-    /// Per-context string constant cache. `LoadString` materializes immutable
-    /// primitive string literals once per linked chunk identity and
-    /// constant-pool index, then reuses the GC string handle on later
-    /// executions. Boxed cells retain a stable address across hash-table growth
-    /// so generated code may read a prepared cell directly. Values are traced
-    /// from [`RuntimeState::trace_roots`] so a moving collection rewrites each
-    /// cached handle in place.
-    string_constant_cache: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
+    /// Per-context string constant cells. JIT preparation canonicalizes every
+    /// `LoadString` literal before taking a compile snapshot, then publishes
+    /// the shared address-stable box to each site that uses the constant.
+    /// Values are traced from
+    /// [`RuntimeState::trace_roots`] so moving collection rewrites prepared
+    /// handles in place without invalidating code relocations.
+    string_constant_cells: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
     /// Decimal strings for small non-negative integers, served on demand
     /// (JSC `SmallStrings` / V8 number-string-cache idea, adapted). Integer →
     /// string is one of the most repeated allocations in real code (`"" + n`,
@@ -1504,9 +1508,9 @@ impl Interpreter {
         self.template_objects.values()
     }
 
-    /// Root-tracing view of cached string constants.
-    pub(crate) fn string_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.string_constant_cache.values().map(Box::as_ref)
+    /// Root-tracing view of prepared string-constant cells.
+    pub(crate) fn string_constant_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.string_constant_cells.values().map(Box::as_ref)
     }
 
     /// Upper bound (exclusive) of the cached small-integer decimal strings.
@@ -1604,8 +1608,8 @@ impl Interpreter {
     }
 
     #[cfg(test)]
-    fn string_constant_cache_len_for_test(&self) -> usize {
-        self.string_constant_cache.len()
+    fn string_constant_cell_count_for_test(&self) -> usize {
+        self.string_constant_cells.len()
     }
 
     #[cfg(test)]
@@ -1614,7 +1618,7 @@ impl Interpreter {
         context: &ExecutionContext,
         idx: u32,
     ) -> Option<usize> {
-        self.string_constant_cache
+        self.string_constant_cells
             .get(&context.constant_cache_key(idx))
             .map(|cell| std::ptr::from_ref::<Value>(cell.as_ref()) as usize)
     }
@@ -1643,7 +1647,10 @@ impl Interpreter {
         idx: u32,
     ) -> Result<Value, VmError> {
         let key = context.constant_cache_key(idx);
-        if let Some(value) = self.string_constant_cache.get(&key) {
+        if let Some(value) = self.string_constant_cells.get(&key) {
+            if !value.is_string() {
+                return Err(VmError::InvalidOperand);
+            }
             return Ok(**value);
         }
         let units = context
@@ -1651,7 +1658,8 @@ impl Interpreter {
             .ok_or_else(|| VmError::InvalidOperand)?;
         let string = JsString::from_utf16_units(units, self.gc_heap_mut())?;
         let value = Value::string(string);
-        self.string_constant_cache.insert(key, Box::new(value));
+        let replaced = self.string_constant_cells.insert(key, Box::new(value));
+        debug_assert!(replaced.is_none(), "string constants canonicalize once");
         Ok(value)
     }
 

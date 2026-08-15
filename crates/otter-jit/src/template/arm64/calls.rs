@@ -37,7 +37,6 @@
 use std::collections::BTreeMap;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_bytecode::Op;
 use otter_vm::native_abi as abi;
 use otter_vm::{
     JitCompileSnapshot, JitInlineCallee, JitInlineMethod, closure::JS_CLOSURE_BODY_TYPE_TAG,
@@ -65,9 +64,7 @@ use crate::artifact::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
     InlineSiteArtifact,
 };
-use crate::entry::{
-    MAX_METHOD_ARGS, NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED, pack_method_arg_regs,
-};
+use crate::entry::{NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED};
 use crate::template::{
     ACCUMULATOR_DREG, ArithKind, FusedArithKind, FusedChainStep, InlineEntryValue, InlineLeafPlan,
     InlineScratchSlot, TemplateOp, TemplatePlan, TemplateTail,
@@ -662,6 +659,7 @@ fn try_emit_inline_numeric_method(
         },
         17,
         plan.has_receiver_property().then_some(16),
+        false,
         guard_miss,
     )?;
     if plan.has_receiver_property() {
@@ -818,6 +816,14 @@ fn try_emit_inline_numeric_callee(
             ; b.ne =>bail
         );
     }
+    // Frameless leaf inlining has no callee NativeFrame slot to carry a
+    // closure's dynamic eval chain. A generated call can propagate this
+    // handle; an inline candidate must prove it null before entering.
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w11, [x9, view.closure_call_layout.eval_env_byte]
+        ; cbnz w11, =>bail
+    );
     dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_fid_byte]);
     emit_load_u64(ops, 12, u64::from(callee.function_id()));
     dynasm!(ops
@@ -910,6 +916,8 @@ pub(super) fn emit_call(
     byte_pc: u32,
     bail: DynamicLabel,
     threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     if let Some(target) = view.static_native_calls.get(&byte_pc) {
@@ -1034,6 +1042,8 @@ pub(super) fn emit_call(
             code_map,
             bail,
             threw,
+            throw_value,
+            fatal,
             done,
         )?;
         if let Some(events) = direct_call_events.as_deref_mut() {
@@ -1115,9 +1125,9 @@ pub(super) fn direct_call_lowering_event(
 /// A baked target uses the shared stack-owned generated linkage. An unplanned
 /// site completes through the single generic in-place construct transition,
 /// which runs the interpreter's own `Construct` synchronously and writes
-/// `dst`. Status `0` continues the compiled caller, `1` throws, and `2` (a
-/// non-constructor callee) takes the exact side exit so the interpreter owns
-/// the `TypeError`.
+/// `dst`. `Success` continues, `Throw` enters the parked-error epilogue, and
+/// `SideExit` (a non-constructor callee) leaves before effects so the
+/// interpreter owns the `TypeError`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_construct(
     ops: &mut Assembler,
@@ -1137,6 +1147,8 @@ pub(super) fn emit_construct(
     byte_pc: u32,
     bail: DynamicLabel,
     threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     // Keep fixed `super()` on the in-place transition until template entry
     // tiering accounts for a generated superclass edge. Entering it directly
@@ -1196,6 +1208,8 @@ pub(super) fn emit_construct(
             code_map,
             bail,
             threw,
+            throw_value,
+            fatal,
             done,
             20,
             |ops, source, target, _| emit_load_reg(ops, target, source),
@@ -1268,14 +1282,8 @@ pub(super) fn emit_construct(
         table.entry(abi::STUB_JIT_CONSTRUCT),
         abi::STUB_JIT_CONSTRUCT,
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #1
-        ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>bail
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    super::transitions::emit_status_word_result(ops, Some(bail), threw, fatal);
     Ok(())
 }
 
@@ -1284,8 +1292,9 @@ pub(super) fn emit_construct(
 /// Leaf/inlined collection layers run first. Otherwise a VM-baked bounded
 /// method-target chain remains native: generated code walks exact
 /// receiver/prototype/method-slot guards in feedback order, then builds the
-/// selected rooted callee frame directly. Missing plans and guard-chain misses
-/// deoptimize the original opcode before method lookup effects.
+/// selected rooted callee frame directly. Missing plans and final guard-chain
+/// misses build one contiguous boxed-value packet and complete through the
+/// canonical method-call boundary exactly once.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
@@ -1296,8 +1305,6 @@ pub(super) fn emit_method_call(
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
-    name: u32,
-    argc: u16,
     argument_registers: &[u16],
     logical_pc: u32,
     byte_pc: u32,
@@ -1305,7 +1312,11 @@ pub(super) fn emit_method_call(
     arg1: Option<u16>,
     bail: DynamicLabel,
     threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), crate::entry::Unsupported> {
+    let argc = u16::try_from(argument_registers.len())
+        .map_err(|_| Unsupported::OperandShape("template method argument count"))?;
     let done = ops.new_dynamic_label();
     // A guarded call straight into a declared entry precedes every other
     // layer; its guard miss lands on the next one.
@@ -1457,6 +1468,7 @@ pub(super) fn emit_method_call(
             },
             17,
             None,
+            true,
             next_target,
         )?;
         if let Some(code_map) = code_map.as_deref_mut() {
@@ -1483,6 +1495,8 @@ pub(super) fn emit_method_call(
             code_map.as_deref_mut(),
             bail,
             threw,
+            throw_value,
+            fatal,
             done,
         )?;
         if let Some(events) = direct_call_events.as_deref_mut() {
@@ -1505,28 +1519,53 @@ pub(super) fn emit_method_call(
         }
         dynasm!(ops ; .arch aarch64 ; =>next_target);
     }
-    if argument_registers.len() <= MAX_METHOD_ARGS {
-        let packed_meta = u64::from(dst) | (u64::from(receiver) << 16) | (u64::from(argc) << 32);
-        super::spread_call::emit_spread_call_op(
-            ops,
-            relocations,
-            table,
-            view,
-            None,
-            None,
-            Op::CallMethodValue as u8,
-            packed_meta,
-            pack_method_arg_regs(argument_registers),
-            u64::from(name),
-            logical_pc,
-            byte_pc,
-            bail,
-            threw,
-        )?;
-        dynasm!(ops ; .arch aarch64 ; b =>done);
-    } else {
-        dynasm!(ops ; .arch aarch64 ; b =>bail);
+    let packet_words = argument_registers
+        .len()
+        .checked_add(1)
+        .and_then(|words| u32::try_from(words).ok())
+        .ok_or(Unsupported::OperandShape(
+            "template method value-packet word count",
+        ))?;
+    let packet_bytes = packet_words
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(15))
+        .map(|bytes| bytes & !15)
+        .ok_or(Unsupported::OperandShape(
+            "template method value-packet frame",
+        ))?;
+    dynasm!(ops ; .arch aarch64 ; sub sp, sp, packet_bytes);
+    emit_load_reg(ops, 9, receiver)?;
+    dynasm!(ops ; .arch aarch64 ; str x9, [sp]);
+    for (index, &argument) in argument_registers.iter().enumerate() {
+        emit_load_reg(ops, 9, argument)?;
+        let offset = u32::try_from(index + 1)
+            .ok()
+            .and_then(|word| word.checked_mul(8))
+            .ok_or(Unsupported::OperandShape(
+                "template method value-packet offset",
+            ))?;
+        dynasm!(ops ; .arch aarch64 ; str x9, [sp, offset]);
     }
+    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; mov x1, sp ; movz w2, packet_words);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        table.entry(abi::STUB_JIT_CALL_METHOD_VALUE),
+        abi::STUB_JIT_CALL_METHOD_VALUE,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; add sp, sp, packet_bytes
+        ; cbz x1, >method_value_completed
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
+        ; method_value_completed:
+    );
+    emit_store_reg(ops, 0, dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done);
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

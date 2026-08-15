@@ -18,9 +18,8 @@
 //! # Invariants
 //! - Value-family arguments are boxed [`crate::Value`] raw ABI bits; typed
 //!   numeric leaves use the platform's unboxed floating-point ABI.
-//! - Machine results use the two-register
-//!   [`crate::native_abi::RuntimeStubResultPair`] encoding; Rust-facing
-//!   helpers expose [`crate::native_abi::RuntimeStubResult`].
+//! - Machine and Rust-facing helpers use the same two-register
+//!   [`crate::native_abi::NativeResultPair`]; no unpacked result DTO exists.
 //! - Signature families are never mixed behind one untyped address array.
 //! - `LeafNoAlloc` stubs must not allocate, trigger GC, call JS, flatten
 //!   strings, or mutate heap state.
@@ -32,8 +31,8 @@
 //! - [`crate::method_ops`]
 
 use crate::native_abi::{
-    CodeRegistryView, NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId,
-    RuntimeStubResult, RuntimeStubResultPair, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_ARRAY_POP_LEAF,
+    CodeRegistryView, NO_SAFEPOINT, NativeResultDomain, NativeResultPair, RuntimeStubAllocContext,
+    RuntimeStubDescriptor, RuntimeStubId, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_ARRAY_POP_LEAF,
     STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
     STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
     STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
@@ -55,10 +54,9 @@ use std::cell::UnsafeCell;
 /// The heap pointer is opaque to generated code. It must name the current
 /// isolate heap and must remain valid for the duration of the call. The callee
 /// must not allocate, trigger GC, or retain the pointer. The result is the
-/// two-register [`RuntimeStubResultPair`] encoding, so generated code never
+/// two-register [`NativeResultPair`] encoding, so generated code never
 /// needs a memory-returned record for a leaf probe.
-pub type LeafNoAllocStub2Fn =
-    extern "C" fn(*const otter_gc::GcHeap, u64, u64) -> RuntimeStubResultPair;
+pub type LeafNoAllocStub2Fn = extern "C" fn(*const otter_gc::GcHeap, u64, u64) -> NativeResultPair;
 
 /// Callable leaf/no-allocation stub entry with its ABI descriptor.
 #[derive(Clone, Copy)]
@@ -90,8 +88,8 @@ impl LeafNoAllocStub2 {
         heap: *const otter_gc::GcHeap,
         a0_bits: u64,
         a1_bits: u64,
-    ) -> RuntimeStubResult {
-        (self.entry)(heap, a0_bits, a1_bits).into_result()
+    ) -> NativeResultPair {
+        (self.entry)(heap, a0_bits, a1_bits)
     }
 }
 
@@ -167,8 +165,7 @@ impl Float64ToWordLeafStub1 {
 /// GC-managed state in place and runs any required write barrier, but still
 /// must not allocate, trigger collection, or re-enter JS, so the call site
 /// publishes no safepoint and no rooting packet.
-pub type MutatingLeafStub2Fn =
-    extern "C" fn(*mut otter_gc::GcHeap, u64, u64) -> RuntimeStubResultPair;
+pub type MutatingLeafStub2Fn = extern "C" fn(*mut otter_gc::GcHeap, u64, u64) -> NativeResultPair;
 
 /// Callable mutating-leaf stub entry with its ABI descriptor.
 #[derive(Clone, Copy)]
@@ -200,8 +197,8 @@ impl MutatingLeafStub2 {
         heap: *mut otter_gc::GcHeap,
         a0_bits: u64,
         a1_bits: u64,
-    ) -> RuntimeStubResult {
-        (self.entry)(heap, a0_bits, a1_bits).into_result()
+    ) -> NativeResultPair {
+        (self.entry)(heap, a0_bits, a1_bits)
     }
 }
 
@@ -213,7 +210,7 @@ impl MutatingLeafStub2 {
 /// and never allocate, collect, or re-enter JS, so the call site publishes no
 /// safepoint and no rooting packet.
 pub type MutatingLeafStub3Fn =
-    extern "C" fn(*mut otter_gc::GcHeap, u64, u64, u64) -> RuntimeStubResultPair;
+    extern "C" fn(*mut otter_gc::GcHeap, u64, u64, u64) -> NativeResultPair;
 
 /// Callable three-argument mutating-leaf stub entry with its ABI descriptor.
 #[derive(Clone, Copy)]
@@ -246,8 +243,8 @@ impl MutatingLeafStub3 {
         a0_bits: u64,
         a1_bits: u64,
         a2_bits: u64,
-    ) -> RuntimeStubResult {
-        (self.entry)(heap, a0_bits, a1_bits, a2_bits).into_result()
+    ) -> NativeResultPair {
+        (self.entry)(heap, a0_bits, a1_bits, a2_bits)
     }
 }
 
@@ -257,13 +254,8 @@ impl MutatingLeafStub3 {
 /// from the raw `Value` arguments:
 /// `(alloc_ctx, safepoint_id, receiver_bits, arg0_bits, arg1_bits)`.
 /// `safepoint_id` must identify a precise map for the current call site.
-pub type AllocValueStubFn = extern "C" fn(
-    *mut RuntimeStubAllocContext,
-    SafepointId,
-    u64,
-    u64,
-    u64,
-) -> RuntimeStubResultPair;
+pub type AllocValueStubFn =
+    extern "C" fn(*mut RuntimeStubAllocContext, SafepointId, u64, u64, u64) -> NativeResultPair;
 
 /// Fixed-value allocating runtime stub ABI record.
 ///
@@ -309,7 +301,7 @@ impl AllocValueStub {
         recv_bits: u64,
         arg0_bits: u64,
         arg1_bits: u64,
-    ) -> Option<RuntimeStubResultPair> {
+    ) -> Option<NativeResultPair> {
         self.entry
             .map(|entry| entry(ctx, safepoint, recv_bits, arg0_bits, arg1_bits))
     }
@@ -926,9 +918,9 @@ pub fn invoke_leaf_no_alloc_stub2(
     id: RuntimeStubId,
     a0: Value,
     a1: Value,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(stub) = leaf_no_alloc_stub2_by_id(id) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     stub.invoke_raw(
         heap as *const otter_gc::GcHeap,
@@ -948,9 +940,9 @@ pub fn invoke_mutating_leaf_stub3(
     a0: Value,
     a1: Value,
     a2: Value,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(stub) = mutating_leaf_stub3_by_id(id) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     stub.invoke_raw(
         heap as *mut otter_gc::GcHeap,
@@ -960,16 +952,20 @@ pub fn invoke_mutating_leaf_stub3(
     )
 }
 
-fn alloc_value_stub_result_pair(
+fn record_alloc_value_stub_result(
     ctx: *mut RuntimeStubAllocContext,
-    result: RuntimeStubResult,
-) -> RuntimeStubResultPair {
+    result: NativeResultPair,
+) -> NativeResultPair {
+    let status = match result.validate(NativeResultDomain::Probe) {
+        Some(status) => status,
+        None => return NativeResultPair::fatal_internal(),
+    };
     if let Some(ctx) = alloc_context_mut(ctx)
         && let Some(interp) = alloc_interpreter_mut(ctx)
     {
-        interp.record_jit_alloc_value_stub_status(result.status);
+        interp.record_jit_alloc_value_stub_status(status);
     }
-    RuntimeStubResultPair::from_result(result)
+    result
 }
 
 /// Allocating `Map.prototype.set` mutation stub.
@@ -983,8 +979,8 @@ pub extern "C" fn collection_map_set_alloc(
     recv_bits: u64,
     key_bits: u64,
     value_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_map_set_alloc_inner(ctx, safepoint, recv_bits, key_bits, value_bits),
     )
@@ -998,8 +994,8 @@ pub extern "C" fn collection_set_add_alloc(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_set_add_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
     )
@@ -1013,8 +1009,8 @@ pub extern "C" fn collection_map_get_alloc(
     recv_bits: u64,
     key_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_map_get_alloc_inner(ctx, safepoint, recv_bits, key_bits, unused_bits),
     )
@@ -1028,8 +1024,8 @@ pub extern "C" fn collection_map_has_alloc(
     recv_bits: u64,
     key_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_map_has_alloc_inner(ctx, safepoint, recv_bits, key_bits, unused_bits),
     )
@@ -1043,8 +1039,8 @@ pub extern "C" fn collection_set_has_alloc(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_set_has_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
     )
@@ -1058,8 +1054,8 @@ pub extern "C" fn collection_map_delete_alloc(
     recv_bits: u64,
     key_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_map_delete_alloc_inner(ctx, safepoint, recv_bits, key_bits, unused_bits),
     )
@@ -1073,8 +1069,8 @@ pub extern "C" fn collection_set_delete_alloc(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         collection_set_delete_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
     )
@@ -1088,8 +1084,8 @@ pub extern "C" fn string_concat_alloc(
     lhs_bits: u64,
     rhs_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         string_concat_alloc_inner(ctx, safepoint, lhs_bits, rhs_bits, unused_bits),
     )
@@ -1103,8 +1099,8 @@ pub extern "C" fn array_construct_alloc(
     length_bits: u64,
     padding0_bits: u64,
     padding1_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         array_construct_alloc_inner(ctx, safepoint, length_bits, padding0_bits, padding1_bits),
     )
@@ -1162,14 +1158,14 @@ pub extern "C" fn to_boolean_leaf(
     heap: *const otter_gc::GcHeap,
     value_bits: u64,
     _ignored: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let value = Value::from_abi_bits(value_bits);
     let truthy = value.to_boolean(heap);
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(truthy)))
+    NativeResultPair::success(Value::boolean(truthy))
 }
 
 /// Full f64 remainder over two operand words already guarded to be numbers
@@ -1181,17 +1177,15 @@ pub extern "C" fn number_rem_leaf(
     heap: *const otter_gc::GcHeap,
     lhs_bits: u64,
     rhs_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let lhs = Value::from_abi_bits(lhs_bits);
     let rhs = Value::from_abi_bits(rhs_bits);
     let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let rem = a.as_f64() % b.as_f64();
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
-        crate::NumberValue::Double(rem),
-    )))
+    NativeResultPair::success(Value::number(crate::NumberValue::Double(rem)))
 }
 
 /// Pure unboxed Number remainder for typed numeric machine code.
@@ -1225,25 +1219,23 @@ pub extern "C" fn string_char_code_at_leaf(
     heap: *const otter_gc::GcHeap,
     receiver_bits: u64,
     index_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let receiver = Value::from_abi_bits(receiver_bits);
     let index = Value::from_abi_bits(index_bits);
     let (Some(string), Some(index)) = (receiver.as_string(heap), index.as_i32()) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     if index < 0 {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     }
     let Some(unit) = string.char_code_at(index as u32, heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
-        crate::NumberValue::from_i32(i32::from(unit)),
-    )))
+    NativeResultPair::success(Value::number(crate::NumberValue::from_i32(i32::from(unit))))
 }
 
 /// Resolve two operand words to a string receiver and a string argument, the
@@ -1267,23 +1259,23 @@ pub extern "C" fn string_code_point_at_leaf(
     heap: *const otter_gc::GcHeap,
     receiver_bits: u64,
     index_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let (Some(string), Some(index)) = (
         Value::from_abi_bits(receiver_bits).as_string(heap),
         Value::from_abi_bits(index_bits).as_i32(),
     ) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     if index < 0 {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     }
     let index = index as u32;
     let Some(first) = string.char_code_at(index, heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     // §22.1.3.4 CodePointAt: a leading surrogate followed by a trailing one
     // yields the combined scalar value; anything else yields the unit itself.
@@ -1293,8 +1285,8 @@ pub extern "C" fn string_code_point_at_leaf(
         }
         _ => u32::from(first),
     };
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
-        crate::NumberValue::from_i32(code_point as i32),
+    NativeResultPair::success(Value::number(crate::NumberValue::from_i32(
+        code_point as i32,
     )))
 }
 
@@ -1305,21 +1297,19 @@ pub extern "C" fn string_index_of_leaf(
     heap: *const otter_gc::GcHeap,
     receiver_bits: u64,
     needle_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let Some((haystack, needle)) = string_pair(heap, receiver_bits, needle_bits) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let Ok(found) = haystack.index_of(needle, 0, None, heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let position = found.map_or(-1, |index| index as i32);
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
-        crate::NumberValue::from_i32(position),
-    )))
+    NativeResultPair::success(Value::number(crate::NumberValue::from_i32(position)))
 }
 
 /// `String.prototype.includes` over two string operands, searching from index
@@ -1330,18 +1320,18 @@ pub extern "C" fn string_includes_leaf(
     heap: *const otter_gc::GcHeap,
     receiver_bits: u64,
     needle_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let Some((haystack, needle)) = string_pair(heap, receiver_bits, needle_bits) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let Ok(found) = haystack.index_of(needle, 0, None, heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(found.is_some())))
+    NativeResultPair::success(Value::boolean(found.is_some()))
 }
 
 /// `String.prototype.startsWith` over two string operands, anchored at index
@@ -1352,17 +1342,15 @@ pub extern "C" fn string_starts_with_leaf(
     heap: *const otter_gc::GcHeap,
     receiver_bits: u64,
     prefix_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let Some((string, prefix)) = string_pair(heap, receiver_bits, prefix_bits) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(
-        string.starts_with(prefix, 0, heap),
-    )))
+    NativeResultPair::success(Value::boolean(string.starts_with(prefix, 0, heap)))
 }
 
 /// `String.prototype.endsWith` over two string operands, anchored at the
@@ -1373,18 +1361,16 @@ pub extern "C" fn string_ends_with_leaf(
     heap: *const otter_gc::GcHeap,
     receiver_bits: u64,
     suffix_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let Some((string, suffix)) = string_pair(heap, receiver_bits, suffix_bits) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let end = string.len();
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(
-        string.ends_with(suffix, end, heap),
-    )))
+    NativeResultPair::success(Value::boolean(string.ends_with(suffix, end, heap)))
 }
 
 /// §7.2.15 IsStrictlyEqual over two raw operand words. Total for every value
@@ -1396,15 +1382,15 @@ pub extern "C" fn strict_eq_leaf(
     heap: *const otter_gc::GcHeap,
     lhs_bits: u64,
     rhs_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let lhs = Value::from_abi_bits(lhs_bits);
     let rhs = Value::from_abi_bits(rhs_bits);
     let eq = crate::abstract_ops::is_strictly_equal(&lhs, &rhs, heap);
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(eq)))
+    NativeResultPair::success(Value::boolean(eq))
 }
 
 /// One numeric unary builtin, reached through the declared leaf ABI.
@@ -1412,25 +1398,25 @@ pub extern "C" fn strict_eq_leaf(
 /// The argument arrives already boxed; a non-numeric argument misses so the
 /// call site falls through to ordinary dispatch rather than performing
 /// coercion here, which could observe user code and is not a leaf operation.
-fn math_unary_leaf(arg_bits: u64, op: fn(f64) -> f64) -> RuntimeStubResult {
+fn math_unary_leaf(arg_bits: u64, op: fn(f64) -> f64) -> NativeResultPair {
     let Some(value) = Value::from_abi_bits(arg_bits).as_f64() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
-    RuntimeStubResult::ok_value(Value::number_f64(op(value)))
+    NativeResultPair::success(Value::number_f64(op(value)))
 }
 
 /// One numeric binary builtin, reached through the declared leaf ABI.
 ///
 /// Both arguments arrive already boxed; either one non-numeric misses, for the
 /// same reason the unary entry does — coercion can observe user code.
-fn math_binary_leaf(lhs_bits: u64, rhs_bits: u64, op: fn(f64, f64) -> f64) -> RuntimeStubResult {
+fn math_binary_leaf(lhs_bits: u64, rhs_bits: u64, op: fn(f64, f64) -> f64) -> NativeResultPair {
     let (Some(lhs), Some(rhs)) = (
         Value::from_abi_bits(lhs_bits).as_f64(),
         Value::from_abi_bits(rhs_bits).as_f64(),
     ) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
-    RuntimeStubResult::ok_value(Value::number_f64(op(lhs, rhs)))
+    NativeResultPair::success(Value::number_f64(op(lhs, rhs)))
 }
 
 /// §21.3.2.24 `Math.max` over two numbers.
@@ -1466,9 +1452,9 @@ pub extern "C" fn math_abs_leaf(
     heap: *const otter_gc::GcHeap,
     arg_bits: u64,
     _unused: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::abs))
+    math_unary_leaf(arg_bits, f64::abs)
 }
 
 /// Leaf ABI entry for `Math.floor`.
@@ -1476,9 +1462,9 @@ pub extern "C" fn math_floor_leaf(
     heap: *const otter_gc::GcHeap,
     arg_bits: u64,
     _unused: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::floor))
+    math_unary_leaf(arg_bits, f64::floor)
 }
 
 /// Leaf ABI entry for `Math.sqrt`.
@@ -1486,9 +1472,9 @@ pub extern "C" fn math_sqrt_leaf(
     heap: *const otter_gc::GcHeap,
     arg_bits: u64,
     _unused: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(math_unary_leaf(arg_bits, f64::sqrt))
+    math_unary_leaf(arg_bits, f64::sqrt)
 }
 
 /// Leaf ABI entry for two-argument `Math.max`.
@@ -1496,9 +1482,9 @@ pub extern "C" fn math_max_leaf(
     heap: *const otter_gc::GcHeap,
     lhs_bits: u64,
     rhs_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(math_binary_leaf(lhs_bits, rhs_bits, js_math_max))
+    math_binary_leaf(lhs_bits, rhs_bits, js_math_max)
 }
 
 /// Leaf ABI entry for two-argument `Math.min`.
@@ -1506,9 +1492,9 @@ pub extern "C" fn math_min_leaf(
     heap: *const otter_gc::GcHeap,
     lhs_bits: u64,
     rhs_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(math_binary_leaf(lhs_bits, rhs_bits, js_math_min))
+    math_binary_leaf(lhs_bits, rhs_bits, js_math_min)
 }
 
 /// Leaf ABI entry for exact-one-argument `parseInt(Int32)`.
@@ -1521,15 +1507,14 @@ pub extern "C" fn parse_int_i32_leaf(
     heap: *const otter_gc::GcHeap,
     arg_bits: u64,
     _unused: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let value = Value::from_abi_bits(arg_bits);
-    let result = if value.is_int32() {
-        RuntimeStubResult::ok_bits(arg_bits)
+    if value.is_int32() {
+        NativeResultPair::success_bits(arg_bits)
     } else {
-        RuntimeStubResult::miss()
-    };
-    RuntimeStubResultPair::from_result(result)
+        NativeResultPair::miss()
+    }
 }
 
 /// Leaf `Map.prototype.get` probe.
@@ -1541,28 +1526,28 @@ pub extern "C" fn collection_map_get_leaf(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(collection_map_get_leaf_inner(heap, recv_bits, key_bits))
+    collection_map_get_leaf_inner(heap, recv_bits, key_bits)
 }
 
 fn collection_map_get_leaf_inner(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     if !leaf_key_is_materialized(heap, key) {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     let Some(map) = recv.as_map() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
-    RuntimeStubResult::ok_value(
+    NativeResultPair::success(
         collections::map_get(map, heap, &key).unwrap_or_else(Value::undefined),
     )
 }
@@ -1584,9 +1569,9 @@ pub extern "C" fn write_barrier_mutating(
     heap: *mut otter_gc::GcHeap,
     parent_header: u64,
     child_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let Some(heap) = heap_mut(heap) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+        return NativeResultPair::miss();
     };
     let child = Value::from_abi_bits(child_bits);
     // SAFETY: the emitted barrier derived this header from the receiver it is
@@ -1594,7 +1579,7 @@ pub extern "C" fn write_barrier_mutating(
     unsafe {
         heap.record_write_at(parent_header as *mut otter_gc::header::GcHeader, &child);
     }
-    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::undefined()))
+    NativeResultPair::success(Value::undefined())
 }
 
 /// Insert or overwrite one `Map` entry in place.
@@ -1603,10 +1588,8 @@ pub extern "C" fn collection_map_set_mutating(
     recv_bits: u64,
     key_bits: u64,
     value_bits: u64,
-) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(collection_map_set_mutating_inner(
-        heap, recv_bits, key_bits, value_bits,
-    ))
+) -> NativeResultPair {
+    collection_map_set_mutating_inner(heap, recv_bits, key_bits, value_bits)
 }
 
 fn collection_map_set_mutating_inner(
@@ -1614,24 +1597,24 @@ fn collection_map_set_mutating_inner(
     recv_bits: u64,
     key_bits: u64,
     value_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(heap) = heap_mut(heap) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     // A key needing materialization for SameValueZero would flatten a string,
     // which a leaf entry may not do.
     if !leaf_key_is_materialized(heap, key) {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     let Some(map) = recv.as_map() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     if collections::map_set_existing(map, heap, &key, Value::from_abi_bits(value_bits)) {
-        RuntimeStubResult::ok_value(recv)
+        NativeResultPair::success(recv)
     } else {
-        RuntimeStubResult::miss()
+        NativeResultPair::miss()
     }
 }
 
@@ -1644,28 +1627,28 @@ pub extern "C" fn collection_map_has_leaf(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(collection_map_has_leaf_inner(heap, recv_bits, key_bits))
+    collection_map_has_leaf_inner(heap, recv_bits, key_bits)
 }
 
 fn collection_map_has_leaf_inner(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     if !leaf_key_is_materialized(heap, key) {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     let Some(map) = recv.as_map() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
-    RuntimeStubResult::ok_value(Value::boolean(collections::map_has(map, heap, &key)))
+    NativeResultPair::success(Value::boolean(collections::map_has(map, heap, &key)))
 }
 
 /// Leaf `Set.prototype.has` probe.
@@ -1677,28 +1660,28 @@ pub extern "C" fn collection_set_has_leaf(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResultPair {
+) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    RuntimeStubResultPair::from_result(collection_set_has_leaf_inner(heap, recv_bits, key_bits))
+    collection_set_has_leaf_inner(heap, recv_bits, key_bits)
 }
 
 fn collection_set_has_leaf_inner(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(heap) = heap_ref(heap) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let recv = Value::from_abi_bits(recv_bits);
     let key = Value::from_abi_bits(key_bits);
     if !leaf_key_is_materialized(heap, key) {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     let Some(set) = recv.as_set() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
-    RuntimeStubResult::ok_value(Value::boolean(collections::set_has(set, heap, &key)))
+    NativeResultPair::success(Value::boolean(collections::set_has(set, heap, &key)))
 }
 
 fn collection_map_set_alloc_inner(
@@ -1707,12 +1690,12 @@ fn collection_map_set_alloc_inner(
     recv_bits: u64,
     key_bits: u64,
     value_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -1727,7 +1710,7 @@ fn collection_map_set_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -1741,11 +1724,11 @@ fn collection_map_set_alloc_inner(
         let key = roots.value(1);
         let value = roots.value(2);
         let Some(map) = recv.as_map() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
         match collections::map_set(map, &mut interp.gc_heap, key, value) {
-            Ok(()) => RuntimeStubResult::ok_value(roots.value(0)),
-            Err(_) => RuntimeStubResult::out_of_memory(),
+            Ok(()) => NativeResultPair::success(roots.value(0)),
+            Err(_) => NativeResultPair::out_of_memory(),
         }
     })()
 }
@@ -1756,12 +1739,12 @@ fn collection_set_add_alloc_inner(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -1776,7 +1759,7 @@ fn collection_set_add_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -1789,11 +1772,11 @@ fn collection_set_add_alloc_inner(
         let recv = roots.value(0);
         let value = roots.value(1);
         let Some(set) = recv.as_set() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
         match collections::set_add(set, &mut interp.gc_heap, value) {
-            Ok(()) => RuntimeStubResult::ok_value(roots.value(0)),
-            Err(_) => RuntimeStubResult::out_of_memory(),
+            Ok(()) => NativeResultPair::success(roots.value(0)),
+            Err(_) => NativeResultPair::out_of_memory(),
         }
     })()
 }
@@ -1804,12 +1787,12 @@ fn collection_map_get_alloc_inner(
     recv_bits: u64,
     key_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -1824,7 +1807,7 @@ fn collection_map_get_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -1837,9 +1820,9 @@ fn collection_map_get_alloc_inner(
         let recv = roots.value(0);
         let key = roots.value(1);
         let Some(map) = recv.as_map() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
-        RuntimeStubResult::ok_value(
+        NativeResultPair::success(
             collections::map_get(map, &interp.gc_heap, &key).unwrap_or_else(Value::undefined),
         )
     })()
@@ -1851,12 +1834,12 @@ fn collection_map_has_alloc_inner(
     recv_bits: u64,
     key_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -1871,7 +1854,7 @@ fn collection_map_has_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -1884,9 +1867,9 @@ fn collection_map_has_alloc_inner(
         let recv = roots.value(0);
         let key = roots.value(1);
         let Some(map) = recv.as_map() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
-        RuntimeStubResult::ok_value(Value::boolean(collections::map_has(
+        NativeResultPair::success(Value::boolean(collections::map_has(
             map,
             &interp.gc_heap,
             &key,
@@ -1900,12 +1883,12 @@ fn collection_set_has_alloc_inner(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -1920,7 +1903,7 @@ fn collection_set_has_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -1933,9 +1916,9 @@ fn collection_set_has_alloc_inner(
         let recv = roots.value(0);
         let value = roots.value(1);
         let Some(set) = recv.as_set() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
-        RuntimeStubResult::ok_value(Value::boolean(collections::set_has(
+        NativeResultPair::success(Value::boolean(collections::set_has(
             set,
             &interp.gc_heap,
             &value,
@@ -1949,12 +1932,12 @@ fn collection_map_delete_alloc_inner(
     recv_bits: u64,
     key_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -1969,7 +1952,7 @@ fn collection_map_delete_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -1982,9 +1965,9 @@ fn collection_map_delete_alloc_inner(
         let recv = roots.value(0);
         let key = roots.value(1);
         let Some(map) = recv.as_map() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
-        RuntimeStubResult::ok_value(Value::boolean(collections::map_delete(
+        NativeResultPair::success(Value::boolean(collections::map_delete(
             map,
             &mut interp.gc_heap,
             &key,
@@ -1998,12 +1981,12 @@ fn collection_set_delete_alloc_inner(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -2018,7 +2001,7 @@ fn collection_set_delete_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -2031,9 +2014,9 @@ fn collection_set_delete_alloc_inner(
         let recv = roots.value(0);
         let value = roots.value(1);
         let Some(set) = recv.as_set() else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
-        RuntimeStubResult::ok_value(Value::boolean(collections::set_delete(
+        NativeResultPair::success(Value::boolean(collections::set_delete(
             set,
             &mut interp.gc_heap,
             &value,
@@ -2047,12 +2030,12 @@ fn string_concat_alloc_inner(
     lhs_bits: u64,
     rhs_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // One-allocation fast path for `<short flat latin1 string> + <int32>` and
     // its mirror — the common key-building shape (`"k" + n`), skipping the
@@ -2063,8 +2046,8 @@ fn string_concat_alloc_inner(
         Value::from_abi_bits(rhs_bits),
     ) {
         return match fast {
-            Ok(value) => RuntimeStubResult::ok_value(value),
-            Err(_) => RuntimeStubResult::out_of_memory(),
+            Ok(value) => NativeResultPair::success(value),
+            Err(_) => NativeResultPair::out_of_memory(),
         };
     }
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -2080,7 +2063,7 @@ fn string_concat_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
@@ -2089,33 +2072,31 @@ fn string_concat_alloc_inner(
         let lhs = roots.value(0);
         let rhs = roots.value(1);
         if lhs.as_string(&interp.gc_heap).is_none() && rhs.as_string(&interp.gc_heap).is_none() {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         }
         let Ok(lhs_string) = (if let Some(string) = lhs.as_string(&interp.gc_heap) {
             Ok(string)
         } else {
             interp.js_string_for_concat(lhs)
         }) else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
         let Ok(rhs_string) = (if let Some(string) = rhs.as_string(&interp.gc_heap) {
             Ok(string)
         } else {
             interp.js_string_for_concat(rhs)
         }) else {
-            return RuntimeStubResult::miss();
+            return NativeResultPair::miss();
         };
         match crate::string::JsString::concat(lhs_string, rhs_string, &mut interp.gc_heap) {
-            Ok(result) => RuntimeStubResult::ok_value(Value::string(result)),
+            Ok(result) => NativeResultPair::success(Value::string(result)),
             // The generated caller owns the exact source FrameState. A logical
             // length overflow is therefore a pre-effect miss: deopt/replay lets
             // the canonical interpreter raise one catchable RangeError. It is
             // not heap exhaustion and must never increment the OOM outcome.
-            Err(crate::string::StringConcatError::StringTooLong { .. }) => {
-                RuntimeStubResult::miss()
-            }
+            Err(crate::string::StringConcatError::StringTooLong { .. }) => NativeResultPair::miss(),
             Err(crate::string::StringConcatError::OutOfMemory(_)) => {
-                RuntimeStubResult::out_of_memory()
+                NativeResultPair::out_of_memory()
             }
         }
     })()
@@ -2127,18 +2108,18 @@ fn array_construct_alloc_inner(
     length_bits: u64,
     padding0_bits: u64,
     padding1_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(length) = Value::from_abi_bits(length_bits).as_i32() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Ok(length) = u32::try_from(length) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame/spill windows stay published for this synchronous call.
@@ -2153,14 +2134,14 @@ fn array_construct_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _call_roots_guard = interp
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     match interp.array_construct_length_runtime_rooted(length) {
-        Ok(array) => RuntimeStubResult::ok_value(array),
-        Err(_) => RuntimeStubResult::out_of_memory(),
+        Ok(array) => NativeResultPair::success(array),
+        Err(_) => NativeResultPair::out_of_memory(),
     }
 }
 
@@ -2192,16 +2173,16 @@ pub extern "C" fn array_pop_leaf(
     heap: *mut otter_gc::GcHeap,
     recv_bits: u64,
     _unused_bits: u64,
-) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(array_pop_leaf_inner(heap, recv_bits))
+) -> NativeResultPair {
+    array_pop_leaf_inner(heap, recv_bits)
 }
 
-fn array_pop_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> RuntimeStubResult {
+fn array_pop_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> NativeResultPair {
     let Some(heap) = heap_mut(heap) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(arr) = Value::from_abi_bits(recv_bits).as_array() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let len = crate::array::len(arr, heap);
     // The last index must be a present own element: a hole would make the
@@ -2210,9 +2191,9 @@ fn array_pop_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> RuntimeS
         || !crate::array::has_own_element(arr, heap, len - 1)
         || !dense_range_is_fast(arr, heap, len - 1, len)
     {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
-    RuntimeStubResult::ok_value(crate::array::pop(arr, heap))
+    NativeResultPair::success(crate::array::pop(arr, heap))
 }
 
 /// Allocating `Array.prototype.push` over a dense array.
@@ -2227,8 +2208,8 @@ pub extern "C" fn array_push_alloc(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         array_push_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
     )
@@ -2240,19 +2221,19 @@ fn array_push_alloc_inner(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // `push` creates a *new* index, so the spec consults the prototype chain
     // for an inherited indexed setter there. The realm protector trips as soon
     // as any indexed accessor is installed anywhere, and generated code cannot
     // read it, so it is part of the stub's precondition set.
     if interp.array_index_accessor_protector {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -2267,17 +2248,17 @@ fn array_push_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let Some(arr) = roots.value(0).as_array() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let len = crate::array::len(arr, &interp.gc_heap);
     if !dense_range_is_fast(arr, &interp.gc_heap, len, len + 1) {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     let value = roots.value(1);
     // Growth may collect; the rooted receiver and pending value are traced so
@@ -2288,9 +2269,9 @@ fn array_push_alloc_inner(
     };
     match crate::array::push_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
         Ok(new_len) => {
-            RuntimeStubResult::ok_value(Value::number(crate::NumberValue::from_f64(new_len as f64)))
+            NativeResultPair::success(Value::number(crate::NumberValue::from_f64(new_len as f64)))
         }
-        Err(_) => RuntimeStubResult::out_of_memory(),
+        Err(_) => NativeResultPair::out_of_memory(),
     }
 }
 
@@ -2300,16 +2281,16 @@ pub extern "C" fn array_shift_leaf(
     heap: *mut otter_gc::GcHeap,
     recv_bits: u64,
     _unused_bits: u64,
-) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(array_shift_leaf_inner(heap, recv_bits))
+) -> NativeResultPair {
+    array_shift_leaf_inner(heap, recv_bits)
 }
 
-fn array_shift_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> RuntimeStubResult {
+fn array_shift_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> NativeResultPair {
     let Some(heap) = heap_mut(heap) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(arr) = Value::from_abi_bits(recv_bits).as_array() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let len = crate::array::len(arr, heap);
     // Every moved index must be a present own element: a hole anywhere in the
@@ -2318,9 +2299,9 @@ fn array_shift_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> Runtim
         || !crate::array::is_fully_dense(arr, heap)
         || !dense_range_is_fast(arr, heap, 0, len)
     {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
-    RuntimeStubResult::ok_value(crate::array::dense_shift(arr, heap))
+    NativeResultPair::success(crate::array::dense_shift(arr, heap))
 }
 
 /// Allocating `Array.prototype.unshift` over a dense array.
@@ -2331,8 +2312,8 @@ pub extern "C" fn array_unshift_alloc(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResultPair {
-    alloc_value_stub_result_pair(
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
         ctx,
         array_unshift_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
     )
@@ -2344,17 +2325,17 @@ fn array_unshift_alloc_inner(
     recv_bits: u64,
     value_bits: u64,
     unused_bits: u64,
-) -> RuntimeStubResult {
+) -> NativeResultPair {
     let Some(ctx) = alloc_context_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     // Head insertion creates a fresh trailing index, so the realm
     // indexed-accessor protector gates it exactly as it gates `push`.
     if interp.array_index_accessor_protector {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
@@ -2369,19 +2350,19 @@ fn array_unshift_alloc_inner(
             ],
         )
     }) else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let _roots_guard = interp
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let Some(arr) = roots.value(0).as_array() else {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     };
     let len = crate::array::len(arr, &interp.gc_heap);
     if !crate::array::is_fully_dense(arr, &interp.gc_heap)
         || !dense_range_is_fast(arr, &interp.gc_heap, len, len + 1)
     {
-        return RuntimeStubResult::miss();
+        return NativeResultPair::miss();
     }
     let value = roots.value(1);
     let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -2390,9 +2371,9 @@ fn array_unshift_alloc_inner(
     };
     match crate::array::dense_unshift_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
         Ok(new_len) => {
-            RuntimeStubResult::ok_value(Value::number(crate::NumberValue::from_f64(new_len as f64)))
+            NativeResultPair::success(Value::number(crate::NumberValue::from_f64(new_len as f64)))
         }
-        Err(_) => RuntimeStubResult::out_of_memory(),
+        Err(_) => NativeResultPair::out_of_memory(),
     }
 }
 
@@ -2473,13 +2454,23 @@ fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
 mod tests {
     use super::*;
     use crate::native_abi::{
-        NO_FRAME_STATE, NativeFrame, NativeFrameFlags, NativeFrameKind, RuntimeStubStatus,
+        NO_FRAME_STATE, NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultStatus,
         TaggedLocation, TaggedLocationKind, VmFrameHeader, VmThread,
     };
     use otter_gc::ExtraRootSource;
 
     fn n(i: i32) -> Value {
         Value::number_i32(i)
+    }
+
+    fn probe_status(result: NativeResultPair) -> NativeResultStatus {
+        result
+            .validate(NativeResultDomain::Probe)
+            .expect("valid probe result")
+    }
+
+    fn probe_value(result: NativeResultPair) -> Option<Value> {
+        (probe_status(result) == NativeResultStatus::Success).then(|| result.payload_value())
     }
 
     fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
@@ -2529,7 +2520,6 @@ mod tests {
         let native_frame = NativeFrame::new(
             VmFrameHeader {
                 function_id: 0,
-                code_block_id: 0,
                 pc: 0,
                 register_count: slots.len() as u16,
                 kind: NativeFrameKind::Baseline,
@@ -2582,8 +2572,8 @@ mod tests {
         for value in [i32::MIN, -1, 0, 1, i32::MAX] {
             let boxed = Value::number_i32(value).to_abi_bits();
             let pair = parse_int_i32_leaf(std::ptr::null(), boxed, 0);
-            assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-            assert_eq!(pair.value_bits, boxed);
+            assert_eq!(probe_status(pair), NativeResultStatus::Success);
+            assert_eq!(pair.payload_bits(), boxed);
         }
 
         for value in [
@@ -2592,7 +2582,7 @@ mod tests {
             Value::boolean(true),
         ] {
             let pair = parse_int_i32_leaf(std::ptr::null(), value.to_abi_bits(), 0);
-            assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+            assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
         }
     }
 
@@ -2681,12 +2671,12 @@ mod tests {
             recv_bits: u64,
             arg0_bits: u64,
             arg1_bits: u64,
-        ) -> RuntimeStubResultPair {
+        ) -> NativeResultPair {
             if ctx.is_null() || safepoint != 9 || recv_bits != 1 || arg0_bits != 2 || arg1_bits != 3
             {
-                return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+                return NativeResultPair::miss();
             }
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(recv_bits))
+            NativeResultPair::success_bits(recv_bits)
         }
 
         let entry: AllocValueStubFn = probe;
@@ -2701,8 +2691,8 @@ mod tests {
         let result = stub
             .invoke_raw(&mut ctx, 9, 1, 2, 3)
             .expect("executable alloc stub");
-        assert_eq!(result.status(), RuntimeStubStatus::Ok);
-        assert_eq!(result.value_bits, 1);
+        assert_eq!(probe_status(result), NativeResultStatus::Success);
+        assert_eq!(result.payload_bits(), 1);
     }
 
     #[test]
@@ -2846,8 +2836,8 @@ mod tests {
         let pair = COLLECTION_MAP_SET_ALLOC
             .invoke_raw(&mut ctx, 21, slots[0], slots[1], slots[2])
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        let result = pair.into_result().into_value().expect("receiver");
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let result = probe_value(pair).expect("receiver");
         let map = result.as_map().expect("map receiver");
         assert_eq!(
             collections::map_get(map, interp.gc_heap_mut(), &Value::string(key)),
@@ -2871,8 +2861,8 @@ mod tests {
         let pair = COLLECTION_SET_ADD_ALLOC
             .invoke_raw(&mut ctx, 22, slots[0], slots[1], slots[2])
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        let result = pair.into_result().into_value().expect("receiver");
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let result = probe_value(pair).expect("receiver");
         let set = result.as_set().expect("set receiver");
         assert!(collections::set_has(
             set,
@@ -2896,8 +2886,8 @@ mod tests {
         let pair = STRING_CONCAT_ALLOC
             .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        let value = pair.into_result().into_value().expect("string");
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let value = probe_value(pair).expect("string");
         let string = value.as_string(interp.gc_heap()).expect("string value");
         assert_eq!(string.to_lossy_string(interp.gc_heap()), "k7");
 
@@ -2910,7 +2900,7 @@ mod tests {
                 slots[2],
             )
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
     }
 
     #[test]
@@ -2927,10 +2917,8 @@ mod tests {
         let pair = ARRAY_CONSTRUCT_ALLOC
             .invoke_raw(&mut ctx, 25, slots[0], slots[1], slots[2])
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        let empty = pair
-            .into_result()
-            .into_value()
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let empty = probe_value(pair)
             .and_then(Value::as_array)
             .expect("empty array");
         assert_eq!(crate::array::len(empty, interp.gc_heap()), 0);
@@ -2938,10 +2926,8 @@ mod tests {
         let pair = ARRAY_CONSTRUCT_ALLOC
             .invoke_raw(&mut ctx, 25, n(8).to_abi_bits(), slots[1], slots[2])
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        let array = pair
-            .into_result()
-            .into_value()
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let array = probe_value(pair)
             .and_then(Value::as_array)
             .expect("length array");
         assert_eq!(crate::array::len(array, interp.gc_heap()), 8);
@@ -2970,7 +2956,7 @@ mod tests {
             let pair = ARRAY_CONSTRUCT_ALLOC
                 .invoke_raw(&mut ctx, 26, invalid.to_abi_bits(), slots[1], slots[2])
                 .expect("entry");
-            assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+            assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
         }
 
         let after = interp.gc_heap().stats();
@@ -2993,7 +2979,7 @@ mod tests {
         let pair = ARRAY_CONSTRUCT_ALLOC
             .invoke_raw(&mut ctx, 27, slots[0], slots[1], slots[2])
             .expect("entry");
-        assert_eq!(pair.status(), RuntimeStubStatus::OutOfMemory);
+        assert_eq!(probe_status(pair), NativeResultStatus::OutOfMemory);
     }
 
     #[test]
@@ -3058,7 +3044,7 @@ mod tests {
             Value::undefined().to_abi_bits(),
             Value::undefined().to_abi_bits(),
         );
-        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
 
         let mut interp = Interpreter::new();
         let safepoints = [SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1)];
@@ -3071,7 +3057,7 @@ mod tests {
             Value::undefined().to_abi_bits(),
             Value::undefined().to_abi_bits(),
         );
-        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
     }
 
     #[test]
@@ -3086,8 +3072,8 @@ mod tests {
             Value::map(map).to_abi_bits(),
             Value::string(key).to_abi_bits(),
         );
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        assert_eq!(pair.into_result().into_value(), Some(n(42)));
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        assert_eq!(probe_value(pair), Some(n(42)));
 
         let result = invoke_leaf_no_alloc_stub2(
             &heap,
@@ -3095,8 +3081,8 @@ mod tests {
             Value::map(map),
             Value::string(key),
         );
-        assert_eq!(result.status, RuntimeStubStatus::Ok);
-        assert_eq!(result.into_value(), Some(n(42)));
+        assert_eq!(probe_status(result), NativeResultStatus::Success);
+        assert_eq!(probe_value(result), Some(n(42)));
     }
 
     #[test]
@@ -3115,8 +3101,8 @@ mod tests {
             Value::map(map).to_abi_bits(),
             Value::string(rope).to_abi_bits(),
         );
-        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
-        assert_eq!(pair.into_result().into_value(), None);
+        assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
+        assert_eq!(probe_value(pair), None);
     }
 
     #[test]
@@ -3163,7 +3149,7 @@ mod tests {
                 insert_map_slots[2],
             )
             .expect("map set entry");
-        assert_eq!(inserted.status(), RuntimeStubStatus::Ok);
+        assert_eq!(probe_status(inserted), NativeResultStatus::Success);
 
         let mut insert_set_slots = [
             Value::set(set).to_abi_bits(),
@@ -3181,14 +3167,14 @@ mod tests {
                 insert_set_slots[2],
             )
             .expect("set add entry");
-        assert_eq!(inserted.status(), RuntimeStubStatus::Ok);
+        assert_eq!(probe_status(inserted), NativeResultStatus::Success);
 
         let leaf = collection_map_has_leaf(
             &interp.gc_heap as *const otter_gc::GcHeap,
             Value::map(map).to_abi_bits(),
             Value::string(lookup_rope).to_abi_bits(),
         );
-        assert_eq!(leaf.status(), RuntimeStubStatus::Miss);
+        assert_eq!(probe_status(leaf), NativeResultStatus::SideExit);
 
         let mut map_slots = [
             Value::map(map).to_abi_bits(),
@@ -3199,23 +3185,20 @@ mod tests {
         let get = COLLECTION_MAP_GET_ALLOC
             .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
             .expect("map get entry");
-        assert_eq!(get.status(), RuntimeStubStatus::Ok);
-        assert_eq!(get.into_result().into_value(), Some(n(77)));
+        assert_eq!(probe_status(get), NativeResultStatus::Success);
+        assert_eq!(probe_value(get), Some(n(77)));
 
         let has = COLLECTION_MAP_HAS_ALLOC
             .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
             .expect("map has entry");
-        assert_eq!(has.status(), RuntimeStubStatus::Ok);
-        assert_eq!(has.into_result().into_value(), Some(Value::boolean(true)));
+        assert_eq!(probe_status(has), NativeResultStatus::Success);
+        assert_eq!(probe_value(has), Some(Value::boolean(true)));
 
         let deleted = COLLECTION_MAP_DELETE_ALLOC
             .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
             .expect("map delete entry");
-        assert_eq!(deleted.status(), RuntimeStubStatus::Ok);
-        assert_eq!(
-            deleted.into_result().into_value(),
-            Some(Value::boolean(true))
-        );
+        assert_eq!(probe_status(deleted), NativeResultStatus::Success);
+        assert_eq!(probe_value(deleted), Some(Value::boolean(true)));
 
         let mut set_slots = [
             Value::set(set).to_abi_bits(),
@@ -3226,17 +3209,14 @@ mod tests {
         let has = COLLECTION_SET_HAS_ALLOC
             .invoke_raw(&mut set_ctx, 23, set_slots[0], set_slots[1], set_slots[2])
             .expect("set has entry");
-        assert_eq!(has.status(), RuntimeStubStatus::Ok);
-        assert_eq!(has.into_result().into_value(), Some(Value::boolean(true)));
+        assert_eq!(probe_status(has), NativeResultStatus::Success);
+        assert_eq!(probe_value(has), Some(Value::boolean(true)));
 
         let deleted = COLLECTION_SET_DELETE_ALLOC
             .invoke_raw(&mut set_ctx, 23, set_slots[0], set_slots[1], set_slots[2])
             .expect("set delete entry");
-        assert_eq!(deleted.status(), RuntimeStubStatus::Ok);
-        assert_eq!(
-            deleted.into_result().into_value(),
-            Some(Value::boolean(true))
-        );
+        assert_eq!(probe_status(deleted), NativeResultStatus::Success);
+        assert_eq!(probe_value(deleted), Some(Value::boolean(true)));
     }
 
     #[test]
@@ -3250,8 +3230,8 @@ mod tests {
             Value::set(set).to_abi_bits(),
             n(7).to_abi_bits(),
         );
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        assert_eq!(pair.into_result().into_value(), Some(Value::boolean(true)));
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        assert_eq!(probe_value(pair), Some(Value::boolean(true)));
     }
 
     #[test]
@@ -3261,8 +3241,8 @@ mod tests {
             Value::undefined().to_abi_bits(),
             Value::undefined().to_abi_bits(),
         );
-        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
-        assert_eq!(pair.into_result().into_value(), None);
+        assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
+        assert_eq!(probe_value(pair), None);
     }
 
     #[test]
@@ -3311,10 +3291,15 @@ mod tests {
                     descriptor.signature,
                     crate::native_abi::RuntimeStubSignature::Poll1
                         | crate::native_abi::RuntimeStubSignature::Variadic
+                        | crate::native_abi::RuntimeStubSignature::ContextWords
                         | crate::native_abi::RuntimeStubSignature::ReentrantValue2
                         | crate::native_abi::RuntimeStubSignature::ReentrantValue3
                         | crate::native_abi::RuntimeStubSignature::ReentrantNamedLoad
                         | crate::native_abi::RuntimeStubSignature::ReentrantNamedStore
+                        | crate::native_abi::RuntimeStubSignature::ReentrantValueSpan
+                        | crate::native_abi::RuntimeStubSignature::CommittedValue2
+                        | crate::native_abi::RuntimeStubSignature::RouteThrow1
+                        | crate::native_abi::RuntimeStubSignature::AcknowledgeCaughtThrow0
                 ));
             }
         }

@@ -604,37 +604,32 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Eval
   |
   | pub struct Gc<T: ?Sized> {
   |            ^^
-note: required because it appears within the type `Option<otter_gc::compressed::Gc<EvalEnvBody>>`
- --> $RUST/core/src/option.rs
+note: required because it appears within the type `Frame`
+ --> src/frame_state.rs
   |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `otter_vm::call_ops::LeanCallbackRoot`
- --> src/call_ops.rs
-  |
-  | pub(crate) struct LeanCallbackRoot {
-  |                   ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `PhantomData<otter_vm::call_ops::LeanCallbackRoot>`
+  | pub struct Frame {
+  |            ^^^^^
+note: required because it appears within the type `PhantomData<Frame>`
  --> $RUST/core/src/marker.rs
   |
   | pub struct PhantomData<T: PointeeSized>;
   |            ^^^^^^^^^^^
-note: required because it appears within the type `alloc::raw_vec::RawVec<otter_vm::call_ops::LeanCallbackRoot>`
+note: required because it appears within the type `alloc::raw_vec::RawVec<Frame>`
  --> $RUST/alloc/src/raw_vec/mod.rs
   |
   | pub(crate) struct RawVec<T, A: Allocator = Global> {
   |                   ^^^^^^
-note: required because it appears within the type `Vec<otter_vm::call_ops::LeanCallbackRoot>`
+note: required because it appears within the type `Vec<Frame>`
  --> $RUST/alloc/src/vec/mod.rs
   |
   | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
   |            ^^^
-note: required because it appears within the type `otter_vm::Interpreter`
- --> src/lib.rs
+note: required because it appears within the type `ActivationStack`
+ --> src/activation_stack.rs
   |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  | pub struct ActivationStack {
+  |            ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ActivationStack`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |

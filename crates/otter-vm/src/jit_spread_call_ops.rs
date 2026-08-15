@@ -6,7 +6,7 @@
 //! - Synchronous full-completion siblings for frame-pushing call/construct
 //!   helpers.
 //! - Canonical `GetMethod + Call` completion for compiled method-call misses.
-//! - Packed-operand dispatch for the template-tier reentrant stub.
+//! - Packed-operand dispatch for the remaining spread/call-family stub.
 //!
 //! # Invariants
 //! - Calls and constructions append to the current rooted activation stack;
@@ -58,7 +58,7 @@ impl Interpreter {
             self.push_iteration_anchor(value);
         }
         let call = |interp: &mut Self, stack: &mut ActivationStack| {
-            let receiver = interp.iteration_anchor(receiver_anchor);
+            let mut receiver = interp.iteration_anchor(receiver_anchor);
             if receiver.is_nullish() {
                 let label = if receiver.is_null() {
                     "null"
@@ -67,19 +67,29 @@ impl Interpreter {
                 };
                 return Err(interp.err_type((format!("Cannot read properties of {label}")).into()));
             }
+            let feedback_site = context.property_ic_site(function_id, call_pc);
+            let capture_site =
+                feedback_site.is_some_and(|site| !interp.method_site_feedback_saturated(site));
+            let method_site = capture_site
+                .then(|| {
+                    interp.method_site_for_receiver(context, function_id, name_index, &mut receiver)
+                })
+                .flatten();
+            // Shape migration may allocate and relocate the receiver. The
+            // iteration anchor is the canonical root used by all resolution
+            // and call steps below.
+            interp.set_iteration_anchor(receiver_anchor, receiver);
             // The compiled site shares the interpreter's method-resolution
             // caches: a shape-guarded own-slot hit, then the load-IC-backed
             // resolution (which serves prototype methods), and only then the
             // per-call `[[Get]]` chain walk.
-            let method_site = context
-                .property_ic_site(function_id, call_pc)
-                .unwrap_or(usize::MAX);
+            let method_ic_site = feedback_site.unwrap_or(usize::MAX);
             let mut method = Value::undefined();
-            if method_site != usize::MAX
+            if method_ic_site != usize::MAX
                 && let Some(obj) = receiver.as_object()
             {
                 if let Some(crate::method_ops::MethodCallIc::Ordinary(hit)) =
-                    interp.feedback_directory.method_ic(method_site)
+                    interp.feedback_directory.method_ic(method_ic_site)
                 {
                     if let Some(cached) =
                         crate::object::load_own_data_slot_by_shape(obj, &interp.gc_heap, hit)
@@ -87,21 +97,22 @@ impl Interpreter {
                     {
                         method = cached;
                     } else {
-                        interp.feedback_directory.clear_method_ic(method_site);
+                        interp.feedback_directory.clear_method_ic(method_ic_site);
                     }
                 }
                 if method.is_undefined()
                     && let Some(atomized_key) =
                         context.property_atom_for_function(function_id, name_index)
-                    && let Some(resolved) = interp.resolve_method_ic(obj, atomized_key, method_site)
+                    && let Some(resolved) =
+                        interp.resolve_method_ic(obj, atomized_key, method_ic_site)
                     && interp.is_callable_runtime(&resolved)
                 {
                     if let Some(hit) = interp
                         .feedback_directory
-                        .mono_load_own_data_hit(method_site)
+                        .mono_load_own_data_hit(method_ic_site)
                     {
                         interp.feedback_directory.install_method_ic(
-                            method_site,
+                            method_ic_site,
                             crate::method_ops::MethodCallIc::Ordinary(hit),
                         );
                     }
@@ -112,12 +123,47 @@ impl Interpreter {
                 let method_key = context
                     .property_atom_for_function(function_id, name_index)
                     .ok_or(VmError::InvalidOperand)?;
+                receiver = interp.iteration_anchor(receiver_anchor);
                 method = interp
                     .get_method_value_for_call(context, stack, receiver, method_key)?
                     .unwrap_or_else(Value::undefined);
             }
             if !interp.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
+            }
+
+            // Match interpreter dispatch's resolved-target publication. A
+            // target is recorded only when the pre-call receiver/holder shape
+            // program names the exact data slot that produced this callable.
+            // Accessors, proxies, exotic receivers, and deep chains therefore
+            // remain unrecorded rather than weakening the generated guard.
+            if let (Some(feedback_site), Some(method_site)) = (feedback_site, method_site) {
+                let method_function = method.as_function().or_else(|| {
+                    method
+                        .as_closure(&interp.gc_heap)
+                        .map(|closure| closure.function_id())
+                });
+                let changed = if let Some(method_function) = method_function {
+                    interp.note_method_target(feedback_site, method_function, method_site)
+                } else {
+                    method
+                        .as_native_function()
+                        .and_then(|native| {
+                            crate::jit_static_native::jit_static_call_target(
+                                native,
+                                &interp.gc_heap,
+                            )
+                        })
+                        .filter(|declaration| usize::from(declaration.argument_count) == args_len)
+                        .is_some_and(|declaration| {
+                            interp.record_method_native_leaf_feedback(
+                                feedback_site,
+                                declaration.leaf_stub_id,
+                                method_site,
+                            )
+                        })
+                };
+                interp.commit_method_call_feedback_transition(function, function_id, changed);
             }
             let receiver = interp.iteration_anchor(receiver_anchor);
             let mut rooted_args = SmallVec::with_capacity(args_len);
@@ -496,37 +542,6 @@ impl Interpreter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_method_call_full_regs(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        dst: u16,
-        receiver_reg: u16,
-        name_index: u32,
-        arg_regs: &[u16],
-    ) -> Result<(), VmError> {
-        let receiver = *read_register(&stack[frame_index], receiver_reg)?;
-        let function_id = stack[frame_index].function_id;
-        let call_pc = stack[frame_index].pc;
-        let mut args = SmallVec::with_capacity(arg_regs.len());
-        for &reg in arg_regs {
-            args.push(*read_register(&stack[frame_index], reg)?);
-        }
-        let result = self.jit_runtime_method_call_values(
-            context,
-            stack,
-            function_id,
-            call_pc,
-            receiver,
-            name_index,
-            args,
-        )?;
-        write_register(&mut stack[frame_index], dst, result)?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn run_construct_spread_full_regs(
         &mut self,
         context: &ExecutionContext,
@@ -570,9 +585,7 @@ impl Interpreter {
         if frame_index + 1 != stack.len() {
             return Err(VmError::InvalidOperand);
         }
-        if opcode != Op::CallMethodValue as u8 {
-            self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        }
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if matches!(
             opcode,
             value
@@ -616,18 +629,6 @@ impl Interpreter {
                     lane(arg0, 0),
                     lane(arg0, 1),
                     Some(lane(arg0, 2)),
-                    &regs,
-                )?;
-            }
-            value if value == Op::CallMethodValue as u8 => {
-                let regs = packed_regs(arg1, lane(arg0, 2) as usize);
-                self.run_method_call_full_regs(
-                    context,
-                    stack,
-                    frame_index,
-                    lane(arg0, 0),
-                    lane(arg0, 1),
-                    arg2 as u32,
                     &regs,
                 )?;
             }

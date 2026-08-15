@@ -188,21 +188,6 @@ pub struct ColdFrame {
     /// `super()` can bind the original constructor environment even
     /// when the arrow runs through a nested sync dispatch.
     pub derived_this_cell: Option<UpvalueCell>,
-    /// Var-scoped bindings a direct eval introduced into this frame's
-    /// variable environment at runtime (§19.2.1.3
-    /// EvalDeclarationInstantiation step 16.b). Consulted by
-    /// [`otter_bytecode::Op::LoadDynamic`] /
-    /// [`otter_bytecode::Op::StoreDynamic`] /
-    /// [`otter_bytecode::Op::TypeofDynamic`] before the global
-    /// fallback, and folded into the caller scope handed to any later
-    /// direct eval from the same frame.
-    pub eval_vars: Option<Box<rustc_hash::FxHashMap<String, crate::UpvalueCell>>>,
-    /// §9.1 variable-environment record for direct eval — the
-    /// GC-owned, closure-shareable successor of `eval_vars`.
-    /// Created at frame entry for `contains_direct_eval` functions;
-    /// closures made in this frame capture the handle so
-    /// eval-introduced bindings outlive the frame.
-    pub eval_env: Option<crate::eval_env::EvalEnvHandle>,
 }
 
 impl ColdFrame {
@@ -225,8 +210,61 @@ impl ColdFrame {
             && self.active_iterator_closers.is_empty()
             && !self.is_derived_constructor
             && self.derived_this_cell.is_none()
-            && self.eval_vars.is_none()
-            && self.eval_env.is_none()
+    }
+
+    /// Whether exact deoptimization may replace only this record's static
+    /// catch-handler stack.
+    ///
+    /// Suspension owners, in-flight protocol ladders, parked `finally`
+    /// completions, iterator-close regions, and non-catch handlers carry
+    /// dynamic control state that cannot be derived from a resume PC. The
+    /// remaining fields are activation state independent of the handler stack
+    /// and must survive reconstruction unchanged.
+    ///
+    /// This destructuring is deliberately exhaustive: adding a cold-frame
+    /// field requires an explicit audit of whether static deopt reconstruction
+    /// preserves or rejects it.
+    #[must_use]
+    pub(crate) fn supports_static_catch_rebuild(&self) -> bool {
+        let Self {
+            acquired,
+            async_state,
+            generator_owner,
+            pending_to_primitive,
+            pending_bind_function,
+            pending_get_iterator,
+            pending_iterator_next,
+            parked_finally,
+            construct_target,
+            new_target,
+            rest_args,
+            incoming_args,
+            handlers,
+            active_iterator_closers,
+            is_derived_constructor,
+            derived_this_cell,
+        } = self;
+        let _preserved = (
+            acquired,
+            construct_target,
+            new_target,
+            rest_args,
+            incoming_args,
+            is_derived_constructor,
+            derived_this_cell,
+        );
+
+        async_state.is_none()
+            && generator_owner.is_none()
+            && pending_to_primitive.is_none()
+            && pending_bind_function.is_none()
+            && pending_get_iterator.is_none()
+            && pending_iterator_next.is_none()
+            && parked_finally.is_empty()
+            && active_iterator_closers.is_empty()
+            && handlers
+                .iter()
+                .all(|handler| handler.catch_pc.is_some() && handler.finally_pc.is_none())
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -285,16 +323,6 @@ impl ColdFrame {
         }
         for (v, _) in &self.active_iterator_closers {
             v.trace_value_slots(visitor);
-        }
-        if let Some(map) = &self.eval_vars {
-            for cell in map.values() {
-                let p = cell as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
-                visitor(p);
-            }
-        }
-        if let Some(env) = &self.eval_env {
-            let p = env as *const crate::eval_env::EvalEnvHandle as *mut otter_gc::raw::RawGc;
-            visitor(p);
         }
     }
 }

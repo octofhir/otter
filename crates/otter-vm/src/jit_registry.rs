@@ -201,14 +201,18 @@ impl JitCodeRegistry {
             flags,
             code.generated_stack_frame_bytes().unwrap_or(0),
         ));
-        self.register_inner(code_object_id, code, Some(entry_cell))
+        self.register_inner(
+            code_object_id,
+            code,
+            Some((entry_cell, param_count, register_count)),
+        )
     }
 
     fn register_inner(
         &mut self,
         code_object_id: u64,
         code: Arc<dyn JitFunctionCode>,
-        entry_cell: Option<Box<CodeEntryCell>>,
+        entry_cell: Option<(Box<CodeEntryCell>, u16, u16)>,
     ) -> bool {
         debug_assert_ne!(code_object_id, 0);
         debug_assert_eq!(code.metadata().id, code_object_id);
@@ -237,10 +241,8 @@ impl JitCodeRegistry {
             },
         );
         debug_assert!(replaced.is_none(), "code-object ids are never reused");
-        if let Some(entry_cell) = entry_cell {
-            let function_id = entry_cell.function_id;
-            let param_count = entry_cell.param_count;
-            let register_count = entry_cell.register_count;
+        if let Some((entry_cell, param_count, register_count)) = entry_cell {
+            let function_id = entry_cell.native_frame_header.function_id;
             let function_entry =
                 self.function_entry_cells
                     .entry(function_id)
@@ -477,11 +479,16 @@ impl JitCodeRegistry {
         let mut generations = Vec::with_capacity(self.entry_cells.len());
         for (&code_object_id, cell) in &self.entry_cells {
             debug_assert_eq!(cell.code_object_id, code_object_id);
+            let function_id = cell.native_frame_header.function_id;
+            let function_entry = self
+                .function_entry_cells
+                .get(&function_id)
+                .expect("every generation retains its permanent function cell");
             let registered = self.codes.get(&code_object_id);
             let (entries, returns, deopts, throws, streak) = cell.generated_feedback();
             generations.push(JitCodeGenerationSnapshot {
                 code_object_id,
-                function_id: cell.function_id,
+                function_id,
                 tier: if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
                     NativeFrameKind::Baseline
                 } else {
@@ -491,8 +498,8 @@ impl JitCodeRegistry {
                     .map_or(CodeLifetimeState::Retired, |registered| registered.state),
                 linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
                 active_count: cell.active_count(),
-                param_count: cell.param_count,
-                register_count: cell.register_count,
+                param_count: function_entry.param_count,
+                register_count: function_entry.register_count,
                 generated_entries: entries,
                 generated_returns: returns,
                 generated_deopts: deopts,
@@ -527,7 +534,7 @@ impl JitCodeRegistry {
                 .entry(code_object_id)
                 .or_default();
             let delta = GeneratedCallFeedback {
-                function_id: cell.function_id,
+                function_id: cell.native_frame_header.function_id,
                 code_object_id,
                 tier: if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
                     NativeFrameKind::Baseline
@@ -563,7 +570,7 @@ impl JitCodeRegistry {
             NativeFrameKind::Optimizing
         };
         Some(GeneratedDeoptState {
-            function_id: cell.function_id,
+            function_id: cell.native_frame_header.function_id,
             tier,
             entries,
             deopts,
@@ -576,7 +583,7 @@ impl JitCodeRegistry {
     pub(crate) fn generation_function_id(&self, code_object_id: u64) -> Option<u32> {
         self.entry_cells
             .get(&code_object_id)
-            .map(|cell| cell.function_id)
+            .map(|cell| cell.native_frame_header.function_id)
     }
 
     /// Address of the published view for [`crate::native_abi::VmThread`].
@@ -868,8 +875,9 @@ mod tests {
         // SAFETY: entry cells are boxed and retained for the registry lifetime.
         let cell = unsafe { &*(cell_addr as *const CodeEntryCell) };
         assert_eq!(cell.code_object_id, 13);
-        assert_eq!(cell.param_count, 2);
-        assert_eq!(cell.register_count, 9);
+        let function_cell = &registry.function_entry_cells[&cell.native_frame_header.function_id];
+        assert_eq!(function_cell.param_count, 2);
+        assert_eq!(function_cell.register_count, 9);
         assert!(cell.try_acquire().is_some());
 
         registry.invalidate_function(0);
@@ -936,7 +944,7 @@ mod tests {
         // SAFETY: generation cells are stable for the registry lifetime.
         let optimizing_cell =
             unsafe { &*(registry.entry_cell_addr(102).unwrap() as *const CodeEntryCell) };
-        assert_eq!(optimizing_cell.register_count, 9);
+        assert_eq!(registry.function_entry_cells[&7].register_count, 9);
         assert_eq!(optimizing_cell.native_frame_header.register_count, 2);
 
         assert_eq!(registry.invalidate_code_object(102), vec![7]);

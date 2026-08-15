@@ -20,7 +20,7 @@ use otter_vm::native_abi as abi;
 
 use super::values::{emit_load_runtime_stub, emit_load_u64};
 use crate::artifact::relocation::RelocationCapture;
-use crate::entry::{NATIVE_FRAME_PC_OFFSET, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED};
+use crate::entry::NATIVE_FRAME_PC_OFFSET;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_exception_op(
@@ -33,7 +33,8 @@ pub(super) fn emit_exception_op(
     arg2: u64,
     bail: DynamicLabel,
     returned: DynamicLabel,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     let resume = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -52,13 +53,15 @@ pub(super) fn emit_exception_op(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cmp x1, STATUS_CONTINUE as u32
+        ; cmp x1, abi::NativeResultStatus::Continue as u32
         ; b.eq =>done
-        ; cmp x1, STATUS_RETURNED as u32
+        ; cmp x1, abi::NativeResultStatus::Success as u32
         ; b.eq =>returned
-        ; cmp x1, STATUS_BAILED as u32
+        ; cmp x1, abi::NativeResultStatus::SideExit as u32
         ; b.eq =>resume
-        ; b =>threw
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
         ; =>resume
         ; str w0, [x21, NATIVE_FRAME_PC_OFFSET]
         ; b =>bail

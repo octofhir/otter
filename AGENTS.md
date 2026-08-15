@@ -325,6 +325,15 @@ mutate through the explicit context APIs (`NativeCtx::alloc[_old]`,
 mutation, raw slot visitors, `otter_gc::raw::*`, or manual write
 barriers from contributor-facing code.
 
+The compiled-code ABI is private engine plumbing, not an extension or FFI
+contract. `NativeFrame`, safepoint/root records, runtime-stub ids, and compiled
+result pairs may cross `otter-jit` ↔ `otter-vm` only. Native extensions and any
+future Node-facing modules must enter through the high-level `NativeCtx` /
+handle-scope API; do not reuse JIT frame or status layouts as a second GC entry.
+Physically identical engine carriers must have one owner and one type. Express
+different legal status subsets through descriptor-domain validation, not
+parallel structs, aliases, constructors, decoders, or duplicate test matrices.
+
 ## Platform Support
 
 Pure Rust implementation - no external JavaScript engine dependencies.
@@ -364,9 +373,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     be spliced; `compilePrepared` reports `directConstructs`, `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
     `globalLoadSites` counts analyzed global reads, `globalLexicalLoads`
-    counts permanent global-declarative cells, `stringConstantLoads` counts
-    materialized literals with stable traced cells, and `globalObjectLoads`
-    counts guarded global-object slots available for direct reads. Capture is
+    counts permanent global-declarative cells, `stringConstantCells` counts
+    eagerly prepared stable traced literal cells,
+    and `globalObjectLoads` counts guarded global-object slots available for direct reads. Capture is
     default-off and bounded to 16,384 events per top-level run; `truncated`
     and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still
@@ -406,25 +415,25 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     undefined, and non-cell primitives complete without reentry. Every
     non-nullish Cell exact-deoptimizes before the Boolean destination is
     defined so the canonical path remains authoritative for HTMLDDA objects.
-  - Prepared string literals expose `stringConstantCell` relocations keyed by
+  - String literals are canonicalized before the compile snapshot and expose
+    `stringConstantCell` relocations keyed by
     function id and byte PC. Exact addresses are redacted. Generated code reads
     the current value from an address-stable GC-traced cell; moving collection
     rewrites that cell in place, and no moving string handle is baked into code.
-    Cold literals retain the canonical transition and keep an optimizing body
-    ineligible until a later compile snapshot can publish the cell.
-  - Inspect the first line of `optimized-ir.txt`: general legacy lowering emits
-    the deterministic Otter optimized unit, while a scalar function compiled
-    by the replacement pipeline starts with `; backend=otter-machine-ir
-    scalar-function` and contains normalized Machine IR plus allocation. Its
-    code map uses the `machineScalarFunction` structural region. The legacy
-    unit's summary reports copy-web, coalesced-value, inactive-value, raw-spill,
-    and post-deopt spill counts. Exact-bit `LoadLocal` / `StoreLocal` / `Reuse`
-    webs share one home; unread rematerializable heads own no emitted state.
+    If a cold literal cannot be materialized with active frame roots, optional
+    compilation declines without publishing a code object or JavaScript error.
+  - Every optimizing `optimized-ir.txt` starts with
+    `; backend=otter-machine-ir scalar-function` and contains normalized
+    Machine IR plus allocation. Its code map uses the
+    `machineScalarFunction` structural region. A function that Machine cannot
+    compile stays on the Template tier; there is no second optimizing IR,
+    allocator, or emitter fallback.
     Machine direct data access is attributed by `machineElementLoad` /
     `machineElementStore`, `machinePackedDoubleElementLoad` /
     `machinePackedDoubleElementStore`, and `machinePropertyLoad` /
     `machinePropertyStore`, each with `bytePc`; direct captured-cell reads use
-    `machineUpvalueLoad`. Ordinary packed-double Array operations prove the
+    `machineUpvalueLoad`, while prepared literals use
+    `machineStringConstantLoad`. Ordinary packed-double Array operations prove the
     exact exotic and physical-kind guards, keep the element payload in Float64
     SSA, and use an exact Float64-to-Uint32 index check. Integral values and
     `-0` stay generated; fractions, negatives, NaN, and values beyond Uint32
@@ -435,8 +444,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     These regions clear raw view caches, publish precise moving roots, and call
     the canonical fixed boxed-value `[[Get]]` / `[[Set]]` boundary. Success or
     throw commits exactly once; it never deoptimizes and replays the source
-    operation. Generic accesses protected by a local catch remain on a
-    materialized backend until Machine committed-throw landing is available.
+    operation. Generic accesses protected by a local catch remain on the
+    Template tier until the fast probe and committed cold call are represented
+    as explicit Machine CFG before register allocation. The fixed boundary
+    already returns a pure exception value and must not stay hidden inside an
+    emitter pseudo-operation.
     Reducible non-reentrant loops may group invariant packed-double receivers
     into bounded native-stack view caches. `optimized-ir.txt` reports
     `packed-double-view-caches=<N>` and annotates each packed access with its
@@ -457,8 +469,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     terminal prototype; dictionary-backed `%Object.prototype%` additions stay
     on the canonical store boundary. Runtime success or throw commits exactly
     once; a property miss never deoptimizes and replays the source operation.
-    Property operations protected by a local catch remain on a materialized
-    backend until Machine committed-throw landing is available.
+    Property operations protected by a local catch remain on the Template tier
+    until their fast probe and committed cold call become explicit Machine CFG
+    before register allocation. The fixed property boundary already returns a
+    pure exception value; no emitter-hidden call may bypass SSA landing and GC
+    liveness.
     Primitive-string and dense-array `.length` share the property-load region;
     unsigned lengths outside int32 exit to canonical Number boxing. A fixed
     TypedArray view over a resizable ArrayBuffer also guards its complete baked
@@ -535,10 +550,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     prototype chain, fixed, spread, and generated-super receivers start with
     undefined own slots and their bodies perform ordinary existing-slot stores.
     The observable region is the pre-effect miss fallback.
-    The legacy optimizing backend retains that compact canonical construct
-    transition for parameter-free callees with at most three frame registers;
-    `directCallLowered` reports `unprofitable` instead of presenting
-    this deliberate code-size decision as a layout failure.
+    When Machine deliberately declines a construct plan for code-size or
+    profitability reasons, the function remains on Template;
+    `directCallLowered` reports `unprofitable` instead of presenting that
+    decision as a layout failure.
     Non-simple class-chain fields and exact ordinary function-constructor
     fields may expose `machineConstructorFieldTransition`; this region guards
     the receiver and complete ordinary prototype chain before committing one

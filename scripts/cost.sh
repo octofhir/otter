@@ -74,7 +74,6 @@ axes = {
     "ic_miss": total(
         "property-ic-load-misses",
         "property-ic-store-misses",
-        "property-ic-has-misses",
     ),
     "ic_install": total(
         "property-ic-load-installs",

@@ -67,9 +67,10 @@ use crate::{
         CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
         CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
         FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GC_PAGE_SIZE, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
-        NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_EVAL_ENV_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
+        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NEW_FROM_SPACE_KIND,
         OBJECT_BODY_TYPE_TAG, PAGE_ALLOCATED_BYTES_OFFSET, PAGE_BUMP_CURSOR_OFFSET,
         PAGE_SPACE_OFFSET, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
@@ -77,9 +78,9 @@ use crate::{
         RECEIVER_ALLOC_PAGE_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
         RECEIVER_ALLOC_TRACKED_BYTES_OFFSET, RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
         RECEIVER_ALLOC_TYPE_COUNT_OFFSET, RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
-        RUNTIME_STATS_OFFSET, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET, Unsupported,
-        VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
-        VM_THREAD_CURRENT_FRAME_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
+        RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
+        VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
     },
 };
 
@@ -431,6 +432,12 @@ fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
     }
 }
 
+/// Synthesize the one canonical structural-failure pair.
+fn emit_fatal_pair(ops: &mut Assembler) {
+    emit_load_u64(ops, 0, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; mov x1, abi::NativeResultStatus::Fatal as u64);
+}
+
 /// Branch on the exact ECMAScript Object-vs-primitive split for one tagged
 /// value. Function-id immediates and every non-primitive GC body are Objects;
 /// strings, symbols, and bigints are the only primitive cell families.
@@ -727,8 +734,9 @@ pub(crate) fn direct_call_artifact(
 
 /// Emit one complete generated call.
 ///
-/// `bail` names the caller's exact pre-effect deopt exit. `threw` handles a
-/// parked exception after the generated frame has been fully unwound.
+/// `bail` names the caller's exact pre-effect deopt exit. `finish_error`
+/// normalizes a parked runtime error, `throw_value` carries a pure JavaScript
+/// exception in `x0`, and `fatal` propagates only `ctx.error`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_direct_call(
     ops: &mut Assembler,
@@ -740,7 +748,9 @@ pub(crate) fn emit_direct_call(
     initialize_upvalues_entry: u64,
     code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
-    threw: DynamicLabel,
+    finish_error: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_direct_call_with_access(
@@ -757,7 +767,9 @@ pub(crate) fn emit_direct_call(
         initialize_upvalues_entry,
         code_map,
         bail,
-        threw,
+        finish_error,
+        throw_value,
+        fatal,
         done,
         20,
         |ops, source, target, _| {
@@ -804,7 +816,9 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     initialize_upvalues_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
-    threw: DynamicLabel,
+    finish_error: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
     done: DynamicLabel,
     context_register: u8,
     mut load: Load,
@@ -829,12 +843,15 @@ where
     let entry_rejected = ops.new_dynamic_label();
     let callee_returned = ops.new_dynamic_label();
     let callee_bailed = ops.new_dynamic_label();
+    let callee_threw = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
     let cleanup = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
-    let cleanup_threw = ops.new_dynamic_label();
+    let cleanup_abrupt = ops.new_dynamic_label();
     let caller_bail = ops.new_dynamic_label();
-    let construct_prepare_threw = ops.new_dynamic_label();
+    let construct_prepare_error = ops.new_dynamic_label();
+    let construct_prepare_throw = ops.new_dynamic_label();
+    let construct_prepare_fatal = ops.new_dynamic_label();
     let construct_prepare_ready = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
@@ -865,6 +882,7 @@ where
                 // closure. No safepoint or mutation occurs between guards.
                 ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
                 ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+                ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
             );
             load(ops, receiver, 12, 0)?;
             dynasm!(ops
@@ -873,6 +891,7 @@ where
                 ; =>direct_function
                 ; mov x10, xzr
                 ; mov w11, wzr
+                ; mov w15, wzr
             );
             load(ops, receiver, 12, 0)?;
         }
@@ -919,6 +938,7 @@ where
                 ; b.ne =>caller_bail
                 ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
                 ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+                ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
             );
 
             if site.target.plan.this_mode == JitDirectCallThisMode::StrictOrLexical {
@@ -937,6 +957,7 @@ where
                     ; =>direct_function
                     ; mov x10, xzr
                     ; mov w11, wzr
+                    ; mov w15, wzr
                 );
                 if let Some(receiver) = explicit_receiver {
                     load(ops, receiver, 12, 0)?;
@@ -970,6 +991,7 @@ where
                     ; =>direct_function
                     ; mov x10, xzr
                     ; mov w11, wzr
+                    ; mov w15, wzr
                 );
                 emit_load_sloppy_global_this(ops, relocations, view, context_register);
             }
@@ -1025,10 +1047,12 @@ where
                 ; b.ne =>caller_bail
                 ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
                 ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+                ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
                 ; b =>callable_ready
                 ; =>direct_function
                 ; mov x10, xzr
                 ; mov w11, wzr
+                ; mov w15, wzr
                 ; b =>callable_ready
                 ; =>class_wrapper
                 ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
@@ -1063,6 +1087,7 @@ where
         ; str x25, [sp, layout.saved_x25]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
         ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+        ; str w15, [sp, NATIVE_FRAME_EVAL_ENV_OFFSET]
     );
     match site.form {
         form if form.is_construct() => {
@@ -1084,7 +1109,7 @@ where
             dynasm!(ops
                 ; .arch aarch64
                 ; stp x12, x13, [sp, NATIVE_FRAME_THIS_OFFSET as i32]
-                ; str x11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+                ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             );
         }
         _ => unreachable!("construct forms handled above"),
@@ -1174,8 +1199,10 @@ where
         ; ldr x16, [x25]
         ; cbz x16, =>entry_rejected
         ; str x16, [sp, layout.entry_addr]
-        ; ldp x13, x14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32]
-        ; stp x13, x14, [sp]
+        ; ldr x13, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET]
+        ; ldr w14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET + 8]
+        ; str x13, [sp]
+        ; str w14, [sp, 8]
         ; add x14, sp, NATIVE_FRAME_STACK_SIZE
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
@@ -1271,10 +1298,14 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
-            ; cmp x1, STATUS_RETURNED as u32
+            ; cmp x1, abi::NativeResultStatus::Success as u32
             ; b.eq =>construct_prepare_ready
-            ; cmp x1, STATUS_BAILED as u32
-            ; b.ne =>construct_prepare_threw
+            ; cmp x1, abi::NativeResultStatus::SideExit as u32
+            ; b.eq >observable_prepare
+            ; cmp x1, abi::NativeResultStatus::Throw as u32
+            ; b.eq =>construct_prepare_error
+            ; b =>construct_prepare_fatal
+            ; observable_prepare:
         );
         if site.target.receiver_allocation.is_some() {
             record_region(
@@ -1323,8 +1354,11 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
-            ; cmp x1, STATUS_RETURNED as u32
-            ; b.ne =>construct_prepare_threw
+            ; cmp x1, abi::NativeResultStatus::Success as u32
+            ; b.eq =>construct_prepare_ready
+            ; cmp x1, abi::NativeResultStatus::Throw as u32
+            ; b.eq =>construct_prepare_throw
+            ; b =>construct_prepare_fatal
             ; =>construct_prepare_ready
         );
         record_region(
@@ -1376,16 +1410,19 @@ where
             ; =>closure_constructor
             ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
             ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+            ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
             ; b =>constructor_state_ready
             ; =>direct_constructor
             ; mov x10, xzr
             ; mov w11, wzr
+            ; mov w15, wzr
             ; =>constructor_state_ready
             ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
             ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
             ; str x14, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
             ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
             ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+            ; str w15, [sp, NATIVE_FRAME_EVAL_ENV_OFFSET]
         );
         if let DirectCallArguments::Fixed(arguments) = site.arguments {
             for (argument, &source) in arguments.iter().take(copied_argument_count).enumerate() {
@@ -1434,10 +1471,12 @@ where
             ; =>closure_constructor
             ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
             ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
+            ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
             ; b =>constructor_state_ready
             ; =>direct_constructor
             ; mov x10, xzr
             ; mov w11, wzr
+            ; mov w15, wzr
             ; =>constructor_state_ready
         );
         if site.form.inherits_new_target() {
@@ -1455,6 +1494,7 @@ where
             ; str x14, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
             ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
             ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+            ; str w15, [sp, NATIVE_FRAME_EVAL_ENV_OFFSET]
             ; ldrb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
             ; orr w15, w15, abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as u32
             ; strb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
@@ -1486,12 +1526,18 @@ where
             initialize_upvalues_entry,
             abi::STUB_JIT_INITIALIZE_UPVALUES,
         );
+        let initialized = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
-            ; cmp x0, #2
-            ; b.eq =>construct_prepare_threw
-            ; cbnz x0, =>uncommitted_rejected
+            ; cmp x1, abi::NativeResultStatus::Success as u32
+            ; b.eq =>initialized
+            ; cmp x1, abi::NativeResultStatus::SideExit as u32
+            ; b.eq =>uncommitted_rejected
+            ; cmp x1, abi::NativeResultStatus::Throw as u32
+            ; b.eq =>construct_prepare_error
+            ; b =>construct_prepare_fatal
+            ; =>initialized
         );
     }
     if let DirectCallArguments::Spread(arguments) = site.arguments {
@@ -1573,15 +1619,24 @@ where
     );
 
     let return_start = ops.offset().0;
+    let invalid_callee_result = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x1, STATUS_BAILED as u32
+        ; cmp x1, abi::NativeResultStatus::SideExit as u32
         ; b.eq =>callee_bailed
-        ; cmp x1, STATUS_RETURNED as u32
+        ; cmp x1, abi::NativeResultStatus::Success as u32
         ; b.eq =>callee_returned
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>callee_threw
+        ; cmp x1, abi::NativeResultStatus::Fatal as u32
+        ; b.eq =>result_ready
+        ; b =>invalid_callee_result
+        ; =>callee_threw
     );
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
     emit_reset_generated_bail_streak(ops);
+    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>invalid_callee_result);
+    emit_fatal_pair(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
     if site.form.prepared_receiver().is_some() {
         let result_start = ops.offset().0;
@@ -1613,6 +1668,7 @@ where
         let primitive = ops.new_dynamic_label();
         let cold = ops.new_dynamic_label();
         let ready = ops.new_dynamic_label();
+        let invalid_construct_result = ops.new_dynamic_label();
         emit_object_type_branch(ops, relocations, view, 0, object, primitive);
         dynasm!(ops ; .arch aarch64 ; =>primitive);
         emit_load_u64(ops, 9, VALUE_UNDEFINED);
@@ -1655,7 +1711,20 @@ where
             derived_construct_result_entry,
             abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
         );
-        dynasm!(ops ; .arch aarch64 ; blr x16);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x1, abi::NativeResultStatus::Success as u32
+            ; b.eq =>ready
+            ; cmp x1, abi::NativeResultStatus::Throw as u32
+            ; b.eq =>callee_threw
+            ; cmp x1, abi::NativeResultStatus::Fatal as u32
+            ; b.eq =>result_ready
+            ; b =>invalid_construct_result
+        );
+        dynasm!(ops ; .arch aarch64 ; =>invalid_construct_result);
+        emit_fatal_pair(ops);
+        dynasm!(ops ; .arch aarch64 ; b =>result_ready);
         record_region(
             &mut code_map,
             "directConstructResultThrow",
@@ -1671,9 +1740,16 @@ where
         ; .arch aarch64
         ; b =>result_ready
         ; =>callee_bailed
+        ; mov x7, x0
+        ; ldr w14, [sp, NATIVE_FRAME_PC_OFFSET]
+        ; cmp x0, x14
+        ; b.eq >callee_bail_pc_valid
     );
+    emit_fatal_pair(ops);
+    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; callee_bail_pc_valid:);
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_DEOPTS_OFFSET);
     emit_increment_feedback_u32(ops, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET);
+    let invalid_deopt_result = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, X(context_register)
@@ -1709,9 +1785,17 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cmp x1, STATUS_RETURNED as u32
-        ; b.ne =>result_ready
+        ; cmp x1, abi::NativeResultStatus::Success as u32
+        ; b.eq =>result_ready
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>callee_threw
+        ; cmp x1, abi::NativeResultStatus::Fatal as u32
+        ; b.eq =>result_ready
+        ; b =>invalid_deopt_result
     );
+    dynasm!(ops ; .arch aarch64 ; =>invalid_deopt_result);
+    emit_fatal_pair(ops);
+    dynasm!(ops ; .arch aarch64 ; b =>result_ready);
     dynasm!(ops ; .arch aarch64 ; =>result_ready ; b =>cleanup);
     record_region(
         &mut code_map,
@@ -1744,16 +1828,29 @@ where
         ; .arch aarch64
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
-        ; cmp x1, STATUS_RETURNED as u32
+        ; cmp x1, abi::NativeResultStatus::Success as u32
         ; b.eq =>returned
-        ; b =>cleanup_threw
+        ; b =>cleanup_abrupt
     );
     dynasm!(ops ; .arch aarch64 ; =>returned);
     restore_roots(ops)?;
     store(ops, site.dst, 0, 0)?;
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>cleanup_threw);
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>cleanup_abrupt);
+    let cleanup_throw = ops.new_dynamic_label();
+    let cleanup_fatal = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>cleanup_throw
+        ; cmp x1, abi::NativeResultStatus::Fatal as u32
+        ; b.eq =>cleanup_fatal
+    );
+    emit_fatal_pair(ops);
+    dynasm!(ops ; .arch aarch64 ; =>cleanup_fatal);
     restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>threw);
+    dynasm!(ops ; .arch aarch64 ; b =>fatal ; =>cleanup_throw ; mov x17, x0);
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
     record_region(
         &mut code_map,
         "directCallCleanup",
@@ -1791,12 +1888,31 @@ where
 
     dynasm!(ops
         ; .arch aarch64
-        ; =>construct_prepare_threw
+        ; =>construct_prepare_error
         ; ldr x25, [sp, layout.saved_x25]
         ; add sp, sp, layout.frame_bytes
     );
     restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>threw);
+    dynasm!(ops ; .arch aarch64 ; b =>finish_error);
+
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>construct_prepare_throw
+        ; mov x17, x0
+        ; ldr x25, [sp, layout.saved_x25]
+        ; add sp, sp, layout.frame_bytes
+    );
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
+
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>construct_prepare_fatal
+        ; ldr x25, [sp, layout.saved_x25]
+        ; add sp, sp, layout.frame_bytes
+    );
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; b =>fatal);
 
     Ok(())
 }

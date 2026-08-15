@@ -8,14 +8,14 @@
 //!
 //! # Invariants
 //! - Every success represents a fully committed opcode and falls through once.
-//! - `STATUS_BAILED` carries either the sole pre-effect activation miss or a
-//!   caller handler PC already published by the VM; neither path replays an
-//!   observable call.
+//! - A status-word `SideExit` carries the sole pre-effect activation miss. A
+//!   committed failure reaches the compiled frame's canonical final boundary;
+//!   neither path replays an observable call.
 //!
 //! # See also
 //! - `otter_vm::Interpreter::jit_runtime_spread_call_op`
 
-use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use dynasmrt::{DynamicLabel, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
 use super::{
@@ -28,7 +28,7 @@ use crate::{
         emit_direct_call_with_access,
     },
     artifact::{CodeMapCapture, relocation::RelocationCapture},
-    entry::{STATUS_BAILED, STATUS_THREW, Unsupported},
+    entry::Unsupported,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -49,6 +49,8 @@ pub(super) fn emit_spread_call_op(
     byte_pc: u32,
     bail: DynamicLabel,
     threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
     let direct = if opcode == otter_bytecode::Op::CallSpread as u8 {
@@ -128,6 +130,8 @@ pub(super) fn emit_spread_call_op(
             code_map,
             bail,
             threw,
+            throw_value,
+            fatal,
             done,
             20,
             |ops, source, target, _| emit_load_reg(ops, target, source),
@@ -158,7 +162,6 @@ pub(super) fn emit_spread_call_op(
         return Ok(());
     }
 
-    let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
     emit_load_u64(ops, 1, u64::from(opcode));
     emit_load_u64(ops, 2, arg0);
@@ -171,16 +174,7 @@ pub(super) fn emit_spread_call_op(
         transitions.variadic_entry(abi::STUB_JIT_SPREAD_CALL_OP),
         abi::STUB_JIT_SPREAD_CALL_OP,
     );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbz x0, =>done
-        ; cmp x0, STATUS_BAILED as u32
-        ; b.eq =>bail
-        ; cmp x0, STATUS_THREW as u32
-        ; b.eq =>threw
-        ; b =>threw
-        ; =>done
-    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    super::transitions::emit_status_word_result(ops, Some(bail), threw, fatal);
     Ok(())
 }

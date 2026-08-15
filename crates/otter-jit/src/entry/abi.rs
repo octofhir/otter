@@ -20,7 +20,9 @@
 use otter_vm::{
     ActiveFrameMut, ActiveFrameRef, RuntimeCall, RuntimeStubAllocContext, Value, VmError,
     VmRuntimeActivation,
-    native_abi::{CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, VmThread},
+    native_abi::{
+        CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, NativeResultPair, VmThread,
+    },
 };
 /// Machine-visible context shared by every compiled tier.
 ///
@@ -128,16 +130,16 @@ impl JitCtx {
         // for its complete dynamic extent. Direct-call linkage swaps this
         // pointer only after the callee record is fully initialized.
         let frame = unsafe { self.native_frame.as_ref() }.ok_or(VmError::InvalidOperand)?;
-        let Some(index) = frame.materialized_frame_index() else {
-            debug_assert!(
-                frame
-                    .header
-                    .flags
-                    .contains(NativeFrameFlags::STACK_REGISTERS)
-            );
+        if frame
+            .header
+            .flags
+            .contains(NativeFrameFlags::STACK_REGISTERS)
+        {
             return Err(VmError::InvalidOperand);
-        };
-        Ok(index as usize)
+        }
+        self.checked_activation()
+            .map(|activation| activation.frame_index())
+            .ok_or(VmError::InvalidOperand)
     }
 
     /// VM-owned activation published through the sole machine-visible thread
@@ -168,21 +170,6 @@ impl JitCtx {
         Some(unsafe { &*(runtime_context as *const VmRuntimeActivation) })
     }
 }
-
-/// Two-word return of compiled code (`x0`/`x1` on arm64).
-#[repr(C)]
-pub(crate) struct JitRet {
-    pub(crate) value: u64,
-    pub(crate) status: u64,
-}
-
-/// `status` discriminants in [`JitRet`].
-pub(crate) const STATUS_RETURNED: u64 = 0;
-pub(crate) const STATUS_BAILED: u64 = 1;
-pub(crate) const STATUS_THREW: u64 = 2;
-/// Internal runtime-transition result: the committed opcode completed and the
-/// current machine-code fallthrough remains authoritative.
-pub(crate) const STATUS_CONTINUE: u64 = 3;
 
 pub(crate) const THREAD_OFFSET: u32 = std::mem::offset_of!(JitCtx, thread) as u32;
 pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_frame) as u32;
@@ -322,38 +309,11 @@ pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
 pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
-pub(crate) const NATIVE_FRAME_ACTIVATION_ID_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, activation_id) as u32;
-/// Byte offset of the identity pair a compiled frame record carries: the VM
-/// function id followed by the immutable code-block id.
-pub(crate) const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
-    + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, function_id))
-    as u32;
-/// Byte offset of the packed `(register_count, kind, flags)` word. The three
-/// fields are contiguous and little-endian, so one 32-bit store publishes the
-/// whole shape of a frame record.
-pub(crate) const NATIVE_FRAME_SHAPE_WORD_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
-    + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count))
-    as u32;
+pub(crate) const NATIVE_FRAME_EVAL_ENV_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, eval_env) as u32;
 pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags))
     as u32;
-
-// The packed shape word is only a valid encoding while the three fields stay
-// adjacent in this order.
-const _: [(); 12] = [(); std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count)];
-const _: [(); 14] = [(); std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, kind)];
-const _: [(); 15] = [(); std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags)];
-
-/// Packed `(register_count, kind, flags)` word for a spliced frame's record:
-/// an optimizing-tier activation whose register window is generated-code stack
-/// storage, so the collector traces and rewrites it in place.
-#[must_use]
-pub(crate) const fn stack_register_frame_shape_word(register_count: u16) -> u32 {
-    (register_count as u32)
-        | ((otter_vm::native_abi::NativeFrameKind::Optimizing as u32) << 16)
-        | ((otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS as u32) << 24)
-}
 
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
@@ -361,4 +321,4 @@ pub(crate) const fn stack_register_frame_shape_word(register_count: u16) -> u32 
 const _: [(); 136] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
-pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
+pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> NativeResultPair;

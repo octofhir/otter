@@ -6,7 +6,6 @@
 //!
 //! # Contents
 //! - Fixed-width register helpers for string indexing.
-//! - `typeof` string materialisation.
 //!
 //! # Invariants
 //! - Inputs are decoded from the executable instruction format before reaching
@@ -20,19 +19,6 @@
 use crate::{Frame, Interpreter, JsString, Value, VmError, read_register, write_register};
 
 impl Interpreter {
-    pub(crate) fn run_typeof_regs(
-        &mut self,
-        frame: &mut Frame,
-        dst: u16,
-        src: u16,
-    ) -> Result<(), VmError> {
-        let tag = read_register(frame, src)?.typeof_string_with_heap(&self.gc_heap);
-        let s = JsString::from_str(tag, &mut self.gc_heap)?;
-        write_register(frame, dst, Value::string(s))?;
-        frame.advance_pc()?;
-        Ok(())
-    }
-
     pub(crate) fn run_get_string_index_regs(
         &mut self,
         frame: &mut Frame,

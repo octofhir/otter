@@ -1,4 +1,4 @@
-//! Runtime variable-environment record for direct `eval`.
+//! Runtime variable-environment records for direct `eval`.
 //!
 //! §9.1 — a direct `eval` in sloppy code declares its `var` bindings
 //! in the CALLER's variable environment. Those bindings must be
@@ -10,18 +10,25 @@
 //! # Contents
 //! - [`EvalEnvBody`] — GC-owned name → cell table with a parent link.
 //! - [`EvalEnvHandle`] — 4-byte GC handle.
+//! - [`EvalEnvSnapshotBinding`] — owned compiler-facing chain snapshot.
 //!
 //! # Invariants
-//! - Created at frame entry for any function whose compiled record
-//!   has `contains_direct_eval`; closures made inside capture the
-//!   handle, so the chain mirrors the lexical function nesting.
-//! - Cells are append-only; `names[i]` labels `cells[i]`.
+//! - Created at frame entry for any function whose compiled record has
+//!   `contains_direct_eval`; closures made inside capture the handle, so the
+//!   chain mirrors the lexical function nesting.
+//! - `names[i]` always labels `cells[i]`; deletion compacts both vectors in
+//!   lockstep and no compiled code retains a positional index.
+//! - The nearest record wins lookup and deletion. Snapshotting removes shadowed
+//!   ancestors and sorts the remaining owned names deterministically.
+//! - The current record is the only insertion target. Sloppy direct eval reuses
+//!   its caller's current record; strict direct eval owns a fresh child record.
 //!
 //! # See also
 //! - `global_ops` (the dynamic Load/Store/Typeof walkers)
 //! - `eval_ops` (binding adoption from a compiled eval body)
 
 use otter_macros::Pelt;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::UpvalueCell;
 
@@ -45,6 +52,23 @@ pub struct EvalEnvBody {
 
 /// 4-byte compressed GC handle.
 pub type EvalEnvHandle = otter_gc::Gc<EvalEnvBody>;
+
+/// One unique binding in an owned snapshot of an eval-environment chain.
+///
+/// Snapshots are sorted by `name` for deterministic compiler slot layout. When
+/// more than one record binds the same name, only the nearest binding appears.
+#[derive(Debug, Clone)]
+pub struct EvalEnvSnapshotBinding {
+    /// Owned source-level binding name.
+    pub name: String,
+    /// Live binding cell at snapshot time. Allocation-capable consumers must
+    /// re-resolve `name` from the traced chain before dereferencing it.
+    pub cell: UpvalueCell,
+    /// Zero for the current record, increasing toward outer ancestors.
+    pub depth: usize,
+    /// Whether this binding belongs to the current record.
+    pub current: bool,
+}
 
 /// Allocate a fresh, empty record.
 pub fn alloc_eval_env(
@@ -88,11 +112,76 @@ pub(crate) fn alloc_eval_env_with_roots(
     Ok(env)
 }
 
-/// Remove `name` from the nearest env in the chain that binds it —
-/// §19.2.1.3 eval-created var bindings are CreateMutableBinding(vn,
-/// true), i.e. deletable. Lookup is by name on every read, so index
-/// compaction here cannot invalidate anything.
-pub fn eval_env_delete(heap: &mut otter_gc::GcHeap, env: EvalEnvHandle, name: &str) -> bool {
+/// Find `name` in exactly the current record.
+#[must_use]
+pub fn eval_env_lookup_current(
+    heap: &otter_gc::GcHeap,
+    env: EvalEnvHandle,
+    name: &str,
+) -> Option<UpvalueCell> {
+    heap.read_payload(env, |body| {
+        body.names
+            .iter()
+            .position(|candidate| candidate == name)
+            .map(|index| body.cells[index])
+    })
+}
+
+/// Find `name` in the current record or its nearest binding ancestor.
+#[must_use]
+pub fn eval_env_lookup_chain(
+    heap: &otter_gc::GcHeap,
+    env: EvalEnvHandle,
+    name: &str,
+) -> Option<UpvalueCell> {
+    let mut current = Some(env);
+    while let Some(handle) = current {
+        let (found, parent) = heap.read_payload(handle, |body| {
+            let found = body
+                .names
+                .iter()
+                .position(|candidate| candidate == name)
+                .map(|index| body.cells[index]);
+            (found, body.parent)
+        });
+        if found.is_some() {
+            return found;
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Insert a fresh binding into exactly the current record.
+///
+/// Returns `false` without modifying the record when `name` already belongs to
+/// that record. Shadowing an ancestor remains valid and returns `true`.
+pub fn eval_env_insert_current(
+    heap: &mut otter_gc::GcHeap,
+    env: EvalEnvHandle,
+    name: String,
+    cell: UpvalueCell,
+) -> bool {
+    let inserted = heap.with_payload(env, |body| {
+        if body.names.iter().any(|candidate| candidate == &name) {
+            return false;
+        }
+        body.names.push(name);
+        body.cells.push(cell);
+        true
+    });
+    if inserted {
+        heap.record_write(env, &cell);
+    }
+    inserted
+}
+
+/// Remove `name` from the nearest record in the chain that binds it.
+///
+/// Eval-created `var` bindings are deletable (§19.2.1.3
+/// CreateMutableBinding(vn, true)). Lookup remains name-based, so compacting
+/// the parallel vectors cannot invalidate compiled slot metadata.
+pub fn eval_env_delete_chain(heap: &mut otter_gc::GcHeap, env: EvalEnvHandle, name: &str) -> bool {
     let mut current = Some(env);
     while let Some(handle) = current {
         let (removed, parent) = heap.with_payload(handle, |body| {
@@ -113,43 +202,158 @@ pub fn eval_env_delete(heap: &mut otter_gc::GcHeap, env: EvalEnvHandle, name: &s
     false
 }
 
-/// Find `name` in `env` or any ancestor record.
+/// Snapshot every unique binding in `env` and its ancestors.
+///
+/// Traversal is nearest-first, so a shadowed ancestor is omitted. The returned
+/// vector is sorted by name rather than by hash or allocation order, providing
+/// one deterministic slot order to the eval compiler.
 #[must_use]
-pub fn eval_env_lookup(
+pub fn eval_env_snapshot_chain(
     heap: &otter_gc::GcHeap,
     env: EvalEnvHandle,
-    name: &str,
-) -> Option<UpvalueCell> {
+) -> Vec<EvalEnvSnapshotBinding> {
+    let mut seen = HashSet::new();
+    let mut bindings = BTreeMap::new();
     let mut current = Some(env);
+    let mut depth = 0usize;
     while let Some(handle) = current {
-        let (found, parent) = heap.read_payload(handle, |body| {
-            let found = body
-                .names
-                .iter()
-                .position(|n| n == name)
-                .map(|i| body.cells[i]);
-            (found, body.parent)
+        let parent = heap.read_payload(handle, |body| {
+            for (name, cell) in body.names.iter().zip(body.cells.iter().copied()) {
+                if seen.insert(name.clone()) {
+                    bindings.insert(
+                        name.clone(),
+                        EvalEnvSnapshotBinding {
+                            name: name.clone(),
+                            cell,
+                            depth,
+                            current: depth == 0,
+                        },
+                    );
+                }
+            }
+            body.parent
         });
-        if found.is_some() {
-            return found;
-        }
         current = parent;
+        depth += 1;
     }
-    None
+    bindings.into_values().collect()
 }
 
-/// Append a binding (the caller guarantees the name is fresh in
-/// THIS record; shadowing across records is resolved by lookup
-/// order).
-pub fn eval_env_insert(
-    heap: &mut otter_gc::GcHeap,
-    env: EvalEnvHandle,
-    name: String,
-    cell: UpvalueCell,
-) {
-    heap.with_payload(env, |body| {
-        body.names.push(name);
-        body.cells.push(cell);
-    });
-    heap.record_write(env, &cell);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Value;
+
+    fn cell(heap: &mut otter_gc::GcHeap, value: i32) -> UpvalueCell {
+        crate::alloc_upvalue(heap, Value::number_i32(value)).expect("upvalue cell")
+    }
+
+    #[test]
+    fn chain_snapshot_is_unique_nearest_first_and_name_sorted() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let outer_a = cell(&mut heap, 1);
+        let outer_dup = cell(&mut heap, 2);
+        let outer_z = cell(&mut heap, 3);
+        let inner_b = cell(&mut heap, 4);
+        let inner_dup = cell(&mut heap, 5);
+
+        let outer = alloc_eval_env(&mut heap, None).expect("outer env");
+        assert!(eval_env_insert_current(
+            &mut heap,
+            outer,
+            "z".to_string(),
+            outer_z,
+        ));
+        assert!(eval_env_insert_current(
+            &mut heap,
+            outer,
+            "dup".to_string(),
+            outer_dup,
+        ));
+        assert!(eval_env_insert_current(
+            &mut heap,
+            outer,
+            "a".to_string(),
+            outer_a,
+        ));
+
+        let mut no_extra_roots = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        let inner = alloc_eval_env_with_roots(&mut heap, Some(outer), &mut no_extra_roots)
+            .expect("inner env");
+        assert!(eval_env_insert_current(
+            &mut heap,
+            inner,
+            "b".to_string(),
+            inner_b,
+        ));
+        assert!(eval_env_insert_current(
+            &mut heap,
+            inner,
+            "dup".to_string(),
+            inner_dup,
+        ));
+        assert!(!eval_env_insert_current(
+            &mut heap,
+            inner,
+            "dup".to_string(),
+            outer_dup,
+        ));
+
+        assert_eq!(eval_env_lookup_current(&heap, inner, "a"), None);
+        assert_eq!(eval_env_lookup_chain(&heap, inner, "a"), Some(outer_a));
+        assert_eq!(eval_env_lookup_chain(&heap, inner, "dup"), Some(inner_dup));
+
+        let snapshot = eval_env_snapshot_chain(&heap, inner);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "dup", "z"],
+        );
+        let a = snapshot
+            .iter()
+            .find(|binding| binding.name == "a")
+            .expect("outer binding");
+        assert_eq!(a.cell, outer_a);
+        assert_eq!(a.depth, 1);
+        assert!(!a.current);
+        let duplicate = snapshot
+            .iter()
+            .find(|binding| binding.name == "dup")
+            .expect("nearest duplicate");
+        assert_eq!(duplicate.cell, inner_dup);
+        assert_eq!(duplicate.depth, 0);
+        assert!(duplicate.current);
+    }
+
+    #[test]
+    fn deletion_removes_only_the_nearest_matching_record() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let outer_cell = cell(&mut heap, 1);
+        let inner_cell = cell(&mut heap, 2);
+        let outer = alloc_eval_env(&mut heap, None).expect("outer env");
+        assert!(eval_env_insert_current(
+            &mut heap,
+            outer,
+            "x".to_string(),
+            outer_cell,
+        ));
+        let mut no_extra_roots = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        let inner = alloc_eval_env_with_roots(&mut heap, Some(outer), &mut no_extra_roots)
+            .expect("inner env");
+        assert!(eval_env_insert_current(
+            &mut heap,
+            inner,
+            "x".to_string(),
+            inner_cell,
+        ));
+
+        assert!(eval_env_delete_chain(&mut heap, inner, "x"));
+        assert_eq!(eval_env_lookup_current(&heap, inner, "x"), None);
+        assert_eq!(eval_env_lookup_chain(&heap, inner, "x"), Some(outer_cell));
+        assert!(eval_env_delete_chain(&mut heap, inner, "x"));
+        assert_eq!(eval_env_lookup_chain(&heap, inner, "x"), None);
+        assert!(!eval_env_delete_chain(&mut heap, inner, "x"));
+    }
 }

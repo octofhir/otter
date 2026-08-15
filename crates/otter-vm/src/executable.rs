@@ -257,6 +257,8 @@ impl CodeBlock {
                     + crate::closure::CLOSURE_BODY_UPVALUE_BASE_OFFSET as u32,
                 upvalue_count_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_UPVALUE_COUNT_OFFSET as u32,
+                eval_env_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_EVAL_ENV_OFFSET as u32,
                 bound_this_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_BOUND_THIS_OFFSET as u32,
                 bound_new_target_byte: gc_header_bytes
@@ -355,10 +357,10 @@ impl CodeBlock {
             // live global declarative record. Raw snapshots carry no GC cell
             // identity.
             global_lexical_loads: rustc_hash::FxHashMap::default(),
-            // Baked by `Interpreter::bake_string_constant_loads`, which owns
+            // Baked by `Interpreter::bake_string_constant_cells`, which owns
             // the address-stable traced literal cells. Raw snapshots carry no
             // process-local cell identity.
-            string_constant_loads: rustc_hash::FxHashMap::default(),
+            string_constant_cells: rustc_hash::FxHashMap::default(),
             // Baked by `Interpreter::bake_global_lexical_loads`, which owns
             // the live global declarative record and global object.
             global_object_loads: rustc_hash::FxHashMap::default(),
@@ -1072,10 +1074,7 @@ impl CodeBlock {
                     // `CallMethodValue` shares the load-IC table: a prototype
                     // method is a data slot on the prototype, so its resolution
                     // is cached by receiver shape exactly like a `LoadProperty`.
-                    Op::LoadProperty
-                    | Op::StoreProperty
-                    | Op::HasProperty
-                    | Op::CallMethodValue => {
+                    Op::LoadProperty | Op::StoreProperty | Op::CallMethodValue => {
                         let site = *next_property_ic_site;
                         *next_property_ic_site = next_property_ic_site
                             .checked_add(1)
@@ -1501,6 +1500,8 @@ mod tests {
                     + crate::closure::CLOSURE_BODY_UPVALUE_BASE_OFFSET as u32,
                 upvalue_count_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_UPVALUE_COUNT_OFFSET as u32,
+                eval_env_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_EVAL_ENV_OFFSET as u32,
                 bound_this_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_BOUND_THIS_OFFSET as u32,
                 bound_new_target_byte: gc_header_bytes
@@ -1649,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn named_property_ops_get_dense_ic_sites() {
+    fn only_cache_owning_property_ops_get_dense_ic_sites() {
         let function = function(vec![
             Instruction {
                 pc: 0,
@@ -1670,6 +1671,15 @@ mod tests {
                     Operand::Register(2),
                 ],
             },
+            Instruction {
+                pc: 2,
+                op: Op::HasProperty,
+                operands: vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            },
         ]);
         let module = module(function);
 
@@ -1679,6 +1689,7 @@ mod tests {
         assert_eq!(executable.property_ic_site_end(), 2);
         assert_eq!(function.code[0].property_ic_site(), Some(0));
         assert_eq!(function.code[1].property_ic_site(), Some(1));
+        assert_eq!(function.code[2].property_ic_site(), None);
     }
 
     #[test]

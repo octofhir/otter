@@ -4,7 +4,8 @@
 //! - Named and computed `delete` on ordinary objects from loop OSR.
 //! - A Proxy whose `deleteProperty` trap is observable during the compiled
 //!   transition.
-//! - Unqualified `delete` of a configurable global.
+//! - Unqualified `delete` of a configurable global and of a global declarative
+//!   binding reached through dynamic name resolution.
 //!
 //! # Invariants
 //! - `DeleteProperty`/`DeleteElement`/`DeleteDynamic` complete in machine code
@@ -19,6 +20,14 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 const SOURCE: &str = r#"
 globalThis.slot = 0;
+let lexicalKeep = 11;
+
+function deleteGlobalLexicalDynamically() {
+  // Force dynamic identifier bytecode without introducing a binding that
+  // shadows the script-global lexical.
+  eval("");
+  return [delete lexicalKeep, lexicalKeep].join(":");
+}
 
 function deletes(rounds) {
   let trapCalls = 0;
@@ -41,7 +50,7 @@ function deletes(rounds) {
     globalThis.slot = round;
     if (delete slot) removed++;
   }
-  return [removed, trapCalls].join(":");
+  return [removed, trapCalls, deleteGlobalLexicalDynamically()].join(":");
 }
 
 deletes(180);
@@ -72,6 +81,7 @@ fn run(selection: JitSelection) -> (String, u64, u64) {
 #[test]
 fn delete_completes_from_loop_osr() {
     let (oracle, _, _) = run(JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "720:180:false:11");
     let (compiled, osr_attempts, reentrant) = run(JitSelection::Template);
     assert_eq!(compiled, oracle);
     assert!(osr_attempts > 0, "fixture must enter at a loop OSR header");

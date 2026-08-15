@@ -6,11 +6,11 @@
 //!   gates.
 //!
 //! # Invariants
-//! - `BindThisValue` completes in machine code through the shared reentrant
+//! - `BindThisValue` completes through the shared committed boxed-value
 //!   transition; every result matches the interpreter oracle.
 //!
 //! # See also
-//! - `otter_vm::RuntimeCall::class_op`
+//! - `otter_vm::RuntimeCall::scalar_values`
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 

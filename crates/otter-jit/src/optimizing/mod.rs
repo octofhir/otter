@@ -1,53 +1,36 @@
-//! Feedback-guided optimizing tier with one shared AArch64 backend.
+//! Finalized code objects and entry points for the Machine optimizing tier.
 //!
-//! Supported functions run the complete CFG, dominance, SSA, liveness,
-//! representation, identity-copy coalescing, register allocation, frame-state,
-//! and deopt-lowering
-//! pipeline before the AArch64 emitter checks its eligibility contract. The
-//! backend compiles multi-block int32 and float64
-//! arithmetic, element access, and reducible loops entered at function entry
-//! or by on-stack replacement at a hot loop header. CFG edges carry
-//! sequentialized phi moves, while every back-edge polls the VM thread's
-//! interrupt and fuel cells before returning to its dominating header.
-//! Side-effect-free loops version invariant own-data Number loads after one
-//! complete all-hit iteration, without moving accessor or miss semantics.
-//! Generated Map, string, and Int32 Math method hits guard allocated SSA
-//! receivers and return directly to allocated homes without publishing a
-//! transition frame or round-tripping through the interpreter window.
-//! Installed code enters through the shared reentrant `JitCtx` ABI and
-//! homes transition operands in the canonical native register window and
-//! publishes only precise tagged roots around allocating element transitions.
+//! Supported functions lower once through typed scalar HIR, target-neutral
+//! Machine IR, regalloc2, exact safepoint/deoptimization metadata, and the
+//! AArch64 encoder. A function outside that pipeline returns [`Unsupported`];
+//! optimizing compilation has no second SSA, allocator, emitter, or artifact
+//! fallback. The VM retains the independently compiled template body as its
+//! baseline for such functions.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
-//! - `pipeline` / `unit` — backend-neutral orchestration and its owned,
-//!   verified analysis product.
+//! - [`compile_optimized`] — the sole optimizing compilation entry point.
 //!
 //! # Invariants
-//! - Every `LoadElement` / `StoreElement` materializes its operands plus tagged
-//!   SSA values live across the call, publishes a code-object-owned precise
-//!   frame bitmap, and reloads only locations that moving GC can rewrite.
-//! - Every backwards bytecode edge targets a header that dominates its predecessor;
-//!   irreducible loops and exception edges are rejected.
-//! - The sole ABI argument is a dynamically valid `JitCtx`; parameters, OSR
-//!   materialization, and deopt writeback use its rooted interpreter window.
-//!   `x20` retains that context while `x19` joins `x21..x28` as an allocatable
-//!   callee-saved GPR; cold boundaries reload the window base on demand.
-//! - A two-word `JitRet` uses `x0` for a boxed returned value and `x1` for
-//!   `RETURNED`, `BAILED`, or `THREW` status.
-//! - Phi moves execute before a back-edge poll. Interrupt or exhausted fuel
-//!   bails at the target header so the interpreter owns cancellation/refill.
-//! - Tagged int32 values are `(0xfffe << 48) | payload_u32`; boxed doubles use
-//!   the VM's frozen NaN-box encoding and canonical NaN representation.
-//! - Bail writeback is generated from the same [`DeoptTable`] published with
-//!   the code object; every interpreter register and the exact logical resume
-//!   PC are published before return.
+//! - Allocating or reentrant Machine calls publish precise tagged roots derived
+//!   from final allocator locations and reload only values moving GC can rewrite.
+//! - Every backwards bytecode edge targets a header that dominates its
+//!   predecessor; irreducible loops and unsupported exception regions reject
+//!   the Machine compilation instead of selecting another optimizer.
+//! - The sole entry ABI argument is a dynamically valid `JitCtx`; parameters
+//!   and OSR inputs enter allocator-owned homes, while cold deoptimization
+//!   reconstructs the interpreter window from exact metadata.
+//! - The VM-owned two-word `NativeResultPair` uses `x0` for a boxed
+//!   Return/Throw value or exact Bail PC and `x1` for status.
+//! - Deopt reconstruction is generated from the same [`DeoptTable`] published
+//!   with the code object; every live interpreter value and the exact logical
+//!   resume PC are committed before returning to the VM.
 //! - Every backend publishes bytes through the same [`CompiledCode`], code
 //!   registry, native-frame kind, artifact bundle, and W^X lifecycle.
 //!
 //! # See also
-//! - [`crate::ir`] — the reusable optimizing analyses consumed here.
+//! - [`crate::machine`] — the sole optimizing instruction and allocation path.
 //! - [`crate::template`] — the runtime-wired baseline compiler.
 
 use std::collections::BTreeMap;
@@ -55,20 +38,13 @@ use std::collections::BTreeMap;
 use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
     deopt::DeoptTable,
-    native_abi::{CodeDependency, CodeObjectMetadata, FrameMap, SafepointRecord},
+    native_abi::{CodeDependency, CodeObjectMetadata, SafepointRecord},
 };
 
 use crate::{
     CompiledCode, Unsupported,
     entry::{TransitionTable, enter_compiled},
 };
-
-#[cfg(target_arch = "aarch64")]
-mod arm64;
-#[cfg(target_arch = "aarch64")]
-mod artifact;
-pub(crate) mod pipeline;
-pub(crate) mod unit;
 
 /// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +60,10 @@ pub struct OptimizedMetadata {
     /// Stack-owned generated calls may publish only initialized parameters
     /// until this body reaches a cold exit.
     pub parameter_prefix_entry: bool,
-    /// Total number of allocatable GPR and FP registers used by linear scan.
+    /// Total number of physical GPR and FP registers used by regalloc2.
     pub machine_register_count: u8,
-    /// GPR and FP spill slots forced by linear scan before deopt legalization.
-    pub linear_scan_spill_slot_count: u32,
+    /// Spill slots selected by regalloc2 before root-save area reservation.
+    pub allocator_spill_slot_count: u32,
     /// Number of eight-byte allocator-spill and GC-root-save slots reserved by
     /// the emitter.
     pub spill_slot_count: u32,
@@ -103,8 +79,6 @@ pub struct OptimizedCode {
     /// allocation must live exactly as long as the code.
     deopt: Box<otter_vm::deopt::DeoptRuntime>,
     safepoint_records: Box<[SafepointRecord]>,
-    frame_maps: Box<[FrameMap]>,
-    frame_map_bitmap_words: Box<[u64]>,
     /// Loop-header logical PC → assembler offset of its OSR trampoline.
     osr_entries: BTreeMap<u32, usize>,
     /// Exact installed callee generations entered by emitted direct edges.
@@ -126,8 +100,6 @@ impl OptimizedCode {
         generated_stack_frame_bytes: Option<u32>,
         deopt: Box<otter_vm::deopt::DeoptRuntime>,
         safepoint_records: Box<[SafepointRecord]>,
-        frame_maps: Box<[FrameMap]>,
-        frame_map_bitmap_words: Box<[u64]>,
         osr_entries: BTreeMap<u32, usize>,
         dependencies: Box<[CodeDependency]>,
         load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
@@ -140,7 +112,7 @@ impl OptimizedCode {
             entry_offset: code.entry_offset() as u32,
             code_size: code.len() as u32,
             safepoint_count: safepoint_records.len() as u32,
-            frame_map_count: frame_maps.len() as u32,
+            frame_map_count: 0,
             spill_map_count: 0,
             dependency_count: dependencies.len() as u32,
         };
@@ -149,8 +121,6 @@ impl OptimizedCode {
             generated_stack_frame_bytes,
             deopt,
             safepoint_records,
-            frame_maps,
-            frame_map_bitmap_words,
             osr_entries,
             dependencies,
             _load_ic_cells: load_ic_cells,
@@ -179,19 +149,6 @@ impl OptimizedCode {
     }
 
     #[cfg(test)]
-    fn frame_map(&self, id: u32) -> Option<&FrameMap> {
-        self.frame_maps
-            .binary_search_by_key(&id, |frame_map| frame_map.id)
-            .ok()
-            .map(|index| &self.frame_maps[index])
-    }
-
-    #[cfg(test)]
-    fn frame_map_bitmap_words(&self) -> &[u64] {
-        &self.frame_map_bitmap_words
-    }
-
-    #[cfg(test)]
     pub(crate) unsafe fn osr_entry_ptr_for_test(&self, logical_pc: u32) -> Option<*const u8> {
         let offset = *self.osr_entries.get(&logical_pc)?;
         // SAFETY: tests keep this code object alive through the native call.
@@ -209,9 +166,7 @@ impl std::fmt::Debug for OptimizedCode {
             )
             .field("deopt_points", &self.deopt.table.len())
             .field("safepoints", &self.safepoint_records.len())
-            .field("frame_maps", &self.frame_maps.len())
             .field("osr_entries", &self.osr_entries.len())
-            .field("frame_map_bitmap_words", &self.frame_map_bitmap_words.len())
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -261,7 +216,7 @@ impl JitFunctionCode for OptimizedCode {
     }
 
     fn run_entry(&self, _activation: otter_vm::VmRuntimeActivation) -> JitExecOutcome {
-        JitExecOutcome::Threw(otter_vm::VmError::InvalidOperand)
+        JitExecOutcome::Fatal(otter_vm::VmError::InvalidOperand)
     }
 
     fn run_optimized_entry(&self, activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
@@ -305,7 +260,7 @@ impl JitFunctionCode for OptimizedCode {
     }
 }
 
-/// Compile through the shared optimizing backend, or return [`Unsupported`]
+/// Compile through the Machine optimizing backend, or return [`Unsupported`]
 /// without producing executable code.
 #[cfg(target_arch = "aarch64")]
 pub fn compile_optimized(
@@ -313,7 +268,7 @@ pub fn compile_optimized(
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
     let transitions = TransitionTable::resolve();
-    compile_optimized_with_artifacts(view, code_object_id, &transitions, None, false)
+    compile_optimized_with_artifacts(view, code_object_id, &transitions, None)
         .map(|output| output.code)
 }
 
@@ -323,23 +278,8 @@ pub(crate) fn compile_optimized_with_artifacts(
     code_object_id: u64,
     transitions: &TransitionTable,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
-    capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
-    if let Some(output) = crate::machine::numeric::try_compile(
-        view,
-        code_object_id,
-        transitions,
-        artifact_request.clone(),
-    )? {
-        return Ok(output);
-    }
-    arm64::compile_with_artifacts(
-        view,
-        code_object_id,
-        transitions,
-        artifact_request,
-        capture_events,
-    )
+    crate::machine::numeric::try_compile(view, code_object_id, transitions, artifact_request)
 }
 
 /// Non-arm64 stub: the first optimizing backend is arm64-only.
@@ -372,17 +312,20 @@ mod tests {
     use super::compile_optimized;
 
     #[test]
-    fn refuses_out_of_subset_on_every_host() {
+    fn machine_only_optimizer_refuses_out_of_subset_on_every_host() {
         let instructions = vec![
-            JitTestInstruction::new(
-                Op::TypeOf,
-                0,
-                11,
-                vec![Operand::Register(1), Operand::Register(0)],
-            ),
+            JitTestInstruction::new(Op::Throw, 0, 11, vec![Operand::Register(0)]),
             JitTestInstruction::new(Op::ReturnValue, 1, 29, vec![Operand::Register(1)]),
         ];
         let view = JitCompileSnapshot::without_feedback(17, 1, 2, instructions);
-        assert!(compile_optimized(&view, 91).is_err());
+        let result = compile_optimized(&view, 91);
+        assert!(result.is_err());
+        #[cfg(target_arch = "aarch64")]
+        assert!(matches!(
+            result,
+            Err(super::Unsupported::OperandShape(
+                "function outside Machine HIR"
+            ))
+        ));
     }
 }

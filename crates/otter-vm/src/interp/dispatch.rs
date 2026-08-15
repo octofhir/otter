@@ -1140,25 +1140,38 @@ impl Interpreter {
                     continue;
                 }
                 Op::Instanceof => {
-                    let operands = function.operand_view(instr);
-                    if self.drive_instanceof(stack, context, operands)? {
-                        continue;
-                    }
                     let (dst, lhs, rhs) = instr.reg3();
+                    let lhs = *read_register(&stack[top_idx], lhs)?;
+                    let rhs = *read_register(&stack[top_idx], rhs)?;
+                    let result = self.object_protocol_value(
+                        stack,
+                        context,
+                        crate::ObjectProtocolValueOp::Instanceof,
+                        lhs,
+                        rhs,
+                    )?;
                     let frame = &mut stack[top_idx];
-                    self.run_instanceof_legacy_regs(frame, dst, lhs, rhs)?;
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §28.2.4.7 / .10 Proxy.[[HasProperty]] /
                 // [[Delete]] — invoke `has` / `deleteProperty`
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
-                    let operands = function.operand_view(instr);
-                    if self.drive_has_property_proxy(stack, context, operands)? {
-                        continue;
-                    }
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_has_property_regs(stack, top_idx, context, dst, lhs, rhs)?;
+                    let lhs = *read_register(&stack[top_idx], lhs)?;
+                    let rhs = *read_register(&stack[top_idx], rhs)?;
+                    let result = self.object_protocol_value(
+                        stack,
+                        context,
+                        crate::ObjectProtocolValueOp::HasProperty,
+                        lhs,
+                        rhs,
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::DeleteProperty => {
@@ -1224,24 +1237,34 @@ impl Interpreter {
                 // `setPrototypeOf` traps when the receiver is a
                 // Proxy.
                 Op::GetPrototype => {
-                    let operands = function.operand_view(instr);
-                    if self.drive_get_prototype_proxy(stack, context, operands)? {
-                        continue;
-                    }
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.object_protocol_value(
+                        stack,
+                        context,
+                        crate::ObjectProtocolValueOp::GetPrototype,
+                        source,
+                        Value::undefined(),
+                    )?;
                     let frame = &mut stack[top_idx];
-                    self.run_get_prototype_regs(frame, dst, src)?;
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::SetPrototype => {
-                    let operands = function.operand_view(instr);
-                    if self.drive_set_prototype_proxy(stack, context, operands)? {
-                        continue;
-                    }
                     let obj_reg = instr.reg(0);
                     let proto_reg = instr.reg(1);
-                    self.run_set_prototype_regs(context, stack, top_idx, obj_reg, proto_reg)?;
+                    let object = *read_register(&stack[top_idx], obj_reg)?;
+                    let prototype = *read_register(&stack[top_idx], proto_reg)?;
+                    self.object_protocol_value(
+                        stack,
+                        context,
+                        crate::ObjectProtocolValueOp::SetPrototype,
+                        object,
+                        prototype,
+                    )?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 // §19.4.1 indirect eval — recursively dispatches a
@@ -1337,7 +1360,18 @@ impl Interpreter {
                 Op::LoadLength => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_load_length_reg(&mut stack[top_idx], dst, src)?;
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::LoadLength,
+                        source,
+                        Value::undefined(),
+                        Value::undefined(),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LogicalNot => {
@@ -1367,8 +1401,18 @@ impl Interpreter {
                 Op::TypeOf => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::TypeOf,
+                        source,
+                        Value::undefined(),
+                        Value::undefined(),
+                    )?;
                     let frame = &mut stack[top_idx];
-                    self.run_typeof_regs(frame, dst, src)?;
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadThis => {
@@ -1390,11 +1434,16 @@ impl Interpreter {
                         .frame_cold(&stack[top_idx])
                         .and_then(|cold| cold.new_target)
                         .unwrap_or(Value::undefined());
-                    let mut frame = ActiveFrameMut::materialized_with_new_target(
-                        &mut stack[top_idx],
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::LoadNewTarget,
+                        Value::undefined(),
+                        Value::undefined(),
                         new_target,
-                    );
-                    self.frame_load_new_target(&mut frame, dst)?;
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
                 }
@@ -1702,7 +1751,18 @@ impl Interpreter {
                 Op::ToObject => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_to_object_reg(stack, top_idx, dst, src)?;
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::ToObject,
+                        source,
+                        Value::undefined(),
+                        Value::undefined(),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.1.19 ToPropertyKey with full user coercion —
@@ -1711,7 +1771,18 @@ impl Interpreter {
                 Op::ToPropertyKey => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_to_property_key_reg(context, stack, top_idx, dst, src)?;
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::ToPropertyKey,
+                        source,
+                        Value::undefined(),
+                        Value::undefined(),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.3.31 PrivateElementFind own-only — private
@@ -2319,12 +2390,21 @@ impl Interpreter {
                                 stack, context, top_idx, dst, lhs, rhs, true, feedback,
                             )?;
                         }
-                        Op::SameValue => self.run_same_value_regs(
-                            unsafe { stack.top_unchecked_mut() },
-                            dst,
-                            lhs,
-                            rhs,
-                        )?,
+                        Op::SameValue => {
+                            let lhs = *read_register(&stack[top_idx], lhs)?;
+                            let rhs = *read_register(&stack[top_idx], rhs)?;
+                            let result = self.scalar_value(
+                                stack,
+                                context,
+                                crate::ScalarValueOp::SameValue,
+                                lhs,
+                                rhs,
+                                Value::undefined(),
+                            )?;
+                            let frame = &mut stack[top_idx];
+                            write_register(frame, dst, result)?;
+                            frame.advance_pc_fast();
+                        }
                         _ => unreachable!("equality opcode group"),
                     }
                     continue;
@@ -2332,13 +2412,35 @@ impl Interpreter {
                 Op::ArrayLength => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_array_length_reg(&mut stack[top_idx], dst, src)?;
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::ArrayLength,
+                        source,
+                        Value::undefined(),
+                        Value::undefined(),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::IsArray => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_is_array_reg(&mut stack[top_idx], dst, src)?;
+                    let source = *read_register(&stack[top_idx], src)?;
+                    let result = self.scalar_value(
+                        stack,
+                        context,
+                        crate::ScalarValueOp::IsArray,
+                        source,
+                        Value::undefined(),
+                        Value::undefined(),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::IsEvalIntrinsic => {

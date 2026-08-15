@@ -7,9 +7,11 @@
 //!   binding, in declaration order),
 //! - an optional bound `this` (arrow closures capture their receiver
 //!   lexically; non-arrow closures take `this` from the call site),
-//! - an optional bound `new.target` for arrow closures.
+//! - an optional bound `new.target` for arrow closures,
 //! - an optional derived-constructor `this` cell for arrow
-//!   `super()` calls that run after the original frame is off-stack.
+//!   `super()` calls that run after the original frame is off-stack,
+//! - one nullable compressed direct-eval environment handle in the stable
+//!   call header.
 //!
 //! # Contents
 //!
@@ -25,8 +27,10 @@
 //! # Invariants
 //!
 //! - The machine-facing prefix is `#[repr(C)]`: native linkage may read
-//!   [`ClosureCallHeader`], `bound_this`, and `bound_new_target` only. It
-//!   must never interpret the following Rust `Option` layout.
+//!   [`ClosureCallHeader`], `bound_this`, and `bound_new_target` only. The
+//!   nullable direct-eval handle has one representation and one traced owner:
+//!   [`ClosureCallHeader::eval_env`]. Native linkage must never interpret the
+//!   following Rust `Option` layout.
 //! - The upvalue spine is built once at closure creation
 //!   ([`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)) and never
 //!   resized. It is a [`crate::upvalue_spine::UpvalueSpineBody`] in old
@@ -37,11 +41,9 @@
 //! - Canonical `Value` fields are always traced. Presence flags distinguish
 //!   `None` from `Some(undefined)` while [`JsClosure`] keeps the ergonomic
 //!   `Option<Value>` API.
-//! - Bound `new.target`, derived-constructor `this`, and direct-eval
-//!   environments require the call-setup runtime stub. The stub establishes
-//!   that state and returns to the compiled callee; it does not force the
-//!   activation out of the native tier. Their flags are stable even though the
-//!   Rust-only tail uses `Option` for the high-level implementation.
+//! - Bound `new.target` and derived-constructor `this` require the call-setup
+//!   runtime stub. A direct-eval environment is copied directly into the
+//!   callee's traced native frame and does not route through that stub.
 //!
 //! # See also
 //!
@@ -72,17 +74,14 @@ pub const CLOSURE_CALL_FLAG_BOUND_THIS: u32 = 1 << 0;
 pub const CLOSURE_CALL_FLAG_BOUND_NEW_TARGET: u32 = 1 << 1;
 /// [`ClosureCallHeader::flags`] bit: the Rust tail carries a derived-`this` cell.
 pub const CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS: u32 = 1 << 2;
-/// [`ClosureCallHeader::flags`] bit: the Rust tail carries a direct-eval environment.
-pub const CLOSURE_CALL_FLAG_EVAL_ENV: u32 = 1 << 3;
-
 /// Flags whose semantics require the call-setup runtime stub.
 ///
 /// Native linkage handles lexical `this` inline. Lexical `new.target`, shared
-/// derived-constructor state, and eval environments route through setup before
-/// control returns to the compiled callee in the same native activation.
-pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 = CLOSURE_CALL_FLAG_BOUND_NEW_TARGET
-    | CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS
-    | CLOSURE_CALL_FLAG_EVAL_ENV;
+/// derived-constructor state route through setup before control returns to the
+/// compiled callee in the same native activation. The direct-eval environment
+/// has its own fixed header slot and is copied inline.
+pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 =
+    CLOSURE_CALL_FLAG_BOUND_NEW_TARGET | CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS;
 
 /// Stable machine-facing closure call metadata.
 ///
@@ -102,6 +101,8 @@ pub struct ClosureCallHeader {
     pub upvalue_base: u64,
     /// Number of captured [`UpvalueCell`] entries at `upvalue_base`.
     pub upvalue_count: u32,
+    /// Nullable compressed direct-eval environment handle.
+    pub eval_env: crate::eval_env::EvalEnvHandle,
 }
 
 /// Allocation-neutral closure state consumed by call preparation.
@@ -126,7 +127,7 @@ impl ClosureCallHeader {
         bound_this: bool,
         bound_new_target: bool,
         bound_derived_this: bool,
-        eval_env: bool,
+        eval_env: Option<crate::eval_env::EvalEnvHandle>,
     ) -> Self {
         let mut flags = 0;
         if bound_this {
@@ -138,14 +139,12 @@ impl ClosureCallHeader {
         if bound_derived_this {
             flags |= CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS;
         }
-        if eval_env {
-            flags |= CLOSURE_CALL_FLAG_EVAL_ENV;
-        }
         Self {
             function_id,
             flags,
             upvalue_base,
             upvalue_count,
+            eval_env: eval_env.unwrap_or_else(crate::eval_env::EvalEnvHandle::null),
         }
     }
 
@@ -159,7 +158,7 @@ impl ClosureCallHeader {
     /// Whether native linkage must run the call-setup runtime stub.
     ///
     /// `false` means all closure call state can be installed inline. `true`
-    /// still remains in a [`crate::jit::VmRuntimeActivation`]: the setup stub
+    /// still remains in the current compiled activation: the setup stub
     /// establishes the complex state, then dispatch resumes in compiled code.
     #[inline]
     #[must_use]
@@ -192,11 +191,6 @@ pub struct JsClosureBody {
     /// constructor's shared `this` cell so `super()` can bind it even
     /// when the arrow is invoked through a nested sync dispatch.
     pub bound_derived_this: Option<UpvalueCell>,
-    /// §9.1 — the creating frame's direct-eval variable environment
-    /// (when any enclosing function contains a direct eval call
-    /// site). Calls re-expose it so eval-introduced `var` bindings
-    /// stay visible through this closure's scope chain.
-    pub eval_env: Option<crate::eval_env::EvalEnvHandle>,
     /// §10.2 — this closure instance's own-property bag. Each function
     /// object created by evaluating a function expression/declaration
     /// owns a DISTINCT property store (`f.foo = 1`, the materialized
@@ -230,7 +224,7 @@ impl otter_gc::SafeTraceable for JsClosureBody {
         self.bound_this.pelt_trace(visitor);
         self.bound_new_target.pelt_trace(visitor);
         self.bound_derived_this.pelt_trace(visitor);
-        self.eval_env.pelt_trace(visitor);
+        self.call_header.eval_env.pelt_trace(visitor);
         self.own_props.pelt_trace(visitor);
     }
 }
@@ -246,6 +240,9 @@ pub const CLOSURE_CALL_HEADER_UPVALUE_BASE_OFFSET: usize =
 /// Byte offset of `upvalue_count` inside [`ClosureCallHeader`].
 pub const CLOSURE_CALL_HEADER_UPVALUE_COUNT_OFFSET: usize =
     std::mem::offset_of!(ClosureCallHeader, upvalue_count);
+/// Byte offset of `eval_env` inside [`ClosureCallHeader`].
+pub const CLOSURE_CALL_HEADER_EVAL_ENV_OFFSET: usize =
+    std::mem::offset_of!(ClosureCallHeader, eval_env);
 
 /// Byte offset of the nested call header in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_CALL_HEADER_OFFSET: usize = std::mem::offset_of!(JsClosureBody, call_header);
@@ -261,6 +258,10 @@ pub const CLOSURE_BODY_UPVALUE_BASE_OFFSET: usize =
 /// Byte offset of the nested upvalue count in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_UPVALUE_COUNT_OFFSET: usize =
     CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_UPVALUE_COUNT_OFFSET;
+/// Byte offset of the nested nullable eval-environment handle in
+/// [`JsClosureBody`]'s payload.
+pub const CLOSURE_BODY_EVAL_ENV_OFFSET: usize =
+    CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_EVAL_ENV_OFFSET;
 /// Byte offset of canonical `bound_this` in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, bound_this);
 /// Byte offset of canonical `bound_new_target` in [`JsClosureBody`]'s payload.
@@ -273,6 +274,7 @@ const _: [(); 0] = [(); CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET];
 const _: [(); 4] = [(); CLOSURE_CALL_HEADER_FLAGS_OFFSET];
 const _: [(); 8] = [(); CLOSURE_CALL_HEADER_UPVALUE_BASE_OFFSET];
 const _: [(); 16] = [(); CLOSURE_CALL_HEADER_UPVALUE_COUNT_OFFSET];
+const _: [(); 20] = [(); CLOSURE_CALL_HEADER_EVAL_ENV_OFFSET];
 const _: [(); 0] = [(); CLOSURE_BODY_CALL_HEADER_OFFSET];
 const _: [(); 24] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
 const _: [(); 32] = [(); CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET];
@@ -295,7 +297,7 @@ impl JsClosureBody {
             bound_this.is_some(),
             bound_new_target.is_some(),
             bound_derived_this.is_some(),
-            eval_env.is_some(),
+            eval_env,
         );
         Self {
             call_header,
@@ -303,7 +305,6 @@ impl JsClosureBody {
             bound_new_target: bound_new_target.unwrap_or_else(Value::undefined),
             spine,
             bound_derived_this,
-            eval_env,
             own_props: None,
         }
     }
@@ -340,11 +341,7 @@ impl JsClosureBody {
 
     #[inline]
     pub(crate) fn eval_env_option(&self) -> Option<crate::eval_env::EvalEnvHandle> {
-        debug_assert_eq!(
-            self.call_header.has_flag(CLOSURE_CALL_FLAG_EVAL_ENV),
-            self.eval_env.is_some()
-        );
-        self.eval_env
+        (!self.call_header.eval_env.is_null()).then_some(self.call_header.eval_env)
     }
 
     /// Copy call metadata while borrowing the immutable upvalue allocation.
@@ -546,13 +543,24 @@ pub fn alloc_closure(
     heap: &mut GcHeap,
     function_id: u32,
     upvalues: Vec<UpvalueCell>,
-    bound_this: Option<Value>,
-    bound_new_target: Option<Value>,
-    bound_derived_this: Option<UpvalueCell>,
-    eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    mut bound_this: Option<Value>,
+    mut bound_new_target: Option<Value>,
+    mut bound_derived_this: Option<UpvalueCell>,
+    mut eval_env: Option<crate::eval_env::EvalEnvHandle>,
 ) -> Result<JsClosure, OutOfMemory> {
     let mut upvalues = upvalues;
-    let spine = alloc_spine_for(heap, &mut upvalues, &mut |_| {})?;
+    let spine = {
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            trace_pending_call_fields(
+                &mut bound_this,
+                &mut bound_new_target,
+                &mut bound_derived_this,
+                &mut eval_env,
+                visitor,
+            );
+        };
+        alloc_spine_for(heap, &mut upvalues, &mut visit)?
+    };
     let body = JsClosureBody::new(
         function_id,
         spine,
@@ -585,6 +593,27 @@ fn alloc_spine_for(
     crate::upvalue_spine::alloc_upvalue_spine(heap, upvalues, external_visit)
 }
 
+/// Trace closure-call fields that remain in Rust locals while the captured
+/// upvalue spine is allocated.
+///
+/// The spine allocation can trigger a moving full collection before the
+/// closure body exists. These are therefore real pending-payload slots, not
+/// copies that can be reconstructed from the eventual body.
+fn trace_pending_call_fields(
+    bound_this: &mut Option<Value>,
+    bound_new_target: &mut Option<Value>,
+    bound_derived_this: &mut Option<UpvalueCell>,
+    eval_env: &mut Option<crate::eval_env::EvalEnvHandle>,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    use crate::pelt::PeltField as _;
+
+    bound_this.pelt_trace(visitor);
+    bound_new_target.pelt_trace(visitor);
+    bound_derived_this.pelt_trace(visitor);
+    eval_env.pelt_trace(visitor);
+}
+
 /// Allocate a closure body while exposing caller-owned roots across
 /// any allocation-triggered collection.
 ///
@@ -599,14 +628,26 @@ pub fn alloc_closure_with_roots(
     heap: &mut GcHeap,
     function_id: u32,
     upvalues: Vec<UpvalueCell>,
-    bound_this: Option<Value>,
-    bound_new_target: Option<Value>,
-    bound_derived_this: Option<UpvalueCell>,
-    eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    mut bound_this: Option<Value>,
+    mut bound_new_target: Option<Value>,
+    mut bound_derived_this: Option<UpvalueCell>,
+    mut eval_env: Option<crate::eval_env::EvalEnvHandle>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
     let mut upvalues = upvalues;
-    let spine = alloc_spine_for(heap, &mut upvalues, external_visit)?;
+    let spine = {
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            trace_pending_call_fields(
+                &mut bound_this,
+                &mut bound_new_target,
+                &mut bound_derived_this,
+                &mut eval_env,
+                visitor,
+            );
+        };
+        alloc_spine_for(heap, &mut upvalues, &mut visit)?
+    };
     let body = JsClosureBody::new(
         function_id,
         spine,
@@ -624,7 +665,291 @@ pub fn alloc_closure_with_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc_upvalue;
+    use crate::pelt::PeltField as _;
+    use crate::{Value, alloc_upvalue, eval_env::EvalEnvBody, upvalue::UpvalueCellBody};
+
+    fn alloc_closure_across_forced_full_gc(with_external_roots: bool) {
+        const HEAP_CAP: u64 = 4 * 1024;
+
+        let mut heap = GcHeap::with_max_heap_bytes(HEAP_CAP).expect("heap");
+        let mut bound_new_target = None;
+        let mut bound_derived_this = None;
+        let mut eval_env = None;
+
+        let this_object = crate::object::alloc_object_with_roots(&mut heap, &mut |_| {})
+            .expect("young bound this");
+        let mut bound_this = Some(Value::object(this_object));
+
+        let target_object = {
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                trace_pending_call_fields(
+                    &mut bound_this,
+                    &mut bound_new_target,
+                    &mut bound_derived_this,
+                    &mut eval_env,
+                    visitor,
+                );
+            };
+            crate::object::alloc_object_with_roots(&mut heap, &mut roots)
+                .expect("young bound new.target")
+        };
+        bound_new_target = Some(Value::object(target_object));
+
+        let derived_cell = {
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                trace_pending_call_fields(
+                    &mut bound_this,
+                    &mut bound_new_target,
+                    &mut bound_derived_this,
+                    &mut eval_env,
+                    visitor,
+                );
+            };
+            heap.alloc_with_roots(
+                UpvalueCellBody {
+                    value: Value::number_i32(303),
+                },
+                &mut roots,
+            )
+            .expect("young derived-this cell")
+        };
+        bound_derived_this = Some(derived_cell);
+
+        let env = {
+            let derived_cell = bound_derived_this.expect("derived cell");
+            let body = EvalEnvBody {
+                names: vec!["evalSentinel".to_string()],
+                cells: vec![derived_cell],
+                parent: None,
+            };
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                trace_pending_call_fields(
+                    &mut bound_this,
+                    &mut bound_new_target,
+                    &mut bound_derived_this,
+                    &mut eval_env,
+                    visitor,
+                );
+            };
+            heap.alloc_with_roots(body, &mut roots)
+                .expect("young eval env")
+        };
+        eval_env = Some(env);
+
+        let mut captured = {
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                trace_pending_call_fields(
+                    &mut bound_this,
+                    &mut bound_new_target,
+                    &mut bound_derived_this,
+                    &mut eval_env,
+                    visitor,
+                );
+            };
+            heap.alloc_with_roots(
+                UpvalueCellBody {
+                    value: Value::number_i32(404),
+                },
+                &mut roots,
+            )
+            .expect("young captured cell")
+        };
+
+        let mut external = if with_external_roots {
+            let object = {
+                let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    trace_pending_call_fields(
+                        &mut bound_this,
+                        &mut bound_new_target,
+                        &mut bound_derived_this,
+                        &mut eval_env,
+                        visitor,
+                    );
+                    visitor(std::ptr::addr_of_mut!(captured).cast::<RawGc>());
+                };
+                crate::object::alloc_object_with_roots(&mut heap, &mut roots)
+                    .expect("young external root")
+            };
+            Some(Value::object(object))
+        } else {
+            None
+        };
+
+        let this_shape = crate::object::shape_id(
+            bound_this
+                .expect("bound this")
+                .as_object()
+                .expect("bound this object"),
+            &heap,
+        );
+        let target_shape = crate::object::shape_id(
+            bound_new_target
+                .expect("bound new.target")
+                .as_object()
+                .expect("bound new.target object"),
+            &heap,
+        );
+        let external_shape = external.map(|value| {
+            crate::object::shape_id(value.as_object().expect("external object"), &heap)
+        });
+        let original_offsets = [
+            bound_this
+                .expect("bound this")
+                .as_object()
+                .expect("bound this object")
+                .offset(),
+            bound_new_target
+                .expect("bound new.target")
+                .as_object()
+                .expect("bound new.target object")
+                .offset(),
+            bound_derived_this.expect("derived cell").offset(),
+            eval_env.expect("eval env").offset(),
+            captured.offset(),
+        ];
+
+        // Fill the capped heap without crossing it. The next spine allocation
+        // must overshoot, collect the unrooted filler cells, and retry while
+        // rewriting every pending closure-call field in place.
+        let before_filler = heap.tracked_bytes();
+        {
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                trace_pending_call_fields(
+                    &mut bound_this,
+                    &mut bound_new_target,
+                    &mut bound_derived_this,
+                    &mut eval_env,
+                    visitor,
+                );
+                visitor(std::ptr::addr_of_mut!(captured).cast::<RawGc>());
+                external.pelt_trace(visitor);
+            };
+            let _ = heap
+                .alloc_old_with_roots(
+                    UpvalueCellBody {
+                        value: Value::undefined(),
+                    },
+                    &mut roots,
+                )
+                .expect("first filler");
+        }
+        let filler_bytes = heap.tracked_bytes() - before_filler;
+        assert!(filler_bytes > 0);
+        while heap.tracked_bytes().saturating_add(filler_bytes) <= HEAP_CAP {
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                trace_pending_call_fields(
+                    &mut bound_this,
+                    &mut bound_new_target,
+                    &mut bound_derived_this,
+                    &mut eval_env,
+                    visitor,
+                );
+                visitor(std::ptr::addr_of_mut!(captured).cast::<RawGc>());
+                external.pelt_trace(visitor);
+            };
+            let _ = heap
+                .alloc_old_with_roots(
+                    UpvalueCellBody {
+                        value: Value::undefined(),
+                    },
+                    &mut roots,
+                )
+                .expect("filler");
+        }
+        assert!(HEAP_CAP - heap.tracked_bytes() < filler_bytes);
+        let collections_before = heap.gc_stats().gc_cycles;
+
+        let closure = if with_external_roots {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external.pelt_trace(visitor);
+            };
+            alloc_closure_with_roots(
+                &mut heap,
+                71,
+                vec![captured],
+                bound_this,
+                bound_new_target,
+                bound_derived_this,
+                eval_env,
+                &mut external_visit,
+            )
+            .expect("closure after forced collection")
+        } else {
+            alloc_closure(
+                &mut heap,
+                71,
+                vec![captured],
+                bound_this,
+                bound_new_target,
+                bound_derived_this,
+                eval_env,
+            )
+            .expect("closure after forced collection")
+        };
+
+        assert!(heap.gc_stats().gc_cycles > collections_before);
+        let stored_this = closure
+            .bound_this(&heap)
+            .expect("stored this")
+            .as_object()
+            .expect("stored this object");
+        let stored_target = closure
+            .bound_new_target(&heap)
+            .expect("stored new.target")
+            .as_object()
+            .expect("stored new.target object");
+        let stored_derived = closure
+            .bound_derived_this(&heap)
+            .expect("stored derived-this cell");
+        let stored_env = closure.eval_env(&heap).expect("stored eval env");
+        let stored_capture = closure.upvalues_snapshot(&heap)[0];
+
+        assert_eq!(crate::object::shape_id(stored_this, &heap), this_shape);
+        assert_eq!(crate::object::shape_id(stored_target, &heap), target_shape);
+        assert_eq!(
+            crate::read_upvalue(&heap, stored_derived),
+            Value::number_i32(303)
+        );
+        assert_eq!(
+            crate::read_upvalue(&heap, stored_capture),
+            Value::number_i32(404)
+        );
+        heap.read_payload(stored_env, |body| {
+            assert_eq!(body.names.len(), 1);
+            assert_eq!(body.names[0], "evalSentinel");
+            assert_eq!(body.cells.as_slice(), &[stored_derived]);
+        });
+        assert!(
+            [
+                stored_this.offset(),
+                stored_target.offset(),
+                stored_derived.offset(),
+                stored_env.offset(),
+                stored_capture.offset(),
+            ]
+            .iter()
+            .zip(original_offsets)
+            .any(|(after, before)| *after != before),
+            "forced full GC must relocate at least one young capture"
+        );
+
+        if let (Some(value), Some(shape)) = (external, external_shape) {
+            assert_eq!(
+                crate::object::shape_id(value.as_object().expect("external object"), &heap),
+                shape
+            );
+        }
+    }
+
+    #[test]
+    fn closure_allocator_roots_pending_call_fields_across_forced_full_gc() {
+        alloc_closure_across_forced_full_gc(false);
+    }
+
+    #[test]
+    fn closure_allocator_composes_external_roots_across_forced_full_gc() {
+        alloc_closure_across_forced_full_gc(true);
+    }
 
     #[test]
     fn allocates_empty_closure() {
@@ -640,6 +965,7 @@ mod tests {
             assert_eq!(body.call_header.flags, 0);
             assert_eq!(body.call_header.upvalue_base, 0);
             assert_eq!(body.call_header.upvalue_count, 0);
+            assert!(body.call_header.eval_env.is_null());
             assert!(body.spine.is_null(), "no captures means no spine cell");
             assert!(body.bound_this.is_undefined());
             assert!(body.bound_new_target.is_undefined());
@@ -726,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tail_flags_require_runtime_setup() {
+    fn semantic_tail_flags_and_eval_env_use_distinct_call_paths() {
         let mut heap = GcHeap::new().expect("heap");
         let derived_this = alloc_upvalue(&mut heap, Value::hole()).expect("derived this");
         let eval_env = crate::eval_env::alloc_eval_env(&mut heap, None).expect("eval env");
@@ -743,8 +1069,8 @@ mod tests {
         let header = closure.call_header(&heap);
         assert!(header.has_flag(CLOSURE_CALL_FLAG_BOUND_NEW_TARGET));
         assert!(header.has_flag(CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS));
-        assert!(header.has_flag(CLOSURE_CALL_FLAG_EVAL_ENV));
         assert!(header.requires_runtime_setup());
+        assert_eq!(header.eval_env, eval_env);
         assert_eq!(closure.bound_new_target(&heap), Some(Value::null()));
         assert_eq!(closure.bound_derived_this(&heap), Some(derived_this));
         assert_eq!(closure.eval_env(&heap), Some(eval_env));
@@ -754,8 +1080,10 @@ mod tests {
             flags: CLOSURE_CALL_FLAG_BOUND_THIS,
             upvalue_base: 0,
             upvalue_count: 0,
+            eval_env,
         };
         assert!(!lexical_this_only.requires_runtime_setup());
+        assert_eq!(lexical_this_only.eval_env, eval_env);
     }
 
     #[test]
@@ -766,6 +1094,7 @@ mod tests {
         assert_eq!(CLOSURE_BODY_CALL_FLAGS_OFFSET, 4);
         assert_eq!(CLOSURE_BODY_UPVALUE_BASE_OFFSET, 8);
         assert_eq!(CLOSURE_BODY_UPVALUE_COUNT_OFFSET, 16);
+        assert_eq!(CLOSURE_BODY_EVAL_ENV_OFFSET, 20);
         assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 24);
         assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 32);
     }

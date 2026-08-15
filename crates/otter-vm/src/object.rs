@@ -3697,22 +3697,6 @@ pub(crate) fn lookup_own_atom(
     })
 }
 
-/// Validate that a cached own-property slot is still present.
-#[must_use]
-pub(crate) fn has_own_slot(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
-    hit: OwnPropertySlotHit,
-) -> bool {
-    heap.read_payload(obj, |body| {
-        if body_shape_id(heap, body) != hit.shape_id {
-            return false;
-        }
-        let offset = hit.slot as usize;
-        body_has_key_at(heap, body, offset) && offset < body_property_count(heap, body)
-    })
-}
-
 /// Load a cached own data slot after validating shape and atom guards.
 #[must_use]
 pub(crate) fn load_own_data_slot_atom(

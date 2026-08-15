@@ -1605,6 +1605,27 @@ pub enum NativeError {
         /// Human-readable message.
         message: String,
     },
+    /// A failed system call, carrying the own properties Node stamps on one:
+    /// `code`, `errno`, `syscall`, and the path operands the call was given.
+    /// Node's own tests read these off `fs`, `net`, and `process` errors, so a
+    /// native that wraps a syscall reports it here rather than as a bare
+    /// [`NativeError::Coded`], which carries only a code.
+    #[error("{message}")]
+    Syscall {
+        /// Node error code for the failure (`"ENOENT"`).
+        code: &'static str,
+        /// Rendered message, already in Node's
+        /// `CODE: description, syscall 'path'` shape.
+        message: String,
+        /// Name of the call that failed (`"chdir"`, `"open"`, `"kill"`).
+        syscall: &'static str,
+        /// Primary path operand, when the call had one.
+        path: Option<String>,
+        /// Secondary path operand, for calls that take two (`rename`, `chdir`).
+        dest: Option<String>,
+        /// Platform errno, reported negated the way Node reports it.
+        errno: i32,
+    },
     /// Type or value error inside the native body that does not
     /// originate as a `throw` (e.g. wrong arity). Surfaces as
     /// `VmError::TypeMismatch`.
@@ -1733,20 +1754,25 @@ pub fn vm_to_native_error(
             name,
             message: message(),
         },
-        crate::VmError::Coded => {
-            if let Some(ErrorDetail::Coded(payload)) = detail {
-                NativeError::Coded {
-                    kind: payload.kind,
-                    code: payload.code,
-                    message: payload.message,
-                }
-            } else {
-                NativeError::TypeError {
-                    name,
-                    reason: err.to_string(),
-                }
-            }
-        }
+        crate::VmError::Coded => match detail {
+            Some(ErrorDetail::Syscall(payload)) => NativeError::Syscall {
+                code: payload.code,
+                message: payload.message,
+                syscall: payload.syscall,
+                path: payload.path,
+                dest: payload.dest,
+                errno: payload.errno,
+            },
+            Some(ErrorDetail::Coded(payload)) => NativeError::Coded {
+                kind: payload.kind,
+                code: payload.code,
+                message: payload.message,
+            },
+            _ => NativeError::TypeError {
+                name,
+                reason: err.to_string(),
+            },
+        },
         crate::VmError::TypeError | crate::VmError::TypeMismatchAt => NativeError::TypeError {
             name,
             reason: message(),

@@ -247,10 +247,18 @@ impl Interpreter {
             Some(ErrorDetail::Uncaught(m)) => m.to_string(),
             _ => String::new(),
         };
+        // System-call properties (`errno`, `syscall`, `path`, `dest`) to stamp
+        // alongside the code.
+        let mut syscall_detail: Option<crate::run_control::VmSyscallError> = None;
         let dynamic_message: String;
         let (kind, message): (error_classes::ErrorKind, &str) = match err {
             VmError::Coded => {
-                if let Some(ErrorDetail::Coded(payload)) = &detail {
+                if let Some(ErrorDetail::Syscall(payload)) = &detail {
+                    node_code = Some(payload.code);
+                    dynamic_message = payload.message.clone();
+                    syscall_detail = Some(payload.clone());
+                    (error_classes::ErrorKind::Error, dynamic_message.as_str())
+                } else if let Some(ErrorDetail::Coded(payload)) = &detail {
                     node_code = Some(payload.code);
                     dynamic_message = payload.message.clone();
                     (payload.kind, dynamic_message.as_str())
@@ -405,6 +413,42 @@ impl Interpreter {
                         code_h,
                         crate::object::PropertyFlags::new(true, false, true),
                     );
+                }
+                if let Some(payload) = &syscall_detail {
+                    // Node reports the platform errno negated, and names the
+                    // call plus the paths it was given.
+                    let errno = interp.scoped_value(
+                        scope,
+                        Value::number(crate::NumberValue::from_f64(f64::from(payload.errno))),
+                    );
+                    let _ = interp.scoped_define_data(
+                        scope,
+                        obj_h,
+                        "errno",
+                        errno,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    );
+                    if let Ok(syscall_h) = interp.scoped_string(scope, payload.syscall) {
+                        let _ = interp.scoped_define_data(
+                            scope,
+                            obj_h,
+                            "syscall",
+                            syscall_h,
+                            crate::object::PropertyFlags::new(true, false, true),
+                        );
+                    }
+                    for (name, value) in [("path", &payload.path), ("dest", &payload.dest)] {
+                        let Some(value) = value else { continue };
+                        if let Ok(value_h) = interp.scoped_string(scope, value) {
+                            let _ = interp.scoped_define_data(
+                                scope,
+                                obj_h,
+                                name,
+                                value_h,
+                                crate::object::PropertyFlags::new(true, false, true),
+                            );
+                        }
+                    }
                 }
                 if code == "ERR_SYSTEM_ERROR" {
                     if let Ok(name_h) = interp.scoped_string(scope, "SystemError") {
@@ -585,6 +629,21 @@ pub(crate) fn native_to_vm_error_with_stack(
             code,
             message,
         } => interp.err_coded(kind, code, message),
+        NativeError::Syscall {
+            code,
+            message,
+            syscall,
+            path,
+            dest,
+            errno,
+        } => interp.err_syscall(crate::run_control::VmSyscallError {
+            code,
+            message,
+            syscall,
+            path,
+            dest,
+            errno,
+        }),
         NativeError::TypeError { name, reason } => native_spec_error(
             interp,
             stack,

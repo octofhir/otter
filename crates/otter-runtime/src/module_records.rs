@@ -117,65 +117,121 @@ impl RuntimeModuleRecords {
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<(), OtterError> {
         let realm_id = interp.active_host_realm_id();
+        // Synthesizing a namespace from a CommonJS builtin runs JavaScript (the
+        // module's own wrapper and `require` graph), which needs a linked
+        // context to dispatch into. Build one only when a module in this batch
+        // actually needs it.
+        let needs_javascript = module_inits.iter().any(|init| {
+            hosted_modules.iter().any(|hosted| {
+                hosted.specifier() == init.url && hosted.commonjs_value_install().is_some()
+            })
+        });
+        let host_context = if needs_javascript {
+            let empty = otter_compiler::compile_script_source(
+                "",
+                otter_syntax::SourceKind::JavaScript,
+                "<hosted-namespace-root>",
+            )
+            .map_err(|error| OtterError::HostedModule {
+                specifier: "<hosted-namespace-root>".to_string(),
+                message: format!("{error:?}"),
+            })?;
+            Some(interp.link_module(empty))
+        } else {
+            None
+        };
         let records = self.realms.entry(realm_id).or_default();
-        NativeCtx::with_host_context(interp, NativeCallInfo::default_call(), None, |ctx| {
-            ctx.scope(|mut scope| {
-                for init in module_inits {
-                    if records.contains_key(&init.url) {
-                        continue;
-                    }
-                    let env = if let Some(hosted) = hosted_modules
-                        .iter()
-                        .copied()
-                        .find(|hosted| hosted.specifier() == init.url)
-                    {
-                        // One namespace per specifier per isolate: the
-                        // installer's side effects must run once, and a
-                        // namespace-only CommonJS load shares this object.
-                        match scope.cached_host_module_env(init.url.as_str()) {
-                            Some(env) => env,
-                            None => {
-                                let install = hosted.namespace_install().ok_or_else(|| {
-                                    OtterError::HostedModule {
-                                        specifier: init.url.clone(),
-                                        message: "module does not expose an ESM namespace"
-                                            .to_string(),
-                                    }
-                                })?;
-                                let env =
-                                    install(&mut scope, capabilities, runtime_task_spawner.clone())
+        NativeCtx::with_host_context(
+            interp,
+            NativeCallInfo::default_call(),
+            host_context.as_ref(),
+            |ctx| {
+                ctx.scope(|mut scope| {
+                    for init in module_inits {
+                        if records.contains_key(&init.url) {
+                            continue;
+                        }
+                        let env = if let Some(hosted) = hosted_modules
+                            .iter()
+                            .copied()
+                            .find(|hosted| hosted.specifier() == init.url)
+                        {
+                            // One namespace per specifier per isolate: the
+                            // installer's side effects must run once, and a
+                            // namespace-only CommonJS load shares this object.
+                            match scope.cached_host_module_env(init.url.as_str()) {
+                                Some(env) => env,
+                                None => {
+                                    // A module that publishes a CommonJS value is
+                                    // served from that value, so `default` is the
+                                    // object `require` returns. Only a module
+                                    // without one falls back to its namespace
+                                    // installer, which then becomes its own
+                                    // `default`.
+                                    let env = if hosted.commonjs_value_install().is_some() {
+                                        synthesize_commonjs_namespace(
+                                            &mut scope,
+                                            &init.url,
+                                            hosted_modules,
+                                            capabilities,
+                                            runtime_task_spawner.clone(),
+                                        )?
+                                    } else {
+                                        let install =
+                                            hosted.namespace_install().ok_or_else(|| {
+                                                OtterError::HostedModule {
+                                                    specifier: init.url.clone(),
+                                                    message: "module exposes neither a namespace \
+                                                          nor a CommonJS value"
+                                                        .to_string(),
+                                                }
+                                            })?;
+                                        let namespace = install(
+                                            &mut scope,
+                                            capabilities,
+                                            runtime_task_spawner.clone(),
+                                        )
                                         .map_err(|error| OtterError::HostedModule {
                                             specifier: init.url.clone(),
                                             message: error.to_string(),
                                         })?;
-                                scope
-                                    .cache_host_module_env(init.url.as_str(), env)
-                                    .map_err(|error| OtterError::HostedModule {
-                                        specifier: init.url.clone(),
-                                        message: error.to_string(),
-                                    })?;
-                                env
+                                        scope.set(namespace, "default", namespace).map_err(
+                                            |error| OtterError::HostedModule {
+                                                specifier: init.url.clone(),
+                                                message: error.to_string(),
+                                            },
+                                        )?;
+                                        namespace
+                                    };
+                                    scope
+                                        .cache_host_module_env(init.url.as_str(), env)
+                                        .map_err(|error| OtterError::HostedModule {
+                                            specifier: init.url.clone(),
+                                            message: error.to_string(),
+                                        })?;
+                                    env
+                                }
                             }
-                        }
-                    } else {
-                        scope.bare_object().map_err(module_allocation_error)?
-                    };
-                    scope
-                        .register_module_env(init.url.as_str(), env)
-                        .map_err(module_allocation_error)?;
-                    // The graph load + linker pipeline has already done
-                    // resolve + compile + linking by the time we get here.
-                    records.insert(
-                        init.url.clone(),
-                        RuntimeModuleRecord {
-                            function_id: init.function_id,
-                            state: RuntimeModuleRecordState::Instantiated,
-                        },
-                    );
-                }
-                Ok(())
-            })
-        })
+                        } else {
+                            scope.bare_object().map_err(module_allocation_error)?
+                        };
+                        scope
+                            .register_module_env(init.url.as_str(), env)
+                            .map_err(module_allocation_error)?;
+                        // The graph load + linker pipeline has already done
+                        // resolve + compile + linking by the time we get here.
+                        records.insert(
+                            init.url.clone(),
+                            RuntimeModuleRecord {
+                                function_id: init.function_id,
+                                state: RuntimeModuleRecordState::Instantiated,
+                            },
+                        );
+                    }
+                    Ok(())
+                })
+            },
+        )
     }
 
     /// Mark all instantiated records as evaluating. Called once
@@ -235,6 +291,49 @@ impl RuntimeModuleRecords {
             .and_then(|records| records.get(url))
             .map(|record| record.state)
     }
+}
+
+/// Build the ESM namespace for a builtin that publishes only a CommonJS value.
+///
+/// The value is produced by the CommonJS loader itself, so the builtin's own
+/// `require` graph runs exactly as it does for `require()`. `default` is that
+/// value and every own enumerable string key becomes a named export, which is
+/// how Node presents a CommonJS-backed builtin to an `import`.
+fn synthesize_commonjs_namespace<'scope>(
+    scope: &mut otter_vm::NativeScope<'scope, '_>,
+    specifier: &str,
+    hosted_modules: &[HostedModule],
+    capabilities: &CapabilitySet,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<otter_vm::Local<'scope>, OtterError> {
+    let cfg = std::sync::Arc::new(crate::commonjs::CjsConfig {
+        capabilities: capabilities.clone(),
+        hosted: hosted_modules.to_vec(),
+        runtime_task_spawner,
+        addon_loader: None,
+    });
+    let hosted_error = |error: otter_vm::NativeError| OtterError::HostedModule {
+        specifier: specifier.to_string(),
+        message: error.to_string(),
+    };
+
+    let exports =
+        crate::commonjs::cjs_load_builtin(scope, &cfg, specifier).map_err(hosted_error)?;
+    let namespace = scope.bare_object().map_err(hosted_error)?;
+    scope
+        .set(namespace, "default", exports)
+        .map_err(hosted_error)?;
+    for key in scope
+        .enumerable_own_string_keys(exports)
+        .map_err(hosted_error)?
+    {
+        if key == "default" {
+            continue;
+        }
+        let value = scope.get(exports, &key).map_err(hosted_error)?;
+        scope.set(namespace, &key, value).map_err(hosted_error)?;
+    }
+    Ok(namespace)
 }
 
 fn module_allocation_error(error: NativeError) -> OtterError {

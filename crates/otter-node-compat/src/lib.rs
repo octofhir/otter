@@ -104,6 +104,12 @@ impl RunOptions {
     /// Worker count for the concurrent phase. Two cores are held back: one for
     /// the runner's own bookkeeping and one so the machine stays usable, which
     /// also keeps timing-sensitive Node tests off a fully saturated scheduler.
+    ///
+    /// The ceiling is not advisory. A single worker is a whole process tree —
+    /// the test, whatever it spawns, and whatever those spawn in turn — so a
+    /// width chosen for cores alone can put a machine under hundreds of live
+    /// processes. `--jobs` may lower this number and cannot raise it past
+    /// [`MAX_CONCURRENT_TESTS`].
     fn worker_count(&self) -> usize {
         self.jobs
             .unwrap_or_else(|| {
@@ -111,7 +117,7 @@ impl RunOptions {
                     .map(|cores| cores.get().saturating_sub(2))
                     .unwrap_or(1)
             })
-            .max(1)
+            .clamp(1, MAX_CONCURRENT_TESTS)
     }
 }
 
@@ -201,6 +207,10 @@ const NODE_SUITES: [&str; 2] = ["parallel", "sequential"];
 const REPORT_DIR: &str = "tests/node-compat/reports";
 const SITE_DATA: &str = "docs/site/public/node-conformance/data.json";
 const WATCHDOG_MIN_GRACE_SECS: u64 = 5;
+
+/// The most test process trees that may be alive at once, whatever `--jobs`
+/// or the core count would otherwise allow.
+const MAX_CONCURRENT_TESTS: usize = 16;
 
 fn default_timeout_secs() -> u64 {
     10
@@ -591,12 +601,20 @@ fn run_one_test(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to run otter for '{}'", test.display_path))?;
+    // The test leads its own process group, so everything it starts is a
+    // member and can be ended with it.
+    let group = child.id();
 
     let timed_out = wait_for_child_with_watchdog(&mut child, watchdog_timeout)
         .with_context(|| format!("failed while waiting for '{}'", test.display_path))?;
     let status = child
         .wait()
         .with_context(|| format!("failed to wait for '{}'", test.display_path))?;
+    // A test that exits having left children behind must not leave them
+    // running: a corpus of a few hundred such tests otherwise accumulates
+    // processes until the machine is unusable. This runs on every path, not
+    // only the timeout one.
+    end_process_group(group);
     let duration_ms = started.elapsed().as_millis();
 
     let stderr = read_output_file(&stderr_path);
@@ -692,17 +710,30 @@ fn configure_watchdog_process_group(command: &mut Command) {
 }
 
 fn kill_with_watchdog(child: &mut std::process::Child) {
+    end_process_group(child.id());
+    let _ = child.kill();
+}
+
+/// End every process still in a test's group.
+///
+/// A group id stays reserved while any process is still a member, so the group
+/// this names is either the test's own or already empty — in which case the
+/// signal finds nothing and does nothing.
+fn end_process_group(group: u32) {
     #[cfg(unix)]
     {
-        let pid = child.id();
-        if pid > 0 {
+        if let Ok(group) = i32::try_from(group)
+            && group > 0
+        {
             unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
+                libc::kill(-group, libc::SIGKILL);
             }
         }
     }
-
-    let _ = child.kill();
+    #[cfg(not(unix))]
+    {
+        let _ = group;
+    }
 }
 
 fn is_timeout_error(message: &str) -> bool {
@@ -1000,6 +1031,36 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use super::{Outcome, RunOptions, module_of, run};
+
+    use crate::MAX_CONCURRENT_TESTS;
+    use std::path::PathBuf;
+
+    /// The worker count is a ceiling on live process trees, not a suggestion:
+    /// one worker is a whole tree, so a width taken from `--jobs` or from the
+    /// core count unclamped is what makes a corpus run swamp a machine.
+    #[test]
+    fn worker_count_never_exceeds_the_ceiling() {
+        let workspace = PathBuf::from("/nonexistent");
+
+        let mut options = RunOptions::new(workspace.clone());
+        options.jobs = Some(1024);
+        assert_eq!(options.worker_count(), MAX_CONCURRENT_TESTS);
+
+        options.jobs = Some(MAX_CONCURRENT_TESTS + 1);
+        assert_eq!(options.worker_count(), MAX_CONCURRENT_TESTS);
+
+        // Below the ceiling `--jobs` still says exactly what it says, and zero
+        // is not a width a run can have.
+        options.jobs = Some(3);
+        assert_eq!(options.worker_count(), 3);
+        options.jobs = Some(0);
+        assert_eq!(options.worker_count(), 1);
+
+        // The default is derived from the cores and is capped the same way.
+        options.jobs = None;
+        assert!(options.worker_count() <= MAX_CONCURRENT_TESTS);
+        assert!(options.worker_count() >= 1);
+    }
 
     #[test]
     fn modules_follow_node_test_naming() {

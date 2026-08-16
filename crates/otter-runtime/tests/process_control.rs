@@ -4,6 +4,8 @@
 //! - `chdir` moves the process and `cwd()` reports the move.
 //! - Argument and signal validation carry Node's codes and messages.
 //! - `kill` dispatches through the object's own `_kill`.
+//! - An uncaught throw reaches the capture callback, then `uncaughtException`
+//!   listeners.
 //! - A denied read capability stops the move.
 //!
 //! # Invariants
@@ -188,4 +190,39 @@ fn kill_dispatches_through_the_objects_own_raw_kill() {
         }
         "#)
     .expect("kill routes through the replaceable _kill");
+}
+
+#[test]
+fn the_capture_callback_is_installed_once_and_cleared_with_null() {
+    run(r#"
+        if (process.hasUncaughtExceptionCaptureCallback()) {
+            throw new Error("a fresh process must not have a capture callback");
+        }
+
+        let invalid;
+        try { process.setUncaughtExceptionCaptureCallback(42); } catch (error) { invalid = error; }
+        if (invalid?.code !== "ERR_INVALID_ARG_TYPE") throw new Error("code was " + invalid?.code);
+        if (invalid.message !==
+            'The "fn" argument must be of type function or null. Received type number (42)') {
+            throw new Error("message was " + invalid.message);
+        }
+
+        process.setUncaughtExceptionCaptureCallback(() => {});
+        if (!process.hasUncaughtExceptionCaptureCallback()) throw new Error("not installed");
+
+        let already;
+        try {
+            process.setUncaughtExceptionCaptureCallback(() => {});
+        } catch (error) {
+            already = error;
+        }
+        if (already?.code !== "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET") {
+            throw new Error("code was " + already?.code);
+        }
+        if (already.name !== "Error") throw new Error("name was " + already.name);
+
+        process.setUncaughtExceptionCaptureCallback(null);
+        if (process.hasUncaughtExceptionCaptureCallback()) throw new Error("not cleared");
+        "#)
+    .expect("the capture callback follows Node's install rules");
 }

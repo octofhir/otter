@@ -162,6 +162,40 @@ fn active_event_count<'s>(
     Ok(names.len())
 }
 
+/// Announce a change to the listener set, the way Node does: `newListener`
+/// before the listener is added, `removeListener` after it is gone. A program
+/// that watches these is watching for exactly that ordering.
+fn emit_listener_change(
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
+    meta_event: &str,
+    event: Local<'_>,
+    listener: Local<'_>,
+) -> Result<(), NativeError> {
+    let events = scope.get(process, EVENTS_SLOT)?;
+    let meta = scope.string(meta_event)?;
+    // Nothing is listening for the change, so nothing needs to be told about
+    // it — and the emit is skipped rather than walked.
+    let length = array_length(scope, events)?;
+    let mut watched = false;
+    for index in 0..length {
+        let record = scope.index(events, index)?;
+        if record_matches_event(scope, record, meta)? {
+            watched = true;
+            break;
+        }
+    }
+    if !watched {
+        return Ok(());
+    }
+    let emit = scope.get(process, "emit")?;
+    if !scope.is_callable(emit) {
+        return Ok(());
+    }
+    scope.call(emit, process, &[meta, event, listener])?;
+    Ok(())
+}
+
 fn refresh_event_count(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
@@ -223,6 +257,9 @@ fn add_listener(
         let process = scope.value(process);
         let event = scope.value(event);
         let listener = scope.value(listener);
+        emit_listener_change(&mut scope, process, "newListener", event, listener)?;
+        // The announcement can itself add listeners, so the array is read
+        // after it rather than before.
         let events = scope.get(process, EVENTS_SLOT)?;
         let record = scope.bare_object()?;
         scope.set(record, RECORD_EVENT, event)?;
@@ -272,6 +309,7 @@ fn process_remove_listener(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         let listener = scope.value(listener);
         let events = scope.get(process, EVENTS_SLOT)?;
         let length = array_length(&scope, events)?;
+        let mut removed = false;
         for index in (0..length).rev() {
             let record = scope.index(events, index)?;
             if !record_matches_event(&mut scope, record, event)? {
@@ -281,8 +319,12 @@ fn process_remove_listener(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             if same_value(&scope, stored, listener) {
                 let inactive = scope.boolean(false);
                 scope.set(record, RECORD_ACTIVE, inactive)?;
+                removed = true;
                 break;
             }
+        }
+        if removed {
+            emit_listener_change(&mut scope, process, "removeListener", event, listener)?;
         }
         refresh_event_count(&mut scope, process, events)?;
         Ok(scope.finish(process))

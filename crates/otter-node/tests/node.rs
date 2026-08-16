@@ -539,3 +539,63 @@ fn node_cluster_reports_the_primary_role() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// `process` is an EventEmitter in its own right: the runtime installs one and
+/// nothing replaces it, so the listener methods, the meta-events, and the
+/// `events` helpers all address the same object.
+#[test]
+fn node_process_is_the_only_event_emitter_it_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import events from "node:events";
+
+        // Requiring `events` must not hand `process` a second emitter.
+        const before = process.on;
+        await import("node:events");
+        if (process.on !== before) throw new Error("process.on was replaced");
+
+        const seen = [];
+        const handler = () => {};
+        process.on("newListener", (name, listener) => {
+            if (name === "removeListener") return;
+            // Node announces the addition before it takes effect.
+            seen.push(`new:${name}:${process.listenerCount(name)}:${listener === handler}`);
+        });
+        process.on("removeListener", (name) => seen.push(`gone:${name}`));
+
+        process.on("alpha", handler);
+        if (process.listenerCount("alpha") !== 1) throw new Error("listener was not added");
+        process.removeListener("alpha", handler);
+        if (process.listenerCount("alpha") !== 0) throw new Error("listener was not removed");
+
+        const expected = ["new:alpha:0:true", "gone:alpha"];
+        if (seen.join("|") !== expected.join("|")) throw new Error("meta events: " + seen.join("|"));
+
+        // Removing a listener that was never added announces nothing.
+        seen.length = 0;
+        process.removeListener("alpha", handler);
+        if (seen.length !== 0) throw new Error("a removal that did nothing was announced");
+
+        // The `events` helpers work against it, which is what having one
+        // emitter buys.
+        const settled = events.once(process, "beta");
+        process.emit("beta", 1, 2);
+        const args = await settled;
+        if (args.join() !== "1,2") throw new Error("events.once got " + args.join());
+
+        process.setMaxListeners(5);
+        if (process.getMaxListeners() !== 5) throw new Error("max " + process.getMaxListeners());
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

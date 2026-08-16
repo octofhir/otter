@@ -72,6 +72,26 @@ pub fn cluster_cjs_value<'scope>(
     otter_runtime::run_builtin_cjs_shim(scope, "node:cluster", CLUSTER_SHIM, module, require)
 }
 
+/// `node:http` — HTTP/1.1 framing over `node:net`.
+///
+/// # Errors
+/// Returns a native error when the shim fails to allocate or evaluate.
+pub fn http_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "node:http",
+        include_str!("http.js"),
+        module,
+        require,
+    )
+}
+
 /// `node:perf_hooks` — performance timeline subset.
 pub fn perf_hooks_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,

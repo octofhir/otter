@@ -159,6 +159,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("tty", tty::tty_cjs_value),
     HostedModule::cjs_only("node:net", net::net_cjs_value),
     HostedModule::cjs_only("net", net::net_cjs_value),
+    HostedModule::cjs_only("node:http", misc_modules::http_cjs_value),
+    HostedModule::cjs_only("http", misc_modules::http_cjs_value),
     HostedModule::new("node:worker_threads", stubs::install_worker_threads),
     HostedModule::new("worker_threads", stubs::install_worker_threads),
     HostedModule::cjs_only("node:buffer", buffer::buffer_cjs_value),

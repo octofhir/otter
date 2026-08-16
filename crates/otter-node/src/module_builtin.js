@@ -12,13 +12,40 @@ function isBuiltin(name) {
   return builtinModules.includes(String(name).replace(/^node:/, ''));
 }
 
-function createRequire() {
-  const fn = function require() {
-    const err = new Error('createRequire is not supported in this runtime');
-    err.code = 'ERR_UNSUPPORTED';
+// `require` here is this shim's own resolver. Bare specifiers reach it
+// unchanged; a relative one is resolved against `filename` first, which is the
+// whole point of createRequire.
+function createRequire(filename) {
+  // `URL` is a web global; an embedder can run node modules without it.
+  const isURL = typeof URL !== 'undefined' && filename instanceof URL;
+  if (typeof filename !== 'string' && !isURL) {
+    const err = new TypeError(
+      'The "filename" argument must be of type string or an instance of URL. Received ' +
+        (filename === null ? 'null' : typeof filename));
+    err.code = 'ERR_INVALID_ARG_TYPE';
     throw err;
+  }
+  const path = require('path');
+  let from = isURL ? filename.pathname : String(filename);
+  if (from.startsWith('file://')) from = from.slice('file://'.length);
+  // A directory argument names the base directly; anything else is a file whose
+  // directory is the base.
+  const base = from.endsWith('/') ? from : path.dirname(from);
+
+  // Named `requireFrom`, not `require`: a named function expression binds its
+  // own name in scope, which would shadow this shim's resolver and recurse.
+  const fn = function requireFrom(id) {
+    const spec = String(id);
+    if (spec.startsWith('./') || spec.startsWith('../') || spec === '.' || spec === '..') {
+      return require(path.resolve(base, spec));
+    }
+    return require(spec);
   };
-  fn.resolve = (id) => id;
+  fn.resolve = (id) => {
+    const spec = String(id);
+    if (spec.startsWith('./') || spec.startsWith('../')) return path.resolve(base, spec);
+    return spec;
+  };
   fn.resolve.paths = () => [];
   fn.cache = {};
   fn.extensions = {};

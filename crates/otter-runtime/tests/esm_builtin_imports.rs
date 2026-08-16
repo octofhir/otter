@@ -5,6 +5,8 @@
 //! - The default export is the value `require` returns, so a callable builtin
 //!   stays callable.
 //!
+//! - A CommonJS file is importable from an ES module.
+//!
 //! # Invariants
 //! - Every hosted builtin the CommonJS loader serves is importable: the ESM
 //!   namespace is synthesized from the same value, not from a second
@@ -77,4 +79,58 @@ fn the_default_export_carries_the_modules_own_properties() {
     runtime()
         .run_file(&entry)
         .expect("the default export is the module's own exports object");
+}
+
+#[test]
+fn a_commonjs_file_is_importable_from_an_es_module() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("plain.js"),
+        "exports.alpha = 1;\nexports.beta = function () { return 2; };\n",
+    )
+    .expect("write dependency");
+    std::fs::write(
+        dir.path().join("replaced.js"),
+        "module.exports = { solo: 42 };\n",
+    )
+    .expect("write dependency");
+    let entry = write_module(
+        dir.path(),
+        r#"
+        import plain, { alpha, beta } from "./plain.js";
+        import replaced from "./replaced.js";
+
+        if (alpha !== 1) throw new Error("alpha was " + alpha);
+        if (beta() !== 2) throw new Error("beta() was " + beta());
+        if (plain.alpha !== 1) throw new Error("default export lost its keys");
+        if (replaced.solo !== 42) throw new Error("module.exports replacement lost");
+        "#,
+    );
+
+    runtime()
+        .run_file(&entry)
+        .expect("a CommonJS dependency imports as default plus its assigned names");
+}
+
+#[test]
+fn a_class_exposes_its_static_members_as_named_exports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = write_module(
+        dir.path(),
+        r#"
+        import module_, { createRequire, isBuiltin } from "node:module";
+
+        if (typeof createRequire !== "function") {
+            throw new Error("createRequire is " + typeof createRequire);
+        }
+        if (typeof isBuiltin !== "function") throw new Error("isBuiltin is missing");
+        if (module_.createRequire !== createRequire) {
+            throw new Error("the named export is not the default's own member");
+        }
+        "#,
+    );
+
+    runtime()
+        .run_file(&entry)
+        .expect("a class-valued module publishes its statics as named exports");
 }

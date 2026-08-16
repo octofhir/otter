@@ -379,6 +379,27 @@ impl<'a> ModuleGraphBuilder<'a> {
             return Err(GraphError::Cycle { url });
         }
 
+        // A dependency with no module syntax is a CommonJS file. ES module
+        // linking resolves bindings before evaluation, so it cannot import one
+        // directly: wrap it in a module that requires it and re-exports what it
+        // assigns. `.mjs` is always a module and never takes this path.
+        let text = if url.ends_with(".mjs") {
+            text
+        } else {
+            let shim = with_program(text.as_str(), kind, |program| {
+                Ok::<Option<String>, GraphError>(if crate::program_looks_like_module(program) {
+                    None
+                } else {
+                    Some(commonjs_module_shim(&url, &commonjs_export_names(program)))
+                })
+            })
+            .map_err(|error| GraphError::Parse {
+                url: url.clone(),
+                error,
+            })??;
+            shim.unwrap_or(text)
+        };
+
         // Retain the verbatim source so the interpreter can map this
         // module's frame spans back to `(line, column)` for
         // `Error.prototype.stack` / `util.getCallSites`. Captured before
@@ -799,6 +820,194 @@ fn dynamic_literal_should_preload(specifier: &str) -> bool {
         || specifier.starts_with("file://")
         || specifier.starts_with("http://")
         || specifier.starts_with("https://")
+}
+
+/// Names a CommonJS file assigns onto its exports, in first-seen order.
+///
+/// This is the same job `cjs-module-lexer` does for Node: an `import` of a
+/// CommonJS file needs the names up front, because ES module linking resolves
+/// bindings before anything runs. Recognized shapes are the ones that carry a
+/// statically visible name — `exports.x = …`, `module.exports.x = …`,
+/// `module.exports = { x }`, and `Object.defineProperty(exports, "x", …)`.
+fn commonjs_export_names(program: &Program<'_>) -> Vec<String> {
+    use oxc_ast::ast::{Expression, MemberExpression, ObjectPropertyKind};
+    use oxc_ast_visit::Visit;
+
+    #[derive(Default)]
+    struct ExportNameFinder {
+        names: Vec<String>,
+    }
+
+    impl ExportNameFinder {
+        fn push(&mut self, name: &str) {
+            if !is_identifier_name(name) || self.names.iter().any(|seen| seen == name) {
+                return;
+            }
+            self.names.push(name.to_string());
+        }
+
+        /// `exports` or `module.exports` — the two objects a name can land on.
+        fn is_exports_target(expression: &Expression<'_>) -> bool {
+            match expression {
+                Expression::Identifier(identifier) => identifier.name == "exports",
+                Expression::StaticMemberExpression(member) => {
+                    member.property.name == "exports"
+                        && matches!(
+                            &member.object,
+                            Expression::Identifier(object) if object.name == "module"
+                        )
+                }
+                _ => false,
+            }
+        }
+    }
+
+    impl<'a> Visit<'a> for ExportNameFinder {
+        fn visit_assignment_expression(&mut self, node: &oxc_ast::ast::AssignmentExpression<'a>) {
+            if let Some(MemberExpression::StaticMemberExpression(member)) =
+                node.left.as_member_expression()
+                && Self::is_exports_target(&member.object)
+            {
+                self.push(member.property.name.as_str());
+            }
+            // `module.exports = { a, b }` publishes each key.
+            if node
+                .left
+                .as_simple_assignment_target()
+                .and_then(|target| target.as_member_expression())
+                .is_some_and(|member| match member {
+                    MemberExpression::StaticMemberExpression(member) => {
+                        member.property.name == "exports"
+                            && matches!(
+                                &member.object,
+                                Expression::Identifier(object) if object.name == "module"
+                            )
+                    }
+                    _ => false,
+                })
+                && let Expression::ObjectExpression(object) = &node.right
+            {
+                for property in &object.properties {
+                    if let ObjectPropertyKind::ObjectProperty(property) = property
+                        && let Some(name) = property.key.static_name()
+                    {
+                        self.push(&name);
+                    }
+                }
+            }
+            oxc_ast_visit::walk::walk_assignment_expression(self, node);
+        }
+
+        fn visit_call_expression(&mut self, node: &oxc_ast::ast::CallExpression<'a>) {
+            if let Expression::StaticMemberExpression(callee) = &node.callee
+                && callee.property.name == "defineProperty"
+                && matches!(&callee.object, Expression::Identifier(object) if object.name == "Object")
+                && node.arguments.len() >= 2
+                && node
+                    .arguments
+                    .first()
+                    .and_then(|argument| argument.as_expression())
+                    .is_some_and(Self::is_exports_target)
+                && let Some(Expression::StringLiteral(name)) = node
+                    .arguments
+                    .get(1)
+                    .and_then(|argument| argument.as_expression())
+            {
+                self.push(name.value.as_str());
+            }
+            oxc_ast_visit::walk::walk_call_expression(self, node);
+        }
+    }
+
+    let mut finder = ExportNameFinder::default();
+    finder.visit_program(program);
+    finder.names
+}
+
+/// Whether `name` can be written as an export binding. Reserved words and
+/// anything that is not an identifier are skipped: they are still reachable
+/// through the default export.
+fn is_identifier_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    ];
+    let mut characters = name.chars();
+    let valid = characters
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+        && characters
+            .all(|character| character.is_alphanumeric() || character == '_' || character == '$');
+    valid && !RESERVED.contains(&name)
+}
+
+/// Wrap a CommonJS file as an ES module: `default` is its `module.exports` and
+/// each statically visible name becomes a named export.
+///
+/// Node presents a CommonJS file to an `import` exactly this way, and the
+/// corpus depends on it heavily — `import { gcUntil } from '../common/gc.js'`
+/// is a CommonJS file imported from an ES module.
+fn commonjs_module_shim(url: &str, names: &[String]) -> String {
+    // `require` takes a path, not a URL.
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    let url_literal = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".to_string());
+    let mut source = String::new();
+    source.push_str("import __otterModule from \"node:module\";\n");
+    source.push_str(&format!(
+        "const __otterCommonJs = __otterModule.createRequire({url_literal})({url_literal});\n"
+    ));
+    source.push_str("export default __otterCommonJs;\n");
+    for name in names {
+        source.push_str(&format!(
+            "export const {name} = __otterCommonJs[{}];\n",
+            serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string())
+        ));
+    }
+    source
 }
 
 fn hosted_module_fragment(url: &str) -> BytecodeModule {

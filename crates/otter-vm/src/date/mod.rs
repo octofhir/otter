@@ -49,9 +49,15 @@ pub(crate) fn month_abbreviation_index(s: &str) -> Option<u8> {
 /// clock is misbehaving.
 #[must_use]
 pub fn now_ms() -> f64 {
+    // §21.4.1.1: a time value is an integral number of milliseconds. Reporting
+    // the sub-millisecond remainder would also hand every script a
+    // higher-resolution clock than the platform intends to expose.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64() * 1000.0)
+        .map(|elapsed| {
+            let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            millis as f64
+        })
         .unwrap_or(f64::NAN)
 }
 

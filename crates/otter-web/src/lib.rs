@@ -79,6 +79,9 @@ otter_macros::romp! {
         (include_str!("web_fetch.js"), defines = ["fetch", "Headers", "Request", "Response"]),
         // URLPattern needs URL (a native class) + RegExp; both exist eagerly.
         (include_str!("web_urlpattern.js"), defines = ["URLPattern"]),
+        // Console extras sit on top of the engine's write path, so they load
+        // after every other global is in place.
+        (include_str!("web_console.js"), defines = ["Console"]),
     ],
 }
 

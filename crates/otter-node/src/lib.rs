@@ -81,6 +81,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::cjs_only("node:async_hooks", async_hooks::async_hooks_cjs_value),
     HostedModule::cjs_only("async_hooks", async_hooks::async_hooks_cjs_value),
+    HostedModule::cjs_only("node:console", misc_modules::console_cjs_value),
+    HostedModule::cjs_only("console", misc_modules::console_cjs_value),
     HostedModule::cjs_only("node:vm", misc_modules::vm_cjs_value),
     HostedModule::cjs_only("vm", misc_modules::vm_cjs_value),
     HostedModule::cjs_only("node:process", misc_modules::process_cjs_value),

@@ -1324,3 +1324,45 @@ fn crypto_subtle_digest_matches_known_vectors_and_rejects_unknowns() {
          da39a3ee5e6b4b0d3255bfef95601890afd80709|NotSupportedError"
     );
 }
+
+/// The console methods the standard defines on top of the engine's write path:
+/// counters, timers, grouping, and the `Console` class the global answers to.
+#[test]
+fn console_extras_count_time_group_and_construct() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        (() => {
+            console.count("a");
+            console.count("a");
+            console.countReset("a");
+            console.count("a");
+
+            console.group("outer");
+            console.log("inside");
+            console.groupEnd();
+
+            if (typeof console.Console !== "function") return "Console is missing";
+            if (!(console instanceof console.Console)) return "global is not a Console";
+
+            const lines = [];
+            const sink = { write(chunk) { lines.push(chunk); } };
+            const custom = new console.Console({ stdout: sink });
+            custom.log("routed");
+            if (lines.join("") !== "routed\n") return "custom console wrote " + lines.join("");
+
+            let invalid;
+            try { new console.Console({}); } catch (error) { invalid = error; }
+            if (invalid?.code !== "ERR_INVALID_ARG_TYPE") return "code was " + invalid?.code;
+
+            for (const name of ["table", "dir", "dirxml", "time", "timeEnd", "timeLog",
+                                "clear", "profile", "profileEnd", "timeStamp"]) {
+                if (typeof console[name] !== "function") return name + " is missing";
+            }
+            return "ok";
+        })()
+        "#,
+    );
+    assert_eq!(result, "ok");
+}

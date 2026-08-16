@@ -169,6 +169,8 @@ pub fn util_types_cjs_value<'scope>(
     _module: Local<'scope>,
     require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let util = otter_runtime::require_commonjs_dependency(scope, require, "util")?;
-    scope.get(util, "types")
+    // Resolve through the compat table rather than `util` itself: `util` is
+    // vendored and re-exports this same object, so going through it would
+    // meet a half-initialized module in the require cycle.
+    otter_runtime::require_commonjs_dependency(scope, require, "internal/util/types")
 }

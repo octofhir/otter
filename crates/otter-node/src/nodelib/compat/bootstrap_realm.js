@@ -274,6 +274,38 @@ const bindings = {
   util: {
     privateSymbols,
     ...privateSymbols,
+    constants: {
+      kPending: 0,
+      kFulfilled: 1,
+      kRejected: 2,
+      ALL_PROPERTIES: 0,
+      ONLY_WRITABLE: 1,
+      ONLY_ENUMERABLE: 2,
+      ONLY_CONFIGURABLE: 4,
+      SKIP_STRINGS: 8,
+      SKIP_SYMBOLS: 16,
+    },
+    // Promise-state constants and probes, the inspect contract.
+    kPending: 0,
+    kFulfilled: 1,
+    kRejected: 2,
+    getPromiseDetails(_promise) {
+      // Settlement state is not observable from JavaScript; pending is the
+      // honest answer until the engine exposes a probe.
+      return [0];
+    },
+    getProxyDetails(_value, _showProxy) { return undefined; },
+    previewEntries(_value) { return [[], false]; },
+    getConstructorName(object) {
+      let current = object;
+      while (current !== null && current !== undefined) {
+        const ctor = Object.getOwnPropertyDescriptor(current, 'constructor')?.value;
+        if (typeof ctor === 'function' && ctor.name !== '') return ctor.name;
+        current = Object.getPrototypeOf(current);
+      }
+      return Object.prototype.toString.call(object).slice(8, -1);
+    },
+    getExternalValue(_value) { return 0n; },
     markPromiseAsHandled(promise) {
       // The engine's rejection tracker only reports promises with no
       // reactions; attaching a no-op catch marks it handled.
@@ -284,9 +316,22 @@ const bindings = {
         structuredClone(buffer, { transfer: [buffer] });
       }
     },
-    getOwnNonIndexProperties(object, _filter) {
-      return Object.getOwnPropertyNames(object).filter((k) => !/^\d+$/.test(k));
+    // ALL_PROPERTIES = 0, ONLY_ENUMERABLE = 2 — inspect passes both.
+    getOwnNonIndexProperties(object, filter) {
+      const names = Object.getOwnPropertyNames(object)
+        .filter((k) => !/^\d+$/.test(k));
+      if ((filter & 2) === 0) return names;
+      return names.filter((k) =>
+        Object.getOwnPropertyDescriptor(object, k)?.enumerable === true);
     },
+  },
+  config: {
+    hasIntl: false,
+    hasSmallICU: false,
+    isDebugBuild: false,
+  },
+  buffer: {
+    compare(a, b) { return Buffer.compare(a, b); },
   },
   os: {
     getOSInformation() { return ['', '', '']; },

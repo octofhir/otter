@@ -84,7 +84,8 @@ macro_rules! nodelib_module {
 nodelib_module!(bootstrap_realm, "internal/bootstrap/realm", compat "nodelib/compat/bootstrap_realm.js");
 nodelib_module!(internal_util, "internal/util", compat "nodelib/compat/internal_util.js");
 nodelib_module!(internal_util_types, "internal/util/types", compat "nodelib/compat/internal_util_types.js");
-nodelib_module!(internal_util_inspect, "internal/util/inspect", compat "nodelib/compat/internal_util_inspect.js");
+nodelib_module!(internal_util_inspect, "internal/util/inspect", vendored "nodelib/internal/util/inspect.js");
+nodelib_module!(internal_util_comparisons, "internal/util/comparisons", vendored "nodelib/internal/util/comparisons.js");
 nodelib_module!(internal_util_debuglog, "internal/util/debuglog", compat "nodelib/compat/internal_util_debuglog.js");
 nodelib_module!(internal_util_colors, "internal/util/colors", compat "nodelib/compat/internal_util_colors.js");
 nodelib_module!(internal_assert, "internal/assert", compat "nodelib/compat/internal_assert.js");
@@ -99,6 +100,8 @@ nodelib_module!(internal_process_task_queues, "internal/process/task_queues", co
 nodelib_module!(internal_buffer, "internal/buffer", compat "nodelib/compat/internal_buffer.js");
 nodelib_module!(internal_encoding, "internal/encoding", compat "nodelib/compat/internal_encoding.js");
 nodelib_module!(internal_blob, "internal/blob", compat "nodelib/compat/internal_blob.js");
+nodelib_module!(internal_source_map_cache, "internal/source_map/source_map_cache", compat "nodelib/compat/internal_source_map_cache.js");
+nodelib_module!(internal_crypto_keys, "internal/crypto/keys", compat "nodelib/compat/internal_crypto_keys.js");
 nodelib_module!(internal_async_hooks, "internal/async_hooks", compat "nodelib/compat/internal_async_hooks.js");
 nodelib_module!(internal_async_context_frame, "internal/async_context_frame", compat "nodelib/compat/internal_async_context_frame.js");
 
@@ -136,3 +139,7 @@ nodelib_module!(streams_iter_push, "internal/streams/iter/push", vendored "nodel
 nodelib_module!(streams_iter_ringbuffer, "internal/streams/iter/ringbuffer", vendored "nodelib/internal/streams/iter/ringbuffer.js");
 nodelib_module!(streams_iter_share, "internal/streams/iter/share", vendored "nodelib/internal/streams/iter/share.js");
 nodelib_module!(stream_iter, "stream/iter", vendored "nodelib/stream/iter.js");
+nodelib_module!(internal_fixed_queue, "internal/fixed_queue", vendored "nodelib/internal/fixed_queue.js");
+nodelib_module!(internal_events_symbols, "internal/events/symbols", vendored "nodelib/internal/events/symbols.js");
+nodelib_module!(node_events, "node:events", vendored "nodelib/events.js");
+nodelib_module!(node_util, "node:util", vendored "nodelib/util.js");

@@ -978,6 +978,27 @@ impl Interpreter {
             }
             return Ok(out);
         }
+        // §10.2 a class constructor keeps its static members on a separate
+        // object, so its own keys come from the constructor-aware walk. Without
+        // this, `Object.keys` on a class answers nothing at all, even for a
+        // plainly enumerable static assigned after the declaration.
+        if let Some(class) = target.as_class_constructor() {
+            let keys = self.class_constructor_own_property_keys(Some(context), class)?;
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(descriptor) = self.ordinary_get_own_property_descriptor_value(
+                    stack,
+                    context,
+                    target,
+                    &VmPropertyKey::OwnedString(key.clone()),
+                    hops + 1,
+                )? && descriptor.enumerable()
+                {
+                    out.push(key);
+                }
+            }
+            return Ok(out);
+        }
         Ok(Vec::new())
     }
 

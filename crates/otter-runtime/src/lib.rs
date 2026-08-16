@@ -6063,7 +6063,7 @@ fn source_text_looks_like_module(text: &str, kind: SourceKind) -> bool {
     with_program(text, kind, program_looks_like_module).unwrap_or(false)
 }
 
-fn program_looks_like_module(program: &oxc_ast::ast::Program<'_>) -> bool {
+pub(crate) fn program_looks_like_module(program: &oxc_ast::ast::Program<'_>) -> bool {
     use oxc_ast::ast::{Expression, Statement};
     use oxc_ast_visit::Visit;
 

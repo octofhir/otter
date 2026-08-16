@@ -256,287 +256,292 @@ function collectHeaders(pairs) {
 
 // ------------------------------------------------------- incoming message ---
 
-class IncomingMessage extends Readable {
-  constructor(socket) {
-    super();
-    this.socket = socket;
-    this.connection = socket;
-    this.headers = {};
-    this.rawHeaders = [];
-    this.trailers = {};
-    this.rawTrailers = [];
-    this.httpVersion = '1.1';
-    this.httpVersionMajor = 1;
-    this.httpVersionMinor = 1;
-    this.method = null;
-    this.url = '';
-    this.statusCode = null;
-    this.statusMessage = null;
-    this.complete = false;
-  }
-
-  _read() {}
-
-  setTimeout(timeout, callback) {
-    if (this.socket) this.socket.setTimeout(timeout, callback);
-    return this;
-  }
-
-  _adopt(message) {
-    Object.assign(this, message);
-  }
+function IncomingMessage(socket) {
+  if (!(this instanceof IncomingMessage)) return new IncomingMessage(socket);
+  Readable.call(this);
+  this.socket = socket;
+  this.connection = socket;
+  this.headers = {};
+  this.rawHeaders = [];
+  this.trailers = {};
+  this.rawTrailers = [];
+  this.httpVersion = '1.1';
+  this.httpVersionMajor = 1;
+  this.httpVersionMinor = 1;
+  this.method = null;
+  this.url = '';
+  this.statusCode = null;
+  this.statusMessage = null;
+  this.complete = false;
 }
+Object.setPrototypeOf(IncomingMessage.prototype, Readable.prototype);
+Object.setPrototypeOf(IncomingMessage, Readable);
+
+IncomingMessage.prototype._read = function _read() {};
+
+IncomingMessage.prototype.setTimeout = function setTimeout(timeout, callback) {
+  if (this.socket) this.socket.setTimeout(timeout, callback);
+  return this;
+};
+
+IncomingMessage.prototype._adopt = function _adopt(message) {
+  Object.assign(this, message);
+};
 
 // --------------------------------------------------------- outgoing message ---
 
 // Everything both a response and a request need: a header block that can still
 // be changed until it is sent, and a body that is framed once it is.
-class OutgoingMessage extends Writable {
-  constructor(socket) {
-    super();
-    this.socket = socket;
-    this.connection = socket;
-    this.headersSent = false;
-    this.finished = false;
-    this.sendDate = true;
-    this.chunkedEncoding = false;
-    this._headers = new Map();
-    this._trailers = [];
-  }
+function OutgoingMessage(socket) {
+  if (!(this instanceof OutgoingMessage)) return new OutgoingMessage(socket);
+  Writable.call(this);
+  this.socket = socket;
+  this.connection = socket;
+  this.headersSent = false;
+  this.finished = false;
+  this.sendDate = true;
+  this.chunkedEncoding = false;
+  this._headers = new Map();
+  this._trailers = [];
+}
+Object.setPrototypeOf(OutgoingMessage.prototype, Writable.prototype);
+Object.setPrototypeOf(OutgoingMessage, Writable);
 
-  setHeader(name, value) {
-    if (this.headersSent) {
-      throw codedError('Cannot set headers after they are sent to the client',
-        'ERR_HTTP_HEADERS_SENT');
-    }
-    if (typeof name !== 'string' || name === '') {
-      throw codedError(`Header name must be a valid HTTP token ["${name}"]`,
-        'ERR_INVALID_HTTP_TOKEN');
-    }
-    this._headers.set(name.toLowerCase(), [name, value]);
-    return this;
+OutgoingMessage.prototype.setHeader = function setHeader(name, value) {
+  if (this.headersSent) {
+    throw codedError('Cannot set headers after they are sent to the client',
+      'ERR_HTTP_HEADERS_SENT');
   }
-
-  getHeader(name) {
-    const found = this._headers.get(String(name).toLowerCase());
-    return found === undefined ? undefined : found[1];
+  if (typeof name !== 'string' || name === '') {
+    throw codedError(`Header name must be a valid HTTP token ["${name}"]`,
+      'ERR_INVALID_HTTP_TOKEN');
   }
+  this._headers.set(name.toLowerCase(), [name, value]);
+  return this;
+};
 
-  getHeaders() {
-    const headers = {};
-    for (const [key, [, value]] of this._headers) headers[key] = value;
-    return headers;
+OutgoingMessage.prototype.getHeader = function getHeader(name) {
+  const found = this._headers.get(String(name).toLowerCase());
+  return found === undefined ? undefined : found[1];
+};
+
+OutgoingMessage.prototype.getHeaders = function getHeaders() {
+  const headers = {};
+  for (const [key, [, value]] of this._headers) headers[key] = value;
+  return headers;
+};
+
+OutgoingMessage.prototype.getHeaderNames = function getHeaderNames() {
+  return [...this._headers.keys()];
+};
+
+OutgoingMessage.prototype.hasHeader = function hasHeader(name) {
+  return this._headers.has(String(name).toLowerCase());
+};
+
+OutgoingMessage.prototype.removeHeader = function removeHeader(name) {
+  if (this.headersSent) {
+    throw codedError('Cannot remove headers after they are sent to the client',
+      'ERR_HTTP_HEADERS_SENT');
   }
+  this._headers.delete(String(name).toLowerCase());
+};
 
-  getHeaderNames() {
-    return [...this._headers.keys()];
-  }
+OutgoingMessage.prototype.addTrailers = function addTrailers(headers) {
+  const entries = headers instanceof Map ? [...headers] : Object.entries(headers ?? {});
+  for (const [name, value] of entries) this._trailers.push([name, value]);
+};
 
-  hasHeader(name) {
-    return this._headers.has(String(name).toLowerCase());
-  }
+OutgoingMessage.prototype.setTimeout = function setTimeout(timeout, callback) {
+  if (this.socket) this.socket.setTimeout(timeout, callback);
+  return this;
+};
 
-  removeHeader(name) {
-    if (this.headersSent) {
-      throw codedError('Cannot remove headers after they are sent to the client',
-        'ERR_HTTP_HEADERS_SENT');
-    }
-    this._headers.delete(String(name).toLowerCase());
-  }
-
-  addTrailers(headers) {
-    const entries = headers instanceof Map ? [...headers] : Object.entries(headers ?? {});
-    for (const [name, value] of entries) this._trailers.push([name, value]);
-  }
-
-  setTimeout(timeout, callback) {
-    if (this.socket) this.socket.setTimeout(timeout, callback);
-    return this;
-  }
-
-  _headerBlock(firstLine) {
-    const lines = [firstLine];
-    for (const [, [name, value]] of this._headers) {
-      if (Array.isArray(value)) {
-        for (const entry of value) lines.push(`${name}: ${entry}`);
-      } else {
-        lines.push(`${name}: ${value}`);
-      }
-    }
-    return `${lines.join('\r\n')}\r\n\r\n`;
-  }
-
-  // The body is framed by whatever the header block promised: a length if one
-  // was given, chunks otherwise.
-  _decideFraming() {
-    if (this._headers.has('content-length')) {
-      this.chunkedEncoding = false;
-      return;
-    }
-    this.chunkedEncoding = true;
-    this._headers.set('transfer-encoding', ['Transfer-Encoding', 'chunked']);
-  }
-
-  _write(chunk, encoding, callback) {
-    if (!this.headersSent) this._sendHeaders();
-    const body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding || 'utf8');
-    if (this.chunkedEncoding) {
-      this.socket.write(`${body.length.toString(16)}\r\n`);
-      this.socket.write(body);
-      this.socket.write('\r\n');
+OutgoingMessage.prototype._headerBlock = function _headerBlock(firstLine) {
+  const lines = [firstLine];
+  for (const [, [name, value]] of this._headers) {
+    if (Array.isArray(value)) {
+      for (const entry of value) lines.push(`${name}: ${entry}`);
     } else {
-      this.socket.write(body);
+      lines.push(`${name}: ${value}`);
     }
-    callback();
   }
+  return `${lines.join('\r\n')}\r\n\r\n`;
+};
 
-  _final(callback) {
-    if (!this.headersSent) this._sendHeaders();
-    if (this.chunkedEncoding) {
-      const trailers = this._trailers
-        .map(([name, value]) => `${name}: ${value}\r\n`)
-        .join('');
-      this.socket.write(`0\r\n${trailers}\r\n`);
-    }
-    this.finished = true;
-    this._finished();
-    callback();
+// The body is framed by whatever the header block promised: a length if one
+// was given, chunks otherwise.
+OutgoingMessage.prototype._decideFraming = function _decideFraming() {
+  if (this._headers.has('content-length')) {
+    this.chunkedEncoding = false;
+    return;
   }
+  this.chunkedEncoding = true;
+  this._headers.set('transfer-encoding', ['Transfer-Encoding', 'chunked']);
+};
 
-  _finished() {}
+OutgoingMessage.prototype._write = function _write(chunk, encoding, callback) {
+  if (!this.headersSent) this._sendHeaders();
+  const body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding || 'utf8');
+  if (this.chunkedEncoding) {
+    this.socket.write(`${body.length.toString(16)}\r\n`);
+    this.socket.write(body);
+    this.socket.write('\r\n');
+  } else {
+    this.socket.write(body);
+  }
+  callback();
+};
+
+OutgoingMessage.prototype._final = function _final(callback) {
+  if (!this.headersSent) this._sendHeaders();
+  if (this.chunkedEncoding) {
+    const trailers = this._trailers
+      .map(([name, value]) => `${name}: ${value}\r\n`)
+      .join('');
+    this.socket.write(`0\r\n${trailers}\r\n`);
+  }
+  this.finished = true;
+  this._finished();
+  callback();
+};
+
+OutgoingMessage.prototype._finished = function _finished() {};
+
+function ServerResponse(socket, request) {
+  if (!(this instanceof ServerResponse)) return new ServerResponse(socket, request);
+  OutgoingMessage.call(this, socket);
+  this.statusCode = 200;
+  this.statusMessage = undefined;
+  this.shouldKeepAlive = true;
+  this._request = request;
 }
+Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
+Object.setPrototypeOf(ServerResponse, OutgoingMessage);
 
-class ServerResponse extends OutgoingMessage {
-  constructor(socket, request) {
-    super(socket);
-    this.statusCode = 200;
-    this.statusMessage = undefined;
-    this.shouldKeepAlive = true;
-    this._request = request;
+ServerResponse.prototype.writeHead = function writeHead(statusCode, statusMessage, headers) {
+  if (typeof statusMessage === 'object' && statusMessage !== null) {
+    headers = statusMessage;
+    statusMessage = undefined;
   }
+  if (this.headersSent) {
+    throw codedError('Cannot render headers after they are sent to the client',
+      'ERR_HTTP_HEADERS_SENT');
+  }
+  this.statusCode = statusCode;
+  if (statusMessage !== undefined) this.statusMessage = statusMessage;
+  if (headers) {
+    if (Array.isArray(headers)) {
+      for (let i = 0; i < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
+    } else {
+      for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
+    }
+  }
+  return this;
+};
 
-  writeHead(statusCode, statusMessage, headers) {
-    if (typeof statusMessage === 'object' && statusMessage !== null) {
-      headers = statusMessage;
-      statusMessage = undefined;
-    }
-    if (this.headersSent) {
-      throw codedError('Cannot render headers after they are sent to the client',
-        'ERR_HTTP_HEADERS_SENT');
-    }
-    this.statusCode = statusCode;
-    if (statusMessage !== undefined) this.statusMessage = statusMessage;
-    if (headers) {
-      if (Array.isArray(headers)) {
-        for (let i = 0; i < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
-      } else {
-        for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
-      }
-    }
-    return this;
-  }
+ServerResponse.prototype.writeContinue = function writeContinue(callback) {
+  this.socket.write('HTTP/1.1 100 Continue\r\n\r\n');
+  if (typeof callback === 'function') callback();
+};
 
-  writeContinue(callback) {
-    this.socket.write('HTTP/1.1 100 Continue\r\n\r\n');
-    if (typeof callback === 'function') callback();
+ServerResponse.prototype._sendHeaders = function _sendHeaders() {
+  this.headersSent = true;
+  const message = this.statusMessage ?? STATUS_CODES[this.statusCode] ?? 'unknown';
+  if (this.sendDate && !this._headers.has('date')) {
+    this._headers.set('date', ['Date', new Date().toUTCString()]);
   }
+  this._decideFraming();
+  if (!this._headers.has('connection')) {
+    this._headers.set('connection', ['Connection',
+      this.shouldKeepAlive ? 'keep-alive' : 'close']);
+  }
+  this.socket.write(this._headerBlock(`HTTP/1.1 ${this.statusCode} ${message}`));
+};
 
-  _sendHeaders() {
-    this.headersSent = true;
-    const message = this.statusMessage ?? STATUS_CODES[this.statusCode] ?? 'unknown';
-    if (this.sendDate && !this._headers.has('date')) {
-      this._headers.set('date', ['Date', new Date().toUTCString()]);
-    }
-    this._decideFraming();
-    if (!this._headers.has('connection')) {
-      this._headers.set('connection', ['Connection',
-        this.shouldKeepAlive ? 'keep-alive' : 'close']);
-    }
-    this.socket.write(this._headerBlock(`HTTP/1.1 ${this.statusCode} ${message}`));
-  }
-
-  _finished() {
-    this.emit('finish');
-    if (!this.shouldKeepAlive) this.socket.end();
-  }
-}
+ServerResponse.prototype._finished = function _finished() {
+  this.emit('finish');
+  if (!this.shouldKeepAlive) this.socket.end();
+};
 
 // ------------------------------------------------------------------ server ---
 
-class Server extends EventEmitter {
-  constructor(options, listener) {
-    super();
-    if (typeof options === 'function') { listener = options; options = {}; }
-    this._options = options ?? {};
-    this.timeout = 0;
-    this._socket = net.createServer((socket) => this._connection(socket));
-    this._socket.on('error', (error) => this.emit('error', error));
-    this._socket.on('close', () => this.emit('close'));
-    this._socket.on('listening', () => this.emit('listening'));
-    if (typeof listener === 'function') this.on('request', listener);
-  }
-
-  get listening() {
-    return this._socket.listening;
-  }
-
-  listen(...args) {
-    this._socket.listen(...args);
-    return this;
-  }
-
-  address() {
-    return this._socket.address();
-  }
-
-  close(callback) {
-    this._socket.close(callback);
-    return this;
-  }
-
-  getConnections(callback) {
-    return this._socket.getConnections(callback);
-  }
-
-  setTimeout(timeout, callback) {
-    this.timeout = timeout;
-    if (typeof callback === 'function') this.on('timeout', callback);
-    return this;
-  }
-
-  ref() { this._socket.ref(); return this; }
-  unref() { this._socket.unref(); return this; }
-
-  _connection(socket) {
-    this.emit('connection', socket);
-    if (this.timeout > 0) socket.setTimeout(this.timeout);
-    let request = null;
-    const parser = new Parser('request', {
-      head: (message) => {
-        request = new IncomingMessage(socket);
-        request._adopt(message);
-        const response = new ServerResponse(socket, request);
-        response.shouldKeepAlive = keepAlive(message);
-        this.emit('request', request, response);
-      },
-      body: (chunk) => { if (request) request.push(chunk); },
-      complete: () => {
-        if (request) {
-          request.complete = true;
-          request.push(null);
-          request = null;
-        }
-      },
-      error: (error) => {
-        this.emit('clientError', error, socket);
-        socket.destroy();
-      },
-    });
-    socket.on('data', (chunk) => parser.execute(chunk));
-    socket.on('end', () => parser.finish());
-    socket.on('error', () => {});
-  }
+function Server(options, listener) {
+  if (!(this instanceof Server)) return new Server(options, listener);
+  EventEmitter.call(this);
+  if (typeof options === 'function') { listener = options; options = {}; }
+  this._options = options ?? {};
+  this.timeout = 0;
+  this._socket = net.createServer((socket) => this._connection(socket));
+  this._socket.on('error', (error) => this.emit('error', error));
+  this._socket.on('close', () => this.emit('close'));
+  this._socket.on('listening', () => this.emit('listening'));
+  if (typeof listener === 'function') this.on('request', listener);
 }
+Object.setPrototypeOf(Server.prototype, EventEmitter.prototype);
+Object.setPrototypeOf(Server, EventEmitter);
+
+Object.defineProperty(Server.prototype, 'listening', {
+  get() { return this._socket.listening; },
+  configurable: true,
+});
+
+Server.prototype.listen = function listen(...args) {
+  this._socket.listen(...args);
+  return this;
+};
+
+Server.prototype.address = function address() {
+  return this._socket.address();
+};
+
+Server.prototype.close = function close(callback) {
+  this._socket.close(callback);
+  return this;
+};
+
+Server.prototype.getConnections = function getConnections(callback) {
+  return this._socket.getConnections(callback);
+};
+
+Server.prototype.setTimeout = function setTimeout(timeout, callback) {
+  this.timeout = timeout;
+  if (typeof callback === 'function') this.on('timeout', callback);
+  return this;
+};
+
+Server.prototype.ref = function ref() { this._socket.ref(); return this; };
+Server.prototype.unref = function unref() { this._socket.unref(); return this; };
+
+Server.prototype._connection = function _connection(socket) {
+  this.emit('connection', socket);
+  if (this.timeout > 0) socket.setTimeout(this.timeout);
+  let request = null;
+  const parser = new Parser('request', {
+    head: (message) => {
+      request = new IncomingMessage(socket);
+      request._adopt(message);
+      const response = new ServerResponse(socket, request);
+      response.shouldKeepAlive = keepAlive(message);
+      this.emit('request', request, response);
+    },
+    body: (chunk) => { if (request) request.push(chunk); },
+    complete: () => {
+      if (request) {
+        request.complete = true;
+        request.push(null);
+        request = null;
+      }
+    },
+    error: (error) => {
+      this.emit('clientError', error, socket);
+      socket.destroy();
+    },
+  });
+  socket.on('data', (chunk) => parser.execute(chunk));
+  socket.on('end', () => parser.finish());
+  socket.on('error', () => {});
+};
 
 function keepAlive(message) {
   const connection = message.headers.connection;
@@ -550,117 +555,118 @@ function keepAlive(message) {
 
 // ------------------------------------------------------------------ client ---
 
-class ClientRequest extends OutgoingMessage {
-  constructor(options, callback) {
-    super(null);
-    const settings = normalizeClientOptions(options);
-    this.method = settings.method;
-    this.path = settings.path;
-    this._settings = settings;
-    this.shouldKeepAlive = false;
-    if (typeof callback === 'function') this.once('response', callback);
+function ClientRequest(options, callback) {
+  if (!(this instanceof ClientRequest)) return new ClientRequest(options, callback);
+  OutgoingMessage.call(this, null);
+  const settings = normalizeClientOptions(options);
+  this.method = settings.method;
+  this.path = settings.path;
+  this._settings = settings;
+  this.shouldKeepAlive = false;
+  if (typeof callback === 'function') this.once('response', callback);
 
-    for (const [name, value] of Object.entries(settings.headers)) this.setHeader(name, value);
-    if (!this._headers.has('host')) {
-      const port = settings.port === 80 ? '' : `:${settings.port}`;
-      this._headers.set('host', ['Host', `${settings.host}${port}`]);
-    }
-
-    this.socket = net.connect(settings.port, settings.host);
-    this.connection = this.socket;
-    this.socket.on('connect', () => {
-      this.emit('socket', this.socket);
-      this._flush();
-    });
-    this.socket.on('error', (error) => this.emit('error', error));
-    this._listen();
+  for (const [name, value] of Object.entries(settings.headers)) this.setHeader(name, value);
+  if (!this._headers.has('host')) {
+    const port = settings.port === 80 ? '' : `:${settings.port}`;
+    this._headers.set('host', ['Host', `${settings.host}${port}`]);
   }
 
-  _listen() {
-    let response = null;
-    const parser = new Parser('response', {
-      bodyless: this.method === 'HEAD',
-      head: (message) => {
-        response = new IncomingMessage(this.socket);
-        response._adopt(message);
-        this.res = response;
-        this.emit('response', response);
-      },
-      body: (chunk) => { if (response) response.push(chunk); },
-      complete: () => {
-        if (response) {
-          response.complete = true;
-          response.push(null);
-          response = null;
-        }
-        this.socket.end();
-      },
-      error: (error) => this.emit('error', error),
-    });
-    this.socket.on('data', (chunk) => parser.execute(chunk));
-    this.socket.on('end', () => parser.finish());
-  }
-
-  // Nothing can go out before the connection exists, so the body written
-  // before then is held and sent in order once it does.
-  _write(chunk, encoding, callback) {
-    if (this.socket.connecting) {
-      (this._queued ??= []).push([chunk, encoding]);
-      callback();
-      return;
-    }
-    super._write(chunk, encoding, callback);
-  }
-
-  _final(callback) {
-    if (this.socket.connecting) {
-      this._endPending = () => super._final(() => {});
-      callback();
-      return;
-    }
-    super._final(callback);
-  }
-
-  _flush() {
-    for (const [chunk, encoding] of this._queued ?? []) {
-      super._write(chunk, encoding, () => {});
-    }
-    this._queued = undefined;
-    if (this._endPending) {
-      const end = this._endPending;
-      this._endPending = undefined;
-      end();
-    }
-  }
-
-  _sendHeaders() {
-    this.headersSent = true;
-    if (this.method === 'GET' || this.method === 'HEAD' || this.method === 'DELETE') {
-      // A request with no body says so by its absence, not by a framing header.
-      if (!this._headers.has('content-length')) this.chunkedEncoding = false;
-    } else {
-      this._decideFraming();
-    }
-    if (!this._headers.has('connection')) {
-      this._headers.set('connection', ['Connection', 'close']);
-    }
-    this.socket.write(this._headerBlock(`${this.method} ${this.path} HTTP/1.1`));
-  }
-
-  abort() {
-    this.destroy();
-  }
-
-  _destroy(error, callback) {
-    if (this.socket) this.socket.destroy();
-    callback(error);
-  }
-
-  setTimeout(timeout, callback) {
-    if (this.socket) this.socket.setTimeout(timeout, callback);
-    return this;
-  }
+  this.socket = net.connect(settings.port, settings.host);
+  this.connection = this.socket;
+  this.socket.on('connect', () => {
+    this.emit('socket', this.socket);
+    this._flush();
+  });
+  this.socket.on('error', (error) => this.emit('error', error));
+  this._listen();
 }
+Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
+Object.setPrototypeOf(ClientRequest, OutgoingMessage);
+
+ClientRequest.prototype._listen = function _listen() {
+  let response = null;
+  const parser = new Parser('response', {
+    bodyless: this.method === 'HEAD',
+    head: (message) => {
+      response = new IncomingMessage(this.socket);
+      response._adopt(message);
+      this.res = response;
+      this.emit('response', response);
+    },
+    body: (chunk) => { if (response) response.push(chunk); },
+    complete: () => {
+      if (response) {
+        response.complete = true;
+        response.push(null);
+        response = null;
+      }
+      this.socket.end();
+    },
+    error: (error) => this.emit('error', error),
+  });
+  this.socket.on('data', (chunk) => parser.execute(chunk));
+  this.socket.on('end', () => parser.finish());
+};
+
+// Nothing can go out before the connection exists, so the body written
+// before then is held and sent in order once it does.
+ClientRequest.prototype._write = function _write(chunk, encoding, callback) {
+  if (this.socket.connecting) {
+    (this._queued ??= []).push([chunk, encoding]);
+    callback();
+    return;
+  }
+  OutgoingMessage.prototype._write.call(this, chunk, encoding, callback);
+};
+
+ClientRequest.prototype._final = function _final(callback) {
+  if (this.socket.connecting) {
+    this._endPending = () => OutgoingMessage.prototype._final.call(this, () => {});
+    callback();
+    return;
+  }
+  OutgoingMessage.prototype._final.call(this, callback);
+};
+
+ClientRequest.prototype._flush = function _flush() {
+  for (const [chunk, encoding] of this._queued ?? []) {
+    OutgoingMessage.prototype._write.call(this, chunk, encoding, () => {});
+  }
+  this._queued = undefined;
+  if (this._endPending) {
+    const end = this._endPending;
+    this._endPending = undefined;
+    end();
+  }
+};
+
+ClientRequest.prototype._sendHeaders = function _sendHeaders() {
+  this.headersSent = true;
+  if (this.method === 'GET' || this.method === 'HEAD' || this.method === 'DELETE') {
+    // A request with no body says so by its absence, not by a framing header.
+    if (!this._headers.has('content-length')) this.chunkedEncoding = false;
+  } else {
+    this._decideFraming();
+  }
+  if (!this._headers.has('connection')) {
+    this._headers.set('connection', ['Connection', 'close']);
+  }
+  this.socket.write(this._headerBlock(`${this.method} ${this.path} HTTP/1.1`));
+};
+
+ClientRequest.prototype.abort = function abort() {
+  this.destroy();
+};
+
+ClientRequest.prototype._destroy = function _destroy(error, callback) {
+  if (this.socket) this.socket.destroy();
+  callback(error);
+};
+
+ClientRequest.prototype.setTimeout = function setTimeout(timeout, callback) {
+  if (this.socket) this.socket.setTimeout(timeout, callback);
+  return this;
+};
 
 function normalizeClientOptions(options) {
   let settings = options;
@@ -707,23 +713,25 @@ function get(options, second, third) {
 }
 
 // A connection per request, which is what `Connection: close` above says.
-class Agent extends EventEmitter {
-  constructor(options = {}) {
-    super();
-    this.options = options;
-    this.maxSockets = options.maxSockets ?? Infinity;
-    this.maxFreeSockets = options.maxFreeSockets ?? 256;
-    this.keepAlive = options.keepAlive === true;
-    this.sockets = {};
-    this.freeSockets = {};
-    this.requests = {};
-  }
-
-  destroy() {}
-  getName(options) {
-    return `${options?.host ?? 'localhost'}:${options?.port ?? ''}`;
-  }
+function Agent(options) {
+  if (!(this instanceof Agent)) return new Agent(options);
+  EventEmitter.call(this);
+  options = options || {};
+  this.options = options;
+  this.maxSockets = options.maxSockets ?? Infinity;
+  this.maxFreeSockets = options.maxFreeSockets ?? 256;
+  this.keepAlive = options.keepAlive === true;
+  this.sockets = {};
+  this.freeSockets = {};
+  this.requests = {};
 }
+Object.setPrototypeOf(Agent.prototype, EventEmitter.prototype);
+Object.setPrototypeOf(Agent, EventEmitter);
+
+Agent.prototype.destroy = function destroy() {};
+Agent.prototype.getName = function getName(options) {
+  return `${options?.host ?? 'localhost'}:${options?.port ?? ''}`;
+};
 
 module.exports = {
   STATUS_CODES,

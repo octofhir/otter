@@ -92,6 +92,118 @@ pub fn http_cjs_value<'scope>(
     )
 }
 
+/// `node:https` — the http surface with TLS defaults (port 443).
+///
+/// # Errors
+/// Returns a native error when the shim fails to allocate or evaluate.
+pub fn https_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "node:https",
+        include_str!("https.js"),
+        module,
+        require,
+    )
+}
+
+/// The `_http_*` internals Node exposes as real modules: each is a narrow
+/// re-export over the hosted `http` module, exactly as Bun ships them.
+macro_rules! http_internal_shim {
+    ($fn_name:ident, $specifier:literal, $source:literal) => {
+        /// One `_http_*` internal module: a re-export over `http`.
+        ///
+        /// # Errors
+        /// Returns a native error when the shim fails to allocate or evaluate.
+        pub fn $fn_name<'scope>(
+            scope: &mut NativeScope<'scope, '_>,
+            _caps: &CapabilitySet,
+            _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+            module: Local<'scope>,
+            require: Local<'scope>,
+        ) -> Result<Local<'scope>, NativeError> {
+            otter_runtime::run_builtin_cjs_shim(scope, $specifier, $source, module, require)
+        }
+    };
+}
+
+http_internal_shim!(
+    http_common_cjs_value,
+    "node:_http_common",
+    r#"'use strict';
+const http = require('http');
+module.exports = {
+  _checkIsHttpToken: http._checkIsHttpToken,
+  _checkInvalidHeaderChar: http._checkInvalidHeaderChar,
+  methods: http.METHODS,
+  chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
+};
+"#
+);
+
+http_internal_shim!(
+    http_agent_cjs_value,
+    "node:_http_agent",
+    r#"'use strict';
+const http = require('http');
+module.exports = { Agent: http.Agent, globalAgent: http.globalAgent };
+"#
+);
+
+http_internal_shim!(
+    http_client_cjs_value,
+    "node:_http_client",
+    r#"'use strict';
+const http = require('http');
+module.exports = { ClientRequest: http.ClientRequest };
+"#
+);
+
+http_internal_shim!(
+    http_incoming_cjs_value,
+    "node:_http_incoming",
+    r#"'use strict';
+const http = require('http');
+module.exports = { IncomingMessage: http.IncomingMessage };
+"#
+);
+
+http_internal_shim!(
+    http_outgoing_cjs_value,
+    "node:_http_outgoing",
+    r#"'use strict';
+const http = require('http');
+module.exports = { OutgoingMessage: http.OutgoingMessage };
+"#
+);
+
+http_internal_shim!(
+    http_server_cjs_value,
+    "node:_http_server",
+    r#"'use strict';
+const http = require('http');
+module.exports = {
+  Server: http.Server,
+  ServerResponse: http.ServerResponse,
+  STATUS_CODES: http.STATUS_CODES,
+};
+"#
+);
+
+http_internal_shim!(
+    internal_http_cjs_value,
+    "node:internal/http",
+    r#"'use strict';
+const http = require('http');
+module.exports = { kOutHeaders: http._kOutHeaders };
+"#
+);
+
 /// `node:perf_hooks` — performance timeline subset.
 pub fn perf_hooks_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,

@@ -62,6 +62,7 @@ impl Interpreter {
         for job in finalization_jobs {
             let mut args = SmallVec::new();
             args.push(job.held_value);
+            let async_context = self.async_context();
             self.microtasks.enqueue(Microtask {
                 callee: job.cleanup_callback,
                 this_value: Value::undefined(),
@@ -69,6 +70,7 @@ impl Interpreter {
                 context: job.context,
                 result_capability: None,
                 kind: MicrotaskKind::FinalizationCallback,
+                async_context,
             });
         }
         self.gc_heap.sweep_phase();
@@ -276,7 +278,14 @@ impl Interpreter {
                         detail: self.take_error_detail(),
                     });
                 };
-                if let Err(err) = self.invoke_microtask(&context, task) {
+                // The task runs in the async context it was queued under, and
+                // the drain restores the ambient one afterwards: two tasks
+                // queued from different stores must not see each other's.
+                let ambient = self.async_context();
+                self.set_async_context(task.async_context);
+                let outcome = self.invoke_microtask(&context, task);
+                self.set_async_context(ambient);
+                if let Err(err) = outcome {
                     self.microtasks.end_drain();
                     return Err(err);
                 }
@@ -697,6 +706,7 @@ impl Interpreter {
         // reject native runs in a fresh job (matches spec
         // ordering — the next reaction picks it up on the next
         // generation).
+        let async_context = self.async_context();
         self.microtasks.enqueue(Microtask {
             callee,
             this_value: Value::undefined(),
@@ -704,6 +714,7 @@ impl Interpreter {
             context: Some(context.clone()),
             result_capability: None,
             kind: microtask::MicrotaskKind::Call,
+            async_context,
         });
     }
 

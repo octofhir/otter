@@ -185,6 +185,7 @@ impl Interpreter {
             eval_hook: None,
             pending_generator_throw: None,
             pending_uncaught_throw: None,
+            async_context: crate::Value::undefined(),
             iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,
             module_sources: crate::source_registry::SourceRegistry::default(),

@@ -764,6 +764,7 @@ impl Interpreter {
         let init = init_value
             .as_promise()
             .expect("rooted async-module gate survives reaction allocation");
+        let async_context = self.async_context();
         let outcome = crate::JsPromise::perform_then_with_context(
             &init,
             &mut self.gc_heap,
@@ -771,6 +772,7 @@ impl Interpreter {
             Some(on_rejected),
             capability,
             Some(context.clone()),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
@@ -1064,6 +1066,7 @@ impl Interpreter {
             context: Some(context.clone()),
             result_capability: None,
             kind: crate::microtask::MicrotaskKind::Call,
+            async_context: self.async_context(),
         });
         Ok(())
     }
@@ -1122,6 +1125,7 @@ impl Interpreter {
         .map_err(VmError::from)?;
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&on_fulfilled, &on_rejected], &[])?;
+        let async_context = self.async_context();
         let outcome = crate::JsPromise::perform_then_with_context(
             &init,
             &mut self.gc_heap,
@@ -1129,6 +1133,7 @@ impl Interpreter {
             Some(on_rejected),
             capability,
             Some(context.clone()),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);

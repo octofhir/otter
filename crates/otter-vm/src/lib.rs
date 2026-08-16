@@ -1318,6 +1318,12 @@ pub struct Interpreter {
     /// original thrown value is preserved here until the outer
     /// dispatch loop re-throws it on the still-live caller stack.
     pending_uncaught_throw: Option<Value>,
+    /// The async context every job queued from here inherits. Host code reads
+    /// and writes it through [`Interpreter::async_context`] /
+    /// [`Interpreter::set_async_context`]; a microtask or timer captures it at
+    /// enqueue and restores it around its own execution, which is what carries
+    /// an `AsyncLocalStorage` store across `await`, `then`, and `setTimeout`.
+    async_context: Value,
     /// Iteration-anchor stack: GC roots for in-flight iterator
     /// drains. `iterator_to_list_sync` and similar helpers push the
     /// iterator + next-method handles here before each

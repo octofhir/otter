@@ -103,6 +103,7 @@ fn pending_promise_microtask_payload_roots_until_drained() {
         args: smallvec![Value::object(payload)],
         context: None,
         result_capability: None,
+        async_context: Value::undefined(),
         kind: crate::MicrotaskKind::Call,
     });
 

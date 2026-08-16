@@ -235,6 +235,7 @@ impl Interpreter {
         )?;
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected], &[])?;
+        let async_context = self.async_context();
         let outcome = crate::JsPromise::perform_then_with_context(
             &gate,
             &mut self.gc_heap,
@@ -242,6 +243,7 @@ impl Interpreter {
             Some(on_rejected),
             capability,
             Some(context.clone()),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);

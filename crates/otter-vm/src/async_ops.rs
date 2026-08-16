@@ -124,6 +124,9 @@ impl Interpreter {
         // Advance past the Await before parking so resumption
         // continues at the next instruction.
         stack[top_idx].advance_pc()?;
+        // The continuation belongs to the context that awaited, so capture it
+        // before the frame parks.
+        let async_context = self.async_context();
         let promise = self.await_promise_resolve(context, stack, awaited)?;
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
@@ -140,6 +143,7 @@ impl Interpreter {
             capability,
             None,
             Some(context.clone()),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
@@ -162,6 +166,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         stack[top_idx].advance_pc()?;
+        // The continuation belongs to the context that awaited, so capture it
+        // before the frame parks.
+        let async_context = self.async_context();
         let promise = self.await_promise_resolve(context, stack, awaited)?;
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
@@ -178,6 +185,7 @@ impl Interpreter {
             capability,
             Some(owner),
             Some(context.clone()),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);

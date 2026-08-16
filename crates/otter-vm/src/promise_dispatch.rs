@@ -3002,12 +3002,14 @@ fn method_then(
         let on_fulfilled = on_fulfilled.map(|value| interp.escape_scoped(value));
         let on_rejected = on_rejected.map(|value| interp.escape_scoped(value));
         let capability = capability_handles.current(interp, context.clone());
+        let async_context = interp.async_context();
         let outcome = promise.perform_then_with_context(
             interp.gc_heap_mut(),
             on_fulfilled,
             on_rejected,
             capability,
             context.clone(),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             interp.microtasks_mut().enqueue(job);
@@ -3056,12 +3058,14 @@ fn perform_then_with_handlers(
         let on_fulfilled = on_fulfilled.map(|value| interp.escape_scoped(value));
         let on_rejected = on_rejected.map(|value| interp.escape_scoped(value));
         let capability = capability_handles.current(interp, context.clone());
+        let async_context = interp.async_context();
         let outcome: PromiseThenOutcome = promise.perform_then_with_context(
             interp.gc_heap_mut(),
             on_fulfilled,
             on_rejected,
             capability,
             context.clone(),
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             interp.microtasks_mut().enqueue(job);
@@ -3098,12 +3102,14 @@ fn attach_then(
         let on_fulfilled = on_fulfilled.map(|value| interp.escape_scoped(value));
         let on_rejected = on_rejected.map(|value| interp.escape_scoped(value));
         let capability = capability_handles.current(interp, context.clone());
+        let async_context = interp.async_context();
         let outcome = promise.perform_then_with_context(
             interp.gc_heap_mut(),
             on_fulfilled,
             on_rejected,
             capability,
             context,
+            async_context,
         );
         if let Some(job) = outcome.immediate_job {
             interp.microtasks_mut().enqueue(job);
@@ -3315,6 +3321,7 @@ fn resolve_native_body(
                 )?;
                 let job = scope.value(job);
                 let job = scope.raw(job);
+                let async_context = scope.context().interp_mut().async_context();
                 scope
                     .context()
                     .interp_mut()
@@ -3326,6 +3333,7 @@ fn resolve_native_body(
                         context: Some(exec),
                         result_capability: None,
                         kind: crate::microtask::MicrotaskKind::Call,
+                        async_context,
                     });
                 return Ok(Value::undefined());
             }

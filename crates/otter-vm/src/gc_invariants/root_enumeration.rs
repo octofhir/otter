@@ -454,6 +454,7 @@ fn microtask_payload_root_survives_force_gc() {
         args: smallvec::smallvec![crate::Value::object(object)],
         context: None,
         result_capability: None,
+        async_context: crate::Value::undefined(),
         kind: crate::MicrotaskKind::Call,
     });
 

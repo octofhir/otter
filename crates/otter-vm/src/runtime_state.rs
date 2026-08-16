@@ -209,6 +209,9 @@ impl<'a> RuntimeState<'a> {
         if let Some(value) = interp.pending_uncaught_throw_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // 8a) The async context is reachable only from here between jobs, and a
+        //     moving collection must rewrite it in place.
+        interp.async_context_for_trace().trace_value_slots(visitor);
         // 8b) Iteration-anchor stack — handles for in-flight
         //     iterator drains live here so a GC triggered inside a
         //     user `next` body cannot reclaim them. See

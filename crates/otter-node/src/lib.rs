@@ -23,7 +23,8 @@
 //! - [`otter_runtime::CommonJsAddonLoader`]
 
 pub mod assert;
-pub mod buffer;
+pub mod async_hooks;
+mod buffer;
 pub mod child_process;
 pub mod crypto;
 pub mod diagnostics_channel;
@@ -78,6 +79,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "internal/test/binding",
         internal_test_binding_ext::internal_test_binding_cjs_value,
     ),
+    HostedModule::cjs_only("node:async_hooks", async_hooks::async_hooks_cjs_value),
+    HostedModule::cjs_only("async_hooks", async_hooks::async_hooks_cjs_value),
     HostedModule::cjs_only("node:vm", misc_modules::vm_cjs_value),
     HostedModule::cjs_only("vm", misc_modules::vm_cjs_value),
     HostedModule::cjs_only("node:process", misc_modules::process_cjs_value),

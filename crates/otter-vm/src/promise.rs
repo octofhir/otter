@@ -98,6 +98,10 @@ pub struct PromiseReaction {
     /// time so host-driven settlement (e.g. cross-thread promise
     /// resolution) can resume on the right module.
     pub context: Option<ExecutionContext>,
+    /// Otter-specific: async context current when this reaction was
+    /// registered. The job restores it, so a store entered before `then` is
+    /// still current inside the handler.
+    pub async_context: Value,
 }
 
 impl crate::pelt::PeltField for PromiseReaction {
@@ -106,6 +110,7 @@ impl crate::pelt::PeltField for PromiseReaction {
         self.capability.resolve.trace_value_slot_mut(visitor);
         self.capability.reject.trace_value_slot_mut(visitor);
         self.handler.trace_value_slots_mut(visitor);
+        self.async_context.trace_value_slot_mut(visitor);
     }
 }
 
@@ -296,6 +301,7 @@ pub trait JsPromise: std::fmt::Debug {
         on_rejected: Option<Value>,
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
+        async_context: Value,
     ) -> PromiseThenOutcome;
 
     /// `true` once any reaction has been attached.
@@ -518,23 +524,25 @@ impl PurePromise {
         capability: PromiseCapability,
         owner: Option<crate::generator::JsGenerator>,
         context: Option<ExecutionContext>,
+        async_context: Value,
     ) -> PromiseThenOutcome {
-        let outcome = self.perform_then_internal(heap, capability, context, |kind| {
-            let fulfilled = kind == ReactionKind::Fulfill;
-            match owner {
-                Some(owner) => PromiseReactionHandler::AsyncGenResume {
-                    parked,
-                    await_dst,
-                    owner,
-                    fulfilled,
-                },
-                None => PromiseReactionHandler::AsyncResume {
-                    parked,
-                    await_dst,
-                    fulfilled,
-                },
-            }
-        });
+        let outcome =
+            self.perform_then_internal(heap, capability, context, async_context, |kind| {
+                let fulfilled = kind == ReactionKind::Fulfill;
+                match owner {
+                    Some(owner) => PromiseReactionHandler::AsyncGenResume {
+                        parked,
+                        await_dst,
+                        owner,
+                        fulfilled,
+                    },
+                    None => PromiseReactionHandler::AsyncResume {
+                        parked,
+                        await_dst,
+                        fulfilled,
+                    },
+                }
+            });
         self.finish_then_outcome(heap, outcome)
     }
 
@@ -543,6 +551,7 @@ impl PurePromise {
         heap: &mut otter_gc::GcHeap,
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
+        async_context: Value,
         mut handler_for: impl FnMut(ReactionKind) -> PromiseReactionHandler,
     ) -> ThenOutcomeInternal {
         let reaction_context = context.or_else(|| capability.context.clone());
@@ -555,12 +564,14 @@ impl PurePromise {
                         handler: handler_for(ReactionKind::Fulfill),
                         kind: ReactionKind::Fulfill,
                         context: reaction_context.clone(),
+                        async_context,
                     };
                     let reject = PromiseReaction {
                         capability,
                         handler: handler_for(ReactionKind::Reject),
                         kind: ReactionKind::Reject,
                         context: reaction_context,
+                        async_context,
                     };
                     body.fulfill_reactions.push(fulfill.clone());
                     body.reject_reactions.push(reject.clone());
@@ -575,6 +586,7 @@ impl PurePromise {
                         handler: handler_for(ReactionKind::Fulfill),
                         kind: ReactionKind::Fulfill,
                         context: reaction_context,
+                        async_context,
                     };
                     ThenOutcomeInternal {
                         immediate_reaction: Some((reaction, value)),
@@ -587,6 +599,7 @@ impl PurePromise {
                         handler: handler_for(ReactionKind::Reject),
                         kind: ReactionKind::Reject,
                         context: reaction_context,
+                        async_context,
                     };
                     ThenOutcomeInternal {
                         immediate_reaction: Some((reaction, reason)),
@@ -673,7 +686,14 @@ impl JsPromise for PurePromise {
         on_rejected: Option<Value>,
         capability: PromiseCapability,
     ) -> PromiseThenOutcome {
-        self.perform_then_with_context(heap, on_fulfilled, on_rejected, capability, None)
+        self.perform_then_with_context(
+            heap,
+            on_fulfilled,
+            on_rejected,
+            capability,
+            None,
+            Value::undefined(),
+        )
     }
 
     fn perform_then_with_context(
@@ -683,11 +703,18 @@ impl JsPromise for PurePromise {
         on_rejected: Option<Value>,
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
+        async_context: Value,
     ) -> PromiseThenOutcome {
-        let outcome = self.perform_then_internal(heap, capability, context, |kind| match kind {
-            ReactionKind::Fulfill => PromiseReactionHandler::Call(on_fulfilled),
-            ReactionKind::Reject => PromiseReactionHandler::Call(on_rejected),
-        });
+        let outcome = self.perform_then_internal(
+            heap,
+            capability,
+            context,
+            async_context,
+            |kind| match kind {
+                ReactionKind::Fulfill => PromiseReactionHandler::Call(on_fulfilled),
+                ReactionKind::Reject => PromiseReactionHandler::Call(on_rejected),
+            },
+        );
         self.finish_then_outcome(heap, outcome)
     }
 
@@ -869,7 +896,13 @@ impl JsPromiseHandle {
         owner: Option<crate::generator::JsGenerator>,
     ) -> PromiseThenOutcome {
         self.perform_async_resume_then_with_context(
-            heap, parked, await_dst, capability, owner, None,
+            heap,
+            parked,
+            await_dst,
+            capability,
+            owner,
+            None,
+            Value::undefined(),
         )
     }
 
@@ -883,11 +916,18 @@ impl JsPromiseHandle {
         capability: PromiseCapability,
         owner: Option<crate::generator::JsGenerator>,
         context: Option<ExecutionContext>,
+        async_context: Value,
     ) -> PromiseThenOutcome {
         match self.inner {
-            PromiseRepr::Pure(p) => {
-                p.perform_async_resume_then(heap, parked, await_dst, capability, owner, context)
-            }
+            PromiseRepr::Pure(p) => p.perform_async_resume_then(
+                heap,
+                parked,
+                await_dst,
+                capability,
+                owner,
+                context,
+                async_context,
+            ),
         }
     }
 }
@@ -930,11 +970,17 @@ impl JsPromise for JsPromiseHandle {
         on_rejected: Option<Value>,
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
+        async_context: Value,
     ) -> PromiseThenOutcome {
         match self.inner {
-            PromiseRepr::Pure(p) => {
-                p.perform_then_with_context(heap, on_fulfilled, on_rejected, capability, context)
-            }
+            PromiseRepr::Pure(p) => p.perform_then_with_context(
+                heap,
+                on_fulfilled,
+                on_rejected,
+                capability,
+                context,
+                async_context,
+            ),
         }
     }
 
@@ -982,6 +1028,7 @@ pub fn new_promise_reaction_job(
     use crate::microtask::MicrotaskCapability;
     use smallvec::smallvec;
 
+    let async_context = reaction.async_context;
     match reaction.handler {
         PromiseReactionHandler::Call(handler) => {
             let (callee, result_capability) = match handler {
@@ -1004,6 +1051,7 @@ pub fn new_promise_reaction_job(
                 context: reaction.context,
                 result_capability,
                 kind: MicrotaskKind::Call,
+                async_context,
             })
         }
         PromiseReactionHandler::AsyncResume {
@@ -1024,6 +1072,7 @@ pub fn new_promise_reaction_job(
                     await_dst,
                     fulfilled,
                 },
+                async_context,
             })
         }
         PromiseReactionHandler::AsyncGenResume {
@@ -1039,6 +1088,7 @@ pub fn new_promise_reaction_job(
                 args: smallvec![value],
                 context: reaction.context,
                 result_capability: None,
+                async_context,
                 kind: MicrotaskKind::AsyncGenResume {
                     frame,
                     cold,

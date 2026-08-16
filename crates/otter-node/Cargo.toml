@@ -21,6 +21,7 @@ idna = "1.1"
 libloading = "0.8"
 
 [target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

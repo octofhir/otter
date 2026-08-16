@@ -79,3 +79,68 @@ fn node_fs_read_write_round_trips_with_permissions() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// The filesystem members added for Node's own tests: a private temporary
+/// directory, both link kinds, ownership-free timestamp changes, and the
+/// descriptor operations that used to be silent no-ops.
+#[test]
+fn node_fs_links_timestamps_and_descriptor_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        format!(
+            r#"
+            import {{
+                closeSync, existsSync, fsyncSync, ftruncateSync, linkSync, mkdtempSync,
+                openSync, readFileSync, readlinkSync, statSync, symlinkSync, utimesSync,
+                writeFileSync,
+            }} from "node:fs";
+            import {{ join }} from "node:path";
+
+            const root = {root:?};
+            const scratch = mkdtempSync(join(root, "otter-"));
+            if (!existsSync(scratch)) throw new Error("mkdtemp did not create a directory");
+            if (!scratch.startsWith(join(root, "otter-"))) {{
+                throw new Error("mkdtemp ignored its prefix: " + scratch);
+            }}
+            if (mkdtempSync(join(root, "otter-")) === scratch) {{
+                throw new Error("mkdtemp handed out the same name twice");
+            }}
+
+            const file = join(scratch, "a.txt");
+            writeFileSync(file, "hello");
+            const hard = join(scratch, "hard.txt");
+            linkSync(file, hard);
+            if (readFileSync(hard, "utf8") !== "hello") throw new Error("hard link lost content");
+
+            const soft = join(scratch, "soft.txt");
+            symlinkSync(file, soft);
+            if (readlinkSync(soft) !== file) throw new Error("symlink target: " + readlinkSync(soft));
+
+            utimesSync(file, 1600000000, 1600000001);
+            const stamped = statSync(file);
+            if (Math.round(stamped.mtimeMs / 1000) !== 1600000001) {{
+                throw new Error("mtime was " + stamped.mtimeMs);
+            }}
+
+            const fd = openSync(file, "r+");
+            ftruncateSync(fd, 1);
+            fsyncSync(fd);
+            closeSync(fd);
+            if (readFileSync(file, "utf8") !== "h") {{
+                throw new Error("ftruncate left " + readFileSync(file, "utf8"));
+            }}
+        "#,
+            root = dir.path().to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

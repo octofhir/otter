@@ -18,42 +18,6 @@ fn not_implemented(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     Err(type_error("stub", "not implemented"))
 }
 
-/// `node:net` — placeholder namespace. The harness reads the default
-/// auto-select-family timeout at load, so those accessors are provided.
-pub fn install_net<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-) -> Result<Local<'scope>, NativeError> {
-    let namespace = scope.bare_object()?;
-    let get_timeout = scope.native_method(
-        "getDefaultAutoSelectFamilyAttemptTimeout",
-        0,
-        net_default_timeout,
-    )?;
-    scope.set(
-        namespace,
-        "getDefaultAutoSelectFamilyAttemptTimeout",
-        get_timeout,
-    )?;
-    let set_timeout =
-        scope.native_method("setDefaultAutoSelectFamilyAttemptTimeout", 1, net_noop)?;
-    scope.set(
-        namespace,
-        "setDefaultAutoSelectFamilyAttemptTimeout",
-        set_timeout,
-    )?;
-    Ok(namespace)
-}
-
-fn net_default_timeout(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::number(otter_vm::number::NumberValue::from_i32(10)))
-}
-
-fn net_noop(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::undefined())
-}
-
 /// `node:worker_threads` — only `isMainThread` is consulted at harness load.
 pub fn install_worker_threads<'scope>(
     scope: &mut NativeScope<'scope, '_>,

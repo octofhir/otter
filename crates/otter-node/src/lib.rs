@@ -37,6 +37,7 @@ pub mod internal_errors_ext;
 pub mod internal_test_binding_ext;
 pub mod misc_modules;
 pub mod napi;
+pub mod net;
 pub mod node_test;
 pub mod os;
 pub mod path;
@@ -156,8 +157,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("util/types", util::util_types_cjs_value),
     HostedModule::cjs_only("node:tty", tty::tty_cjs_value),
     HostedModule::cjs_only("tty", tty::tty_cjs_value),
-    HostedModule::new("node:net", stubs::install_net),
-    HostedModule::new("net", stubs::install_net),
+    HostedModule::cjs_only("node:net", net::net_cjs_value),
+    HostedModule::cjs_only("net", net::net_cjs_value),
     HostedModule::new("node:worker_threads", stubs::install_worker_threads),
     HostedModule::new("worker_threads", stubs::install_worker_threads),
     HostedModule::cjs_only("node:buffer", buffer::buffer_cjs_value),

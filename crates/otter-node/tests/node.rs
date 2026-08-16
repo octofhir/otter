@@ -599,3 +599,62 @@ fn node_process_is_the_only_event_emitter_it_has() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// `net`'s address classification and the shapes it exposes without opening
+/// anything. Listening, connecting, and carrying bytes all need the host's IO
+/// runtime, which a bare runtime has none of, so those are CLI-verified.
+#[test]
+fn node_net_classifies_addresses_and_exposes_its_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import net from "node:net";
+
+        for (const name of ["createServer", "createConnection", "connect", "isIP"]) {
+            if (typeof net[name] !== "function") throw new Error(name + " is missing");
+        }
+        if (typeof net.Server !== "function") throw new Error("Server is missing");
+        if (typeof net.Socket !== "function") throw new Error("Socket is missing");
+
+        // A version is reported as the number naming it, and anything else as 0.
+        const addresses = [
+            ["127.0.0.1", 4], ["0.0.0.0", 4], ["255.255.255.255", 4],
+            ["::1", 6], ["::", 6], ["2001:db8::1", 6],
+            ["256.0.0.1", 0], ["1.2.3", 0], ["", 0], ["nope", 0], ["1.2.3.4.5", 0],
+        ];
+        for (const [address, version] of addresses) {
+            if (net.isIP(address) !== version) {
+                throw new Error(`isIP(${address}) is ${net.isIP(address)}, not ${version}`);
+            }
+        }
+        if (!net.isIPv4("1.2.3.4") || net.isIPv4("::1")) throw new Error("isIPv4 disagrees");
+        if (!net.isIPv6("::1") || net.isIPv6("1.2.3.4")) throw new Error("isIPv6 disagrees");
+
+        // A server that was never told to listen has no address, which is what
+        // a program checks before using one. Closing it reports the refusal on
+        // a later turn, so that leg belongs with the CLI checks.
+        const server = net.createServer();
+        if (server.listening) throw new Error("a fresh server is listening");
+        if (server.address() !== null) throw new Error("a fresh server has an address");
+
+        // A socket that was never connected is pending and carries no peer.
+        const socket = new net.Socket();
+        if (!socket.pending) throw new Error("a fresh socket is not pending");
+        if (socket.connecting) throw new Error("a fresh socket is connecting");
+        if (socket.remoteAddress !== undefined) throw new Error("a fresh socket has a peer");
+        if (typeof socket.write !== "function" || typeof socket.pipe !== "function") {
+            throw new Error("a socket is not a stream");
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

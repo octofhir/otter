@@ -1840,7 +1840,12 @@ impl Interpreter {
         method_key: AtomizedPropertyKey<'_>,
     ) -> Result<Option<Value>, VmError> {
         let name = method_key.name();
+        // A bound function is an exotic object whose ordinary `[[Get]]`
+        // resolves own metadata first and then walks `%Function.prototype%`
+        // (§10.4.1.3); `ordinary_get_value` owns that walk, so it routes with
+        // the property-bearing receivers below.
         let is_property_bearing = recv_value.is_object()
+            || recv_value.as_bound_function().is_some()
             || recv_value.is_proxy()
             || recv_value.is_array()
             || recv_value.is_regexp()

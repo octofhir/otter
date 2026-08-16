@@ -718,6 +718,30 @@ impl crate::Interpreter {
             let has_real_name = crate::object::get(obj, heap, "name")
                 .is_some_and(|name| !name.is_undefined() && !name.is_null());
             let message = crate::object::get(obj, heap, "message");
+            // Node prints an uncaught Error's `stack`: the `Name: message`
+            // header followed by its frames. An own `stack` data property
+            // (user-assigned, or written by `Error.captureStackTrace`) wins;
+            // otherwise the frames captured at construction render the same
+            // string the `Error.prototype.stack` getter would. Anything
+            // without either falls back to the name/message rendering.
+            if let Some(stack) = crate::object::get(obj, heap, "stack")
+                && let Some(text) = stack.as_string(heap)
+            {
+                let rendered = text.to_lossy_string(heap);
+                if !rendered.is_empty() {
+                    return rendered;
+                }
+            }
+            if crate::object::has_error_data(obj, heap)
+                && let Some(frames) = crate::object::error_stack_frames(obj, heap)
+                && !frames.is_empty()
+            {
+                let mut rendered = error_classes::render_error_to_string(value, heap);
+                if !rendered.is_empty() {
+                    error_classes::append_stack_frames(&mut rendered, &frames, self);
+                    return rendered;
+                }
+            }
             if !has_real_name && let Some(ctor_name) = self.thrown_constructor_name(obj) {
                 let message = message
                     .filter(|v| !v.is_undefined())

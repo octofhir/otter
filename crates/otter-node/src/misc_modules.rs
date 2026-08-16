@@ -21,7 +21,13 @@ const MODULE_SHIM: &str = include_str!("module_builtin.js");
 const CLUSTER_SHIM: &str = include_str!("cluster.js");
 const INTERNAL_UTIL_SHIM: &str = include_str!("internal_util.js");
 const VM_SHIM: &str = include_str!("vm.js");
-const INTERNAL_URL_SHIM: &str = "'use strict'; module.exports = { isURL(value) { return typeof URL !== 'undefined' && value instanceof URL; } };";
+const INTERNAL_URL_SHIM: &str = r#"'use strict';
+module.exports = {
+  URL: globalThis.URL,
+  isURL(value) { return typeof URL !== 'undefined' && value instanceof URL; },
+  pathToFileURL(path) { return new URL(`file://${String(path)}`); },
+};
+"#;
 
 /// `internal/event_target` (exposed under `--expose-internals`) — re-exports the
 /// `Event` / `EventTarget` / `CustomEvent` globals (installed by the Web API

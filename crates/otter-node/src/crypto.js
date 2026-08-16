@@ -12,7 +12,10 @@ function toLatin1(data, enc) {
   if (data instanceof Uint8Array || (data && data.buffer instanceof ArrayBuffer)) {
     return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('latin1');
   }
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('latin1');
+  if (data instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)) {
+    return Buffer.from(data).toString('latin1');
+  }
   return Buffer.from(String(data), 'utf8').toString('latin1');
 }
 
@@ -187,6 +190,133 @@ const constants = {
   RSA_PKCS1_PSS_PADDING: 6,
 };
 
+// ---- key derivation ----
+// Node renders the offending value in its `Received …` tail; these errors are
+// asserted verbatim by its own tests.
+function receivedTail(value) {
+  if (value === null || value === undefined) return ` Received ${value}`;
+  if (typeof value === 'string') return ` Received type string ('${value}')`;
+  if (typeof value === 'object') {
+    return ` Received an instance of ${value.constructor ? value.constructor.name : 'Object'}`;
+  }
+  if (typeof value === 'function') return ` Received function ${value.name}`;
+  return ` Received type ${typeof value} (${String(value)})`;
+}
+
+function invalidArgType(name, expected, value) {
+  const err = new TypeError(
+    `The "${name}" argument must be of type ${expected}.${receivedTail(value)}`);
+  err.code = 'ERR_INVALID_ARG_TYPE';
+  return err;
+}
+
+function outOfRange(name, constraint, value) {
+  const err = new RangeError(
+    `The value of "${name}" is out of range. It must be ${constraint}. Received ${String(value)}`);
+  err.code = 'ERR_OUT_OF_RANGE';
+  return err;
+}
+
+// An integer in `[min, max]`, rejecting a non-number by type and a number that
+// is out of range or fractional by range, which is the split Node uses.
+function validateInteger(name, value, min, max) {
+  if (typeof value !== 'number') throw invalidArgType(name, 'number', value);
+  if (!Number.isInteger(value)) {
+    throw outOfRange(name, 'an integer', value);
+  }
+  if (value < min || value > max) {
+    throw outOfRange(name, `>= ${min} && <= ${max}`, value);
+  }
+  return value;
+}
+
+function validateCallback(cb) {
+  if (typeof cb !== 'function') throw invalidArgType('callback', 'function', cb);
+  return cb;
+}
+
+const MAX_ITERATIONS = 2147483647;
+const MAX_KEYLEN = 2147483647;
+
+// Node takes the password and salt as a string, an ArrayBuffer, or a view over
+// one; anything else is rejected before any work happens.
+function validateKeyMaterial(name, value) {
+  const acceptable = typeof value === 'string' ||
+    ArrayBuffer.isView(value) ||
+    value instanceof ArrayBuffer ||
+    (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer);
+  if (!acceptable) {
+    throw invalidArgType(
+      name, 'string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView', value);
+  }
+  return value;
+}
+
+function validateDigest(digest) {
+  if (typeof digest !== 'string') throw invalidArgType('digest', 'string', digest);
+  // An unknown name is its own error, distinct from a wrong type.
+  if (!getHashes().includes(digest.toLowerCase())) {
+    const err = new TypeError(`Invalid digest: ${digest}`);
+    err.code = 'ERR_CRYPTO_INVALID_DIGEST';
+    throw err;
+  }
+  return digest;
+}
+
+function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+  validateKeyMaterial('password', password);
+  validateKeyMaterial('salt', salt);
+  validateDigest(digest);
+  validateInteger('iterations', iterations, 1, MAX_ITERATIONS);
+  validateInteger('keylen', keylen, 0, MAX_KEYLEN);
+  const derived = native.pbkdf2Digest(
+    String(digest), toLatin1(password), toLatin1(salt), iterations, keylen === 0 ? 0 : keylen);
+  return Buffer.from(derived, 'latin1');
+}
+
+function pbkdf2(password, salt, iterations, keylen, digest, cb) {
+  if (typeof digest === 'function') { cb = digest; digest = undefined; }
+  validateCallback(cb);
+  // Argument errors are thrown, not passed to the callback.
+  validateKeyMaterial('password', password);
+  validateKeyMaterial('salt', salt);
+  validateDigest(digest);
+  validateInteger('iterations', iterations, 1, MAX_ITERATIONS);
+  validateInteger('keylen', keylen, 0, MAX_KEYLEN);
+  setTimeout(() => {
+    let derived;
+    try {
+      derived = pbkdf2Sync(password, salt, iterations, keylen, digest);
+    } catch (err) {
+      return cb(err);
+    }
+    cb(null, derived);
+  });
+}
+
+// Node answers `hkdfSync` with an ArrayBuffer, not a Buffer.
+function hkdfSync(digest, ikm, salt, info, keylen) {
+  validateInteger('keylen', keylen, 0, MAX_KEYLEN);
+  const derived = native.hkdfDerive(
+    String(digest), toLatin1(ikm), toLatin1(salt), toLatin1(info), keylen);
+  const buf = Buffer.from(derived, 'latin1');
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}
+
+function hkdf(digest, ikm, salt, info, keylen, cb) {
+  validateCallback(cb);
+  validateInteger('keylen', keylen, 0, MAX_KEYLEN);
+  setTimeout(() => {
+    let derived;
+    try {
+      derived = hkdfSync(digest, ikm, salt, info, keylen);
+    } catch (err) {
+      return cb(err);
+    }
+    cb(null, derived);
+  });
+}
+
 const webcrypto = { getRandomValues, randomUUID, subtle: {} };
 
 module.exports = {
@@ -194,4 +324,5 @@ module.exports = {
   randomBytes, randomFillSync, randomFill, randomInt, randomUUID,
   getRandomValues, getHashes, getCiphers, getFips, setFips, timingSafeEqual,
   constants, webcrypto, Hash, Hmac,
+  pbkdf2, pbkdf2Sync, hkdf, hkdfSync,
 };

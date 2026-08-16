@@ -48,6 +48,8 @@ fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'sc
     m!("randomBytes", 1, random_bytes);
     m!("hashDigest", 2, hash_digest);
     m!("hmacDigest", 3, hmac_digest);
+    m!("pbkdf2Digest", 5, pbkdf2_digest);
+    m!("hkdfDerive", 5, hkdf_derive);
 
     Ok(object)
 }
@@ -148,4 +150,135 @@ fn hmac<D: Digest>(key: &[u8], data: &[u8], block_size: usize) -> Vec<u8> {
     outer.update(&opad);
     outer.update(&inner_digest);
     outer.finalize().to_vec()
+}
+
+/// `pbkdf2(password, salt, iterations, keylen, digest)` — RFC 2898 PBKDF2 over
+/// the same HMAC this module already builds, so every digest it supports is
+/// available here too.
+fn pbkdf2_digest(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let algo = normalize_algo(&runtime_arg_to_string(args, 0, ctx.heap()));
+    let password = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
+    let salt = latin1_to_bytes(&runtime_arg_to_string(args, 2, ctx.heap()));
+    let iterations = number_arg(args, 3).max(1.0) as u32;
+    let key_len = number_arg(args, 4).max(0.0) as usize;
+
+    let derived = with_digest(&algo, |block, mac| {
+        pbkdf2(mac, block, &password, &salt, iterations, key_len)
+    })?;
+    crate::string_value(ctx, &bytes_to_latin1(&derived))
+}
+
+/// `hkdf(digest, ikm, salt, info, keylen)` — RFC 5869 extract-then-expand.
+fn hkdf_derive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let algo = normalize_algo(&runtime_arg_to_string(args, 0, ctx.heap()));
+    let ikm = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
+    let salt = latin1_to_bytes(&runtime_arg_to_string(args, 2, ctx.heap()));
+    let info = latin1_to_bytes(&runtime_arg_to_string(args, 3, ctx.heap()));
+    let key_len = number_arg(args, 4).max(0.0) as usize;
+
+    let derived = with_digest(&algo, |block, mac| {
+        let digest_len = mac(&[], &[], block).len();
+        // An absent salt is a string of zeros as long as the digest.
+        let salt = if salt.is_empty() {
+            vec![0u8; digest_len]
+        } else {
+            salt.clone()
+        };
+        let prk = mac(&salt, &ikm, block);
+        hkdf_expand(mac, block, &prk, &info, key_len, digest_len)
+    })?;
+    crate::string_value(ctx, &bytes_to_latin1(&derived))
+}
+
+/// Run `body` with the HMAC of the named digest and that digest's block size.
+fn with_digest<R>(
+    algo: &str,
+    body: impl FnOnce(usize, &dyn Fn(&[u8], &[u8], usize) -> Vec<u8>) -> R,
+) -> Result<R, NativeError> {
+    match algo {
+        "sha1" => Ok(body(64, &|key, data, block| {
+            hmac::<sha1::Sha1>(key, data, block)
+        })),
+        "md5" => Ok(body(64, &|key, data, block| {
+            hmac::<md5::Md5>(key, data, block)
+        })),
+        "sha224" => Ok(body(64, &|key, data, block| {
+            hmac::<Sha224>(key, data, block)
+        })),
+        "sha256" => Ok(body(64, &|key, data, block| {
+            hmac::<Sha256>(key, data, block)
+        })),
+        "sha384" => Ok(body(128, &|key, data, block| {
+            hmac::<Sha384>(key, data, block)
+        })),
+        "sha512" => Ok(body(128, &|key, data, block| {
+            hmac::<Sha512>(key, data, block)
+        })),
+        other => Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::Error,
+            code: "ERR_OSSL_EVP_UNSUPPORTED",
+            message: format!("Digest method not supported: {other}"),
+        }),
+    }
+}
+
+fn number_arg(args: &[Value], index: usize) -> f64 {
+    args.get(index)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+}
+
+/// RFC 2898 §5.2. Each block is `U1 ^ U2 ^ … ^ Uc`, where `U1` covers the salt
+/// and the block index and every later `U` is the HMAC of the one before it.
+fn pbkdf2(
+    mac: &dyn Fn(&[u8], &[u8], usize) -> Vec<u8>,
+    block_size: usize,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key_len);
+    let mut block_index: u32 = 1;
+    while out.len() < key_len {
+        let mut seed = salt.to_vec();
+        seed.extend_from_slice(&block_index.to_be_bytes());
+        let mut current = mac(password, &seed, block_size);
+        let mut block = current.clone();
+        for _ in 1..iterations {
+            current = mac(password, &current, block_size);
+            for (accumulated, byte) in block.iter_mut().zip(current.iter()) {
+                *accumulated ^= byte;
+            }
+        }
+        out.extend_from_slice(&block);
+        block_index += 1;
+    }
+    out.truncate(key_len);
+    out
+}
+
+/// RFC 5869 §2.3 expand.
+fn hkdf_expand(
+    mac: &dyn Fn(&[u8], &[u8], usize) -> Vec<u8>,
+    block_size: usize,
+    prk: &[u8],
+    info: &[u8],
+    key_len: usize,
+    digest_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key_len);
+    let mut previous: Vec<u8> = Vec::new();
+    let mut counter: u8 = 1;
+    while out.len() < key_len {
+        let mut input = previous.clone();
+        input.extend_from_slice(info);
+        input.push(counter);
+        previous = mac(prk, &input, block_size);
+        out.extend_from_slice(&previous);
+        counter = counter.wrapping_add(1);
+        let _ = digest_len;
+    }
+    out.truncate(key_len);
+    out
 }

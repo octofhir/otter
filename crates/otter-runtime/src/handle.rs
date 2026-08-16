@@ -2319,10 +2319,10 @@ impl IsolateRunner {
     /// timers are not run because the reply already carries the
     /// failure. Cancellation of leftover timers happens
     /// out-of-band when [`crate::Runtime`] drops.
-    fn drive_event_loop_to_idle<T>(
+    fn drive_event_loop_to_idle(
         &mut self,
-        initial: Result<T, OtterError>,
-    ) -> Result<T, OtterError> {
+        initial: Result<ExecutionResult, OtterError>,
+    ) -> Result<ExecutionResult, OtterError> {
         // Clippy `question_mark` suggests `as_ref()?` but the
         // function returns `Result<T, OtterError>` while `as_ref`
         // gives `Result<&T, &OtterError>`; rewriting would force
@@ -2332,6 +2332,16 @@ impl IsolateRunner {
             return initial;
         }
         loop {
+            // An exit requested from a task or timer callback completes the
+            // run with that code, exactly as an exit during entry evaluation
+            // does.
+            if let Some(code) = self.runtime.take_pending_exit_code() {
+                let duration = initial
+                    .as_ref()
+                    .map(|result| result.duration)
+                    .unwrap_or_default();
+                return Ok(ExecutionResult::from_exit_code(code, duration));
+            }
             // An unhandled throw from a task or timer callback fails the run:
             // the entry value is gone the way Node's is when an uncaught
             // exception ends the process.

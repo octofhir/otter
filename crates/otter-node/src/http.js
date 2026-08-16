@@ -370,14 +370,34 @@ OutgoingMessage.prototype._headerBlock = function _headerBlock(firstLine) {
 };
 
 // The body is framed by whatever the header block promised: a length if one
-// was given, chunks otherwise.
+// was given, chunks when the peer understands them, and the end of the
+// connection otherwise (an HTTP/1.0 requester never sees chunks).
+OutgoingMessage.prototype.useChunkedEncodingByDefault = true;
+
 OutgoingMessage.prototype._decideFraming = function _decideFraming() {
   if (this._headers.has('content-length')) {
     this.chunkedEncoding = false;
     return;
   }
+  if (this.useChunkedEncodingByDefault === false) {
+    this.chunkedEncoding = false;
+    return;
+  }
   this.chunkedEncoding = true;
   this._headers.set('transfer-encoding', ['Transfer-Encoding', 'chunked']);
+};
+
+// Flush the header block and write `data` to the wire as-is — no body
+// framing. `write` frames; this is the raw layer beneath it, and the corpus
+// calls it directly to force per-write packets.
+OutgoingMessage.prototype._send = function _send(data, encoding, callback) {
+  if (typeof encoding === 'function') { callback = encoding; encoding = null; }
+  if (!this.headersSent) this._sendHeaders();
+  if (data != null && data.length !== 0) {
+    this.socket.write(Buffer.isBuffer(data) ? data : Buffer.from(String(data), encoding || 'utf8'));
+  }
+  if (typeof callback === 'function') callback();
+  return true;
 };
 
 OutgoingMessage.prototype._write = function _write(chunk, encoding, callback) {
@@ -451,10 +471,23 @@ ServerResponse.prototype._sendHeaders = function _sendHeaders() {
   if (this.sendDate && !this._headers.has('date')) {
     this._headers.set('date', ['Date', new Date().toUTCString()]);
   }
+  // Framing is decided before the Connection header is chosen but written
+  // after it, matching Node's injected-header order (Date, Connection,
+  // Transfer-Encoding). A response with neither a length nor chunks is
+  // delimited by the connection closing, so it cannot keep the socket alive.
+  const hadTransferEncoding = this._headers.has('transfer-encoding');
   this._decideFraming();
+  if (!this.chunkedEncoding && !this._headers.has('content-length')) {
+    this.shouldKeepAlive = false;
+  }
   if (!this._headers.has('connection')) {
     this._headers.set('connection', ['Connection',
       this.shouldKeepAlive ? 'keep-alive' : 'close']);
+  }
+  if (this.chunkedEncoding && !hadTransferEncoding) {
+    // Re-insert so the block reads Connection before Transfer-Encoding.
+    this._headers.delete('transfer-encoding');
+    this._headers.set('transfer-encoding', ['Transfer-Encoding', 'chunked']);
   }
   this.socket.write(this._headerBlock(`HTTP/1.1 ${this.statusCode} ${message}`));
 };
@@ -523,6 +556,10 @@ Server.prototype._connection = function _connection(socket) {
       request._adopt(message);
       const response = new ServerResponse(socket, request);
       response.shouldKeepAlive = keepAlive(message);
+      // An HTTP/1.0 requester does not understand chunks; its response body
+      // runs to the end of the connection instead.
+      response.useChunkedEncodingByDefault =
+        message.httpVersionMajor === 1 && message.httpVersionMinor >= 1;
       this.emit('request', request, response);
     },
     body: (chunk) => { if (request) request.push(chunk); },

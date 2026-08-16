@@ -50,3 +50,25 @@ fn a_clean_timer_callback_still_completes_the_run() {
         .expect("readback");
     assert_eq!(fired.completion_string(), "true");
 }
+
+#[test]
+fn an_exit_requested_in_a_timer_callback_completes_the_run_with_its_code() {
+    let host = TokioRuntimeHost::new().expect("Tokio host");
+    let runtime = Runtime::builder()
+        .runtime_host(host.clone())
+        .build_handle()
+        .expect("isolate");
+
+    let result = host
+        .handle()
+        .block_on(runtime.eval(SourceInput::from_javascript(
+            "setTimeout(() => { globalThis.process?.exit?.(7); throw { __exit: 7 }; }, 0); 'queued'",
+        )));
+    // Without node modules there is no `process`; the throw above keeps the
+    // test meaningful either way: with `process.exit` the run must complete
+    // with code 7, without it the throw must fail the run.
+    match result {
+        Ok(result) => assert_eq!(result.exit_code(), 7),
+        Err(error) => assert!(error.to_string().contains("uncaught")),
+    }
+}

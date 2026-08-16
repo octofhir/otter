@@ -2597,6 +2597,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
             runtime_task_spawner,
+            pending_exit_code: None,
         })
     }
 
@@ -2857,6 +2858,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
             runtime_task_spawner,
+            pending_exit_code: None,
             restored_from_snapshot: false,
         };
         if runtime.config.install_worker_global {
@@ -2956,6 +2958,13 @@ pub struct Runtime {
     promise_registry: promise_registry::PromiseRegistry,
     /// Sender for owned tasks that must run on the isolate event loop.
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    /// Exit requested by JavaScript from a host-driven callback — a timer
+    /// fire, a native event delivery, or an `uncaughtException` handler —
+    /// after the entry evaluation already completed. An exit is not an
+    /// exception: the isolate runner consumes this and completes the
+    /// in-flight run with the code, exactly as an exit during entry
+    /// evaluation does.
+    pending_exit_code: Option<u8>,
 }
 
 pub(crate) enum MessageEventDispatchError {
@@ -3873,13 +3882,15 @@ impl Runtime {
             &mut self.interp,
             otter_vm::NativeCallInfo::call(global_value),
             Some(context),
-            |ctx| {
-                run(ctx)
-                    .map(|value| ctx.persistent_root_insert(value))
-                    .map_err(map_native_error)
-            },
+            |ctx| run(ctx).map(|value| ctx.persistent_root_insert(value)),
         ) {
             Ok(root) => Some(root),
+            Err(otter_vm::NativeError::Exit { code }) => {
+                // An exit requested inside the delivered callback is not an
+                // exception — record it for the runner and end the event.
+                self.pending_exit_code = Some(code);
+                return Ok(());
+            }
             Err(error) => {
                 // A native event delivery that throws is an uncaught error
                 // like a timer callback that throws: `process` and any active
@@ -3888,20 +3899,36 @@ impl Runtime {
                 if self.dispatch_uncaught_exception(context)? {
                     None
                 } else {
-                    return Err(error);
+                    return Err(map_native_error(error));
                 }
             }
         };
-        let drain = self
-            .drain_microtasks_dispatching_uncaught(context)
-            .map_err(|err| {
-                enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
-            });
+        let drain = match self.drain_microtasks_dispatching_uncaught(context) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if let otter_vm::VmError::Exit { code } = err.error {
+                    self.pending_exit_code = Some(code);
+                    Ok(())
+                } else {
+                    Err(enrich_runtime_diagnostic_with_cause(
+                        &mut self.interp,
+                        map_vm_error(err),
+                    ))
+                }
+            }
+        };
         if let Some(root) = result_root {
             self.interp.persistent_root_remove(root);
         }
         drain?;
         Ok(())
+    }
+
+    /// Take an exit code requested by JavaScript during a host-driven
+    /// callback. The isolate runner polls this after every task or timer
+    /// message and completes the in-flight run with it.
+    pub fn take_pending_exit_code(&mut self) -> Option<u8> {
+        self.pending_exit_code.take()
     }
 
     /// The realm's execution context, once a top-level run has established
@@ -4089,6 +4116,13 @@ impl Runtime {
             args,
         );
         if let Err(error) = called {
+            // An exit requested inside the callback is not an exception —
+            // record it for the runner and end the fire cleanly.
+            if let otter_vm::VmError::Exit { code } = error {
+                self.interp.set_async_context(ambient_async_context);
+                self.pending_exit_code = Some(code);
+                return Ok(TimerFireOutcome::Fired { repeat });
+            }
             // A timer callback that throws is an uncaught error like any
             // other: `process` and any active domain get first refusal before
             // it becomes the embedder's problem.
@@ -4111,10 +4145,16 @@ impl Runtime {
         let outcome = self.interp.drain_microtasks(&context);
         match outcome {
             Ok(()) => Ok(TimerFireOutcome::Fired { repeat }),
-            Err(err) => Err(enrich_runtime_diagnostic_with_cause(
-                &mut self.interp,
-                map_vm_error(err),
-            )),
+            Err(err) => {
+                if let otter_vm::VmError::Exit { code } = err.error {
+                    self.pending_exit_code = Some(code);
+                    return Ok(TimerFireOutcome::Fired { repeat });
+                }
+                Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(err),
+                ))
+            }
         }
     }
 
@@ -5505,6 +5545,13 @@ impl Runtime {
                 // still carries the original throw.
                 self.interp.set_pending_uncaught_throw(thrown);
                 Ok(false)
+            }
+            // `process.exit` inside the handler is Node's documented way to
+            // end the process from `uncaughtException` — a clean exit
+            // request, not a handler failure.
+            Err(otter_vm::NativeError::Exit { code }) => {
+                self.pending_exit_code = Some(code);
+                Ok(true)
             }
             Err(error) => Err(OtterError::Internal {
                 code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
@@ -7296,7 +7343,20 @@ mod tests {
         match err {
             OtterError::Runtime { diagnostic } => {
                 assert_eq!(diagnostic.code, "UNCAUGHT");
-                assert_eq!(diagnostic.message, "uncaught exception: Error: boom");
+                // The rendering is the error's stack: header line first,
+                // frame lines after, exactly what Node prints.
+                assert!(
+                    diagnostic
+                        .message
+                        .starts_with("uncaught exception: Error: boom"),
+                    "unexpected message: {}",
+                    diagnostic.message
+                );
+                assert!(
+                    diagnostic.message.contains("\n    at "),
+                    "expected frame lines, got: {}",
+                    diagnostic.message
+                );
             }
             other => panic!("expected Runtime, got {other:?}"),
         }

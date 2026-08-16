@@ -94,6 +94,27 @@ pub fn v8_cjs_value<'scope>(
     otter_runtime::run_builtin_cjs_shim(scope, "node:v8", V8_SHIM, module, require)
 }
 
+/// `node:console` — the global console itself, which is what Node's own
+/// `require('console')` answers with.
+///
+/// # Errors
+/// Returns a native error when the shim fails to evaluate.
+pub fn console_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "node:console",
+        "'use strict';\nmodule.exports = globalThis.console;\n",
+        module,
+        require,
+    )
+}
+
 /// `node:module` — builtin-module metadata + a minimal Module class.
 pub fn module_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,

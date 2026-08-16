@@ -9,6 +9,7 @@
 //! - A denied read capability stops the move.
 //! - POSIX credential reads and refused changes carry Node's shapes.
 //! - `getActiveResourcesInfo` separates pending timers from immediates.
+//! - `execve` validates its three arguments with Node's codes and messages.
 //!
 //! # Invariants
 //! - Every assertion here is the shape Node's own `test/parallel` files check,
@@ -326,4 +327,39 @@ fn active_resources_name_pending_timers_and_immediates() {
             "<test>",
         )
         .expect("active resources report pending timers by kind");
+}
+
+#[cfg(unix)]
+#[test]
+fn execve_validates_its_arguments() {
+    run(r#"
+        const expected = [
+          [() => process.execve(123), "ERR_INVALID_ARG_TYPE",
+           'The "execPath" argument must be of type string. Received type number (123)'],
+          [() => process.execve(process.execPath, "123"), "ERR_INVALID_ARG_TYPE",
+           `The "args" argument must be an instance of Array. Received type string ('123')`],
+          [() => process.execve(process.execPath, [123]), "ERR_INVALID_ARG_VALUE",
+           "The argument 'args[0]' must be a string without null bytes. Received 123"],
+          [() => process.execve(process.execPath, [], "123"), "ERR_INVALID_ARG_TYPE",
+           `The "env" argument must be of type object. Received type string ('123')`],
+          [() => process.execve(process.execPath, [], { abc: 123 }), "ERR_INVALID_ARG_VALUE",
+           "The argument 'env' must be an object with string keys and values without " +
+           "null bytes. Received { abc: 123 }"],
+        ];
+
+        for (const [call, code, message] of expected) {
+            let thrown;
+            try { call(); } catch (error) { thrown = error; }
+            if (thrown?.code !== code) throw new Error("code was " + thrown?.code);
+            if (thrown.message !== message) throw new Error("message was " + thrown.message);
+            if (thrown.name !== "TypeError") throw new Error("name was " + thrown.name);
+        }
+
+        let missing;
+        try { process.execve("/definitely/not/here", []); } catch (error) { missing = error; }
+        if (missing?.code !== "ENOENT") throw new Error("code was " + missing?.code);
+        if (missing.syscall !== "execve") throw new Error("syscall was " + missing.syscall);
+        if (!(missing.errno > 0)) throw new Error("errno was " + missing.errno);
+        "#)
+    .expect("execve validates before it replaces the image");
 }

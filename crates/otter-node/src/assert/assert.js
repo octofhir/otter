@@ -729,7 +729,10 @@ function expectedException(actual, expected, message, fn) {
     });
   }
   if (expected instanceof RegExp) {
-    const str = actual && typeof actual.message === 'string' ? actual.message : String(actual);
+    // A regular expression is matched against the error's string form, not its
+    // message: `String(err)` is `"Error: reason"`, and patterns anchored with
+    // `^Error:` depend on it.
+    const str = String(actual);
     if (expected.test(str)) return true;
     throw new AssertionError({
       actual, expected, operator: fn.name,
@@ -932,7 +935,7 @@ function doesNotThrow(fn, ...rest) {
 
 function matchesFilter(actual, expected) {
   if (typeof expected === 'function' && isErrorConstructor(expected)) return actual instanceof expected;
-  if (expected instanceof RegExp) return expected.test(actual && actual.message ? actual.message : String(actual));
+  if (expected instanceof RegExp) return expected.test(String(actual));
   return true;
 }
 

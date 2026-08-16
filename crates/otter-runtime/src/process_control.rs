@@ -93,6 +93,7 @@ pub(crate) fn install(
         0,
         NativeCall::Static(has_uncaught_exception_capture_callback),
     )?;
+    install_credentials(scope, process)?;
     let empty = scope.undefined();
     scope.define(
         process,
@@ -484,7 +485,24 @@ fn received_suffix(ctx: &mut NativeCtx<'_>, value: Value) -> String {
         let rendered = value.display_string(ctx.heap());
         return format!(" Received type boolean ({rendered})");
     }
+    if value.as_object().is_some() {
+        return format!(" Received an instance of {}", constructor_name(ctx, value));
+    }
     format!(" Received {}", value.display_string(ctx.heap()))
+}
+
+/// The constructor name Node prints for a rejected object argument.
+fn constructor_name(ctx: &mut NativeCtx<'_>, value: Value) -> String {
+    ctx.get_value_property(value, "constructor")
+        .ok()
+        .and_then(|constructor| {
+            ctx.get_value_property(constructor, "name")
+                .ok()
+                .and_then(|name| name.as_string(ctx.heap()))
+                .map(|name| name.to_lossy_string(ctx.heap()))
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Object".to_string())
 }
 
 /// Read a numeric argument as `f64`; every other value type answers `None`.
@@ -529,5 +547,165 @@ fn errno_description(error: &std::io::Error) -> &'static str {
         "ENAMETOOLONG" => "name too long",
         "ELOOP" => "too many symbolic links encountered",
         _ => "operation failed",
+    }
+}
+
+/// POSIX credential members. Node leaves these undefined on Windows, so they
+/// are installed only where the platform has them.
+#[cfg(unix)]
+fn install_credentials(
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
+) -> Result<(), NativeError> {
+    for (name, call) in [
+        ("getuid", NativeCall::Static(get_uid)),
+        ("geteuid", NativeCall::Static(get_euid)),
+        ("getgid", NativeCall::Static(get_gid)),
+        ("getegid", NativeCall::Static(get_egid)),
+    ] {
+        crate::process::define_process_method(scope, process, name, 0, call)?;
+    }
+    for (name, call) in [
+        ("setuid", NativeCall::Static(set_uid)),
+        ("seteuid", NativeCall::Static(set_euid)),
+        ("setgid", NativeCall::Static(set_gid)),
+        ("setegid", NativeCall::Static(set_egid)),
+    ] {
+        crate::process::define_process_method(scope, process, name, 1, call)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_credentials(
+    _scope: &mut NativeScope<'_, '_>,
+    _process: Local<'_>,
+) -> Result<(), NativeError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn get_uid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::number_i32(nix::unistd::getuid().as_raw() as i32))
+}
+
+#[cfg(unix)]
+fn get_euid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::number_i32(nix::unistd::geteuid().as_raw() as i32))
+}
+
+#[cfg(unix)]
+fn get_gid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::number_i32(nix::unistd::getgid().as_raw() as i32))
+}
+
+#[cfg(unix)]
+fn get_egid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::number_i32(nix::unistd::getegid().as_raw() as i32))
+}
+
+#[cfg(unix)]
+fn set_uid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let id = credential_id(ctx, args, Credential::User)?;
+    nix::unistd::setuid(nix::unistd::Uid::from_raw(id))
+        .map_err(|errno| credential_failure("setuid", errno))?;
+    Ok(Value::undefined())
+}
+
+#[cfg(unix)]
+fn set_euid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let id = credential_id(ctx, args, Credential::User)?;
+    nix::unistd::seteuid(nix::unistd::Uid::from_raw(id))
+        .map_err(|errno| credential_failure("seteuid", errno))?;
+    Ok(Value::undefined())
+}
+
+#[cfg(unix)]
+fn set_gid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let id = credential_id(ctx, args, Credential::Group)?;
+    nix::unistd::setgid(nix::unistd::Gid::from_raw(id))
+        .map_err(|errno| credential_failure("setgid", errno))?;
+    Ok(Value::undefined())
+}
+
+#[cfg(unix)]
+fn set_egid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let id = credential_id(ctx, args, Credential::Group)?;
+    nix::unistd::setegid(nix::unistd::Gid::from_raw(id))
+        .map_err(|errno| credential_failure("setegid", errno))?;
+    Ok(Value::undefined())
+}
+
+/// Which name table a credential argument is looked up in.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Credential {
+    User,
+    Group,
+}
+
+#[cfg(unix)]
+impl Credential {
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Group => "Group",
+        }
+    }
+}
+
+/// Read a credential argument: a numeric id passes through, a name is resolved
+/// against the platform's own user or group table.
+#[cfg(unix)]
+fn credential_id(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    credential: Credential,
+) -> Result<u32, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    if let Some(number) = number_arg(value) {
+        // Node truncates to an unsigned 32-bit id, which is what the platform
+        // takes; a value outside that range fails in the syscall, not here.
+        return Ok(number as i64 as u32);
+    }
+    if let Some(string) = value.as_string(ctx.heap()) {
+        let name = string.to_lossy_string(ctx.heap());
+        let resolved = match credential {
+            Credential::User => nix::unistd::User::from_name(&name)
+                .ok()
+                .flatten()
+                .map(|user| user.uid.as_raw()),
+            Credential::Group => nix::unistd::Group::from_name(&name)
+                .ok()
+                .flatten()
+                .map(|group| group.gid.as_raw()),
+        };
+        return resolved.ok_or(NativeError::Coded {
+            kind: ErrorKind::TypeError,
+            code: "ERR_UNKNOWN_CREDENTIAL",
+            message: format!("{} identifier does not exist: {name}", credential.label()),
+        });
+    }
+    Err(NativeError::Coded {
+        kind: ErrorKind::TypeError,
+        code: "ERR_INVALID_ARG_TYPE",
+        message: format!(
+            "The \"id\" argument must be one of type number or string.{}",
+            received_suffix(ctx, value)
+        ),
+    })
+}
+
+/// A refused credential change reports the errno the way Node does: the code,
+/// the call's name, and the platform's own description.
+#[cfg(unix)]
+fn credential_failure(syscall: &'static str, errno: nix::errno::Errno) -> NativeError {
+    NativeError::Syscall {
+        code: errno_code_from_raw(errno as i32),
+        message: format!("{}, {}", errno_code_from_raw(errno as i32), errno.desc()),
+        syscall,
+        path: None,
+        dest: None,
+        errno: errno as i32,
     }
 }

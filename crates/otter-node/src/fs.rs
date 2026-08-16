@@ -210,6 +210,16 @@ pub fn fs_native_value<'scope>(
     m!("writeFd", 3, fs_write_fd);
     m!("closeFd", 1, fs_close_fd);
     m!("fstatFd", 1, fs_fstat_fd);
+    m!("link", 2, fs_link);
+    m!("symlink", 2, fs_symlink);
+    m!("mkdtemp", 1, fs_mkdtemp);
+    m!("chown", 3, fs_chown);
+    m!("lchown", 3, fs_lchown);
+    m!("utimes", 3, fs_utimes);
+    m!("lutimes", 3, fs_lutimes);
+    m!("fsyncFd", 1, fs_fsync_fd);
+    m!("fdatasyncFd", 1, fs_fdatasync_fd);
+    m!("ftruncateFd", 2, fs_ftruncate_fd);
 
     Ok(object)
 }
@@ -816,4 +826,271 @@ fn fs_error(err: FsError) -> NativeError {
         code,
         message: err.to_string(),
     }
+}
+
+/// `link(existing, new)` — a hard link is a second name for the same file, so
+/// both ends are write operations.
+fn fs_link(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let existing = path_arg(ctx, args, 0, "fs.link")?;
+    let target = path_arg(ctx, args, 1, "fs.link")?;
+    require_read(&existing, caps).map_err(fs_error)?;
+    require_write(&target, caps).map_err(fs_error)?;
+    std::fs::hard_link(&existing, &target).map_err(|e| fs_error(io_error(&target, &e)))?;
+    Ok(Value::undefined())
+}
+
+/// `symlink(target, path)` — the target is recorded verbatim and never
+/// resolved, so only the link itself is a filesystem write.
+fn fs_symlink(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let target = path_arg(ctx, args, 0, "fs.symlink")?;
+    let link = path_arg(ctx, args, 1, "fs.symlink")?;
+    require_write(&link, caps).map_err(fs_error)?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).map_err(|e| fs_error(io_error(&link, &e)))?;
+    #[cfg(not(unix))]
+    {
+        let _ = &target;
+        return Err(fs_error(FsError::Io {
+            path: link.clone(),
+            message: "ENOSYS: symlink is not supported on this platform".to_string(),
+            code: "ENOSYS",
+        }));
+    }
+    Ok(Value::undefined())
+}
+
+/// `mkdtemp(prefix)` — create a uniquely named directory and answer its path.
+/// The name is drawn from the same source the platform uses for temporary
+/// files, so two concurrent callers cannot collide.
+fn fs_mkdtemp(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let prefix = path_arg(ctx, args, 0, "fs.mkdtemp")?;
+    let parent = prefix
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    require_write(&parent, caps).map_err(fs_error)?;
+
+    // `XXXXXX` in the caller's prefix is Node's own placeholder; anything else
+    // gets the suffix appended.
+    let base = prefix.to_string_lossy().to_string();
+    let stem = base.strip_suffix("XXXXXX").unwrap_or(&base).to_string();
+    for attempt in 0..1_000 {
+        let candidate = PathBuf::from(format!("{stem}{}", temp_suffix(attempt)));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                let created = candidate.to_string_lossy().to_string();
+                return crate::string_value(ctx, &created);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(fs_error(io_error(&candidate, &error))),
+        }
+    }
+    Err(fs_error(FsError::Io {
+        path: PathBuf::from(stem),
+        message: "EEXIST: could not find an unused temporary directory name".to_string(),
+        code: "EEXIST",
+    }))
+}
+
+/// Six characters drawn from the clock and the attempt counter, which is what
+/// `mkdtemp`'s `XXXXXX` placeholder stands for.
+fn temp_suffix(attempt: u32) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0)
+        ^ (attempt.wrapping_mul(2_654_435_761));
+    let mut out = String::with_capacity(6);
+    for _ in 0..6 {
+        out.push(ALPHABET[(seed % ALPHABET.len() as u32) as usize] as char);
+        seed /= ALPHABET.len() as u32;
+        seed = seed.wrapping_add(attempt);
+    }
+    out
+}
+
+fn fs_chown(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    change_owner(ctx, args, caps, "fs.chown", true)
+}
+
+fn fs_lchown(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    change_owner(ctx, args, caps, "fs.lchown", false)
+}
+
+/// `chown` follows a symbolic link; `lchown` changes the link itself.
+fn change_owner(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+    name: &'static str,
+    follow: bool,
+) -> Result<Value, NativeError> {
+    let path = path_arg(ctx, args, 0, name)?;
+    require_write(&path, caps).map_err(fs_error)?;
+    #[cfg(unix)]
+    {
+        let uid = args.get(1).and_then(|value| value.as_f64()).unwrap_or(-1.0);
+        let gid = args.get(2).and_then(|value| value.as_f64()).unwrap_or(-1.0);
+        // A negative id means "leave this one alone", which is how the syscall
+        // reads `-1`.
+        let uid = (uid >= 0.0).then(|| nix::unistd::Uid::from_raw(uid as u32));
+        let gid = (gid >= 0.0).then(|| nix::unistd::Gid::from_raw(gid as u32));
+        let result = if follow {
+            nix::unistd::chown(path.as_path(), uid, gid)
+        } else {
+            nix::unistd::fchownat(
+                nix::fcntl::AT_FDCWD,
+                path.as_path(),
+                uid,
+                gid,
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        result.map_err(|errno| {
+            fs_error(io_error(
+                &path,
+                &std::io::Error::from_raw_os_error(errno as i32),
+            ))
+        })?;
+    }
+    Ok(Value::undefined())
+}
+
+fn fs_utimes(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    change_times(ctx, args, caps, "fs.utimes", true)
+}
+
+fn fs_lutimes(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    change_times(ctx, args, caps, "fs.lutimes", false)
+}
+
+/// Times arrive in seconds, the way Node passes them, and are split into the
+/// whole seconds and nanoseconds the syscall takes.
+fn change_times(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+    name: &'static str,
+    follow: bool,
+) -> Result<Value, NativeError> {
+    let path = path_arg(ctx, args, 0, name)?;
+    require_write(&path, caps).map_err(fs_error)?;
+    #[cfg(unix)]
+    {
+        use nix::sys::time::TimeVal;
+
+        // `utimes` takes microseconds; Node hands out seconds.
+        let seconds_to_timeval = |seconds: f64| {
+            let whole = seconds.trunc();
+            let micros = ((seconds - whole) * 1_000_000.0).round();
+            TimeVal::new(whole as i64, micros as i32)
+        };
+        let access =
+            seconds_to_timeval(args.get(1).and_then(|value| value.as_f64()).unwrap_or(0.0));
+        let modify =
+            seconds_to_timeval(args.get(2).and_then(|value| value.as_f64()).unwrap_or(0.0));
+        let result = if follow {
+            nix::sys::stat::utimes(path.as_path(), &access, &modify)
+        } else {
+            nix::sys::stat::lutimes(path.as_path(), &access, &modify)
+        };
+        result.map_err(|errno| {
+            fs_error(io_error(
+                &path,
+                &std::io::Error::from_raw_os_error(errno as i32),
+            ))
+        })?;
+    }
+    Ok(Value::undefined())
+}
+
+fn fs_fsync_fd(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    sync_descriptor(ctx, args, caps, false)
+}
+
+fn fs_fdatasync_fd(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    sync_descriptor(ctx, args, caps, true)
+}
+
+fn sync_descriptor(
+    _ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _caps: &CapabilitySet,
+    data_only: bool,
+) -> Result<Value, NativeError> {
+    let fd = args
+        .first()
+        .and_then(|value| value.as_f64())
+        .unwrap_or(-1.0) as i32;
+    FD_TABLE
+        .with(|table| {
+            table.borrow().get(&fd).map(|file| {
+                if data_only {
+                    file.sync_data()
+                } else {
+                    file.sync_all()
+                }
+            })
+        })
+        .ok_or_else(|| fs_error(io_error(Path::new("<fd>"), &bad_descriptor())))?
+        .map_err(|error| fs_error(io_error(Path::new("<fd>"), &error)))?;
+    Ok(Value::undefined())
+}
+
+fn fs_ftruncate_fd(
+    _ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let fd = args
+        .first()
+        .and_then(|value| value.as_f64())
+        .unwrap_or(-1.0) as i32;
+    let length = args.get(1).and_then(|value| value.as_f64()).unwrap_or(0.0) as u64;
+    FD_TABLE
+        .with(|table| table.borrow().get(&fd).map(|file| file.set_len(length)))
+        .ok_or_else(|| fs_error(io_error(Path::new("<fd>"), &bad_descriptor())))?
+        .map_err(|error| fs_error(io_error(Path::new("<fd>"), &error)))?;
+    Ok(Value::undefined())
+}
+
+/// EBADF — the descriptor is not one this table handed out.
+fn bad_descriptor() -> std::io::Error {
+    std::io::Error::from_raw_os_error(9)
 }

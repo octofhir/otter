@@ -21,7 +21,8 @@ const constants = {
 };
 
 function pathStr(p) {
-  if (p instanceof URL) return decodeURIComponent(p.pathname);
+  // `URL` is a web global; an embedder can enable node APIs without it.
+  if (typeof URL !== 'undefined' && p instanceof URL) return decodeURIComponent(p.pathname);
   if (Buffer.isBuffer(p)) return p.toString('utf8');
   return String(p);
 }
@@ -161,9 +162,26 @@ function writeSync(fd, data, offsetOrPosition, lengthOrEncoding, position) {
   return native.writeFd(fd, latin1, position === undefined || position === null ? -1 : position);
 }
 function fstatSync(fd, options) { return new Stats(native.fstatFd(fd)); }
-function ftruncateSync() {}
-function fsyncSync() {}
-function fdatasyncSync() {}
+function ftruncateSync(fd, len) { native.ftruncateFd(fd, Number(len) || 0); }
+function fsyncSync(fd) { native.fsyncFd(fd); }
+function fdatasyncSync(fd) { native.fdatasyncFd(fd); }
+function linkSync(existing, target) { native.link(pathStr(existing), pathStr(target)); }
+function symlinkSync(target, path) { native.symlink(pathStr(target), pathStr(path)); }
+function mkdtempSync(prefix) { return native.mkdtemp(pathStr(prefix)); }
+function chownSync(path, uid, gid) { native.chown(pathStr(path), Number(uid), Number(gid)); }
+function lchownSync(path, uid, gid) { native.lchown(pathStr(path), Number(uid), Number(gid)); }
+// Node accepts a Date or a numeric time in seconds for both stamps.
+function toSeconds(time) {
+  if (time instanceof Date) return time.getTime() / 1000;
+  const value = Number(time);
+  return Number.isFinite(value) ? value : Date.now() / 1000;
+}
+function utimesSync(path, atime, mtime) {
+  native.utimes(pathStr(path), toSeconds(atime), toSeconds(mtime));
+}
+function lutimesSync(path, atime, mtime) {
+  native.lutimes(pathStr(path), toSeconds(atime), toSeconds(mtime));
+}
 
 // ---- async (callback) ----
 function asyncify(syncFn) {
@@ -194,6 +212,16 @@ const rename = asyncify(renameSync);
 const readlink = asyncify(readlinkSync);
 const chmod = asyncify(chmodSync);
 const truncate = asyncify(truncateSync);
+const link = asyncify(linkSync);
+const symlink = asyncify(symlinkSync);
+const mkdtemp = asyncify(mkdtempSync);
+const chown = asyncify(chownSync);
+const lchown = asyncify(lchownSync);
+const utimes = asyncify(utimesSync);
+const lutimes = asyncify(lutimesSync);
+const ftruncate = asyncify(ftruncateSync);
+const fsync = asyncify(fsyncSync);
+const fdatasync = asyncify(fdatasyncSync);
 const open = asyncify(openSync);
 const close = asyncify(closeSync);
 const fstat = asyncify(fstatSync);
@@ -240,6 +268,13 @@ const promises = {
   readlink: promisify(readlinkSync),
   chmod: promisify(chmodSync),
   truncate: promisify(truncateSync),
+  link: promisify(linkSync),
+  symlink: promisify(symlinkSync),
+  mkdtemp: promisify(mkdtempSync),
+  chown: promisify(chownSync),
+  lchown: promisify(lchownSync),
+  utimes: promisify(utimesSync),
+  lutimes: promisify(lutimesSync),
   constants,
 };
 
@@ -310,6 +345,9 @@ module.exports = {
   readFileSync, writeFileSync, appendFileSync, existsSync, statSync, lstatSync,
   readdirSync, mkdirSync, rmSync, rmdirSync, unlinkSync, realpathSync,
   copyFileSync, accessSync, renameSync, readlinkSync, chmodSync, truncateSync,
+  linkSync, symlinkSync, mkdtempSync, chownSync, lchownSync, utimesSync, lutimesSync,
+  link, symlink, mkdtemp, chown, lchown, utimes, lutimes,
+  ftruncate, fsync, fdatasync,
   openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, fsyncSync, fdatasyncSync,
   readFile, writeFile, appendFile, exists, stat, lstat, readdir, mkdir, rm, rmdir,
   unlink, realpath, copyFile, access, rename, readlink, chmod, truncate,

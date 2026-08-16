@@ -487,3 +487,55 @@ fn node_dgram_validates_before_it_opens_a_socket() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// `cluster` reports which role the process is in, and the primary's surface
+/// is the one a program gets when nothing launched it as a worker. Forking a
+/// worker starts a process and waits on a channel, neither of which a bare
+/// runtime can do, so that half is covered by running the CLI.
+#[test]
+fn node_cluster_reports_the_primary_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import cluster from "node:cluster";
+
+        if (cluster.isWorker) throw new Error("a process nobody forked is not a worker");
+        if (!cluster.isPrimary) throw new Error("isPrimary " + cluster.isPrimary);
+        if (cluster.isMaster !== cluster.isPrimary) throw new Error("isMaster disagrees");
+        if (cluster.worker !== undefined) throw new Error("a primary is not a worker");
+
+        // The primary keeps a registry, and a worker has none to keep.
+        if (typeof cluster.workers !== "object" || cluster.workers === null) {
+            throw new Error("workers registry is " + typeof cluster.workers);
+        }
+        if (Object.keys(cluster.workers).length !== 0) throw new Error("registry is not empty");
+
+        for (const name of ["fork", "disconnect", "setupPrimary", "setupMaster"]) {
+            if (typeof cluster[name] !== "function") throw new Error(name + " is missing");
+        }
+        if (typeof cluster.Worker !== "function") throw new Error("Worker class is missing");
+
+        // Settings name the program a worker would run, which is this one.
+        const settings = cluster.setupPrimary();
+        if (settings.exec !== process.argv[1]) throw new Error("exec is " + settings.exec);
+        if (cluster.settings !== settings) throw new Error("settings were not kept");
+
+        // A primary schedules round-robin unless told otherwise, and the
+        // policy names are the ones a program compares against.
+        if (cluster.SCHED_RR === cluster.SCHED_NONE) throw new Error("policies collide");
+        if (cluster.schedulingPolicy !== cluster.SCHED_RR) {
+            throw new Error("policy " + cluster.schedulingPolicy);
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

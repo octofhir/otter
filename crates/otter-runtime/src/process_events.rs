@@ -169,7 +169,45 @@ fn refresh_event_count(
 ) -> Result<(), NativeError> {
     let count = active_event_count(scope, events)?;
     let count = scope.number(count as f64);
-    scope.set(process, "_eventsCount", count)
+    scope.set(process, "_eventsCount", count)?;
+    apply_channel_interest(scope, process, events)
+}
+
+/// A channel holds the run loop open only while the program is listening to
+/// it. Without this a process launched with a channel could never finish on
+/// its own: the channel would outlive every other reason to keep running, and
+/// a forked child that only does its work and returns would hang.
+fn apply_channel_interest(
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
+    events: Local<'_>,
+) -> Result<(), NativeError> {
+    let channel = scope.get(process, "channel")?;
+    if !scope.is_object(channel) {
+        return Ok(());
+    }
+    let mut listening = false;
+    let length = array_length(scope, events)?;
+    for index in 0..length {
+        let record = scope.index(events, index)?;
+        if !record_is_active(scope, record)? {
+            continue;
+        }
+        let event = scope.get(record, RECORD_EVENT)?;
+        if !scope.is_string(event) {
+            continue;
+        }
+        let name = scope.display_string(event);
+        if name == "message" || name == "disconnect" {
+            listening = true;
+            break;
+        }
+    }
+    let method = scope.get(channel, if listening { "ref" } else { "unref" })?;
+    if scope.is_callable(method) {
+        scope.call(method, channel, &[])?;
+    }
+    Ok(())
 }
 
 fn add_listener(

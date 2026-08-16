@@ -458,18 +458,36 @@ EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
   return originalGetMaxListeners(emitterOrTarget);
 };
 
+// A channel keeps its process running only while the program is listening to
+// it, so a process launched with one can still finish on its own. The runtime
+// applies that to the emitter it installs; the methods below replace that
+// emitter, so they have to apply it too.
+const CHANNEL_EVENTS = ['message', 'disconnect'];
+
+function refreshChannelInterest(proc) {
+  const channel = proc.channel;
+  if (!channel || typeof channel.ref !== 'function') return;
+  if (CHANNEL_EVENTS.some((name) => proc.listenerCount(name) > 0)) channel.ref();
+  else channel.unref();
+}
+
+const LISTENER_METHODS = [
+  'addListener', 'on', 'once', 'prependListener', 'prependOnceListener',
+  'removeListener', 'off', 'removeAllListeners',
+];
+
 function installProcessEmitter() {
   const proc = globalThis.process;
   if (!proc || proc.__otterEventsInstalled) return;
   EventEmitter.init.call(proc);
-  proc.addListener = EventEmitter.prototype.addListener;
-  proc.on = EventEmitter.prototype.on;
-  proc.once = EventEmitter.prototype.once;
-  proc.prependListener = EventEmitter.prototype.prependListener;
-  proc.prependOnceListener = EventEmitter.prototype.prependOnceListener;
-  proc.removeListener = EventEmitter.prototype.removeListener;
-  proc.off = EventEmitter.prototype.off;
-  proc.removeAllListeners = EventEmitter.prototype.removeAllListeners;
+  for (const name of LISTENER_METHODS) {
+    const method = EventEmitter.prototype[name];
+    proc[name] = function listenerMethod(...args) {
+      const result = method.apply(this, args);
+      refreshChannelInterest(proc);
+      return result;
+    };
+  }
   proc.emit = EventEmitter.prototype.emit;
   proc.listenerCount = EventEmitter.prototype.listenerCount;
   proc.listeners = EventEmitter.prototype.listeners;

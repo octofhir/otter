@@ -190,9 +190,10 @@ impl IpcChannel {
         address: Option<PathBuf>,
     ) -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
         let (outgoing, queued) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        // An open channel is work the process is waiting on, so it holds the
-        // run loop the way a pending timer does.
-        let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+        // An open channel is a reason to keep running only while the program
+        // is listening to it, which it says by referencing the channel. A
+        // process that never asks for a message must be free to finish.
+        let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Unref);
         let channel = Arc::new(Self {
             outgoing: Mutex::new(Some(outgoing)),
             keep_alive: Arc::new(Mutex::new(Some(keep_alive))),
@@ -206,6 +207,26 @@ impl IpcChannel {
     #[must_use]
     pub fn connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Say whether waiting on this channel should keep the process running.
+    ///
+    /// A program that listens for messages is waiting for one, and a program
+    /// that does not is not — so this follows the listeners rather than the
+    /// channel simply being open.
+    pub fn set_referenced(&self, referenced: bool) {
+        if let Some(keep_alive) = self
+            .keep_alive
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            if referenced {
+                keep_alive.ref_();
+            } else {
+                keep_alive.unref();
+            }
+        }
     }
 
     /// Queue one message. Answers whether it was accepted; a disconnected

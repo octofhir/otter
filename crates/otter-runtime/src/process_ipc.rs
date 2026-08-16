@@ -95,12 +95,17 @@ pub(crate) fn install(
     let connected = scope.boolean(true);
     scope.set(process, "connected", connected)?;
 
-    // Node's channel is a handle a program may hold the loop open with or
-    // release; ours is held by the channel itself, so these answer without
-    // changing anything.
+    // The channel is a handle the program holds the run loop open with, or
+    // lets go of. `process.on('message')` references it and dropping the last
+    // such listener releases it, so a child that never asks for a message can
+    // finish on its own.
     let handle = scope.object()?;
-    for name in ["ref", "unref"] {
-        let call: Arc<NativeFn> = Arc::new(|_ctx, _args, _captures| Ok(Value::undefined()));
+    for (name, referenced) in [("ref", true), ("unref", false)] {
+        let holder = channel.clone();
+        let call: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
+            holder.set_referenced(referenced);
+            Ok(Value::undefined())
+        });
         let function = scope.native_call(name, 0, NativeCall::Dynamic(call))?;
         scope.define(handle, name, function, Attr::builtin_function().to_flags())?;
     }
@@ -128,6 +133,32 @@ fn encode(scope: &mut NativeScope<'_, '_>, message: Local<'_>) -> Result<String,
     }
     Ok(scope.display_string(text))
 }
+
+/// Which event a message arrives as.
+///
+/// A module built on a channel — `cluster` is the one that needs it — has to
+/// coordinate with its peer over the same channel the program uses. Its own
+/// traffic is named, and named traffic is reported separately so a program's
+/// `message` listeners only ever see what the peer's program sent.
+fn event_name(
+    scope: &mut NativeScope<'_, '_>,
+    message: Local<'_>,
+) -> Result<&'static str, NativeError> {
+    if !scope.is_object(message) {
+        return Ok("message");
+    }
+    let command = scope.get(message, "cmd")?;
+    if !scope.is_string(command) {
+        return Ok("message");
+    }
+    if scope.display_string(command).starts_with(INTERNAL_PREFIX) {
+        return Ok("internalMessage");
+    }
+    Ok("message")
+}
+
+/// What marks a message as belonging to a module rather than to the program.
+pub(crate) const INTERNAL_PREFIX: &str = "NODE_";
 
 /// Record on `process` that nothing further will cross the channel.
 fn mark_disconnected(
@@ -179,7 +210,8 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                         let text = scope.string(payload)?;
                         let undefined = scope.undefined();
                         let message = scope.call(parse, undefined, &[text])?;
-                        let name = scope.string("message")?;
+                        let event = event_name(&mut scope, message)?;
+                        let name = scope.string(event)?;
                         scope.call(emit, process, &[name, message])?;
                     }
                     IpcEvent::Closed => {

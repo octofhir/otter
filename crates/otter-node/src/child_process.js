@@ -135,6 +135,22 @@ const children = new Map();
 // What marks a message as belonging to a module rather than to the program.
 const INTERNAL_PREFIX = 'NODE_';
 
+// `stdio` names what happens to each standard stream, and may carry an `ipc`
+// slot — which is how a caller asks `spawn` for a channel, the same one `fork`
+// opens by default.
+function normalizeStdio(stdio, fallback) {
+  const named = stdio === undefined ? fallback : stdio;
+  const list = Array.isArray(named) ? named : [named, named, named];
+  const streams = [];
+  let wantsChannel = false;
+  for (const entry of list) {
+    if (entry === 'ipc') { wantsChannel = true; continue; }
+    if (streams.length < 3) streams.push(entry === undefined ? 'pipe' : String(entry));
+  }
+  while (streams.length < 3) streams.push('pipe');
+  return { streams, wantsChannel };
+}
+
 function isInternal(message) {
   return message !== null && typeof message === 'object' &&
     typeof message.cmd === 'string' && message.cmd.startsWith(INTERNAL_PREFIX);
@@ -154,6 +170,7 @@ class ChildProcess extends EventEmitter {
     this.stderr = new Readable({ read() {} });
     this.stdin = new Writable({ write(c, e, cb) { cb(); } });
     this.stdio = [this.stdin, this.stdout, this.stderr];
+    this._piped = [true, true, true];
   }
   // The low-level entry point Node exposes on the class itself. Its argument
   // checks run before anything is spawned, and its tests assert them verbatim.
@@ -242,6 +259,16 @@ class ChildProcess extends EventEmitter {
     setTimeout(() => this.emit('disconnect'), 0);
   }
   _run(command, args, options) {
+    // A stream the child was not given a pipe for is not a stream this side
+    // can read, and Node reports that as `null` rather than as a stream that
+    // never yields anything.
+    const streams = options?.stdio;
+    if (Array.isArray(streams)) {
+      this._piped = [0, 1, 2].map((slot) => streams[slot] === 'pipe');
+      if (!this._piped[1]) this.stdout = null;
+      if (!this._piped[2]) this.stderr = null;
+      this.stdio = [this.stdin, this.stdout, this.stderr];
+    }
     // The child starts now, so `pid` is readable the moment `spawn` returns;
     // its outcome arrives on a later turn through `__otterChildExit`.
     let started;
@@ -263,19 +290,22 @@ class ChildProcess extends EventEmitter {
 
   _failed(error) {
     this.emit('error', error);
-    this.stdout.push(null);
-    this.stderr.push(null);
+    this._endStreams();
     setTimeout(() => this.emit('close', null, null), 0);
+  }
+
+  _endStreams() {
+    if (this.stdout) this.stdout.push(null);
+    if (this.stderr) this.stderr.push(null);
   }
 
   // The native half reports the outcome once, when the child has run to
   // completion and its output has been read to the end.
   _exited(status, signal, stdout, stderr) {
     children.delete(this._handle);
-    if (stdout) this.stdout.push(Buffer.from(stdout, 'latin1'));
-    if (stderr) this.stderr.push(Buffer.from(stderr, 'latin1'));
-    this.stdout.push(null);
-    this.stderr.push(null);
+    if (stdout && this.stdout) this.stdout.push(Buffer.from(stdout, 'latin1'));
+    if (stderr && this.stderr) this.stderr.push(Buffer.from(stderr, 'latin1'));
+    this._endStreams();
     this.exitCode = status;
     this.signalCode = signal;
     this.connected = false;
@@ -320,8 +350,13 @@ globalThis.__otterChildIpc = function channelEvent(handle, kind, payload) {
 
 function spawn(command, args, options) {
   const n = normalizeArgs(command, args, options);
+  const { streams, wantsChannel } = normalizeStdio(n.options.stdio, ['ignore', 'pipe', 'pipe']);
   const cp = new ChildProcess();
-  cp._run(n.command, n.args, n.options);
+  cp._run(n.command, n.args, { ...n.options, stdio: streams, ipc: wantsChannel });
+  if (wantsChannel && cp._handle !== 0) {
+    cp.connected = true;
+    cp.channel = { ref() {}, unref() {} };
+  }
   return cp;
 }
 
@@ -371,19 +406,13 @@ function fork(modulePath, args, options) {
   const a = Array.isArray(args) ? args : [];
   const given = options || {};
   // A forked child shares this process's output unless the caller asked for it
-  // on a stream of its own, which is what `silent` means.
-  const settings = {
-    ...given,
-    ipc: true,
-    stdio: given.stdio ?? (given.silent ? 'pipe' : 'inherit'),
-  };
+  // on a stream of its own, which is what `silent` means. Either way it gets a
+  // channel, which is what makes it a fork rather than a spawn.
+  const inherited = given.silent ? 'pipe' : 'inherit';
+  const stdio = given.stdio ?? [inherited, inherited, inherited];
+  const settings = { ...given, stdio: [...(Array.isArray(stdio) ? stdio : [stdio, stdio, stdio]), 'ipc'] };
   const execPath = (typeof process !== 'undefined' && process.execPath) || 'node';
-  const cp = spawn(execPath, [String(modulePath), ...a.map(String)], settings);
-  if (cp._handle !== 0) {
-    cp.connected = true;
-    cp.channel = { ref() {}, unref() {} };
-  }
-  return cp;
+  return spawn(execPath, [String(modulePath), ...a.map(String)], settings);
 }
 
 module.exports = {

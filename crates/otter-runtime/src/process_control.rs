@@ -93,6 +93,13 @@ pub(crate) fn install(
         0,
         NativeCall::Static(has_uncaught_exception_capture_callback),
     )?;
+    crate::process::define_process_method(
+        scope,
+        process,
+        "getActiveResourcesInfo",
+        0,
+        NativeCall::Static(get_active_resources_info),
+    )?;
     install_credentials(scope, process)?;
     let empty = scope.undefined();
     scope.define(
@@ -548,6 +555,28 @@ fn errno_description(error: &std::io::Error) -> &'static str {
         "ELOOP" => "too many symbolic links encountered",
         _ => "operation failed",
     }
+}
+
+/// `process.getActiveResourcesInfo()` — the kinds of the resources still
+/// keeping the event loop alive. Node names a pending `setTimeout` or
+/// `setInterval` `"Timeout"` and a pending `setImmediate` `"Immediate"`.
+fn get_active_resources_info(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let kinds = ctx.interp_mut().timer_callbacks().active_kinds();
+    ctx.scope(|mut scope| {
+        let array = scope.array(kinds.len())?;
+        for (index, kind) in kinds.iter().enumerate() {
+            let name = match kind {
+                otter_vm::TimerKind::Timeout => "Timeout",
+                otter_vm::TimerKind::Immediate => "Immediate",
+            };
+            let name = scope.string(name)?;
+            scope.set_index(array, index, name)?;
+        }
+        Ok(scope.finish(array))
+    })
 }
 
 /// POSIX credential members. Node leaves these undefined on Windows, so they

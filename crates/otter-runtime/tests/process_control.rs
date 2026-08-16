@@ -8,12 +8,36 @@
 //!   listeners.
 //! - A denied read capability stops the move.
 //! - POSIX credential reads and refused changes carry Node's shapes.
+//! - `getActiveResourcesInfo` separates pending timers from immediates.
 //!
 //! # Invariants
 //! - Every assertion here is the shape Node's own `test/parallel` files check,
 //!   so a passing test means the corpus test can pass too.
 
+use std::sync::{Arc, Mutex};
+
 use otter_runtime::{CapabilitySet, Permission, Runtime, SourceInput};
+use otter_vm::TimerScheduler;
+
+/// Timers need a scheduler installed by the host; this one hands out tokens and
+/// never fires, which is exactly the "still pending" state the resource report
+/// describes.
+#[derive(Default)]
+struct PendingScheduler {
+    next_token: Mutex<u64>,
+}
+
+impl TimerScheduler for PendingScheduler {
+    fn schedule(&self, _delay_ms: u64, _repeat_ms: Option<u64>) -> u64 {
+        let mut next = self.next_token.lock().expect("token counter");
+        *next += 1;
+        *next
+    }
+
+    fn cancel(&self, _token: u64) -> bool {
+        true
+    }
+}
 
 fn runtime_with(capabilities: CapabilitySet) -> Runtime {
     Runtime::builder()
@@ -270,4 +294,36 @@ fn credentials_read_and_report_a_refused_change() {
         }
         "#)
     .expect("credentials follow Node's shapes");
+}
+
+#[test]
+fn active_resources_name_pending_timers_and_immediates() {
+    let mut runtime = runtime_with(CapabilitySet::allow_all());
+    runtime.install_timer_scheduler(Arc::new(PendingScheduler::default()));
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+        if (process.getActiveResourcesInfo().length !== 0) {
+            throw new Error("a fresh process has no pending resources");
+        }
+
+        for (let i = 0; i < 3; i++) setTimeout(() => {}, 1000);
+        setImmediate(() => {});
+        const interval = setInterval(() => {}, 1000);
+
+        const info = process.getActiveResourcesInfo();
+        const timeouts = info.filter((type) => type === "Timeout").length;
+        const immediates = info.filter((type) => type === "Immediate").length;
+        if (timeouts !== 4) throw new Error("timeouts: " + timeouts);
+        if (immediates !== 1) throw new Error("immediates: " + immediates);
+
+        clearInterval(interval);
+        const after = process.getActiveResourcesInfo().filter((t) => t === "Timeout").length;
+        if (after !== 3) throw new Error("after clearInterval: " + after);
+        "#,
+            ),
+            "<test>",
+        )
+        .expect("active resources report pending timers by kind");
 }

@@ -327,7 +327,7 @@ pub use register_stack::RegisterWindow;
 pub use string::{JsString, MAX_ROPE_DEPTH};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
-pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
+pub use timers::{TimerCallbacks, TimerEntry, TimerKind, TimerScheduler, TimerSchedulerHandle};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
 // Eight-byte tagged value. Canonical `Value` export.

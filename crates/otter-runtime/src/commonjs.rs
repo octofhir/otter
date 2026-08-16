@@ -481,6 +481,37 @@ pub(crate) fn cjs_load(
     })
 }
 
+/// Load one hosted builtin by specifier through the CommonJS pipeline, so its
+/// own `require` graph, aliases, and cycles behave exactly as they do for a
+/// `require()` from JavaScript.
+///
+/// The ESM side calls this for a builtin that publishes only a CommonJS value:
+/// the namespace it synthesizes has to hold the same object `require` would
+/// return, and that object can only be produced by running the installer with
+/// a working `require` in hand.
+///
+/// # Errors
+/// Returns a native error when the specifier is not a hosted builtin, or when
+/// the installer fails.
+pub(crate) fn cjs_load_builtin<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cfg: &Arc<CjsConfig>,
+    specifier: &str,
+) -> Result<Local<'scope>, NativeError> {
+    let hosted = resolve_builtin(cfg, specifier).ok_or_else(|| {
+        runtime_type_error("import", format!("no builtin module named '{specifier}'"))
+    })?;
+    let key = hosted.specifier().to_string();
+    let resolution = CjsResolution {
+        filename: key.clone(),
+        key,
+        dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        target: CjsTarget::Hosted(hosted),
+    };
+    let cache = scope.bare_object()?;
+    load_resolved_scoped(scope, cfg, cache, &resolution, None)
+}
+
 /// Compile and execute one CommonJS file, returning its `module.exports`.
 pub(crate) fn cjs_instantiate_file(
     ctx: &mut NativeCtx<'_>,

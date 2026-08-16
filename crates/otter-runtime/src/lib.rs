@@ -272,11 +272,11 @@ impl HostedModule {
         }
     }
 
-    /// Create a hosted module that is available only through CommonJS.
+    /// Create a hosted module whose implementation is a CommonJS value.
     ///
-    /// CJS-only rows are deliberately omitted from the ESM hosted-specifier
-    /// set, so an `import` cannot synthesize a fake namespace from a callable
-    /// or otherwise non-object `module.exports`.
+    /// An `import` of such a module gets a namespace whose `default` is that
+    /// value and whose named exports are the value's own enumerable string
+    /// keys — the shape Node gives a builtin backed by CommonJS.
     #[must_use]
     pub const fn cjs_only(specifier: &'static str, cjs_value: HostedCommonJsInstall) -> Self {
         Self {
@@ -292,10 +292,12 @@ impl HostedModule {
         self.specifier
     }
 
-    /// Whether this module exposes a namespace to the ESM loader.
+    /// Whether the ESM loader can serve this module. A module that publishes
+    /// only a CommonJS value is importable too: its namespace is synthesized
+    /// from that value, which is what Node does for every builtin.
     #[must_use]
     pub const fn supports_esm(self) -> bool {
-        self.install.is_some()
+        self.install.is_some() || self.cjs_value.is_some()
     }
 
     /// Namespace installer used by the ESM loader.

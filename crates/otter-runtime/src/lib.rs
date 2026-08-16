@@ -3869,7 +3869,7 @@ impl Runtime {
     {
         let global = *self.interp.global_this();
         let global_value = otter_vm::Value::object(global);
-        let result_root = otter_vm::NativeCtx::with_host_context(
+        let result_root = match otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::call(global_value),
             Some(context),
@@ -3878,11 +3878,28 @@ impl Runtime {
                     .map(|value| ctx.persistent_root_insert(value))
                     .map_err(map_native_error)
             },
-        )?;
-        let drain = self.interp.drain_microtasks(context).map_err(|err| {
-            enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
-        });
-        self.interp.persistent_root_remove(result_root);
+        ) {
+            Ok(root) => Some(root),
+            Err(error) => {
+                // A native event delivery that throws is an uncaught error
+                // like a timer callback that throws: `process` and any active
+                // domain get first refusal before it becomes the embedder's
+                // problem. Only an unhandled throw fails the event.
+                if self.dispatch_uncaught_exception(context)? {
+                    None
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+        let drain = self
+            .drain_microtasks_dispatching_uncaught(context)
+            .map_err(|err| {
+                enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
+            });
+        if let Some(root) = result_root {
+            self.interp.persistent_root_remove(root);
+        }
         drain?;
         Ok(())
     }

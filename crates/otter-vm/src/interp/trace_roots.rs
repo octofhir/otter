@@ -214,6 +214,14 @@ impl Interpreter {
         &self.async_context
     }
 
+    /// The realm's fallback execution context, once a top-level run has
+    /// established one. A host driving the loop between turns needs it to
+    /// dispatch work that has no context of its own.
+    #[must_use]
+    pub fn realm_execution_context(&self) -> Option<crate::ExecutionContext> {
+        self.realm_context.clone()
+    }
+
     /// The async context jobs queued from here inherit.
     #[must_use]
     pub fn async_context(&self) -> Value {

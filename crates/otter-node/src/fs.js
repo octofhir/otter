@@ -250,7 +250,112 @@ function promisify(syncFn) {
     });
   };
 }
+// A promise-side handle to an open file. Node hands one out from
+// `fsPromises.open` and closes it explicitly or through `using`; every method
+// here is the promise form of the descriptor call with the same name.
+class FileHandle {
+  #fd;
+  #closed = false;
+
+  constructor(fd) {
+    this.#fd = fd;
+  }
+
+  get fd() { return this.#fd; }
+
+  #descriptor() {
+    if (this.#closed) {
+      const err = new Error('EBADF: bad file descriptor, read');
+      err.code = 'EBADF';
+      err.syscall = 'read';
+      throw err;
+    }
+    return this.#fd;
+  }
+
+  async close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    closeSync(this.#fd);
+  }
+
+  async read(buffer, offset, length, position) {
+    const fd = this.#descriptor();
+    if (buffer && typeof buffer === 'object' && !ArrayBuffer.isView(buffer)) {
+      const options = buffer;
+      buffer = options.buffer ?? Buffer.alloc(16384);
+      offset = options.offset ?? 0;
+      length = options.length ?? buffer.byteLength - offset;
+      position = options.position ?? null;
+    }
+    if (!buffer) buffer = Buffer.alloc(16384);
+    const bytesRead = readSync(fd, buffer, offset ?? 0, length ?? buffer.byteLength, position ?? null);
+    return { bytesRead, buffer };
+  }
+
+  async write(data, a, b, c) {
+    const fd = this.#descriptor();
+    const bytesWritten = writeSync(fd, data, a, b, c);
+    return { bytesWritten, buffer: data };
+  }
+
+  async readFile(options) { return readFileSync(this.#descriptor(), options); }
+  async writeFile(data, options) { return writeFileSync(this.#descriptor(), data, options); }
+  async appendFile(data, options) { return appendFileSync(this.#descriptor(), data, options); }
+  async stat(options) { return fstatSync(this.#descriptor(), options); }
+  async truncate(len) { return ftruncateSync(this.#descriptor(), len); }
+  async sync() { return fsyncSync(this.#descriptor()); }
+  async datasync() { return fdatasyncSync(this.#descriptor()); }
+
+  createReadStream(options = {}) {
+    return new ReadStream(null, { ...options, fd: this.#descriptor() });
+  }
+
+  createWriteStream(options = {}) {
+    return new WriteStream(null, { ...options, fd: this.#descriptor() });
+  }
+
+  // The whole file as one web stream. `autoClose` is the only option Node
+  // reads here, and it closes the handle once the reader drains.
+  readableWebStream(options = {}) {
+    const handle = this;
+    const fd = this.#descriptor();
+    return new ReadableStream({
+      pull(controller) {
+        const chunk = Buffer.alloc(65536);
+        const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, null);
+        if (bytesRead === 0) {
+          controller.close();
+          if (options.autoClose !== false) handle.close();
+          return;
+        }
+        controller.enqueue(new Uint8Array(chunk.subarray(0, bytesRead)));
+      },
+      cancel() {
+        if (options.autoClose !== false) return handle.close();
+        return undefined;
+      },
+    });
+  }
+}
+
+// `await using handle = await open(...)` disposes through this symbol. The
+// engine only defines it once explicit resource management is available, and a
+// computed key of `undefined` would silently create a property named
+// "undefined" instead.
+if (typeof Symbol.asyncDispose === 'symbol') {
+  FileHandle.prototype[Symbol.asyncDispose] = function asyncDispose() {
+    return this.close();
+  };
+}
+
+async function openHandle(path, flags = 'r', mode = 0o666) {
+  return new FileHandle(openSync(path, flags, mode));
+}
+
 const promises = {
+  open: openHandle,
+  FileHandle,
   readFile: promisify(readFileSync),
   writeFile: promisify(writeFileSync),
   appendFile: promisify(appendFileSync),

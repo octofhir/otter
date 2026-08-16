@@ -144,3 +144,55 @@ fn node_fs_links_timestamps_and_descriptor_operations() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// `fsPromises.open` hands out a handle whose reads, writes, metadata, and
+/// web stream all address the same descriptor, and whose methods refuse to run
+/// once it is closed.
+#[test]
+fn node_fs_promises_file_handle_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    let data = dir.path().join("data.txt");
+    std::fs::write(&data, "hello world").unwrap();
+    std::fs::write(
+        &main,
+        format!(
+            r#"
+            import {{ open }} from "node:fs/promises";
+
+            const handle = await open({path:?}, "r");
+            if (typeof handle.fd !== "number") throw new Error("fd was " + typeof handle.fd);
+
+            const {{ bytesRead, buffer }} = await handle.read(Buffer.alloc(5), 0, 5, 0);
+            if (bytesRead !== 5) throw new Error("bytesRead was " + bytesRead);
+            if (buffer.toString("utf8", 0, bytesRead) !== "hello") {{
+                throw new Error("read " + buffer.toString("utf8", 0, bytesRead));
+            }}
+
+            const stat = await handle.stat();
+            if (stat.size !== 11) throw new Error("size was " + stat.size);
+
+            await handle.close();
+            let afterClose;
+            try {{
+                await handle.read(Buffer.alloc(1), 0, 1, 0);
+            }} catch (error) {{
+                afterClose = error;
+            }}
+            if (afterClose?.code !== "EBADF") {{
+                throw new Error("a closed handle answered " + afterClose?.code);
+            }}
+            await handle.close();
+        "#,
+            path = data.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

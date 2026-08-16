@@ -251,3 +251,54 @@ fn node_crypto_key_derivation_matches_the_published_vectors() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// A store entered with `AsyncLocalStorage.run` is still current inside the
+/// continuations scheduled from that scope, and absent outside it. The timer
+/// leg needs a host scheduler, so it is covered by the Node corpus rather than
+/// here.
+#[test]
+fn node_async_local_storage_survives_every_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import { AsyncLocalStorage } from "node:async_hooks";
+
+        const storage = new AsyncLocalStorage();
+        const seen = [];
+
+        await storage.run({ id: 7 }, async () => {
+            seen.push(["sync", storage.getStore()?.id]);
+            const microtask = Promise.resolve().then(() => {
+                seen.push(["microtask", storage.getStore()?.id]);
+            });
+            const resumed = (async () => {
+                await null;
+                seen.push(["await", storage.getStore()?.id]);
+            })();
+            await Promise.all([microtask, resumed]);
+        });
+
+        if (storage.getStore() !== undefined) throw new Error("the store escaped its scope");
+        for (const [where, id] of seen) {
+            if (id !== 7) throw new Error(where + " saw " + id);
+        }
+        if (seen.length !== 3) throw new Error("recorded " + JSON.stringify(seen));
+
+        // A second store must not see the first one's binding.
+        const other = new AsyncLocalStorage();
+        storage.run({ id: 1 }, () => {
+            if (other.getStore() !== undefined) throw new Error("stores are not independent");
+        });
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

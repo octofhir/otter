@@ -1024,6 +1024,18 @@ impl<'rt> NativeCtx<'rt> {
         crate::abstract_ops::is_strictly_equal(&left, &right, self.heap())
     }
 
+    /// The async context every job queued from here inherits.
+    #[must_use]
+    pub fn async_context(&self) -> Value {
+        self.cx.interp.async_context()
+    }
+
+    /// Replace the async context. The caller restores the previous value; the
+    /// interpreter never unwinds it on their behalf.
+    pub fn set_async_context(&mut self, value: Value) {
+        self.cx.interp.set_async_context(value);
+    }
+
     /// Resolve a `globalThis.<name>` value (e.g. a constructor) for native use.
     #[must_use]
     pub fn global_value(&self, name: &str) -> Option<Value> {
@@ -1622,6 +1634,7 @@ impl<'rt> NativeCtx<'rt> {
                 name: "NativeCtx::queue_microtask",
                 reason: "missing execution context".to_string(),
             })?;
+        let async_context = self.cx.interp.async_context();
         self.cx.interp.microtasks_mut().enqueue(crate::Microtask {
             callee,
             this_value: Value::undefined(),
@@ -1629,6 +1642,7 @@ impl<'rt> NativeCtx<'rt> {
             context: Some(context),
             result_capability: None,
             kind: crate::microtask::MicrotaskKind::Call,
+            async_context,
         });
         Ok(())
     }

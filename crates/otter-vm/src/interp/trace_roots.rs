@@ -208,6 +208,24 @@ impl Interpreter {
         self.pending_generator_throw.as_ref()
     }
 
+    /// The live async context, for the root walk.
+    #[must_use]
+    pub fn async_context_for_trace(&self) -> &Value {
+        &self.async_context
+    }
+
+    /// The async context jobs queued from here inherit.
+    #[must_use]
+    pub fn async_context(&self) -> Value {
+        self.async_context
+    }
+
+    /// Replace the async context. Callers restore the previous value
+    /// themselves; the interpreter never unwinds it on their behalf.
+    pub fn set_async_context(&mut self, value: Value) {
+        self.async_context = value;
+    }
+
     /// Borrow the pending uncaught throw side-channel slot for GC
     /// root tracing.
     #[must_use]

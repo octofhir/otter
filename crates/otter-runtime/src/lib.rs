@@ -4045,28 +4045,32 @@ impl Runtime {
             self.interp.timer_callbacks_mut().remove(token);
         }
         let context = entry.context.clone();
+        // The callback runs in the context that scheduled it, and the ambient
+        // one is restored afterwards.
+        let ambient_async_context = self.interp.async_context();
+        self.interp.set_async_context(entry.async_context);
         let mut args: smallvec::SmallVec<[otter_vm::Value; 8]> =
             smallvec::SmallVec::with_capacity(entry.extra_args.len());
         args.extend(entry.extra_args);
-        self.interp
-            .run_callable_sync(
-                &context,
-                &entry.callback,
-                otter_vm::Value::undefined(),
-                args,
-            )
-            .map_err(|error| {
-                // Pair the `Copy` discriminant with the in-flight detail the
-                // same way the top-level run does. Without it the embedder
-                // gets a bare "uncaught exception" and cannot tell which
-                // timer callback failed or why.
-                let detail = self.interp.take_error_detail();
-                map_vm_error(otter_vm::RunError {
-                    error,
-                    frames: Vec::new(),
-                    detail,
-                })
-            })?;
+        let called = self.interp.run_callable_sync(
+            &context,
+            &entry.callback,
+            otter_vm::Value::undefined(),
+            args,
+        );
+        self.interp.set_async_context(ambient_async_context);
+        called.map_err(|error| {
+            // Pair the `Copy` discriminant with the in-flight detail the
+            // same way the top-level run does. Without it the embedder
+            // gets a bare "uncaught exception" and cannot tell which
+            // timer callback failed or why.
+            let detail = self.interp.take_error_detail();
+            map_vm_error(otter_vm::RunError {
+                error,
+                frames: Vec::new(),
+                detail,
+            })
+        })?;
         let outcome = self.interp.drain_microtasks(&context);
         match outcome {
             Ok(()) => Ok(TimerFireOutcome::Fired { repeat }),

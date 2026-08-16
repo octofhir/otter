@@ -110,6 +110,9 @@ pub struct TimerEntry {
     /// `setTimeout(fn, 0)` are indistinguishable by delay alone, and a host
     /// reporting its live resources has to tell them apart.
     pub kind: TimerKind,
+    /// Async context captured when the timer was scheduled; the host restores
+    /// it around the callback.
+    pub async_context: Value,
 }
 
 /// The API a pending timer entry came from.
@@ -125,6 +128,7 @@ impl TimerEntry {
     /// Trace every GC-bearing slot held by this entry.
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.callback.trace_value_slots(visitor);
+        self.async_context.trace_value_slots(visitor);
         for arg in &self.extra_args {
             arg.trace_value_slots(visitor);
         }
@@ -328,6 +332,7 @@ fn schedule_timer_common(
             reason: "host runtime did not install a timer scheduler".to_string(),
         })?;
     interp.record_runtime_host_op_enqueued();
+    let async_context = interp.async_context();
     let token = scheduler.schedule(delay_ms, repeat.then_some(delay_ms));
     let realm_id = interp.active_host_realm_id();
     interp.timer_callbacks_mut().insert(
@@ -339,6 +344,7 @@ fn schedule_timer_common(
             context,
             repeat_ms: repeat.then_some(delay_ms),
             kind: TimerKind::Timeout,
+            async_context,
         },
     );
     Ok(Value::number_f64(token as f64))
@@ -406,6 +412,7 @@ fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             reason: "host runtime did not install a timer scheduler".to_string(),
         })?;
     interp.record_runtime_host_op_enqueued();
+    let async_context = interp.async_context();
     let token = scheduler.schedule(0, None);
     let realm_id = interp.active_host_realm_id();
     interp.timer_callbacks_mut().insert(
@@ -417,6 +424,7 @@ fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             context,
             repeat_ms: None,
             kind: TimerKind::Immediate,
+            async_context,
         },
     );
     Ok(Value::number_f64(token as f64))

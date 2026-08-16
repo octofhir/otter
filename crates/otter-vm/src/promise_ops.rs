@@ -68,6 +68,7 @@ impl Interpreter {
             context: Some(context.clone()),
             result_capability: None,
             kind: microtask::MicrotaskKind::Call,
+            async_context: self.async_context(),
         });
         Ok(())
     }

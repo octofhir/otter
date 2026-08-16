@@ -96,6 +96,10 @@ pub struct Microtask {
     /// shape). `Op::Await` enqueues [`MicrotaskKind::AsyncResume`]
     /// to wake a parked async frame.
     pub kind: MicrotaskKind,
+    /// Async context captured when this task was queued. The drain restores it
+    /// around the task, so a store entered before an `await` is still current
+    /// when the continuation runs.
+    pub async_context: Value,
 }
 
 /// What a queued microtask actually does when the drain reaches
@@ -308,6 +312,7 @@ impl Microtask {
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.callee.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
+        self.async_context.trace_value_slots(visitor);
         for arg in &self.args {
             arg.trace_value_slots(visitor);
         }
@@ -360,6 +365,7 @@ mod tests {
             args: SmallVec::new(),
             context: None,
             result_capability: None,
+            async_context: Value::undefined(),
             kind: MicrotaskKind::Call,
         }
     }

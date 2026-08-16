@@ -106,6 +106,19 @@ pub struct TimerEntry {
     /// field to keep the entry alive after firing instead of
     /// removing it.
     pub repeat_ms: Option<u64>,
+    /// Which API scheduled the entry. `setImmediate` and
+    /// `setTimeout(fn, 0)` are indistinguishable by delay alone, and a host
+    /// reporting its live resources has to tell them apart.
+    pub kind: TimerKind,
+}
+
+/// The API a pending timer entry came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerKind {
+    /// `setTimeout` or `setInterval`.
+    Timeout,
+    /// `setImmediate`.
+    Immediate,
 }
 
 impl TimerEntry {
@@ -141,6 +154,19 @@ impl TimerCallbacks {
     /// the host cancels them.
     pub fn remove(&mut self, token: u64) -> Option<TimerEntry> {
         self.entries.remove(&token)
+    }
+
+    /// The kind of every entry still pending, in token order so a host
+    /// reporting them gets a stable answer.
+    #[must_use]
+    pub fn active_kinds(&self) -> Vec<TimerKind> {
+        let mut entries: Vec<(u64, TimerKind)> = self
+            .entries
+            .iter()
+            .map(|(token, entry)| (*token, entry.kind))
+            .collect();
+        entries.sort_unstable_by_key(|(token, _)| *token);
+        entries.into_iter().map(|(_, kind)| kind).collect()
     }
 
     /// Remove and return host tokens owned by a disposed realm.
@@ -312,6 +338,7 @@ fn schedule_timer_common(
             extra_args: extra,
             context,
             repeat_ms: repeat.then_some(delay_ms),
+            kind: TimerKind::Timeout,
         },
     );
     Ok(Value::number_f64(token as f64))
@@ -389,6 +416,7 @@ fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             extra_args: extra,
             context,
             repeat_ms: None,
+            kind: TimerKind::Immediate,
         },
     );
     Ok(Value::number_f64(token as f64))

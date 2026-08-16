@@ -70,6 +70,7 @@ class Parser {
   }
 
   execute(chunk) {
+    if (this.state === 'upgraded') return;
     this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
     for (;;) {
       if (this.state === 'head') {
@@ -116,6 +117,26 @@ class Parser {
     message.rawHeaders = headers.flat();
     message.headers = collectHeaders(headers);
 
+    // An upgraded connection stops being HTTP: hand the head and whatever
+    // followed it to the owner and never parse again.
+    const upgraded = message.statusCode === 101 ||
+      (typeof message.headers.upgrade === 'string' &&
+       /\bupgrade\b/i.test(String(message.headers.connection ?? '')));
+    if (upgraded && typeof this.handlers.upgrade === 'function') {
+      this.state = 'upgraded';
+      const head = this.buffer;
+      this.buffer = Buffer.alloc(0);
+      this.handlers.upgrade(message, head);
+      return false;
+    }
+    // 1xx responses (other than a 101 upgrade) are informational: report
+    // them and keep waiting for the real response on the same connection.
+    if (this.kind === 'response' &&
+        message.statusCode >= 100 && message.statusCode < 200) {
+      if (typeof this.handlers.info === 'function') this.handlers.info(message);
+      this.state = 'head';
+      return true;
+    }
     const framing = this._framing(message);
     this.handlers.head(message);
     if (framing === 'none') {
@@ -258,7 +279,7 @@ function collectHeaders(pairs) {
 
 function IncomingMessage(socket) {
   if (!(this instanceof IncomingMessage)) return new IncomingMessage(socket);
-  Readable.call(this);
+  Readable.call(this, { autoDestroy: false });
   this.socket = socket;
   this.connection = socket;
   this.headers = {};
@@ -294,7 +315,10 @@ IncomingMessage.prototype._adopt = function _adopt(message) {
 // be changed until it is sent, and a body that is framed once it is.
 function OutgoingMessage(socket) {
   if (!(this instanceof OutgoingMessage)) return new OutgoingMessage(socket);
-  Writable.call(this);
+  // The message finishes when its body is written; the socket underneath has
+  // its own lifetime (keep-alive, a request finished before its response
+  // exists), so the stream machinery must not destroy on finish.
+  Writable.call(this, { autoDestroy: false });
   this.socket = socket;
   this.connection = socket;
   this.headersSent = false;
@@ -392,6 +416,10 @@ OutgoingMessage.prototype._decideFraming = function _decideFraming() {
 // calls it directly to force per-write packets.
 OutgoingMessage.prototype._send = function _send(data, encoding, callback) {
   if (typeof encoding === 'function') { callback = encoding; encoding = null; }
+  if (!this.socket || this.socket.destroyed) {
+    if (typeof callback === 'function') callback();
+    return false;
+  }
   if (!this.headersSent) this._sendHeaders();
   if (data != null && data.length !== 0) {
     this.socket.write(Buffer.isBuffer(data) ? data : Buffer.from(String(data), encoding || 'utf8'));
@@ -401,6 +429,10 @@ OutgoingMessage.prototype._send = function _send(data, encoding, callback) {
 };
 
 OutgoingMessage.prototype._write = function _write(chunk, encoding, callback) {
+  // A peer that tore the connection down mid-response makes every further
+  // write meaningless, not an uncaught error; Node's socket swallows them
+  // through its own error listener.
+  if (!this.socket || this.socket.destroyed) { callback(); return; }
   if (!this.headersSent) this._sendHeaders();
   const body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding || 'utf8');
   if (this.chunkedEncoding) {
@@ -414,6 +446,11 @@ OutgoingMessage.prototype._write = function _write(chunk, encoding, callback) {
 };
 
 OutgoingMessage.prototype._final = function _final(callback) {
+  if (this.socket && this.socket.destroyed) {
+    this.finished = true;
+    callback();
+    return;
+  }
   if (!this.headersSent) this._sendHeaders();
   if (this.chunkedEncoding) {
     const trailers = this._trailers
@@ -427,6 +464,18 @@ OutgoingMessage.prototype._final = function _final(callback) {
 };
 
 OutgoingMessage.prototype._finished = function _finished() {};
+
+// `internal/http` exposes the raw header table under this symbol; tests read
+// entries as `[Name, value]` pairs keyed by the lowercased name.
+const kOutHeaders = Symbol('kOutHeaders');
+Object.defineProperty(OutgoingMessage.prototype, kOutHeaders, {
+  get() {
+    const out = { __proto__: null };
+    for (const [key, entry] of this._headers) out[key] = entry;
+    return out;
+  },
+  configurable: true,
+});
 
 function ServerResponse(socket, request) {
   if (!(this instanceof ServerResponse)) return new ServerResponse(socket, request);
@@ -551,6 +600,16 @@ Server.prototype._connection = function _connection(socket) {
   if (this.timeout > 0) socket.setTimeout(this.timeout);
   let request = null;
   const parser = new Parser('request', {
+    upgrade: (message, head) => {
+      const upgraded = new IncomingMessage(socket);
+      upgraded._adopt(message);
+      if (this.listenerCount('upgrade') > 0) {
+        this.emit('upgrade', upgraded, socket, head);
+      } else {
+        // Nobody claims the socket, so nothing ever will speak on it again.
+        socket.destroy();
+      }
+    },
     head: (message) => {
       request = new IncomingMessage(socket);
       request._adopt(message);
@@ -560,6 +619,14 @@ Server.prototype._connection = function _connection(socket) {
       // runs to the end of the connection instead.
       response.useChunkedEncodingByDefault =
         message.httpVersionMajor === 1 && message.httpVersionMinor >= 1;
+      const expects = String(message.headers.expect ?? '').toLowerCase();
+      if (expects === '100-continue') {
+        if (this.listenerCount('checkContinue') > 0) {
+          this.emit('checkContinue', request, response);
+          return;
+        }
+        response.writeContinue();
+      }
       this.emit('request', request, response);
     },
     body: (chunk) => { if (request) request.push(chunk); },
@@ -600,21 +667,38 @@ function ClientRequest(options, callback) {
   this.path = settings.path;
   this._settings = settings;
   this.shouldKeepAlive = false;
+  this.aborted = false;
   if (typeof callback === 'function') this.once('response', callback);
 
-  for (const [name, value] of Object.entries(settings.headers)) this.setHeader(name, value);
+  const headers = settings.headers;
+  if (Array.isArray(headers)) {
+    // Either a flat [name, value, name, value] list or a list of pairs.
+    if (Array.isArray(headers[0])) {
+      for (const [name, value] of headers) this.setHeader(name, value);
+    } else {
+      for (let i = 0; i + 1 < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
+    }
+  } else {
+    for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
+  }
   if (!this._headers.has('host')) {
-    const port = settings.port === 80 ? '' : `:${settings.port}`;
+    const port = settings.port === settings.defaultPort ? '' : `:${settings.port}`;
     this._headers.set('host', ['Host', `${settings.host}${port}`]);
   }
 
   this.socket = net.connect(settings.port, settings.host);
   this.connection = this.socket;
   this.socket.on('connect', () => {
+    if (this.aborted) return;
     this.emit('socket', this.socket);
     this._flush();
   });
-  this.socket.on('error', (error) => this.emit('error', error));
+  this.socket.on('error', (error) => {
+    // An abort tears the socket down on purpose; the wreckage is not an
+    // error of the request.
+    if (!this.aborted) this.emit('error', error);
+  });
+  if (settings.timeout != null) this.setTimeout(settings.timeout);
   this._listen();
 }
 Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
@@ -624,6 +708,20 @@ ClientRequest.prototype._listen = function _listen() {
   let response = null;
   const parser = new Parser('response', {
     bodyless: this.method === 'HEAD',
+    info: (message) => {
+      // 100 Continue and friends: informational, the real response follows.
+      if (message.statusCode === 100) this.emit('continue');
+      else this.emit('information', message);
+    },
+    upgrade: (message, head) => {
+      const res = new IncomingMessage(this.socket);
+      res._adopt(message);
+      if (this.listenerCount('upgrade') > 0) {
+        this.emit('upgrade', res, this.socket, head);
+      } else {
+        this.socket.destroy();
+      }
+    },
     head: (message) => {
       response = new IncomingMessage(this.socket);
       response._adopt(message);
@@ -666,6 +764,7 @@ ClientRequest.prototype._final = function _final(callback) {
 };
 
 ClientRequest.prototype._flush = function _flush() {
+  if (this.aborted) return;
   for (const [chunk, encoding] of this._queued ?? []) {
     OutgoingMessage.prototype._write.call(this, chunk, encoding, () => {});
   }
@@ -692,10 +791,17 @@ ClientRequest.prototype._sendHeaders = function _sendHeaders() {
 };
 
 ClientRequest.prototype.abort = function abort() {
+  if (this.aborted) return;
+  this.aborted = true;
+  queueMicrotask(() => {
+    this.emit('abort');
+    this.emit('close');
+  });
   this.destroy();
 };
 
 ClientRequest.prototype._destroy = function _destroy(error, callback) {
+  this.aborted = true;
   if (this.socket) this.socket.destroy();
   callback(error);
 };
@@ -705,29 +811,47 @@ ClientRequest.prototype.setTimeout = function setTimeout(timeout, callback) {
   return this;
 };
 
+function decodedHostname(hostname) {
+  try {
+    return decodeURIComponent(hostname);
+  } catch {
+    return hostname;
+  }
+}
+
 function normalizeClientOptions(options) {
   let settings = options;
-  if (typeof options === 'string') {
-    const url = new URL(options);
+  if (typeof options === 'string' || options instanceof URL) {
+    const url = typeof options === 'string' ? new URL(options) : options;
     settings = {
-      host: url.hostname,
-      port: url.port === '' ? 80 : Number(url.port),
+      protocol: url.protocol,
+      host: decodedHostname(url.hostname),
+      port: url.port === '' ? undefined : Number(url.port),
       path: `${url.pathname}${url.search}`,
     };
-  } else if (options instanceof URL) {
-    settings = {
-      host: options.hostname,
-      port: options.port === '' ? 80 : Number(options.port),
-      path: `${options.pathname}${options.search}`,
-    };
   }
+  const protocol = settings.protocol ?? 'http:';
+  const defaultPort = Number(settings.defaultPort ?? (protocol === 'https:' ? 443 : 80));
   return {
+    protocol,
+    defaultPort,
     method: (settings.method ?? 'GET').toUpperCase(),
     host: settings.hostname ?? settings.host ?? 'localhost',
-    port: Number(settings.port ?? 80),
+    port: Number(settings.port ?? defaultPort),
     path: settings.path ?? '/',
     headers: settings.headers ?? {},
+    timeout: settings.timeout,
   };
+}
+
+// RFC 9110 token / field-value checks, exported through `_http_common`.
+const TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+function _checkIsHttpToken(value) {
+  return typeof value === 'string' && TOKEN_RE.test(value);
+}
+const INVALID_FIELD_CHAR_RE = /[^\t\x20-\x7e\x80-\xff]/;
+function _checkInvalidHeaderChar(value) {
+  return typeof value === 'string' && INVALID_FIELD_CHAR_RE.test(value);
 }
 
 function createServer(options, listener) {
@@ -765,14 +889,30 @@ function Agent(options) {
 Object.setPrototypeOf(Agent.prototype, EventEmitter.prototype);
 Object.setPrototypeOf(Agent, EventEmitter);
 
+Agent.prototype.defaultPort = 80;
+Agent.prototype.protocol = 'http:';
+
 Agent.prototype.destroy = function destroy() {};
-Agent.prototype.getName = function getName(options) {
-  return `${options?.host ?? 'localhost'}:${options?.port ?? ''}`;
+
+// §https://nodejs.org/api/http.html#agentgetnameoptions — the pool key:
+// `host:port:localAddress`, with `:family` when one of 4/6 was named and
+// `:socketPath` for a unix socket.
+Agent.prototype.getName = function getName(options = {}) {
+  let name = `${options.host || 'localhost'}:`;
+  if (options.port) name += options.port;
+  name += ':';
+  if (options.localAddress) name += options.localAddress;
+  if (options.family === 4 || options.family === 6) name += `:${options.family}`;
+  if (options.socketPath) name += `:${options.socketPath}`;
+  return name;
 };
 
 module.exports = {
   STATUS_CODES,
   METHODS,
+  _checkIsHttpToken,
+  _checkInvalidHeaderChar,
+  _kOutHeaders: kOutHeaders,
   Agent,
   ClientRequest,
   IncomingMessage,

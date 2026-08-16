@@ -175,6 +175,12 @@ Socket.prototype.connect = function connect(...args) {
 
 // The native half hands over an established connection, from either side.
 Socket.prototype._adopt = function _adopt(handle, remote) {
+  if (this.destroyed) {
+    // Destroyed while the connect was in flight: the handle arrives with
+    // nobody to own it, so it closes instead of leaking a live loop.
+    native.close(handle);
+    return;
+  }
   this._handle = handle;
   this.connecting = false;
   this.pending = false;

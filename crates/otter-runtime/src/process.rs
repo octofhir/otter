@@ -46,7 +46,12 @@ pub(crate) fn install_global(
     process_env_overlay: &std::collections::BTreeMap<String, String>,
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
+    runtime_task_spawner: Option<&crate::RuntimeTaskSpawner>,
 ) -> Result<(), OtterError> {
+    // Claimed before `process.env` is built, so the variable naming the
+    // channel is gone from it — a process this one launches must not believe
+    // it inherited the same channel.
+    let channel = inherited_channel(runtime_task_spawner);
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
@@ -164,6 +169,9 @@ pub(crate) fn install_global(
                     ),
                 ] {
                     define_process_method(&mut scope, process, name, length, call)?;
+                }
+                if let Some(channel) = &channel {
+                    crate::process_ipc::install(&mut scope, process, channel)?;
                 }
                 let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
                 scope.set(process, "hrtime", hrtime)?;
@@ -414,7 +422,11 @@ pub(crate) fn reattach_after_restore(
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
     working_directory: &crate::process_control::WorkingDirectory,
+    runtime_task_spawner: Option<crate::RuntimeTaskSpawner>,
 ) -> Result<(), OtterError> {
+    // A channel belongs to this launch, not to the donor the snapshot was
+    // taken from, so it is claimed here for the same reason `env` is rebuilt.
+    let channel = inherited_channel(runtime_task_spawner.as_ref());
     let snapshot = runtime_process_snapshot();
     let global_object = *interp.global_this();
     let result: Result<(), NativeError> = NativeCtx::with_host_context(
@@ -468,6 +480,9 @@ pub(crate) fn reattach_after_restore(
                     capabilities,
                     working_directory,
                 )?;
+                if let Some(channel) = &channel {
+                    crate::process_ipc::install(&mut scope, process, channel)?;
+                }
                 Ok(())
             })
         },
@@ -935,6 +950,21 @@ fn runtime_process_snapshot() -> RuntimeProcessSnapshot {
 
 fn pid_to_i32(pid: u32) -> i32 {
     pid.min(i32::MAX as u32) as i32
+}
+
+/// Open the channel this process was launched with, if it was launched with
+/// one and the host runs an event loop to carry it.
+fn inherited_channel(
+    runtime_task_spawner: Option<&crate::RuntimeTaskSpawner>,
+) -> Option<std::sync::Arc<crate::ipc::IpcChannel>> {
+    let spawner = runtime_task_spawner?;
+    let address = std::env::var(crate::ipc::CHANNEL_VAR).ok()?;
+    crate::ipc::IpcChannel::join(
+        Path::new(&address),
+        spawner,
+        crate::process_ipc::ProcessIpcEvent::new,
+    )
+    .ok()
 }
 
 #[cfg(test)]

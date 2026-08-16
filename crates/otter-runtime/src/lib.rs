@@ -70,6 +70,7 @@ pub mod error;
 mod event_loop;
 pub mod handle;
 pub mod hooks;
+pub mod ipc;
 pub mod module_graph;
 pub mod module_loader;
 mod module_records;
@@ -80,6 +81,7 @@ mod process_env;
 mod process_events;
 mod process_execve;
 mod process_flags;
+mod process_ipc;
 pub mod promise_registry;
 mod realm;
 mod runtime_activity;
@@ -131,6 +133,7 @@ pub use hooks::{
     RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
     RuntimeResolveRequest, default_check_capability, default_compile_source,
 };
+pub use ipc::{IpcChannel, IpcEvent};
 pub use otter_compiler::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
     CompiledSourceSpan, LiveBindingSlot,
@@ -2643,6 +2646,7 @@ impl Runtime {
             &runtime.config.capabilities,
             &runtime.config.hooks,
             &working_directory,
+            runtime.runtime_task_spawner.clone(),
         )
         .ok()?;
         Some(runtime)
@@ -2802,6 +2806,7 @@ impl Runtime {
                             &config.process_env_overlay,
                             &config.capabilities,
                             &config.hooks,
+                            runtime_task_spawner.as_ref(),
                         )?;
                     }
                     // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /

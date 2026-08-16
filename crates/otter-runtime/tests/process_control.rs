@@ -7,6 +7,7 @@
 //! - An uncaught throw reaches the capture callback, then `uncaughtException`
 //!   listeners.
 //! - A denied read capability stops the move.
+//! - POSIX credential reads and refused changes carry Node's shapes.
 //!
 //! # Invariants
 //! - Every assertion here is the shape Node's own `test/parallel` files check,
@@ -225,4 +226,48 @@ fn the_capture_callback_is_installed_once_and_cleared_with_null() {
         if (process.hasUncaughtExceptionCaptureCallback()) throw new Error("not cleared");
         "#)
     .expect("the capture callback follows Node's install rules");
+}
+
+#[cfg(unix)]
+#[test]
+fn credentials_read_and_report_a_refused_change() {
+    run(r#"
+        for (const name of ["getuid", "geteuid", "getgid", "getegid"]) {
+            const value = process[name]();
+            if (typeof value !== "number" || !Number.isInteger(value)) {
+                throw new Error(name + " returned " + value);
+            }
+        }
+
+        let invalid;
+        try { process.setuid({}); } catch (error) { invalid = error; }
+        if (invalid?.code !== "ERR_INVALID_ARG_TYPE") throw new Error("code was " + invalid?.code);
+        if (invalid.message !==
+            'The "id" argument must be one of type number or string. ' +
+            'Received an instance of Object') {
+            throw new Error("message was " + invalid.message);
+        }
+
+        let unknown;
+        try { process.setgid("fhqwhgadshgnsdhjsdbkhsdabkfabkveyb"); } catch (error) {
+            unknown = error;
+        }
+        if (unknown?.code !== "ERR_UNKNOWN_CREDENTIAL") throw new Error("code was " + unknown?.code);
+        if (unknown.message !== "Group identifier does not exist: fhqwhgadshgnsdhjsdbkhsdabkfabkveyb") {
+            throw new Error("message was " + unknown.message);
+        }
+
+        if (process.getuid() !== 0) {
+            let refused;
+            try { process.setuid("nobody"); } catch (error) { refused = error; }
+            if (!refused) throw new Error("an unprivileged setuid must be refused");
+            if (!/^Error: (?:EPERM, .+|User identifier does not exist: nobody)$/.test(String(refused))) {
+                throw new Error("stringified as " + String(refused));
+            }
+            if (refused.code === "EPERM" && refused.syscall !== "setuid") {
+                throw new Error("syscall was " + refused.syscall);
+            }
+        }
+        "#)
+    .expect("credentials follow Node's shapes");
 }

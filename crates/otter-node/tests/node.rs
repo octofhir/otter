@@ -196,3 +196,58 @@ fn node_fs_promises_file_handle_round_trips() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// Key derivation answers the RFC vectors byte for byte, and its argument
+/// checks carry the codes Node's own tests assert.
+#[test]
+fn node_crypto_key_derivation_matches_the_published_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import { pbkdf2Sync, hkdfSync } from "node:crypto";
+
+        // RFC 6070 PBKDF2-HMAC-SHA1.
+        const first = pbkdf2Sync("password", "salt", 1, 20, "sha1").toString("hex");
+        if (first !== "0c60c80f961f0e71f3a9b524af6012062fe037a6") {
+            throw new Error("pbkdf2 sha1: " + first);
+        }
+        const long = pbkdf2Sync(
+            "passwordPASSWORDpassword",
+            "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 25, "sha1").toString("hex");
+        if (long !== "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038") {
+            throw new Error("pbkdf2 long: " + long);
+        }
+        const sha256 = pbkdf2Sync("password", "salt", 4096, 32, "sha256").toString("hex");
+        if (sha256 !== "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a") {
+            throw new Error("pbkdf2 sha256: " + sha256);
+        }
+
+        const derived = Buffer.from(hkdfSync("sha256", "secret", "salt", "info", 42))
+            .toString("hex");
+        if (derived.length !== 84) throw new Error("hkdf length: " + derived.length);
+
+        const checks = [
+            [() => pbkdf2Sync("p", "s", 0, 20, "sha1"), "ERR_OUT_OF_RANGE"],
+            [() => pbkdf2Sync("p", "s", 1, "20", "sha1"), "ERR_INVALID_ARG_TYPE"],
+            [() => pbkdf2Sync("p", "s", 1, 20), "ERR_INVALID_ARG_TYPE"],
+            [() => pbkdf2Sync("p", "s", 1, 20, "md55"), "ERR_CRYPTO_INVALID_DIGEST"],
+            [() => pbkdf2Sync(1, "s", 1, 20, "sha1"), "ERR_INVALID_ARG_TYPE"],
+        ];
+        for (const [call, code] of checks) {
+            let thrown;
+            try { call(); } catch (error) { thrown = error; }
+            if (thrown?.code !== code) throw new Error(code + " got " + thrown?.code);
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

@@ -276,7 +276,9 @@ impl Interpreter {
     /// preserves identity per §27.2.1.3.2 step 1.f.iii for natives
     /// that need to re-throw a JS value verbatim — such as the
     /// `thrower` function CreateCatchFinally(C, onFinally) installs.
-    pub(crate) fn set_pending_uncaught_throw(&mut self, value: Value) {
+    /// The host reads the slot with [`Self::take_pending_uncaught_throw`] and
+    /// writes it back through here when it decides the throw still escapes.
+    pub fn set_pending_uncaught_throw(&mut self, value: Value) {
         self.pending_uncaught_throw = Some(value);
     }
 }

@@ -5350,6 +5350,74 @@ impl Runtime {
         self.run_script_with_context(source, &specifier)
     }
 
+    /// Offer the in-flight uncaught throw to `process`, the way Node does: the
+    /// capture callback installed by `setUncaughtExceptionCaptureCallback`
+    /// first, then `uncaughtException` listeners. Answers whether JavaScript
+    /// took ownership of the throw; when it did not, the pending value is put
+    /// back so the diagnostic still reports the original error.
+    ///
+    /// # Errors
+    /// Returns the error raised by the handler itself — a throw inside the
+    /// handler is not caught again.
+    fn dispatch_uncaught_exception(
+        &mut self,
+        context: &ExecutionContext,
+    ) -> Result<bool, OtterError> {
+        let Some(thrown) = self.interp.take_pending_uncaught_throw() else {
+            return Ok(false);
+        };
+        let handled = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::default_call(),
+            Some(context),
+            |ctx| -> Result<bool, otter_vm::NativeError> {
+                ctx.scope(|mut scope| {
+                    let Some(process) = scope.global("process") else {
+                        return Ok(false);
+                    };
+                    let thrown = scope.value(thrown);
+
+                    let capture = scope.get(process, process_control::CAPTURE_SLOT)?;
+                    if scope.is_callable(capture) {
+                        scope.call(capture, process, &[thrown])?;
+                        return Ok(true);
+                    }
+
+                    let count = scope.get(process, "listenerCount")?;
+                    if !scope.is_callable(count) {
+                        return Ok(false);
+                    }
+                    let event = scope.string("uncaughtException")?;
+                    let listeners = scope.call(count, process, &[event])?;
+                    if scope.number_value(listeners).unwrap_or(0.0) < 1.0 {
+                        return Ok(false);
+                    }
+                    let emit = scope.get(process, "emit")?;
+                    if !scope.is_callable(emit) {
+                        return Ok(false);
+                    }
+                    let event = scope.string("uncaughtException")?;
+                    let origin = scope.string("uncaughtException")?;
+                    scope.call(emit, process, &[event, thrown, origin])?;
+                    Ok(true)
+                })
+            },
+        );
+        match handled {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                // Nothing took it: restore the value so the escaping diagnostic
+                // still carries the original throw.
+                self.interp.set_pending_uncaught_throw(thrown);
+                Ok(false)
+            }
+            Err(error) => Err(OtterError::Internal {
+                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                message: format!("uncaught exception handler failed: {error}"),
+            }),
+        }
+    }
+
     /// Execute a file as a CommonJS module: wrap it in
     /// `(function (exports, require, module, __filename, __dirname) { ... })`,
     /// invoke it with a per-module `require`, and run any microtasks it queued.
@@ -5397,7 +5465,14 @@ impl Runtime {
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
                 return Ok((self.attach_execution_stats(result), context));
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // The module threw. `process` gets first refusal: a capture
+                // callback, then `uncaughtException` listeners. Only an
+                // unhandled throw is a load failure.
+                if !self.dispatch_uncaught_exception(&context)? {
+                    return Err(err);
+                }
+            }
             Ok(None) => {}
         }
         // Drain microtasks queued during module execution.

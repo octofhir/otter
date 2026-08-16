@@ -52,6 +52,11 @@ impl WorkingDirectory {
     }
 }
 
+/// Where `setUncaughtExceptionCaptureCallback` parks its callback. The slot is
+/// an own, non-enumerable property of `process`, so the callback is rooted by
+/// the object that owns it and never outlives the isolate.
+pub(crate) const CAPTURE_SLOT: &str = "__otter_uncaught_capture__";
+
 pub(crate) fn install(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
@@ -74,7 +79,93 @@ pub(crate) fn install(
         NativeCall::Static(raw_kill),
     )?;
     crate::process::define_process_method(scope, process, "abort", 0, NativeCall::Static(abort))?;
+    crate::process::define_process_method(
+        scope,
+        process,
+        "setUncaughtExceptionCaptureCallback",
+        1,
+        NativeCall::Static(set_uncaught_exception_capture_callback),
+    )?;
+    crate::process::define_process_method(
+        scope,
+        process,
+        "hasUncaughtExceptionCaptureCallback",
+        0,
+        NativeCall::Static(has_uncaught_exception_capture_callback),
+    )?;
+    let empty = scope.undefined();
+    scope.define(
+        process,
+        CAPTURE_SLOT,
+        empty,
+        otter_vm::Attr {
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
+    )?;
     Ok(())
+}
+
+/// `process.setUncaughtExceptionCaptureCallback(fn)` — install the function an
+/// uncaught exception is routed to, or clear it with `null`. A second install
+/// while one is active is an error: Node refuses to let two owners silently
+/// share the process's last line of defence.
+fn set_uncaught_exception_capture_callback(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let candidate = args.first().copied().unwrap_or_else(Value::undefined);
+    // Rendered from the raw argument before the scope allocates: a handle
+    // allocation can move the value this tail describes.
+    let received = received_suffix(ctx, candidate);
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let candidate = scope.value(candidate);
+
+        if scope.is_null(candidate) {
+            let cleared = scope.undefined();
+            scope.set(process, CAPTURE_SLOT, cleared)?;
+            return Ok(Value::undefined());
+        }
+
+        if !scope.is_callable(candidate) {
+            return Err(NativeError::Coded {
+                kind: ErrorKind::TypeError,
+                code: "ERR_INVALID_ARG_TYPE",
+                message: format!("The \"fn\" argument must be of type function or null.{received}"),
+            });
+        }
+
+        let current = scope.get(process, CAPTURE_SLOT)?;
+        if scope.is_callable(current) {
+            return Err(NativeError::Coded {
+                kind: ErrorKind::Error,
+                code: "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET",
+                message: "`process.setupUncaughtExceptionCapture()` was called while a \
+                          capture callback was already active"
+                    .to_string(),
+            });
+        }
+
+        scope.set(process, CAPTURE_SLOT, candidate)?;
+        Ok(Value::undefined())
+    })
+}
+
+/// `process.hasUncaughtExceptionCaptureCallback()`.
+fn has_uncaught_exception_capture_callback(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let current = scope.get(process, CAPTURE_SLOT)?;
+        Ok(Value::boolean(scope.is_callable(current)))
+    })
 }
 
 /// `process.chdir(directory)` — move the host process and record where it

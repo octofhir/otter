@@ -1,8 +1,9 @@
 'use strict';
-// `node:child_process` — built on the native synchronous spawn primitive
-// (`__cpnative.spawnSyncRaw`). The async surface runs the same primitive and
-// replays its output through EventEmitter/stream, which is sufficient for the
-// common "spawn a child, collect its output, observe exit" pattern.
+// `node:child_process` — the event surface over the native spawn primitives.
+//
+// The native half starts a child and reports its outcome a turn later, and
+// owns the channel a forked child joins; this side owns the `ChildProcess`
+// class and the table the native dispatchers route through.
 
 const native = require('__cpnative');
 const { Buffer } = require('buffer');
@@ -128,6 +129,9 @@ const KNOWN_SIGNALS = [
   'SIGXFSZ', 'SIGVTALRM', 'SIGPROF', 'SIGWINCH', 'SIGIO', 'SIGPOLL', 'SIGSYS',
 ];
 
+// Every started child, by the handle the native half dispatches through.
+const children = new Map();
+
 class ChildProcess extends EventEmitter {
   constructor() {
     super();
@@ -136,6 +140,8 @@ class ChildProcess extends EventEmitter {
     this.signalCode = null;
     this.killed = false;
     this.connected = false;
+    this.channel = null;
+    this._handle = 0;
     this.stdout = new Readable({ read() {} });
     this.stderr = new Readable({ read() {} });
     this.stdin = new Writable({ write(c, e, cb) { cb(); } });
@@ -183,58 +189,123 @@ class ChildProcess extends EventEmitter {
         // The child may already be gone; `killed` still reflects the request.
       }
     }
-    this.emit('exit', null, typeof name === 'string' ? name : 'SIGTERM');
+    // The child's own exit is reported when it happens, so nothing is
+    // announced here on its behalf.
     return true;
   }
   ref() {}
   unref() {}
-  disconnect() { this.connected = false; }
+
+  send(message, callback) {
+    if (arguments.length === 0) {
+      const err = new TypeError('The "message" argument must be specified');
+      err.code = 'ERR_MISSING_ARGS';
+      throw err;
+    }
+    if (!this.connected) {
+      const err = new Error('Channel closed');
+      err.code = 'ERR_IPC_CHANNEL_CLOSED';
+      if (typeof callback === 'function') { callback(err); return false; }
+      throw err;
+    }
+    let payload;
+    try {
+      payload = JSON.stringify(message);
+    } catch (error) {
+      if (typeof callback === 'function') { callback(error); return false; }
+      throw error;
+    }
+    if (payload === undefined) {
+      throw invalidArgType(
+        'message', 'one of type string, object, number, boolean, or null', message);
+    }
+    const accepted = native.ipcSend(this._handle, payload);
+    if (typeof callback === 'function') {
+      setTimeout(() => callback(accepted ? null : new Error('Channel closed')), 0);
+    }
+    return accepted;
+  }
+
+  disconnect() {
+    if (!this.connected) return;
+    this.connected = false;
+    this.channel = null;
+    native.ipcDisconnect(this._handle);
+    setTimeout(() => this.emit('disconnect'), 0);
+  }
   _run(command, args, options) {
     // The child starts now, so `pid` is readable the moment `spawn` returns;
-    // only its outcome waits for a turn of the loop.
+    // its outcome arrives on a later turn through `__otterChildExit`.
     let started;
     try {
       started = native.spawnStart(command, args, options ?? {});
     } catch (error) {
-      setTimeout(() => {
-        this.emit('error', error);
-        this.stdout.push(null);
-        this.stderr.push(null);
-        setTimeout(() => this.emit('close', null, null), 0);
-      }, 0);
+      setTimeout(() => this._failed(error), 0);
       return;
     }
     if (started.error) {
       const raw = started;
-      setTimeout(() => {
-        this.emit('error', buildError(raw, command));
-        this.stdout.push(null);
-        this.stderr.push(null);
-        setTimeout(() => this.emit('close', null, null), 0);
-      }, 0);
+      setTimeout(() => this._failed(buildError(raw, command)), 0);
       return;
     }
     this.pid = started.pid;
-    setTimeout(() => {
-      const raw = native.spawnCollect(this.pid);
-      if (raw.error) {
-        this.emit('error', buildError(raw, command));
-        this.stdout.push(null);
-        this.stderr.push(null);
-        setTimeout(() => this.emit('close', null, null), 0);
+    this._handle = started.id;
+    children.set(started.id, this);
+  }
+
+  _failed(error) {
+    this.emit('error', error);
+    this.stdout.push(null);
+    this.stderr.push(null);
+    setTimeout(() => this.emit('close', null, null), 0);
+  }
+
+  // The native half reports the outcome once, when the child has run to
+  // completion and its output has been read to the end.
+  _exited(status, signal, stdout, stderr) {
+    children.delete(this._handle);
+    if (stdout) this.stdout.push(Buffer.from(stdout, 'latin1'));
+    if (stderr) this.stderr.push(Buffer.from(stderr, 'latin1'));
+    this.stdout.push(null);
+    this.stderr.push(null);
+    this.exitCode = status;
+    this.signalCode = signal;
+    this.connected = false;
+    this.channel = null;
+    this.emit('exit', status, signal);
+    setTimeout(() => this.emit('close', status, signal), 0);
+  }
+
+  _channelEvent(kind, payload) {
+    if (kind === 'message') {
+      let message;
+      try {
+        message = JSON.parse(payload);
+      } catch {
         return;
       }
-      if (raw.stdout) this.stdout.push(Buffer.from(raw.stdout, 'latin1'));
-      if (raw.stderr) this.stderr.push(Buffer.from(raw.stderr, 'latin1'));
-      this.stdout.push(null);
-      this.stderr.push(null);
-      this.exitCode = raw.status;
-      this.signalCode = raw.signal;
-      this.emit('exit', raw.status, raw.signal);
-      setTimeout(() => this.emit('close', raw.status, raw.signal));
-    }, 0);
+      this.emit('message', message);
+      return;
+    }
+    if (!this.connected) return;
+    this.connected = false;
+    this.channel = null;
+    this.emit('disconnect');
   }
 }
+
+// The native half dispatches here, on the isolate thread.
+globalThis.__otterChildExit = function exited(handle, status, signal, stdout, stderr) {
+  const child = children.get(handle);
+  if (child === undefined) return;
+  child._exited(status, signal, stdout, stderr);
+};
+
+globalThis.__otterChildIpc = function channelEvent(handle, kind, payload) {
+  const child = children.get(handle);
+  if (child === undefined) return;
+  child._channelEvent(kind, payload);
+};
 
 function spawn(command, args, options) {
   const n = normalizeArgs(command, args, options);
@@ -283,12 +354,17 @@ function exec(command, options, cb) {
   return execFile(shell, ['-c', String(command)], options, cb);
 }
 
+// A forked child runs this same binary and joins a channel opened for it, so
+// `child.send` here and `process.send` there are the two ends of one channel.
 function fork(modulePath, args, options) {
   const a = Array.isArray(args) ? args : [];
+  const settings = { ...(options || {}), ipc: true };
   const execPath = (typeof process !== 'undefined' && process.execPath) || 'node';
-  const cp = spawn(execPath, [String(modulePath), ...a.map(String)], options || {});
-  cp.connected = true;
-  cp.send = () => true;
+  const cp = spawn(execPath, [String(modulePath), ...a.map(String)], settings);
+  if (cp._handle !== 0) {
+    cp.connected = true;
+    cp.channel = { ref() {}, unref() {} };
+  }
   return cp;
 }
 

@@ -1,22 +1,34 @@
 //! `node:child_process` native core.
 //!
-//! A capability-gated synchronous spawn primitive; the async `spawn`/`exec`
-//! surface and the `ChildProcess` class are layered on top in
-//! `child_process.js`. Process output crosses the boundary as latin1 strings
-//! (the same bridge the `fs` core uses), so the JS layer can present Buffers.
+//! A capability-gated spawn primitive; the `ChildProcess` class and the
+//! `spawn`/`exec`/`fork` surface are layered on top in `child_process.js`.
+//! Process output crosses the boundary as latin1 strings (the same bridge the
+//! `fs` core uses), so the JS layer can present Buffers.
+//!
+//! # Contents
+//! - The synchronous primitive behind `spawnSync` and its callers.
+//! - [`spawn_start`], which starts a child and answers at once; its outcome
+//!   arrives later as a task on the isolate thread.
+//! - The channel a forked child is launched to join, and the sends across it.
 //!
 //! # Invariants
 //! - The `run` (subprocess) capability is checked before any process starts.
 //! - Explicit child environments are enumerated through JavaScript internal
 //!   methods, so filtered `process.env` proxies cannot leak hidden host values.
+//! - Waiting for a child never happens on the isolate thread: a program that
+//!   forked a child and is exchanging messages with it must keep running.
 //! - No VM state is retained across the spawn.
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
-    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
-    RuntimeValue as Value, runtime_arg_to_string,
+    CapabilitySet, IpcChannel, IpcEvent, OtterError, Runtime, RuntimeLiveness,
+    RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNativeScope as NativeScope, RuntimeTask, RuntimeTaskSpawner, RuntimeValue as Value,
+    runtime_arg_to_string,
 };
 use otter_vm::object;
 
@@ -37,16 +49,17 @@ pub fn child_process_cjs_value<'scope>(
 pub fn child_process_native_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
     _module: Local<'scope>,
     _require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    native_value(scope, caps)
+    native_value(scope, caps, runtime_task_spawner)
 }
 
 fn native_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
+    spawner: Option<RuntimeTaskSpawner>,
 ) -> Result<Local<'scope>, NativeError> {
     let object = scope.object()?;
     let caps_for_start = caps.clone();
@@ -61,50 +74,175 @@ fn native_value<'scope>(
     )?;
     scope.set(object, "spawnSyncRaw", method)?;
 
-    // Running children, keyed by pid. Owned by the closures below — one table
-    // per module instance, so two isolates never see each other's children.
-    let children: ChildTable =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Children this module started, and the channels it holds to the ones it
+    // forked. Owned by the closures below — one table per module instance, so
+    // two isolates never see each other's children.
+    let children: ChildTable = Arc::new(Mutex::new(HashMap::new()));
+    let next_id = Arc::new(AtomicU32::new(1));
 
     let start_caps = caps_for_start.clone();
     let start_table = children.clone();
+    let start_ids = next_id.clone();
+    let start_spawner = spawner.clone();
     let start = scope.native_closure(
         "spawnStart",
         3,
         &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            spawn_start(ctx, args, &start_caps, &start_table)
+            spawn_start(
+                ctx,
+                args,
+                &start_caps,
+                &start_table,
+                &start_ids,
+                start_spawner.as_ref(),
+            )
         },
     )?;
     scope.set(object, "spawnStart", start)?;
 
-    let collect_table = children.clone();
-    let collect = scope.native_closure(
-        "spawnCollect",
-        1,
+    let send_table = children.clone();
+    let send = scope.native_closure(
+        "ipcSend",
+        2,
         &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            spawn_collect(ctx, args, &collect_table)
+            let id = handle_arg(args, 0);
+            let payload = runtime_arg_to_string(args, 1, ctx.heap());
+            let channel = lookup_channel(&send_table, id);
+            let accepted = channel.is_some_and(|channel| channel.send(&payload));
+            Ok(Value::boolean(accepted))
         },
     )?;
-    scope.set(object, "spawnCollect", collect)?;
+    scope.set(object, "ipcSend", send)?;
+
+    let disconnect_table = children.clone();
+    let disconnect = scope.native_closure(
+        "ipcDisconnect",
+        1,
+        &[],
+        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            let id = handle_arg(args, 0);
+            if let Some(channel) = lookup_channel(&disconnect_table, id) {
+                channel.disconnect();
+            }
+            Ok(Value::undefined())
+        },
+    )?;
+    scope.set(object, "ipcDisconnect", disconnect)?;
     Ok(object)
 }
 
-/// Children this module started and has not yet reaped. The natives are
-/// declared `Send + Sync`, so the table is shared through an `Arc<Mutex<_>>`
-/// even though only the isolate's own thread ever touches it.
-type ChildTable =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, std::process::Child>>>;
+fn handle_arg(args: &[Value], index: usize) -> u32 {
+    args.get(index)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0) as u32
+}
 
-/// Start a child and answer its pid without waiting for it. The caller reaps
-/// it with [`spawn_collect`], which is what lets `spawn` return a live handle
-/// the way Node's does.
+fn lookup_channel(children: &ChildTable, id: u32) -> Option<Arc<IpcChannel>> {
+    children
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .and_then(|entry| entry.channel.clone())
+}
+
+/// What this module keeps about one child it started. The natives are declared
+/// `Send + Sync`, so the table is shared through an `Arc<Mutex<_>>` even though
+/// only the isolate's own thread ever touches it.
+struct ChildEntry {
+    channel: Option<Arc<IpcChannel>>,
+}
+
+type ChildTable = Arc<Mutex<HashMap<u32, ChildEntry>>>;
+
+/// One channel event on a forked child, reported to the program.
+struct ChildIpcEvent {
+    id: u32,
+    event: IpcEvent,
+}
+
+impl RuntimeTask for ChildIpcEvent {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Some(context) = runtime.realm_execution_context() else {
+            return Ok(());
+        };
+        let (kind, payload) = match &self.event {
+            IpcEvent::Message(payload) => ("message", payload.as_str()),
+            IpcEvent::Closed => ("disconnect", ""),
+        };
+        runtime.run_native_event(&context, |ctx| {
+            ctx.scope(|mut scope| {
+                let globals = scope.global_this();
+                let dispatcher = scope.get(globals, "__otterChildIpc")?;
+                if !scope.is_callable(dispatcher) {
+                    let undefined = scope.undefined();
+                    return Ok(scope.finish(undefined));
+                }
+                let id = scope.number(f64::from(self.id));
+                let kind = scope.string(kind)?;
+                let payload = scope.string(payload)?;
+                let undefined = scope.undefined();
+                let result = scope.call(dispatcher, undefined, &[id, kind, payload])?;
+                Ok(scope.finish(result))
+            })
+        })
+    }
+}
+
+/// A child's outcome, reported once it has run to completion.
+struct ChildExit {
+    id: u32,
+    status: Option<i32>,
+    signal: Option<String>,
+    stdout: String,
+    stderr: String,
+}
+
+impl RuntimeTask for ChildExit {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Some(context) = runtime.realm_execution_context() else {
+            return Ok(());
+        };
+        runtime.run_native_event(&context, |ctx| {
+            ctx.scope(|mut scope| {
+                let globals = scope.global_this();
+                let dispatcher = scope.get(globals, "__otterChildExit")?;
+                if !scope.is_callable(dispatcher) {
+                    let undefined = scope.undefined();
+                    return Ok(scope.finish(undefined));
+                }
+                let id = scope.number(f64::from(self.id));
+                let status = match self.status {
+                    Some(code) => scope.number(f64::from(code)),
+                    None => scope.null(),
+                };
+                let signal = match &self.signal {
+                    Some(name) => scope.string(name)?,
+                    None => scope.null(),
+                };
+                let stdout = scope.string(&self.stdout)?;
+                let stderr = scope.string(&self.stderr)?;
+                let undefined = scope.undefined();
+                let result =
+                    scope.call(dispatcher, undefined, &[id, status, signal, stdout, stderr])?;
+                Ok(scope.finish(result))
+            })
+        })
+    }
+}
+
+/// Start a child and answer at once, so `spawn` returns a live handle the way
+/// Node's does. The outcome arrives later as a task on the isolate thread —
+/// waiting here would stop a program that forked a child from ever hearing
+/// from it.
 fn spawn_start(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
     caps: &CapabilitySet,
     children: &ChildTable,
+    next_id: &Arc<AtomicU32>,
+    spawner: Option<&RuntimeTaskSpawner>,
 ) -> Result<Value, NativeError> {
     let command = runtime_arg_to_string(args, 0, ctx.heap());
     if command.is_empty() {
@@ -126,9 +264,29 @@ fn spawn_start(
     let opts = args.get(2).copied();
     let cwd = opt_string(ctx, opts, "cwd");
     let env = opt_env(ctx, opts)?;
+    let wants_channel = opt_flag(ctx, opts, "ipc");
     if should_propagate_allow_all(ctx, &command, caps) {
         argv.insert(0, "--allow-all".to_string());
     }
+
+    let Some(spawner) = spawner else {
+        return Err(crate::type_error(
+            "child_process",
+            "host runtime did not install an event loop",
+        ));
+    };
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+
+    // The channel is opened before the child starts, so the address it is told
+    // to join is already listening when it gets there.
+    let channel = if wants_channel {
+        let (channel, address) =
+            IpcChannel::listen(spawner, move |event| ChildIpcEvent { id, event })
+                .map_err(|error| crate::type_error("child_process", error.to_string()))?;
+        Some((channel, address))
+    } else {
+        None
+    };
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
@@ -138,6 +296,16 @@ fn spawn_start(
     if let Some(env) = env {
         cmd.env_clear();
         cmd.envs(env);
+    }
+    match &channel {
+        Some((_, address)) => {
+            cmd.env(otter_runtime::ipc::CHANNEL_VAR, address);
+        }
+        // A child that was not forked must not believe it inherited this
+        // process's own channel.
+        None => {
+            cmd.env_remove(otter_runtime::ipc::CHANNEL_VAR);
+        }
     }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -151,57 +319,54 @@ fn spawn_start(
     children
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(pid, child);
+        .insert(
+            id,
+            ChildEntry {
+                channel: channel.map(|(channel, _)| channel),
+            },
+        );
+
+    reap(child, id, spawner);
 
     ctx.scope(|mut scope| {
         let object = scope.object()?;
+        let id_value = scope.number(f64::from(id));
+        scope.set(object, "id", id_value)?;
         let pid_value = scope.number(f64::from(pid));
         scope.set(object, "pid", pid_value)?;
         Ok(scope.finish(object))
     })
 }
 
-/// Wait for a child started by [`spawn_start`] and answer its outcome.
-fn spawn_collect(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    children: &ChildTable,
-) -> Result<Value, NativeError> {
-    let pid = args.first().and_then(|value| value.as_f64()).unwrap_or(0.0) as u32;
-    let removed = children
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&pid);
-    let Some(child) = removed else {
-        return Err(crate::type_error("child_process", "no such child process"));
+/// Wait for a child away from the isolate thread and report its outcome there.
+fn reap(child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
+    let Some(io) = spawner.io_handle() else {
+        return;
     };
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(err) => return spawn_error_result(ctx, "<child>", &err),
-    };
-    let status = output.status.code();
-    let signal = exit_signal(&output.status);
-    let stdout = bytes_to_latin1(&output.stdout);
-    let stderr = bytes_to_latin1(&output.stderr);
-
-    ctx.scope(|mut scope| {
-        let object = scope.object()?;
-        let status_value = match status {
-            Some(code) => scope.number(f64::from(code)),
-            None => scope.null(),
+    // A running child is work the program is waiting on, so it holds the run
+    // loop open until its outcome has been reported.
+    let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let exit_spawner = spawner.clone();
+    io.spawn_blocking(move || {
+        let exit = match child.wait_with_output() {
+            Ok(output) => ChildExit {
+                id,
+                status: output.status.code(),
+                signal: exit_signal(&output.status),
+                stdout: bytes_to_latin1(&output.stdout),
+                stderr: bytes_to_latin1(&output.stderr),
+            },
+            Err(error) => ChildExit {
+                id,
+                status: None,
+                signal: None,
+                stdout: String::new(),
+                stderr: error.to_string(),
+            },
         };
-        scope.set(object, "status", status_value)?;
-        let signal_value = match &signal {
-            Some(name) => scope.string(name)?,
-            None => scope.null(),
-        };
-        scope.set(object, "signal", signal_value)?;
-        let stdout_value = scope.string(&stdout)?;
-        scope.set(object, "stdout", stdout_value)?;
-        let stderr_value = scope.string(&stderr)?;
-        scope.set(object, "stderr", stderr_value)?;
-        Ok(scope.finish(object))
-    })
+        let _ = exit_spawner.enqueue(exit, RuntimeLiveness::Unref);
+        drop(keep_alive);
+    });
 }
 
 fn bytes_to_latin1(bytes: &[u8]) -> String {
@@ -234,6 +399,16 @@ fn opt_string(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> Option
     } else {
         None
     }
+}
+
+fn opt_flag(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> bool {
+    let Some(value) = opts
+        .and_then(Value::as_object)
+        .and_then(|obj| object::get(obj, ctx.heap(), key))
+    else {
+        return false;
+    };
+    value.to_boolean(ctx.heap())
 }
 
 fn opt_env(

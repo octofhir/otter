@@ -49,6 +49,7 @@ fn native_value<'scope>(
     caps: &CapabilitySet,
 ) -> Result<Local<'scope>, NativeError> {
     let object = scope.object()?;
+    let caps_for_start = caps.clone();
     let caps = caps.clone();
     let method = scope.native_closure(
         "spawnSyncRaw",
@@ -59,7 +60,148 @@ fn native_value<'scope>(
         },
     )?;
     scope.set(object, "spawnSyncRaw", method)?;
+
+    // Running children, keyed by pid. Owned by the closures below — one table
+    // per module instance, so two isolates never see each other's children.
+    let children: ChildTable =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let start_caps = caps_for_start.clone();
+    let start_table = children.clone();
+    let start = scope.native_closure(
+        "spawnStart",
+        3,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            spawn_start(ctx, args, &start_caps, &start_table)
+        },
+    )?;
+    scope.set(object, "spawnStart", start)?;
+
+    let collect_table = children.clone();
+    let collect = scope.native_closure(
+        "spawnCollect",
+        1,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            spawn_collect(ctx, args, &collect_table)
+        },
+    )?;
+    scope.set(object, "spawnCollect", collect)?;
     Ok(object)
+}
+
+/// Children this module started and has not yet reaped. The natives are
+/// declared `Send + Sync`, so the table is shared through an `Arc<Mutex<_>>`
+/// even though only the isolate's own thread ever touches it.
+type ChildTable =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, std::process::Child>>>;
+
+/// Start a child and answer its pid without waiting for it. The caller reaps
+/// it with [`spawn_collect`], which is what lets `spawn` return a live handle
+/// the way Node's does.
+fn spawn_start(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+    children: &ChildTable,
+) -> Result<Value, NativeError> {
+    let command = runtime_arg_to_string(args, 0, ctx.heap());
+    if command.is_empty() {
+        return Err(crate::type_error("child_process", "command is required"));
+    }
+    if !caps.run.matches(&command) {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::Error,
+            code: "EACCES",
+            message: format!("EACCES: subprocess capability denied for '{command}'"),
+        });
+    }
+
+    let mut argv = args
+        .get(1)
+        .copied()
+        .map(|value| read_string_array(ctx, value))
+        .unwrap_or_default();
+    let opts = args.get(2).copied();
+    let cwd = opt_string(ctx, opts, "cwd");
+    let env = opt_env(ctx, opts)?;
+    if should_propagate_allow_all(ctx, &command, caps) {
+        argv.insert(0, "--allow-all".to_string());
+    }
+
+    let mut cmd = Command::new(&command);
+    cmd.args(&argv);
+    if let Some(dir) = &cwd {
+        cmd.current_dir(dir);
+    }
+    if let Some(env) = env {
+        cmd.env_clear();
+        cmd.envs(env);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => return spawn_error_result(ctx, &command, &err),
+    };
+    let pid = child.id();
+    children
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(pid, child);
+
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let pid_value = scope.number(f64::from(pid));
+        scope.set(object, "pid", pid_value)?;
+        Ok(scope.finish(object))
+    })
+}
+
+/// Wait for a child started by [`spawn_start`] and answer its outcome.
+fn spawn_collect(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    children: &ChildTable,
+) -> Result<Value, NativeError> {
+    let pid = args.first().and_then(|value| value.as_f64()).unwrap_or(0.0) as u32;
+    let removed = children
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&pid);
+    let Some(child) = removed else {
+        return Err(crate::type_error("child_process", "no such child process"));
+    };
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(err) => return spawn_error_result(ctx, "<child>", &err),
+    };
+    let status = output.status.code();
+    let signal = exit_signal(&output.status);
+    let stdout = bytes_to_latin1(&output.stdout);
+    let stderr = bytes_to_latin1(&output.stderr);
+
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let status_value = match status {
+            Some(code) => scope.number(f64::from(code)),
+            None => scope.null(),
+        };
+        scope.set(object, "status", status_value)?;
+        let signal_value = match &signal {
+            Some(name) => scope.string(name)?,
+            None => scope.null(),
+        };
+        scope.set(object, "signal", signal_value)?;
+        let stdout_value = scope.string(&stdout)?;
+        scope.set(object, "stdout", stdout_value)?;
+        let stderr_value = scope.string(&stderr)?;
+        scope.set(object, "stderr", stderr_value)?;
+        Ok(scope.finish(object))
+    })
 }
 
 fn bytes_to_latin1(bytes: &[u8]) -> String {

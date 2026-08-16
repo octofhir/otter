@@ -87,6 +87,47 @@ function execSync(command, options) {
   return checkSyncResult(result, command);
 }
 
+
+// Node names a property `options.x` and an argument `"x"`, and renders the
+// offending value the same way in both.
+function receivedTail(value) {
+  if (value === null || value === undefined) return ` Received ${value}`;
+  if (typeof value === 'string') return ` Received type string ('${value}')`;
+  if (typeof value === 'function') return ` Received function ${value.name}`;
+  if (typeof value === 'object') {
+    return ` Received an instance of ${value.constructor ? value.constructor.name : 'Object'}`;
+  }
+  return ` Received type ${typeof value} (${String(value)})`;
+}
+
+function invalidArgType(name, expectation, value, isProperty = false) {
+  const subject = isProperty ? `The "${name}" property must be` : `The "${name}" argument must be`;
+  const err = new TypeError(`${subject} ${expectation}.${receivedTail(value)}`);
+  err.code = 'ERR_INVALID_ARG_TYPE';
+  return err;
+}
+
+// `envPairs` is a list of `KEY=VALUE` strings, which is the shape the platform
+// takes; the rest of this module works with an object.
+function envFromPairs(pairs) {
+  if (!Array.isArray(pairs)) return undefined;
+  const env = {};
+  for (const pair of pairs) {
+    const text = String(pair);
+    const split = text.indexOf('=');
+    if (split === -1) continue;
+    env[text.slice(0, split)] = text.slice(split + 1);
+  }
+  return env;
+}
+
+const KNOWN_SIGNALS = [
+  'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGIOT', 'SIGBUS',
+  'SIGFPE', 'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM',
+  'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 'SIGURG', 'SIGXCPU',
+  'SIGXFSZ', 'SIGVTALRM', 'SIGPROF', 'SIGWINCH', 'SIGIO', 'SIGPOLL', 'SIGSYS',
+];
+
 class ChildProcess extends EventEmitter {
   constructor() {
     super();
@@ -100,14 +141,82 @@ class ChildProcess extends EventEmitter {
     this.stdin = new Writable({ write(c, e, cb) { cb(); } });
     this.stdio = [this.stdin, this.stdout, this.stderr];
   }
-  kill(signal) { this.killed = true; this.emit('exit', null, signal || 'SIGTERM'); return true; }
+  // The low-level entry point Node exposes on the class itself. Its argument
+  // checks run before anything is spawned, and its tests assert them verbatim.
+  spawn(options) {
+    if (options === null || typeof options !== 'object') {
+      throw invalidArgType('options', 'of type object', options);
+    }
+    // Node checks the list-shaped properties before the file, and its tests
+    // pass one at a time with no file at all.
+    if (options.envPairs !== undefined && !Array.isArray(options.envPairs)) {
+      throw invalidArgType('options.envPairs', 'an instance of Array', options.envPairs, true);
+    }
+    if (options.args !== undefined && !Array.isArray(options.args)) {
+      throw invalidArgType('options.args', 'an instance of Array', options.args, true);
+    }
+    if (typeof options.file !== 'string') {
+      throw invalidArgType('options.file', 'of type string', options.file, true);
+    }
+    const args = options.args ? options.args.slice(1) : [];
+    this._run(options.file, args, {
+      cwd: options.cwd,
+      env: envFromPairs(options.envPairs),
+    });
+    return 0;
+  }
+
+  kill(signal) {
+    const name = signal === undefined ? 'SIGTERM' : signal;
+    // An unknown signal name is refused before anything is sent, which is what
+    // Node does and what its tests assert.
+    if (typeof name === 'string' && !KNOWN_SIGNALS.includes(name)) {
+      const err = new TypeError(`Unknown signal: ${name}`);
+      err.code = 'ERR_UNKNOWN_SIGNAL';
+      throw err;
+    }
+    this.killed = true;
+    if (typeof this.pid === 'number') {
+      try {
+        process.kill(this.pid, name);
+      } catch {
+        // The child may already be gone; `killed` still reflects the request.
+      }
+    }
+    this.emit('exit', null, typeof name === 'string' ? name : 'SIGTERM');
+    return true;
+  }
   ref() {}
   unref() {}
   disconnect() { this.connected = false; }
   _run(command, args, options) {
+    // The child starts now, so `pid` is readable the moment `spawn` returns;
+    // only its outcome waits for a turn of the loop.
+    let started;
+    try {
+      started = native.spawnStart(command, args, options ?? {});
+    } catch (error) {
+      setTimeout(() => {
+        this.emit('error', error);
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setTimeout(() => this.emit('close', null, null), 0);
+      }, 0);
+      return;
+    }
+    if (started.error) {
+      const raw = started;
+      setTimeout(() => {
+        this.emit('error', buildError(raw, command));
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setTimeout(() => this.emit('close', null, null), 0);
+      }, 0);
+      return;
+    }
+    this.pid = started.pid;
     setTimeout(() => {
-      const raw = rawSpawn(command, args, options);
-      this.pid = raw.pid;
+      const raw = native.spawnCollect(this.pid);
       if (raw.error) {
         this.emit('error', buildError(raw, command));
         this.stdout.push(null);

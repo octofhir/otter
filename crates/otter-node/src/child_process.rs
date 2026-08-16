@@ -307,9 +307,17 @@ fn spawn_start(
             cmd.env_remove(otter_runtime::ipc::CHANNEL_VAR);
         }
     }
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // A child whose output the caller does not intend to read should write
+    // where this process writes, rather than into a pipe nobody drains.
+    if opt_string(ctx, opts, "stdio").as_deref() == Some("inherit") {
+        cmd.stdin(Stdio::inherit());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+    } else {
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+    }
 
     let child = match cmd.spawn() {
         Ok(child) => child,

@@ -132,6 +132,14 @@ const KNOWN_SIGNALS = [
 // Every started child, by the handle the native half dispatches through.
 const children = new Map();
 
+// What marks a message as belonging to a module rather than to the program.
+const INTERNAL_PREFIX = 'NODE_';
+
+function isInternal(message) {
+  return message !== null && typeof message === 'object' &&
+    typeof message.cmd === 'string' && message.cmd.startsWith(INTERNAL_PREFIX);
+}
+
 class ChildProcess extends EventEmitter {
   constructor() {
     super();
@@ -284,7 +292,10 @@ class ChildProcess extends EventEmitter {
       } catch {
         return;
       }
-      this.emit('message', message);
+      // A module built on the channel coordinates with its peer over the same
+      // channel the program uses, so its own traffic is reported separately
+      // and a program's `message` listeners only see what the peer sent.
+      this.emit(isInternal(message) ? 'internalMessage' : 'message', message);
       return;
     }
     if (!this.connected) return;
@@ -358,7 +369,14 @@ function exec(command, options, cb) {
 // `child.send` here and `process.send` there are the two ends of one channel.
 function fork(modulePath, args, options) {
   const a = Array.isArray(args) ? args : [];
-  const settings = { ...(options || {}), ipc: true };
+  const given = options || {};
+  // A forked child shares this process's output unless the caller asked for it
+  // on a stream of its own, which is what `silent` means.
+  const settings = {
+    ...given,
+    ipc: true,
+    stdio: given.stdio ?? (given.silent ? 'pipe' : 'inherit'),
+  };
   const execPath = (typeof process !== 'undefined' && process.execPath) || 'node';
   const cp = spawn(execPath, [String(modulePath), ...a.map(String)], settings);
   if (cp._handle !== 0) {

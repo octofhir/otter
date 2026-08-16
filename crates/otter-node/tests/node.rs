@@ -392,3 +392,98 @@ fn node_dns_lookup_resolves_and_validates() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// `dgram`'s synchronous surface: the socket type it accepts, and the errors it
+/// raises before it touches a socket. Binding, sending, and receiving all park
+/// their work on a timer, which a bare runtime has no scheduler for, so those
+/// legs are covered by the Node corpus rather than here.
+#[test]
+fn node_dgram_validates_before_it_opens_a_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import dgram from "node:dgram";
+
+        function codeOf(run) {
+            try { run(); } catch (error) { return error.code; }
+            return undefined;
+        }
+
+        if (codeOf(() => dgram.createSocket("udp5")) !== "ERR_SOCKET_BAD_TYPE") {
+            throw new Error("bad type is not rejected");
+        }
+        if (codeOf(() => dgram.createSocket({})) !== "ERR_SOCKET_BAD_TYPE") {
+            throw new Error("missing type is not rejected");
+        }
+
+        // A string and an options object name the same socket.
+        for (const options of ["udp4", { type: "udp4" }]) {
+            const socket = dgram.createSocket(options);
+            if (socket.type !== "udp4") throw new Error("type " + socket.type);
+            if (!(socket instanceof dgram.Socket)) throw new Error("not a Socket");
+        }
+
+        const socket = dgram.createSocket("udp6");
+        if (socket.type !== "udp6") throw new Error("type " + socket.type);
+
+        // Nothing is open yet, so the state errors come before any syscall.
+        if (codeOf(() => socket.address()) !== "ERR_SOCKET_DGRAM_NOT_RUNNING") {
+            throw new Error("address() on an unbound socket");
+        }
+        if (codeOf(() => socket.remoteAddress()) !== "ERR_SOCKET_DGRAM_NOT_CONNECTED") {
+            throw new Error("remoteAddress() on an unconnected socket");
+        }
+        if (codeOf(() => socket.disconnect()) !== "ERR_SOCKET_DGRAM_NOT_CONNECTED") {
+            throw new Error("disconnect() on an unconnected socket");
+        }
+        if (codeOf(() => socket.send("payload")) !== "ERR_SOCKET_DGRAM_NOT_CONNECTED") {
+            throw new Error("send() without a port on an unconnected socket");
+        }
+
+        // The port is checked before the connection state is.
+        if (codeOf(() => socket.connect(0)) !== "ERR_SOCKET_BAD_PORT") {
+            throw new Error("connect(0)");
+        }
+        if (codeOf(() => socket.connect(65536)) !== "ERR_SOCKET_BAD_PORT") {
+            throw new Error("connect(65536)");
+        }
+        if (codeOf(() => socket.connectSync(1, "example.com")) !== "ERR_INVALID_ARG_VALUE") {
+            throw new Error("connectSync with a name instead of an address");
+        }
+        if (codeOf(() => socket.bindSync({ address: "example.com" })) !== "ERR_INVALID_ARG_VALUE") {
+            throw new Error("bindSync with a name instead of an address");
+        }
+        if (codeOf(() => socket.bindSync({ port: 65536 })) !== "ERR_SOCKET_BAD_PORT") {
+            throw new Error("bindSync with an out-of-range port");
+        }
+        if (codeOf(() => socket.bindSync(null)) !== "ERR_INVALID_ARG_TYPE") {
+            throw new Error("bindSync(null)");
+        }
+
+        // The option setters type-check their argument before reaching the socket.
+        const wrongTypes = [
+            () => socket.setTTL("2"),
+            () => socket.setMulticastTTL("2"),
+            () => socket.setBroadcast(1),
+            () => socket.setMulticastInterface(1),
+            () => socket.addMembership(1),
+            () => socket.dropMembership(1),
+        ];
+        for (const run of wrongTypes) {
+            if (codeOf(run) !== "ERR_INVALID_ARG_TYPE") {
+                throw new Error("option setter accepted a wrong type: " + run);
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

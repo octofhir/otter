@@ -27,6 +27,7 @@ pub mod async_hooks;
 mod buffer;
 pub mod child_process;
 pub mod crypto;
+pub mod dgram;
 pub mod diagnostics_channel;
 pub mod dns;
 pub mod events;
@@ -82,6 +83,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::cjs_only("node:async_hooks", async_hooks::async_hooks_cjs_value),
     HostedModule::cjs_only("async_hooks", async_hooks::async_hooks_cjs_value),
+    HostedModule::cjs_only("node:dgram", dgram::dgram_cjs_value),
+    HostedModule::cjs_only("dgram", dgram::dgram_cjs_value),
     HostedModule::cjs_only("node:dns", dns::dns_cjs_value),
     HostedModule::cjs_only("dns", dns::dns_cjs_value),
     HostedModule::cjs_only("node:dns/promises", dns::dns_cjs_value),

@@ -3882,6 +3882,14 @@ impl Runtime {
         Ok(())
     }
 
+    /// The realm's execution context, once a top-level run has established
+    /// one. A host task that must re-enter JavaScript needs it and has no
+    /// context of its own.
+    #[must_use]
+    pub fn realm_execution_context(&self) -> Option<otter_vm::ExecutionContext> {
+        self.interp.realm_execution_context()
+    }
+
     /// `true` when the per-isolate `TimerCallbacks` table has any
     /// outstanding entries. The isolate runner uses this to decide
     /// whether the script's run loop needs to keep ticking the

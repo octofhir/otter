@@ -307,16 +307,31 @@ fn spawn_start(
             cmd.env_remove(otter_runtime::ipc::CHANNEL_VAR);
         }
     }
-    // A child whose output the caller does not intend to read should write
-    // where this process writes, rather than into a pipe nobody drains.
-    if opt_string(ctx, opts, "stdio").as_deref() == Some("inherit") {
-        cmd.stdin(Stdio::inherit());
-        cmd.stdout(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
-    } else {
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+    // Each standard stream is named separately, because a caller reading one
+    // and leaving another to this process's own output is an ordinary thing to
+    // ask for. A stream nobody intends to read must not become a pipe nobody
+    // drains.
+    let streams = match opts {
+        Some(options) => {
+            let named = value_of(ctx, options, "stdio");
+            read_string_array(ctx, named)
+        }
+        None => Vec::new(),
+    };
+    for (index, slot) in [0usize, 1, 2].into_iter().enumerate() {
+        let default = if slot == 0 { "ignore" } else { "pipe" };
+        let how = streams.get(slot).map(String::as_str).unwrap_or(default);
+        let target = match how {
+            "inherit" => Stdio::inherit(),
+            "ignore" => Stdio::null(),
+            _ if slot == 0 => Stdio::null(),
+            _ => Stdio::piped(),
+        };
+        match index {
+            0 => cmd.stdin(target),
+            1 => cmd.stdout(target),
+            _ => cmd.stderr(target),
+        };
     }
 
     let child = match cmd.spawn() {
@@ -407,6 +422,13 @@ fn opt_string(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> Option
     } else {
         None
     }
+}
+
+/// Read one property of an options object, as a value the array reader can take.
+fn value_of(ctx: &mut NativeCtx<'_>, opts: Value, key: &str) -> Value {
+    opts.as_object()
+        .and_then(|object| object::get(object, ctx.heap(), key))
+        .unwrap_or_else(Value::undefined)
 }
 
 fn opt_flag(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> bool {

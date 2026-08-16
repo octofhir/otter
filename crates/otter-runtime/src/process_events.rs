@@ -581,7 +581,25 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                             ));
                         }
                     }
-                } else if scope.is_object(second) && !scope.is_callable(second) {
+                } else if scope.is_object(second)
+                    && !scope.is_callable(second)
+                    && !scope.is_array(second)?
+                {
+                    // A list is not a set of options, so it is named as a bad
+                    // `type` rather than searched for members it cannot have.
+                    // `type` and `code` name what the warning is, so a
+                    // non-string is refused rather than quietly ignored.
+                    // `detail` is free-form and a non-string is simply not
+                    // carried, which is the distinction Node draws.
+                    for (name, expectation) in [
+                        ("type", "The \"type\" argument must be of type string"),
+                        ("code", "The \"code\" argument must be of type string"),
+                    ] {
+                        let value = scope.get(second, name)?;
+                        if !scope.is_undefined(value) && value_string(&scope, value).is_none() {
+                            return Err(invalid_arg(expectation));
+                        }
+                    }
                     let kind = scope.get(second, "type")?;
                     if let Some(value) = value_string(&scope, kind)
                         && !value.is_empty()

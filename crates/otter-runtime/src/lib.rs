@@ -78,6 +78,7 @@ mod process;
 mod process_control;
 mod process_env;
 mod process_events;
+mod process_execve;
 mod process_flags;
 pub mod promise_registry;
 mod realm;

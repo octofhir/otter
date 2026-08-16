@@ -101,6 +101,7 @@ pub(crate) fn install(
         NativeCall::Static(get_active_resources_info),
     )?;
     install_credentials(scope, process)?;
+    crate::process_execve::install(scope, process, capabilities)?;
     let empty = scope.undefined();
     scope.define(
         process,
@@ -465,7 +466,7 @@ fn invalid_arg_type(
     }
 }
 
-fn received_suffix(ctx: &mut NativeCtx<'_>, value: Value) -> String {
+pub(crate) fn received_suffix(ctx: &mut NativeCtx<'_>, value: Value) -> String {
     if value.is_undefined() {
         return " Received undefined".to_string();
     }
@@ -522,7 +523,7 @@ fn errno_code(error: &std::io::Error) -> &'static str {
 }
 
 #[cfg(unix)]
-fn errno_code_from_raw(errno: i32) -> &'static str {
+pub(crate) fn errno_code_from_raw(errno: i32) -> &'static str {
     match errno {
         libc::ENOENT => "ENOENT",
         libc::ENOTDIR => "ENOTDIR",
@@ -537,7 +538,7 @@ fn errno_code_from_raw(errno: i32) -> &'static str {
 }
 
 #[cfg(not(unix))]
-fn errno_code_from_raw(errno: i32) -> &'static str {
+pub(crate) fn errno_code_from_raw(errno: i32) -> &'static str {
     match errno {
         2 => "ENOENT",
         13 => "EACCES",

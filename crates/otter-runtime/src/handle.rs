@@ -1733,6 +1733,7 @@ fn run_isolate(
         module_cancellation,
         module_task_handle,
         deferred_commands: VecDeque::new(),
+        fatal_task_error: None,
         shutdown: false,
     };
     runner.run_until_idle();
@@ -1936,6 +1937,13 @@ struct IsolateRunner {
     module_cancellation: crate::module_loader::ModuleLoadCancellation,
     module_task_handle: tokio::runtime::Handle,
     deferred_commands: VecDeque<RuntimeCommand>,
+    /// First unhandled error thrown by a runtime task or timer callback in
+    /// this turn. `process` and any active domain have already refused it by
+    /// the time it lands here; the in-flight command's waiter receives it as
+    /// the run's failure, exactly as Node fails the process on an uncaught
+    /// exception. Without a waiter it is reported to stderr instead of being
+    /// dropped.
+    fatal_task_error: Option<OtterError>,
     shutdown: bool,
 }
 
@@ -1962,12 +1970,32 @@ impl IsolateRunner {
         self.process_message(msg)
     }
 
+    /// Remember the first unhandled task/timer error of the turn; the
+    /// in-flight command's `drive_event_loop_to_idle` takes it as the run's
+    /// failure. Later errors of the same turn lose to the first, as they do
+    /// in Node, where the first uncaught exception ends the process.
+    fn record_fatal_task_error(&mut self, error: OtterError) {
+        if self.fatal_task_error.is_none() {
+            self.fatal_task_error = Some(error);
+        }
+    }
+
+    /// Surface a fatal task error that no command waiter will ever receive.
+    /// Reaching this outside a driven turn means the embedder is ticking the
+    /// inbox directly; stderr is the only remaining sink.
+    fn report_stray_fatal_task_error(&mut self) {
+        if let Some(error) = self.fatal_task_error.take() {
+            eprintln!("{error}");
+        }
+    }
+
     fn run_until_idle(&mut self) {
         loop {
             match self.poll_one_tick() {
                 TickOutcome::Processed | TickOutcome::Idle => {}
                 TickOutcome::Shutdown => return,
             }
+            self.report_stray_fatal_task_error();
             // Every poll consumes a message, so every outcome must be
             // honoured here. Discarding a consumed `Shutdown` would re-enter
             // the blocking receive even though the atomic shutdown signal has
@@ -2023,10 +2051,11 @@ impl IsolateRunner {
                             .completed_host_ops
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.counters
                             .failed_host_ops
                             .fetch_add(1, Ordering::Relaxed);
+                        self.record_fatal_task_error(error);
                     }
                 }
                 self.record_microtask_snapshot();
@@ -2046,11 +2075,10 @@ impl IsolateRunner {
                     );
                     return TickOutcome::Processed;
                 }
-                // Drive the JS callback associated with `token`
-                // through the runtime. A swallowed `Err` reply path
-                // is intentional: the surrounding command (if any)
-                // already returned its synchronous result, and the
-                // diagnostic runs through the structured sink.
+                // Drive the JS callback associated with `token` through the
+                // runtime. An `Err` here means `process` and any active
+                // domain already refused the throw inside `fire_timer`, so
+                // it is fatal for the run.
                 match self.runtime.fire_timer(token.0) {
                     Ok(TimerFireOutcome::Missing) => {}
                     Ok(TimerFireOutcome::Fired { repeat }) => {
@@ -2063,13 +2091,14 @@ impl IsolateRunner {
                             );
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
                         decrement_liveness(
                             liveness,
                             &self.counters.pending_ref_timers,
                             &self.counters.pending_unref_timers,
                         );
+                        self.record_fatal_task_error(error);
                     }
                 }
                 self.record_microtask_snapshot();
@@ -2303,6 +2332,12 @@ impl IsolateRunner {
             return initial;
         }
         loop {
+            // An unhandled throw from a task or timer callback fails the run:
+            // the entry value is gone the way Node's is when an uncaught
+            // exception ends the process.
+            if let Some(error) = self.fatal_task_error.take() {
+                return Err(error);
+            }
             let pending_ref_timers = self.counters.pending_ref_timers.load(Ordering::Relaxed);
             let pending_ref_host_ops = self.counters.pending_ref_host_ops.load(Ordering::Relaxed);
             if pending_ref_timers == 0 && pending_ref_host_ops == 0 {

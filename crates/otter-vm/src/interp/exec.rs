@@ -284,11 +284,15 @@ impl Interpreter {
                 let ambient = self.async_context();
                 self.set_async_context(task.async_context);
                 let outcome = self.invoke_microtask(&context, task);
-                self.set_async_context(ambient);
                 if let Err(err) = outcome {
+                    // The failing task's context stays installed: the host
+                    // decides what to do with the error and needs to see the
+                    // context it was raised in. Restoring is the host's job
+                    // from here.
                     self.microtasks.end_drain();
                     return Err(err);
                 }
+                self.set_async_context(ambient);
             }
             self.microtasks.end_drain();
             // Loop continues: any tasks pushed during this

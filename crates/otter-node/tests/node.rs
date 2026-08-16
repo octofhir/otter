@@ -302,3 +302,51 @@ fn node_async_local_storage_survives_every_continuation() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// A domain owns the errors of the work started inside it: a synchronous
+/// throw, and one raised from a continuation the domain never sees directly.
+#[test]
+fn node_domain_claims_errors_from_its_own_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import domain from "node:domain";
+
+        const caught = [];
+        const sync = domain.create();
+        sync.on("error", (error) => caught.push(["sync", error.message]));
+        sync.run(() => { throw new Error("boom"); });
+
+        if (caught.length !== 1) throw new Error("sync throw was not claimed");
+        if (caught[0][1] !== "boom") throw new Error("claimed " + caught[0][1]);
+
+        const nested = domain.create();
+        nested.run(() => {
+            if (process.domain !== nested) throw new Error("process.domain is not the active one");
+        });
+        if (process.domain === nested) throw new Error("the domain outlived its run");
+
+        const bound = domain.create();
+        let boundError;
+        bound.on("error", (error) => { boundError = error; });
+        bound.bind(() => { throw new Error("bound"); })();
+        if (boundError?.message !== "bound") throw new Error("bind did not route");
+
+        const intercepted = domain.create();
+        let interceptedError;
+        intercepted.on("error", (error) => { interceptedError = error; });
+        intercepted.intercept(() => { throw new Error("never runs"); })(new Error("first-arg"));
+        if (interceptedError?.message !== "first-arg") throw new Error("intercept did not route");
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

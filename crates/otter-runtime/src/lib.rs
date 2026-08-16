@@ -4058,19 +4058,26 @@ impl Runtime {
             otter_vm::Value::undefined(),
             args,
         );
-        self.interp.set_async_context(ambient_async_context);
-        called.map_err(|error| {
-            // Pair the `Copy` discriminant with the in-flight detail the
-            // same way the top-level run does. Without it the embedder
-            // gets a bare "uncaught exception" and cannot tell which
-            // timer callback failed or why.
-            let detail = self.interp.take_error_detail();
-            map_vm_error(otter_vm::RunError {
-                error,
-                frames: Vec::new(),
-                detail,
-            })
-        })?;
+        if let Err(error) = called {
+            // A timer callback that throws is an uncaught error like any
+            // other: `process` and any active domain get first refusal before
+            // it becomes the embedder's problem.
+            // The dispatch runs before the ambient context is restored: an
+            // active domain lives in the callback's own context, and it is the
+            // one that must see the error.
+            let handled = self.dispatch_uncaught_exception(&context);
+            self.interp.set_async_context(ambient_async_context);
+            if !handled? {
+                let detail = self.interp.take_error_detail();
+                return Err(map_vm_error(otter_vm::RunError {
+                    error,
+                    frames: Vec::new(),
+                    detail,
+                }));
+            }
+        } else {
+            self.interp.set_async_context(ambient_async_context);
+        }
         let outcome = self.interp.drain_microtasks(&context);
         match outcome {
             Ok(()) => Ok(TimerFireOutcome::Fired { repeat }),
@@ -4578,7 +4585,7 @@ impl Runtime {
         // drain so any `queueMicrotask` registered during script
         // execution gets a chance to run before we report success.
         let script_outcome = self.interp.run(&context);
-        let drain_outcome = self.interp.drain_microtasks(&context);
+        let drain_outcome = self.drain_microtasks_dispatching_uncaught(&context);
         let value = match (script_outcome, drain_outcome) {
             (
                 Err(otter_vm::RunError {
@@ -4696,8 +4703,16 @@ impl Runtime {
         if !self.interp.microtasks().has_any_pending() {
             return Ok(());
         }
-        self.interp
-            .drain_microtasks_with_default(None)
+        // The host loop drains between turns, and a task that throws here is
+        // as uncaught as one thrown during evaluation: it gets the same offer
+        // to `process` and to any active domain.
+        let Some(context) = self.interp.realm_execution_context() else {
+            return self
+                .interp
+                .drain_microtasks_with_default(None)
+                .map_err(map_vm_error);
+        };
+        self.drain_microtasks_dispatching_uncaught(&context)
             .map_err(map_vm_error)
     }
 
@@ -4758,7 +4773,7 @@ impl Runtime {
         // generation is a moving collector, so the completion cannot stay in
         // a plain local across them.
         let root = self.interp.persistent_root_insert(value);
-        let settled = match self.interp.drain_microtasks(&context) {
+        let settled = match self.drain_microtasks_dispatching_uncaught(&context) {
             Ok(()) => self.pump_layer_a_dynamic_imports(&context),
             Err(err) => {
                 let mapped = map_vm_error(err);
@@ -5144,7 +5159,7 @@ impl Runtime {
         }
         let execute_started = timings.is_some().then(std::time::Instant::now);
         let script_outcome = self.interp.run(&context);
-        let drain_outcome = self.interp.drain_microtasks(&context);
+        let drain_outcome = self.drain_microtasks_dispatching_uncaught(&context);
         let value = match (script_outcome, drain_outcome) {
             (
                 Err(otter_vm::RunError {
@@ -5357,6 +5372,35 @@ impl Runtime {
         self.run_script_with_context(source, &specifier)
     }
 
+    /// Drain microtasks, offering a task's uncaught throw to `process` and any
+    /// active domain before it ends the drain. A handled throw does not end the
+    /// turn: the tasks queued behind the failing one still have to run.
+    fn drain_microtasks_dispatching_uncaught(
+        &mut self,
+        context: &ExecutionContext,
+    ) -> Result<(), otter_vm::RunError> {
+        loop {
+            match self.interp.drain_microtasks(context) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // The failing task's context is still installed, which is
+                    // where an active domain lives.
+                    let ambient = self.interp.async_context();
+                    let handled = self.dispatch_uncaught_exception(context);
+                    self.interp.set_async_context(ambient);
+                    match handled {
+                        Ok(true) => continue,
+                        Ok(false) => return Err(error),
+                        // A handler that itself throws is reported as the
+                        // original failure; the handler's error has already
+                        // been surfaced through the diagnostic sink.
+                        Err(_) => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+
     /// Offer the in-flight uncaught throw to `process`, the way Node does: the
     /// capture callback installed by `setUncaughtExceptionCaptureCallback`
     /// first, then `uncaughtException` listeners. Answers whether JavaScript
@@ -5379,10 +5423,24 @@ impl Runtime {
             Some(context),
             |ctx| -> Result<bool, otter_vm::NativeError> {
                 ctx.scope(|mut scope| {
+                    let thrown = scope.value(thrown);
+
+                    // A domain claims the error first: that is the whole point
+                    // of `domain.run`, and it must win over the process-wide
+                    // handlers below.
+                    if let Some(domain) = scope.global("__otterDomainModule") {
+                        let handler = scope.get(domain, "_handleUncaught")?;
+                        if scope.is_callable(handler) {
+                            let handled = scope.call(handler, domain, &[thrown])?;
+                            if scope.boolean_value(handled).unwrap_or(false) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+
                     let Some(process) = scope.global("process") else {
                         return Ok(false);
                     };
-                    let thrown = scope.value(thrown);
 
                     let capture = scope.get(process, process_control::CAPTURE_SLOT)?;
                     if scope.is_callable(capture) {
@@ -5482,10 +5540,15 @@ impl Runtime {
             }
             Ok(None) => {}
         }
-        // Drain microtasks queued during module execution.
-        self.interp.drain_microtasks(&context).map_err(|err| {
-            enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
-        })?;
+        // Drain microtasks queued during module execution. A task that throws
+        // is an uncaught error: `process` and any active domain get first
+        // refusal, exactly as they do for the module body itself.
+        // A handled error does not end the turn: the tasks queued behind the
+        // failing one still have to run, which is why the drain resumes.
+        self.drain_microtasks_dispatching_uncaught(&context)
+            .map_err(|err| {
+                enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
+            })?;
         let result = ExecutionResult::from_vm_value(
             otter_vm::Value::undefined(),
             start.elapsed(),

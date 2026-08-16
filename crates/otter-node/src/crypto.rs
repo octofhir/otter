@@ -152,6 +152,10 @@ fn hmac<D: Digest>(key: &[u8], data: &[u8], block_size: usize) -> Vec<u8> {
     outer.finalize().to_vec()
 }
 
+/// One digest's HMAC: `(key, data, block_size) -> tag`. Both derivations are
+/// written against this so a new digest costs one line in [`with_digest`].
+type Mac<'a> = &'a dyn Fn(&[u8], &[u8], usize) -> Vec<u8>;
+
 /// `pbkdf2(password, salt, iterations, keylen, digest)` — RFC 2898 PBKDF2 over
 /// the same HMAC this module already builds, so every digest it supports is
 /// available here too.
@@ -191,10 +195,7 @@ fn hkdf_derive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 }
 
 /// Run `body` with the HMAC of the named digest and that digest's block size.
-fn with_digest<R>(
-    algo: &str,
-    body: impl FnOnce(usize, &dyn Fn(&[u8], &[u8], usize) -> Vec<u8>) -> R,
-) -> Result<R, NativeError> {
+fn with_digest<R>(algo: &str, body: impl FnOnce(usize, Mac<'_>) -> R) -> Result<R, NativeError> {
     match algo {
         "sha1" => Ok(body(64, &|key, data, block| {
             hmac::<sha1::Sha1>(key, data, block)
@@ -231,7 +232,7 @@ fn number_arg(args: &[Value], index: usize) -> f64 {
 /// RFC 2898 §5.2. Each block is `U1 ^ U2 ^ … ^ Uc`, where `U1` covers the salt
 /// and the block index and every later `U` is the HMAC of the one before it.
 fn pbkdf2(
-    mac: &dyn Fn(&[u8], &[u8], usize) -> Vec<u8>,
+    mac: Mac<'_>,
     block_size: usize,
     password: &[u8],
     salt: &[u8],
@@ -260,7 +261,7 @@ fn pbkdf2(
 
 /// RFC 5869 §2.3 expand.
 fn hkdf_expand(
-    mac: &dyn Fn(&[u8], &[u8], usize) -> Vec<u8>,
+    mac: Mac<'_>,
     block_size: usize,
     prk: &[u8],
     info: &[u8],

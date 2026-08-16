@@ -350,3 +350,45 @@ fn node_domain_claims_errors_from_its_own_work() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// `dns` rejects the arguments Node rejects and exposes the platform's own
+/// hint flags. Resolution itself needs a host timer to deliver its callback,
+/// so it is covered by the Node corpus rather than here.
+#[test]
+fn node_dns_lookup_resolves_and_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import dns from "node:dns";
+
+        let wrongType;
+        try { dns.lookup(1, {}); } catch (error) { wrongType = error; }
+        if (wrongType?.code !== "ERR_INVALID_ARG_TYPE") throw new Error("code " + wrongType?.code);
+        if (wrongType.name !== "TypeError") throw new Error("name " + wrongType.name);
+
+        let badOrder;
+        try { dns.setDefaultResultOrder("sideways"); } catch (error) { badOrder = error; }
+        if (badOrder?.code !== "ERR_INVALID_ARG_VALUE") throw new Error("code " + badOrder?.code);
+
+        dns.setServers(["1.1.1.1"]);
+        if (dns.getServers().join() !== "1.1.1.1") throw new Error("servers did not round-trip");
+
+        // The hint flags are the platform's own, not invented ones.
+        for (const flag of ["ADDRCONFIG", "V4MAPPED", "ALL"]) {
+            if (typeof dns[flag] !== "number" || dns[flag] <= 0) {
+                throw new Error(flag + " is " + dns[flag]);
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

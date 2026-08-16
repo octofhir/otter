@@ -658,3 +658,44 @@ fn node_net_classifies_addresses_and_exposes_its_shapes() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// A `once` listener is `onceWrapper.bind(state)`, so every once-emit calls
+/// `.apply` on a **bound function** receiver. The compiled method-call stub
+/// resolves the method through `get_method_value_for_call` alone, which used
+/// to have no bound-function branch: the resolution answered `None`, and the
+/// emit died with "value is not a function" once the call site was compiled —
+/// the interpreter path masked it. The hot loops below push both call sites
+/// into the compiled tier before the assertions run.
+#[test]
+fn node_events_once_listener_survives_a_compiled_emit() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import { EventEmitter } from "node:events";
+
+        const e = new EventEmitter();
+        e.on("warm", () => {});
+        for (let i = 0; i < 20000; i++) e.emit("warm");
+
+        let got = null;
+        e.once("ping", (v) => { got = v; });
+        e.emit("ping", 42);
+        if (got !== 42) throw new Error("once listener saw " + got);
+
+        const f = function () { return this.v; }.bind({ v: 7 });
+        let s = 0;
+        for (let i = 0; i < 20000; i++) s += f.apply(null, []);
+        if (s !== 7 * 20000) throw new Error("bound apply totalled " + s);
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

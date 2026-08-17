@@ -54,6 +54,24 @@ fn capture_call_sites(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     })
 }
 
+/// `proxyDetails(value)` — `[target, handler]` for a live Proxy, or
+/// `undefined` for anything else (revoked proxies read as null slots).
+fn proxy_details(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let Some(proxy) = args.first().and_then(|value| value.as_proxy()) else {
+        return Ok(Value::undefined());
+    };
+    let target = proxy.target(ctx.heap());
+    let handler = proxy.handler(ctx.heap());
+    ctx.scope(|mut scope| {
+        let pair = scope.array(2)?;
+        let target = scope.value(target);
+        let handler = scope.value(handler);
+        scope.set_index(pair, 0, target)?;
+        scope.set_index(pair, 1, handler)?;
+        Ok(scope.finish(pair))
+    })
+}
+
 fn typed_arrays_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let heap = ctx.heap_mut();
     let Some(left) = args.first().and_then(|value| value.as_typed_array(heap)) else {
@@ -161,6 +179,7 @@ pub fn otter_natives_cjs_value<'scope>(
     )?;
     let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
     let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
+    let proxy_details = scope.native_method("proxyDetails", 1, proxy_details)?;
     let flags = Attr {
         writable: false,
         enumerable: true,
@@ -169,6 +188,7 @@ pub fn otter_natives_cjs_value<'scope>(
     .to_flags();
     scope.define(export, "captureCallSites", callsites, flags)?;
     scope.define(export, "typedArraysEqual", typed_arrays_equal, flags)?;
+    scope.define(export, "proxyDetails", proxy_details, flags)?;
     Ok(export)
 }
 

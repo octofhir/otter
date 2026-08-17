@@ -221,6 +221,15 @@ class ChildProcess extends EventEmitter {
   ref() {}
   unref() {}
 
+  // Explicit resource management: disposing a child kills it.
+  [Symbol.dispose]() {
+    if (!this.killed) this.kill('SIGTERM');
+  }
+
+  async [Symbol.asyncDispose]() {
+    if (!this.killed) this.kill('SIGTERM');
+  }
+
   send(message, callback) {
     if (arguments.length === 0) {
       const err = new TypeError('The "message" argument must be specified');

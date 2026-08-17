@@ -11,12 +11,9 @@
 //! - [`assert_cjs_value`] - the callable `assert` namespace (`assert.js`),
 //!   resolving `util` and `internal/assert/calltracker` through CommonJS.
 //! - [`calltracker_cjs_value`] - the internal `CallTracker` factory.
-//! - [`myers_diff_cjs_value`] - `internal/assert/myers_diff` exposed as its own
-//!   requirable module (the conformance suite imports it directly under
-//!   `--expose-internals`).
 //!
 //! # See also
-//! - `assert/assert.js`, `assert/calltracker.js`, `assert/myers_diff.js`.
+//! - `assert/assert.js`, `assert/calltracker.js`.
 
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeError as NativeError,
@@ -27,8 +24,6 @@ use otter_runtime::{
 const ASSERT_JS: &str = include_str!("assert.js");
 /// Embedded `internal/assert/calltracker` factory.
 const CALLTRACKER_JS: &str = include_str!("calltracker.js");
-/// Embedded `internal/assert/myers_diff`.
-const MYERS_DIFF_JS: &str = include_str!("myers_diff.js");
 
 /// CommonJS export: the callable `assert` namespace.
 pub fn assert_cjs_value<'scope>(
@@ -70,19 +65,3 @@ pub fn calltracker_cjs_value<'scope>(
     )
 }
 
-/// CommonJS export for `internal/assert/myers_diff` (`--expose-internals`).
-pub fn myers_diff_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "internal/assert/myers_diff",
-        MYERS_DIFF_JS,
-        module,
-        require,
-    )
-}

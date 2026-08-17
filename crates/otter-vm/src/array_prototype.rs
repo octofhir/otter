@@ -1764,10 +1764,15 @@ impl Interpreter {
         let len = length_of_array_like(self, stack, context, &o)?;
         // §23.1.3.16 step 3 — sep = (separator is undefined) ? ","
         // : ? ToString(separator). Ordered AFTER the length read.
-        let separator = match separator_arg {
-            None => ",".to_string(),
-            Some(v) if v.is_undefined() => ",".to_string(),
-            Some(v) => self.coerce_to_string(stack, context, &v)?,
+        // Kept as UTF-16 units end to end: a lossy Rust-string detour would
+        // replace lone surrogates with U+FFFD, which join must preserve.
+        let separator: Vec<u16> = match separator_arg {
+            None => vec![b',' as u16],
+            Some(v) if v.is_undefined() => vec![b',' as u16],
+            Some(v) => {
+                let js = crate::coerce::to_js_string_or_throw(self, stack, context, &v)?;
+                js.to_utf16_vec(&self.gc_heap)
+            }
         };
         // Allocation is bounded by `MAX_ARRAY_LIKE_PROBE_LEN`, matching
         // `impl_join`, so a pathological `length` (`2**32`) never sizes a
@@ -1805,7 +1810,7 @@ impl Interpreter {
         } else {
             (0..cap).collect()
         };
-        let mut parts: Vec<String> = vec![String::new(); cap];
+        let mut parts: Vec<Vec<u16>> = vec![Vec::new(); cap];
         // Snapshot every element handle in ONE payload read before touching the
         // allocator. `Get(O, ToString(k))` interns each index-key string, and
         // that allocation can trigger a young-gen scavenge that relocates the
@@ -1842,7 +1847,8 @@ impl Interpreter {
                 if v.is_hole() || v.is_undefined() || v.is_null() {
                     continue;
                 }
-                parts[k] = self.coerce_to_string(stack, context, &v)?;
+                let js = crate::coerce::to_js_string_or_throw(self, stack, context, &v)?;
+                parts[k] = js.to_utf16_vec(&self.gc_heap);
             }
         } else {
             let o_root = self.json_root_push(o);
@@ -1852,16 +1858,25 @@ impl Interpreter {
                 }
                 let o_cur = self.json_root_get(o_root);
                 let v = self.get_property_value_for_call(stack, context, o_cur, &k.to_string())?;
-                parts[k] = if v.is_undefined() || v.is_null() {
-                    String::new()
+                if v.is_undefined() || v.is_null() {
+                    parts[k] = Vec::new();
                 } else {
-                    self.coerce_to_string(stack, context, &v)?
-                };
+                    let js = crate::coerce::to_js_string_or_throw(self, stack, context, &v)?;
+                    parts[k] = js.to_utf16_vec(&self.gc_heap);
+                }
             }
             self.json_root_pop_to(o_root);
         }
-        let joined = parts.join(&separator);
-        Ok(Value::string(JsString::from_str(
+        let total: usize = parts.iter().map(Vec::len).sum::<usize>()
+            + separator.len() * (parts.len().saturating_sub(1));
+        let mut joined: Vec<u16> = Vec::with_capacity(total);
+        for (k, part) in parts.iter().enumerate() {
+            if k > 0 {
+                joined.extend_from_slice(&separator);
+            }
+            joined.extend_from_slice(part);
+        }
+        Ok(Value::string(JsString::from_utf16_units(
             &joined,
             self.gc_heap_mut(),
         )?))

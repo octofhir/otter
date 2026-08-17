@@ -459,11 +459,8 @@ const bindings = {
     isNativeError: (value) => Error.isError(value),
     isPromise: (value) => value instanceof Promise,
   },
-  string_decoder: {
-    encodings: [
-      'ascii', 'utf8', 'base64', 'ucs2', 'hex', 'binary', 'latin1',
-      'utf16le', 'base64url',
-    ],
+  get string_decoder() {
+    return require('internal/string_decoder_binding');
   },
   messaging: {},
   profiler: {},

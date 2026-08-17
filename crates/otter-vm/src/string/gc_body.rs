@@ -728,13 +728,18 @@ pub fn flatten_in_place(
     // into a view over it: same length, same hash, same identity, and every
     // later access takes the flat fast path through one hop. Short results
     // still collapse straight into the body's inline array.
+    // The rope node carried a placeholder hash; the rewritten body is no
+    // longer a cons, so `equals_string_bodies`' hash reject now trusts it —
+    // it must hold the real content hash.
     if latin1 {
         let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+        let hash = hash_latin1(&bytes);
         if bytes.len() <= INLINE_LATIN1_CAP {
             let mut inline = [0u8; INLINE_LATIN1_CAP];
             inline[..bytes.len()].copy_from_slice(&bytes);
             heap.with_payload(rooted, |b| {
                 b.repr = JsStringBodyRepr::InlineLatin1(inline);
+                b.hash = hash;
                 true
             });
             return Ok(());
@@ -746,16 +751,19 @@ pub fn flatten_in_place(
                 parent: flat,
                 start: 0,
             };
+            b.hash = hash;
             true
         });
         heap.record_write(rooted, &flat);
         return Ok(());
     }
+    let hash = hash_utf16(&units);
     if units.len() <= INLINE_FLAT_CAP {
         let mut inline = [0u16; INLINE_FLAT_CAP];
         inline[..units.len()].copy_from_slice(&units);
         heap.with_payload(rooted, |b| {
             b.repr = JsStringBodyRepr::InlineFlat(inline);
+            b.hash = hash;
             true
         });
         return Ok(());
@@ -766,6 +774,7 @@ pub fn flatten_in_place(
             parent: flat,
             start: 0,
         };
+        b.hash = hash;
         true
     });
     heap.record_write(rooted, &flat);

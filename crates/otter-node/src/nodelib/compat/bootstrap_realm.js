@@ -433,6 +433,20 @@ const bindings = {
   },
   messaging: {},
   profiler: {},
+  // The parser binding is its own compat module; a getter defers the require
+  // until first use so realm bootstrap stays cycle-free.
+  get http_parser() {
+    return require('internal/http_parser');
+  },
+  trace_events: {
+    getCategoryEnabledBuffer() { return new Uint8Array(1); },
+    trace() {},
+  },
+  stream_wrap: {
+    streamBaseState: new Int32Array(2),
+    kReadBytesOrError: 0,
+    kBytesWritten: 1,
+  },
 };
 
 function internalBinding(name) {

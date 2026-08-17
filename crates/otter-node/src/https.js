@@ -10,6 +10,10 @@ const { EventEmitter } = require('events');
 function Agent(options) {
   if (!(this instanceof Agent)) return new Agent(options);
   http.Agent.call(this, options);
+  // The base constructor stamps own `protocol`/`defaultPort` for plain http;
+  // this agent's identity is the TLS pair.
+  this.protocol = 'https:';
+  this.defaultPort = 443;
 }
 Object.setPrototypeOf(Agent.prototype, http.Agent.prototype);
 Object.setPrototypeOf(Agent, http.Agent);
@@ -18,19 +22,16 @@ Agent.prototype.protocol = 'https:';
 
 const globalAgent = new Agent({ keepAlive: true });
 
-function normalized(options) {
-  if (typeof options === 'string' || options instanceof URL) return options;
-  return { protocol: 'https:', defaultPort: 443, ...options };
-}
-
+// Node routes https.request through http's ClientRequest with the https
+// global agent as `_defaultAgent`; the agent supplies protocol and port 443.
 function request(options, second, third) {
   if (typeof options === 'string' || options instanceof URL) {
     if (typeof second === 'object' && second !== null) {
-      return http.request(options, { defaultPort: 443, ...second }, third);
+      return http.request(options, { _defaultAgent: globalAgent, ...second }, third);
     }
-    return http.request(options, second, third);
+    return http.request(options, { _defaultAgent: globalAgent }, second);
   }
-  return http.request(normalized(options), second, third);
+  return http.request({ _defaultAgent: globalAgent, ...options }, second, third);
 }
 
 function get(options, second, third) {

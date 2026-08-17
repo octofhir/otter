@@ -9,7 +9,9 @@
 # test to hide. Modules are derived from Node's own file naming
 # (test-<module>-*.js).
 
-timeout_secs = 10
+# Node's own harness budgets 120 seconds per test; http lifecycle tests
+# legitimately ride the server's 65-second keep-alive default.
+timeout_secs = 120
 
 # Timeout overrides for modules whose official tests are legitimately slower
 # than the global budget.

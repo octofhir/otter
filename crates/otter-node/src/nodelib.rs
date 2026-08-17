@@ -82,7 +82,9 @@ macro_rules! nodelib_module {
 }
 
 nodelib_module!(bootstrap_realm, "internal/bootstrap/realm", compat "nodelib/compat/bootstrap_realm.js");
-nodelib_module!(internal_util, "internal/util", compat "nodelib/compat/internal_util.js");
+// `internal/util` is vendored; the file sits beside the `internal/util/`
+// directory, hence the `_module` basename — the content is a verbatim copy.
+nodelib_module!(internal_util, "internal/util", vendored "nodelib/internal/util_module.js");
 nodelib_module!(internal_util_types, "internal/util/types", compat "nodelib/compat/internal_util_types.js");
 nodelib_module!(internal_util_inspect, "internal/util/inspect", vendored "nodelib/internal/util/inspect.js");
 nodelib_module!(internal_util_comparisons, "internal/util/comparisons", vendored "nodelib/internal/util/comparisons.js");
@@ -97,6 +99,8 @@ nodelib_module!(internal_event_target, "internal/event_target", compat "nodelib/
 nodelib_module!(internal_v8_startup_snapshot, "internal/v8/startup_snapshot", compat "nodelib/compat/internal_v8_startup_snapshot.js");
 nodelib_module!(internal_modules_helpers, "internal/modules/helpers", compat "nodelib/compat/internal_modules_helpers.js");
 nodelib_module!(internal_process_task_queues, "internal/process/task_queues", compat "nodelib/compat/internal_process_task_queues.js");
+nodelib_module!(internal_process_execution, "internal/process/execution", compat "nodelib/compat/internal_process_execution.js");
+nodelib_module!(internal_process_warning, "internal/process/warning", compat "nodelib/compat/internal_process_warning.js");
 nodelib_module!(internal_buffer, "internal/buffer", compat "nodelib/compat/internal_buffer.js");
 nodelib_module!(internal_encoding, "internal/encoding", compat "nodelib/compat/internal_encoding.js");
 nodelib_module!(internal_blob, "internal/blob", compat "nodelib/compat/internal_blob.js");

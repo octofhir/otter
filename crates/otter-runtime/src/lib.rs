@@ -4142,7 +4142,9 @@ impl Runtime {
         } else {
             self.interp.set_async_context(ambient_async_context);
         }
-        let outcome = self.interp.drain_microtasks(&context);
+        // The drain offers an uncaught task throw to `process` and any active
+        // domain exactly as the callback's own throw above was offered.
+        let outcome = self.drain_microtasks_dispatching_uncaught(&context);
         match outcome {
             Ok(()) => Ok(TimerFireOutcome::Fired { repeat }),
             Err(err) => {

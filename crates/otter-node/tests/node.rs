@@ -699,3 +699,56 @@ fn node_events_once_listener_survives_a_compiled_emit() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+/// An async generator's completing resume settles the pending `next()`.
+/// The awaiting signal must come from the generator's state, not from the
+/// request queue: the caller's own `next()` request sits in that queue, so
+/// queue-emptiness misread every completion as an await parking and left
+/// the promise pending forever — `for await` over any stream never ended.
+#[test]
+fn async_generator_completion_settles_the_pending_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        async function* plain() { yield 1; }
+        {
+            const g = plain();
+            await g.next();
+            const r = await g.next();
+            if (r.done !== true) throw new Error("implicit end never settled");
+        }
+        async function* withReturn() { yield 1; return 5; }
+        {
+            const g = withReturn();
+            await g.next();
+            const r = await g.next();
+            if (r.done !== true || r.value !== 5) throw new Error("return value lost");
+        }
+        async function* withAwait() { await Promise.resolve(); yield 1; }
+        {
+            const g = withAwait();
+            await g.next();
+            const r = await g.next();
+            if (r.done !== true) throw new Error("await body never completed");
+        }
+        const { PassThrough } = await import("node:stream");
+        {
+            const c = new PassThrough();
+            c.end("foobar");
+            let saw = "";
+            for await (const chunk of c) saw += String(chunk);
+            if (saw !== "foobar") throw new Error("iteration saw " + saw);
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    runtime.run_module(&main).unwrap();
+}

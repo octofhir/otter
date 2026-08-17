@@ -16,6 +16,37 @@ function taggedCheck(tag) {
   return (value) => toString(value) === tag;
 }
 
+// Brand checks: a lie in Symbol.toStringTag or a swapped prototype must not
+// fool these, so each probes an internal-slot-requiring intrinsic.
+function brandCheck(fn) {
+  return (value) => {
+    if (typeof value !== 'object' || value === null) return false;
+    try {
+      fn.call(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+}
+const dateBrand = brandCheck(Date.prototype.getTime);
+const stringBrand = brandCheck(String.prototype.valueOf);
+const numberBrand = brandCheck(Number.prototype.valueOf);
+const booleanBrand = brandCheck(Boolean.prototype.valueOf);
+const symbolBrand = brandCheck(Symbol.prototype.valueOf);
+const bigintBrand = brandCheck(BigInt.prototype.valueOf);
+const mapBrand = brandCheck(Object.getOwnPropertyDescriptor(Map.prototype, 'size').get);
+const setBrand = brandCheck(Object.getOwnPropertyDescriptor(Set.prototype, 'size').get);
+const regexpBrand = (value) => {
+  if (typeof value !== 'object' || value === null) return false;
+  try {
+    RegExp.prototype.exec.call(value, '');
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const AsyncFunctionCtor = Object.getPrototypeOf(async function () {}).constructor;
 const GeneratorFunctionCtor = Object.getPrototypeOf(function* () {}).constructor;
 const AsyncGeneratorFunctionCtor = Object.getPrototypeOf(async function* () {}).constructor;
@@ -30,10 +61,10 @@ const types = {
   isDataView: (value) => value instanceof DataView,
   isTypedArray: (value) => ArrayBuffer.isView(value) && !(value instanceof DataView),
   isUint8Array: (value) => value instanceof Uint8Array,
-  isDate: (value) => value instanceof Date,
-  isRegExp: (value) => value instanceof RegExp,
-  isMap: (value) => value instanceof Map,
-  isSet: (value) => value instanceof Set,
+  isDate: dateBrand,
+  isRegExp: regexpBrand,
+  isMap: mapBrand,
+  isSet: setBrand,
   isWeakMap: (value) => value instanceof WeakMap,
   isWeakSet: (value) => value instanceof WeakSet,
   isPromise: (value) => value instanceof Promise,
@@ -52,11 +83,11 @@ const types = {
     typeof value === 'function' &&
     (value instanceof AsyncFunctionCtor || value instanceof AsyncGeneratorFunctionCtor),
   isGeneratorObject: taggedCheck('Generator'),
-  isNumberObject: taggedCheck('Number'),
-  isStringObject: taggedCheck('String'),
-  isBooleanObject: taggedCheck('Boolean'),
-  isSymbolObject: taggedCheck('Symbol'),
-  isBigIntObject: taggedCheck('BigInt'),
+  isNumberObject: numberBrand,
+  isStringObject: stringBrand,
+  isBooleanObject: booleanBrand,
+  isSymbolObject: symbolBrand,
+  isBigIntObject: bigintBrand,
   isBoxedPrimitive: (value) =>
     typeof value === 'object' && value !== null &&
     (types.isNumberObject(value) || types.isStringObject(value) ||

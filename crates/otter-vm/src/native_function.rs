@@ -1579,7 +1579,7 @@ pub enum NativeError {
     /// A user-thrown JS value escaped the native body. The
     /// dispatcher will route this through the same path as
     /// `Op::Throw` — i.e. into the catchable handler stack.
-    #[error("native function {name} threw")]
+    #[error("native function {name} threw: {message}")]
     Thrown {
         /// Display name of the offending native (for diagnostics).
         name: &'static str,

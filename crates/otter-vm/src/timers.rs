@@ -76,6 +76,12 @@ pub trait TimerScheduler: Send + Sync {
     /// `false`; the VM additionally drops the entry from
     /// [`TimerCallbacks`] so the late fire is a no-op.
     fn cancel(&self, token: u64) -> bool;
+
+    /// Move a pending timer between the ref/unref liveness classes.
+    /// An unref'd timer still fires while the loop is alive but no
+    /// longer holds the run-until-idle boundary open. Returns `false`
+    /// for an unknown or already-fired token.
+    fn set_ref(&self, token: u64, refed: bool) -> bool;
 }
 
 /// Cloneable handle the VM uses to talk to the host scheduler.
@@ -227,6 +233,7 @@ const TIMER_NATIVES: &[(&str, u8, NativeFastFn)] = &[
     ("clearInterval", 1, clear_interval_native),
     ("setImmediate", 1, set_immediate_native),
     ("clearImmediate", 1, clear_immediate_native),
+    ("__otterTimerSetRef", 2, timer_set_ref_native),
 ];
 
 /// Install the `setTimeout` / `setInterval` / `clearTimeout` /
@@ -432,4 +439,29 @@ fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
 
 fn clear_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     cancel_timer_common(ctx, args, "clearImmediate")
+}
+
+/// `__otterTimerSetRef(token, refed)` — move a pending timer between the
+/// ref/unref liveness classes on the host scheduler. Node's `Timeout`
+/// wrapper drives this from `ref()`/`unref()`.
+fn timer_set_ref_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let token = match args.first().and_then(|v| v.as_number()) {
+        Some(n) => {
+            let raw = n.as_f64();
+            if raw.is_finite() && raw >= 0.0 {
+                raw as u64
+            } else {
+                return Ok(Value::boolean(false));
+            }
+        }
+        None => return Ok(Value::boolean(false)),
+    };
+    let refed = args
+        .get(1)
+        .is_none_or(|value| value.to_boolean(ctx.heap()));
+    let moved = ctx
+        .interp_mut()
+        .timer_scheduler()
+        .is_some_and(|scheduler| scheduler.set_ref(token, refed));
+    Ok(Value::boolean(moved))
 }

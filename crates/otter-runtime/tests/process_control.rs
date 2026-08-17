@@ -38,6 +38,10 @@ impl TimerScheduler for PendingScheduler {
     fn cancel(&self, _token: u64) -> bool {
         true
     }
+
+    fn set_ref(&self, _token: u64, _refed: bool) -> bool {
+        true
+    }
 }
 
 fn runtime_with(capabilities: CapabilitySet) -> Runtime {

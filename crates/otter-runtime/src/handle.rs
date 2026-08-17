@@ -501,6 +501,10 @@ struct RuntimeCounters {
     cancelled_host_ops: AtomicU64,
     pending_ref_timers: AtomicUsize,
     pending_unref_timers: AtomicUsize,
+    /// Current liveness class per pending JS timer token. Fire, cancel, and
+    /// ref/unref all consult this so the class moved by `set_ref` is the one
+    /// decremented, not the class the timer was scheduled with.
+    timer_liveness: Mutex<HashMap<u64, RuntimeLiveness>>,
     fired_timers: AtomicU64,
     cancelled_timers: AtomicU64,
     pending_dynamic_module_jobs: AtomicUsize,
@@ -634,6 +638,59 @@ impl RuntimeActivityAccounting for RuntimeCounters {
     }
 }
 
+impl RuntimeCounters {
+    /// Record a freshly scheduled JS timer in the Ref class.
+    fn timer_register(&self, token: u64) {
+        self.timer_liveness
+            .lock()
+            .expect("timer liveness lock")
+            .insert(token, RuntimeLiveness::Ref);
+    }
+
+    /// Current class of a pending timer; an unknown token reads as Ref,
+    /// matching the class its scheduling incremented.
+    fn timer_class(&self, token: u64) -> RuntimeLiveness {
+        self.timer_liveness
+            .lock()
+            .expect("timer liveness lock")
+            .get(&token)
+            .copied()
+            .unwrap_or(RuntimeLiveness::Ref)
+    }
+
+    /// Forget a completed or cancelled timer, returning its final class.
+    fn timer_take(&self, token: u64) -> Option<RuntimeLiveness> {
+        self.timer_liveness
+            .lock()
+            .expect("timer liveness lock")
+            .remove(&token)
+    }
+
+    /// Move a pending timer between liveness classes. `false` when the
+    /// token is unknown (already fired or cancelled).
+    fn timer_set_ref(&self, token: u64, refed: bool) -> bool {
+        let desired = if refed {
+            RuntimeLiveness::Ref
+        } else {
+            RuntimeLiveness::Unref
+        };
+        let mut map = self.timer_liveness.lock().expect("timer liveness lock");
+        let Some(current) = map.get_mut(&token) else {
+            return false;
+        };
+        if *current != desired {
+            decrement_liveness(
+                *current,
+                &self.pending_ref_timers,
+                &self.pending_unref_timers,
+            );
+            increment_liveness(desired, &self.pending_ref_timers, &self.pending_unref_timers);
+            *current = desired;
+        }
+        true
+    }
+}
+
 enum RuntimeMessage {
     Command(RuntimeCommand),
     RuntimeTask {
@@ -642,7 +699,6 @@ enum RuntimeMessage {
     },
     TimerFired {
         token: TimerToken,
-        liveness: RuntimeLiveness,
         expects_js_callback: bool,
     },
     SettlePromise {
@@ -780,6 +836,7 @@ impl RuntimeHandle {
             cancelled_host_ops: AtomicU64::new(0),
             pending_ref_timers: AtomicUsize::new(0),
             pending_unref_timers: AtomicUsize::new(0),
+            timer_liveness: Mutex::new(HashMap::new()),
             fired_timers: AtomicU64::new(0),
             cancelled_timers: AtomicU64::new(0),
             pending_dynamic_module_jobs: AtomicUsize::new(0),
@@ -1153,7 +1210,6 @@ impl RuntimeHandle {
             tx: self.inner.tx.clone(),
             counters: self.inner.counters.clone(),
             io_handle: self.inner.event_loop.handle(),
-            liveness: RuntimeLiveness::Ref,
             repeat: request.repeat.is_some(),
             expects_js_callback: false,
         });
@@ -1774,17 +1830,19 @@ struct RuntimeTimerWake {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
     io_handle: tokio::runtime::Handle,
-    liveness: RuntimeLiveness,
     repeat: bool,
     expects_js_callback: bool,
 }
 
 impl TimerWake for RuntimeTimerWake {
     fn timer_fired(&self, token: TimerToken) {
+        // The pending class may have moved since scheduling (ref/unref);
+        // read it at fire time so the eventual decrement matches.
+        let liveness = self.counters.timer_class(token.0);
         let accounting = if self.repeat {
             InternalPostAccounting::DropOnFull
         } else {
-            InternalPostAccounting::Timer(self.liveness)
+            InternalPostAccounting::Timer(liveness)
         };
         post_internal_message(
             &self.io_handle,
@@ -1792,7 +1850,6 @@ impl TimerWake for RuntimeTimerWake {
             &self.counters,
             RuntimeMessage::TimerFired {
                 token,
-                liveness: self.liveness,
                 expects_js_callback: self.expects_js_callback,
             },
             accounting,
@@ -1854,13 +1911,13 @@ impl TimerScheduler for InboxTimerScheduler {
         // scheduler does not guarantee that for `sleep(0)`.
         if delay_ms == 0 && repeat_ms.is_none() {
             let token = TimerToken(self.next_immediate_token.fetch_add(1, Ordering::Relaxed));
+            self.counters.timer_register(token.0);
             post_internal_message(
                 &self.event_loop.handle(),
                 &self.tx,
                 &self.counters,
                 RuntimeMessage::TimerFired {
                     token,
-                    liveness,
                     expects_js_callback: true,
                 },
                 InternalPostAccounting::Timer(liveness),
@@ -1875,15 +1932,42 @@ impl TimerScheduler for InboxTimerScheduler {
             tx: self.tx.clone(),
             counters: self.counters.clone(),
             io_handle: self.event_loop.handle(),
-            liveness,
             repeat: repeat_ms.is_some(),
             expects_js_callback: true,
         });
         let token = self.event_loop.schedule_timer(request, wake);
+        self.counters.timer_register(token.0);
         token.0
     }
 
+    fn set_ref(&self, token: u64, refed: bool) -> bool {
+        self.counters.timer_set_ref(token, refed)
+    }
+
     fn cancel(&self, token: u64) -> bool {
+        let taken = self.counters.timer_take(token);
+        let release = |counters: &RuntimeCounters| match taken {
+            Some(liveness) => decrement_liveness(
+                liveness,
+                &counters.pending_ref_timers,
+                &counters.pending_unref_timers,
+            ),
+            // Unknown class (host-scheduled or already-released token):
+            // best-effort release, Ref first.
+            None => {
+                counters
+                    .pending_ref_timers
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                    .or_else(|_| {
+                        counters.pending_unref_timers.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |v| v.checked_sub(1),
+                        )
+                    })
+                    .ok();
+            }
+        };
         // Immediate-token tokens have no Tokio handle to cancel;
         // the inbox already carries the `TimerFired` message, but
         // the per-isolate `TimerCallbacks` table was just emptied
@@ -1891,17 +1975,7 @@ impl TimerScheduler for InboxTimerScheduler {
         // no-op. Decrement the liveness counter here so the
         // run-until-idle loop accounts for the cancellation.
         if token >= FIRST_IMMEDIATE_TOKEN {
-            self.counters
-                .pending_ref_timers
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
-                .or_else(|_| {
-                    self.counters.pending_unref_timers.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| v.checked_sub(1),
-                    )
-                })
-                .ok();
+            release(&self.counters);
             self.counters
                 .cancelled_timers
                 .fetch_add(1, Ordering::Relaxed);
@@ -1909,17 +1983,7 @@ impl TimerScheduler for InboxTimerScheduler {
         }
         let cancelled = self.event_loop.cancel_timer(TimerToken(token));
         if cancelled {
-            self.counters
-                .pending_ref_timers
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
-                .or_else(|_| {
-                    self.counters.pending_unref_timers.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| v.checked_sub(1),
-                    )
-                })
-                .ok();
+            release(&self.counters);
             self.counters
                 .cancelled_timers
                 .fetch_add(1, Ordering::Relaxed);
@@ -2063,9 +2127,11 @@ impl IsolateRunner {
             }
             RuntimeMessage::TimerFired {
                 token,
-                liveness,
                 expects_js_callback,
             } => {
+                // The class may have moved between posting and processing;
+                // the map holds the class whose counter is still held.
+                let liveness = self.counters.timer_class(token.0);
                 if !expects_js_callback {
                     self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
                     decrement_liveness(
@@ -2084,6 +2150,10 @@ impl IsolateRunner {
                     Ok(TimerFireOutcome::Fired { repeat }) => {
                         self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
                         if !repeat {
+                            let liveness = self
+                                .counters
+                                .timer_take(token.0)
+                                .unwrap_or(RuntimeLiveness::Ref);
                             decrement_liveness(
                                 liveness,
                                 &self.counters.pending_ref_timers,
@@ -2093,6 +2163,10 @@ impl IsolateRunner {
                     }
                     Err(error) => {
                         self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
+                        let liveness = self
+                            .counters
+                            .timer_take(token.0)
+                            .unwrap_or(RuntimeLiveness::Ref);
                         decrement_liveness(
                             liveness,
                             &self.counters.pending_ref_timers,

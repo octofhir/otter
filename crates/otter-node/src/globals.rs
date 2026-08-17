@@ -14,8 +14,19 @@ pub fn node_globals_installer() -> RuntimeGlobalInstaller {
 }
 
 fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
-    runtime.install_script(SourceInput::from_javascript(
+    runtime.install_script(SourceInput::from_javascript(concat!(
         "Object.defineProperty(globalThis, Symbol.toStringTag, { value: 'global', configurable: true });\n\
-         Object.defineProperty(globalThis, 'global', { value: globalThis, writable: true, configurable: true });",
-    ))
+         Object.defineProperty(globalThis, 'global', { value: globalThis, writable: true, configurable: true });\n\
+         if (typeof process === 'object' && process.report === undefined) {\n\
+           process.report = {\n\
+             getReport() { return { header: {}, javascriptStack: {}, libuv: [], workers: [], environmentVariables: {}, sharedObjects: [] }; },\n\
+             writeReport() { return ''; },\n\
+             directory: '', filename: '',\n\
+             compact: false, excludeNetwork: false, excludeEnv: false,\n\
+             reportOnFatalError: false, reportOnSignal: false, reportOnUncaughtException: false,\n\
+             signal: 'SIGUSR2',\n\
+           };\n\
+         }\n",
+        include_str!("node_timers_global.js"),
+    )))
 }

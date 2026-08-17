@@ -30,6 +30,13 @@ impl Interpreter {
         &mut self.gc_heap
     }
 
+    /// Snapshot aggregate collector counters without exposing mutable heap
+    /// authority to diagnostics and benchmark clients.
+    #[must_use]
+    pub fn gc_stats_snapshot(&mut self) -> otter_gc::GcStats {
+        self.gc_heap.gc_stats().clone()
+    }
+
     /// `pub(crate)` alias used by [`crate::runtime_cx::RuntimeTurn`]
     /// to forward the heap borrow without rebinding through a
     /// public method. Tracks the explicit-context migration in

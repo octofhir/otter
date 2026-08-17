@@ -49,11 +49,16 @@ mod artifact;
 mod code;
 mod entry;
 pub mod machine;
+mod measurement;
 pub mod optimizing;
 mod template;
 
 pub use code::CompiledCode;
 pub use entry::{BackendFailure, TransitionTable, Unsupported};
+pub use measurement::{
+    JitCompilerMeasurement, JitCompilerProbe, JitMeasurementTier, MeasuredCompilation,
+    MeasuredValidation,
+};
 pub use optimizing::{OptimizedCode, compile_optimized};
 pub use template::{TemplateCode, compile};
 
@@ -105,6 +110,15 @@ impl OtterJitCompiler {
         Self::with_policy(JitTierPolicy::TemplateOnly)
     }
 
+    /// Whether this compiler policy admits Machine IR promotion.
+    ///
+    /// This scalar query keeps clients from importing the VM's compiler-hook
+    /// contract merely to verify a selected production policy.
+    #[must_use]
+    pub fn supports_optimizing_tier(&self) -> bool {
+        self.policy == JitTierPolicy::ProductionTiered
+    }
+
     fn with_policy(policy: JitTierPolicy) -> Self {
         let transitions = TransitionTable::resolve();
         Self {
@@ -116,7 +130,7 @@ impl OtterJitCompiler {
 
 impl otter_vm::JitCompilerHook for OtterJitCompiler {
     fn optimizing_tier_enabled(&self) -> bool {
-        self.policy == JitTierPolicy::ProductionTiered
+        self.supports_optimizing_tier()
     }
 
     fn runtime_stub_bindings(&self) -> Vec<otter_vm::JitRuntimeStubBinding> {

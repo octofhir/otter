@@ -45,9 +45,9 @@ use std::fmt::Write as _;
 
 use otter_vm::{
     JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactIdentity,
-    JitArtifactMetadata, JitCompileSnapshot, JitDebugTarget, JitDebugTier, SafepointRecord,
-    TaggedLocationKind,
+    JitArtifactMetadata, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
     deopt::{DeoptLocation, DeoptRepr, DeoptTable},
+    native_abi::{SafepointRecord, TaggedLocationKind},
 };
 use serde::Serialize;
 

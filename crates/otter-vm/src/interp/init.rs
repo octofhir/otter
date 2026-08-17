@@ -8,8 +8,9 @@
 //!   the handle arena.
 //! - Realm activation swaps the complete global, lexical, template, module,
 //!   namespace, inline-cache, and evaluation state as one isolate-local unit.
-//! - Introspection accessors expose property-IC, JIT, protector, and shape
-//!   epoch counters.
+//! - Configuration and introspection accessors expose property-IC, JIT,
+//!   protector, and shape epoch state. Compiled post-entry state transitions
+//!   remain in the JIT call module rather than this accessor surface.
 //!
 //! # Invariants
 //! - Every partially built GC graph is owned either by an RAII bootstrap root
@@ -1197,14 +1198,6 @@ impl Interpreter {
     #[must_use]
     pub fn jit_runtime_stats(&self) -> JitRuntimeStats {
         self.jit_runtime_stats
-    }
-
-    /// Mark exact per-generation feedback for cold reconciliation.
-    ///
-    /// Generated linkage clears one idempotent context marker instead of
-    /// maintaining duplicate aggregate counters on every call.
-    pub fn jit_note_generated_feedback(&mut self, dirty: bool) {
-        self.jit_generated_feedback_pending |= dirty;
     }
 
     /// Return the current collection method IC summary.

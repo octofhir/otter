@@ -456,9 +456,7 @@ fn timer_set_ref_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         }
         None => return Ok(Value::boolean(false)),
     };
-    let refed = args
-        .get(1)
-        .is_none_or(|value| value.to_boolean(ctx.heap()));
+    let refed = args.get(1).is_none_or(|value| value.to_boolean(ctx.heap()));
     let moved = ctx
         .interp_mut()
         .timer_scheduler()

@@ -49,12 +49,12 @@ note: required because it appears within the type `Option<otter_gc::external::Ex
   |
   | pub enum Option<T> {
   |          ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -88,12 +88,51 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Obje
   |
   | pub struct Gc<T: ?Sized> {
   |            ^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const ()` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const ()` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const ()`
+note: required because it appears within the type `PhantomData<*const ()>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `otter_vm::Value`
+ --> src/value/mod.rs
+  |
+  | pub struct Value(u64, std::marker::PhantomData<*const ()>);
+  |            ^^^^^
+note: required because it appears within the type `Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -132,56 +171,12 @@ note: required because it appears within the type `Option<otter_gc::external::Ex
   |
   | pub enum Option<T> {
   |          ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeTurn<'rt> {
-  |                   ^^^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `*const ()` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const ()` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const ()`
-note: required because it appears within the type `PhantomData<*const ()>`
- --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Value`
- --> src/value/mod.rs
-  |
-  | pub struct Value(u64, std::marker::PhantomData<*const ()>);
-  |            ^^^^^
-note: required because it appears within the type `Option<otter_vm::Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -216,12 +211,12 @@ note: required because it appears within the type `Option<Box<(dyn StepTracer + 
   |
   | pub enum Option<T> {
   |          ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -261,12 +256,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -306,12 +301,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -328,13 +323,13 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
-error[E0277]: `*mut NativeFrame` cannot be sent between threads safely
+error[E0277]: `*mut otter_vm::native_abi::NativeFrame` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
 6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut NativeFrame` cannot be sent between threads safely
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut otter_vm::native_abi::NativeFrame` cannot be sent between threads safely
   |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*mut NativeFrame`
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*mut otter_vm::native_abi::NativeFrame`
 note: required because it appears within the type `JitNativeActivation`
  --> src/jit.rs
   |
@@ -355,12 +350,12 @@ note: required because it appears within the type `Vec<JitNativeActivation>`
   |
   | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
   |            ^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -409,12 +404,12 @@ note: required because it appears within the type `otter_gc::heap::GcHeap`
   |
   | pub struct GcHeap {
   |            ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -463,12 +458,12 @@ note: required because it appears within the type `otter_gc::heap::GcHeap`
   |
   | pub struct GcHeap {
   |            ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -565,12 +560,12 @@ note: required because it appears within the type `HashMap<(u32, u32), otter_gc:
   |
   | pub struct HashMap<
   |            ^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -587,19 +582,19 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
-error[E0277]: `*const EvalEnvBody` cannot be sent between threads safely
+error[E0277]: `*const otter_vm::eval_env::EvalEnvBody` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
 6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const EvalEnvBody` cannot be sent between threads safely
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const otter_vm::eval_env::EvalEnvBody` cannot be sent between threads safely
   |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const EvalEnvBody`
-note: required because it appears within the type `PhantomData<*const EvalEnvBody>`
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const otter_vm::eval_env::EvalEnvBody`
+note: required because it appears within the type `PhantomData<*const otter_vm::eval_env::EvalEnvBody>`
  --> $RUST/core/src/marker.rs
   |
   | pub struct PhantomData<T: PointeeSized>;
   |            ^^^^^^^^^^^
-note: required because it appears within the type `otter_gc::compressed::Gc<EvalEnvBody>`
+note: required because it appears within the type `otter_gc::compressed::Gc<otter_vm::eval_env::EvalEnvBody>`
  --> $WORKSPACE/crates/otter-gc/src/compressed.rs
   |
   | pub struct Gc<T: ?Sized> {
@@ -688,12 +683,12 @@ note: required because it appears within the type `WellKnownSymbols`
   |
   | pub struct WellKnownSymbols {
   |            ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -753,12 +748,12 @@ note: required because it appears within the type `otter_gc::heap::GcHeap`
   |
   | pub struct GcHeap {
   |            ^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -812,12 +807,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -886,12 +881,12 @@ note: required because it appears within the type `MicrotaskQueue`
   |
   | pub struct MicrotaskQueue {
   |            ^^^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -960,12 +955,12 @@ note: required because it appears within the type `promise_rejection::RejectionT
   |
   | pub(crate) struct RejectionTracker {
   |                   ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |

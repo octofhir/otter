@@ -79,7 +79,7 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*mut ()`
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const ()`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |
@@ -103,7 +103,7 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const ()`
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*mut ()`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |
@@ -199,7 +199,7 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*mut NativeFrame`
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*mut otter_vm::native_abi::NativeFrame`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |
@@ -315,12 +315,12 @@ note: required because it appears within the type `HashMap<(u32, u32), otter_gc:
   |
   | pub struct HashMap<
   |            ^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> $WORKSPACE/crates/otter-vm/src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'_>`
  --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
   |
@@ -354,7 +354,7 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const EvalEnvBody`
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const otter_vm::eval_env::EvalEnvBody`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |
@@ -457,12 +457,12 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
+note: required because it appears within the type `Interpreter`
  --> $WORKSPACE/crates/otter-vm/src/lib.rs
   |
   | pub struct Interpreter {
   |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&mut otter_vm::Interpreter`
+  = note: required because it appears within the type `&mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'_>`
  --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
   |

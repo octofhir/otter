@@ -272,7 +272,7 @@ impl Interpreter {
                 frame
                     .header()
                     .flags
-                    .contains(NativeFrameFlags::STACK_REGISTERS)
+                    .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
             })
             .count();
         u32::try_from(published)
@@ -293,7 +293,7 @@ impl Interpreter {
             if frame
                 .header()
                 .flags
-                .contains(NativeFrameFlags::STACK_REGISTERS)
+                .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
             {
                 frame.trace_stack_register_slots(visitor);
             }

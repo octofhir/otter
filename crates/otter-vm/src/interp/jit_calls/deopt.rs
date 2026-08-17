@@ -1,6 +1,6 @@
 //! Cold materialization for JIT side exits.
 //!
-//! Native execution normally keeps the canonical [`crate::NativeFrame`] and its
+//! Native execution normally keeps the canonical [`crate::native_abi::NativeFrame`] and its
 //! register window intact. This module is the narrow exception: a generated
 //! stack-owned call or nested inline exit copies/materializes an
 //! [`crate::ActivationStack`] frame only after the side exit has fired.
@@ -35,12 +35,12 @@
 //! # See also
 //! - [`crate::active_frame`] — canonical tier-neutral activation access.
 //! - [`crate::jit::JitDeoptFrame`] — owned inline-deopt reconstruction input.
-//! - [`crate::NativeFrame`] — canonical activation reconstructed only after a
+//! - [`crate::native_abi::NativeFrame`] — canonical activation reconstructed only after a
 //!   cold side exit.
 
 use crate::{
-    ActivationStack, ActiveFrameRef, ExecutionContext, Frame, Interpreter, NativeFrame,
-    NativeFrameFlags, Value, VmError, jit,
+    ActivationStack, ActiveFrameRef, ExecutionContext, Frame, Interpreter, Value, VmError, jit,
+    native_abi::{NativeFrame, NativeFrameFlags},
 };
 
 impl Interpreter {

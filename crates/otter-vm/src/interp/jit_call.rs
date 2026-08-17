@@ -7,7 +7,9 @@
 //! inlined/stack-call side-exit materialization in `jit_calls/deopt`.
 //! Call and back-edge accounting also feeds the additive optimizing-tier
 //! policy without consulting its decision. Generated-call entry feedback is
-//! reconciled once after the outer native activation returns.
+//! reconciled once after the outer native activation returns. That outer
+//! boundary owns one post-entry transaction which roots and collector-rewrites
+//! a validated compiled Return/Throw payload across the cold reconciliation.
 //!
 //! # Invariants
 //! Every generated callee frame remains published until native return, throw,
@@ -25,8 +27,15 @@
 //! Canonical tier transitions retain one [`NativeFrame`] and register window;
 //! materialized [`Frame`] construction is confined to cold deoptimization and
 //! interpreter-owned dispatch.
+//! A nested compiled return never allocates during post-entry bookkeeping: it
+//! only leaves feedback pending for the outermost activation. No result root
+//! index or token crosses the VM/JIT boundary.
 #![allow(unused_imports)]
 use crate::*;
+use crate::{
+    native_abi::{NativeFrame, NativeResultDomain, NativeResultPair, NativeResultStatus},
+    rooting::RootScopeExt,
+};
 
 /// Deoptimizations one exit site absorbs before its generation is discarded
 /// and rebuilt against the feedback those bails refined. A body that bails
@@ -823,25 +832,84 @@ impl Interpreter {
         code
     }
 
+    /// Finish one compiled entry as a single VM-owned result transaction.
+    ///
+    /// Generated code has already unpublished its own native activation. A
+    /// surviving parent activation makes this a nested return: mark feedback
+    /// pending and return immediately, without retirement, allocation, or a
+    /// temporary root. The outermost return retires unreachable code and, when
+    /// feedback is pending, roots only a domain-validated boxed Return/Throw
+    /// payload while the cold reconciliation may compile and collect.
+    pub(crate) fn finish_compiled_entry_transaction(
+        &mut self,
+        context: &ExecutionContext,
+        result: NativeResultPair,
+        feedback_dirty: bool,
+    ) -> Result<NativeResultPair, VmError> {
+        self.jit_generated_feedback_pending |= feedback_dirty;
+        if self.jit_native_activation_top != 0 {
+            return Ok(result);
+        }
+
+        // This is the generated-code retirement epoch boundary. No native
+        // frame can still hold an unleased entry address, so invalid mappings
+        // with no ordinary Arc owner may now be released.
+        self.jit_code_registry.retire_unreferenced();
+        if !self.jit_generated_feedback_pending {
+            return Ok(result);
+        }
+
+        Ok(self.with_rooted_compiled_result(result, |vm| {
+            vm.reconcile_generated_feedback(context);
+        }))
+    }
+
+    /// Run outer-boundary work with a compiled boxed result rooted in place.
+    ///
+    /// The descriptor-owned compiled domain is validated before payload bits
+    /// are interpreted. Side exits, fatal results, and malformed carriers pass
+    /// through unchanged and never enter a GC root slot.
+    fn with_rooted_compiled_result(
+        &mut self,
+        result: NativeResultPair,
+        operation: impl FnOnce(&mut Self),
+    ) -> NativeResultPair {
+        let Some(status @ (NativeResultStatus::Success | NativeResultStatus::Throw)) =
+            result.validate(NativeResultDomain::Compiled)
+        else {
+            operation(self);
+            return result;
+        };
+
+        let mut payload = result.payload_value();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: `payload` precedes `roots`, remains stationary until the
+        // explicit drop, and is the only moving value held across `operation`.
+        unsafe { roots.add_value(&mut payload) };
+        operation(self);
+        drop(roots);
+
+        match status {
+            NativeResultStatus::Success => NativeResultPair::success(payload),
+            NativeResultStatus::Throw => NativeResultPair::throw_value(payload),
+            NativeResultStatus::SideExit
+            | NativeResultStatus::Continue
+            | NativeResultStatus::OutOfMemory
+            | NativeResultStatus::Fatal => unreachable!("status narrowed above"),
+        }
+    }
+
     /// Reconcile generated entry-cell feedback after the outermost native
-    /// activation has been unpublished.
+    /// activation has been unpublished and its boxed result has been rooted.
     ///
     /// Native entries stay allocation- and transition-free. This cold pass
     /// groups exact-generation deltas by function, advances the same hotness
     /// and call-budget counters as materialized bytecode calls, then lets the
     /// existing optimizing resolver sample hot baseline callees. Optimizing
     /// generations never become promotion candidates.
-    pub fn jit_reconcile_generated_feedback(&mut self, context: &ExecutionContext) {
-        if self.jit_native_activation_top != 0 {
-            return;
-        }
-        // This is the generated-code retirement epoch boundary. No native
-        // frame can still hold an unleased entry address, so invalid mappings
-        // with no ordinary Arc owner may now be released.
-        self.jit_code_registry.retire_unreferenced();
-        if !self.jit_generated_feedback_pending {
-            return;
-        }
+    fn reconcile_generated_feedback(&mut self, context: &ExecutionContext) {
+        debug_assert_eq!(self.jit_native_activation_top, 0);
+        debug_assert!(self.jit_generated_feedback_pending);
         self.jit_generated_feedback_pending = false;
 
         let feedback = self.jit_code_registry.take_generated_feedback();
@@ -932,30 +1000,6 @@ impl Interpreter {
             }
             let _ = self.resolve_optimized_code_for_fid(context, fid);
         }
-    }
-
-    /// Root a boxed Return/Throw payload across generated-feedback repair.
-    ///
-    /// The returned index is a LIFO token consumed by
-    /// [`Self::jit_release_generated_result_root`]. This is a short-lived GC
-    /// root only; it is not an exception propagation channel.
-    #[doc(hidden)]
-    pub fn jit_push_generated_result_root(&mut self, value: Value) -> usize {
-        self.push_iteration_anchor(value) - 1
-    }
-
-    /// Read a collector-rewritten generated-result payload root.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn jit_generated_result_root(&self, index: usize) -> Value {
-        self.iteration_anchor(index)
-    }
-
-    /// Release one generated-result payload root and any newer temporary
-    /// anchors owned by the same entry transaction.
-    #[doc(hidden)]
-    pub fn jit_release_generated_result_root(&mut self, index: usize) {
-        self.pop_iteration_anchors_to(index);
     }
 
     /// Advance the shared function-entry hotness counter by one cold batch.
@@ -1226,5 +1270,94 @@ impl Interpreter {
             *caller_regs.add(dst_reg as usize) = Value::boolean(eq ^ negate);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_context() -> ExecutionContext {
+        ExecutionContext::from_module(otter_bytecode::BytecodeModule {
+            module: "compiled-entry-transaction-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: otter_bytecode::SourceKind::JavaScript,
+            functions: Vec::new(),
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    fn assert_moving_payload_is_rewritten(status: NativeResultStatus) {
+        let mut vm = Interpreter::new();
+        let object = crate::object::alloc_object_with_roots(&mut vm.gc_heap, &mut |_| {})
+            .expect("young result object");
+        let value = Value::object(object);
+        let original_bits = value.to_abi_bits();
+        let result = match status {
+            NativeResultStatus::Success => NativeResultPair::success(value),
+            NativeResultStatus::Throw => NativeResultPair::throw_value(value),
+            NativeResultStatus::SideExit
+            | NativeResultStatus::Continue
+            | NativeResultStatus::OutOfMemory
+            | NativeResultStatus::Fatal => panic!("fixture requires a boxed compiled result"),
+        };
+
+        let rewritten = vm.with_rooted_compiled_result(result, |vm| {
+            vm.collect_minor_tracing_runtime_roots();
+        });
+
+        assert_eq!(
+            rewritten.validate(NativeResultDomain::Compiled),
+            Some(status)
+        );
+        assert_ne!(
+            rewritten.payload_bits(),
+            original_bits,
+            "minor collection must relocate the young result"
+        );
+        assert!(rewritten.payload_value().as_object().is_some());
+    }
+
+    #[test]
+    fn compiled_success_payload_is_rewritten_across_moving_collection() {
+        assert_moving_payload_is_rewritten(NativeResultStatus::Success);
+    }
+
+    #[test]
+    fn compiled_throw_payload_is_rewritten_across_moving_collection() {
+        assert_moving_payload_is_rewritten(NativeResultStatus::Throw);
+    }
+
+    #[test]
+    fn compiled_side_exit_is_unchanged_across_collection() {
+        let mut vm = Interpreter::new();
+        let result = NativeResultPair::side_exit(37);
+        let returned = vm.with_rooted_compiled_result(result, |vm| {
+            vm.collect_minor_tracing_runtime_roots();
+        });
+        assert_eq!(returned, result);
+    }
+
+    #[test]
+    fn nested_compiled_entry_defers_feedback_without_touching_the_result() {
+        let mut vm = Interpreter::new();
+        let context = empty_context();
+        let result = NativeResultPair::success(Value::number_i32(41));
+
+        vm.jit_native_activation_top = 1;
+        let nested = vm
+            .finish_compiled_entry_transaction(&context, result, true)
+            .expect("nested completion");
+        assert_eq!(nested, result);
+        assert!(vm.jit_generated_feedback_pending);
+
+        vm.jit_native_activation_top = 0;
+        let outer = vm
+            .finish_compiled_entry_transaction(&context, result, false)
+            .expect("outer completion");
+        assert_eq!(outer, result);
+        assert!(!vm.jit_generated_feedback_pending);
     }
 }

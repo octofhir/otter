@@ -15,7 +15,10 @@
 //! - `crate::template::plan`, the machine-code consumer of these rules.
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitCompileSnapshot, NO_FRAME_STATE, SafepointId, SafepointRecord};
+use otter_vm::{
+    JitCompileSnapshot,
+    native_abi::{NO_FRAME_STATE, SafepointId, SafepointRecord},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Register indices that fit in one packed fixed-operand metadata word.

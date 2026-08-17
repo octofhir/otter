@@ -1,7 +1,7 @@
 //! Representation-neutral active-frame opcode kernels.
 //!
 //! Hot binding operations consume [`ActiveFrameMut`] and therefore run over
-//! either a materialized [`Frame`] or the canonical [`crate::NativeFrame`]
+//! either a materialized [`Frame`] or the canonical [`crate::native_abi::NativeFrame`]
 //! without copying registers or reconstructing a [`ActivationStack`]. Kernels never
 //! advance the PC: interpreter dispatch, baseline code, and optimizing code
 //! each own their continuation coordinate.

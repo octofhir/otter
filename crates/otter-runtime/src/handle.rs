@@ -684,7 +684,11 @@ impl RuntimeCounters {
                 &self.pending_ref_timers,
                 &self.pending_unref_timers,
             );
-            increment_liveness(desired, &self.pending_ref_timers, &self.pending_unref_timers);
+            increment_liveness(
+                desired,
+                &self.pending_ref_timers,
+                &self.pending_unref_timers,
+            );
             *current = desired;
         }
         true

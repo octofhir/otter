@@ -19,6 +19,8 @@
 //! - Live-frame diagnostics belong to [`NativeCtx`](crate::NativeCtx), whose
 //!   [`RuntimeTurn`](crate::runtime_cx::RuntimeTurn) carries the explicit
 //!   activation-stack borrow.
+//! - Snapshot root-slot walks stay VM-private; embedders receive owned snapshot
+//!   artifacts rather than raw collector slots.
 //!
 //! # See also
 //! - [`crate::runtime_cx`] — explicit runtime-turn and native binding context.
@@ -473,7 +475,7 @@ impl Interpreter {
     /// not it is filled, so the sequence has the same length and order on
     /// a built isolate and on an empty one. That is what lets a capture
     /// collect the slots into a list and a restore write them back.
-    pub fn visit_snapshot_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+    pub(crate) fn visit_snapshot_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         let global =
             &self.global_this as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
         visitor(global);
@@ -519,7 +521,7 @@ impl Interpreter {
 
     /// Collect the snapshot root slots in walk order.
     #[must_use]
-    pub fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
+    pub(crate) fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
         let mut out = Vec::new();
         // SAFETY: every slot address the walk yields is a live field of
         // this interpreter, read while nothing else holds it.

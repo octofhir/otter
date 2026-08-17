@@ -80,7 +80,7 @@ mod conversion;
 mod cpu_profile;
 pub mod date;
 mod element_feedback;
-pub mod eval_env;
+mod eval_env;
 // `date` is a directory module — see `date/mod.rs`.
 mod activation_stack;
 pub mod bootstrap;
@@ -160,6 +160,12 @@ mod method_ops;
 pub mod microtask;
 mod module_ops;
 mod module_records;
+/// Private VM↔compiler↔generated-code ABI.
+///
+/// This module is public only so the separately compiled `otter-jit` crate can
+/// consume the one current machine contract. Embedders, extensions, and native
+/// modules must use [`NativeCtx`] and handle scopes instead.
+#[doc(hidden)]
 pub mod native_abi;
 pub mod native_census;
 pub mod native_function;
@@ -193,6 +199,11 @@ mod runtime_activation;
 pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
+/// Compiler-internal machine-callable runtime entrypoints.
+///
+/// This module is not an extension or embedding boundary. Its records and
+/// entrypoints are consumed only by the VM and generated code.
+#[doc(hidden)]
 pub mod runtime_stubs;
 pub mod snapshot;
 pub mod source_registry;
@@ -266,10 +277,6 @@ pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKe
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
-/// Private VM↔generated-code ABI handle. Native extensions must not interpret
-/// or manufacture its compressed representation.
-#[doc(hidden)]
-pub use eval_env::EvalEnvHandle;
 pub use handles::{HandleArena, Local, ObjectLayout, PendingValue, PendingValues};
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
@@ -301,16 +308,6 @@ pub use js_surface::{
     PropertySpec,
 };
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
-pub use native_abi::{
-    FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrame, NativeFrameFlags, NativeFrameKind,
-    RuntimeStubAllocContext, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId,
-    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
-    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_BACKEDGE_POLL, STUB_STRING_CONCAT_ALLOC, SafepointId,
-    SafepointRecord, TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS, VmFrameHeader,
-    validate_stub_descriptor,
-};
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
     native_value, native_value_static, native_value_with_captures,

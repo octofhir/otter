@@ -91,14 +91,6 @@ pub fn https_cjs_value<'scope>(
     )
 }
 
-
-
-
-
-
-
-
-
 /// `node:perf_hooks` — performance timeline subset.
 pub fn perf_hooks_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
@@ -208,4 +200,3 @@ pub fn vm_cjs_value<'scope>(
 ) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:vm", VM_SHIM, module, require)
 }
-

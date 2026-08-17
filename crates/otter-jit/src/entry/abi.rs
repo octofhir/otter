@@ -8,20 +8,21 @@
 //!   counters carried by each compiled activation.
 //!
 //! # Invariants
-//! Every offset is derived with `offset_of!`; emitted code must not duplicate
-//! Rust layout knowledge outside this module. Context pointers remain valid for
-//! the dynamic extent of one compiled activation. Nursery-window pointers are
-//! consumed only by the no-safepoint allocation sequence and refreshed by its
-//! rooted cold sibling.
+//! `JitCtx` offsets are derived with `offset_of!` here. Offsets for VM-private
+//! fields are imported from `otter_vm::native_abi`; the JIT never re-derives
+//! them from private Rust fields. Context pointers remain valid for the dynamic
+//! extent of one compiled activation. Nursery-window pointers are consumed
+//! only by the no-safepoint allocation sequence and refreshed by its rooted
+//! cold sibling.
 //!
 //! # See also
 //! - `otter_vm::native_abi` — authoritative VM frame and thread records.
 
 use otter_vm::{
-    ActiveFrameMut, ActiveFrameRef, RuntimeCall, RuntimeStubAllocContext, Value, VmError,
-    VmRuntimeActivation,
+    ActiveFrameMut, ActiveFrameRef, RuntimeCall, Value, VmError, VmRuntimeActivation,
     native_abi::{
-        CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, NativeResultPair, VmThread,
+        CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, NativeResultPair,
+        RuntimeStubAllocContext, VmThread,
     },
 };
 /// Machine-visible context shared by every compiled tier.
@@ -309,8 +310,6 @@ pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
 pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
-pub(crate) const NATIVE_FRAME_EVAL_ENV_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, eval_env) as u32;
 pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags))
     as u32;

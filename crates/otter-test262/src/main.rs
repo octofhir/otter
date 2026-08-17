@@ -445,7 +445,7 @@ fn resolve_jobs(explicit: usize, shard_total: usize) -> usize {
 }
 
 fn init_test262_cage(jobs: usize, max_heap_bytes: u64) -> Result<()> {
-    if otter_runtime::otter_gc::cage_size() != 0 {
+    if otter_runtime::configured_managed_heap_bytes() != 0 {
         return Ok(());
     }
     // N concurrent isolates can each grow toward `max_heap_bytes`,
@@ -461,8 +461,7 @@ fn init_test262_cage(jobs: usize, max_heap_bytes: u64) -> Result<()> {
     };
     let want = (jobs as u64).saturating_mul(per_worker);
     let cage = want.max(TEST262_CAGE_BYTES as u64).min(MAX_CAGE) as usize;
-    otter_runtime::otter_gc::init_cage_with_size(cage)
-        .context("failed to initialise Test262 GC cage")?;
+    otter_runtime::initialize_managed_heap(cage).context("failed to initialise Test262 GC cage")?;
     Ok(())
 }
 

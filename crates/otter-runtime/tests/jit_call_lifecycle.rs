@@ -16,6 +16,8 @@
 //! - Callees that allocate their own captured cells while retaining the current
 //!   receiver across moving-GC safepoints.
 //! - Frameless direct callees that mint distinct capture-free function values.
+//! - Generated success and throw payloads that stay live while outer-entry
+//!   feedback reconciliation replaces code and may collect.
 //! - Recursive calls that catch or propagate throws before the same runtime
 //!   successfully enters an independent compiler-generated native call.
 //!
@@ -38,6 +40,8 @@
 //!   state until the new frame is published.
 //! - Capture-free function construction uses the published SELF/register
 //!   window and never requires a materialized interpreter frame.
+//! - The VM returns collector-rewritten `NativeResultPair` payloads after its
+//!   feedback transaction; no JIT-owned root token exists between those steps.
 //! - Return, caught-throw, and escaping-throw completion release every nested
 //!   call lifecycle resource so later compiled entries remain reusable.
 //! - Loop OSR is disabled, so observed direct calls cross whole-function
@@ -678,6 +682,71 @@ fn frameless_make_function_mints_distinct_values_across_gc() {
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, "[true,41,42,131328]");
     assert_whole_function_direct_calls(&compiled);
+}
+
+const GENERATED_RESULT_FEEDBACK_RECONCILIATION: &str = r#"
+function returnYoungResult(ordinal) {
+  return { ordinal, label: "return-" + ordinal };
+}
+
+function throwYoungResult(ordinal) {
+  throw { ordinal, label: "throw-" + ordinal };
+}
+
+function callReturnYoungResult(ordinal) {
+  return returnYoungResult(ordinal);
+}
+
+function callThrowYoungResult(ordinal) {
+  return throwYoungResult(ordinal);
+}
+
+let returnedChecksum = 0;
+let thrownChecksum = 0;
+let lastReturned = null;
+let lastThrown = null;
+for (let ordinal = 0; ordinal < 384; ordinal++) {
+  const returned = callReturnYoungResult(ordinal);
+  returnedChecksum += returned.ordinal;
+  lastReturned = returned.label;
+  try {
+    callThrowYoungResult(ordinal);
+  } catch (thrown) {
+    thrownChecksum += thrown.ordinal;
+    lastThrown = thrown.label;
+  }
+}
+
+JSON.stringify([returnedChecksum, thrownChecksum, lastReturned, lastThrown]);
+"#;
+
+#[test]
+fn generated_result_payloads_survive_feedback_reconciliation() {
+    let oracle = run(
+        GENERATED_RESULT_FEEDBACK_RECONCILIATION,
+        "jit-generated-result-feedback-reconciliation.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        GENERATED_RESULT_FEEDBACK_RECONCILIATION,
+        "jit-generated-result-feedback-reconciliation.js",
+        JitSelection::Template,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(
+        compiled.completion,
+        r#"[73536,73536,"return-383","throw-383"]"#
+    );
+    assert_whole_function_compiled(&compiled);
+    assert!(
+        compiled.generated_calls > 0,
+        "reconciliation must publish generated-call feedback"
+    );
+    assert!(
+        compiled.code_generations > 0,
+        "fixture must publish native generations before reconciliation"
+    );
 }
 
 const RECURSIVE_THROW_CLEANUP: &str = r#"

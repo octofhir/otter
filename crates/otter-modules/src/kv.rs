@@ -184,7 +184,7 @@ fn open_kv(
     args: &[Value],
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
-    let path = crate::arg_string(args, 0, "openKv", ctx.heap())?;
+    let path = crate::arg_string(ctx, args, 0, "openKv")?;
     let store = if path.is_empty() || path == ":memory:" {
         KvStore::memory()
     } else {
@@ -227,10 +227,10 @@ fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
 
 fn method_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.set")?;
-    let key = crate::arg_string(args, 0, "KvStore.set", ctx.heap())?;
+    let key = crate::arg_string(ctx, args, 0, "KvStore.set")?;
     let value = args
         .get(1)
-        .map(|v| crate::value_to_json(v, ctx.heap()))
+        .map(|v| crate::value_to_json(ctx, v))
         .transpose()?
         .unwrap_or(JsonValue::Null);
     let result =
@@ -242,7 +242,7 @@ fn method_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn method_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.get")?;
-    let key = crate::arg_string(args, 0, "KvStore.get", ctx.heap())?;
+    let key = crate::arg_string(ctx, args, 0, "KvStore.get")?;
     let value = runtime_with_host_data::<KvStore, _>(ctx, object, |store| {
         store.get(&key).unwrap_or(JsonValue::Null)
     })
@@ -252,7 +252,7 @@ fn method_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn method_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.has")?;
-    let key = crate::arg_string(args, 0, "KvStore.has", ctx.heap())?;
+    let key = crate::arg_string(ctx, args, 0, "KvStore.has")?;
     let has = runtime_with_host_data::<KvStore, _>(ctx, object, |store| store.has(&key))
         .map_err(|err| host_error("KvStore.has", err))?;
     Ok(Value::boolean(has))
@@ -260,7 +260,7 @@ fn method_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn method_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.delete")?;
-    let key = crate::arg_string(args, 0, "KvStore.delete", ctx.heap())?;
+    let key = crate::arg_string(ctx, args, 0, "KvStore.delete")?;
     let result = runtime_with_host_data_mut::<KvStore, _>(ctx, object, |store| store.delete(&key))
         .map_err(|err| host_error("KvStore.delete", err))?;
     let deleted = result.map_err(|err| crate::type_error("KvStore.delete", err.to_string()))?;

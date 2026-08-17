@@ -297,7 +297,7 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
         let stack_owned = native_frame
             .header
             .flags
-            .contains(otter_vm::NativeFrameFlags::STACK_REGISTERS);
+            .contains(otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS);
         let rebuild_result = (|| {
             if stack_owned {
                 return Ok(());

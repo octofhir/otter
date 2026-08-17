@@ -64,4 +64,3 @@ pub fn calltracker_cjs_value<'scope>(
         require,
     )
 }
-

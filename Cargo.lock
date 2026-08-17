@@ -2681,7 +2681,6 @@ dependencies = [
  "libloading",
  "md-5",
  "nix",
- "otter-gc",
  "otter-runtime",
  "otter-vm",
  "sha1",

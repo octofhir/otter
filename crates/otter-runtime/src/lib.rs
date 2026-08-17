@@ -69,6 +69,7 @@ pub mod embedding;
 pub mod error;
 mod event_loop;
 pub mod handle;
+mod heap_config;
 pub mod hooks;
 pub mod ipc;
 pub mod module_graph;
@@ -127,6 +128,9 @@ pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, Diagnostic
 pub use error::{ConfigError, IoErrorKind, OtterError, RealmError};
 pub use event_loop::{RuntimeLiveness, TokioRuntimeHost};
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
+pub use heap_config::{
+    MANAGED_HEAP_PAGE_BYTES, configured_managed_heap_bytes, initialize_managed_heap,
+};
 pub use hooks::{
     CapabilityRequest, RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook,
     RuntimeCompileRequest, RuntimeDiagnosticHook, RuntimeHooks, RuntimeJobHook, RuntimeJobKind,
@@ -138,7 +142,6 @@ pub use otter_compiler::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
     CompiledSourceSpan, LiveBindingSlot,
 };
-pub use otter_gc;
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{
@@ -4451,13 +4454,6 @@ impl Runtime {
     /// Propagates [`otter_gc::ImageError`].
     pub fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
         self.interp.capture_heap_image()
-    }
-
-    /// The root slots a snapshot has to carry, in the fixed walk order a
-    /// restore writes them back in.
-    #[must_use]
-    pub fn capture_snapshot_roots(&self) -> Vec<otter_gc::raw::RawGc> {
-        self.interp.capture_snapshot_roots()
     }
 
     /// Whether this runtime restored from a snapshot blob instead of

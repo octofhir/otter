@@ -58,20 +58,18 @@ pub type EvalEnvHandle = otter_gc::Gc<EvalEnvBody>;
 /// Snapshots are sorted by `name` for deterministic compiler slot layout. When
 /// more than one record binds the same name, only the nearest binding appears.
 #[derive(Debug, Clone)]
-pub struct EvalEnvSnapshotBinding {
+pub(crate) struct EvalEnvSnapshotBinding {
     /// Owned source-level binding name.
-    pub name: String,
-    /// Live binding cell at snapshot time. Allocation-capable consumers must
-    /// re-resolve `name` from the traced chain before dereferencing it.
-    pub cell: UpvalueCell,
+    pub(crate) name: String,
     /// Zero for the current record, increasing toward outer ancestors.
-    pub depth: usize,
+    pub(crate) depth: usize,
     /// Whether this binding belongs to the current record.
-    pub current: bool,
+    pub(crate) current: bool,
 }
 
 /// Allocate a fresh, empty record.
-pub fn alloc_eval_env(
+#[cfg(test)]
+pub(crate) fn alloc_eval_env(
     heap: &mut otter_gc::GcHeap,
     parent: Option<EvalEnvHandle>,
 ) -> Result<EvalEnvHandle, otter_gc::OutOfMemory> {
@@ -114,7 +112,8 @@ pub(crate) fn alloc_eval_env_with_roots(
 
 /// Find `name` in exactly the current record.
 #[must_use]
-pub fn eval_env_lookup_current(
+#[cfg(test)]
+pub(crate) fn eval_env_lookup_current(
     heap: &otter_gc::GcHeap,
     env: EvalEnvHandle,
     name: &str,
@@ -208,7 +207,7 @@ pub fn eval_env_delete_chain(heap: &mut otter_gc::GcHeap, env: EvalEnvHandle, na
 /// vector is sorted by name rather than by hash or allocation order, providing
 /// one deterministic slot order to the eval compiler.
 #[must_use]
-pub fn eval_env_snapshot_chain(
+pub(crate) fn eval_env_snapshot_chain(
     heap: &otter_gc::GcHeap,
     env: EvalEnvHandle,
 ) -> Vec<EvalEnvSnapshotBinding> {
@@ -218,13 +217,13 @@ pub fn eval_env_snapshot_chain(
     let mut depth = 0usize;
     while let Some(handle) = current {
         let parent = heap.read_payload(handle, |body| {
-            for (name, cell) in body.names.iter().zip(body.cells.iter().copied()) {
+            debug_assert_eq!(body.names.len(), body.cells.len());
+            for name in &body.names {
                 if seen.insert(name.clone()) {
                     bindings.insert(
                         name.clone(),
                         EvalEnvSnapshotBinding {
                             name: name.clone(),
-                            cell,
                             depth,
                             current: depth == 0,
                         },
@@ -315,14 +314,12 @@ mod tests {
             .iter()
             .find(|binding| binding.name == "a")
             .expect("outer binding");
-        assert_eq!(a.cell, outer_a);
         assert_eq!(a.depth, 1);
         assert!(!a.current);
         let duplicate = snapshot
             .iter()
             .find(|binding| binding.name == "dup")
             .expect("nearest duplicate");
-        assert_eq!(duplicate.cell, inner_dup);
         assert_eq!(duplicate.depth, 0);
         assert!(duplicate.current);
     }

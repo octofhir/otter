@@ -171,6 +171,12 @@ It already owns:
   return, constructor receiver preparation, callee overflow/deopt, propagated
   throw, nested/recursive generated calls, and moving minor GC all execute
   without replay or conservative stack scanning;
+- one VM-owned compiled-entry completion transaction. After native frame and
+  direct-eval ownership are restored, the JIT hands back the sole
+  `NativeResultPair`; the VM roots a validated Return/Throw payload across
+  generated-feedback reconciliation and returns the collector-rewritten pair.
+  No root index, token, manual release phase, eval-environment handle, or
+  flattened native-ABI alias crosses the compiler boundary;
 - exact generated receiver-allocation attribution for attempts, successes,
   structural and space misses, cold/Rust boundaries, GC, refills, OOM, and
   deopts, plus `directConstructReceiverAllocFast` / `Cold` code-map proof;

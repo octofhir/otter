@@ -277,7 +277,7 @@ pub(super) fn emit_add_generic(
     dst: u16,
     lhs: u16,
     rhs: u16,
-    concat_safepoint: otter_vm::SafepointId,
+    concat_safepoint: otter_vm::native_abi::SafepointId,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {

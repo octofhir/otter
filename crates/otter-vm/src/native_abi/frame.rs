@@ -4,6 +4,8 @@
 //! - [`VmThread`] is the only process state generated code receives.
 //! - [`VmFrameHeader`] is the tier-independent frame prefix.
 //! - [`NativeFrame`] is the compact activation record shared by every tier.
+//! - [`NATIVE_FRAME_EVAL_ENV_OFFSET`] is the sole compiler-visible location of
+//!   the VM-private direct-eval root slot.
 //!
 //! # Invariants
 //! - Every machine-observed field has C layout and a fixed width.
@@ -11,6 +13,8 @@
 //!   layout. Generated code must not cast its opaque addresses to Rust types.
 //! - VM and JIT are built together and consume one current layout; there is no
 //!   compatibility/version protocol inside the process.
+//! - Typed direct-eval root access stays inside the VM; generated code receives
+//!   only the VM-derived numeric slot offset.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
 //!   recomputed after any allocating or reentrant call.
 //!
@@ -185,7 +189,7 @@ pub struct NativeFrame {
     /// This is an ordinary traced frame slot and the sole owner while the
     /// native activation is published. Materialization moves the handle into
     /// the replacement [`crate::Frame`]; it never copies the root.
-    pub eval_env: EvalEnvHandle,
+    pub(crate) eval_env: EvalEnvHandle,
 }
 
 impl NativeFrame {
@@ -256,7 +260,7 @@ impl NativeFrame {
 
     /// Direct-eval environment inherited by this activation, if any.
     #[must_use]
-    pub const fn eval_env(&self) -> Option<EvalEnvHandle> {
+    pub(crate) const fn eval_env(&self) -> Option<EvalEnvHandle> {
         if self.eval_env.is_null() {
             None
         } else {
@@ -264,8 +268,9 @@ impl NativeFrame {
         }
     }
 
-    /// Publish one nullable direct-eval environment handle.
-    pub fn set_eval_env(&mut self, eval_env: Option<EvalEnvHandle>) {
+    /// Publish one nullable direct-eval environment handle in VM tests.
+    #[cfg(test)]
+    pub(crate) fn set_eval_env(&mut self, eval_env: Option<EvalEnvHandle>) {
         self.eval_env = eval_env.unwrap_or_else(EvalEnvHandle::null);
     }
 
@@ -344,6 +349,13 @@ const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, new_target_bits)];
 const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, self_value_bits)];
 const _: [(); 56] = [(); std::mem::offset_of!(NativeFrame, upvalue_count)];
 const _: [(); 60] = [(); std::mem::offset_of!(NativeFrame, eval_env)];
+
+/// Byte offset of the VM-owned direct-eval environment root in
+/// [`NativeFrame`].
+///
+/// Generated code may write the nullable compressed handle at this numeric
+/// offset, but the Rust field and its typed accessors remain VM-private.
+pub const NATIVE_FRAME_EVAL_ENV_OFFSET: u32 = std::mem::offset_of!(NativeFrame, eval_env) as u32;
 
 #[cfg(test)]
 mod tests {

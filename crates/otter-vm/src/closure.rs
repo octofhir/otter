@@ -102,7 +102,7 @@ pub struct ClosureCallHeader {
     /// Number of captured [`UpvalueCell`] entries at `upvalue_base`.
     pub upvalue_count: u32,
     /// Nullable compressed direct-eval environment handle.
-    pub eval_env: crate::eval_env::EvalEnvHandle,
+    pub(crate) eval_env: crate::eval_env::EvalEnvHandle,
 }
 
 /// Allocation-neutral closure state consumed by call preparation.
@@ -465,8 +465,9 @@ impl JsClosure {
     }
 
     /// Captured direct-eval variable environment, if any.
+    #[cfg(test)]
     #[must_use]
-    pub fn eval_env(self, heap: &GcHeap) -> Option<crate::eval_env::EvalEnvHandle> {
+    pub(crate) fn eval_env(self, heap: &GcHeap) -> Option<crate::eval_env::EvalEnvHandle> {
         heap.read_payload(self.handle, JsClosureBody::eval_env_option)
     }
 

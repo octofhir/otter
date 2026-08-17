@@ -9,7 +9,6 @@ description = "Node.js-compatible hosted modules for Otter."
 [dependencies]
 otter-runtime = { workspace = true }
 otter-vm = { workspace = true }
-otter-gc = { workspace = true }
 thiserror = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }

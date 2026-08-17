@@ -582,6 +582,7 @@ function Server(options, listener) {
   if (typeof options === 'function') { listener = options; options = {}; }
   this._options = options ?? {};
   this.timeout = 0;
+  this.keepAliveTimeout = (options && options.keepAliveTimeout) ?? 5000;
   this._socket = net.createServer((socket) => this._connection(socket));
   this._socket.on('error', (error) => this.emit('error', error));
   this._socket.on('close', () => this.emit('close'));
@@ -606,6 +607,9 @@ Server.prototype.address = function address() {
 };
 
 Server.prototype.close = function close(callback) {
+  // Since Node 19 `close` also ends idle keep-alive connections; only
+  // in-flight requests hold their sockets open.
+  this.closeIdleConnections();
   this._socket.close(callback);
   return this;
 };
@@ -656,7 +660,15 @@ Server.prototype._connection = function _connection(socket) {
       request._adopt(message);
       const response = new ServerResponse(socket, request);
       socket._httpActiveRequests += 1;
-      response.once('finish', () => { socket._httpActiveRequests -= 1; });
+      socket.setTimeout(0);
+      response.once('finish', () => {
+        socket._httpActiveRequests -= 1;
+        // An idle kept-alive connection lives keepAliveTimeout, then goes.
+        if (socket._httpActiveRequests === 0 && response.shouldKeepAlive &&
+            this.keepAliveTimeout > 0 && !socket.destroyed) {
+          socket.setTimeout(this.keepAliveTimeout, () => socket.destroy());
+        }
+      });
       response.shouldKeepAlive = keepAlive(message);
       // An HTTP/1.0 requester does not understand chunks; its response body
       // runs to the end of the connection instead.
@@ -798,21 +810,37 @@ ClientRequest.prototype._listen = function _listen() {
     },
     body: (chunk) => { if (response) response.push(chunk); },
     complete: () => {
-      if (response) {
-        response.complete = true;
-        response.push(null);
-        response = null;
-      }
       const socket = this.socket;
       socket.removeListener('data', this._parserOnData);
       socket.removeListener('end', this._parserOnEnd);
-      if (this.agent && this.shouldKeepAlive && !socket.destroyed) {
-        this.agent.freeSocket(socket, this._settings);
-      } else if (this.agent) {
-        socket.end();
-        this.agent.removeSocket(socket, this._settings);
+      const release = () => {
+        if (this.agent && this.shouldKeepAlive && !socket.destroyed) {
+          this.agent.freeSocket(socket, this._settings);
+        } else if (this.agent) {
+          socket.end();
+          this.agent.removeSocket(socket, this._settings);
+        } else {
+          socket.end();
+        }
+      };
+      const releaseWhenDone = () => {
+        // Both directions must be done: the consumer drained the response
+        // AND this request finished writing — a server may answer before
+        // the request body went out, and the socket is not reusable until
+        // it does.
+        if (!this.finished) {
+          this.once('finish', releaseWhenDone);
+          return;
+        }
+        release();
+      };
+      if (response) {
+        response.once('end', releaseWhenDone);
+        response.complete = true;
+        response.push(null);
+        response = null;
       } else {
-        socket.end();
+        releaseWhenDone();
       }
     },
     error: (error) => this.emit('error', error),
@@ -1015,8 +1043,15 @@ Agent.prototype.addRequest = function addRequest(req, options) {
     };
     // Node's createConnection contract: the socket may come back as the
     // return value or through the (err, socket) callback — user overrides
-    // use either.
-    const socket = this.createConnection({ ...options, ...this.options },
+    // use either. The connection options carry the agent's keep-alive
+    // choice and its initial delay.
+    const connOptions = {
+      ...options,
+      ...this.options,
+      keepAlive: this.keepAlive,
+      keepAliveInitialDelay: this.keepAliveMsecs,
+    };
+    const socket = this.createConnection(connOptions,
       (error, created) => {
         if (error) {
           if (!delivered) { delivered = true; req.emit('error', error); }

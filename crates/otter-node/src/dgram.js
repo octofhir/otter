@@ -72,11 +72,14 @@ function invalidArgType(name, expected, value) {
 class Socket extends EventEmitter {
   #handle = 0;
   #type;
+  #sendBlockList = null;
+  #receiveBlockList = null;
   #bound = false;
   #closed = false;
   #remote = null;
   #connecting = false;
   #binding = false;
+  #pendingSends = [];
 
   constructor(options = {}, listener) {
     super();
@@ -89,6 +92,18 @@ class Socket extends EventEmitter {
     this.#type = settings.type;
     if (typeof listener === 'function') this.on('message', listener);
     if (typeof settings.recvBufferSize === 'number') this._recvBufferSize = settings.recvBufferSize;
+    this.#sendBlockList = settings.sendBlockList ?? null;
+    this.#receiveBlockList = settings.receiveBlockList ?? null;
+  }
+
+  #blockFamily() {
+    return this.#type === 'udp6' ? 'ipv6' : 'ipv4';
+  }
+
+  #blockedError(address) {
+    const err = new Error(`IP address is not allowed: ${address}`);
+    err.code = 'ERR_IP_BLOCKED';
+    return err;
   }
 
   get type() { return this.#type; }
@@ -106,7 +121,16 @@ class Socket extends EventEmitter {
       throw err;
     }
 
-    const bound = native.bind(this.#type, Number(port) || 0, address ?? '');
+    let bound;
+    try {
+      bound = native.bind(this.#type, Number(port) || 0, address ?? '');
+    } catch (error) {
+      // Node's bind errors carry the address that failed.
+      if (error !== null && typeof error === 'object' && typeof address === 'string') {
+        error.address ??= address;
+      }
+      throw error;
+    }
     this.#handle = bound.handle;
     this.#bound = true;
     sockets.set(bound.handle, this);
@@ -187,18 +211,47 @@ class Socket extends EventEmitter {
     let payload = toLatin1(msg);
     if (typeof length === 'number') payload = payload.slice(offset, offset + length);
 
+    const target = address ?? (this.#type === 'udp6' ? '::1' : '127.0.0.1');
+    if (this.#sendBlockList?.check(target, this.#blockFamily())) {
+      const err = this.#blockedError(target);
+      setTimeout(() => {
+        if (typeof callback === 'function') return callback(err);
+        this.emit('error', err);
+      }, 0);
+      return this;
+    }
     if (!this.#bound) this.bind(0);
-    setTimeout(() => {
-      let sent;
-      try {
-        sent = native.send(this.#handle, payload, Number(port) || 0, address ?? '');
-      } catch (error) {
-        if (typeof callback === 'function') return callback(error);
-        return this.emit('error', error);
-      }
-      if (typeof callback === 'function') callback(null, sent);
-    }, 0);
+    // Delivery happens on the next tick, but close() drains the queue
+    // first — a close() right after send() must not cancel the datagram.
+    const entry = { payload, port: Number(port) || 0, address: address ?? '', target, callback, done: false };
+    this.#pendingSends.push(entry);
+    setTimeout(() => this.#deliverSend(entry), 0);
     return this;
+  }
+
+  #deliverSend(entry) {
+    if (entry.done) return;
+    entry.done = true;
+    const index = this.#pendingSends.indexOf(entry);
+    if (index !== -1) this.#pendingSends.splice(index, 1);
+    let sent = 0;
+    let sendError = null;
+    try {
+      sent = native.send(this.#handle, entry.payload, entry.port, entry.address);
+    } catch (error) {
+      // Node's send errors carry the destination.
+      if (error !== null && typeof error === 'object') {
+        error.address ??= entry.target;
+        error.port ??= entry.port;
+      }
+      sendError = error;
+    }
+    if (this.#closed || entry.silent === true) return;
+    if (sendError !== null) {
+      if (typeof entry.callback === 'function') return entry.callback(sendError);
+      return this.emit('error', sendError);
+    }
+    if (typeof entry.callback === 'function') entry.callback(null, sent);
   }
 
   // A connected socket records its peer and sends there; the connection is not
@@ -214,6 +267,14 @@ class Socket extends EventEmitter {
     }
     if (this.#remote !== null || this.#connecting) {
       throw socketError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
+    }
+    if (this.#sendBlockList?.check(address ?? '127.0.0.1', this.#blockFamily())) {
+      const err = this.#blockedError(address ?? '127.0.0.1');
+      setTimeout(() => {
+        if (typeof callback === 'function') return callback(err);
+        this.emit('error', err);
+      }, 0);
+      return;
     }
     this.#connecting = true;
     if (typeof callback === 'function') this.once('connect', callback);
@@ -243,6 +304,9 @@ class Socket extends EventEmitter {
     if (this.#remote !== null || this.#connecting) {
       throw socketError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
     }
+    if (this.#sendBlockList?.check(address ?? '127.0.0.1', this.#blockFamily())) {
+      throw this.#blockedError(address ?? '127.0.0.1');
+    }
     if (!this.#bound) this.#bindNow(0);
     this.#remote = native.resolve(Number(port), address ?? '', this.#type);
     setTimeout(() => { if (!this.#closed) this.emit('connect'); }, 0);
@@ -265,8 +329,17 @@ class Socket extends EventEmitter {
 
   address() {
     if (!this.#bound) {
-      const err = new Error('Socket is not running');
-      err.code = 'ERR_SOCKET_DGRAM_NOT_RUNNING';
+      // A closed socket reports not-running; one that was never bound has
+      // no descriptor and fails the way the getsockname syscall would.
+      if (this.#closed) {
+        const err = new Error('Socket is not running');
+        err.code = 'ERR_SOCKET_DGRAM_NOT_RUNNING';
+        throw err;
+      }
+      const err = new Error('getsockname EBADF');
+      err.code = 'EBADF';
+      err.errno = -9;
+      err.syscall = 'getsockname';
       throw err;
     }
     return native.address(this.#handle);
@@ -279,6 +352,13 @@ class Socket extends EventEmitter {
       if (typeof callback === 'function') { callback(err); return this; }
       throw err;
     }
+    // Queued datagrams leave before the descriptor goes away, silently:
+    // Node never reports on a send whose socket closed before the tick.
+    while (this.#pendingSends.length > 0) {
+      const entry = this.#pendingSends[0];
+      entry.silent = true;
+      this.#deliverSend(entry);
+    }
     this.#closed = true;
     if (typeof callback === 'function') this.once('close', callback);
     if (this.#bound) {
@@ -288,6 +368,25 @@ class Socket extends EventEmitter {
     }
     setTimeout(() => this.emit('close'), 0);
     return this;
+  }
+
+  // Explicit resource management: disposing closes; a socket already closed
+  // disposes as a no-op.
+  [Symbol.asyncDispose]() {
+    return new Promise((resolve) => {
+      if (this.#closed) return resolve();
+      this.close(() => resolve());
+    });
+  }
+
+  // Sends complete synchronously in this realm, so the kernel-side queue the
+  // native binding would report is always drained.
+  getSendQueueSize() {
+    return 0;
+  }
+
+  getSendQueueCount() {
+    return 0;
   }
 
   setBroadcast(on) {
@@ -346,6 +445,7 @@ class Socket extends EventEmitter {
 
   _deliver(payload, address, port, family) {
     const message = Buffer.from(payload, 'latin1');
+    if (this.#receiveBlockList?.check(address, this.#blockFamily())) return;
     this.emit('message', message, { address, family, port, size: message.length });
   }
 }

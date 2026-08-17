@@ -86,8 +86,16 @@ function internalBinding(name) {
       return debugBinding();
     case 'buffer':
       return bufferBinding();
-    default:
-      return {};
+    default: {
+      // Everything else answers with the compat realm's binding, the same
+      // registry the vendored lib modules compile against.
+      const realm = require('internal/bootstrap/realm');
+      try {
+        return realm.internalBinding(name);
+      } catch {
+        return {};
+      }
+    }
   }
 }
 

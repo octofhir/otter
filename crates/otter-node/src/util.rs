@@ -138,6 +138,40 @@ fn float16_is_nan(bits: u16) -> bool {
     bits & 0x7c00 == 0x7c00 && bits & 0x03ff != 0
 }
 
+
+/// Hosted `internal/otter/natives` — the native helpers the compat realm's
+/// `internalBinding('util')` forwards to. Kept as one narrow module so the
+/// realm shim stays plain JavaScript.
+///
+/// # Errors
+/// Returns a native error when allocation fails.
+pub fn otter_natives_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    let export = otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "internal/otter/natives",
+        "'use strict'; module.exports = {};",
+        module,
+        require,
+    )?;
+    let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
+    let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
+    let flags = Attr {
+        writable: false,
+        enumerable: true,
+        configurable: false,
+    }
+    .to_flags();
+    scope.define(export, "captureCallSites", callsites, flags)?;
+    scope.define(export, "typedArraysEqual", typed_arrays_equal, flags)?;
+    Ok(export)
+}
+
 /// CommonJS export: the `util` namespace.
 pub fn util_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,

@@ -542,7 +542,16 @@ fn value_string(scope: &NativeScope<'_, '_>, value: Local<'_>) -> Option<String>
 
 fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let input = args.first().copied().unwrap_or_else(Value::undefined);
-    let process = *ctx.this_value();
+    // Node's emitWarning works detached (`const w = process.emitWarning;
+    // w(...)`) — its own lib passes it around unbound, so the receiver falls
+    // back to the global `process` when the call site supplied none.
+    let receiver = *ctx.this_value();
+    let process = if receiver.is_object() {
+        receiver
+    } else {
+        ctx.global_value("process")
+            .ok_or_else(|| invalid_arg("process global is unavailable"))?
+    };
     let error_constructor = ctx
         .global_value("Error")
         .ok_or_else(|| invalid_arg("Error constructor is unavailable"))?;

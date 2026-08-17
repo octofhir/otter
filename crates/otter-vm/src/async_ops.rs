@@ -187,6 +187,14 @@ impl Interpreter {
             Some(context.clone()),
             async_context,
         );
+        // The body is parked on the awaited promise. The state is the ONLY
+        // reliable awaiting signal: the request queue also holds the plain
+        // `.next()` that is waiting on this turn, so queue-emptiness cannot
+        // distinguish an await from a completed body.
+        owner.set_async_state(
+            &mut self.gc_heap,
+            crate::generator::AsyncGeneratorState::Awaiting,
+        );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
         }

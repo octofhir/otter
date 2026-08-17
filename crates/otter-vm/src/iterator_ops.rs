@@ -2768,18 +2768,16 @@ impl Interpreter {
                 // the frame: a parked await leaves the slot empty
                 // (the await microtask owns it) AND `sub_stack` is
                 // empty.
-                let parked = is_async && !handle.has_frame(&self.gc_heap) && {
-                    // The await machinery stored the parked frame
-                    // in its closure, not on the gen handle. Detect
-                    // that case by checking if queued requests still
-                    // exist — if so, it is awaiting.
-                    handle.has_async_requests(&self.gc_heap)
-                };
+                // An `Op::Await` parking stores the frame in the resume
+                // microtask's closure, not on the gen handle, and stamps
+                // `Awaiting` — the request queue cannot answer this (the
+                // caller's own `.next()` request is still queued either way).
+                let parked = is_async
+                    && !handle.has_frame(&self.gc_heap)
+                    && handle.async_state(&self.gc_heap) == AsyncGeneratorState::Awaiting;
                 if parked {
-                    // Body suspended on `Op::Await`; the resume
-                    // microtask will eventually settle
-                    // the queued request.
-                    handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Awaiting);
+                    // The resume microtask will eventually settle the queued
+                    // request.
                     return Ok(Value::undefined());
                 }
                 // Body completed.

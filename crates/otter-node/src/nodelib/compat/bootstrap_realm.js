@@ -145,6 +145,17 @@ function derive(name) {
     }
   }
 
+  // `<Base>Prototype<Method>Apply` — the spread-call form:
+  // ArrayPrototypePushApply(target, items) = Array.prototype.push.apply.
+  m = /^([A-Z][A-Za-z0-9]*?)Prototype([A-Z][A-Za-z0-9]*)Apply$/.exec(name);
+  if (m) {
+    const base = m[1] === 'TypedArray' ? TypedArray : constructors[m[1]];
+    const method = base?.prototype?.[lowerFirst(m[2])];
+    if (typeof method === 'function') {
+      return (thisArg, args) => ReflectApply(method, thisArg, args);
+    }
+  }
+
   // `<Base>Prototype<Method>` — uncurried prototype method.
   m = /^([A-Z][A-Za-z0-9]*?)Prototype([A-Z][A-Za-z0-9]*)$/.exec(name);
   if (m) {
@@ -324,6 +335,69 @@ const bindings = {
       return names.filter((k) =>
         Object.getOwnPropertyDescriptor(object, k)?.enumerable === true);
     },
+    constructSharedArrayBuffer(byteLength) {
+      return typeof SharedArrayBuffer === 'function'
+        ? new SharedArrayBuffer(byteLength)
+        : undefined;
+    },
+    guessHandleType() { return 'PIPE'; },
+    defineLazyProperties(target, moduleName, names) {
+      for (const name of names) {
+        Object.defineProperty(target, name, {
+          configurable: true,
+          enumerable: true,
+          get() {
+            const value = require(moduleName)[name];
+            Object.defineProperty(target, name, {
+              value, writable: true, configurable: true, enumerable: true,
+            });
+            return value;
+          },
+          set(value) {
+            Object.defineProperty(target, name, {
+              value, writable: true, configurable: true, enumerable: true,
+            });
+          },
+        });
+      }
+    },
+    sleep(msec) {
+      if (typeof SharedArrayBuffer === 'function' && typeof Atomics === 'object') {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, msec);
+      }
+    },
+    getCallSites(frameCount) {
+      const natives = require('internal/otter/natives');
+      // Skip this wrapper and the vendored util.getCallSites frame so the
+      // first reported site is their caller.
+      return JSON.parse(natives.captureCallSites(2, frameCount));
+    },
+    parseEnv(content) {
+      const out = { __proto__: null };
+      for (const rawLine of String(content).split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (line === '' || line.startsWith('#')) continue;
+        const eq = line.indexOf('=');
+        if (eq === -1) continue;
+        let key = line.slice(0, eq).trim();
+        if (key.startsWith('export ')) key = key.slice(7).trim();
+        let value = line.slice(eq + 1).trim();
+        const quoted = value.length > 1 &&
+          ((value[0] === '"' && value.endsWith('"')) ||
+           (value[0] === "'" && value.endsWith("'")) ||
+           (value[0] === '`' && value.endsWith('`')));
+        if (quoted) {
+          const quote = value[0];
+          value = value.slice(1, -1);
+          if (quote === '"') value = value.replace(/\\n/g, '\n');
+        } else {
+          const comment = value.indexOf(' #');
+          if (comment !== -1) value = value.slice(0, comment).trim();
+        }
+        out[key] = value;
+      }
+      return out;
+    },
   },
   config: {
     hasIntl: false,
@@ -336,8 +410,16 @@ const bindings = {
   os: {
     getOSInformation() { return ['', '', '']; },
   },
-  types: {},
-  string_decoder: {},
+  types: {
+    isNativeError: (value) => value instanceof Error,
+    isPromise: (value) => value instanceof Promise,
+  },
+  string_decoder: {
+    encodings: [
+      'ascii', 'utf8', 'base64', 'ucs2', 'hex', 'binary', 'latin1',
+      'utf16le', 'base64url',
+    ],
+  },
   messaging: {},
   profiler: {},
 };

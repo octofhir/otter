@@ -9,6 +9,8 @@ const defaults = new Map([
   ['--trace-warnings', false],
   ['--disable-proto', ''],
   ['--frozen-intrinsics', false],
+  ['--max-http-header-size', 16384],
+  ['--insecure-http-parser', false],
 ]);
 module.exports = {
   getOptionValue(name) { return defaults.get(name); },

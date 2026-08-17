@@ -212,8 +212,11 @@ const WATCHDOG_MIN_GRACE_SECS: u64 = 5;
 /// or the core count would otherwise allow.
 const MAX_CONCURRENT_TESTS: usize = 16;
 
+// Node's own test harness allows 120 seconds per test; several http
+// lifecycle tests legitimately ride the server's 65-second keep-alive
+// default, so a shorter watchdog misclassifies them as hangs.
 fn default_timeout_secs() -> u64 {
-    10
+    120
 }
 
 pub fn run(options: RunOptions) -> Result<RunReport> {

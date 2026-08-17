@@ -40,7 +40,13 @@ struct Entry {
 }
 
 enum EntryKind {
-    Listener,
+    Listener {
+        /// Wakes the accept task so the listening socket closes the moment
+        /// `close` is called, not at the next accept wakeup — a connect
+        /// racing a just-closed server must be refused, never accepted by
+        /// the kernel backlog and then reset.
+        shutdown: Arc<tokio::sync::Notify>,
+    },
     Connection {
         outgoing: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
         socket: Arc<tokio::net::TcpStream>,
@@ -124,6 +130,17 @@ fn build_native<'scope>(
         &[],
         move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
             let id = handle_arg(args, 0);
+            // A typed-array payload crosses as raw bytes; only string
+            // payloads take the latin1 detour.
+            if let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap())) {
+                let heap = ctx.heap();
+                let offset = view.byte_offset(heap);
+                let len = view.byte_length(heap);
+                let sent = view.buffer(heap).with_bytes(heap, |bytes| {
+                    write_bytes(&write_table, id, &bytes[offset..offset + len])
+                });
+                return Ok(RuntimeValue::boolean(sent));
+            }
             let payload = runtime_arg_to_string(args, 1, ctx.heap());
             Ok(RuntimeValue::boolean(write_bytes(
                 &write_table,
@@ -324,13 +341,16 @@ fn listen(
 
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(
             id,
             Entry {
-                kind: EntryKind::Listener,
+                kind: EntryKind::Listener {
+                    shutdown: shutdown.clone(),
+                },
                 keep_alive: Some(keep_alive),
                 local: Some(local),
                 remote: None,
@@ -342,7 +362,10 @@ fn listen(
     let accept_spawner = spawner.clone();
     io.spawn(async move {
         loop {
-            let accepted = listener.accept().await;
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                () = shutdown.notified() => return,
+            };
             let still_listening = accept_table
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -672,10 +695,17 @@ fn write_bytes(table: &Table, id: u32, bytes: &[u8]) -> bool {
 /// Forget an entry entirely: its loops end and its hold on the runtime goes
 /// with it.
 fn close_entry(table: &Table, id: u32) {
-    table
+    let removed = table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&id);
+    if let Some(Entry {
+        kind: EntryKind::Listener { ref shutdown },
+        ..
+    }) = removed
+    {
+        shutdown.notify_one();
+    }
 }
 
 /// Let go of an entry's hold on the runtime while leaving it usable.

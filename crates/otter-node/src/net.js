@@ -15,13 +15,15 @@ const connections = new Map();
 const pending = new Map();
 let nextToken = 1;
 
-function toLatin1(data, encoding) {
-  if (typeof data === 'string') return Buffer.from(data, encoding || 'utf8').toString('latin1');
-  if (Buffer.isBuffer(data)) return data.toString('latin1');
+// The wire payload stays a byte view all the way into the native write;
+// only genuine strings are encoded first.
+function toWireBuffer(data, encoding) {
+  if (Buffer.isBuffer(data)) return data;
+  if (typeof data === 'string') return Buffer.from(data, encoding || 'utf8');
   if (ArrayBuffer.isView(data)) {
-    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('latin1');
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   }
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('latin1');
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
   throw invalidArgType('data', 'string or an instance of Buffer, TypedArray, or DataView', data);
 }
 
@@ -42,11 +44,27 @@ function codedError(message, code) {
   return err;
 }
 
+// The vendored http stack touches `socket._handle` as an object — read
+// flow flags, an `onread` hook slot, and async-id plumbing. The numeric
+// native id lives behind it as `_fd`; `isStreamBase` stays false so the
+// parser-consume fast path is never taken and data flows as JS 'data'.
+function SocketHandle(socket, fd) {
+  this._socket = socket;
+  this._fd = fd;
+  this.reading = true;
+  this.onread = null;
+  this.isStreamBase = false;
+  this._consumed = false;
+}
+SocketHandle.prototype.readStart = function readStart() { this.reading = true; return 0; };
+SocketHandle.prototype.readStop = function readStop() { this.reading = false; return 0; };
+SocketHandle.prototype.getAsyncId = function getAsyncId() { return -1; };
+
 function Socket(options) {
   if (!(this instanceof Socket)) return new Socket(options);
   options = options || {};
   Duplex.call(this, options);
-  this._handle = 0;
+  this._handle = null;
   this.connecting = false;
   this.destroyed = false;
   this.pending = true;
@@ -73,24 +91,70 @@ Socket.prototype._maybeDestroy = function _maybeDestroy() {
   if (this._readEnded && this._writeEnded && !this.destroyed) this.destroy();
 };
 
+// Close once pending writes have flushed — writes here reach the native
+// layer synchronously, so this is end() plus a destroy on 'finish'.
+Socket.prototype.destroySoon = function destroySoon() {
+  if (this.writableFinished) {
+    this.destroy();
+  } else {
+    this.once('finish', () => this.destroy());
+    this.end();
+  }
+};
+
+Socket.prototype._unrefTimer = function _unrefTimer() {
+  this._touch();
+};
+
 // The native half pushes; nothing is pulled, so the read side only has to
 // exist.
 Socket.prototype._read = function _read() {};
 
 Socket.prototype._write = function _write(chunk, encoding, callback) {
-  if (this._handle === 0) {
+  if (this.connecting) {
+    // Node's net.Socket accepts writes before the connection exists and
+    // flushes them on connect, in order.
+    (this._pendingWrites ??= []).push([chunk, encoding]);
+    callback();
+    return;
+  }
+  if (this._handle === null) {
     callback(codedError('This socket is closed', 'ERR_SOCKET_CLOSED'));
     return;
   }
-  const payload = toLatin1(chunk, encoding);
+  const payload = toWireBuffer(chunk, encoding);
   this.bytesWritten += payload.length;
-  native.write(this._handle, payload);
+  native.write(this._handle._fd, payload);
+  this._touch();
+  callback();
+};
+
+// Corked writes (the vendored http stack corks around header+body flushes)
+// leave in one native write, so raw peers see them as one packet.
+Socket.prototype._writev = function _writev(chunks, callback) {
+  if (this.connecting) {
+    (this._pendingWrites ??= []).push(...chunks.map((c) => [c.chunk, c.encoding]));
+    callback();
+    return;
+  }
+  if (this._handle === null) {
+    callback(codedError('This socket is closed', 'ERR_SOCKET_CLOSED'));
+    return;
+  }
+  const payload = Buffer.concat(chunks.map(({ chunk, encoding }) => toWireBuffer(chunk, encoding)));
+  this.bytesWritten += payload.length;
+  native.write(this._handle._fd, payload);
   this._touch();
   callback();
 };
 
 Socket.prototype._final = function _final(callback) {
-  if (this._handle !== 0) native.end(this._handle);
+  if (this.connecting) {
+    this._pendingFinal = true;
+    callback();
+    return;
+  }
+  if (this._handle !== null) native.end(this._handle._fd);
   this._writeEnded = true;
   callback();
   this._maybeDestroy();
@@ -98,10 +162,10 @@ Socket.prototype._final = function _final(callback) {
 
 Socket.prototype._destroy = function _destroy(error, callback) {
   this.destroyed = true;
-  if (this._handle !== 0) {
-    connections.delete(this._handle);
-    native.close(this._handle);
-    this._handle = 0;
+  if (this._handle !== null) {
+    connections.delete(this._handle._fd);
+    native.close(this._handle._fd);
+    this._handle = null;
   }
   this._clearTimer();
   callback(error);
@@ -134,7 +198,7 @@ Socket.prototype._clearTimer = function _clearTimer() {
 };
 
 Socket.prototype.setNoDelay = function setNoDelay(enable = true) {
-  if (this._handle !== 0) native.setOption(this._handle, 'setNoDelay', enable !== false);
+  if (this._handle !== null) native.setOption(this._handle._fd, 'setNoDelay', enable !== false);
   return this;
 };
 
@@ -143,22 +207,26 @@ Socket.prototype.setKeepAlive = function setKeepAlive() {
 };
 
 Socket.prototype.address = function address() {
-  if (this._handle === 0) return {};
-  return native.address(this._handle, 'local') ?? {};
+  if (this._handle === null) return {};
+  return native.address(this._handle._fd, 'local') ?? {};
 };
 
 Socket.prototype.ref = function ref() {
-  if (this._handle !== 0) native.hold(this._handle, true);
+  if (this._handle !== null) native.hold(this._handle._fd, true);
   return this;
 };
 
 Socket.prototype.unref = function unref() {
-  if (this._handle !== 0) native.hold(this._handle, false);
+  if (this._handle !== null) native.hold(this._handle._fd, false);
   return this;
 };
 
 Socket.prototype.connect = function connect(...args) {
   const { port, host, callback } = normalizeConnectArgs(args);
+  const options = args[0] !== null && typeof args[0] === 'object' ? args[0] : null;
+  if (options && typeof options.timeout === 'number' && options.timeout > 0) {
+    this.setTimeout(options.timeout);
+  }
   if (typeof callback === 'function') this.once('connect', callback);
   this.connecting = true;
   const token = nextToken++;
@@ -181,10 +249,24 @@ Socket.prototype._adopt = function _adopt(handle, remote) {
     native.close(handle);
     return;
   }
-  this._handle = handle;
+  this._handle = new SocketHandle(this, handle);
   this.connecting = false;
   this.pending = false;
   connections.set(handle, this);
+  if (this._pendingWrites !== undefined) {
+    const queued = this._pendingWrites;
+    this._pendingWrites = undefined;
+    for (const [chunk, encoding] of queued) {
+      const payload = toWireBuffer(chunk, encoding);
+      this.bytesWritten += payload.length;
+      native.write(handle, payload);
+    }
+  }
+  if (this._pendingFinal === true) {
+    this._pendingFinal = false;
+    native.end(handle);
+    this._writeEnded = true;
+  }
   if (remote) {
     this.remoteAddress = remote.address;
     this.remotePort = remote.port;
@@ -212,6 +294,30 @@ Socket.prototype._ended = function _ended() {
   if (!this.allowHalfOpen) this.end();
   this._maybeDestroy();
 };
+
+// Node's own arg canonicalization: `[options, callback]`, marked so a
+// double normalize is a no-op. The vendored http agent calls this directly.
+const normalizedArgsSymbol = Symbol('normalizedArgs');
+function _normalizeArgs(args) {
+  let arr;
+  if (args.length === 0) {
+    arr = [{}, null];
+  } else if (args[0] !== null && typeof args[0] === 'object') {
+    arr = [args[0], typeof args[1] === 'function' ? args[1] : null];
+  } else {
+    const options = { port: args[0] };
+    let callback = null;
+    if (typeof args[1] === 'string') {
+      options.host = args[1];
+      if (typeof args[2] === 'function') callback = args[2];
+    } else if (typeof args[1] === 'function') {
+      callback = args[1];
+    }
+    arr = [options, callback];
+  }
+  arr[normalizedArgsSymbol] = true;
+  return arr;
+}
 
 function normalizeConnectArgs(args) {
   let port;
@@ -395,6 +501,7 @@ module.exports = {
   createServer,
   createConnection: connect,
   connect,
+  _normalizeArgs,
   isIP,
   isIPv4,
   isIPv6,

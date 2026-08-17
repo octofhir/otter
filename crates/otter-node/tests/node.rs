@@ -428,8 +428,10 @@ fn node_dgram_validates_before_it_opens_a_socket() {
         const socket = dgram.createSocket("udp6");
         if (socket.type !== "udp6") throw new Error("type " + socket.type);
 
-        // Nothing is open yet, so the state errors come before any syscall.
-        if (codeOf(() => socket.address()) !== "ERR_SOCKET_DGRAM_NOT_RUNNING") {
+        // Nothing is open yet. A never-bound socket has no descriptor, so
+        // address() fails the way the getsockname syscall would; the
+        // not-running state error is reserved for a socket closed later.
+        if (codeOf(() => socket.address()) !== "EBADF") {
             throw new Error("address() on an unbound socket");
         }
         if (codeOf(() => socket.remoteAddress()) !== "ERR_SOCKET_DGRAM_NOT_CONNECTED") {

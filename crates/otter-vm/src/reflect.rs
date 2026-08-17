@@ -619,6 +619,9 @@ fn vm_to_native(interp: &mut Interpreter, err: VmError) -> NativeError {
             reason: "out of memory".to_string(),
         },
         VmError::Exit { code } => NativeError::Exit { code },
+        // Interruption keeps its class: wrapping it as a JS TypeError would
+        // surface shutdown teardown as a user-visible throw.
+        VmError::Interrupted => NativeError::Interrupted,
         other => NativeError::TypeError {
             name: "Reflect",
             reason: other.to_string(),

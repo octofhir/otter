@@ -2119,7 +2119,14 @@ impl IsolateRunner {
                         self.counters
                             .failed_host_ops
                             .fetch_add(1, Ordering::Relaxed);
-                        self.record_fatal_task_error(error);
+                        // See the timer branch: shutdown's cooperative
+                        // interrupt tearing down an in-flight task is not a
+                        // run failure.
+                        let teardown_interrupt = matches!(error, OtterError::Interrupted)
+                            && self.counters.shutdown.load(Ordering::Acquire);
+                        if !teardown_interrupt {
+                            self.record_fatal_task_error(error);
+                        }
                     }
                 }
                 self.record_microtask_snapshot();
@@ -2172,7 +2179,15 @@ impl IsolateRunner {
                             &self.counters.pending_ref_timers,
                             &self.counters.pending_unref_timers,
                         );
-                        self.record_fatal_task_error(error);
+                        // A timer that fires between shutdown's cooperative
+                        // interrupt and the Shutdown message observing it is
+                        // torn down on purpose — that interruption is not a
+                        // run failure.
+                        let teardown_interrupt = matches!(error, OtterError::Interrupted)
+                            && self.counters.shutdown.load(Ordering::Acquire);
+                        if !teardown_interrupt {
+                            self.record_fatal_task_error(error);
+                        }
                     }
                 }
                 self.record_microtask_snapshot();

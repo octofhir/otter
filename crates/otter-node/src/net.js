@@ -494,7 +494,130 @@ function isIP(input) {
   return 0;
 }
 
+
+// §https://nodejs.org/api/net.html#class-netblocklist — address deny rules.
+// v4 addresses map to a 32-bit integer, v6 to a 128-bit BigInt; a v4 rule
+// also matches its ::ffff: v6 mapping the way Node's does.
+function parseV4(addr) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(addr));
+  if (m === null) return null;
+  let out = 0;
+  for (let i = 1; i <= 4; i++) {
+    const part = Number(m[i]);
+    if (part > 255) return null;
+    out = out * 256 + part;
+  }
+  return out;
+}
+
+function parseV6(addr) {
+  let text = String(addr).toLowerCase();
+  if (text.startsWith('[') && text.endsWith(']')) text = text.slice(1, -1);
+  const zone = text.indexOf('%');
+  if (zone !== -1) text = text.slice(0, zone);
+  let head = text;
+  let tail = '';
+  const gap = text.indexOf('::');
+  if (gap !== -1) {
+    head = text.slice(0, gap);
+    tail = text.slice(gap + 2);
+    if (tail.includes('::')) return null;
+  }
+  const expand = (part) => (part === '' ? [] : part.split(':'));
+  const headParts = expand(head);
+  const tailParts = expand(tail);
+  const last = tailParts.length > 0 ? tailParts[tailParts.length - 1]
+    : headParts[headParts.length - 1];
+  if (last !== undefined && last.includes('.')) {
+    const v4 = parseV4(last);
+    if (v4 === null) return null;
+    const words = [(v4 >>> 16).toString(16), (v4 & 0xffff).toString(16)];
+    if (tailParts.length > 0) tailParts.splice(-1, 1, ...words);
+    else headParts.splice(-1, 1, ...words);
+  }
+  const missing = 8 - headParts.length - tailParts.length;
+  if (gap === -1 ? missing !== 0 : missing < 0) return null;
+  const words = [...headParts, ...new Array(gap === -1 ? 0 : missing).fill('0'), ...tailParts];
+  if (words.length !== 8) return null;
+  let out = 0n;
+  for (const word of words) {
+    if (!/^[0-9a-f]{1,4}$/.test(word)) return null;
+    out = (out << 16n) | BigInt(parseInt(word, 16));
+  }
+  return out;
+}
+
+const V4_MAPPED_PREFIX = 0xffffn << 32n;
+
+function blockKey(addr, family) {
+  if (String(family).toLowerCase() === 'ipv6') {
+    const v6 = parseV6(addr);
+    if (v6 === null) return null;
+    // ::ffff:a.b.c.d compares against v4 rules too.
+    if ((v6 >> 32n) === 0xffffn) return { family: 'ipv4', value: Number(v6 & 0xffffffffn) };
+    return { family: 'ipv6', value: v6 };
+  }
+  const v4 = parseV4(addr);
+  if (v4 === null) return null;
+  return { family: 'ipv4', value: v4 };
+}
+
+class BlockList {
+  #rules = [];
+
+  addAddress(address, family = 'ipv4') {
+    const key = blockKey(address, family);
+    if (key === null) throw invalidArgType('address', 'a valid IP address', address);
+    this.#rules.push({ kind: 'Address', family: key.family, start: key.value, end: key.value, text: `Address: ${key.family.toUpperCase()} ${address}` });
+  }
+
+  addRange(start, end, family = 'ipv4') {
+    const from = blockKey(start, family);
+    const to = blockKey(end, family);
+    if (from === null || to === null || from.family !== to.family) {
+      throw invalidArgType('start', 'a valid IP range', start);
+    }
+    this.#rules.push({ kind: 'Range', family: from.family, start: from.value, end: to.value, text: `Range: ${from.family.toUpperCase()} ${start}-${end}` });
+  }
+
+  addSubnet(network, prefix, family = 'ipv4') {
+    const key = blockKey(network, family);
+    if (key === null) throw invalidArgType('network', 'a valid IP address', network);
+    if (key.family === 'ipv4') {
+      const bits = 32 - prefix;
+      const start = bits >= 32 ? 0 : (key.value >>> 0) & (bits === 0 ? 0xffffffff : (~0 << bits) >>> 0);
+      const end = bits === 0 ? start : (start + 2 ** bits - 1) >>> 0;
+      this.#rules.push({ kind: 'Subnet', family: 'ipv4', start, end, text: `Subnet: IPV4 ${network}/${prefix}` });
+    } else {
+      const bits = BigInt(128 - prefix);
+      const mask = bits === 0n ? (1n << 128n) - 1n : ((1n << 128n) - 1n) ^ ((1n << bits) - 1n);
+      const start = key.value & mask;
+      const end = start + (1n << bits) - 1n;
+      this.#rules.push({ kind: 'Subnet', family: 'ipv6', start, end, text: `Subnet: IPV6 ${network}/${prefix}` });
+    }
+  }
+
+  check(address, family = 'ipv4') {
+    const key = blockKey(address, family);
+    if (key === null) return false;
+    for (const rule of this.#rules) {
+      if (rule.family !== key.family) continue;
+      if (key.value >= rule.start && key.value <= rule.end) return true;
+    }
+    return false;
+  }
+
+  get rules() {
+    return this.#rules.map((rule) => rule.text);
+  }
+
+  static isBlockList(value) {
+    return value instanceof BlockList;
+  }
+}
+
 module.exports = {
+  BlockList,
   Server,
   Socket,
   Stream: Socket,

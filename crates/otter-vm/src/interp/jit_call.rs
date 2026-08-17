@@ -608,10 +608,12 @@ impl Interpreter {
     }
 
     /// Tier-up entry point for a synchronously-entered call frame (the
-    /// [`Self::run_callable_sync`] path), where the callee frame is the sole
-    /// entry on its own `stack`. Mirrors [`Self::maybe_dispatch_jit`] but, on a
-    /// successful compiled run, the completion *is* the call result (there is no
-    /// caller frame to unwind into).
+    /// [`Self::run_callable_sync`] path), where the callee frame was just
+    /// pushed as the sole frame above `floor`. Mirrors
+    /// [`Self::maybe_dispatch_jit`] but, on a successful compiled run, the
+    /// completion *is* the call result (there is no caller frame to unwind
+    /// into). The stack below `floor` may hold frames owned by live compiled
+    /// entries — an unhandled throw must never unwind past `floor`.
     ///
     /// Returns `Ok(Some(v))` when compiled code ran the frame to completion, or
     /// `Ok(None)` to interpret it normally.
@@ -619,6 +621,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        floor: ActivationFloor,
     ) -> Result<Option<Value>, VmError> {
         if self.jit_hook.is_none() {
             return Ok(None);
@@ -665,7 +668,7 @@ impl Interpreter {
                 Ok(Some(value))
             }
             jit::JitExecOutcome::Throw(thrown) => {
-                self.unwind_compiled_throw_above(context, stack, ActivationFloor::ROOT, thrown)?;
+                self.unwind_compiled_throw_above(context, stack, floor, thrown)?;
                 Ok(None)
             }
             jit::JitExecOutcome::Fatal(err) => Err(err),

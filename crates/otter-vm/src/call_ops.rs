@@ -3719,7 +3719,7 @@ impl Interpreter {
         // `dispatch_loop` directly (no `Op::Call`), so without this hook the
         // entry level would always interpret while only its sub-calls JIT. This
         // lets a hot recursion run compiled→compiled with no interpreted levels.
-        if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
+        if let Some(value) = self.dispatch_jit_sync_entry(inner, context, entry_floor)? {
             // The compiled entry frame ran to completion and is terminal
             // (the integer subset cannot suspend or escape its frame), so
             // return its spilled register window and its cold record to their
@@ -4044,7 +4044,7 @@ impl Interpreter {
         let entry_floor = stack.floor();
         stack.push(new_frame);
         if probe {
-            match self.dispatch_jit_sync_entry(stack, context) {
+            match self.dispatch_jit_sync_entry(stack, context, entry_floor) {
                 Ok(Some(value)) => {
                     self.release_frames_above(stack, entry_floor);
                     return Ok(value);

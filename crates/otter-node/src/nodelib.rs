@@ -170,3 +170,5 @@ nodelib_module!(internal_util_diff, "internal/util/diff", vendored "nodelib/inte
 nodelib_module!(internal_myers_diff, "internal/assert/myers_diff", vendored "nodelib/internal/assert/myers_diff.js");
 nodelib_module!(internal_trace_sigint, "internal/util/trace_sigint", vendored "nodelib/internal/util/trace_sigint.js");
 nodelib_module!(internal_watchdog, "internal/watchdog", compat "nodelib/compat/internal_watchdog.js");
+nodelib_module!(internal_string_decoder, "internal/string_decoder_binding", compat "nodelib/compat/internal_string_decoder.js");
+nodelib_module!(node_string_decoder, "node:string_decoder", vendored "nodelib/string_decoder.js");

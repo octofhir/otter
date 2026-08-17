@@ -158,6 +158,25 @@ if (!Buffer) {
     return [offset, len];
   }
 
+  // Seed one period, then double with copyWithin so a huge fill is
+  // O(log n) native copies instead of a per-byte JS loop.
+  function fillPattern(target, bytes, offset, end) {
+    const span = end - offset;
+    if (bytes.length === 1) {
+      Uint8Array.prototype.fill.call(target, bytes[0], offset, end);
+      return;
+    }
+    const first = Math.min(bytes.length, span);
+    for (let i = 0; i < first; i++) target[offset + i] = bytes[i];
+    let filled = first;
+    while (filled < span) {
+      const copy = Math.min(filled, span - filled);
+      Uint8Array.prototype.copyWithin.call(
+        target, offset + filled, offset, offset + copy);
+      filled += copy;
+    }
+  }
+
   function utf8ToBytes(str) {
     const out = [];
     for (let i = 0; i < str.length; i++) {
@@ -196,26 +215,45 @@ if (!Buffer) {
     return n;
   }
 
+  // WHATWG utf-8 decode: second-byte ranges are per-lead (overlongs,
+  // surrogates, and > U+10FFFF are impossible by construction), an invalid
+  // byte is never consumed by the failed sequence (maximal subpart resync),
+  // and each failure yields exactly one replacement.
   function utf8Slice(buf, start, end) {
     let res = '';
     let i = start;
     while (i < end) {
       const b0 = buf[i];
-      let cp; let size;
-      if (b0 < 0x80) { cp = b0; size = 1; }
-      else if ((b0 & 0xe0) === 0xc0) { cp = b0 & 0x1f; size = 2; }
-      else if ((b0 & 0xf0) === 0xe0) { cp = b0 & 0x0f; size = 3; }
-      else if ((b0 & 0xf8) === 0xf0) { cp = b0 & 0x07; size = 4; }
+      if (b0 < 0x80) { res += String.fromCharCode(b0); i += 1; continue; }
+      let size; let cp; let lower = 0x80; let upper = 0xbf;
+      if (b0 >= 0xc2 && b0 <= 0xdf) { size = 2; cp = b0 & 0x1f; }
+      else if (b0 === 0xe0) { size = 3; cp = 0; lower = 0xa0; }
+      else if (b0 >= 0xe1 && b0 <= 0xec) { size = 3; cp = b0 & 0x0f; }
+      else if (b0 === 0xed) { size = 3; cp = 0x0d; upper = 0x9f; }
+      else if (b0 === 0xee || b0 === 0xef) { size = 3; cp = b0 & 0x0f; }
+      else if (b0 === 0xf0) { size = 4; cp = 0; lower = 0x90; }
+      else if (b0 >= 0xf1 && b0 <= 0xf3) { size = 4; cp = b0 & 0x07; }
+      else if (b0 === 0xf4) { size = 4; cp = 4; upper = 0x8f; }
       else { res += '�'; i += 1; continue; }
-      if (i + size > end) { res += '�'; break; }
-      for (let j = 1; j < size; j++) cp = (cp << 6) | (buf[i + j] & 0x3f);
+      i += 1;
+      let ok = true;
+      for (let j = 1; j < size; j++) {
+        if (i >= end) { ok = false; break; }
+        const b = buf[i];
+        if (b < (j === 1 ? lower : 0x80) || b > (j === 1 ? upper : 0xbf)) {
+          ok = false;
+          break;
+        }
+        cp = (cp << 6) | (b & 0x3f);
+        i += 1;
+      }
+      if (!ok) { res += '�'; continue; }
       if (cp > 0xffff) {
         cp -= 0x10000;
         res += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
       } else {
         res += String.fromCharCode(cp);
       }
-      i += size;
     }
     return res;
   }
@@ -432,6 +470,17 @@ if (!Buffer) {
       end = e2;
       const e = enc.normalize(encoding);
       if (e === undefined) throw unknownEncoding(encoding);
+      // The result string is capped like V8's: reject before attempting a
+      // gigabyte materialization. hex doubles, base64 grows 4/3; everything
+      // else yields at most one code unit per byte.
+      const span = end - start;
+      const resultCap = e === 'hex' ? span * 2 : e === 'base64' || e === 'base64url'
+        ? Math.ceil(span / 3) * 4 : span;
+      if (resultCap > 0x1fffffe8) {
+        const err = new Error('Cannot create a string longer than 0x1fffffe8 characters');
+        err.code = 'ERR_STRING_TOO_LONG';
+        throw err;
+      }
       switch (e) {
         case 'utf8': return utf8Slice(this, start, end);
         case 'ascii': { let s = ''; for (let i = start; i < end; i++) s += String.fromCharCode(this[i] & 0x7f); return s; }
@@ -573,14 +622,14 @@ if (!Buffer) {
         }
         const bytes = bytesFromString(value, e);
         if (bytes.length === 0) return this;
-        for (let i = offset, j = 0; i < end; i++, j = (j + 1) % bytes.length) this[i] = bytes[j];
+        fillPattern(this, bytes, offset, end);
       } else if (typeof value === 'number') {
-        for (let i = offset; i < end; i++) this[i] = value & 0xff;
+        Uint8Array.prototype.fill.call(this, value & 0xff, offset, end);
       } else if (value instanceof Uint8Array) {
         if (value.length === 0) throw invalidArgValue('value', value);
-        for (let i = offset, j = 0; i < end; i++, j = (j + 1) % value.length) this[i] = value[j];
+        fillPattern(this, value, offset, end);
       } else if (value === null || value === undefined) {
-        for (let i = offset; i < end; i++) this[i] = 0;
+        Uint8Array.prototype.fill.call(this, 0, offset, end);
       }
       return this;
     }
@@ -1135,7 +1184,7 @@ if (!Buffer) {
   if (typeof globalThis !== 'undefined') globalThis.Buffer = Buffer;
 }
 
-const constants = { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 0x1fffffff };
+const constants = { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 0x1fffffe8 };
 
 function SlowBuffer(length) { return Buffer.allocUnsafeSlow(length); }
 SlowBuffer.prototype = Buffer.prototype;
@@ -1145,7 +1194,7 @@ const bufferExports = {
   SlowBuffer,
   constants,
   kMaxLength,
-  kStringMaxLength: 0x1fffffff,
+  kStringMaxLength: 0x1fffffe8,
   atob: typeof atob === 'function' ? atob : undefined,
   btoa: typeof btoa === 'function' ? btoa : undefined,
   isAscii: Buffer.isAscii,

@@ -137,9 +137,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("querystring", querystring::querystring_cjs_value),
     HostedModule::cjs_only(
         "node:string_decoder",
-        string_decoder::string_decoder_cjs_value,
+        nodelib::node_string_decoder,
     ),
-    HostedModule::cjs_only("string_decoder", string_decoder::string_decoder_cjs_value),
+    HostedModule::cjs_only("string_decoder", nodelib::node_string_decoder),
+    HostedModule::cjs_only("internal/string_decoder_binding", nodelib::internal_string_decoder),
     HostedModule::cjs_only("node:util", nodelib::node_util),
     HostedModule::cjs_only("util", nodelib::node_util),
     HostedModule::cjs_only("node:util/types", util::util_types_cjs_value),

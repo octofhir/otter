@@ -405,7 +405,18 @@ const bindings = {
     isDebugBuild: false,
   },
   buffer: {
-    compare(a, b) { return Buffer.compare(a, b); },
+    // Raw byte comparison over any TypedArray view, as the native binding
+    // does — Buffer.compare's public argument check refuses Int8Array etc.
+    compare(a, b) {
+      const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+      const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+      const len = Math.min(ua.length, ub.length);
+      for (let i = 0; i < len; i++) {
+        if (ua[i] !== ub[i]) return ua[i] < ub[i] ? -1 : 1;
+      }
+      if (ua.length === ub.length) return 0;
+      return ua.length < ub.length ? -1 : 1;
+    },
   },
   os: {
     getOSInformation() { return ['', '', '']; },

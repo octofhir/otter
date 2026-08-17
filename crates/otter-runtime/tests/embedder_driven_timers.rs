@@ -46,6 +46,10 @@ impl TimerScheduler for RecordingScheduler {
         self.cancelled.lock().expect("cancelled").push(token);
         true
     }
+
+    fn set_ref(&self, _token: u64, _refed: bool) -> bool {
+        true
+    }
 }
 
 fn runtime_with(scheduler: &Arc<RecordingScheduler>) -> Runtime {

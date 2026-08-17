@@ -683,7 +683,8 @@ mod tests {
         // `windows` / `includes` / `join`) and the three `%Iterator%`
         // statics (`concat` / `zip` / `zipKeyed`) each cost a callable
         // plus its heap-resident display name.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3458;
+        // +4 for the `__otterTimerSetRef` timer-liveness native.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3462;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 600 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

@@ -136,10 +136,78 @@ pub fn os_cjs_value<'scope>(
         })?;
     }
     scope.set(constants, "priority", priority)?;
+    let signals = scope.object()?;
+    for (name, value) in SIGNALS {
+        scope.scope(|mut field_scope| {
+            let value = field_scope.number(f64::from(*value));
+            field_scope.set(signals, name, value)
+        })?;
+    }
+    scope.set(constants, "signals", signals)?;
+    let errno = scope.object()?;
+    for (name, value) in ERRNO {
+        scope.scope(|mut field_scope| {
+            let value = field_scope.number(f64::from(*value));
+            field_scope.set(errno, name, value)
+        })?;
+    }
+    scope.set(constants, "errno", errno)?;
     scope.set(os, "constants", constants)?;
 
     Ok(os)
 }
+
+/// POSIX signal numbers as this platform defines them.
+const SIGNALS: &[(&str, i32)] = &[
+    ("SIGHUP", libc::SIGHUP),
+    ("SIGINT", libc::SIGINT),
+    ("SIGQUIT", libc::SIGQUIT),
+    ("SIGILL", libc::SIGILL),
+    ("SIGTRAP", libc::SIGTRAP),
+    ("SIGABRT", libc::SIGABRT),
+    ("SIGIOT", libc::SIGIOT),
+    ("SIGBUS", libc::SIGBUS),
+    ("SIGFPE", libc::SIGFPE),
+    ("SIGKILL", libc::SIGKILL),
+    ("SIGUSR1", libc::SIGUSR1),
+    ("SIGSEGV", libc::SIGSEGV),
+    ("SIGUSR2", libc::SIGUSR2),
+    ("SIGPIPE", libc::SIGPIPE),
+    ("SIGALRM", libc::SIGALRM),
+    ("SIGTERM", libc::SIGTERM),
+    ("SIGCHLD", libc::SIGCHLD),
+    ("SIGCONT", libc::SIGCONT),
+    ("SIGSTOP", libc::SIGSTOP),
+    ("SIGTSTP", libc::SIGTSTP),
+    ("SIGTTIN", libc::SIGTTIN),
+    ("SIGTTOU", libc::SIGTTOU),
+    ("SIGURG", libc::SIGURG),
+    ("SIGXCPU", libc::SIGXCPU),
+    ("SIGXFSZ", libc::SIGXFSZ),
+    ("SIGVTALRM", libc::SIGVTALRM),
+    ("SIGPROF", libc::SIGPROF),
+    ("SIGWINCH", libc::SIGWINCH),
+    ("SIGIO", libc::SIGIO),
+    ("SIGSYS", libc::SIGSYS),
+];
+
+/// Common errno values consulted by the corpus.
+const ERRNO: &[(&str, i32)] = &[
+    ("EACCES", libc::EACCES),
+    ("EADDRINUSE", libc::EADDRINUSE),
+    ("ECONNREFUSED", libc::ECONNREFUSED),
+    ("ECONNRESET", libc::ECONNRESET),
+    ("EEXIST", libc::EEXIST),
+    ("EINVAL", libc::EINVAL),
+    ("EISDIR", libc::EISDIR),
+    ("EMFILE", libc::EMFILE),
+    ("ENOENT", libc::ENOENT),
+    ("ENOTDIR", libc::ENOTDIR),
+    ("ENOTEMPTY", libc::ENOTEMPTY),
+    ("EPERM", libc::EPERM),
+    ("EPIPE", libc::EPIPE),
+    ("ETIMEDOUT", libc::ETIMEDOUT),
+];
 
 fn os_method_is_primitive_coercible(name: &str) -> bool {
     matches!(

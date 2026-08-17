@@ -305,7 +305,11 @@ const bindings = {
       // honest answer until the engine exposes a probe.
       return [0];
     },
-    getProxyDetails(_value, _showProxy) { return undefined; },
+    getProxyDetails(value, showProxy = true) {
+      const details = require('internal/otter/natives').proxyDetails(value);
+      if (details === undefined) return undefined;
+      return showProxy ? details : details[0];
+    },
     previewEntries(_value) { return [[], false]; },
     getConstructorName(object) {
       let current = object;
@@ -327,13 +331,26 @@ const bindings = {
         structuredClone(buffer, { transfer: [buffer] });
       }
     },
-    // ALL_PROPERTIES = 0, ONLY_ENUMERABLE = 2 — inspect passes both.
+    // PropertyFilter bits: ALL_PROPERTIES=0, ONLY_ENUMERABLE=2,
+    // SKIP_STRINGS=8, SKIP_SYMBOLS=16. Symbols are part of the answer
+    // unless skipped — strict deep-equal counts symbol-keyed expandos.
     getOwnNonIndexProperties(object, filter) {
-      const names = Object.getOwnPropertyNames(object)
-        .filter((k) => !/^\d+$/.test(k));
-      if ((filter & 2) === 0) return names;
-      return names.filter((k) =>
-        Object.getOwnPropertyDescriptor(object, k)?.enumerable === true);
+      const onlyEnumerable = (filter & 2) !== 0;
+      const keep = (key) => !onlyEnumerable ||
+        Object.getOwnPropertyDescriptor(object, key)?.enumerable === true;
+      const out = [];
+      if ((filter & 8) === 0) {
+        for (const k of Object.getOwnPropertyNames(object)) {
+          if (/^(?:0|[1-9]\d*)$/.test(k)) continue;
+          if (keep(k)) out.push(k);
+        }
+      }
+      if ((filter & 16) === 0) {
+        for (const s of Object.getOwnPropertySymbols(object)) {
+          if (keep(s)) out.push(s);
+        }
+      }
+      return out;
     },
     constructSharedArrayBuffer(byteLength) {
       return typeof SharedArrayBuffer === 'function'
@@ -372,29 +389,46 @@ const bindings = {
       // first reported site is their caller.
       return JSON.parse(natives.captureCallSites(2, frameCount));
     },
+    // Node's dotenv semantics: a quoted value runs to the matching close
+    // quote (across newlines), the rest of that line is discarded, and
+    // double quotes expand \n; an unquoted value ends at the line and
+    // loses its trailing #-comment.
     parseEnv(content) {
       const out = { __proto__: null };
-      for (const rawLine of String(content).split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (line === '' || line.startsWith('#')) continue;
-        const eq = line.indexOf('=');
-        if (eq === -1) continue;
-        let key = line.slice(0, eq).trim();
+      const src = String(content);
+      const n = src.length;
+      let i = 0;
+      while (i < n) {
+        while (i < n && ' \t\r\n'.includes(src[i])) i++;
+        if (i >= n) break;
+        let lineEnd = src.indexOf('\n', i);
+        if (lineEnd === -1) lineEnd = n;
+        if (src[i] === '#') { i = lineEnd + 1; continue; }
+        const eq = src.indexOf('=', i);
+        if (eq === -1 || eq > lineEnd) { i = lineEnd + 1; continue; }
+        let key = src.slice(i, eq).trim();
         if (key.startsWith('export ')) key = key.slice(7).trim();
-        let value = line.slice(eq + 1).trim();
-        const quoted = value.length > 1 &&
-          ((value[0] === '"' && value.endsWith('"')) ||
-           (value[0] === "'" && value.endsWith("'")) ||
-           (value[0] === '`' && value.endsWith('`')));
-        if (quoted) {
-          const quote = value[0];
-          value = value.slice(1, -1);
-          if (quote === '"') value = value.replace(/\\n/g, '\n');
-        } else {
-          const comment = value.indexOf(' #');
-          if (comment !== -1) value = value.slice(0, comment).trim();
+        let j = eq + 1;
+        while (j < n && (src[j] === ' ' || src[j] === '\t')) j++;
+        const quote = src[j];
+        if (quote === '"' || quote === "'" || quote === '`') {
+          const close = src.indexOf(quote, j + 1);
+          if (close !== -1) {
+            let value = src.slice(j + 1, close);
+            if (quote === '"') {
+              value = value.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+            }
+            if (key !== '') out[key] = value;
+            i = src.indexOf('\n', close);
+            i = i === -1 ? n : i + 1;
+            continue;
+          }
         }
-        out[key] = value;
+        let value = src.slice(j, lineEnd).trim();
+        const hash = value.indexOf('#');
+        if (hash !== -1) value = value.slice(0, hash).trim();
+        if (key !== '') out[key] = value;
+        i = lineEnd + 1;
       }
       return out;
     },
@@ -422,7 +456,7 @@ const bindings = {
     getOSInformation() { return ['', '', '']; },
   },
   types: {
-    isNativeError: (value) => value instanceof Error,
+    isNativeError: (value) => Error.isError(value),
     isPromise: (value) => value instanceof Promise,
   },
   string_decoder: {

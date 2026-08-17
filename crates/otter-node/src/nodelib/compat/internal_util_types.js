@@ -71,7 +71,9 @@ const types = {
   isProxy: () => false,
   isExternal: () => false,
   isModuleNamespaceObject: taggedCheck('Module'),
-  isNativeError: (value) => value instanceof Error,
+  // Real brand: an [[ErrorData]] slot check, not a prototype walk — a plain
+  // object with Error.prototype behind it must answer false.
+  isNativeError: (value) => Error.isError(value),
   isMapIterator: taggedCheck('Map Iterator'),
   isSetIterator: taggedCheck('Set Iterator'),
   isGeneratorFunction: (value) =>

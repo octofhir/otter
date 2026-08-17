@@ -101,12 +101,12 @@ fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
 }
 
 fn arg_string(
+    ctx: &NativeCtx<'_>,
     args: &[Value],
     index: usize,
     _name: &'static str,
-    heap: &otter_runtime::otter_gc::GcHeap,
 ) -> Result<String, NativeError> {
-    Ok(runtime_arg_to_string(args, index, heap))
+    Ok(runtime_arg_to_string(args, index, ctx.heap()))
 }
 
 fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
@@ -125,10 +125,7 @@ fn json_to_value(ctx: &mut NativeCtx<'_>, value: JsonValue) -> Result<Value, Nat
     }
 }
 
-fn value_to_json(
-    value: &Value,
-    heap: &otter_runtime::otter_gc::GcHeap,
-) -> Result<JsonValue, NativeError> {
+fn value_to_json(ctx: &NativeCtx<'_>, value: &Value) -> Result<JsonValue, NativeError> {
     if value.is_undefined() || value.is_null() {
         return Ok(JsonValue::Null);
     }
@@ -140,11 +137,14 @@ fn value_to_json(
             .map(JsonValue::Number)
             .ok_or_else(|| type_error("json", "number is not finite JSON"));
     }
-    if let Some(s) = value.as_string(heap) {
-        return Ok(JsonValue::String(s.to_lossy_string(heap)));
+    if let Some(s) = value.as_string(ctx.heap()) {
+        return Ok(JsonValue::String(s.to_lossy_string(ctx.heap())));
     }
     Err(type_error(
         "json",
-        format!("cannot convert {} to JSON", value.display_string(heap)),
+        format!(
+            "cannot convert {} to JSON",
+            value.display_string(ctx.heap())
+        ),
     ))
 }

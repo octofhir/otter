@@ -18,8 +18,8 @@
 
 use crate::CompiledCode;
 use crate::entry::enter_compiled;
-use otter_vm::native_abi::{CodeDependency, CodeObjectMetadata};
-use otter_vm::{JitExecOutcome, JitFunctionCode, SafepointRecord, VmRuntimeActivation};
+use otter_vm::native_abi::{CodeDependency, CodeObjectMetadata, SafepointRecord};
+use otter_vm::{JitExecOutcome, JitFunctionCode, VmRuntimeActivation};
 
 /// Finalized template machine code for one function.
 pub struct TemplateCode {

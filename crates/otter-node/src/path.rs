@@ -1502,7 +1502,7 @@ fn path_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn format_path(ctx: &mut NativeCtx<'_>, args: &[Value], sep: char) -> Result<Value, NativeError> {
     let arg = args.first().copied().unwrap_or_else(Value::undefined);
     let Some(obj) = arg.as_object() else {
-        let suffix = arg_type_helper(&arg, ctx.heap());
+        let suffix = arg_type_helper(ctx, &arg);
         return Err(invalid_arg_type(format!(
             "The \"pathObject\" argument must be of type object.{suffix}"
         )));
@@ -1548,7 +1548,8 @@ fn path_format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 }
 
 /// Node's `invalidArgTypeHelper` suffix for a rejected value (` Received ...`).
-fn arg_type_helper(v: &Value, heap: &otter_gc::GcHeap) -> String {
+fn arg_type_helper(ctx: &NativeCtx<'_>, v: &Value) -> String {
+    let heap = ctx.heap();
     if v.is_undefined() {
         " Received undefined".to_string()
     } else if v.is_null() {

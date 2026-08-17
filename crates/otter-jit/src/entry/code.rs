@@ -9,6 +9,9 @@
 //!   (`extern "C" fn(*mut JitCtx) -> NativeResultPair`).
 //! - The native frame published here carries the exact register window and
 //!   the isolate-owned stub-table/registry addresses for the full call.
+//! - Post-entry feedback reconciliation and collector rewriting of a boxed
+//!   return/throw payload are one VM-owned transaction. The JIT never receives
+//!   a root token or observes an intermediate stale payload.
 //!
 //! # See also
 //! - [`super::abi`] defines the entry and context layouts.
@@ -156,30 +159,18 @@ pub(crate) unsafe fn enter_compiled(
             Ok(ret) => ret,
             Err(error) => return JitExecOutcome::Fatal(error),
         };
-        let status = ret.validate(NativeResultDomain::Compiled);
-        // Generated-feedback reconciliation can compile and collect after the
-        // native activation is unpublished. Keep boxed Return/Throw payloads
-        // in the interpreter's traced temporary-root arena across that cold
-        // work, then read the collector-rewritten value back.
-        let payload_root = if error.is_none()
-            && matches!(
-                status,
-                Some(NativeResultStatus::Success | NativeResultStatus::Throw)
-            ) {
-            // SAFETY: `vm` remains the exclusively borrowed interpreter for
-            // this entry transaction.
-            Some(unsafe { (*vm).jit_push_generated_result_root(ret.payload_value()) })
-        } else {
-            None
+        // Feedback repair may compile and collect after the native activation
+        // is unpublished. The VM owns that complete transaction and returns
+        // the same physical result carrier with any boxed payload rewritten by
+        // the collector.
+        let ret = match activation.finish_compiled_entry(ret, ctx.generated_feedback_clean == 0) {
+            Ok(ret) => ret,
+            Err(error) => return JitExecOutcome::Fatal(error),
         };
-        unsafe {
-            (*vm).jit_note_generated_feedback(ctx.generated_feedback_clean == 0);
-            (*vm).jit_reconcile_generated_feedback(&*activation.context_ptr());
-        }
-        let payload = payload_root.map(|root| unsafe { (*vm).jit_generated_result_root(root) });
-        let outcome = match status {
+        let status = ret.validate(NativeResultDomain::Compiled);
+        match status {
             Some(NativeResultStatus::Success) if error.is_none() => {
-                JitExecOutcome::Returned(payload.expect("return payload rooted"))
+                JitExecOutcome::Returned(ret.payload_value())
             }
             Some(NativeResultStatus::SideExit) if error.is_none() => match ret.logical_pc() {
                 Some(pc) if pc == native_frame.header.pc => {
@@ -189,7 +180,7 @@ pub(crate) unsafe fn enter_compiled(
                 Some(_) | None => JitExecOutcome::Fatal(VmError::InvalidOperand),
             },
             Some(NativeResultStatus::Throw) if error.is_none() => {
-                JitExecOutcome::Throw(payload.expect("throw payload rooted"))
+                JitExecOutcome::Throw(ret.payload_value())
             }
             Some(NativeResultStatus::Fatal) => {
                 JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand))
@@ -202,12 +193,6 @@ pub(crate) unsafe fn enter_compiled(
                 | NativeResultStatus::OutOfMemory,
             )
             | None => JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand)),
-        };
-        if let Some(root) = payload_root {
-            // SAFETY: LIFO token was created above on this interpreter and no
-            // caller can observe it before `enter_compiled` returns.
-            unsafe { (*vm).jit_release_generated_result_root(root) };
         }
-        outcome
     }
 }

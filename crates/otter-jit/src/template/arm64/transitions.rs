@@ -711,7 +711,7 @@ pub(super) fn emit_string_concat_alloc_call(
     dst: u16,
     lhs: u16,
     rhs: u16,
-    safepoint: otter_vm::SafepointId,
+    safepoint: otter_vm::native_abi::SafepointId,
     miss: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -764,7 +764,7 @@ pub(super) fn emit_array_construct_alloc_call(
     relocations: &mut RelocationCapture,
     dst: u16,
     length: Option<u16>,
-    safepoint: otter_vm::SafepointId,
+    safepoint: otter_vm::native_abi::SafepointId,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let descriptor = abi::STUB_ARRAY_CONSTRUCT_ALLOC;

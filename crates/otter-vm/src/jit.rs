@@ -23,6 +23,8 @@
 //!   generations and retained entry-cell tombstones.
 //! - Collector-owned receiver-allocation windows and immutable constructor
 //!   allocation plans used by generated fixed, spread, and superclass linkage.
+//! - [`VmRuntimeActivation`] owns the dynamic VM bridge, including the single
+//!   post-entry feedback/result transaction after generated execution.
 //!
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
@@ -49,6 +51,9 @@
 //! - Generated receiver allocation may mutate only the published nursery
 //!   window and its accounting words; every miss returns to the rooted VM
 //!   allocator before any constructor effect begins.
+//! - A compiled result crosses back as one `NativeResultPair`; only the VM may
+//!   root and collector-rewrite a validated Return/Throw payload while cold
+//!   feedback reconciliation runs.
 //!
 //! # See also
 //! - [`crate::execution_context`] for snapshot creation from frozen bytecode.
@@ -83,7 +88,8 @@ use crate::{
     CodeBlock, CodeBlockInstruction,
     feedback::ArithFeedback,
     native_abi::{
-        CodeDependency, CodeLifetimeState, NativeFrameKind, SafepointId, SafepointRecord,
+        CodeDependency, CodeLifetimeState, NativeFrameKind, NativeResultPair, SafepointId,
+        SafepointRecord,
     },
 };
 
@@ -1628,6 +1634,34 @@ impl VmRuntimeActivation {
     #[must_use]
     pub const fn frame_index(&self) -> usize {
         self.frame_index
+    }
+
+    /// Complete generated execution through the VM-owned post-entry boundary.
+    ///
+    /// This notes exact generated-call feedback, defers all cold work while a
+    /// parent native activation remains published, and at the outer boundary
+    /// returns the sole result carrier with any validated boxed Return/Throw
+    /// payload rewritten by the collector. The JIT never observes a temporary
+    /// root index or token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::VmError::InvalidOperand`] when the activation no longer
+    /// names its live interpreter or execution context.
+    #[doc(hidden)]
+    pub fn finish_compiled_entry(
+        &self,
+        result: NativeResultPair,
+        feedback_dirty: bool,
+    ) -> Result<NativeResultPair, crate::VmError> {
+        // SAFETY: `VmRuntimeActivation::new` stores frozen pointers for exactly
+        // this compiled-entry transaction; the JIT calls this only after its
+        // own native frame has been unpublished and before returning control.
+        let vm = unsafe { self.vm.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
+        // SAFETY: same dynamic activation contract; the immutable context
+        // outlives generated execution and the post-entry transaction.
+        let context = unsafe { self.context.as_ref() }.ok_or(crate::VmError::InvalidOperand)?;
+        vm.finish_compiled_entry_transaction(context, result, feedback_dirty)
     }
 
     /// Mirror non-lexical materialized call state into a fresh native frame.

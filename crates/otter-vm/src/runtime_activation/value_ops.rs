@@ -44,7 +44,7 @@ impl RuntimeCall<'_> {
             .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
         let flags = frame.header().flags;
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        if !flags.contains(crate::NativeFrameFlags::DERIVED_CONSTRUCTOR) {
+        if !flags.contains(crate::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR) {
             return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
@@ -496,8 +496,10 @@ mod tests {
     };
 
     use crate::{
-        ActivationStack, ExecutionContext, Interpreter, JitElementFamily, NativeFrame,
-        NativeFrameKind, Value, VmError, VmFrameHeader, VmRuntimeActivation, rooting::RootScopeExt,
+        ActivationStack, ExecutionContext, Interpreter, JitElementFamily, Value, VmError,
+        VmRuntimeActivation,
+        native_abi::{NativeFrame, NativeFrameKind, VmFrameHeader},
+        rooting::RootScopeExt,
     };
 
     use super::RuntimeCall;

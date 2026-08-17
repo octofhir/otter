@@ -52,8 +52,9 @@ use otter_bytecode::Function;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, VmFrameHeader,
-    abstract_ops, cold_frame::ColdFrameIdx, eval_env::EvalEnvHandle, upvalue_source::UpvalueSource,
+    CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, abstract_ops,
+    cold_frame::ColdFrameIdx, eval_env::EvalEnvHandle, native_abi::VmFrameHeader,
+    upvalue_source::UpvalueSource,
 };
 
 pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
@@ -97,7 +98,7 @@ impl OwnedRegisterSnapshot {
 ///
 /// Existing ActivationStack dispatch paths still own this compact record. New
 /// tier-neutral execution uses [`crate::ActiveFrameMut`] over the canonical
-/// [`crate::NativeFrame`] and its register window, so interpreter/baseline/
+/// [`crate::native_abi::NativeFrame`] and its register window, so interpreter/baseline/
 /// optimizer switches do not require constructing another Rust-owned frame.
 #[repr(C, align(8))]
 #[derive(Debug)]

@@ -62,8 +62,8 @@ fn an_exit_requested_in_a_timer_callback_completes_the_run_with_its_code() {
     let result = host
         .handle()
         .block_on(runtime.eval(SourceInput::from_javascript(
-            "setTimeout(() => { globalThis.process?.exit?.(7); throw { __exit: 7 }; }, 0); 'queued'",
-        )));
+        "setTimeout(() => { globalThis.process?.exit?.(7); throw { __exit: 7 }; }, 0); 'queued'",
+    )));
     // Without node modules there is no `process`; the throw above keeps the
     // test meaningful either way: with `process.exit` the run must complete
     // with code 7, without it the throw must fail the run.

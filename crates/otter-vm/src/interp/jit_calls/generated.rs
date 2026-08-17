@@ -23,9 +23,10 @@
 //! - [`crate::jit_registry`] — owns retained exact-generation entry cells.
 
 use crate::{
-    Interpreter, NativeFrame, NativeFrameFlags, NativeFrameKind, VmError,
+    Interpreter, VmError,
     jit::JitDirectCallKind,
     jit_debug::{JitDebugEvent, JitDebugTier},
+    native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind},
 };
 
 impl Interpreter {

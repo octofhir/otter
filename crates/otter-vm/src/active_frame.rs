@@ -332,8 +332,9 @@ impl<'a> ActiveFrameRef<'a> {
     }
 
     /// Direct-eval environment inherited by this activation, if any.
+    #[cfg(test)]
     #[must_use]
-    pub fn eval_env(&self) -> Option<EvalEnvHandle> {
+    pub(crate) fn eval_env(&self) -> Option<EvalEnvHandle> {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => {
                 (!frame.eval_env.is_null()).then_some(frame.eval_env)
@@ -384,7 +385,7 @@ impl<'a> ActiveFrameRef<'a> {
     /// Register-arena windows are traced by
     /// [`crate::register_stack::RegisterStack`] and must not call this method.
     /// Callers gate it with
-    /// [`crate::NativeFrameFlags::STACK_REGISTERS`] so each tagged register is
+    /// [`crate::native_abi::NativeFrameFlags::STACK_REGISTERS`] so each tagged register is
     /// visited exactly once.
     pub(crate) fn trace_stack_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let ActiveFrameRefInner::Native(native) = &self.inner else {
@@ -675,7 +676,7 @@ impl<'a> ActiveFrameMut<'a> {
 
     /// Direct-eval environment inherited by this activation, if any.
     #[must_use]
-    pub fn eval_env(&self) -> Option<EvalEnvHandle> {
+    pub(crate) fn eval_env(&self) -> Option<EvalEnvHandle> {
         match &self.inner {
             ActiveFrameMutInner::Materialized { frame, .. } => {
                 (!frame.eval_env.is_null()).then_some(frame.eval_env)

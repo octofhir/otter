@@ -29,8 +29,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use otter_vm::{
-    JitArtifactMetadata, JitDebugTarget, JitDebugTier, SafepointRecord, TaggedLocationKind,
+    JitArtifactMetadata, JitDebugTarget, JitDebugTier,
     deopt::DeoptTable,
+    native_abi::{SafepointRecord, TaggedLocationKind},
 };
 use yaxpeax_arch::{Arch, Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::ARMv8;
@@ -642,8 +643,9 @@ fn read_word(code: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use otter_vm::{
-        JitDebugTarget, JitDebugTier, TaggedLocation,
+        JitDebugTarget, JitDebugTier,
         deopt::{DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, FrameState},
+        native_abi::TaggedLocation,
     };
 
     use super::*;

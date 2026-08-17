@@ -775,7 +775,7 @@ fn path_arg(
     index: usize,
     name: &'static str,
 ) -> Result<PathBuf, NativeError> {
-    let path = crate::arg_string(args, index, name, ctx.heap())?;
+    let path = crate::arg_string(ctx, args, index, name)?;
     if path.is_empty() {
         return Err(crate::type_error(name, "path is required"));
     }

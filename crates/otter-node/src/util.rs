@@ -73,7 +73,7 @@ fn proxy_details(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn typed_arrays_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let heap = ctx.heap_mut();
+    let heap = ctx.heap();
     let Some(left) = args.first().and_then(|value| value.as_typed_array(heap)) else {
         return Ok(Value::number_i32(0));
     };
@@ -155,7 +155,6 @@ fn typed_array_bytes_equal(kind: TypedArrayKind, left: &[u8], right: &[u8]) -> b
 fn float16_is_nan(bits: u16) -> bool {
     bits & 0x7c00 == 0x7c00 && bits & 0x03ff != 0
 }
-
 
 /// Hosted `internal/otter/natives` — the native helpers the compat realm's
 /// `internalBinding('util')` forwards to. Kept as one narrow module so the

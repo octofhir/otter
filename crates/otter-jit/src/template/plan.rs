@@ -25,7 +25,10 @@
 
 use otter_bytecode::opcode_schema::{RegisterAccess, register_access_at};
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
+use otter_vm::{
+    JitCompileSnapshot, Value,
+    native_abi::{SafepointId, SafepointRecord},
+};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 

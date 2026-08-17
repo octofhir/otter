@@ -428,7 +428,8 @@ class WriteStream extends Writable {
       const all = Buffer.concat(this._chunks);
       if (this._append) appendFileSync(this.path, all);
       else writeFileSync(this.path, all);
-      this.emit('close');
+      // 'close' comes from the stream machinery's autoDestroy after finish;
+      // emitting it here doubled the event.
       cb();
     } catch (err) { cb(err); }
   }

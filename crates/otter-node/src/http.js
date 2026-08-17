@@ -465,6 +465,21 @@ OutgoingMessage.prototype._final = function _final(callback) {
 
 OutgoingMessage.prototype._finished = function _finished() {};
 
+// `end()` marks the message finished synchronously, and `writable` stays
+// `true` after a finished send — both are load-bearing Node quirks
+// (nodejs/node#15029) the corpus asserts.
+OutgoingMessage.prototype.end = function end(chunk, encoding, callback) {
+  Writable.prototype.end.call(this, chunk, encoding, callback);
+  this.finished = true;
+  return this;
+};
+
+Object.defineProperty(OutgoingMessage.prototype, 'writable', {
+  get() { return !this.destroyed; },
+  set(_v) {},
+  configurable: true,
+});
+
 // `internal/http` exposes the raw header table under this symbol; tests read
 // entries as `[Name, value]` pairs keyed by the lowercased name.
 const kOutHeaders = Symbol('kOutHeaders');
@@ -595,7 +610,20 @@ Server.prototype.setTimeout = function setTimeout(timeout, callback) {
 Server.prototype.ref = function ref() { this._socket.ref(); return this; };
 Server.prototype.unref = function unref() { this._socket.unref(); return this; };
 
+Server.prototype.closeIdleConnections = function closeIdleConnections() {
+  for (const socket of this._connectionSockets ?? []) {
+    if ((socket._httpActiveRequests ?? 0) === 0) socket.destroy();
+  }
+};
+
+Server.prototype.closeAllConnections = function closeAllConnections() {
+  for (const socket of this._connectionSockets ?? []) socket.destroy();
+};
+
 Server.prototype._connection = function _connection(socket) {
+  (this._connectionSockets ??= new Set()).add(socket);
+  socket.once('close', () => this._connectionSockets.delete(socket));
+  socket._httpActiveRequests = 0;
   this.emit('connection', socket);
   if (this.timeout > 0) socket.setTimeout(this.timeout);
   let request = null;
@@ -614,6 +642,8 @@ Server.prototype._connection = function _connection(socket) {
       request = new IncomingMessage(socket);
       request._adopt(message);
       const response = new ServerResponse(socket, request);
+      socket._httpActiveRequests += 1;
+      response.once('finish', () => { socket._httpActiveRequests -= 1; });
       response.shouldKeepAlive = keepAlive(message);
       // An HTTP/1.0 requester does not understand chunks; its response body
       // runs to the end of the connection instead.

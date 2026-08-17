@@ -323,6 +323,10 @@ function OutgoingMessage(socket) {
   this.connection = socket;
   this.headersSent = false;
   this.finished = false;
+  this._batch = null;
+  this._ending = false;
+  this._tail = null;
+  this._last = false;
   this.sendDate = true;
   this.chunkedEncoding = false;
   this._headers = new Map();
@@ -403,6 +407,14 @@ OutgoingMessage.prototype._decideFraming = function _decideFraming() {
     this.chunkedEncoding = false;
     return;
   }
+  // An explicit user-set Transfer-Encoding: chunked frames the body even for
+  // a peer that would not get chunks by default.
+  const te = this._headers.get('transfer-encoding');
+  if (te !== undefined) {
+    const value = Array.isArray(te[1]) ? te[1].join(',') : te[1];
+    this.chunkedEncoding = /(?:^|\W)chunked(?:$|\W)/i.test(String(value));
+    return;
+  }
   if (this.useChunkedEncodingByDefault === false) {
     this.chunkedEncoding = false;
     return;
@@ -428,19 +440,36 @@ OutgoingMessage.prototype._send = function _send(data, encoding, callback) {
   return true;
 };
 
+// Everything one message write produces — header block, chunk framing, body —
+// leaves in a single socket.write. Node flushes head plus first chunk with one
+// writev, and corpus clients count the packets; separate writes race the
+// client's 'data' events apart.
+OutgoingMessage.prototype._raw = function _raw(data) {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
+  if (this._batch) this._batch.push(buf);
+  else this.socket.write(buf);
+};
+
 OutgoingMessage.prototype._write = function _write(chunk, encoding, callback) {
   // A peer that tore the connection down mid-response makes every further
   // write meaningless, not an uncaught error; Node's socket swallows them
   // through its own error listener.
   if (!this.socket || this.socket.destroyed) { callback(); return; }
-  if (!this.headersSent) this._sendHeaders();
   const body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding || 'utf8');
+  const parts = this._batch = [];
+  if (!this.headersSent) this._sendHeaders();
   if (this.chunkedEncoding) {
-    this.socket.write(`${body.length.toString(16)}\r\n`);
-    this.socket.write(body);
-    this.socket.write('\r\n');
+    parts.push(Buffer.from(`${body.length.toString(16)}\r\n`), body, Buffer.from('\r\n'));
   } else {
-    this.socket.write(body);
+    parts.push(body);
+  }
+  this._batch = null;
+  if (this._ending) {
+    // The chunk passed to end() shares its packet with whatever _final adds
+    // (the chunked terminator) — Node flushes them with one writev.
+    (this._tail ??= []).push(...parts);
+  } else {
+    this.socket.write(parts.length === 1 ? parts[0] : Buffer.concat(parts));
   }
   callback();
 };
@@ -453,8 +482,10 @@ OutgoingMessage.prototype._final = function _final(callback) {
   }
   // A message that ends without a body announces an exact zero length
   // instead of an empty chunked stream, except where a body is forbidden
-  // outright (1xx/204/304 responses).
+  // outright (1xx/204/304 responses) or the peer cannot take chunks anyway —
+  // there the body is delimited by the connection closing, unannounced.
   if (!this.headersSent &&
+      this.useChunkedEncodingByDefault !== false &&
       !this._headers.has('content-length') &&
       !this._headers.has('transfer-encoding')) {
     const code = this.statusCode;
@@ -464,12 +495,24 @@ OutgoingMessage.prototype._final = function _final(callback) {
       this._headers.set('content-length', ['Content-Length', '0']);
     }
   }
-  if (!this.headersSent) this._sendHeaders();
+  const parts = this._batch = this._tail ?? [];
+  this._tail = null;
+  if (!this.headersSent) {
+    // The header block leads the packet even when end()'s chunk was staged
+    // first.
+    const staged = parts.splice(0);
+    this._sendHeaders();
+    parts.push(...staged);
+  }
   if (this.chunkedEncoding) {
     const trailers = this._trailers
       .map(([name, value]) => `${name}: ${value}\r\n`)
       .join('');
-    this.socket.write(`0\r\n${trailers}\r\n`);
+    parts.push(Buffer.from(`0\r\n${trailers}\r\n`));
+  }
+  this._batch = null;
+  if (parts.length > 0) {
+    this.socket.write(parts.length === 1 ? parts[0] : Buffer.concat(parts));
   }
   this.finished = true;
   this._finished();
@@ -482,6 +525,7 @@ OutgoingMessage.prototype._finished = function _finished() {};
 // `true` after a finished send — both are load-bearing Node quirks
 // (nodejs/node#15029) the corpus asserts.
 OutgoingMessage.prototype.end = function end(chunk, encoding, callback) {
+  this._ending = true;
   Writable.prototype.end.call(this, chunk, encoding, callback);
   this.finished = true;
   return this;
@@ -548,30 +592,55 @@ ServerResponse.prototype._sendHeaders = function _sendHeaders() {
   if (this.sendDate && !this._headers.has('date')) {
     this._headers.set('date', ['Date', new Date().toUTCString()]);
   }
-  // Framing is decided before the Connection header is chosen but written
-  // after it, matching Node's injected-header order (Date, Connection,
-  // Transfer-Encoding). A response with neither a length nor chunks is
-  // delimited by the connection closing, so it cannot keep the socket alive.
-  const hadTransferEncoding = this._headers.has('transfer-encoding');
-  this._decideFraming();
-  if (!this.chunkedEncoding && !this._headers.has('content-length')) {
+  // Node's keep-alive contract, decided when the header block flushes:
+  // an explicit user Connection header wins outright; otherwise the
+  // connection persists only when the peer gave us a way to frame the body
+  // (a user Content-Length, or chunked capability). `_last` — destroy after
+  // this response — is separate from the header: a connection-delimited
+  // body closes the socket even under a user-supplied keep-alive header.
+  const code = this.statusCode;
+  const hasBody = !(code === 204 || code === 304 || (code >= 100 && code < 200) ||
+    this._request?.method === 'HEAD');
+  // A bodiless status given a user Transfer-Encoding cannot chunk; Node
+  // drops the framing and closes the connection instead (RFC 9110 §6.4.1).
+  if (!hasBody && this._headers.has('transfer-encoding')) {
     this.shouldKeepAlive = false;
   }
-  if (!this._headers.has('connection')) {
+  const conn = this._headers.get('connection');
+  if (conn !== undefined) {
+    const value = String(Array.isArray(conn[1]) ? conn[1].join(',') : conn[1]);
+    if (/(?:^|\W)close(?:$|\W)/i.test(value)) this._last = true;
+    else if (/(?:^|\W)keep-alive(?:$|\W)/i.test(value)) this.shouldKeepAlive = true;
+  } else {
+    const sendKeepAlive = this.shouldKeepAlive &&
+      (this._headers.has('content-length') || this.useChunkedEncodingByDefault);
+    if (!sendKeepAlive) this._last = true;
     this._headers.set('connection', ['Connection',
-      this.shouldKeepAlive ? 'keep-alive' : 'close']);
+      sendKeepAlive ? 'keep-alive' : 'close']);
   }
-  if (this.chunkedEncoding && !hadTransferEncoding) {
-    // Re-insert so the block reads Connection before Transfer-Encoding.
-    this._headers.delete('transfer-encoding');
-    this._headers.set('transfer-encoding', ['Transfer-Encoding', 'chunked']);
+  if (hasBody) {
+    const hadTransferEncoding = this._headers.has('transfer-encoding');
+    this._decideFraming();
+    if (!this.chunkedEncoding && !this._headers.has('content-length')) {
+      // No framing at all: the body runs to the end of the connection.
+      this._last = true;
+    }
+    if (this.chunkedEncoding && !hadTransferEncoding) {
+      // Re-insert so the block reads Connection before Transfer-Encoding.
+      this._headers.delete('transfer-encoding');
+      this._headers.set('transfer-encoding', ['Transfer-Encoding', 'chunked']);
+    }
+  } else {
+    this.chunkedEncoding = false;
   }
-  this.socket.write(this._headerBlock(`HTTP/1.1 ${this.statusCode} ${message}`));
+  this._raw(this._headerBlock(`HTTP/1.1 ${this.statusCode} ${message}`));
 };
 
+// 'finish' itself comes from the stream machinery on the next tick — a
+// synchronous emit here would let close() reap the connection as idle while
+// the request handler is still running.
 ServerResponse.prototype._finished = function _finished() {
-  this.emit('finish');
-  if (!this.shouldKeepAlive) this.socket.end();
+  if (this._last) this.socket.end();
 };
 
 // ------------------------------------------------------------------ server ---
@@ -607,8 +676,10 @@ Server.prototype.address = function address() {
 };
 
 Server.prototype.close = function close(callback) {
-  // Since Node 19 `close` also ends idle keep-alive connections; only
-  // in-flight requests hold their sockets open.
+  // Since Node 19 `close` also ends idle keep-alive connections; a socket
+  // with a request in flight ends when that response finishes instead of
+  // waiting out its keep-alive window.
+  this._closing = true;
   this.closeIdleConnections();
   this._socket.close(callback);
   return this;
@@ -663,17 +734,20 @@ Server.prototype._connection = function _connection(socket) {
       socket.setTimeout(0);
       response.once('finish', () => {
         socket._httpActiveRequests -= 1;
-        // An idle kept-alive connection lives keepAliveTimeout, then goes.
-        if (socket._httpActiveRequests === 0 && response.shouldKeepAlive &&
-            this.keepAliveTimeout > 0 && !socket.destroyed) {
+        if (socket._httpActiveRequests > 0 || socket.destroyed) return;
+        // An idle kept-alive connection lives keepAliveTimeout, then goes;
+        // a `_last` response already ended the socket itself.
+        if (!response._last && this.keepAliveTimeout > 0) {
           socket.setTimeout(this.keepAliveTimeout, () => socket.destroy());
         }
       });
       response.shouldKeepAlive = keepAlive(message);
-      // An HTTP/1.0 requester does not understand chunks; its response body
-      // runs to the end of the connection instead.
+      // An HTTP/1.0 requester does not understand chunks — unless it said
+      // `TE: chunked` — so its response body otherwise runs to the end of
+      // the connection instead.
       response.useChunkedEncodingByDefault =
-        message.httpVersionMajor === 1 && message.httpVersionMinor >= 1;
+        (message.httpVersionMajor === 1 && message.httpVersionMinor >= 1) ||
+        /(?:^|\W)chunked(?:$|\W)/i.test(String(message.headers.te ?? ''));
       const expects = String(message.headers.expect ?? '').toLowerCase();
       if (expects === '100-continue') {
         if (this.listenerCount('checkContinue') > 0) {
@@ -803,6 +877,9 @@ ClientRequest.prototype._listen = function _listen() {
       }
     },
     head: (message) => {
+      // The server must agree to keep-alive; a response that says close (or
+      // an HTTP/1.0 one that stays silent) makes the socket single-use.
+      if (this.shouldKeepAlive && !keepAlive(message)) this.shouldKeepAlive = false;
       response = new IncomingMessage(this.socket);
       response._adopt(message);
       this.res = response;
@@ -895,8 +972,12 @@ ClientRequest.prototype._sendHeaders = function _sendHeaders() {
   if (!this._headers.has('connection')) {
     this._headers.set('connection', ['Connection',
       this.shouldKeepAlive ? 'keep-alive' : 'close']);
+  } else if (/\bclose\b/i.test(String(this._headers.get('connection')[1]))) {
+    // An explicit Connection: close promises the peer this socket dies with
+    // the exchange — it must not go back to the pool.
+    this.shouldKeepAlive = false;
   }
-  this.socket.write(this._headerBlock(`${this.method} ${this.path} HTTP/1.1`));
+  this._raw(this._headerBlock(`${this.method} ${this.path} HTTP/1.1`));
 };
 
 ClientRequest.prototype.abort = function abort() {

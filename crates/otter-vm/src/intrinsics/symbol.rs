@@ -274,7 +274,9 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     };
 
     let well_known_pairs: &[(&'static str, WellKnown)] = &[
+        ("asyncDispose", WellKnown::AsyncDispose),
         ("asyncIterator", WellKnown::AsyncIterator),
+        ("dispose", WellKnown::Dispose),
         ("hasInstance", WellKnown::HasInstance),
         ("isConcatSpreadable", WellKnown::IsConcatSpreadable),
         ("iterator", WellKnown::Iterator),

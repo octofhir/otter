@@ -397,9 +397,15 @@ impl JsSymbol {
 /// (ECMA-262 §6.1.5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WellKnown {
+    /// `@@asyncDispose` — async explicit-resource-management hook
+    /// (`await using`). Spec §6.1.5.1.
+    AsyncDispose,
     /// `@@asyncIterator` — iterator factory for `for await … of`.
     /// Spec §27.1.2.1.
     AsyncIterator,
+    /// `@@dispose` — explicit-resource-management hook (`using`).
+    /// Spec §6.1.5.1.
+    Dispose,
     /// `@@hasInstance` — `instanceof` override. Spec §22.2.1.2.
     HasInstance,
     /// `@@isConcatSpreadable` — `Array.prototype.concat` spread
@@ -437,7 +443,9 @@ impl WellKnown {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            WellKnown::AsyncDispose => "asyncDispose",
             WellKnown::AsyncIterator => "asyncIterator",
+            WellKnown::Dispose => "dispose",
             WellKnown::HasInstance => "hasInstance",
             WellKnown::IsConcatSpreadable => "isConcatSpreadable",
             WellKnown::Iterator => "iterator",
@@ -459,7 +467,9 @@ impl WellKnown {
     #[must_use]
     pub const fn description_text(self) -> &'static str {
         match self {
+            WellKnown::AsyncDispose => "Symbol.asyncDispose",
             WellKnown::AsyncIterator => "Symbol.asyncIterator",
+            WellKnown::Dispose => "Symbol.dispose",
             WellKnown::HasInstance => "Symbol.hasInstance",
             WellKnown::IsConcatSpreadable => "Symbol.isConcatSpreadable",
             WellKnown::Iterator => "Symbol.iterator",
@@ -479,7 +489,9 @@ impl WellKnown {
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
+            "asyncDispose" => WellKnown::AsyncDispose,
             "asyncIterator" => WellKnown::AsyncIterator,
+            "dispose" => WellKnown::Dispose,
             "hasInstance" => WellKnown::HasInstance,
             "isConcatSpreadable" => WellKnown::IsConcatSpreadable,
             "iterator" => WellKnown::Iterator,
@@ -501,7 +513,9 @@ impl WellKnown {
     #[must_use]
     pub const fn all() -> &'static [WellKnown] {
         &[
+            WellKnown::AsyncDispose,
             WellKnown::AsyncIterator,
+            WellKnown::Dispose,
             WellKnown::HasInstance,
             WellKnown::IsConcatSpreadable,
             WellKnown::Iterator,

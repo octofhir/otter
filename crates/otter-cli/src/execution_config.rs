@@ -99,12 +99,47 @@ impl CliExecutionConfig {
         self.expose_gc = expose;
     }
 
+    /// The node-style engine flags this process is running with, in the
+    /// spelling `process.execArgv` reports so a flag-checking harness or a
+    /// `spawn(process.execPath, [...process.execArgv, ...])` re-exec
+    /// reproduces the configuration.
+    fn exec_argv(&self) -> Vec<String> {
+        let w = &self.warning_options;
+        let mut argv = Vec::new();
+        if self.expose_gc {
+            argv.push("--expose-gc".to_string());
+        }
+        if w.no_warnings {
+            argv.push("--no-warnings".to_string());
+        }
+        if w.no_deprecation {
+            argv.push("--no-deprecation".to_string());
+        }
+        if w.throw_deprecation {
+            argv.push("--throw-deprecation".to_string());
+        }
+        if w.trace_warnings {
+            argv.push("--trace-warnings".to_string());
+        }
+        if w.pending_deprecation {
+            argv.push("--pending-deprecation".to_string());
+        }
+        for code in &w.disabled {
+            argv.push(format!("--disable-warning={code}"));
+        }
+        if let Some(title) = &self.process_title {
+            argv.push(format!("--title={title}"));
+        }
+        argv
+    }
+
     pub(crate) fn apply_otter_builder(&self, builder: OtterBuilder) -> OtterBuilder {
         let mut builder = builder
             .jit_selection(self.jit_selection)
             .jit_debug(self.jit_debug_request())
             .warning_options(self.warning_options.clone())
             .process_title(self.process_title.clone())
+            .process_exec_argv(self.exec_argv())
             .expose_gc(self.expose_gc);
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
@@ -346,6 +381,9 @@ mod tests {
             jit_artifacts_target: None,
             jit_selection: JitSelection::InterpreterOnly,
             jit_osr_threshold: None,
+            warning_options: WarningOptions::default(),
+            process_title: None,
+            expose_gc: false,
         };
         let disabled = CliExecutionConfig {
             timeout: Some(Duration::ZERO),
@@ -364,6 +402,9 @@ mod tests {
             jit_artifacts_target: None,
             jit_selection: JitSelection::InterpreterOnly,
             jit_osr_threshold: None,
+            warning_options: WarningOptions::default(),
+            process_title: None,
+            expose_gc: false,
         };
         target.clear();
         assert_eq!(config.trace_target.as_deref(), Some("trace.log"));
@@ -386,6 +427,9 @@ mod tests {
             jit_artifacts_target: None,
             jit_selection: JitSelection::Template,
             jit_osr_threshold: Some(1),
+            warning_options: WarningOptions::default(),
+            process_title: None,
+            expose_gc: false,
         };
         target.clear();
         assert!(config.jit_events_enabled());
@@ -399,6 +443,9 @@ mod tests {
             jit_artifacts_target: Some("jit-artifacts".to_string()),
             jit_selection: JitSelection::Template,
             jit_osr_threshold: Some(1),
+            warning_options: WarningOptions::default(),
+            process_title: None,
+            expose_gc: false,
         };
         assert!(artifacts.jit_artifacts_enabled());
         assert!(!artifacts.jit_events_enabled());

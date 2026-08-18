@@ -42,6 +42,7 @@ pub(crate) fn default_cwd() -> PathBuf {
 pub(crate) fn install_global(
     interp: &mut Interpreter,
     process_argv: &[String],
+    process_exec_argv: &[String],
     process_cwd: &Path,
     process_env_overlay: &std::collections::BTreeMap<String, String>,
     capabilities: &CapabilitySet,
@@ -104,7 +105,11 @@ pub(crate) fn install_global(
                     scope.set_index(argv, index, arg)?;
                 }
                 scope.set(process, "argv", argv)?;
-                let exec_argv = scope.array(0)?;
+                let exec_argv = scope.array(process_exec_argv.len())?;
+                for (index, flag) in process_exec_argv.iter().enumerate() {
+                    let flag = scope.string(flag)?;
+                    scope.set_index(exec_argv, index, flag)?;
+                }
                 scope.set(process, "execArgv", exec_argv)?;
 
                 for (name, value) in [

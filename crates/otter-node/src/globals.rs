@@ -17,6 +17,18 @@ fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
     runtime.install_script(SourceInput::from_javascript(concat!(
         "Object.defineProperty(globalThis, Symbol.toStringTag, { value: 'global', configurable: true });\n\
          Object.defineProperty(globalThis, 'global', { value: globalThis, writable: true, configurable: true });\n\
+         if (typeof process === 'object' && process.ref === undefined) {\n\
+           const refSymbol = Symbol.for('nodejs.ref');\n\
+           const unrefSymbol = Symbol.for('nodejs.unref');\n\
+           process.ref = (maybeRefable) => {\n\
+             const fn = maybeRefable?.[refSymbol] ?? maybeRefable?.ref;\n\
+             if (typeof fn === 'function') fn.call(maybeRefable);\n\
+           };\n\
+           process.unref = (maybeRefable) => {\n\
+             const fn = maybeRefable?.[unrefSymbol] ?? maybeRefable?.unref;\n\
+             if (typeof fn === 'function') fn.call(maybeRefable);\n\
+           };\n\
+         }\n\
          if (typeof process === 'object' && process.report === undefined) {\n\
            process.report = {\n\
              getReport() { return { header: {}, javascriptStack: {}, libuv: [], workers: [], environmentVariables: {}, sharedObjects: [] }; },\n\

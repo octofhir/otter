@@ -147,3 +147,4 @@ exports.run = function run(fn, ...args) {
 };
 
 globalThis.__otterDomainModule = exports;
+Object.defineProperty(globalThis, '__otterDomainModule', { enumerable: false });

@@ -1794,6 +1794,7 @@ fn run_isolate(
         module_task_handle,
         deferred_commands: VecDeque::new(),
         fatal_task_error: None,
+        exit_finalized: false,
         shutdown: false,
     };
     runner.run_until_idle();
@@ -2012,6 +2013,11 @@ struct IsolateRunner {
     /// exception. Without a waiter it is reported to stderr instead of being
     /// dropped.
     fatal_task_error: Option<OtterError>,
+    /// Set once the `'exit'` event has been emitted for the current run.
+    /// Node's process is gone after its exit listeners return, so callbacks a
+    /// listener scheduled — or timers still in flight — must never run.
+    /// Cleared when the next command starts a fresh run.
+    exit_finalized: bool,
     shutdown: bool,
 }
 
@@ -2107,6 +2113,16 @@ impl IsolateRunner {
                 TickOutcome::Processed
             }
             RuntimeMessage::RuntimeTask { task, liveness } => {
+                if self.exit_finalized {
+                    // The 'exit' event already ran; a task landing now belongs
+                    // to a process that no longer exists in Node terms.
+                    decrement_liveness(
+                        liveness,
+                        &self.counters.pending_ref_host_ops,
+                        &self.counters.pending_unref_host_ops,
+                    );
+                    return TickOutcome::Processed;
+                }
                 let result = task.run(&mut self.runtime);
                 decrement_liveness(
                     liveness,
@@ -2143,6 +2159,20 @@ impl IsolateRunner {
                 // The class may have moved between posting and processing;
                 // the map holds the class whose counter is still held.
                 let liveness = self.counters.timer_class(token.0);
+                if self.exit_finalized && expects_js_callback {
+                    // See the RuntimeTask branch: after the 'exit' event no
+                    // scheduled callback may run.
+                    let liveness = self
+                        .counters
+                        .timer_take(token.0)
+                        .unwrap_or(RuntimeLiveness::Ref);
+                    decrement_liveness(
+                        liveness,
+                        &self.counters.pending_ref_timers,
+                        &self.counters.pending_unref_timers,
+                    );
+                    return TickOutcome::Processed;
+                }
                 if !expects_js_callback {
                     self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
                     decrement_liveness(
@@ -2324,6 +2354,8 @@ impl IsolateRunner {
     fn run_command(&mut self, command: RuntimeCommand) {
         self.counters.running_command.store(true, Ordering::Relaxed);
         self.runtime.interrupt_handle().reset();
+        // A new command is a fresh run; its callbacks are live again.
+        self.exit_finalized = false;
         match command {
             RuntimeCommand::CheckFile { path, reply, .. } => {
                 // Compile-only, no event loop driving needed.
@@ -2332,6 +2364,7 @@ impl IsolateRunner {
             RuntimeCommand::RunFile { path, reply, .. } => {
                 let result = self.runtime.run_file(path);
                 let result = self.drive_event_loop_to_idle(result);
+                let result = self.finalize_process_exit(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
@@ -2343,6 +2376,7 @@ impl IsolateRunner {
             } => {
                 let result = self.runtime.run_script(source, &specifier);
                 let result = self.drive_event_loop_to_idle(result);
+                let result = self.finalize_process_exit(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
@@ -2369,12 +2403,14 @@ impl IsolateRunner {
             RuntimeCommand::RunModule { linked, reply, .. } => {
                 let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
+                let result = self.finalize_process_exit(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::RunModuleSource { linked, reply, .. } => {
                 let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
+                let result = self.finalize_process_exit(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
@@ -2392,6 +2428,7 @@ impl IsolateRunner {
             RuntimeCommand::Eval { source, reply, .. } => {
                 let result = self.runtime.eval(source);
                 let result = self.drive_event_loop_to_idle(result);
+                let result = self.finalize_process_exit(result);
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
@@ -2412,6 +2449,59 @@ impl IsolateRunner {
     /// timers are not run because the reply already carries the
     /// failure. Cancellation of leftover timers happens
     /// out-of-band when [`crate::Runtime`] drops.
+    /// Emit `'beforeExit'` with the current `process.exitCode`. Answers
+    /// `Ok(Some(code))` when a listener called `process.exit(code)` (the run
+    /// completes with that code), `Ok(None)` on a normal return, and `Err`
+    /// when a listener threw — an uncaught exception, exactly as in Node.
+    fn emit_before_exit(&mut self) -> Result<Option<u8>, OtterError> {
+        let script = "typeof process === 'object' && typeof process.emit === 'function' \
+            ? (process.emit('beforeExit', typeof process.exitCode === 'number' ? process.exitCode : 0), 0) \
+            : 0";
+        match self.runtime.eval(SourceInput::from_javascript(script)) {
+            Ok(result) if result.explicit_exit() => Ok(Some(result.exit_code())),
+            Ok(_) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Fire the process `'exit'` event exactly once after a run completes and
+    /// fold a listener's replacement code into the result. Runs the hook as a
+    /// bare script — never through [`Self::drive_event_loop_to_idle`] — so a
+    /// handle the run left open cannot stall completion.
+    fn finalize_process_exit(
+        &mut self,
+        result: Result<ExecutionResult, OtterError>,
+    ) -> Result<ExecutionResult, OtterError> {
+        let Ok(inner) = result else {
+            return result;
+        };
+        // From here on the run is over in Node terms: callbacks scheduled by
+        // an exit listener, and timers still in flight, must never execute.
+        self.exit_finalized = true;
+        let code = inner.exit_code();
+        let script = format!(
+            "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}) : {code}"
+        );
+        match self.runtime.eval(SourceInput::from_javascript(script)) {
+            Ok(emit_result) => {
+                // Normal completion answers the hook's final code as the
+                // completion value; a nested `process.exit(newCode)` in a
+                // listener surfaces as an exit-shaped result whose own code
+                // is the replacement.
+                let final_code = emit_result
+                    .completion_string()
+                    .parse::<i64>()
+                    .ok()
+                    .map(|value| value.clamp(0, 255) as u8)
+                    .unwrap_or_else(|| emit_result.exit_code());
+                Ok(inner.with_exit_code(final_code))
+            }
+            // An uncaught throw in an exit listener fails the run the way
+            // Node's does.
+            Err(error) => Err(error),
+        }
+    }
+
     fn drive_event_loop_to_idle(
         &mut self,
         initial: Result<ExecutionResult, OtterError>,
@@ -2444,7 +2534,42 @@ impl IsolateRunner {
             let pending_ref_timers = self.counters.pending_ref_timers.load(Ordering::Relaxed);
             let pending_ref_host_ops = self.counters.pending_ref_host_ops.load(Ordering::Relaxed);
             if pending_ref_timers == 0 && pending_ref_host_ops == 0 {
-                return initial;
+                // The loop drained without an explicit exit: Node emits
+                // `'beforeExit'` here, and a listener may revive the loop by
+                // scheduling new work. An exit-shaped completion skips it.
+                let explicit = initial
+                    .as_ref()
+                    .map(ExecutionResult::explicit_exit)
+                    .unwrap_or(true);
+                if explicit || self.exit_finalized {
+                    return initial;
+                }
+                match self.emit_before_exit() {
+                    Ok(Some(code)) => {
+                        let duration = initial
+                            .as_ref()
+                            .map(|result| result.duration)
+                            .unwrap_or_default();
+                        return Ok(ExecutionResult::from_exit_code(code, duration));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
+                }
+                if let Some(code) = self.runtime.take_pending_exit_code() {
+                    let duration = initial
+                        .as_ref()
+                        .map(|result| result.duration)
+                        .unwrap_or_default();
+                    return Ok(ExecutionResult::from_exit_code(code, duration));
+                }
+                let timers = self.counters.pending_ref_timers.load(Ordering::Relaxed);
+                let host_ops = self.counters.pending_ref_host_ops.load(Ordering::Relaxed);
+                if timers == 0 && host_ops == 0 {
+                    return initial;
+                }
+                // A listener scheduled new work — keep driving; the event
+                // re-fires on the next drain, exactly as Node's does.
+                continue;
             }
             // Block on the next inbox item. A later public command is deferred
             // until this command's Ref'd work finishes: recursively running it

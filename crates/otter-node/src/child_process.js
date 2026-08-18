@@ -427,3 +427,8 @@ function fork(modulePath, args, options) {
 module.exports = {
   spawn, spawnSync, exec, execSync, execFile, execFileSync, fork, ChildProcess,
 };
+
+// Host-dispatch hooks stay off the enumerable global surface: Node's
+// test harness treats any enumerable global it does not know as a leak.
+Object.defineProperty(globalThis, '__otterChildExit', { enumerable: false });
+Object.defineProperty(globalThis, '__otterChildIpc', { enumerable: false });

@@ -1181,7 +1181,13 @@ if (!Buffer) {
     enumerable: false,
   });
 
-  if (typeof globalThis !== 'undefined') globalThis.Buffer = Buffer;
+  if (typeof globalThis !== 'undefined') {
+    // Node's Buffer global is non-enumerable; the harness leak check walks
+    // for..in over globalThis.
+    Object.defineProperty(globalThis, 'Buffer', {
+      value: Buffer, writable: true, enumerable: false, configurable: true,
+    });
+  }
 }
 
 const constants = { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 0x1fffffe8 };

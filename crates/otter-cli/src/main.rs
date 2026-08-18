@@ -565,7 +565,7 @@ async fn main() -> ExitCode {
     }
 
     if inline_eval.is_some() || inline_print.is_some() {
-        if cli.command.is_some() || !cli.args.is_empty() || dump_mode.is_some() {
+        if cli.command.is_some() || dump_mode.is_some() {
             eprintln!("error: inline eval/print cannot be combined with a subcommand or file path");
             return ExitCode::from(2);
         }
@@ -574,7 +574,18 @@ async fn main() -> ExitCode {
             (None, Some(source)) => (source, true),
             _ => unreachable!("checked conflicting inline eval modes above"),
         };
-        let result = run_eval(source, print, json, &caps, &execution, &startup_timer).await;
+        // Node keeps extra positionals as `process.argv` entries after the
+        // exec path rather than refusing them.
+        let result = run_eval(
+            source,
+            print,
+            &cli.args,
+            json,
+            &caps,
+            &execution,
+            &startup_timer,
+        )
+        .await;
         startup_timer.finish();
         return exit_from_result(result, json);
     }
@@ -607,6 +618,7 @@ async fn main() -> ExitCode {
             run_eval(
                 &args.expression,
                 args.print,
+                &[],
                 json,
                 &caps,
                 &execution,
@@ -1800,19 +1812,31 @@ fn candidate_list<'a>(items: impl Iterator<Item = &'a String>) -> String {
 async fn run_eval(
     source: &str,
     print: bool,
+    extra_args: &[String],
     json: bool,
     caps: &CapabilitySet,
     execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
-    let otter = cli_otter_builder(caps, execution).build()?;
+    let mut argv = Vec::with_capacity(extra_args.len() + 1);
+    argv.push(
+        std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "otter".to_string()),
+    );
+    argv.extend(extra_args.iter().cloned());
+    let otter = cli_otter_builder(caps, execution)
+        .process_argv(argv)
+        .build()?;
     startup_timer.mark("runtime_build");
     let attempt = otter.eval_with_diagnostics(source).await;
     let result = finish_jit_debug_attempt(execution, attempt)?;
     startup_timer.mark("runtime_eval");
     if print {
         println!("{}", result.completion_string());
-    } else if json {
+    }
+    if json {
         println!(
             "{}",
             serde_json::json!({

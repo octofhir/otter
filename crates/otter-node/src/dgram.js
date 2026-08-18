@@ -462,3 +462,7 @@ function createSocket(options, listener) {
 }
 
 module.exports = { createSocket, Socket };
+
+// Host-dispatch hooks stay off the enumerable global surface: Node's
+// test harness treats any enumerable global it does not know as a leak.
+Object.defineProperty(globalThis, '__otterDgramDeliver', { enumerable: false });

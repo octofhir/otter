@@ -633,3 +633,7 @@ module.exports = {
   getDefaultAutoSelectFamilyAttemptTimeout: () => 250,
   setDefaultAutoSelectFamilyAttemptTimeout: () => {},
 };
+
+// Host-dispatch hooks stay off the enumerable global surface: Node's
+// test harness treats any enumerable global it does not know as a leak.
+Object.defineProperty(globalThis, '__otterNetDeliver', { enumerable: false });

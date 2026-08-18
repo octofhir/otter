@@ -36,7 +36,19 @@ pub fn dns_cjs_value<'scope>(
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
     let native = build_native(scope, capabilities)?;
     let globals = scope.global_this();
-    scope.set(globals, "__otterDnsNative", native)?;
+    // Non-enumerable: the Node test harness flags any enumerable global it
+    // does not recognize as a leak.
+    scope.define(
+        globals,
+        "__otterDnsNative",
+        native,
+        otter_vm::Attr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+        .to_flags(),
+    )?;
     otter_runtime::run_builtin_cjs_shim(scope, "node:dns", include_str!("dns.js"), module, require)
 }
 

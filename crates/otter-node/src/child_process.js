@@ -24,7 +24,9 @@ function rawSpawn(command, args, options) {
   return native.spawnSyncRaw(command, args, {
     cwd: options.cwd ? String(options.cwd) : undefined,
     input,
-    env: options.env,
+    env: options.env === undefined || options.env === null
+      ? { ...process.env }
+      : options.env,
   });
 }
 
@@ -282,7 +284,12 @@ class ChildProcess extends EventEmitter {
     // its outcome arrives on a later turn through `__otterChildExit`.
     let started;
     try {
-      started = native.spawnStart(command, args, options ?? {});
+      const opts = { ...(options ?? {}) };
+      // Node's child inherits the parent's *JavaScript* environment: a
+      // mutation of `process.env` after startup must be visible in the
+      // child even though it never reached the host process environment.
+      if (opts.env === undefined || opts.env === null) opts.env = { ...process.env };
+      started = native.spawnStart(command, args, opts);
     } catch (error) {
       setTimeout(() => this._failed(error), 0);
       return;

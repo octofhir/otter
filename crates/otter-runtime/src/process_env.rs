@@ -32,6 +32,20 @@ pub(crate) fn build<'s>(
     hooks: &RuntimeHooks,
 ) -> Result<Local<'s>, NativeError> {
     let target = scope.object()?;
+    // Brand for structured clone: `structuredClone(process.env)` clones the
+    // backing target (Node's env is a plain named-property object there).
+    let brand = scope.boolean(true);
+    scope.define(
+        target,
+        "__otter_env_target__",
+        brand,
+        otter_vm::Attr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
+    )?;
     let mut inherited = std::collections::BTreeSet::new();
     for (name, value) in std::env::vars() {
         inherited.insert(name.clone());

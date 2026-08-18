@@ -227,6 +227,40 @@ if (typeof target === 'object' && typeof target.getBuiltinModule !== 'function')
     configurable: true,
   });
 }
+if (typeof target === 'object') {
+  const { internalBinding } = require('internal/bootstrap/realm');
+  const utilTypes = require('util').types;
+  const utilBindingKeys = [
+    'isAnyArrayBuffer', 'isArrayBuffer', 'isArrayBufferView', 'isAsyncFunction',
+    'isDataView', 'isDate', 'isExternal', 'isMap', 'isMapIterator',
+    'isNativeError', 'isPromise', 'isRegExp', 'isSet', 'isSetIterator',
+    'isTypedArray', 'isUint8Array',
+  ];
+  const cache = new Map();
+  Object.defineProperty(target, 'binding', {
+    value: function binding(name) {
+      name = String(name);
+      if (cache.has(name)) return cache.get(name);
+      let bound;
+      if (name === 'util') {
+        bound = {};
+        for (const key of utilBindingKeys) bound[key] = utilTypes[key];
+      } else {
+        try {
+          bound = internalBinding(name);
+        } catch {
+          bound = undefined;
+        }
+        if (bound === undefined || bound === null) bound = {};
+      }
+      cache.set(name, bound);
+      return bound;
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
 "#,
         graft_module,
         require,

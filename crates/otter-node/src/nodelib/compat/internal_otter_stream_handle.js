@@ -8,9 +8,9 @@
 // The native surface delivers reads eagerly; `readStop` parks incoming
 // chunks in a per-handle queue that `readStart` replays in order, so the
 // `onread` contract (including `streamBaseState` words and EOF) matches
-// what vendored `internal/stream_base_commons` expects. Writes complete
-// synchronously — `kLastWriteWasAsync` stays 0 and `oncomplete` is never
-// invoked for them, which is the documented sync-write path.
+// what vendored `internal/stream_base_commons` expects. Writes and
+// shutdowns complete asynchronously through `writeDone`/`shutdownDone`
+// acknowledgements from the native writer task.
 
 const { internalBinding } = require('internal/bootstrap/realm');
 const {
@@ -29,7 +29,10 @@ const native = require('internal/otter/net');
 const connections = new Map();
 const servers = new Map();
 const pendingConnects = new Map();
+const pendingWrites = new Map();
+const pendingShutdowns = new Map();
 let nextConnectToken = 1;
+let nextWriteToken = 1;
 
 function uvCode(codeName) {
   const numeric = uv[`UV_${codeName}`];
@@ -54,6 +57,7 @@ class StreamHandle {
     this._boundPort = 0;
     this._refed = true;
     this._userBuffer = null;
+    this._pendingWriteCount = 0;
   }
 
   getAsyncId() { return -1; }
@@ -63,44 +67,55 @@ class StreamHandle {
   _adoptFd(fd) {
     this.fd = fd;
     connections.set(fd, this);
-    if (!this._refed) native.hold(fd, false);
+    this._updateHold();
+  }
+
+  // A connection holds the loop while it is reading or has writes in
+  // flight (mirrors libuv's active-handle semantics): a paused, drained
+  // socket lets the process exit.
+  _updateHold() {
+    if (this.fd === -1) return;
+    native.hold(this.fd, this._refed && (this.reading || this._pendingWriteCount > 0));
   }
 
   close(callback) {
-    if (this._closed) {
-      if (typeof callback === 'function') queueMicrotask(callback);
-      return;
+    if (!this._closed) {
+      this._closed = true;
+      if (this.fd !== -1) {
+        connections.delete(this.fd);
+        try { native.close(this.fd); } catch { /* already gone */ }
+        this.fd = -1;
+      }
+      if (this._serverId !== -1) {
+        servers.delete(this._serverId);
+        try { native.close(this._serverId); } catch { /* already gone */ }
+        this._serverId = -1;
+      }
     }
-    this._closed = true;
-    if (this.fd !== -1) {
-      connections.delete(this.fd);
-      try { native.close(this.fd); } catch { /* already gone */ }
-      this.fd = -1;
-    }
-    if (this._serverId !== -1) {
-      servers.delete(this._serverId);
-      try { native.close(this._serverId); } catch { /* already gone */ }
-      this._serverId = -1;
-    }
-    if (typeof callback === 'function') queueMicrotask(callback);
+    // The close callback is a libuv close event: it runs on a later loop
+    // turn, after every already-queued nextTick (including the stream's
+    // emitCloseNT). A microtask here would let user close handlers run
+    // before the stream stamped its own close state.
+    if (typeof callback === 'function') setImmediate(callback);
   }
 
   ref() {
     this._refed = true;
-    const id = this.fd !== -1 ? this.fd : this._serverId;
-    if (id !== -1) native.hold(id, true);
+    if (this._serverId !== -1) native.hold(this._serverId, true);
+    this._updateHold();
   }
 
   unref() {
     this._refed = false;
-    const id = this.fd !== -1 ? this.fd : this._serverId;
-    if (id !== -1) native.hold(id, false);
+    if (this._serverId !== -1) native.hold(this._serverId, false);
+    this._updateHold();
   }
 
   // ---- reading ----
 
   readStart() {
     this.reading = true;
+    this._updateHold();
     if (this._parkedChunks.length > 0 || this._eofPending) {
       queueMicrotask(() => this._drainParked());
     }
@@ -109,6 +124,7 @@ class StreamHandle {
 
   readStop() {
     this.reading = false;
+    this._updateHold();
     return 0;
   }
 
@@ -146,6 +162,25 @@ class StreamHandle {
 
   _deliverChunk(chunk) {
     if (typeof this.onread !== 'function' || this._closed) return;
+    // `useUserBuffer` readers consume from their own buffer: fill it and
+    // report the byte count; oversized chunks re-park their remainder.
+    if (this._userBuffer !== null) {
+      const target = this._userBuffer;
+      const take = Math.min(chunk.length, target.length);
+      target.set(chunk.subarray(0, take), 0);
+      if (take < chunk.length) {
+        this._parkedChunks.unshift(chunk.subarray(take));
+        queueMicrotask(() => this._drainParked());
+      }
+      this.bytesRead += take;
+      streamBaseState[kReadBytesOrError] = take;
+      streamBaseState[kArrayBufferOffset] = 0;
+      // `onStreamRead` returns the next generated buffer when the reader
+      // supplies buffers through a generator; adopt it for the next chunk.
+      const next = this.onread(undefined);
+      if (next !== undefined && next !== null) this._userBuffer = next;
+      return;
+    }
     // Counts only bytes handed to `onread`: a paused handle parks chunks
     // and reports 0, the way an unstarted libuv reader would.
     this.bytesRead += chunk.length;
@@ -163,26 +198,49 @@ class StreamHandle {
     this.onread(undefined);
   }
 
-  // ---- writing ----
+  // A failed read surfaces as a negative errno through `onread`, which
+  // `onStreamRead` turns into an ErrnoException-driven destroy.
+  _onReadError(codeName) {
+    if (this._eofDelivered || this._closed) return;
+    this._eofDelivered = true;
+    if (typeof this.onread !== 'function') return;
+    streamBaseState[kReadBytesOrError] = uvCode(codeName);
+    streamBaseState[kArrayBufferOffset] = 0;
+    this.onread(undefined);
+  }
 
-  _writeBytes(buffer) {
+  // ---- writing ----
+  //
+  // Writes complete asynchronously: the native writer task acknowledges
+  // each tokened write with a `writeDone` event, and the wrap fires the
+  // request's `oncomplete` with the libuv-shaped status. A broken pipe
+  // therefore reaches the stream as a write error, exactly where Node's
+  // `onWriteComplete` expects it.
+
+  _writeBytes(req, buffer) {
     if (this.fd === -1 || this._closed) return uvCode('EBADF');
+    const token = nextWriteToken++;
+    let accepted = false;
     try {
-      native.write(this.fd, buffer);
+      accepted = native.write(this.fd, buffer, token);
     } catch {
       return uvCode('EPIPE');
     }
+    if (!accepted) return uvCode('EBADF');
     this.bytesWritten += buffer.length;
+    this._pendingWriteCount++;
+    this._updateHold();
+    pendingWrites.set(token, { handle: this, req });
     streamBaseState[kBytesWritten] = buffer.length;
-    streamBaseState[kLastWriteWasAsync] = 0;
+    streamBaseState[kLastWriteWasAsync] = 1;
     return 0;
   }
 
-  writeBuffer(req, buffer) { return this._writeBytes(buffer); }
-  writeUtf8String(req, data) { return this._writeBytes(Buffer.from(data, 'utf8')); }
-  writeLatin1String(req, data) { return this._writeBytes(Buffer.from(data, 'latin1')); }
-  writeAsciiString(req, data) { return this._writeBytes(Buffer.from(data, 'ascii')); }
-  writeUcs2String(req, data) { return this._writeBytes(Buffer.from(data, 'ucs2')); }
+  writeBuffer(req, buffer) { return this._writeBytes(req, buffer); }
+  writeUtf8String(req, data) { return this._writeBytes(req, Buffer.from(data, 'utf8')); }
+  writeLatin1String(req, data) { return this._writeBytes(req, Buffer.from(data, 'latin1')); }
+  writeAsciiString(req, data) { return this._writeBytes(req, Buffer.from(data, 'ascii')); }
+  writeUcs2String(req, data) { return this._writeBytes(req, Buffer.from(data, 'ucs2')); }
 
   writev(req, chunks, allBuffers) {
     const parts = [];
@@ -195,21 +253,21 @@ class StreamHandle {
         parts.push(typeof data === 'string' ? Buffer.from(data, encoding) : data);
       }
     }
-    return this._writeBytes(Buffer.concat(parts));
+    return this._writeBytes(req, Buffer.concat(parts));
   }
 
   shutdown(req) {
     if (this.fd === -1 || this._closed) return uvCode('ENOTCONN');
-    const fd = this.fd;
-    queueMicrotask(() => {
-      let status = 0;
-      try {
-        native.end(fd);
-      } catch {
-        status = uvCode('ENOTCONN');
-      }
-      if (typeof req.oncomplete === 'function') req.oncomplete.call(req, status);
-    });
+    // The End marker flushes everything queued ahead of it before the
+    // write half closes; completion arrives as a `shutdownDone` event.
+    const token = nextWriteToken++;
+    pendingShutdowns.set(token, req);
+    try {
+      native.end(this.fd, token);
+    } catch {
+      pendingShutdowns.delete(token);
+      return uvCode('ENOTCONN');
+    }
     return 0;
   }
 
@@ -251,7 +309,21 @@ class StreamHandle {
   fchmod(_mode) { return 0; }
 
   open(_fd) { return uvCode('ENOTSUP'); }
-  reset(callback) { this.close(callback); return 0; }
+
+  // §net.Socket.resetAndDestroy — SO_LINGER 0 close: the peer reads
+  // ECONNRESET instead of a clean EOF.
+  reset(callback) {
+    if (this._closed || this.fd === -1) {
+      this.close(callback);
+      return 0;
+    }
+    this._closed = true;
+    connections.delete(this.fd);
+    try { native.reset(this.fd); } catch { /* already gone */ }
+    this.fd = -1;
+    if (typeof callback === 'function') setImmediate(callback);
+    return 0;
+  }
 }
 
 // ---- connect / listen plumbing shared by TCP and Pipe ----
@@ -348,11 +420,38 @@ globalThis.__otterNetDeliver = function deliver(kind, first, second, third) {
     }
     return;
   }
+  if (kind === 'writeDone') {
+    deliverWriteDone(second, third);
+    return;
+  }
+  if (kind === 'shutdownDone') {
+    deliverShutdownDone(second);
+    return;
+  }
   const handle = connections.get(first);
   if (handle === undefined) return;
   if (kind === 'data') handle._onData(second);
   else if (kind === 'end') handle._onEnd();
+  else if (kind === 'readError') handle._onReadError(second);
 };
+
+function deliverWriteDone(token, codeName) {
+  const entry = pendingWrites.get(token);
+  pendingWrites.delete(token);
+  if (entry === undefined) return;
+  const { handle, req } = entry;
+  handle._pendingWriteCount--;
+  handle._updateHold();
+  const status = codeName === undefined ? 0 : uvCode(codeName);
+  if (typeof req.oncomplete === 'function') req.oncomplete.call(req, status);
+}
+
+function deliverShutdownDone(token) {
+  const req = pendingShutdowns.get(token);
+  pendingShutdowns.delete(token);
+  if (req === undefined) return;
+  if (typeof req.oncomplete === 'function') req.oncomplete.call(req, 0);
+}
 // Off the enumerable global surface: the Node harness flags unknown
 // enumerable globals as leaks.
 Object.defineProperty(globalThis, '__otterNetDeliver', { enumerable: false });

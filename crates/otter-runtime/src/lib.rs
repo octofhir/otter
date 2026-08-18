@@ -5837,10 +5837,18 @@ impl Runtime {
         // refusal, exactly as they do for the module body itself.
         // A handled error does not end the turn: the tasks queued behind the
         // failing one still have to run, which is why the drain resumes.
-        self.drain_microtasks_dispatching_uncaught(&context)
-            .map_err(|err| {
-                enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
-            })?;
+        if let Err(err) = self.drain_microtasks_dispatching_uncaught(&context) {
+            // `process.exit(code)` from a queued task (e.g. `process.nextTick`)
+            // is a clean termination, exactly as it is from the module body.
+            if let otter_vm::VmError::Exit { code } = err.error {
+                let result = ExecutionResult::from_exit_code(code, start.elapsed());
+                return Ok((self.attach_execution_stats(result), context));
+            }
+            return Err(enrich_runtime_diagnostic_with_cause(
+                &mut self.interp,
+                map_vm_error(err),
+            ));
+        }
         let result = ExecutionResult::from_vm_value(
             otter_vm::Value::undefined(),
             start.elapsed(),

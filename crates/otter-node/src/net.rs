@@ -1,9 +1,11 @@
-//! Native half of `node:net`: TCP servers and connections.
+//! Native transport under the vendored `net` stack: TCP and Unix-domain
+//! servers and connections.
 //!
 //! # Contents
-//! - [`net_cjs_value`] installs the module's JavaScript shim.
+//! - [`net_binding_cjs_value`] exports the raw dial/listen/byte surface as
+//!   `internal/otter/net` for the compat `tcp_wrap`/`pipe_wrap` handles.
 //! - A table of listeners and connections owned by the natives, keyed by the
-//!   handle the shim holds.
+//!   handle id the wraps hold.
 //! - An accept loop per listener and a read loop per connection, both on the
 //!   host's IO runtime, delivering onto the isolate thread.
 //!
@@ -18,7 +20,7 @@
 //!   while it is open, so a program serving or awaiting data does not exit.
 //!
 //! # See also
-//! - `net.js`
+//! - `nodelib/compat/internal_otter_stream_handle.js`
 
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
@@ -125,33 +127,20 @@ impl NetSocket {
 
 type Table = Arc<Mutex<HashMap<u32, Entry>>>;
 
-/// Build the CommonJS export of `node:net`.
+/// Build the CommonJS export of `internal/otter/net` — the raw dial,
+/// listen, and byte-transport surface the compat `tcp_wrap`/`pipe_wrap`
+/// handle classes drive. Vendored `net` never touches this directly.
 ///
 /// # Errors
-/// Returns a native error when the shim fails to allocate or evaluate.
-pub fn net_cjs_value<'scope>(
+/// Returns a native error when the binding object fails to allocate.
+pub fn net_binding_cjs_value<'scope>(
     scope: &mut RuntimeNativeScope<'scope, '_>,
     capabilities: &CapabilitySet,
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: RuntimeLocal<'scope>,
-    require: RuntimeLocal<'scope>,
+    _module: RuntimeLocal<'scope>,
+    _require: RuntimeLocal<'scope>,
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
-    let native = build_native(scope, capabilities, runtime_task_spawner)?;
-    let globals = scope.global_this();
-    // Non-enumerable: the Node test harness flags any enumerable global it
-    // does not recognize as a leak.
-    scope.define(
-        globals,
-        "__otterNetNative",
-        native,
-        otter_vm::Attr {
-            writable: true,
-            enumerable: false,
-            configurable: true,
-        }
-        .to_flags(),
-    )?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:net", include_str!("net.js"), module, require)
+    build_native(scope, capabilities, runtime_task_spawner)
 }
 
 fn build_native<'scope>(
@@ -603,9 +592,11 @@ fn adopt(
         }
         // The peer has nothing further to send. The connection stays open for
         // this side to finish writing, so only its hold on the loop is
-        // released here.
+        // released here. The EOF notification itself rides a Ref-class task:
+        // the hold is already gone, and an Unref event would be dropped if
+        // nothing else kept the loop alive.
         release(&reader_table, id);
-        let _ = reader_spawner.enqueue(NetEvent::Ended { connection: id }, RuntimeLiveness::Unref);
+        let _ = reader_spawner.enqueue(NetEvent::Ended { connection: id }, RuntimeLiveness::Ref);
     });
     id
 }

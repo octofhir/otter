@@ -11,6 +11,8 @@ const defaults = new Map([
   ['--frozen-intrinsics', false],
   ['--max-http-header-size', 16384],
   ['--insecure-http-parser', false],
+  ['--network-family-autoselection', true],
+  ['--network-family-autoselection-attempt-timeout', 250],
 ]);
 module.exports = {
   getOptionValue(name) { return defaults.get(name); },

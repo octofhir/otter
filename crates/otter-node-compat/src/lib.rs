@@ -436,6 +436,7 @@ fn supported_test_flags(file_path: &Path) -> Vec<String> {
         "--disable-warning=",
     ];
     const SUPPORTED_EXACT: &[&str] = &[
+        "--expose-gc",
         "--no-warnings",
         "--no-deprecation",
         "--throw-deprecation",

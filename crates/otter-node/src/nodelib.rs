@@ -92,6 +92,7 @@ nodelib_module!(internal_util_debuglog, "internal/util/debuglog", compat "nodeli
 nodelib_module!(internal_util_colors, "internal/util/colors", compat "nodelib/compat/internal_util_colors.js");
 nodelib_module!(internal_assert, "internal/assert", compat "nodelib/compat/internal_assert.js");
 nodelib_module!(internal_options, "internal/options", compat "nodelib/compat/internal_options.js");
+nodelib_module!(internal_deps_undici, "internal/deps/undici/undici", compat "nodelib/compat/internal_deps_undici.js");
 nodelib_module!(internal_events_abort_listener, "internal/events/abort_listener", compat "nodelib/compat/internal_events_abort_listener.js");
 nodelib_module!(internal_abort_controller, "internal/abort_controller", compat "nodelib/compat/internal_abort_controller.js");
 nodelib_module!(internal_webstreams_adapters, "internal/webstreams/adapters", compat "nodelib/compat/internal_webstreams_adapters.js");

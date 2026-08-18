@@ -204,6 +204,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/util/colors", nodelib::internal_util_colors),
     HostedModule::cjs_only("internal/assert", nodelib::internal_assert),
     HostedModule::cjs_only("internal/options", nodelib::internal_options),
+    HostedModule::cjs_only("internal/deps/undici/undici", nodelib::internal_deps_undici),
     HostedModule::cjs_only(
         "internal/events/abort_listener",
         nodelib::internal_events_abort_listener,

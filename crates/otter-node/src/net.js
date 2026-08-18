@@ -222,7 +222,7 @@ Socket.prototype.unref = function unref() {
 };
 
 Socket.prototype.connect = function connect(...args) {
-  const { port, host, callback } = normalizeConnectArgs(args);
+  const { port, host, path, callback } = normalizeConnectArgs(args);
   const options = args[0] !== null && typeof args[0] === 'object' ? args[0] : null;
   if (options && typeof options.timeout === 'number' && options.timeout > 0) {
     this.setTimeout(options.timeout);
@@ -232,7 +232,11 @@ Socket.prototype.connect = function connect(...args) {
   const token = nextToken++;
   pending.set(token, this);
   try {
-    native.connect(host, port, token);
+    if (typeof path === 'string' && path !== '') {
+      native.connectPath(path, token);
+    } else {
+      native.connect(host, port, token);
+    }
   } catch (error) {
     pending.delete(token);
     this.connecting = false;
@@ -322,11 +326,16 @@ function _normalizeArgs(args) {
 function normalizeConnectArgs(args) {
   let port;
   let host;
+  let path;
   let callback;
   const first = args[0];
   if (first !== null && typeof first === 'object') {
     port = first.port;
     host = first.host;
+    path = first.path;
+  } else if (typeof first === 'string' && Number.isNaN(Number(first))) {
+    // A non-numeric string target is a Unix socket path.
+    path = first;
   } else {
     port = first;
     if (typeof args[1] === 'string') host = args[1];
@@ -334,7 +343,7 @@ function normalizeConnectArgs(args) {
   for (const argument of args) {
     if (typeof argument === 'function') callback = argument;
   }
-  return { port: Number(port) || 0, host: host ?? 'localhost', callback };
+  return { port: Number(port) || 0, host: host ?? 'localhost', path, callback };
 }
 
 function Server(options, listener) {
@@ -353,11 +362,16 @@ Object.setPrototypeOf(Server, EventEmitter);
 Server.prototype.listen = function listen(...args) {
   let port = 0;
   let host;
+  let path;
   let callback;
   const first = args[0];
   if (first !== null && typeof first === 'object') {
     port = first.port ?? 0;
     host = first.host;
+    path = first.path;
+  } else if (typeof first === 'string' && Number.isNaN(Number(first))) {
+    // A non-numeric string target is a Unix socket path.
+    path = first;
   } else if (typeof first === 'number' || typeof first === 'string') {
     port = Number(first) || 0;
     if (typeof args[1] === 'string') host = args[1];
@@ -369,7 +383,13 @@ Server.prototype.listen = function listen(...args) {
 
   let bound;
   try {
-    bound = native.listen(host ?? '', port);
+    if (typeof path === 'string' && path !== '') {
+      bound = native.listenPath(path);
+      // Node answers the bound path itself for a Unix-socket server.
+      bound.address = path;
+    } else {
+      bound = native.listen(host ?? '', port);
+    }
   } catch (error) {
     setTimeout(() => this.emit('error', error), 0);
     return this;

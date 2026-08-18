@@ -49,8 +49,78 @@ enum EntryKind {
     },
     Connection {
         outgoing: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-        socket: Arc<tokio::net::TcpStream>,
+        socket: NetSocket,
     },
+}
+
+/// A carried connection: TCP or a Unix domain socket. Both sides of the I/O
+/// contract (readiness + non-blocking try ops) are identical, so the loops
+/// run over this enum instead of a concrete stream type.
+#[derive(Clone)]
+enum NetSocket {
+    Tcp(Arc<tokio::net::TcpStream>),
+    Unix(Arc<tokio::net::UnixStream>),
+}
+
+impl NetSocket {
+    async fn readable(&self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.readable().await,
+            Self::Unix(stream) => stream.readable().await,
+        }
+    }
+
+    fn try_read(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.try_read(buffer),
+            Self::Unix(stream) => stream.try_read(buffer),
+        }
+    }
+
+    async fn writable(&self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.writable().await,
+            Self::Unix(stream) => stream.writable().await,
+        }
+    }
+
+    fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.try_write(bytes),
+            Self::Unix(stream) => stream.try_write(bytes),
+        }
+    }
+
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Tcp(stream) => stream.local_addr().ok(),
+            // Unix sockets have no IP address; `socket.address()` answers
+            // `{}` for them, exactly as Node's does.
+            Self::Unix(_) => None,
+        }
+    }
+
+    fn set_nodelay(&self, flag: bool) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_nodelay(flag),
+            Self::Unix(_) => Ok(()),
+        }
+    }
+
+    fn set_ttl(&self, ttl: u32) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_ttl(ttl),
+            Self::Unix(_) => Ok(()),
+        }
+    }
+
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::Tcp(stream) => stream.as_raw_fd(),
+            Self::Unix(stream) => stream.as_raw_fd(),
+        }
+    }
 }
 
 type Table = Arc<Mutex<HashMap<u32, Entry>>>;
@@ -134,6 +204,48 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "connect", connect)?;
+
+    let listen_path_caps = capabilities.clone();
+    let listen_path_table = table.clone();
+    let listen_path_ids = next_id.clone();
+    let listen_path_spawner = spawner.clone();
+    let listen_path = scope.native_closure(
+        "listenPath",
+        1,
+        &[],
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            listen_unix(
+                ctx,
+                args,
+                &listen_path_caps,
+                &listen_path_table,
+                &listen_path_ids,
+                listen_path_spawner.as_ref(),
+            )
+        },
+    )?;
+    scope.set(object, "listenPath", listen_path)?;
+
+    let connect_path_caps = capabilities.clone();
+    let connect_path_table = table.clone();
+    let connect_path_ids = next_id.clone();
+    let connect_path_spawner = spawner.clone();
+    let connect_path = scope.native_closure(
+        "connectPath",
+        2,
+        &[],
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            connect_unix(
+                ctx,
+                args,
+                &connect_path_caps,
+                &connect_path_table,
+                &connect_path_ids,
+                connect_path_spawner.as_ref(),
+            )
+        },
+    )?;
+    scope.set(object, "connectPath", connect_path)?;
 
     let write_table = table.clone();
     let write = scope.native_closure(
@@ -388,13 +500,19 @@ fn listen(
             let Ok((stream, remote)) = accepted else {
                 return;
             };
-            let connection = adopt(stream, remote, &accept_table, &accept_ids, &accept_spawner);
+            let connection = adopt(
+                NetSocket::Tcp(Arc::new(stream)),
+                Some(remote),
+                &accept_table,
+                &accept_ids,
+                &accept_spawner,
+            );
             if accept_spawner
                 .enqueue(
                     NetEvent::Accepted {
                         server: id,
                         connection,
-                        remote,
+                        remote: Some(remote),
                     },
                     RuntimeLiveness::Unref,
                 )
@@ -417,15 +535,14 @@ fn listen(
 
 /// Take ownership of a connected stream and start carrying it.
 fn adopt(
-    stream: tokio::net::TcpStream,
-    remote: std::net::SocketAddr,
+    stream: NetSocket,
+    remote: Option<std::net::SocketAddr>,
     table: &Table,
     next_id: &Arc<AtomicU32>,
     spawner: &RuntimeTaskSpawner,
 ) -> u32 {
     let id = next_id.fetch_add(1, Ordering::Relaxed);
-    let local = stream.local_addr().ok();
-    let stream = Arc::new(stream);
+    let local = stream.local_addr();
     let (outgoing, mut queued) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     table
@@ -440,7 +557,7 @@ fn adopt(
                 },
                 keep_alive: Some(keep_alive),
                 local,
-                remote: Some(remote),
+                remote,
             },
         );
 
@@ -491,6 +608,166 @@ fn adopt(
         let _ = reader_spawner.enqueue(NetEvent::Ended { connection: id }, RuntimeLiveness::Unref);
     });
     id
+}
+
+/// Bind a Unix domain socket and deliver each connection as it arrives.
+/// Mirrors [`listen`], with the socket path standing in for host+port.
+fn listen_unix(
+    ctx: &mut RuntimeNativeCtx<'_>,
+    args: &[RuntimeValue],
+    capabilities: &CapabilitySet,
+    table: &Table,
+    next_id: &Arc<AtomicU32>,
+    spawner: Option<&RuntimeTaskSpawner>,
+) -> Result<RuntimeValue, RuntimeNativeError> {
+    let path = string_arg(ctx, args, 0).unwrap_or_default();
+    if path.is_empty() {
+        return Err(runtime_type_error("net.listen", "missing socket path".to_string()));
+    }
+    if !capabilities.net.matches(&path) {
+        return Err(runtime_type_error(
+            "net.listen",
+            format!("permission denied for '{path}'"),
+        ));
+    }
+    let spawner = io_spawner(spawner, "net.listen")?;
+    let io = spawner
+        .io_handle()
+        .ok_or_else(|| runtime_type_error("net.listen", "no IO runtime".to_string()))?;
+
+    // Binding registers with the reactor and needs the runtime in scope.
+    let listener = {
+        let _guard = io.enter();
+        tokio::net::UnixListener::bind(&path).map_err(|error| system_error(&error, "listen", &path))?
+    };
+
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            id,
+            Entry {
+                kind: EntryKind::Listener {
+                    shutdown: shutdown.clone(),
+                },
+                keep_alive: Some(keep_alive),
+                local: None,
+                remote: None,
+            },
+        );
+
+    let accept_table = table.clone();
+    let accept_ids = next_id.clone();
+    let accept_spawner = spawner.clone();
+    io.spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                () = shutdown.notified() => return,
+            };
+            let still_listening = accept_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&id);
+            if !still_listening {
+                return;
+            }
+            let Ok((stream, _remote)) = accepted else {
+                return;
+            };
+            let connection = adopt(
+                NetSocket::Unix(Arc::new(stream)),
+                None,
+                &accept_table,
+                &accept_ids,
+                &accept_spawner,
+            );
+            if accept_spawner
+                .enqueue(
+                    NetEvent::Accepted {
+                        server: id,
+                        connection,
+                        remote: None,
+                    },
+                    RuntimeLiveness::Unref,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+        let handle = scope.number(f64::from(id));
+        scope.set(result, "handle", handle)?;
+        Ok(scope.finish(result))
+    })
+}
+
+/// Connect to a Unix domain socket. Mirrors [`connect`].
+fn connect_unix(
+    ctx: &mut RuntimeNativeCtx<'_>,
+    args: &[RuntimeValue],
+    capabilities: &CapabilitySet,
+    table: &Table,
+    next_id: &Arc<AtomicU32>,
+    spawner: Option<&RuntimeTaskSpawner>,
+) -> Result<RuntimeValue, RuntimeNativeError> {
+    let path = string_arg(ctx, args, 0).unwrap_or_default();
+    let token = handle_arg(args, 1);
+    if path.is_empty() {
+        return Err(runtime_type_error("net.connect", "missing socket path".to_string()));
+    }
+    if !capabilities.net.matches(&path) {
+        return Err(runtime_type_error(
+            "net.connect",
+            format!("permission denied for '{path}'"),
+        ));
+    }
+    let spawner = io_spawner(spawner, "net.connect")?;
+    let io = spawner
+        .io_handle()
+        .ok_or_else(|| runtime_type_error("net.connect", "no IO runtime".to_string()))?;
+
+    let connect_table = table.clone();
+    let connect_ids = next_id.clone();
+    let connect_spawner = spawner.clone();
+    let attempt = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    io.spawn(async move {
+        let _attempt = attempt;
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(stream) => {
+                let connection = adopt(
+                    NetSocket::Unix(Arc::new(stream)),
+                    None,
+                    &connect_table,
+                    &connect_ids,
+                    &connect_spawner,
+                );
+                let _ = connect_spawner.enqueue(
+                    NetEvent::Connected { token, connection },
+                    RuntimeLiveness::Unref,
+                );
+            }
+            Err(error) => {
+                let code = io_code(&error);
+                let _ = connect_spawner.enqueue(
+                    NetEvent::ConnectFailed {
+                        token,
+                        code,
+                        message: format!("connect {code} {path}"),
+                    },
+                    RuntimeLiveness::Unref,
+                );
+            }
+        }
+    });
+    Ok(RuntimeValue::undefined())
 }
 
 /// Open a connection, and report whether it was made.
@@ -548,8 +825,8 @@ fn connect(
         match tokio::net::TcpStream::connect(target).await {
             Ok(stream) => {
                 let connection = adopt(
-                    stream,
-                    target,
+                    NetSocket::Tcp(Arc::new(stream)),
+                    Some(target),
                     &connect_table,
                     &connect_ids,
                     &connect_spawner,
@@ -580,7 +857,7 @@ enum NetEvent {
     Accepted {
         server: u32,
         connection: u32,
-        remote: std::net::SocketAddr,
+        remote: Option<std::net::SocketAddr>,
     },
     Connected {
         token: u32,
@@ -633,7 +910,10 @@ fn deliver(
                     let name = scope.string("accept")?;
                     let server = scope.number(f64::from(*server));
                     let connection = scope.number(f64::from(*connection));
-                    let remote = address_object(&mut scope, *remote)?;
+                    let remote = match remote {
+                        Some(remote) => address_object(&mut scope, *remote)?,
+                        None => scope.object()?,
+                    };
                     (name, server, connection, remote)
                 }
                 NetEvent::Connected { token, connection } => {
@@ -730,7 +1010,7 @@ fn release(table: &Table, id: u32) {
     }
 }
 
-async fn write_all(stream: &tokio::net::TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_all(stream: &NetSocket, bytes: &[u8]) -> std::io::Result<()> {
     let mut rest = bytes;
     while !rest.is_empty() {
         stream.writable().await?;
@@ -744,13 +1024,11 @@ async fn write_all(stream: &tokio::net::TcpStream, bytes: &[u8]) -> std::io::Res
     Ok(())
 }
 
-fn shutdown_write(stream: &tokio::net::TcpStream) {
-    use std::os::fd::AsRawFd;
-
+fn shutdown_write(stream: &NetSocket) {
     // SAFETY: the descriptor is owned by a live stream, and `SHUT_WR` leaves
     // the read half — which the reader task still holds — untouched.
     unsafe {
-        libc::shutdown(stream.as_raw_fd(), libc::SHUT_WR);
+        libc::shutdown(stream.raw_fd(), libc::SHUT_WR);
     }
 }
 
@@ -790,6 +1068,7 @@ fn string_arg(
 
 fn io_code(error: &std::io::Error) -> &'static str {
     match error.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
         std::io::ErrorKind::AddrInUse => "EADDRINUSE",
         std::io::ErrorKind::AddrNotAvailable => "EADDRNOTAVAIL",
         std::io::ErrorKind::PermissionDenied => "EACCES",

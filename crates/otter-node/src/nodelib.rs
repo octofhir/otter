@@ -173,3 +173,42 @@ nodelib_module!(internal_trace_sigint, "internal/util/trace_sigint", vendored "n
 nodelib_module!(internal_watchdog, "internal/watchdog", compat "nodelib/compat/internal_watchdog.js");
 nodelib_module!(internal_string_decoder, "internal/string_decoder_binding", compat "nodelib/compat/internal_string_decoder.js");
 nodelib_module!(node_string_decoder, "node:string_decoder", vendored "nodelib/string_decoder.js");
+
+/// The vendored `events` module plus a one-time process-prototype graft:
+/// Node's `process` inherits from `EventEmitter` through an intermediate
+/// constructor named `process`, and the corpus asserts that exact chain.
+/// The graft rides the first `events` load because the runtime-built
+/// `process` object exists before any module — and therefore before
+/// `EventEmitter` — does.
+///
+/// # Errors
+/// Returns a native error when the shim fails to allocate or evaluate.
+pub fn node_events_with_process_graft<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    let exports = node_events(scope, caps, runtime_task_spawner, module, require)?;
+    let graft_module = scope.object()?;
+    let graft_exports = scope.object()?;
+    scope.set(graft_module, "exports", graft_exports)?;
+    otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "internal/otter/process-graft",
+        r#"'use strict';
+const { EventEmitter } = require('events');
+const target = globalThis.process;
+if (typeof target === 'object' && !(target instanceof EventEmitter)) {
+  const ProcessCtor = function process() {};
+  Object.setPrototypeOf(ProcessCtor.prototype, EventEmitter.prototype);
+  Object.setPrototypeOf(ProcessCtor, EventEmitter);
+  Object.setPrototypeOf(target, ProcessCtor.prototype);
+}
+"#,
+        graft_module,
+        require,
+    )?;
+    Ok(exports)
+}

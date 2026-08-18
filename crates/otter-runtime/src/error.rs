@@ -119,6 +119,18 @@ pub enum OtterError {
 }
 
 impl OtterError {
+    /// Whether this error is the isolate inbox's transient backpressure
+    /// rejection. A producer that must not drop or reorder its events
+    /// retries on this and treats every other error as terminal.
+    #[must_use]
+    pub fn is_backpressure(&self) -> bool {
+        matches!(
+            self,
+            Self::Internal { code, .. }
+                if code == crate::diagnostics::DiagnosticCode::RuntimeBackpressure.as_str()
+        )
+    }
+
     /// Convenience: build the public timeout variant from a
     /// [`Duration`].
     #[must_use]

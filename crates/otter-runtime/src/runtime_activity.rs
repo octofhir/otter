@@ -106,6 +106,29 @@ impl RuntimeTaskSpawner {
         self.queue.enqueue_boxed(Box::new(task), liveness)
     }
 
+    /// Deliver one task without dropping or reordering it.
+    ///
+    /// The isolate inbox is bounded; a burst of I/O completions can outrun
+    /// the dispatch loop. Backpressure is retried in place — the calling
+    /// producer task does not advance to its next event until this one is
+    /// accepted — so per-producer ordering survives. Answers `false` when
+    /// the isolate is shutting down and the producer should stop.
+    pub async fn enqueue_ordered(
+        &self,
+        task: impl RuntimeTask + Clone,
+        liveness: RuntimeLiveness,
+    ) -> bool {
+        loop {
+            match self.enqueue(task.clone(), liveness) {
+                Ok(()) => return true,
+                Err(err) if err.is_backpressure() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
     pub(crate) fn enqueue_guaranteed(&self, task: impl RuntimeTask, liveness: RuntimeLiveness) {
         self.queue
             .enqueue_boxed_guaranteed(Box::new(task), liveness);

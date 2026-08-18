@@ -248,6 +248,7 @@ impl RuntimeTask for ChildIpcEvent {
 }
 
 /// A chunk one of the child's output pipes produced, delivered live.
+#[derive(Clone)]
 struct ChildStdio {
     id: u32,
     /// 1 = stdout, 2 = stderr.
@@ -284,6 +285,7 @@ impl RuntimeTask for ChildStdio {
 }
 
 /// A child's outcome, reported once it has run to completion.
+#[derive(Clone)]
 struct ChildExit {
     id: u32,
     status: Option<i32>,
@@ -527,7 +529,7 @@ fn reap(mut child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
         // The exit report itself holds the loop: the child's own Ref hold is
         // released right after, and an Unref message could otherwise still be
         // in the inbox when the loop finds nothing left to wait for.
-        let _ = exit_spawner.enqueue(exit, RuntimeLiveness::Ref);
+        exit_spawner.enqueue_ordered(exit, RuntimeLiveness::Ref).await;
         drop(keep_alive);
     });
 }
@@ -546,8 +548,8 @@ async fn stream_pipe(
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(length) => {
-                if spawner
-                    .enqueue(
+                if !spawner
+                    .enqueue_ordered(
                         ChildStdio {
                             id,
                             which,
@@ -555,21 +557,23 @@ async fn stream_pipe(
                         },
                         RuntimeLiveness::Unref,
                     )
-                    .is_err()
+                    .await
                 {
                     return;
                 }
             }
         }
     }
-    let _ = spawner.enqueue(
-        ChildStdio {
-            id,
-            which,
-            data: None,
-        },
-        RuntimeLiveness::Unref,
-    );
+    spawner
+        .enqueue_ordered(
+            ChildStdio {
+                id,
+                which,
+                data: None,
+            },
+            RuntimeLiveness::Unref,
+        )
+        .await;
 }
 
 /// Own a child's stdin pipe: write queued bytes in order and close on `End`

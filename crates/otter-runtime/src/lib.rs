@@ -780,6 +780,10 @@ pub struct ExecutionAttempt {
     result: Result<ExecutionResult, OtterError>,
     failure_jit_debug_report: Option<Box<JitDebugReport>>,
     failure_jit_artifacts: Option<Box<JitArtifactBatch>>,
+    /// Final process exit code chosen by an `'exit'` listener when the run
+    /// itself failed (an uncaught exception still fires the exit event, and
+    /// the listener may replace the code). `None` when no listener ran.
+    exit_code_override: Option<u8>,
 }
 
 impl ExecutionAttempt {
@@ -802,12 +806,14 @@ impl ExecutionAttempt {
                     result: Ok(result),
                     failure_jit_debug_report: None,
                     failure_jit_artifacts: None,
+                    exit_code_override: None,
                 }
             }
             Err(error) => Self {
                 result: Err(error),
                 failure_jit_debug_report: report.map(Box::new),
                 failure_jit_artifacts: artifacts.map(Box::new),
+                exit_code_override: None,
             },
         }
     }
@@ -815,6 +821,19 @@ impl ExecutionAttempt {
     /// Borrow the execution result or its original runtime error.
     pub fn result(&self) -> Result<&ExecutionResult, &OtterError> {
         self.result.as_ref()
+    }
+
+    /// See the `exit_code_override` field.
+    #[must_use]
+    pub fn exit_code_override(&self) -> Option<u8> {
+        self.exit_code_override
+    }
+
+    /// Stamp the exit code an `'exit'` listener chose for a failed run.
+    #[must_use]
+    pub(crate) fn with_exit_code_override(mut self, code: Option<u8>) -> Self {
+        self.exit_code_override = code;
+        self
     }
 
     /// Borrow the complete or partial JIT diagnostics report.

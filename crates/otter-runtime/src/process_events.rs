@@ -646,9 +646,19 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             return Ok::<Option<Value>, NativeError>(None);
         }
 
-        let captures = scope.array(2)?;
+        // Node reads `throwDeprecation` when `emitWarning` is called; only
+        // the throw itself is deferred to the next tick.
+        let throw_deprecation = {
+            let name = scope.get(warning, "name")?;
+            let flag = scope.get(process, "throwDeprecation")?;
+            value_string(&scope, name).as_deref() == Some("DeprecationWarning")
+                && scope.boolean_value(flag).unwrap_or(false)
+        };
+        let captures = scope.array(3)?;
         scope.set_index(captures, 0, process)?;
         scope.set_index(captures, 1, warning)?;
+        let throw_deprecation = scope.boolean(throw_deprecation);
+        scope.set_index(captures, 2, throw_deprecation)?;
         Ok(Some(scope.finish(captures)))
     })?;
     let Some(captures) = captures else {
@@ -665,6 +675,14 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                 .ok_or_else(|| invalid_arg("missing process warning captures"))?;
             let process = otter_vm::array::get(capture, ctx.heap(), 0);
             let warning = otter_vm::array::get(capture, ctx.heap(), 1);
+            // `throwDeprecation` was sampled when `emitWarning` ran; the
+            // deferred delivery turns the warning into an asynchronous throw.
+            let throw_deprecation = otter_vm::array::get(capture, ctx.heap(), 2)
+                .as_boolean()
+                .unwrap_or(false);
+            if throw_deprecation {
+                return Err(ctx.throw_value("DeprecationWarning", warning));
+            }
             let event = ctx.scope(|mut scope| {
                 let event = scope.string("warning")?;
                 Ok::<Value, NativeError>(scope.finish(event))

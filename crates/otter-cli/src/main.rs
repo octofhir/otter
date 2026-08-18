@@ -781,7 +781,19 @@ async fn run_file_with_cwd(
     let otter = builder.build()?;
     startup_timer.mark("runtime_build");
     let attempt = otter.run_file_with_diagnostics(path).await;
-    let result = finish_jit_debug_attempt(execution, attempt)?;
+    // An 'exit' listener may have replaced the exit code of a failed run;
+    // the error still renders, but the process leaves with the chosen code.
+    let exit_override = attempt.exit_code_override();
+    let result = match finish_jit_debug_attempt(execution, attempt) {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(code) = exit_override else {
+                return Err(error);
+            };
+            emit_error(&error, json);
+            return Ok(ExitCode::from(code));
+        }
+    };
     startup_timer.mark("runtime_run_file");
     emit_otter_stats_if_requested(&result);
     if json {
@@ -1831,7 +1843,18 @@ async fn run_eval(
         .build()?;
     startup_timer.mark("runtime_build");
     let attempt = otter.eval_with_diagnostics(source).await;
-    let result = finish_jit_debug_attempt(execution, attempt)?;
+    // See `run_file`: a failed run's 'exit' listener may replace the code.
+    let exit_override = attempt.exit_code_override();
+    let result = match finish_jit_debug_attempt(execution, attempt) {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(code) = exit_override else {
+                return Err(error);
+            };
+            emit_error(&error, json);
+            return Ok(ExitCode::from(code));
+        }
+    };
     startup_timer.mark("runtime_eval");
     if print {
         println!("{}", result.completion_string());

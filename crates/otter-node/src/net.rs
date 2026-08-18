@@ -56,6 +56,10 @@ enum EntryKind {
         /// task drops its stream clone and the kernel closes the socket
         /// immediately instead of at the peer's next transition.
         abort: Arc<tokio::sync::Notify>,
+        /// Messages handed to the writer task and not yet completed. A
+        /// direct `tryWrite` is only allowed while this is zero, or bytes
+        /// would overtake the queue.
+        queued: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
@@ -304,6 +308,32 @@ fn build_native<'scope>(
     )?;
     scope.set(object, "write", write)?;
 
+    let try_write_table = table.clone();
+    let try_write = scope.native_closure(
+        "tryWrite",
+        2,
+        &[],
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let id = handle_arg(args, 0);
+            let written = if let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap()))
+            {
+                let heap = ctx.heap();
+                let offset = view.byte_offset(heap);
+                let len = view.byte_length(heap);
+                view.buffer(heap).with_bytes(heap, |bytes| {
+                    try_write_bytes(&try_write_table, id, &bytes[offset..offset + len])
+                })
+            } else {
+                let payload = runtime_arg_to_string(args, 1, ctx.heap());
+                try_write_bytes(&try_write_table, id, &latin1_to_bytes(&payload))
+            };
+            Ok(RuntimeValue::number(
+                otter_vm::number::NumberValue::from_f64(written as f64),
+            ))
+        },
+    )?;
+    scope.set(object, "tryWrite", try_write)?;
+
     let close_table = table.clone();
     let close = scope.native_closure(
         "close",
@@ -330,10 +360,15 @@ fn build_native<'scope>(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = table.get_mut(&id)
-                && let EntryKind::Connection { outgoing, .. } = &mut entry.kind
+                && let EntryKind::Connection {
+                    outgoing, queued, ..
+                } = &mut entry.kind
                 && let Some(sender) = outgoing.take()
             {
-                let _ = sender.send(WriteMsg::End(token));
+                queued.fetch_add(1, Ordering::SeqCst);
+                if sender.send(WriteMsg::End(token)).is_err() {
+                    queued.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Ok(RuntimeValue::undefined())
         },
@@ -602,6 +637,7 @@ fn adopt(
     let (outgoing, mut queued) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let abort = Arc::new(tokio::sync::Notify::new());
+    let queued_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -612,6 +648,7 @@ fn adopt(
                     outgoing: Some(outgoing),
                     socket: stream.clone(),
                     abort: abort.clone(),
+                    queued: queued_count.clone(),
                 },
                 keep_alive: Some(keep_alive),
                 local,
@@ -621,8 +658,10 @@ fn adopt(
 
     let writer_stream = stream.clone();
     let writer_spawner = spawner.clone();
+    let writer_queued = queued_count;
     tokio::spawn(async move {
         while let Some(message) = queued.recv().await {
+            let _decrement = scopeguard_decrement(&writer_queued);
             match message {
                 WriteMsg::Data(bytes, token) => {
                     if let Err(error) = write_all(&writer_stream, &bytes).await {
@@ -1135,10 +1174,52 @@ fn write_bytes(table: &Table, id: u32, bytes: &[u8], token: u32) -> bool {
     match table.get(&id).map(|entry| &entry.kind) {
         Some(EntryKind::Connection {
             outgoing: Some(outgoing),
+            queued,
             ..
-        }) => outgoing.send(WriteMsg::Data(bytes.to_vec(), token)).is_ok(),
+        }) => {
+            queued.fetch_add(1, Ordering::SeqCst);
+            let sent = outgoing.send(WriteMsg::Data(bytes.to_vec(), token)).is_ok();
+            if !sent {
+                queued.fetch_sub(1, Ordering::SeqCst);
+            }
+            sent
+        }
         _ => false,
     }
+}
+
+/// Attempt an in-line non-blocking write while the writer queue is idle.
+/// Answers the number of bytes accepted by the kernel (possibly zero); the
+/// caller queues the remainder through the ordinary async path.
+fn try_write_bytes(table: &Table, id: u32, bytes: &[u8]) -> usize {
+    let table = table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match table.get(&id).map(|entry| &entry.kind) {
+        Some(EntryKind::Connection {
+            outgoing: Some(_),
+            socket,
+            queued,
+            ..
+        }) if queued.load(Ordering::SeqCst) == 0 => {
+            socket.try_write(bytes).unwrap_or_default()
+        }
+        _ => 0,
+    }
+}
+
+/// Decrement `counter` when the returned guard drops, so every writer-task
+/// message is accounted exactly once even on early returns.
+fn scopeguard_decrement(
+    counter: &Arc<std::sync::atomic::AtomicUsize>,
+) -> impl Drop + use<> {
+    struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    Guard(counter.clone())
 }
 
 /// Forget an entry entirely: its loops end and its hold on the runtime goes

@@ -508,8 +508,37 @@ pub(crate) fn cjs_load_builtin<'scope>(
         dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         target: CjsTarget::Hosted(hosted),
     };
-    let cache = scope.bare_object()?;
+    let cache = canonical_cache(scope)?;
     load_resolved_scoped(scope, cfg, cache, &resolution, None)
+}
+
+/// The realm's one require cache. Every load path — the CommonJS entry
+/// file, `require()` chains, and ESM imports of hosted builtins — must
+/// share it, or a builtin like `net` is instantiated twice and the second
+/// copy's module state (handle tables, dispatch hooks) orphans the first.
+fn canonical_cache<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+) -> Result<Local<'scope>, NativeError> {
+    const SLOT: &str = "__otterRequireCache";
+    if let Some(existing) = scope.global(SLOT) {
+        return Ok(existing);
+    }
+    let cache = scope.bare_object()?;
+    let globals = scope.global_this();
+    // Non-enumerable: the Node test harness flags unknown enumerable
+    // globals as leaks.
+    scope.define(
+        globals,
+        SLOT,
+        cache,
+        otter_vm::Attr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+        .to_flags(),
+    )?;
+    Ok(cache)
 }
 
 /// Compile and execute one CommonJS file, returning its `module.exports`.
@@ -521,7 +550,7 @@ pub(crate) fn cjs_instantiate_file(
 ) -> Result<Value, NativeError> {
     let resolution = CjsResolution::file(abs.to_path_buf());
     ctx.scope(|mut scope| {
-        let cache = scope.bare_object()?;
+        let cache = canonical_cache(&mut scope)?;
         let exports = load_resolved_scoped(&mut scope, cfg, cache, &resolution, Some(source))?;
         Ok(scope.finish(exports))
     })

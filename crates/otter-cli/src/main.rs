@@ -132,6 +132,31 @@ struct Cli {
     #[arg(long, global = true)]
     jitless: bool,
 
+    /// Silence all process warning output (Node's `--no-warnings`).
+    #[arg(long = "no-warnings", global = true)]
+    no_warnings: bool,
+
+    /// Silence deprecation warnings (Node's `--no-deprecation`).
+    #[arg(long = "no-deprecation", global = true)]
+    no_deprecation: bool,
+
+    /// Throw on deprecation warnings (Node's `--throw-deprecation`).
+    #[arg(long = "throw-deprecation", global = true)]
+    throw_deprecation: bool,
+
+    /// Print warning stack traces (Node's `--trace-warnings`).
+    #[arg(long = "trace-warnings", global = true)]
+    trace_warnings: bool,
+
+    /// Emit pending deprecation warnings (Node's `--pending-deprecation`).
+    #[arg(long = "pending-deprecation", global = true)]
+    pending_deprecation: bool,
+
+    /// Disable printing of a warning code or type
+    /// (Node's `--disable-warning=<code-or-type>`).
+    #[arg(long = "disable-warning", value_name = "code", global = true)]
+    disable_warning: Vec<String>,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
@@ -545,13 +570,22 @@ async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse();
     startup_timer.mark("parse_args");
-    let execution = CliExecutionConfig::new(
+    let mut execution = CliExecutionConfig::new(
         cli.timeout_secs,
         cli.trace.clone(),
         cli.jitless,
         cli.jit_events.clone(),
         cli.jit_artifacts.clone(),
     );
+    execution.set_warning_options(otter_runtime::WarningOptions {
+        no_warnings: cli.no_warnings,
+        no_deprecation: cli.no_deprecation,
+        throw_deprecation: cli.throw_deprecation,
+        trace_warnings: cli.trace_warnings,
+        pending_deprecation: cli.pending_deprecation,
+        disabled: cli.disable_warning.clone(),
+    });
+    let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();

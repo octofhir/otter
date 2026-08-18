@@ -688,6 +688,7 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                 Ok::<Value, NativeError>(scope.finish(event))
             })?;
             emit_values(ctx, process, event, &[warning])?;
+            print_warning_default(ctx, process, warning);
             Ok(Value::undefined())
         },
     )?;
@@ -697,4 +698,74 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         let undefined = scope.undefined();
         Ok(scope.finish(undefined))
     })
+}
+
+/// Node's default warning printer: `(node:pid) [CODE] Name: message` on
+/// stderr, or the warning's stack under `--trace-warnings`. Printing — not
+/// emission — is what `--no-warnings` and `--disable-warning` switch off.
+fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value) {
+    use std::io::Write;
+
+    let read_process = |ctx: &NativeCtx<'_>, key: &str| -> Option<Value> {
+        process
+            .as_object()
+            .and_then(|process| otter_vm::object::get(process, ctx.heap(), key))
+    };
+    let silenced = read_process(ctx, "__otter_no_warnings__")
+        .and_then(|value| value.as_boolean())
+        .unwrap_or(false);
+    if silenced {
+        return;
+    }
+    let read_warning = |ctx: &NativeCtx<'_>, key: &str| -> Option<String> {
+        warning
+            .as_object()
+            .and_then(|warning| otter_vm::object::get(warning, ctx.heap(), key))
+            .and_then(|value| value.as_string(ctx.heap()))
+            .map(|value| value.to_lossy_string(ctx.heap()))
+    };
+    let name = read_warning(ctx, "name").unwrap_or_else(|| "Warning".to_string());
+    let code = read_warning(ctx, "code");
+    if let Some(disabled) = read_process(ctx, "__otter_disabled_warnings__")
+        .and_then(Value::as_array)
+    {
+        let length = otter_vm::array::len(disabled, ctx.heap());
+        for index in 0..length {
+            let entry = otter_vm::array::get(disabled, ctx.heap(), index);
+            let Some(entry) = entry.as_string(ctx.heap()) else {
+                continue;
+            };
+            let entry = entry.to_lossy_string(ctx.heap());
+            if Some(entry.as_str()) == code.as_deref() || entry == name {
+                return;
+            }
+        }
+    }
+    let message = read_warning(ctx, "message").unwrap_or_default();
+    let detail = read_warning(ctx, "detail");
+    let trace = read_process(ctx, "__otter_trace_warnings__")
+        .and_then(|value| value.as_boolean())
+        .unwrap_or(false);
+    let pid = std::process::id();
+    let head = match &code {
+        Some(code) => format!("(node:{pid}) [{code}] {name}: {message}"),
+        None => format!("(node:{pid}) {name}: {message}"),
+    };
+    let mut err = std::io::stderr();
+    if trace {
+        // First line gets the pid/code prefix; the stack's frame lines
+        // follow untouched.
+        let _ = writeln!(err, "{head}");
+        if let Some(stack) = read_warning(ctx, "stack") {
+            for line in stack.lines().skip(1) {
+                let _ = writeln!(err, "{line}");
+            }
+        }
+    } else {
+        let _ = writeln!(err, "{head}");
+        if let Some(detail) = detail {
+            let _ = writeln!(err, "{detail}");
+        }
+    }
+    let _ = err.flush();
 }

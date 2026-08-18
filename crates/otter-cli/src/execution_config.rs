@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use otter_runtime::{
     JitArtifactBatch, JitDebugReport, JitDebugRequest, JitDebugTier, JitSelection, OtterBuilder,
-    RuntimeBuilder, TracerFactory,
+    RuntimeBuilder, TracerFactory, WarningOptions,
 };
 
 /// Owned execution settings shared by every runtime-backed CLI command.
@@ -35,6 +35,7 @@ pub(crate) struct CliExecutionConfig {
     jit_artifacts_target: Option<String>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
+    warning_options: WarningOptions,
 }
 
 impl Default for CliExecutionConfig {
@@ -46,6 +47,7 @@ impl Default for CliExecutionConfig {
             jit_artifacts_target: None,
             jit_selection: JitSelection::ProductionTiered,
             jit_osr_threshold: None,
+            warning_options: WarningOptions::default(),
         }
     }
 }
@@ -71,14 +73,21 @@ impl CliExecutionConfig {
             jit_artifacts_target,
             jit_selection,
             jit_osr_threshold: legacy_jit_osr_threshold(),
+            warning_options: WarningOptions::default(),
         }
     }
 
     /// Apply execution settings to the async-capable public runtime facade.
+    /// Replace the warning-channel switches captured from the CLI flags.
+    pub(crate) fn set_warning_options(&mut self, options: WarningOptions) {
+        self.warning_options = options;
+    }
+
     pub(crate) fn apply_otter_builder(&self, builder: OtterBuilder) -> OtterBuilder {
         let mut builder = builder
             .jit_selection(self.jit_selection)
-            .jit_debug(self.jit_debug_request());
+            .jit_debug(self.jit_debug_request())
+            .warning_options(self.warning_options.clone());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }
@@ -99,7 +108,8 @@ impl CliExecutionConfig {
     pub(crate) fn apply_runtime_builder(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
         let mut builder = builder
             .jit_selection(self.jit_selection)
-            .jit_debug(self.jit_debug_request());
+            .jit_debug(self.jit_debug_request())
+            .warning_options(self.warning_options.clone());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }

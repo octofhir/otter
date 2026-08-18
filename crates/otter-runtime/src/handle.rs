@@ -2364,8 +2364,11 @@ impl IsolateRunner {
             RuntimeCommand::RunFile { path, reply, .. } => {
                 let result = self.runtime.run_file(path);
                 let result = self.drive_event_loop_to_idle(result);
-                let result = self.finalize_process_exit(result);
-                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                let (result, exit_override) = self.finalize_process_exit(result);
+                let attempt = self
+                    .runtime
+                    .finish_jit_debug_attempt(result)
+                    .with_exit_code_override(exit_override);
                 send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::RunScript {
@@ -2376,8 +2379,11 @@ impl IsolateRunner {
             } => {
                 let result = self.runtime.run_script(source, &specifier);
                 let result = self.drive_event_loop_to_idle(result);
-                let result = self.finalize_process_exit(result);
-                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                let (result, exit_override) = self.finalize_process_exit(result);
+                let attempt = self
+                    .runtime
+                    .finish_jit_debug_attempt(result)
+                    .with_exit_code_override(exit_override);
                 send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::CreateRealm { reply, .. } => {
@@ -2403,15 +2409,21 @@ impl IsolateRunner {
             RuntimeCommand::RunModule { linked, reply, .. } => {
                 let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
-                let result = self.finalize_process_exit(result);
-                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                let (result, exit_override) = self.finalize_process_exit(result);
+                let attempt = self
+                    .runtime
+                    .finish_jit_debug_attempt(result)
+                    .with_exit_code_override(exit_override);
                 send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::RunModuleSource { linked, reply, .. } => {
                 let result = self.runtime.run_prepared_module(linked);
                 let result = self.drive_event_loop_to_idle(result);
-                let result = self.finalize_process_exit(result);
-                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                let (result, exit_override) = self.finalize_process_exit(result);
+                let attempt = self
+                    .runtime
+                    .finish_jit_debug_attempt(result)
+                    .with_exit_code_override(exit_override);
                 send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::RunModuleInRealm {
@@ -2428,8 +2440,11 @@ impl IsolateRunner {
             RuntimeCommand::Eval { source, reply, .. } => {
                 let result = self.runtime.eval(source);
                 let result = self.drive_event_loop_to_idle(result);
-                let result = self.finalize_process_exit(result);
-                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                let (result, exit_override) = self.finalize_process_exit(result);
+                let attempt = self
+                    .runtime
+                    .finish_jit_debug_attempt(result)
+                    .with_exit_code_override(exit_override);
                 send_run_reply(reply, attempt, &self.counters);
             }
         }
@@ -2468,12 +2483,45 @@ impl IsolateRunner {
     /// fold a listener's replacement code into the result. Runs the hook as a
     /// bare script — never through [`Self::drive_event_loop_to_idle`] — so a
     /// handle the run left open cannot stall completion.
+    ///
+    /// A failed run still fires the event, exactly as Node's uncaught path
+    /// does: the error is preserved for rendering, and the second element
+    /// carries the exit code the listeners settled on (default: the error's
+    /// own recommended code).
     fn finalize_process_exit(
         &mut self,
         result: Result<ExecutionResult, OtterError>,
-    ) -> Result<ExecutionResult, OtterError> {
-        let Ok(inner) = result else {
-            return result;
+    ) -> (Result<ExecutionResult, OtterError>, Option<u8>) {
+        let inner = match result {
+            Ok(inner) => inner,
+            Err(error) => {
+                // Teardown-shaped failures never reach user listeners.
+                if matches!(
+                    error,
+                    OtterError::Interrupted
+                        | OtterError::Timeout { .. }
+                        | OtterError::OutOfMemory { .. }
+                ) {
+                    return (Err(error), None);
+                }
+                self.exit_finalized = true;
+                let code = u8::try_from(error.exit_code().clamp(0, 255)).unwrap_or(1);
+                let script = format!(
+                    "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}) : {code}"
+                );
+                let final_code = match self.runtime.eval(SourceInput::from_javascript(script)) {
+                    Ok(emit_result) => emit_result
+                        .completion_string()
+                        .parse::<i64>()
+                        .ok()
+                        .map(|value| value.clamp(0, 255) as u8)
+                        .unwrap_or_else(|| emit_result.exit_code()),
+                    // A second failure inside an exit listener cannot improve
+                    // on the original error; the run keeps its code.
+                    Err(_) => code,
+                };
+                return (Err(error), Some(final_code));
+            }
         };
         // From here on the run is over in Node terms: callbacks scheduled by
         // an exit listener, and timers still in flight, must never execute.
@@ -2494,11 +2542,11 @@ impl IsolateRunner {
                     .ok()
                     .map(|value| value.clamp(0, 255) as u8)
                     .unwrap_or_else(|| emit_result.exit_code());
-                Ok(inner.with_exit_code(final_code))
+                (Ok(inner.with_exit_code(final_code)), None)
             }
             // An uncaught throw in an exit listener fails the run the way
             // Node's does.
-            Err(error) => Err(error),
+            Err(error) => (Err(error), None),
         }
     }
 

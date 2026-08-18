@@ -206,6 +206,27 @@ if (typeof target === 'object' && !(target instanceof EventEmitter)) {
   Object.setPrototypeOf(ProcessCtor, EventEmitter);
   Object.setPrototypeOf(target, ProcessCtor.prototype);
 }
+if (typeof target === 'object' && typeof target.getBuiltinModule !== 'function') {
+  const Module = require('module');
+  const realmRequire = require;
+  Object.defineProperty(target, 'getBuiltinModule', {
+    value: function getBuiltinModule(id) {
+      if (typeof id !== 'string') {
+        const suffix = id === null ? ' Received null'
+          : ` Received type ${typeof id}`;
+        const err = new TypeError(
+          `The "id" argument must be of type string.${suffix}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Module.isBuiltin(id)) return undefined;
+      return realmRequire(id);
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
 "#,
         graft_module,
         require,

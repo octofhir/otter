@@ -3620,6 +3620,38 @@ impl Runtime {
         if target_url.starts_with("http://") || target_url.starts_with("https://") {
             return Ok(DynamicModuleLoad::FetchHttps { target_url });
         }
+        // A hosted builtin (`node:fs`, `process`, ...) has no file to walk:
+        // synthesize the same CommonJS bridge a static `import` of a CJS file
+        // gets, whose default export is the module's `require` value.
+        if loader.is_hosted_url(&target_url) {
+            let synthetic_url = format!("otter-hosted-dynamic:{target_url}");
+            if let Some(env) = self.interp.module_env(&synthetic_url) {
+                return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
+            }
+            let specifier_literal =
+                serde_json::to_string(&target_url).unwrap_or_else(|_| "\"\"".to_string());
+            let requirer = entry_for_loader.join("__otter_dynamic_import__.js");
+            let requirer_literal = serde_json::to_string(&requirer.to_string_lossy())
+                .unwrap_or_else(|_| "\"\"".to_string());
+            let text = format!(
+                "import __otterModule from \"node:module\";\n\
+                 const __otterCommonJs = __otterModule.createRequire({requirer_literal})({specifier_literal});\n\
+                 export default __otterCommonJs;\n"
+            );
+            let entry = module_loader::ResolvedSource {
+                url: synthetic_url.clone(),
+                kind: SourceKind::JavaScript,
+                jsx: None,
+                text,
+            };
+            let linked = module_graph::load_program_source(&loader, entry).map_err(|e| {
+                DynLoadError::from_graph_error(
+                    &e,
+                    format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
+                )
+            })?;
+            return self.evaluate_dynamic_linked_module(&synthetic_url, linked);
+        }
         let target_path: PathBuf = url_to_path(&target_url).ok_or_else(|| {
             DynLoadError::type_error(format!(
                 "dynamic import: target is not a file:// URL: \"{target_url}\""
@@ -3648,19 +3680,20 @@ impl Runtime {
         self.register_resolved_exports(&linked.metadata);
         self.register_module_sources(&linked.module_sources);
         let context = self.interp.link_module(linked.module);
-        for init in context.module_inits() {
-            if self.interp.module_env(&init.url).is_some() {
-                continue;
-            }
-            let env = self
-                .interp
-                .alloc_host_object_with_roots(&[], &[])
-                .map_err(|e| {
-                    DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
-                })?;
-            self.interp
-                .register_module_env(std::sync::Arc::from(init.url.as_str()), env);
-        }
+        // Hosted builtins in this batch get their real namespaces (running
+        // their installers when needed); plain modules get fresh
+        // environments — the same records pipeline the static loader uses.
+        self.module_records
+            .allocate_for_module_inits(
+                &mut self.interp,
+                context.module_inits(),
+                &self.config.hosted_modules,
+                &self.config.capabilities,
+                self.runtime_task_spawner.clone(),
+            )
+            .map_err(|e| {
+                DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
+            })?;
         // §13.3.10 step 7 — Evaluate(target): the records-backed
         // InnerModuleEvaluation walks the target's eager dependency
         // closure, parking on top-level await instead of blocking.

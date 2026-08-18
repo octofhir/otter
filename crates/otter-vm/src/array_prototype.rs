@@ -4204,48 +4204,40 @@ pub(crate) fn array_callback_native_dispatch(
                 reason: "callback is not a function".to_string(),
             });
         }
-        let callback_roots = [receiver, callback, this_arg];
+        // `array_species_create` below allocates the output array and may
+        // scavenge, relocating the receiver / callback / thisArg. An ad-hoc
+        // value-root slice is not enough here: the collector rewrites such a
+        // root through a shared reference, which a register-resident copy of
+        // the stack local can outlive (the compiler is entitled to assume the
+        // locals are unchanged). Park the handles on the traced
+        // iteration-anchor stack instead and read the relocated values back —
+        // the same discipline the construct paths use.
+        let species_anchor = interp.push_iteration_anchor(receiver) - 1;
+        interp.push_iteration_anchor(callback);
+        interp.push_iteration_anchor(this_arg);
         let mut output_target = match kind {
-            ArrayCallbackKind::Map => {
-                let created = interp.array_species_create(
-                    stack,
-                    &context,
-                    receiver,
-                    len,
-                    &[args, &callback_roots],
-                );
-                Some(created.map_err(|err| {
-                    crate::native_function::vm_to_native_error(
-                        interp,
-                        err,
-                        "Array.prototype callback",
-                    )
-                })?)
-            }
-            ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
-                let created = interp.array_species_create(
-                    stack,
-                    &context,
-                    receiver,
-                    0,
-                    &[args, &callback_roots],
-                );
-                Some(created.map_err(|err| {
-                    crate::native_function::vm_to_native_error(
-                        interp,
-                        err,
-                        "Array.prototype callback",
-                    )
-                })?)
+            ArrayCallbackKind::Map | ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
+                let species_len = if kind == ArrayCallbackKind::Map { len } else { 0 };
+                let created =
+                    interp.array_species_create(stack, &context, receiver, species_len, &[args]);
+                match created {
+                    Ok(created) => Some(created),
+                    Err(err) => {
+                        interp.pop_iteration_anchors_to(species_anchor);
+                        return Err(crate::native_function::vm_to_native_error(
+                            interp,
+                            err,
+                            "Array.prototype callback",
+                        ));
+                    }
+                }
             }
             _ => None,
         };
-        // `array_species_create` above allocates the output array and may
-        // scavenge, relocating the receiver / callback / thisArg. The collector
-        // forwarded the `callback_roots` slots in place, but the standalone
-        // locals are copies it never saw — re-read them so every use below
-        // (fast path, iteration anchors, the live walk) sees the moved handles.
-        let [receiver, callback, this_arg] = callback_roots;
+        let receiver = interp.iteration_anchor(species_anchor);
+        let callback = interp.iteration_anchor(species_anchor + 1);
+        let this_arg = interp.iteration_anchor(species_anchor + 2);
+        interp.pop_iteration_anchors_to(species_anchor);
         // §23.1.3.12 `flatMap` is FlattenIntoArray(A, O, len, 0, 1, mapper,
         // T): each callback result that IsArray is spliced one level deep
         // through the observable HasProperty / Get / CreateDataProperty

@@ -1370,7 +1370,8 @@ impl Interpreter {
             }
             let op = CollectionFastOp::from_map_name(name)?;
             (hit, op)
-        } else if let Some(set) = recv.as_set() {
+        } else {
+            let set = recv.as_set()?;
             let proto = self.realm_intrinsics.set_prototype()?;
             if !prototype_override_is(
                 crate::collections::set_prototype_override(set, &self.gc_heap),
@@ -1389,8 +1390,6 @@ impl Interpreter {
             }
             let op = CollectionFastOp::from_set_name(name)?;
             (hit, op)
-        } else {
-            return None;
         };
         if let Some(hit) = hit {
             let ic = CollectionMethodCallIc {

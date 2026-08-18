@@ -1256,7 +1256,6 @@ fn set_index_value(
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
         return Ok(());
     }
-    let barrier_value = value;
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -1272,16 +1271,18 @@ fn set_index_value(
             body.length = body.length.max(target_len);
             body.mark_dirty();
         });
-        record_exotic_array_write(heap, arr, &barrier_value);
+        record_exotic_array_write(heap, arr, &value);
         return Ok(());
     }
-    reserve_dense_capacity(
-        &mut arr,
-        heap,
-        target_len,
-        dense_kind_for_value(value),
-        &mut |_| {},
-    )?;
+    // The reservation may trigger an emergency collection: `value` must be
+    // traced through it or a moved heap object is written back stale.
+    let preferred_kind = dense_kind_for_value(value);
+    {
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            value.trace_value_slots(visitor);
+        };
+        reserve_dense_capacity(&mut arr, heap, target_len, preferred_kind, &mut roots)?;
+    }
     heap.with_payload(arr, |body| {
         if idx < body.dense_len() {
             body.write_dense_value(idx, value);
@@ -1297,7 +1298,7 @@ fn set_index_value(
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
-    record_array_write(heap, arr, &barrier_value);
+    record_array_write(heap, arr, &value);
     Ok(())
 }
 

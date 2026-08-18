@@ -3143,11 +3143,10 @@ impl Interpreter {
     fn native_receiverless_constructor(&self, callee: &Value) -> Option<NativeFunction> {
         let native = if let Some(native) = callee.as_native_function() {
             native
-        } else if let Some(obj) = callee.as_object() {
+        } else {
+            let obj = callee.as_object()?;
             crate::object::constructor_native(obj, &self.gc_heap)
                 .and_then(|v| v.as_native_function())?
-        } else {
-            return None;
         };
         [
             "Promise",

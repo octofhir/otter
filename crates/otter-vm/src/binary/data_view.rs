@@ -47,6 +47,10 @@ pub struct DataViewBodyGc {
     /// `Object.defineProperty(dv, …)`). `None` until first write —
     /// a `DataView` is an ordinary extensible object per §25.3.
     pub expando: Option<crate::object::JsObject>,
+    /// Subclass `[[Prototype]]` selected at construction; `None` means
+    /// the realm's %DataView.prototype%. Body-resident so a moving
+    /// collection carries it with the object.
+    pub custom_proto: Option<crate::Value>,
 }
 
 impl otter_gc::SafeTraceable for DataViewBodyGc {
@@ -62,6 +66,9 @@ impl otter_gc::SafeTraceable for DataViewBodyGc {
         {
             let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
+        }
+        if let Some(proto) = &self.custom_proto {
+            proto.trace_value_slots(visitor);
         }
     }
 }
@@ -87,6 +94,7 @@ pub fn alloc_data_view(
         byte_length,
         length_tracking: false,
         expando: None,
+        custom_proto: None,
     })
 }
 
@@ -204,7 +212,18 @@ impl JsDataView {
         }
     }
 
-    /// Read the lazy expando bag, if one has been created.
+    /// Subclass prototype override stamped at construction, if any.
+    #[must_use]
+    pub fn custom_proto(self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
+        heap.read_payload(self.handle, |body| body.custom_proto)
+    }
+
+    /// Stamp the construction-time subclass prototype.
+    pub fn set_custom_proto(self, heap: &mut otter_gc::GcHeap, proto: crate::Value) {
+        heap.with_payload(self.handle, |body| body.custom_proto = Some(proto));
+    }
+
+    /// Lazy expando bag for ordinary own properties, if created.
     #[must_use]
     pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
         heap.read_payload(self.handle, |body| body.expando)

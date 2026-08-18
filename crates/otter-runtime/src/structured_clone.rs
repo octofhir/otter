@@ -477,13 +477,10 @@ fn clone_error_object(
     object: otter_vm::object::JsObject,
     heap: &GcHeap,
 ) -> Option<StructuredCloneValue> {
-    let name = match object::get(object, heap, "name") {
-        Some(v) => match v.as_string(heap) {
-            Some(s) => s.to_lossy_string(heap),
-            None => v.display_string(heap),
-        },
-        None => return None,
-    };
+    let name = object::get(object, heap, "name").map(|v| match v.as_string(heap) {
+        Some(s) => s.to_lossy_string(heap),
+        None => v.display_string(heap),
+    })?;
     ErrorKind::from_class_name(&name)?;
     let message = match object::get(object, heap, "message") {
         Some(v) => {

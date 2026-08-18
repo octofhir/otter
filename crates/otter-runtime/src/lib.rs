@@ -4305,11 +4305,13 @@ impl Runtime {
         }
     }
 
-    /// Force a full garbage collection over the complete runtime root set —
-    /// the `--expose-gc` collection, also run before the `'exit'` event so
-    /// finalization WeakRefs resolve the way Node's do at shutdown.
+    /// Force a full garbage collection cycle — mark, ephemeron fixpoint,
+    /// WeakRef/FinalizationRegistry processing (cleanup callbacks are
+    /// enqueued as microtasks), then sweep. This is the `--expose-gc`
+    /// collection, also run before the `'exit'` event so finalization
+    /// WeakRefs resolve the way Node's do at shutdown.
     pub fn force_full_gc(&mut self) {
-        self.interp.collect_full_tracing_runtime_roots();
+        let _ = self.interp.force_gc();
     }
 
     /// Configured heap cap in bytes (`0` = disabled).
@@ -7118,7 +7120,7 @@ fn force_gc_native(
     ctx: &mut otter_vm::NativeCtx<'_>,
     _args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, otter_vm::NativeError> {
-    ctx.interp_mut().collect_full_tracing_runtime_roots();
+    let _ = ctx.interp_mut().force_gc();
     Ok(otter_vm::Value::undefined())
 }
 

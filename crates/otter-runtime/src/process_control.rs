@@ -500,6 +500,10 @@ pub(crate) fn received_suffix(ctx: &mut NativeCtx<'_>, value: Value) -> String {
         let rendered = value.display_string(ctx.heap());
         return format!(" Received type boolean ({rendered})");
     }
+    if value.as_big_int().is_some() {
+        let rendered = value.display_string(ctx.heap());
+        return format!(" Received type bigint ({rendered}n)");
+    }
     if value.is_callable() {
         // Node's `invalidArgTypeHelper`: `function ${name}` even when the
         // name is empty — the trailing space is part of the contract.

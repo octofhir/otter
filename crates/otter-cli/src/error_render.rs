@@ -44,11 +44,42 @@ fn emit_human_diagnostics(err: &OtterError) -> bool {
             emit_human_diagnostic(diagnostic);
             true
         }
+        // A throw escaping the uncaughtException handler is fatal (exit 7)
+        // and prints as the error itself, exactly as Node's does.
+        OtterError::Internal { code, message } if code == "UNCAUGHT_HANDLER_THREW" => {
+            let message = message
+                .strip_prefix("uncaught exception handler failed: ")
+                .unwrap_or(message);
+            let message = message
+                .strip_prefix("native function NativeScope::call threw: ")
+                .unwrap_or(message);
+            eprintln!("{message}");
+            true
+        }
         _ => false,
     }
 }
 
 fn emit_human_diagnostic(diagnostic: &Diagnostic) {
+    // An uncaught exception prints the way Node prints one — the error's own
+    // `Name: message` line followed by its frames — because programs (and the
+    // Node test harness) grep stderr for exactly that shape.
+    if diagnostic.code == "UNCAUGHT" {
+        let message = diagnostic
+            .message
+            .strip_prefix("uncaught exception: ")
+            .unwrap_or(&diagnostic.message);
+        eprintln!("{message}");
+        for frame in &diagnostic.frames {
+            let function = if frame.function.is_empty() {
+                "<anonymous>"
+            } else {
+                &frame.function
+            };
+            eprintln!("    at {function} ({})", frame.module);
+        }
+        return;
+    }
     match render_human_diagnostic(diagnostic) {
         Some(rendered) => eprint!("{rendered}"),
         None => eprintln!("error[{}]: {}", diagnostic.code, diagnostic.message),

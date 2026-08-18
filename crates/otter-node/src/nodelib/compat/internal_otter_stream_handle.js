@@ -219,10 +219,30 @@ class StreamHandle {
 
   _writeBytes(req, buffer) {
     if (this.fd === -1 || this._closed) return uvCode('EBADF');
+    // In-line non-blocking write first, the way libuv's uv_try_write path
+    // completes small writes synchronously: an empty writer queue lets the
+    // kernel take the bytes now, and only the remainder rides the async
+    // queue with a completion token.
+    let queued = buffer;
+    if (this._pendingWriteCount === 0) {
+      let written = 0;
+      try {
+        written = native.tryWrite(this.fd, buffer);
+      } catch {
+        return uvCode('EPIPE');
+      }
+      if (written >= buffer.length) {
+        this.bytesWritten += buffer.length;
+        streamBaseState[kBytesWritten] = buffer.length;
+        streamBaseState[kLastWriteWasAsync] = 0;
+        return 0;
+      }
+      if (written > 0) queued = buffer.subarray(written);
+    }
     const token = nextWriteToken++;
     let accepted = false;
     try {
-      accepted = native.write(this.fd, buffer, token);
+      accepted = native.write(this.fd, queued, token);
     } catch {
       return uvCode('EPIPE');
     }

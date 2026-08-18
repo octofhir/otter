@@ -202,7 +202,6 @@ class HTTPParser {
     const state = this._state;
     if (state === 'line') {
       if (this._stash.length === 0) return 'wait';
-      if (this._messageStart === 0) this._messageStart = Date.now();
       // llhttp rejects an impossible method byte-by-byte, without waiting
       // for the line to complete.
       if (this._type === HTTPParser.REQUEST && this._stash[0] !== 13) {
@@ -214,13 +213,19 @@ class HTTPParser {
         if (this._stash.length > this._maxHeaderSize) {
           return parseError('HPE_HEADER_OVERFLOW', 'Header overflow');
         }
+        if (this._stash.length > 0 && this._messageStart === 0) {
+          this._messageStart = Date.now();
+        }
         return 'wait';
       }
-      // llhttp skips blank lines before a request line.
+      // llhttp skips blank lines before a request line; they do not start
+      // a message, so the header-timeout clock stays unarmed.
       if (idx === 0) {
         this._stash = this._stash.subarray(2);
+        this._messageStart = 0;
         return 'more';
       }
+      if (this._messageStart === 0) this._messageStart = Date.now();
       const line = this._stash.subarray(0, idx).toString('latin1');
       const err = this._type === HTTPParser.RESPONSE
         ? this._parseStatusLine(line)
@@ -404,6 +409,7 @@ class HTTPParser {
     let upgradeHeader = false;
     let contentLength = -1;
     let chunked = false;
+    let transferEncoding = false;
     for (let i = 0; i < raw.length; i += 2) {
       const name = raw[i].toLowerCase();
       const value = raw[i + 1];
@@ -420,9 +426,9 @@ class HTTPParser {
           return parseError('HPE_INVALID_CONTENT_LENGTH', 'Duplicate Content-Length');
         }
         contentLength = parsed;
-      } else if (name === 'transfer-encoding' &&
-                 /(?:^|\W)chunked(?:$|\W)/i.test(value)) {
-        chunked = true;
+      } else if (name === 'transfer-encoding') {
+        transferEncoding = true;
+        if (/(?:^|\W)chunked(?:$|\W)/i.test(value)) chunked = true;
       }
     }
     const versionOnePlus = this._versionMajor === 1 && this._versionMinor >= 1;
@@ -463,7 +469,16 @@ class HTTPParser {
         keepAlive,
       ) | 0;
     }
-    this._skipBody = ret === 1 || ret === 2 || upgrade;
+    // An upgrade request still carries its declared body (llhttp parses it
+    // and only then reports the upgrade index); CONNECT never has one.
+    this._skipBody = ret === 1 || ret === 2 || isConnect;
+    // §llhttp — a Transfer-Encoding whose final coding is not chunked has
+    // no defined body framing for a request; the message errors after the
+    // headers callback, so the request object exists but sees no body.
+    if (transferEncoding && !chunked && !this._skipBody &&
+        this._type === HTTPParser.REQUEST && contentLength === -1) {
+      return parseError('HPE_INVALID_TRANSFER_ENCODING', 'Invalid transfer encoding');
+    }
 
     const bodyless = isResponse &&
       (this._statusCode === 204 || this._statusCode === 304 ||

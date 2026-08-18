@@ -269,6 +269,19 @@ fn clone_local<'scope, 'rt>(
         return Ok(cloned);
     }
 
+    // `process.env` is a Proxy over a branded plain backing object; Node's
+    // env is a native named-property object and clones there. Only the
+    // branded env target is cloned — arbitrary proxies stay uncloneable.
+    if let Some(target) = scope.proxy_target(source) {
+        let brand = scope.get(target, "__otter_env_target__")?;
+        if scope.boolean_value(brand).unwrap_or(false) {
+            let cloned = scope.object()?;
+            publish(state, source, cloned);
+            clone_enumerable_properties(scope, target, cloned, false, state, depth)?;
+            return Ok(cloned);
+        }
+    }
+
     Err(data_clone_error("value"))
 }
 

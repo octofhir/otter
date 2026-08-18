@@ -2741,6 +2741,14 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::set_symbol"))
     }
 
+    /// The `[[ProxyTarget]]` of a Proxy value, parked in this scope; `None`
+    /// when the value is not a Proxy.
+    pub fn proxy_target(&mut self, value: Local<'_>) -> Option<Local<'scope>> {
+        let proxy = self.raw(value).as_proxy()?;
+        let target = proxy.target(self.ctx.heap());
+        Some(self.value(target))
+    }
+
     /// Define an accessor property with explicit descriptor flags. Pass the
     /// scope's `undefined` for an absent getter or setter.
     pub fn define_accessor(

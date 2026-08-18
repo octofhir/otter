@@ -399,6 +399,18 @@ fn clone_value(
     if let Some(obj) = value.as_object() {
         return clone_object(obj, heap, options, depth, path, active);
     }
+    if let Some(proxy) = value.as_proxy() {
+        // `process.env` is implemented as a Proxy over a plain backing
+        // object; Node's env is a native named-property object and
+        // `structuredClone(process.env)` works there. Only the branded env
+        // target is cloned — arbitrary proxies stay uncloneable per HTML.
+        let target = proxy.target(heap);
+        if let Some(target) = target.as_object()
+            && object::get(target, heap, "__otter_env_target__").is_some()
+        {
+            return clone_object(target, heap, options, depth, path, active);
+        }
+    }
     Err(StructuredCloneError::UnsupportedValue {
         path,
         type_name: value_type_name(value),

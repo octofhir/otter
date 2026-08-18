@@ -7,7 +7,11 @@
 // so matcher checks observe it; the `Assert` class is the constructible form.
 
 const util = require('util');
-const { isDeepStrictEqual, isDeepEqual, inspect, getCallSites } = util;
+const { inspect, getCallSites } = util;
+// The comparison engine directly: public `util` exposes only
+// `isDeepStrictEqual`, and loose equality plus the skip-prototype strict
+// variant live in the internal module.
+const { isDeepEqual, isDeepStrictEqual } = require('internal/util/comparisons');
 const makeCallTracker = require('internal/assert/calltracker');
 
 function inspectValue(v) {

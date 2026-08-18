@@ -101,6 +101,56 @@ fn native_value<'scope>(
     )?;
     scope.set(object, "spawnStart", start)?;
 
+    let stdin_table = children.clone();
+    let stdin_write = scope.native_closure(
+        "childStdinWrite",
+        2,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            let id = handle_arg(args, 0);
+            // A typed-array payload crosses as raw bytes; string payloads
+            // take the latin1 detour, exactly like the net write path.
+            let bytes = if let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap())) {
+                let heap = ctx.heap();
+                let offset = view.byte_offset(heap);
+                let len = view.byte_length(heap);
+                view.buffer(heap)
+                    .with_bytes(heap, |bytes| bytes[offset..offset + len].to_vec())
+            } else {
+                latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()))
+            };
+            let sender = stdin_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&id)
+                .and_then(|entry| entry.stdin.clone());
+            let accepted =
+                sender.is_some_and(|sender| sender.send(StdinMessage::Data(bytes)).is_ok());
+            Ok(Value::boolean(accepted))
+        },
+    )?;
+    scope.set(object, "childStdinWrite", stdin_write)?;
+
+    let stdin_end_table = children.clone();
+    let stdin_end = scope.native_closure(
+        "childStdinEnd",
+        1,
+        &[],
+        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            let id = handle_arg(args, 0);
+            let mut table = stdin_end_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = table.get_mut(&id)
+                && let Some(sender) = entry.stdin.take()
+            {
+                let _ = sender.send(StdinMessage::End);
+            }
+            Ok(Value::undefined())
+        },
+    )?;
+    scope.set(object, "childStdinEnd", stdin_end)?;
+
     let send_table = children.clone();
     let send = scope.native_closure(
         "ipcSend",
@@ -152,6 +202,13 @@ fn lookup_channel(children: &ChildTable, id: u32) -> Option<Arc<IpcChannel>> {
 /// only the isolate's own thread ever touches it.
 struct ChildEntry {
     channel: Option<Arc<IpcChannel>>,
+    stdin: Option<tokio::sync::mpsc::UnboundedSender<StdinMessage>>,
+}
+
+/// One instruction for a child's stdin writer task.
+enum StdinMessage {
+    Data(Vec<u8>),
+    End,
 }
 
 type ChildTable = Arc<Mutex<HashMap<u32, ChildEntry>>>;
@@ -190,13 +247,47 @@ impl RuntimeTask for ChildIpcEvent {
     }
 }
 
+/// A chunk one of the child's output pipes produced, delivered live.
+struct ChildStdio {
+    id: u32,
+    /// 1 = stdout, 2 = stderr.
+    which: u8,
+    /// Latin1-bridged bytes; empty marks end-of-stream.
+    data: Option<String>,
+}
+
+impl RuntimeTask for ChildStdio {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Some(context) = runtime.realm_execution_context() else {
+            return Ok(());
+        };
+        runtime.run_native_event(&context, |ctx| {
+            ctx.scope(|mut scope| {
+                let globals = scope.global_this();
+                let dispatcher = scope.get(globals, "__otterChildStdio")?;
+                if !scope.is_callable(dispatcher) {
+                    let undefined = scope.undefined();
+                    return Ok(scope.finish(undefined));
+                }
+                let id = scope.number(f64::from(self.id));
+                let which = scope.number(f64::from(self.which));
+                let payload = match &self.data {
+                    Some(text) => scope.string(text)?,
+                    None => scope.null(),
+                };
+                let undefined = scope.undefined();
+                let result = scope.call(dispatcher, undefined, &[id, which, payload])?;
+                Ok(scope.finish(result))
+            })
+        })
+    }
+}
+
 /// A child's outcome, reported once it has run to completion.
 struct ChildExit {
     id: u32,
     status: Option<i32>,
     signal: Option<String>,
-    stdout: String,
-    stderr: String,
 }
 
 impl RuntimeTask for ChildExit {
@@ -221,11 +312,8 @@ impl RuntimeTask for ChildExit {
                     Some(name) => scope.string(name)?,
                     None => scope.null(),
                 };
-                let stdout = scope.string(&self.stdout)?;
-                let stderr = scope.string(&self.stderr)?;
                 let undefined = scope.undefined();
-                let result =
-                    scope.call(dispatcher, undefined, &[id, status, signal, stdout, stderr])?;
+                let result = scope.call(dispatcher, undefined, &[id, status, signal])?;
                 Ok(scope.finish(result))
             })
         })
@@ -318,14 +406,16 @@ fn spawn_start(
         }
         None => Vec::new(),
     };
+    let mut piped = [false; 3];
     for (index, slot) in [0usize, 1, 2].into_iter().enumerate() {
-        let default = if slot == 0 { "ignore" } else { "pipe" };
-        let how = streams.get(slot).map(String::as_str).unwrap_or(default);
+        let how = streams.get(slot).map(String::as_str).unwrap_or("pipe");
         let target = match how {
             "inherit" => Stdio::inherit(),
             "ignore" => Stdio::null(),
-            _ if slot == 0 => Stdio::null(),
-            _ => Stdio::piped(),
+            _ => {
+                piped[slot] = true;
+                Stdio::piped()
+            }
         };
         match index {
             0 => cmd.stdin(target),
@@ -334,11 +424,22 @@ fn spawn_start(
         };
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => return spawn_error_result(ctx, &command, &err),
     };
     let pid = child.id();
+
+    // The stdin writer runs on the IO runtime and owns the pipe; End (or the
+    // sender dropping) closes it, which is the EOF the child reads.
+    let stdin_sender = child.stdin.take().map(|pipe| {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<StdinMessage>();
+        if let Some(io) = spawner.io_handle() {
+            io.spawn(stdin_writer(pipe, receiver));
+        }
+        sender
+    });
+
     children
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -346,6 +447,7 @@ fn spawn_start(
             id,
             ChildEntry {
                 channel: channel.map(|(channel, _)| channel),
+                stdin: stdin_sender,
             },
         );
 
@@ -361,8 +463,30 @@ fn spawn_start(
     })
 }
 
-/// Wait for a child away from the isolate thread and report its outcome there.
-fn reap(child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
+
+/// Switch a pipe descriptor to non-blocking mode, which is what tokio's
+/// `from_std` conversions require of a handle they adopt.
+#[cfg(unix)]
+fn set_nonblocking<F: std::os::fd::AsFd>(pipe: &F) -> bool {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let fd = pipe.as_fd();
+    let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) else {
+        return false;
+    };
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).is_ok()
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking<F>(_pipe: &F) -> bool {
+    true
+}
+
+/// Wait for a child away from the isolate thread and report its outcome
+/// there. Output pipes stream live chunks as they arrive; the exit report is
+/// enqueued only after both pipes reached end-of-stream, so listeners always
+/// see every chunk before 'exit'.
+fn reap(mut child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
     let Some(io) = spawner.io_handle() else {
         return;
     };
@@ -370,26 +494,109 @@ fn reap(child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
     // loop open until its outcome has been reported.
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let exit_spawner = spawner.clone();
-    io.spawn_blocking(move || {
-        let exit = match child.wait_with_output() {
-            Ok(output) => ChildExit {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    io.spawn(async move {
+        let out_task = stdout
+            .filter(set_nonblocking)
+            .and_then(|pipe| tokio::process::ChildStdout::from_std(pipe).ok())
+            .map(|pipe| tokio::spawn(stream_pipe(pipe, id, 1, exit_spawner.clone())));
+        let err_task = stderr
+            .filter(set_nonblocking)
+            .and_then(|pipe| tokio::process::ChildStderr::from_std(pipe).ok())
+            .map(|pipe| tokio::spawn(stream_pipe(pipe, id, 2, exit_spawner.clone())));
+        let status = tokio::task::spawn_blocking(move || child.wait()).await;
+        if let Some(task) = out_task {
+            let _ = task.await;
+        }
+        if let Some(task) = err_task {
+            let _ = task.await;
+        }
+        let exit = match status {
+            Ok(Ok(status)) => ChildExit {
                 id,
-                status: output.status.code(),
-                signal: exit_signal(&output.status),
-                stdout: bytes_to_latin1(&output.stdout),
-                stderr: bytes_to_latin1(&output.stderr),
+                status: status.code(),
+                signal: exit_signal(&status),
             },
-            Err(error) => ChildExit {
+            _ => ChildExit {
                 id,
                 status: None,
                 signal: None,
-                stdout: String::new(),
-                stderr: error.to_string(),
             },
         };
-        let _ = exit_spawner.enqueue(exit, RuntimeLiveness::Unref);
+        // The exit report itself holds the loop: the child's own Ref hold is
+        // released right after, and an Unref message could otherwise still be
+        // in the inbox when the loop finds nothing left to wait for.
+        let _ = exit_spawner.enqueue(exit, RuntimeLiveness::Ref);
         drop(keep_alive);
     });
+}
+
+/// Read one output pipe to end-of-stream, delivering each chunk live and a
+/// final `None` marking the end.
+async fn stream_pipe(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    id: u32,
+    which: u8,
+    spawner: RuntimeTaskSpawner,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = vec![0u8; 65_536];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(length) => {
+                if spawner
+                    .enqueue(
+                        ChildStdio {
+                            id,
+                            which,
+                            data: Some(bytes_to_latin1(&chunk[..length])),
+                        },
+                        RuntimeLiveness::Unref,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = spawner.enqueue(
+        ChildStdio {
+            id,
+            which,
+            data: None,
+        },
+        RuntimeLiveness::Unref,
+    );
+}
+
+/// Own a child's stdin pipe: write queued bytes in order and close on `End`
+/// (or when the JS side drops the queue), which is the child's EOF.
+async fn stdin_writer(
+    pipe: std::process::ChildStdin,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<StdinMessage>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if !set_nonblocking(&pipe) {
+        return;
+    }
+    let Ok(mut pipe) = tokio::process::ChildStdin::from_std(pipe) else {
+        return;
+    };
+    while let Some(message) = receiver.recv().await {
+        match message {
+            StdinMessage::Data(bytes) => {
+                if pipe.write_all(&bytes).await.is_err() {
+                    return;
+                }
+                let _ = pipe.flush().await;
+            }
+            StdinMessage::End => break,
+        }
+    }
+    let _ = pipe.shutdown().await;
 }
 
 fn bytes_to_latin1(bytes: &[u8]) -> String {

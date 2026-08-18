@@ -236,6 +236,12 @@ if (typeof target === 'object') {
     'isNativeError', 'isPromise', 'isRegExp', 'isSet', 'isSetIterator',
     'isTypedArray', 'isUint8Array',
   ];
+  const allowedBindings = [
+    'buffer', 'cares_wrap', 'constants', 'contextify', 'fs', 'fs_event_wrap',
+    'icu', 'inspector', 'js_stream', 'natives', 'os', 'pipe_wrap',
+    'spawn_sync', 'stream_wrap', 'tcp_wrap', 'tls_wrap', 'tty_wrap',
+    'udp_wrap', 'util', 'uv', 'zlib',
+  ];
   const cache = new Map();
   Object.defineProperty(target, 'binding', {
     value: function binding(name) {
@@ -245,13 +251,15 @@ if (typeof target === 'object') {
       if (name === 'util') {
         bound = {};
         for (const key of utilBindingKeys) bound[key] = utilTypes[key];
-      } else {
+      } else if (allowedBindings.includes(name)) {
         try {
           bound = internalBinding(name);
         } catch {
           bound = undefined;
         }
         if (bound === undefined || bound === null) bound = {};
+      } else {
+        throw new Error(`No such module: ${name}`);
       }
       cache.set(name, bound);
       return bound;

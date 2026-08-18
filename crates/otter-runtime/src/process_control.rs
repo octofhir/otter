@@ -369,10 +369,8 @@ fn kill_pid(ctx: &mut NativeCtx<'_>, value: Value) -> Option<f64> {
         } else {
             trimmed.parse::<f64>().ok()?
         }
-    } else if let Some(boolean) = value.as_boolean() {
-        f64::from(u8::from(boolean))
     } else {
-        return None;
+        f64::from(u8::from(value.as_boolean()?))
     };
     (number.is_finite() && number == f64::from(number as i32)).then_some(number)
 }

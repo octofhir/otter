@@ -67,10 +67,9 @@ pub fn to_index(value: &Value, heap: &otter_gc::GcHeap) -> Option<u64> {
         if b { 1.0 } else { 0.0 }
     } else if value.is_null() {
         0.0
-    } else if let Some(s) = value.as_string(heap) {
-        crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
     } else {
-        return None;
+        let s = value.as_string(heap)?;
+        crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
     };
     if n.is_nan() {
         return Some(0);

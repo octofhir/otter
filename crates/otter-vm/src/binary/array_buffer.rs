@@ -97,6 +97,13 @@ pub struct LocalArrayBufferBodyGc {
     pub max_byte_length: Option<usize>,
     /// GC-budget reservation for the off-heap byte storage.
     pub external: Option<otter_gc::ExternalMemory>,
+    /// Subclass `[[Prototype]]` selected at construction
+    /// (`GetPrototypeFromConstructor`); `None` means the realm's
+    /// %ArrayBuffer.prototype%. Lives in the body so a moving
+    /// collection carries it with the object — an address-keyed side
+    /// table would attach the override to whatever object later
+    /// reuses the address.
+    pub prototype_override: Option<crate::Value>,
     /// Lazy expando bag for ordinary own properties
     /// (`ab.constructor = C` for the species protocol, `ab.x = 1`).
     pub expando: Option<crate::object::JsObject>,
@@ -168,6 +175,9 @@ impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
             let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
         // No outgoing GC slots — the byte storage and its cached base are
         // plain data.
     }
@@ -196,6 +206,7 @@ pub fn alloc_local_array_buffer(
         max_byte_length,
         external,
         expando: None,
+        prototype_override: None,
     })?;
     // The `Vec`'s buffer is a separate allocation, so moving the body — here
     // and in any later collection — leaves the cached base valid.
@@ -662,6 +673,24 @@ impl JsArrayBuffer {
             body.with_bytes_mut(|bytes| bytes.resize(new_len, 0u8));
             true
         })
+    }
+
+    /// Subclass `[[Prototype]]` stamped at construction, if any. Shared
+    /// buffers keep the realm default (subclassing stamps only locals).
+    #[must_use]
+    pub fn custom_proto(self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| body.prototype_override),
+            BufferStorage::Shared(_) => None,
+        }
+    }
+
+    /// Stamp the construction-time subclass prototype (local buffers).
+    pub fn set_custom_proto(self, heap: &mut otter_gc::GcHeap, proto: crate::Value) {
+        if let BufferStorage::Local(h) = self.storage {
+            heap.with_payload(h, |body| body.prototype_override = Some(proto));
+            heap.record_write(h, &proto);
+        }
     }
 
     /// Lazy expando bag for ordinary own properties. `None` until the

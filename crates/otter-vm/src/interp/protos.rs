@@ -30,30 +30,30 @@ impl Interpreter {
         }
     }
 
+    /// Side-table key for exotics whose payloads are genuinely outside
+    /// the GC heap (`Rc`/`Arc` backed), so their addresses are stable.
+    /// GC-backed exotics (buffers, views, typed arrays) must NEVER key
+    /// this table: a moving collection changes their address, orphaning
+    /// the entry and — worse — bequeathing it to whatever object later
+    /// reuses the address. Those types carry the override in their
+    /// bodies instead.
     pub(crate) fn non_gc_exotic_prototype_override_key(
         value: &Value,
         heap: &otter_gc::GcHeap,
     ) -> Option<usize> {
-        if let Some(buffer) = value.as_array_buffer() {
-            return Some(buffer.identity_addr() as usize);
-        }
-        if let Some(view) = value.as_data_view() {
-            return Some(view.identity_addr() as usize);
-        }
         if let Some(intl) = value.as_intl(heap) {
             return Some(intl.identity_addr() as usize);
         }
         if let Some(iter) = value.as_iterator() {
             return Some(iter.as_header_ptr() as usize);
         }
-        value
-            .as_typed_array(heap)
-            .map(|array| array.identity_addr() as usize)
+        None
     }
 
     /// Store the allocation-time `[[Prototype]]` selected by
-    /// ECMA-262 `GetPrototypeFromConstructor` for exotics whose
-    /// bodies are not GC-managed yet.
+    /// ECMA-262 `GetPrototypeFromConstructor`. GC-backed exotics stamp
+    /// their body slot; the address-keyed side table serves only
+    /// stable-address (non-GC) payloads.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
@@ -62,6 +62,24 @@ impl Interpreter {
         value: &Value,
         proto: Option<Value>,
     ) {
+        if let Some(buffer) = value.as_array_buffer() {
+            if let Some(proto) = proto {
+                buffer.set_custom_proto(&mut self.gc_heap, proto);
+            }
+            return;
+        }
+        if let Some(view) = value.as_data_view() {
+            if let Some(proto) = proto {
+                view.set_custom_proto(&mut self.gc_heap, proto);
+            }
+            return;
+        }
+        if let Some(array) = value.as_typed_array(&self.gc_heap) {
+            if let Some(proto) = proto {
+                array.set_custom_proto(&mut self.gc_heap, proto);
+            }
+            return;
+        }
         let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
             return;
         };
@@ -76,6 +94,15 @@ impl Interpreter {
     }
 
     pub(crate) fn non_gc_exotic_prototype_override(&self, value: &Value) -> Option<Value> {
+        if let Some(buffer) = value.as_array_buffer() {
+            return buffer.custom_proto(&self.gc_heap);
+        }
+        if let Some(view) = value.as_data_view() {
+            return view.custom_proto(&self.gc_heap);
+        }
+        if let Some(array) = value.as_typed_array(&self.gc_heap) {
+            return array.custom_proto(&self.gc_heap);
+        }
         let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
         self.non_gc_exotic_prototype_overrides.get(&key).cloned()
     }

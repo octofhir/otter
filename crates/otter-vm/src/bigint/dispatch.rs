@@ -146,10 +146,8 @@ fn parse_radix_literal(input: &str) -> Option<BigInt> {
         (16u32, rest)
     } else if let Some(rest) = lower.strip_prefix("0o") {
         (8u32, rest)
-    } else if let Some(rest) = lower.strip_prefix("0b") {
-        (2u32, rest)
     } else {
-        return None;
+        (2u32, lower.strip_prefix("0b")?)
     };
     BigInt::parse_bytes(body.as_bytes(), radix)
 }

@@ -427,7 +427,9 @@ fn ensure_node_tests_present(workspace_root: &Path) -> Result<()> {
 
 fn ensure_otter_binary(options: &RunOptions) -> Result<PathBuf> {
     if let Some(path) = &options.otter_bin {
-        return Ok(path.clone());
+        // The test child runs from the Node checkout root, so a relative
+        // binary path must be pinned to an absolute one first.
+        return Ok(path.canonicalize().unwrap_or_else(|_| path.clone()));
     }
 
     let binary = options.workspace_root.join("target/release/otter");
@@ -599,7 +601,12 @@ fn run_one_test(
         // Node's own test runner executes from the checkout root; tests that
         // touch `process.cwd()` (chdir into `lib/`, resolve `./.env`) assume
         // exactly that directory.
-        .current_dir(workspace_root.join(NODE_CHECKOUT))
+        .current_dir(
+            workspace_root
+                .join(NODE_CHECKOUT)
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.join(NODE_CHECKOUT)),
+        )
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     configure_watchdog_process_group(&mut command);

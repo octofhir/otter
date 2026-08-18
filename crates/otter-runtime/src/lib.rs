@@ -1671,6 +1671,7 @@ pub(crate) struct RuntimeConfig {
     promise_rejection_hook: Option<PromiseRejectionHookHandle>,
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
+    process_exec_argv: Vec<String>,
     process_cwd: PathBuf,
     process_env_overlay: std::collections::BTreeMap<String, String>,
     warning_options: WarningOptions,
@@ -1976,6 +1977,7 @@ impl Default for RuntimeConfig {
             promise_rejection_hook: None,
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
+            process_exec_argv: Vec::new(),
             process_cwd: process::default_cwd(),
             warning_options: WarningOptions::default(),
             process_title: None,
@@ -2369,6 +2371,19 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn process_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.config.process_argv = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Engine-level flags the process was started with, surfaced as
+    /// `process.execArgv` so a re-exec (`spawn(process.execPath,
+    /// [...process.execArgv, ...])` and the test harness's flag check)
+    /// reproduces the current configuration.
+    #[must_use]
+    pub fn process_exec_argv(
+        mut self,
+        argv: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config.process_exec_argv = argv.into_iter().map(Into::into).collect();
         self
     }
 
@@ -2903,6 +2918,7 @@ impl Runtime {
                         process::install_global(
                             &mut *interp,
                             &config.process_argv,
+                            &config.process_exec_argv,
                             &config.process_cwd,
                             &config.process_env_overlay,
                             &config.capabilities,
@@ -6168,6 +6184,17 @@ impl OtterBuilder {
     #[must_use]
     pub fn process_title(mut self, title: Option<String>) -> Self {
         self.runtime = self.runtime.process_title(title);
+        self
+    }
+
+    /// Engine flags surfaced as `process.execArgv` (the CLI's node-style
+    /// switches), so re-execs reproduce the configuration.
+    #[must_use]
+    pub fn process_exec_argv(
+        mut self,
+        argv: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.runtime = self.runtime.process_exec_argv(argv);
         self
     }
 

@@ -1290,18 +1290,6 @@ impl Interpreter {
     pub(crate) fn escape_scoped(&self, handle: Local<'_>) -> Value {
         self.handle_arena.get(handle.index())
     }
-
-    /// Force a full (mark-sweep) collection while tracing the full runtime root
-    /// set. Old-space objects (e.g. string bodies) do not move, but anything
-    /// the root walk cannot reach is swept — so surviving one proves the arena
-    /// keeps a handle live. Public for the host's `--expose-gc` global, which
-    /// runs exactly this collection.
-    pub fn collect_full_tracing_runtime_roots(&mut self) {
-        let _runtime_roots_guard = self.scope_runtime_roots_guard();
-        self.gc_heap
-            .collect_full(&mut |_visitor| {})
-            .expect("full GC");
-    }
 }
 
 #[cfg(test)]
@@ -1309,6 +1297,17 @@ impl Interpreter {
     /// Current scope-handle arena length.
     fn handle_arena_len_for_test(&self) -> usize {
         self.handle_arena.len()
+    }
+
+    /// Force a full (mark-sweep) collection while tracing the full runtime root
+    /// set — the raw heap collection without the VM's weak-ref/ephemeron
+    /// processing, so it exercises rooting alone. Tests only; a production
+    /// full collection is [`crate::Interpreter::force_gc`].
+    fn collect_full_tracing_runtime_roots(&mut self) {
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        self.gc_heap
+            .collect_full(&mut |_visitor| {})
+            .expect("full GC");
     }
 
     /// Force a minor collection while the direct runtime-root provider is

@@ -157,6 +157,10 @@ struct Cli {
     #[arg(long = "disable-warning", value_name = "code", global = true)]
     disable_warning: Vec<String>,
 
+    /// Initial `process.title` (Node's `--title=<name>`).
+    #[arg(long = "title", value_name = "name", global = true)]
+    title: Option<String>,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
@@ -585,6 +589,7 @@ async fn main() -> ExitCode {
         pending_deprecation: cli.pending_deprecation,
         disabled: cli.disable_warning.clone(),
     });
+    execution.set_process_title(cli.title.clone());
     let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();

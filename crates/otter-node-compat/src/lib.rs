@@ -425,6 +425,44 @@ fn ensure_node_tests_present(workspace_root: &Path) -> Result<()> {
     )
 }
 
+
+/// The subset of a test's `// Flags:` line the engine understands. V8-specific
+/// flags are skipped (the harness's own flag re-exec stays disabled), but the
+/// Node-level switches Otter implements are honored, so tests that assert on
+/// them run the way `node` runs them.
+fn supported_test_flags(file_path: &Path) -> Vec<String> {
+    const SUPPORTED_PREFIXES: &[&str] = &[
+        "--title=",
+        "--disable-warning=",
+    ];
+    const SUPPORTED_EXACT: &[&str] = &[
+        "--no-warnings",
+        "--no-deprecation",
+        "--throw-deprecation",
+        "--trace-warnings",
+        "--pending-deprecation",
+    ];
+    let Ok(source) = std::fs::read_to_string(file_path) else {
+        return Vec::new();
+    };
+    let mut flags = Vec::new();
+    for line in source.lines().take(10) {
+        let Some(rest) = line.trim().strip_prefix("// Flags:") else {
+            continue;
+        };
+        for flag in rest.split_whitespace() {
+            let supported = SUPPORTED_EXACT.contains(&flag)
+                || SUPPORTED_PREFIXES
+                    .iter()
+                    .any(|prefix| flag.starts_with(prefix));
+            if supported {
+                flags.push(flag.to_string());
+            }
+        }
+    }
+    flags
+}
+
 fn ensure_otter_binary(options: &RunOptions) -> Result<PathBuf> {
     if let Some(path) = &options.otter_bin {
         // The test child runs from the Node checkout root, so a relative
@@ -568,6 +606,7 @@ fn run_one_test(
             command
                 .arg(format!("--timeout={test_timeout_secs}"))
                 .arg("--allow-all")
+                .args(supported_test_flags(file_path))
                 .arg(file_path)
                 // The harness's `common` re-execs the test with V8-specific
                 // `// Flags:`. Otter is a different engine, so disable that

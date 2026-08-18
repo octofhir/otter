@@ -133,6 +133,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::cjs_only("stream", nodelib::node_stream),
     HostedModule::cjs_only("node:querystring", querystring::querystring_cjs_value),
+    HostedModule::cjs_only("node:constants", misc_modules::constants_cjs_value),
+    HostedModule::cjs_only("constants", misc_modules::constants_cjs_value),
     HostedModule::cjs_only("querystring", querystring::querystring_cjs_value),
     HostedModule::cjs_only("node:string_decoder", nodelib::node_string_decoder),
     HostedModule::cjs_only("string_decoder", nodelib::node_string_decoder),

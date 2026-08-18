@@ -751,6 +751,19 @@ fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value
         Some(code) => format!("(node:{pid}) [{code}] {name}: {message}"),
         None => format!("(node:{pid}) {name}: {message}"),
     };
+    // `NODE_REDIRECT_WARNINGS=<path>` appends the warning line to the named
+    // file instead of stderr; a file that cannot be opened falls back to
+    // stderr, exactly as Node's redirect does.
+    if let Ok(path) = std::env::var("NODE_REDIRECT_WARNINGS")
+        && !path.is_empty()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    {
+        let _ = writeln!(file, "{head}");
+        return;
+    }
     let mut err = std::io::stderr();
     if trace {
         // First line gets the pid/code prefix; the stack's frame lines

@@ -486,7 +486,13 @@ fn should_propagate_allow_all(
         && caps.env.is_allow_all()
         && caps.run.is_allow_all()
         && caps.ffi.is_allow_all()
-        && current_exec_path(ctx).as_deref() == Some(command)
+        && {
+            // A symlink to the engine binary is still the engine binary; the
+            // corpus spawns itself through one and expects the same grants.
+            let command = std::fs::canonicalize(command).ok();
+            let exec = current_exec_path(ctx).and_then(|exec| std::fs::canonicalize(exec).ok());
+            command.is_some() && command == exec
+        }
 }
 
 fn spawn_sync_raw(

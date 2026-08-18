@@ -306,6 +306,16 @@ impl Interpreter {
                             owner.take_yielded(&mut interp.gc_heap);
                             return Ok(());
                         }
+                        // A further Op::Await re-parked the body: the frame
+                        // left this stack alive, not completed. Settling the
+                        // request here would answer `done: true` while user
+                        // statements still wait to run.
+                        if matches!(
+                            owner.async_state(&interp.gc_heap),
+                            crate::generator::AsyncGeneratorState::Awaiting
+                        ) {
+                            return Ok(());
+                        }
                         // Body completed: settle the front request with
                         // the final return value as `done: true`.
                         interp

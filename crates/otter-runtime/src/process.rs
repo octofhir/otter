@@ -46,6 +46,7 @@ pub(crate) fn install_global(
     process_env_overlay: &std::collections::BTreeMap<String, String>,
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
+    warning_options: &crate::WarningOptions,
     runtime_task_spawner: Option<&crate::RuntimeTaskSpawner>,
 ) -> Result<(), OtterError> {
     // Claimed before `process.env` is built, so the variable naming the
@@ -298,6 +299,58 @@ pub(crate) fn install_global(
                     scope.set(features, name, value)?;
                 }
                 scope.set(process, "features", features)?;
+
+                // Warning-channel switches: the documented mutable process
+                // properties carry the deprecation flags, and hidden slots
+                // carry the printer configuration.
+                for (name, on) in [
+                    ("noDeprecation", warning_options.no_deprecation),
+                    ("throwDeprecation", warning_options.throw_deprecation),
+                    ("traceDeprecation", warning_options.trace_warnings),
+                ] {
+                    let value = scope.boolean(on);
+                    scope.set(process, name, value)?;
+                }
+                let no_warnings = scope.boolean(warning_options.no_warnings);
+                scope.define(
+                    process,
+                    "__otter_no_warnings__",
+                    no_warnings,
+                    Attr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    }
+                    .to_flags(),
+                )?;
+                let trace_warnings = scope.boolean(warning_options.trace_warnings);
+                scope.define(
+                    process,
+                    "__otter_trace_warnings__",
+                    trace_warnings,
+                    Attr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    }
+                    .to_flags(),
+                )?;
+                let disabled = scope.array(warning_options.disabled.len())?;
+                for (index, code) in warning_options.disabled.iter().enumerate() {
+                    let code = scope.string(code)?;
+                    scope.set_index(disabled, index, code)?;
+                }
+                scope.define(
+                    process,
+                    "__otter_disabled_warnings__",
+                    disabled,
+                    Attr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    }
+                    .to_flags(),
+                )?;
 
                 scope.define(
                     global_object,

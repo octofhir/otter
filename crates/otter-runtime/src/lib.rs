@@ -1627,6 +1627,25 @@ pub struct SnapshotRuntimeOptions {
 }
 
 /// Runtime configuration.
+/// Warning-channel switches carried from the CLI (`--no-warnings`,
+/// `--no-deprecation`, `--trace-warnings`, `--throw-deprecation`,
+/// `--pending-deprecation`, `--disable-warning=<code-or-type>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarningOptions {
+    /// Suppress the default stderr printer entirely.
+    pub no_warnings: bool,
+    /// Silence DeprecationWarning emission.
+    pub no_deprecation: bool,
+    /// Turn DeprecationWarning into a throw at delivery.
+    pub throw_deprecation: bool,
+    /// Print the warning's stack instead of the one-line form.
+    pub trace_warnings: bool,
+    /// Emit pending deprecations.
+    pub pending_deprecation: bool,
+    /// Warning codes or type names whose printing is disabled.
+    pub disabled: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
     max_heap_bytes: u64,
@@ -1654,6 +1673,7 @@ pub(crate) struct RuntimeConfig {
     process_argv: Vec<String>,
     process_cwd: PathBuf,
     process_env_overlay: std::collections::BTreeMap<String, String>,
+    warning_options: WarningOptions,
     tracer_factory: Option<TracerFactory>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
@@ -1955,6 +1975,7 @@ impl Default for RuntimeConfig {
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
             process_cwd: process::default_cwd(),
+            warning_options: WarningOptions::default(),
             process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
             jit_selection: JitSelection::default(),
@@ -2344,6 +2365,13 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn process_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.config.process_argv = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the warning-channel switches (`--no-warnings` and friends).
+    #[must_use]
+    pub fn warning_options(mut self, options: WarningOptions) -> Self {
+        self.config.warning_options = options;
         self
     }
 
@@ -2860,6 +2888,7 @@ impl Runtime {
                             &config.process_env_overlay,
                             &config.capabilities,
                             &config.hooks,
+                            &config.warning_options,
                             runtime_task_spawner.as_ref(),
                         )?;
                     }
@@ -6045,6 +6074,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn capabilities(mut self, caps: CapabilitySet) -> Self {
         self.runtime = self.runtime.capabilities(caps);
+        self
+    }
+
+    /// Set the warning-channel switches (`--no-warnings` and friends).
+    #[must_use]
+    pub fn warning_options(mut self, options: WarningOptions) -> Self {
+        self.runtime = self.runtime.warning_options(options);
         self
     }
 

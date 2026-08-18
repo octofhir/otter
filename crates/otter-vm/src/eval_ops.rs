@@ -344,7 +344,9 @@ impl Interpreter {
             .direct_eval_bindings
             .iter()
             .filter(|binding| {
-                !binding.lexical && !caller_scope_names.contains(binding.name.as_ref())
+                !binding.lexical
+                    && !binding.captured
+                    && !caller_scope_names.contains(binding.name.as_ref())
             })
             .filter_map(|binding| {
                 upvalues

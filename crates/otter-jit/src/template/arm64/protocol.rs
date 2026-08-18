@@ -13,7 +13,7 @@
 //!   are never replayed.
 //!
 //! # See also
-//! - `otter_vm::RuntimeCall::object_protocol_values`
+//! - `otter_vm::native_abi::RuntimeCall::object_protocol_values`
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
@@ -27,7 +27,7 @@ pub(super) fn emit_object_protocol_value(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
-    _operation: otter_vm::ObjectProtocolValueOp,
+    _operation: abi::ObjectProtocolValueOp,
     result: Option<u16>,
     value0: u16,
     value1: Option<u16>,

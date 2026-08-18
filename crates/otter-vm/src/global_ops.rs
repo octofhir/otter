@@ -210,7 +210,7 @@ impl Interpreter {
         Ok(())
     }
 
-    fn load_global_or_undefined_value(
+    pub(crate) fn load_global_or_undefined_value(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
@@ -274,10 +274,22 @@ impl Interpreter {
         name_idx: u32,
         value_reg: u16,
     ) -> Result<(), VmError> {
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
+        self.define_global_var_value(context, frame.function_id, name_idx, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn define_global_var_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str_for_function(function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         // §9.1.1.4.18 SetMutableBinding shape — an existing own
         // property keeps its attributes (enumerability,
         // configurability) and only receives the new value; a
@@ -285,7 +297,6 @@ impl Interpreter {
         // in sloppy mode. Only an absent property is defined fresh.
         if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some() {
             object::set(&mut self.global_this, &mut self.gc_heap, name, value);
-            frame.advance_pc()?;
             return Ok(());
         }
         let descriptor = object::PartialPropertyDescriptor {
@@ -303,7 +314,6 @@ impl Interpreter {
         ) {
             return Err(self.err_type((format!("Cannot declare global var '{name}'")).into()));
         }
-        frame.advance_pc()?;
         Ok(())
     }
 
@@ -317,8 +327,20 @@ impl Interpreter {
         name_idx: u32,
         configurable: bool,
     ) -> Result<(), VmError> {
+        self.declare_global_var_value(context, frame.function_id, name_idx, configurable)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn declare_global_var_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+        configurable: bool,
+    ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         // §19.2.1.3 step 5 — a var-scoped name colliding with a
         // global *lexical* binding is a SyntaxError at declaration
@@ -350,7 +372,6 @@ impl Interpreter {
                 );
             }
         }
-        frame.advance_pc()?;
         Ok(())
     }
 
@@ -369,10 +390,23 @@ impl Interpreter {
         value_reg: u16,
         deletable: bool,
     ) -> Result<(), VmError> {
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
+        self.define_global_function_value(context, frame.function_id, name_idx, value, deletable)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn define_global_function_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+        value: Value,
+        deletable: bool,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str_for_function(function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let existing = object::get_own_descriptor(self.global_this, &self.gc_heap, name);
         let redefine = match &existing {
             None => true,
@@ -409,7 +443,6 @@ impl Interpreter {
             }
             object::set(&mut self.global_this, &mut self.gc_heap, name, value);
         }
-        frame.advance_pc()?;
         Ok(())
     }
 
@@ -466,8 +499,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let value = *crate::read_register(&stack[top_idx], value_reg)?;
         let frame = &stack[top_idx];
+        let function_id = frame.function_id;
         let eval_env = (!frame.eval_env.is_null()).then_some(frame.eval_env);
-        self.store_dynamic_value(context, stack, eval_env, value, name_idx)?;
+        self.store_dynamic_value(context, stack, function_id, eval_env, value, name_idx, false)?;
         stack[top_idx].advance_pc()?;
         Ok(())
     }
@@ -476,20 +510,23 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
+        function_id: u32,
         eval_env: Option<EvalEnvHandle>,
         value: Value,
         name_idx: u32,
+        strict: bool,
     ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         if let Some(cell) = self.eval_env_var(eval_env, name) {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
             return Ok(());
         }
         // Fall through to the full global SetMutableBinding so
-        // realm-wide lexical bindings stay visible (sloppy mode).
-        self.store_global_binding_value(context, stack, value, name_idx, false)
+        // realm-wide lexical bindings stay visible; strict mode keeps the
+        // unresolvable-reference rejection.
+        self.store_global_binding_value(context, stack, function_id, value, name_idx, strict)
     }
 
     /// `Op::TypeofDynamic` — `typeof` flavour of
@@ -597,8 +634,20 @@ impl Interpreter {
         name_idx: u32,
         is_const: bool,
     ) -> Result<(), VmError> {
+        self.declare_global_lex_value(context, frame.function_id, name_idx, is_const)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn declare_global_lex_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+        is_const: bool,
+    ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         if self.global_lexicals.contains_key(name) {
             return Err(
@@ -622,7 +671,6 @@ impl Interpreter {
         self.global_lexicals.insert(name.into(), (cell, is_const));
         self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
         self.global_object_load_ic.clear();
-        frame.advance_pc()?;
         Ok(())
     }
 
@@ -636,8 +684,20 @@ impl Interpreter {
         name_idx: u32,
         kind: i32,
     ) -> Result<(), VmError> {
+        self.validate_global_decl_value(context, frame.function_id, name_idx, kind)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_global_decl_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+        kind: i32,
+    ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         match kind {
             // Lexical: same checks as DeclareGlobalLex, minus the
@@ -689,7 +749,6 @@ impl Interpreter {
                 }
             }
         }
-        frame.advance_pc()?;
         Ok(())
     }
 
@@ -702,17 +761,28 @@ impl Interpreter {
         value_reg: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
         let value = *crate::read_register(frame, value_reg)?;
+        self.init_global_lex_value(context, frame.function_id, name_idx, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn init_global_lex_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str_for_function(function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let cell = self
             .global_lexicals
             .get(name)
             .map(|(cell, _)| *cell)
             .ok_or(VmError::InvalidOperand)?;
         crate::store_upvalue(&mut self.gc_heap, cell, value);
-        frame.advance_pc()?;
         Ok(())
     }
 
@@ -729,15 +799,25 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let exists = self.global_binding_exists_value(context, frame.function_id, name_idx)?;
+        crate::write_register(frame, dst, exists)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn global_binding_exists_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+    ) -> Result<Value, VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let exists = self.global_lexicals.contains_key(name)
             || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
             || crate::object::get(self.global_this, &self.gc_heap, name).is_some();
-        crate::write_register(frame, dst, Value::boolean(exists))?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(Value::boolean(exists))
     }
 
     /// `Op::StoreGlobalChecked` — §6.2.5.6 PutValue over a strict
@@ -766,6 +846,50 @@ impl Interpreter {
         self.run_store_global_binding_reg(context, stack, top_idx, value_reg, name_idx, true)
     }
 
+    pub(crate) fn store_global_checked_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        value: Value,
+        name_idx: u32,
+        existed: bool,
+    ) -> Result<(), VmError> {
+        if !existed {
+            let name = context
+                .string_constant_str_for_function(function_id, name_idx)
+                .ok_or(VmError::InvalidOperand)?;
+            return Err(self.err_undefined_ident((name.to_string()).into()));
+        }
+        self.store_global_binding_value(context, stack, function_id, value, name_idx, true)
+    }
+
+    /// Value flavour of [`Self::run_delete_dynamic_active_reg`]: report the
+    /// §13.5.1 delete result over the frame-published eval chain and the
+    /// global environment, without touching registers or the PC.
+    pub(crate) fn delete_dynamic_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        eval_env: Option<EvalEnvHandle>,
+        name_idx: u32,
+    ) -> Result<Value, VmError> {
+        let name = context
+            .string_constant_str_for_function(function_id, name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let removed_env = eval_env.is_some_and(|env| {
+            crate::eval_env::eval_env_delete_chain(&mut self.gc_heap, env, name)
+        });
+        let removed = if removed_env {
+            true
+        } else if self.global_lexicals.contains_key(name) {
+            false
+        } else {
+            crate::object::delete(self.global_this, &mut self.gc_heap, name)
+        };
+        Ok(Value::boolean(removed))
+    }
+
     pub(crate) fn run_store_global_binding_reg(
         &mut self,
         context: &ExecutionContext,
@@ -776,21 +900,23 @@ impl Interpreter {
         strict: bool,
     ) -> Result<(), VmError> {
         let value = *crate::read_register(&stack[top_idx], value_reg)?;
-        self.store_global_binding_value(context, stack, value, name_idx, strict)?;
+        let function_id = stack[top_idx].function_id;
+        self.store_global_binding_value(context, stack, function_id, value, name_idx, strict)?;
         stack[top_idx].advance_pc()?;
         Ok(())
     }
 
-    fn store_global_binding_value(
+    pub(crate) fn store_global_binding_value(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
+        function_id: u32,
         value: Value,
         name_idx: u32,
         strict: bool,
     ) -> Result<(), VmError> {
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
             if is_const {

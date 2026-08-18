@@ -372,6 +372,7 @@ impl Interpreter {
         Self::bake_string_layout(&mut snapshot);
         self.bake_string_constant_cells(&mut snapshot, context, fid)?;
         self.bake_global_lexical_loads(&mut snapshot, context, fid);
+        self.bake_binding_hit_proofs(&mut snapshot, context, fid);
         self.bake_inline_callees(
             &mut snapshot,
             context,
@@ -540,6 +541,7 @@ impl Interpreter {
         Self::bake_string_layout(&mut view);
         self.bake_string_constant_cells(&mut view, context, fid)?;
         self.bake_global_lexical_loads(&mut view, context, fid);
+        self.bake_binding_hit_proofs(&mut view, context, fid);
         self.bake_inline_callees(
             &mut view,
             context,
@@ -1286,6 +1288,82 @@ impl Interpreter {
                     dictionary,
                     value_byte: u32::from(hit.slot) * SLOT_BYTES,
                     global_lexical_epoch: self.global_lexical_epoch,
+                },
+            );
+        }
+    }
+
+    /// Bake direct hit proofs for global-declarative bindings and guarded
+    /// own-data slots already owned by the isolate's global object record.
+    ///
+    /// Global lexical cells are old-space, non-moving GC objects rooted for the
+    /// lifetime of the binding. Their identity cannot be replaced by later
+    /// declarations, while their contained `Value` remains mutable. Generated
+    /// code may therefore read the live cell directly; a TDZ hole enters the
+    /// schema-decoded committed binding boundary to construct the named error.
+    /// Object-record reads additionally guard the live declarative-record epoch
+    /// and global-object shape, so later eval/script lexicals and structural
+    /// mutations miss before reading the baked slot.
+    fn bake_binding_hit_proofs(
+        &self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+        fid: u32,
+    ) {
+        for instruction in &view.instructions {
+            let op = instruction.op(&view.code_block);
+            let Some(binding) = otter_bytecode::opcode_schema::opcode_schema(op).binding else {
+                continue;
+            };
+            let name_operand = match binding {
+                otter_bytecode::opcode_schema::BindingSemantics::Read(
+                    otter_bytecode::opcode_schema::BindingRead::Global { name, .. }
+                    | otter_bytecode::opcode_schema::BindingRead::Exists { name, .. },
+                ) => name,
+                otter_bytecode::opcode_schema::BindingSemantics::Write(
+                    otter_bytecode::opcode_schema::BindingWrite::Global { name, .. }
+                    | otter_bytecode::opcode_schema::BindingWrite::GlobalChecked { name, .. },
+                ) => name,
+                _ => continue,
+            };
+            let Some(name_index) =
+                instruction.const_index(&view.code_block, usize::from(name_operand))
+            else {
+                continue;
+            };
+            let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
+                continue;
+            };
+            if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
+                view.binding_hit_proofs.insert(
+                    instruction.byte_pc,
+                    jit::BindingHitProof::GlobalLexical {
+                        cell_offset: cell.offset(),
+                        writable: !is_const,
+                    },
+                );
+                continue;
+            }
+            let (Some(hit), crate::object::PropertyLookup::Data { flags, .. }) =
+                crate::object::lookup_own_slot(self.global_this, &self.gc_heap, name)
+            else {
+                continue;
+            };
+            let shape = crate::object::shape(self.global_this, &self.gc_heap);
+            let (shape, dictionary) = if shape.is_null() {
+                (hit.shape_id.raw(), true)
+            } else {
+                (u64::from(shape.offset()), false)
+            };
+            const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
+            view.binding_hit_proofs.insert(
+                instruction.byte_pc,
+                jit::BindingHitProof::GlobalObject {
+                    shape,
+                    dictionary,
+                    value_byte: u32::from(hit.slot) * SLOT_BYTES,
+                    global_lexical_epoch: self.global_lexical_epoch,
+                    writable: flags.writable(),
                 },
             );
         }

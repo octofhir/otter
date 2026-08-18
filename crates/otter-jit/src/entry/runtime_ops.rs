@@ -14,8 +14,9 @@
 //! - Raw metadata pointers target immutable boxed slices retained by the
 //!   active code object for the executable mapping's full lifetime.
 //! - JS values remain in the published frame window or its precise safepoint
-//!   spill map across every allocating or throwing operation, preserving
-//!   moving-GC roots for fixed-value and register-index entries alike.
+//!   spill map across every allocating or throwing operation. Binding and
+//!   declaration entries receive only fixed boxed values; names, flags,
+//!   indices, and destinations never cross their ABI.
 //! - Arithmetic and coercion entries validate machine-word operands, then use
 //!   the VM-owned typed runtime boundary; no VM/container pointer escapes.
 //!
@@ -67,21 +68,6 @@ pub(super) extern "C" fn jit_add_stub(ctx: *mut JitCtx, dst: u64, lhs: u64, rhs:
             decode_register(lhs)?,
             decode_register(rhs)?,
         )
-    })();
-    park_result(ctx, result)
-}
-
-pub(super) extern "C" fn jit_store_upvalue_checked_stub(
-    ctx: *mut JitCtx,
-    src: u64,
-    idx: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = (|| {
-        let src = decode_register(src)?;
-        let idx = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)? as i32;
-        ctx.runtime_call()?.store_upvalue_checked(src, idx)
     })();
     park_result(ctx, result)
 }

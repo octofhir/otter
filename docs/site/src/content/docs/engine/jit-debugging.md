@@ -43,11 +43,11 @@ that fires before the isolate replies may have no partial batch to write.
 
 ## Structured events
 
-`compilePrepared.globalLoadSites` counts all analyzed global reads.
-`globalLexicalLoads` counts permanent global-declarative cells available for
-direct generated reads, and `stringConstantCells` counts eagerly prepared
-stable traced literal cells available as relocation loads.
-`globalObjectLoads` counts guarded global-object dictionary slots.
+`compilePrepared.bindingSites` counts all schema-typed binding accesses.
+`bindingHitProofs` counts permanent global-declarative cells and guarded
+global-object slots available for generated reads or writes.
+`stringConstantCells` counts eagerly prepared stable traced literal cells
+available as relocation loads.
 `directCallees`, `directConstructs`,
 `directMethodSites`, and `directMethodTargets` report stable function links
 whose current generations were available for generated plain, base-construct,
@@ -157,10 +157,12 @@ a TDZ hole still enters the canonical throwing global lookup.
 Global-object records similarly retain only structural identity and the
 property slot. Generated code proves the realm epoch and dictionary shape
 before reading the live value; a mismatch uses the canonical lookup.
-Scalar Machine IR exposes these operations as `machineGlobalLexicalLoad` and
-`machineGlobalObjectLoad` code-map regions. They allocate nowhere and own no
-safepoint; TDZ, epoch, shape, or missing-slab guards instead exact-deoptimize at
-the source `LoadGlobalOrThrow` before its destination is written.
+Scalar Machine IR exposes all binding accesses through
+`machineBindingGuard`, `machineBindingHit`, `machineBindingCold`, and
+`machineBindingJoin` code-map regions. Generated hits allocate nowhere. Guard,
+TDZ, const, accessor, Proxy, or unresolved misses enter one committed cold call
+with a precise safepoint and explicit Success/Throw/Fatal control; they never
+exact-deoptimize and replay the source operation.
 Tagged loose comparisons with a static `null` or `undefined` operand expose a
 `machineTaggedNullishEqual` region. Immediate nullish and non-cell primitive
 cases complete without reentry; a Cell exact-deoptimizes before writing the
@@ -344,10 +346,14 @@ Fixed TypedArray views over resizable ArrayBuffers also compare the complete
 baked view extent with the backing store's live byte length. A shrink therefore
 exits before either reading or writing even when the requested index still fits
 the stale cached view length.
-`machineUpvalueLoad` identifies a direct captured-cell read with the same exact
-TDZ/malformed-layout exit contract. Primitive-string and dense-array `.length`
-may appear inside `machinePropertyLoad`; an unsigned length outside the int32
-tag range exits to canonical Number boxing.
+Captured, global-lexical, and guarded global-object accesses use the same
+`machineBindingGuard` / `machineBindingHit` / `machineBindingCold` /
+`machineBindingJoin` family. Stable-cell and slot hits stay generated; TDZ,
+const, layout, epoch, shape, proxy, accessor, and unresolved cases enter the
+single committed `jit_binding_value` boundary and never deopt or replay the
+binding operation. Primitive-string and dense-array `.length` may appear
+inside `machinePropertyLoad`; an unsigned length outside the int32 tag range
+exits to canonical Number boxing.
 
 `machineArrayConstruct` identifies zero-argument or exact-Int32 length-array
 allocation at its source `bytePc`. Its `array_construct_alloc` relocation is a

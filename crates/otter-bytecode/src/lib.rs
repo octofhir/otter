@@ -5,8 +5,7 @@
 //! `otter-vm` (readers / executors). It does **not** execute anything.
 //!
 //! # Contents
-//! - [`Op`] — canonical opcode enum (`Nop`, `LoadUndefined`, `Return`
-//!   for the harness slice; extended slice-by-slice).
+//! - [`Op`] — canonical opcode enum and executable operand contracts.
 //! - [`FunctionCode`] / [`WordInstruction`] — authoritative compiler/wire
 //!   wordcode and schema-driven operand access.
 //! - [`Instruction`] — cold decoded wire/debug DTO.
@@ -59,12 +58,7 @@ use serde::{Deserialize, Serialize};
 /// absent clause when emitting the instruction.
 pub const NO_HANDLER_OFFSET: i32 = i32::MIN;
 
-/// The canonical foundation opcode set.
-///
-/// The harness slice (task 07) provides only the three opcodes
-/// required to compile and execute the smoke fixtures
-/// (`empty-script.ts`, `literal-undefined.ts`). Slice tasks
-/// `09`–`13` extend this enum.
+/// The canonical engine opcode set.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1110,12 +1104,13 @@ pub enum Op {
     LoadDynamic,
 
     /// Write an identifier that may resolve to an eval-introduced
-    /// caller binding. Operands: `Register(value), ConstIndex(name)`.
+    /// caller binding. Operands:
+    /// `Register(value), ConstIndex(name), Imm32(strict)`.
     ///
     /// §10.2.4.2 PutValue counterpart of [`Op::LoadDynamic`]: store
     /// through the frame's eval-introduced binding when present,
-    /// else fall back to the sloppy-mode `globalThis` property
-    /// write.
+    /// else fall back to global `SetMutableBinding`; `strict` selects whether
+    /// an unresolved fallback throws or creates a `globalThis` property.
     StoreDynamic,
 
     /// `typeof` flavour of [`Op::LoadDynamic`]. Operands:
@@ -1305,17 +1300,28 @@ pub enum Op {
     /// missing brand throws TypeError. Fields skip this (their own
     /// store lookup already fails).
     PrivateBrandCheck,
-    /// `LoadShadowedUpvalue dst, name_const, upvalue_idx` — read a
-    /// captured binding in a function whose body contains a direct
-    /// eval: an eval-introduced var of the SAME name shadows the
-    /// capture (§9.1 — the eval declared it in this frame's variable
-    /// environment, which sits inner to the captured one).
+    /// `LoadShadowedUpvalue dst, name_const, upvalue_idx, eval_depth` — read a
+    /// captured binding after probing at most `eval_depth` physical eval
+    /// records strictly inside its declaration owner. An outer eval record can
+    /// never shadow a more deeply declared lexical binding.
     LoadShadowedUpvalue,
     /// `GetTemplateObject dst, site_const` — §13.2.8.4: the frozen
     /// (with frozen non-enumerable `.raw`) template-strings object
     /// for tagged-template site `site_const`, cached realm-wide per
     /// site.
     GetTemplateObject,
+    /// `StoreShadowedUpvalueChecked value, name_const, upvalue_idx, policy`
+    /// — assign a captured binding in a function whose live eval chain may
+    /// contain a nearer binding of the same name. The eval chain is resolved at
+    /// the store point (after RHS evaluation). The schema-owned `policy` packs
+    /// the bounded physical eval depth with mutable checked assignment,
+    /// immutable throw, or immutable silent fallback behavior.
+    StoreShadowedUpvalueChecked,
+    /// `DeleteShadowedUpvalue dst, name_const, upvalue_idx, eval_depth` —
+    /// delete a nearer binding only within the bounded inner eval prefix. If
+    /// the name still resolves to the captured declarative binding, leave it
+    /// intact and return `false`.
+    DeleteShadowedUpvalue,
 }
 
 impl Op {
@@ -1492,6 +1498,8 @@ impl Op {
             Op::Increment => "INCREMENT",
             Op::PrivateBrandCheck => "PRIVATE_BRAND_CHECK",
             Op::LoadShadowedUpvalue => "LOAD_SHADOWED_UPVALUE",
+            Op::StoreShadowedUpvalueChecked => "STORE_SHADOWED_UPVALUE_CHECKED",
+            Op::DeleteShadowedUpvalue => "DELETE_SHADOWED_UPVALUE",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
@@ -1582,7 +1590,6 @@ impl Op {
             | Op::DefineGlobalVar
             | Op::DeclareGlobalVar
             | Op::LoadDynamic
-            | Op::StoreDynamic
             | Op::TypeofDynamic
             | Op::DeleteDynamic
             | Op::NewPrivateName
@@ -1595,8 +1602,9 @@ impl Op {
             | Op::PrivateBrandCheck
             | Op::GetTemplateObject
             | Op::ToNumeric => 2,
-            Op::Increment
-            | Op::LoadShadowedUpvalue
+            Op::StoreShadowedUpvalueChecked => 4,
+            Op::StoreDynamic
+            | Op::Increment
             | Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -1639,6 +1647,7 @@ impl Op {
             | Op::LessThanImm
             | Op::EqualImm
             | Op::NotEqualImm => 3,
+            Op::LoadShadowedUpvalue | Op::DeleteShadowedUpvalue => 4,
             Op::GetPrototype
             | Op::SetPrototype
             | Op::ArrayLength
@@ -2108,12 +2117,13 @@ pub enum ArgumentsObjectKind {
 /// `upvalue` indexes the owning frame's upvalue array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectEvalBinding {
-    /// `true` when the cell is a PASSTHROUGH CAPTURE from an
-    /// enclosing function rather than the caller's own
-    /// variable-environment binding: a direct eval may READ it, but
-    /// a `var` of the same name in the eval body declares a fresh
-    /// caller-frame binding (§19.2.1.3 — HasVarDeclaration consults
-    /// the caller's varEnv only).
+    /// `true` when the cell is a PASSTHROUGH CAPTURE rather than the
+    /// owning function/eval's own variable-environment binding. A
+    /// direct eval may READ it, but must not adopt the alias into its
+    /// caller's current eval record. A `var` of the same name in the
+    /// eval body instead declares a fresh caller-frame binding
+    /// (§19.2.1.3 — HasVarDeclaration consults the caller's varEnv
+    /// only).
     #[serde(default)]
     pub captured: bool,
     /// Source-level binding name.

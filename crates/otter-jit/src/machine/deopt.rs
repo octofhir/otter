@@ -167,7 +167,9 @@ fn lower_slot(
         MachineRepresentation::Boolean => DeoptRepr::Boolean,
         MachineRepresentation::Uint32 => DeoptRepr::Uint32,
         MachineRepresentation::Float64 => DeoptRepr::Float64,
-        MachineRepresentation::Cell | MachineRepresentation::Int64 => {
+        MachineRepresentation::Cell
+        | MachineRepresentation::Int64
+        | MachineRepresentation::NativeStatus => {
             return Err(MachineDeoptError::UnsupportedRepresentation(
                 value,
                 representation,

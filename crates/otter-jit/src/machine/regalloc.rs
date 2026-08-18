@@ -501,7 +501,7 @@ mod tests {
             vec![CallDescriptor {
                 target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC),
                 arguments: vec![MachineRepresentation::Tagged; 3],
-                result: None,
+                results: Vec::new(),
                 effects: CallEffects::READS_HEAP,
                 clobbers: call_clobbers,
                 exceptional: ExceptionalEdge::None,

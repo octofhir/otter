@@ -20,10 +20,10 @@
 
 use super::{JitCtx, JitEntry, jit_pop_native_activation_stub, jit_push_native_activation_stub};
 use otter_vm::{
-    ActivationStack, ActiveFrameMut, Interpreter, JitExecOutcome, VmError, VmRuntimeActivation,
+    ActivationStack, Interpreter, JitExecOutcome, VmError, VmRuntimeActivation,
     native_abi::{
-        NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultDomain, NativeResultStatus,
-        VmFrameHeader, VmThread,
+        ActiveFrameMut, NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultDomain,
+        NativeResultStatus, VmFrameHeader, VmThread,
     },
 };
 

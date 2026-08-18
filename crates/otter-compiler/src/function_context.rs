@@ -953,31 +953,6 @@ impl FunctionContext {
             ),
         }
     }
-
-    /// Emit a binding *assignment* store (PutValue, §6.2.4.6). Captured
-    /// upvalues use [`Op::StoreUpvalueChecked`] so a write to a `let`
-    /// still in its TDZ raises `ReferenceError`; a register binding has
-    /// no runtime hole (the read/write TDZ is detected statically at the
-    /// reference site), so a plain `StoreLocal` suffices.
-    pub(crate) fn emit_assign_storage(
-        &mut self,
-        src: u16,
-        storage: BindingStorage,
-        span: (u32, u32),
-    ) {
-        match storage {
-            BindingStorage::Register { reg } => self.emit(
-                Op::StoreLocal,
-                [Operand::Register(src), Operand::Imm32(reg as i32)],
-                span,
-            ),
-            BindingStorage::Upvalue { idx } => self.emit(
-                Op::StoreUpvalueChecked,
-                [Operand::Register(src), Operand::Imm32(idx as i32)],
-                span,
-            ),
-        }
-    }
 }
 
 /// Compile-time marker bit for parent-capture upvalue indices.
@@ -1014,7 +989,9 @@ pub(crate) fn finalize_virtual_capture_indices(
                     assert!(code.set_operand(pc, 1, Operand::Imm32(remap(v))));
                 }
             }
-            Op::LoadShadowedUpvalue => {
+            Op::LoadShadowedUpvalue
+            | Op::StoreShadowedUpvalueChecked
+            | Op::DeleteShadowedUpvalue => {
                 if let Some(Operand::Imm32(v)) = code.operand(pc, 2) {
                     assert!(code.set_operand(pc, 2, Operand::Imm32(remap(v))));
                 }

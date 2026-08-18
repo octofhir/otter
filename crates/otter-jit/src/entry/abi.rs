@@ -19,10 +19,10 @@
 //! - `otter_vm::native_abi` — authoritative VM frame and thread records.
 
 use otter_vm::{
-    ActiveFrameMut, ActiveFrameRef, RuntimeCall, Value, VmError, VmRuntimeActivation,
+    Value, VmError, VmRuntimeActivation,
     native_abi::{
-        CodeEntryCell, FunctionEntryCell, NativeFrame, NativeFrameFlags, NativeResultPair,
-        RuntimeStubAllocContext, VmThread,
+        ActiveFrameMut, ActiveFrameRef, CodeEntryCell, FunctionEntryCell, NativeFrame,
+        NativeFrameFlags, NativeResultPair, RuntimeCall, RuntimeStubAllocContext, VmThread,
     },
 };
 /// Machine-visible context shared by every compiled tier.

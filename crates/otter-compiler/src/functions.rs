@@ -388,17 +388,16 @@ pub(crate) fn collect_direct_eval_bindings(
         if name.starts_with("__") {
             continue;
         }
-        // §19.2.1.3 — a var the eval re-declares may live in an
-        // ENCLOSING function's scope, reached here as a passthrough
-        // capture. Exposing the cell lets the eval bind the existing
-        // variable instead of minting a shadow. Carry the source
-        // binding's immutability flags so a captured `const` or a named
-        // function expression's self-name binding stays immutable to the
-        // eval body (§10.2.11): a write to it throws in strict mode and
-        // is dropped in sloppy mode, matching a same-function write.
+        // §19.2.1.3 — expose an ENCLOSING function's cell as a
+        // passthrough capture so the eval body can read it. The
+        // `captured` bit prevents an unrelated eval declaration from
+        // adopting this alias into its current record; a body `var` of
+        // the same name instead gets a fresh shadow. Carry the source
+        // binding's immutability flags so reads and writes through the
+        // passthrough preserve `const` and named-function self semantics.
         let (is_const, fn_self_name) = cx
-            .captured_binding_info(name)
-            .map(|info| (info.is_const, info.fn_self_name))
+            .captured_binding_owner(name)
+            .map(|(_, info)| (info.is_const, info.fn_self_name))
             .unwrap_or((false, false));
         entries.push(otter_bytecode::DirectEvalBinding {
             captured: true,

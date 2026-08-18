@@ -634,6 +634,19 @@ pub(crate) fn compile_program_with_mode_impl_super(
             }
         }
     }
+    if !caller.is_empty() {
+        // A body lexical shadowing a caller binding needs a cell: the chunk's
+        // binding table must record the shadow so a nested direct eval splices
+        // the eval-local lexical instead of the stale caller passthrough.
+        let caller_names: HashSet<&str> = caller.iter().map(|b| b.name.as_str()).collect();
+        let mut body_lexical_names = Vec::new();
+        hoist_lexical_names(program.body, &mut body_lexical_names);
+        for (name, _) in body_lexical_names {
+            if caller_names.contains(name.as_str()) {
+                top.captured_names.insert(name);
+            }
+        }
+    }
     if !caller.is_empty() && capture::program_contains_direct_eval(program.body) {
         // A nested direct eval sees this chunk's scope as *its*
         // caller environment — promote every body-level binding to a
@@ -653,14 +666,21 @@ pub(crate) fn compile_program_with_mode_impl_super(
     cx.enter_scope();
 
     if !caller.is_empty() {
-        // Strict eval owns its variable environment (§19.2.1.1) —
-        // a body var name shadows the caller binding with a fresh
-        // local instead of writing through the caller's cell.
+        // Every body lexical owns a fresh eval-local binding. A strict eval's
+        // body vars do too (§19.2.1.1); a sloppy body var only needs a fresh
+        // cell when the same name is a passthrough capture rather than the
+        // caller variable environment's own binding.
         let shadowed: HashSet<String> = {
-            let mut names: Vec<String> = Vec::new();
-            hoist_var_names(program.body, &mut names);
+            let mut lexical_names = Vec::new();
+            hoist_lexical_names(program.body, &mut lexical_names);
+            let mut shadowed = lexical_names
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<HashSet<_>>();
+            let mut var_names = Vec::new();
+            hoist_var_names(program.body, &mut var_names);
             if main_is_strict {
-                names.into_iter().collect()
+                shadowed.extend(var_names);
             } else {
                 // Sloppy eval: a body `var` matching a CAPTURED
                 // caller binding declares fresh (§19.2.1.3 —
@@ -671,11 +691,13 @@ pub(crate) fn compile_program_with_mode_impl_super(
                     .filter(|b| b.captured)
                     .map(|b| b.name.as_str())
                     .collect();
-                names
-                    .into_iter()
-                    .filter(|n| captured.contains(n.as_str()))
-                    .collect()
+                shadowed.extend(
+                    var_names
+                        .into_iter()
+                        .filter(|name| captured.contains(name.as_str())),
+                );
             }
+            shadowed
         };
         for (slot, binding) in caller.iter().enumerate() {
             if shadowed.contains(&binding.name) {
@@ -872,6 +894,18 @@ pub(crate) fn compile_program_with_mode_impl_super(
     // running from this chunk's frame.
     let mut eval_new_bindings: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     if !caller.is_empty() {
+        let mut body_var_names = top_level_vars
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let annex_b_names =
+            crate::annex_b::collect_annex_b_candidates(program.body, &HashSet::new());
+        body_var_names.extend(annex_b_names.iter().map(String::as_str));
+        let caller_captures: HashSet<&str> = caller
+            .iter()
+            .filter(|binding| binding.captured)
+            .map(|binding| binding.name.as_str())
+            .collect();
         let body_lexical: HashSet<&str> = top_level_lex
             .iter()
             .map(|(name, _)| name.as_str())
@@ -885,7 +919,15 @@ pub(crate) fn compile_program_with_mode_impl_super(
             for (name, info) in &scope.bindings {
                 if let BindingStorage::Upvalue { idx } = info.storage {
                     eval_new_bindings.push(otter_bytecode::DirectEvalBinding {
-                        captured: false,
+                        // A caller passthrough remains a passthrough unless
+                        // this eval body itself declares the name. The
+                        // runtime must not adopt unrelated captures into the
+                        // current eval record: doing so would let
+                        // `eval("var y")` shadow a nearer static `x` with an
+                        // alias to an outer dynamic `x`.
+                        captured: caller_captures.contains(name.as_str())
+                            && !body_var_names.contains(name.as_str())
+                            && !body_lexical.contains(name.as_str()),
                         name: name.clone(),
                         upvalue: idx,
                         // A strict eval's own variable environment is

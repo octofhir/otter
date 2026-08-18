@@ -10,7 +10,7 @@
 //! - A missing published activation is the sole bailout case.
 //!
 //! # See also
-//! - `otter_vm::RuntimeCall::class_op`
+//! - `otter_vm::native_abi::RuntimeCall::class_op`
 
 use dynasmrt::{DynamicLabel, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;

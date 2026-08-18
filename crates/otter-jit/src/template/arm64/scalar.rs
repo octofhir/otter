@@ -18,7 +18,7 @@
 //!   `Throw(exception)`. Pre-entry `Fatal` bypasses local JS handlers.
 //!
 //! # See also
-//! - `otter_vm::RuntimeCall::scalar_values`
+//! - `otter_vm::native_abi::RuntimeCall::scalar_values`
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{JitCompileSnapshot, native_abi as abi};
@@ -170,7 +170,7 @@ pub(super) fn emit_scalar_value(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
-    operation: otter_vm::ScalarValueOp,
+    operation: abi::ScalarValueOp,
     result: u16,
     value0: Option<u16>,
     value1: Option<u16>,
@@ -181,13 +181,13 @@ pub(super) fn emit_scalar_value(
     let done = ops.new_dynamic_label();
     if view.cage_base != 0 {
         match (operation, value0) {
-            (otter_vm::ScalarValueOp::LoadLength, Some(src)) => {
+            (abi::ScalarValueOp::LoadLength, Some(src)) => {
                 emit_load_length_fast(ops, view, result, src, slow, done)?;
             }
-            (otter_vm::ScalarValueOp::ArrayLength, Some(src)) => {
+            (abi::ScalarValueOp::ArrayLength, Some(src)) => {
                 emit_array_length_fast(ops, view, result, src, slow, done)?;
             }
-            (otter_vm::ScalarValueOp::IsArray, Some(src)) => {
+            (abi::ScalarValueOp::IsArray, Some(src)) => {
                 emit_is_array_fast(ops, view, result, src, slow, done)?;
             }
             _ => {}

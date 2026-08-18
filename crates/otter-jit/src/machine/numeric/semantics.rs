@@ -25,7 +25,10 @@ use otter_bytecode::{
     Op,
     opcode_schema::{ControlFlow, OpcodeEffects, opcode_schema},
 };
-use otter_vm::{JitCompileSnapshot, JitElementBase};
+use otter_vm::{
+    JitCompileSnapshot, JitElementBase,
+    native_abi::{ObjectProtocolValueOp, ScalarValueOp},
+};
 
 const EFFECTS_NONE: OpcodeEffects = OpcodeEffects {
     may_throw: false,
@@ -54,8 +57,8 @@ const EFFECTS_COMMITTED_RUNTIME: OpcodeEffects = OpcodeEffects {
 /// Typed semantic family completed by the fixed boxed-value runtime boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CommittedValueOperation {
-    ObjectProtocol(otter_vm::ObjectProtocolValueOp),
-    Scalar(otter_vm::ScalarValueOp),
+    ObjectProtocol(ObjectProtocolValueOp),
+    Scalar(ScalarValueOp),
 }
 
 /// Effective semantics of one instruction in an immutable compile snapshot.
@@ -84,29 +87,23 @@ impl InstructionSemantics {
 fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<CommittedValueOperation> {
     Some(match op {
         Op::Instanceof => {
-            CommittedValueOperation::ObjectProtocol(otter_vm::ObjectProtocolValueOp::Instanceof)
+            CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::Instanceof)
         }
         Op::HasProperty => {
-            CommittedValueOperation::ObjectProtocol(otter_vm::ObjectProtocolValueOp::HasProperty)
+            CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::HasProperty)
         }
         Op::GetPrototype if !derived_constructor => {
-            CommittedValueOperation::ObjectProtocol(otter_vm::ObjectProtocolValueOp::GetPrototype)
+            CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::GetPrototype)
         }
         Op::SetPrototype => {
-            CommittedValueOperation::ObjectProtocol(otter_vm::ObjectProtocolValueOp::SetPrototype)
+            CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::SetPrototype)
         }
-        Op::ToObject => CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::ToObject),
-        Op::ToPropertyKey => {
-            CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::ToPropertyKey)
-        }
-        Op::TypeOf => CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::TypeOf),
-        Op::LoadNewTarget => {
-            CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::LoadNewTarget)
-        }
-        Op::SameValue => CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::SameValue),
-        Op::BindThisValue => {
-            CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::BindThisValue)
-        }
+        Op::ToObject => CommittedValueOperation::Scalar(ScalarValueOp::ToObject),
+        Op::ToPropertyKey => CommittedValueOperation::Scalar(ScalarValueOp::ToPropertyKey),
+        Op::TypeOf => CommittedValueOperation::Scalar(ScalarValueOp::TypeOf),
+        Op::LoadNewTarget => CommittedValueOperation::Scalar(ScalarValueOp::LoadNewTarget),
+        Op::SameValue => CommittedValueOperation::Scalar(ScalarValueOp::SameValue),
+        Op::BindThisValue => CommittedValueOperation::Scalar(ScalarValueOp::BindThisValue),
         _ => return None,
     })
 }
@@ -144,7 +141,7 @@ fn classify_instruction(
     let code = view.code_block.as_ref();
     let op = instruction.op(code);
     let committed_value = committed_value_operation(op, view.derived_constructor);
-    let effects = if committed_value.is_some() {
+    let effects = if committed_value.is_some() || opcode_schema(op).binding.is_some() {
         EFFECTS_COMMITTED_RUNTIME
     } else {
         match op {
@@ -153,20 +150,6 @@ fn classify_instruction(
                 if view
                     .string_constant_cells
                     .contains_key(&instruction.byte_pc) =>
-            {
-                EFFECTS_NONE
-            }
-            Op::LoadGlobalOrThrow
-                if view.global_lexical_loads.contains_key(&instruction.byte_pc)
-                    || view.global_object_loads.contains_key(&instruction.byte_pc) =>
-            {
-                EFFECTS_NONE
-            }
-            Op::LoadUpvalue
-                if view.cage_base != 0
-                    && instruction
-                        .imm32(code, 1)
-                        .is_some_and(|index| (0..=4095).contains(&index)) =>
             {
                 EFFECTS_NONE
             }

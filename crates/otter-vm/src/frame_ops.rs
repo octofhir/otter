@@ -79,6 +79,37 @@ impl Interpreter {
     }
 
     /// Store one captured binding through the GC write barrier.
+    /// Value flavour of the upvalue read used by the committed binding call.
+    pub(crate) fn frame_load_upvalue_value(
+        &mut self,
+        frame: &mut ActiveFrameMut<'_>,
+        index: u32,
+    ) -> Result<Value, VmError> {
+        let cell = frame.upvalue(index)?;
+        Ok(read_upvalue(&self.gc_heap, cell))
+    }
+
+    /// Value flavour of the upvalue store used by the committed binding call.
+    /// `Checked` rejects a TDZ hole; `Initialize` may replace it.
+    pub(crate) fn frame_store_upvalue_value(
+        &mut self,
+        frame: &mut ActiveFrameMut<'_>,
+        index: u32,
+        value: Value,
+        check: otter_bytecode::opcode_schema::BindingWriteCheck,
+    ) -> Result<(), VmError> {
+        let cell = frame.upvalue(index)?;
+        if matches!(
+            check,
+            otter_bytecode::opcode_schema::BindingWriteCheck::Checked
+        ) && read_upvalue(&self.gc_heap, cell).is_hole()
+        {
+            return Err(VmError::TemporalDeadZone { local_index: index });
+        }
+        store_upvalue(&mut self.gc_heap, cell, value);
+        Ok(())
+    }
+
     pub(crate) fn frame_store_upvalue(
         &mut self,
         frame: &mut ActiveFrameMut<'_>,

@@ -19,15 +19,20 @@
 //!   places its cooperative poll identically.
 //! - Immediate operands carry final boxed `Value` bit patterns; backends
 //!   materialize them without consulting the constant pool.
+//! - Binding and global-declaration families are selected only by the opcode
+//!   schema. Their runtime operations carry boxed SSA values; immutable site
+//!   metadata is never copied into a raw dispatcher payload.
 //!
 //! # See also
 //! - [`super::arm64`] — the first machine-code consumer of these operations.
 
-use otter_bytecode::opcode_schema::{RegisterAccess, register_access_at};
+use otter_bytecode::opcode_schema::{
+    BindingSemantics, GlobalDeclarationSemantics, RegisterAccess, opcode_schema, register_access_at,
+};
 use otter_bytecode::{Op, Operand};
 use otter_vm::{
     JitCompileSnapshot, Value,
-    native_abi::{SafepointId, SafepointRecord},
+    native_abi::{ObjectProtocolValueOp, SafepointId, SafepointRecord, ScalarValueOp},
 };
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -230,8 +235,23 @@ pub(crate) enum TemplateOp {
     },
     /// Materialize a regex literal from the constant pool.
     LoadRegExp { dst: u16, constant: u32 },
-    /// `r<dst> = global[name]` or throw.
-    LoadGlobal { dst: u16, name: u32 },
+    /// One schema-owned binding access. Names, strictness, captured-cell
+    /// indices, and missing-binding policy remain in the published bytecode
+    /// site; only boxed SSA values cross the committed runtime boundary.
+    BindingValue {
+        semantics: BindingSemantics,
+        result: Option<u16>,
+        value0: Option<u16>,
+        value1: Option<u16>,
+    },
+    /// One schema-owned global declaration/initialization operation. This is
+    /// deliberately separate from ordinary binding access even though both
+    /// use the same fixed two-value ABI shape.
+    GlobalDeclarationValue {
+        semantics: GlobalDeclarationSemantics,
+        value0: Option<u16>,
+        value1: Option<u16>,
+    },
     /// `r<dst>` = builtin error constructor for `constant`.
     LoadBuiltinError { dst: u16, constant: u32 },
     /// `r<dst> = {}`.
@@ -256,12 +276,6 @@ pub(crate) enum TemplateOp {
         index: u16,
         value: u16,
     },
-    /// `r<dst> = upvalue[index]` (captured binding; TDZ raises in the VM).
-    LoadUpvalue { dst: u16, index: i32 },
-    /// `upvalue[index] = r<src>` (barriered store in the VM).
-    StoreUpvalue { src: u16, index: i32 },
-    /// `upvalue[index] = r<src>` with the TDZ read guard.
-    StoreUpvalueChecked { src: u16, index: i32 },
     /// `r<dst> = r<object>.name` through the inline WhiskerIC probe. A miss
     /// completes the VM's full `[[Get]]` semantics in the window transition;
     /// it never exact-side-exits after invoking a getter or proxy trap.
@@ -375,33 +389,20 @@ pub(crate) enum TemplateOp {
     /// Obtain an async iterator (including async-from-sync fallback) through
     /// the VM's full observable `@@asyncIterator` transition.
     GetAsyncIterator { dst: u16, src: u16 },
-    /// Complete one global-variable access (`LoadGlobalThis`,
-    /// `LoadGlobalOrUndefined`, `StoreGlobalBinding`, `StoreGlobalChecked`)
-    /// through the shared reentrant global environment-record transition.
-    /// Accessor globals fire their getters/setters in the VM. `arg0`/`arg1`/
-    /// `arg2` name the destination/value register, constant name index, and the
-    /// opcode-specific strictness flag or `exists` register.
-    GlobalOp {
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
-    },
     /// Complete one object-protocol operation through the fixed boxed-value
     /// committed boundary. `operation` is compile-time-only; the VM decodes
     /// the authoritative operation from the published function/PC. `result`
     /// is absent for `SetPrototype`.
     ObjectProtocolValue {
-        operation: otter_vm::ObjectProtocolValueOp,
+        operation: ObjectProtocolValueOp,
         result: Option<u16>,
         value0: u16,
         value1: Option<u16>,
     },
-    /// Complete one `delete` (`DeleteProperty`, `DeleteElement`,
-    /// `DeleteDynamic`) through the shared reentrant delete transition. Proxy
-    /// `deleteProperty` traps fire in the VM. `arg0`/`arg1`/`arg2` name the
-    /// destination register, object register or name index, and name index or
-    /// key register per opcode.
+    /// Complete one object-property `delete` (`DeleteProperty` or
+    /// `DeleteElement`) through the shared reentrant delete transition. Proxy
+    /// `deleteProperty` traps fire in the VM. Binding deletion belongs to
+    /// [`Self::BindingValue`].
     DeleteOp {
         opcode: u8,
         arg0: u64,
@@ -413,7 +414,7 @@ pub(crate) enum TemplateOp {
     /// This includes derived-`this` binding; the operation kind is never
     /// passed to the VM entry.
     ScalarValue {
-        operation: otter_vm::ScalarValueOp,
+        operation: ScalarValueOp,
         result: u16,
         value0: Option<u16>,
         value1: Option<u16>,
@@ -499,14 +500,6 @@ pub(crate) enum TemplateOp {
         packed_head: u64,
         method: u64,
         packed_args: u64,
-    },
-    /// Complete one dynamic control-family opcode (`LoadShadowedUpvalue`)
-    /// through the shared reentrant VM transition.
-    ControlOp {
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
     },
     /// Complete spread calls/constructions, explicit-receiver calls, and
     /// `CollectArguments` through the shared synchronous VM transition.
@@ -780,6 +773,34 @@ impl TemplatePlan {
                 });
                 continue;
             }
+            let schema = opcode_schema(lowered.op);
+            if let Some(semantics) = schema.binding {
+                let operands = lowered.binding_value_operands()?;
+                instructions.push(TemplateInstr {
+                    pc,
+                    byte_pc: lowered.byte_pc,
+                    op: TemplateOp::BindingValue {
+                        semantics,
+                        result: operands.result,
+                        value0: operands.values[0],
+                        value1: operands.values[1],
+                    },
+                });
+                continue;
+            }
+            if let Some(semantics) = schema.global_declaration {
+                let operands = lowered.global_declaration_operands()?;
+                instructions.push(TemplateInstr {
+                    pc,
+                    byte_pc: lowered.byte_pc,
+                    op: TemplateOp::GlobalDeclarationValue {
+                        semantics,
+                        value0: operands.values[0],
+                        value1: operands.values[1],
+                    },
+                });
+                continue;
+            }
             let op = match lowered.op {
                 Op::LoadInt32 => {
                     let operands = lowered.load_int32_operands()?;
@@ -941,13 +962,6 @@ impl TemplatePlan {
                         constant: operands.constant,
                     }
                 }
-                Op::LoadGlobalOrThrow => {
-                    let operands = lowered.constant_operands()?;
-                    TemplateOp::LoadGlobal {
-                        dst: operands.dst,
-                        name: operands.constant,
-                    }
-                }
                 Op::LoadBuiltinError => {
                     let operands = lowered.constant_operands()?;
                     TemplateOp::LoadBuiltinError {
@@ -1004,36 +1018,6 @@ impl TemplatePlan {
                         receiver: operands.receiver,
                         index: operands.index,
                         value: operands.value,
-                    }
-                }
-                Op::LoadUpvalue => {
-                    let operands = lowered.upvalue_operands()?;
-                    TemplateOp::LoadUpvalue {
-                        dst: operands.value,
-                        index: operands.index,
-                    }
-                }
-                Op::StoreUpvalue => {
-                    let operands = lowered.upvalue_operands()?;
-                    TemplateOp::StoreUpvalue {
-                        src: operands.value,
-                        index: operands.index,
-                    }
-                }
-                Op::StoreUpvalueChecked => {
-                    let operands = lowered.upvalue_operands()?;
-                    TemplateOp::StoreUpvalueChecked {
-                        src: operands.value,
-                        index: operands.index,
-                    }
-                }
-                Op::LoadShadowedUpvalue => {
-                    let operands = lowered.shadowed_upvalue_operands()?;
-                    TemplateOp::ControlOp {
-                        opcode: Op::LoadShadowedUpvalue as u8,
-                        arg0: u64::from(operands.dst),
-                        arg1: u64::from(operands.name),
-                        arg2: operands.index as u64,
                     }
                 }
                 Op::LoadProperty => {
@@ -1236,58 +1220,6 @@ impl TemplatePlan {
                         src: operands.src,
                     }
                 }
-                Op::LoadGlobalThis => {
-                    let dst = lowered.destination_operands()?.dst;
-                    TemplateOp::GlobalOp {
-                        opcode: Op::LoadGlobalThis as u8,
-                        arg0: u64::from(dst),
-                        arg1: 0,
-                        arg2: 0,
-                    }
-                }
-                Op::LoadGlobalOrUndefined => {
-                    let operands = lowered.constant_operands()?;
-                    TemplateOp::GlobalOp {
-                        opcode: Op::LoadGlobalOrUndefined as u8,
-                        arg0: u64::from(operands.dst),
-                        arg1: u64::from(operands.constant),
-                        arg2: 0,
-                    }
-                }
-                Op::StoreGlobalBinding => {
-                    let operands = lowered.global_store_operands()?;
-                    TemplateOp::GlobalOp {
-                        opcode: Op::StoreGlobalBinding as u8,
-                        arg0: u64::from(operands.value),
-                        arg1: u64::from(operands.name),
-                        arg2: u64::from(operands.extra),
-                    }
-                }
-                Op::StoreGlobalChecked
-                | Op::DeclareGlobalVar
-                | Op::DeclareGlobalLex
-                | Op::ValidateGlobalDecl
-                | Op::DefineGlobalVar
-                | Op::DefineGlobalFunction
-                | Op::InitGlobalLex
-                | Op::GlobalBindingExists => {
-                    let operands = lowered.global_store_operands()?;
-                    TemplateOp::GlobalOp {
-                        opcode: lowered.op as u8,
-                        arg0: u64::from(operands.value),
-                        arg1: u64::from(operands.name),
-                        arg2: u64::from(operands.extra),
-                    }
-                }
-                Op::LoadDynamic | Op::StoreDynamic | Op::TypeofDynamic => {
-                    let operands = lowered.constant_operands()?;
-                    TemplateOp::GlobalOp {
-                        opcode: lowered.op as u8,
-                        arg0: u64::from(operands.dst),
-                        arg1: u64::from(operands.constant),
-                        arg2: 0,
-                    }
-                }
                 Op::LoadSuperProperty => {
                     let operands = lowered.property_load_operands()?;
                     TemplateOp::SuperOp {
@@ -1468,7 +1400,7 @@ impl TemplatePlan {
                 Op::BindThisValue => {
                     let operands = lowered.global_store_operands()?;
                     TemplateOp::ScalarValue {
-                        operation: otter_vm::ScalarValueOp::BindThisValue,
+                        operation: ScalarValueOp::BindThisValue,
                         result: operands.value,
                         value0: Some(operands.value),
                         value1: None,
@@ -1582,9 +1514,9 @@ impl TemplatePlan {
                     let operands = lowered.triple_operands()?;
                     TemplateOp::ObjectProtocolValue {
                         operation: if lowered.op == Op::Instanceof {
-                            otter_vm::ObjectProtocolValueOp::Instanceof
+                            ObjectProtocolValueOp::Instanceof
                         } else {
-                            otter_vm::ObjectProtocolValueOp::HasProperty
+                            ObjectProtocolValueOp::HasProperty
                         },
                         result: Some(operands.first),
                         value0: operands.second,
@@ -1602,9 +1534,9 @@ impl TemplatePlan {
                     let operands = lowered.unary_operands()?;
                     TemplateOp::ObjectProtocolValue {
                         operation: if lowered.op == Op::GetPrototype {
-                            otter_vm::ObjectProtocolValueOp::GetPrototype
+                            ObjectProtocolValueOp::GetPrototype
                         } else {
-                            otter_vm::ObjectProtocolValueOp::SetPrototype
+                            ObjectProtocolValueOp::SetPrototype
                         },
                         result: (lowered.op == Op::GetPrototype).then_some(operands.dst),
                         value0: if lowered.op == Op::GetPrototype {
@@ -1633,15 +1565,6 @@ impl TemplatePlan {
                         arg2: u64::from(operands.third),
                     }
                 }
-                Op::DeleteDynamic => {
-                    let operands = lowered.constant_operands()?;
-                    TemplateOp::DeleteOp {
-                        opcode: Op::DeleteDynamic as u8,
-                        arg0: u64::from(operands.dst),
-                        arg1: u64::from(operands.constant),
-                        arg2: 0,
-                    }
-                }
                 Op::ToObject
                 | Op::ToPropertyKey
                 | Op::TypeOf
@@ -1650,12 +1573,12 @@ impl TemplatePlan {
                 | Op::LoadLength => {
                     let operands = lowered.unary_operands()?;
                     let operation = match lowered.op {
-                        Op::ToObject => otter_vm::ScalarValueOp::ToObject,
-                        Op::ToPropertyKey => otter_vm::ScalarValueOp::ToPropertyKey,
-                        Op::TypeOf => otter_vm::ScalarValueOp::TypeOf,
-                        Op::IsArray => otter_vm::ScalarValueOp::IsArray,
-                        Op::ArrayLength => otter_vm::ScalarValueOp::ArrayLength,
-                        Op::LoadLength => otter_vm::ScalarValueOp::LoadLength,
+                        Op::ToObject => ScalarValueOp::ToObject,
+                        Op::ToPropertyKey => ScalarValueOp::ToPropertyKey,
+                        Op::TypeOf => ScalarValueOp::TypeOf,
+                        Op::IsArray => ScalarValueOp::IsArray,
+                        Op::ArrayLength => ScalarValueOp::ArrayLength,
+                        Op::LoadLength => ScalarValueOp::LoadLength,
                         _ => unreachable!("scalar unary opcode group"),
                     };
                     TemplateOp::ScalarValue {
@@ -1668,7 +1591,7 @@ impl TemplatePlan {
                 Op::LoadNewTarget => {
                     let dst = lowered.destination_operands()?.dst;
                     TemplateOp::ScalarValue {
-                        operation: otter_vm::ScalarValueOp::LoadNewTarget,
+                        operation: ScalarValueOp::LoadNewTarget,
                         result: dst,
                         value0: None,
                         value1: None,
@@ -1677,7 +1600,7 @@ impl TemplatePlan {
                 Op::SameValue => {
                     let operands = lowered.triple_operands()?;
                     TemplateOp::ScalarValue {
-                        operation: otter_vm::ScalarValueOp::SameValue,
+                        operation: ScalarValueOp::SameValue,
                         result: operands.first,
                         value0: Some(operands.second),
                         value1: Some(operands.third),
@@ -2064,6 +1987,93 @@ mod tests {
             })
             .collect();
         JitCompileSnapshot::without_feedback(0, 1, 8, instructions)
+    }
+
+    #[test]
+    fn binding_and_declaration_ops_are_selected_from_the_schema() {
+        use otter_bytecode::opcode_schema::{BindingDelete, BindingRead, BindingWrite};
+
+        let v = view(&[
+            (Op::LoadGlobalThis, vec![Operand::Register(0)]),
+            (
+                Op::StoreGlobalChecked,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstIndex(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::StoreShadowedUpvalueChecked,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstIndex(2),
+                    Operand::Imm32(4),
+                    Operand::Imm32(0),
+                ],
+            ),
+            (
+                Op::DeleteShadowedUpvalue,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(2),
+                    Operand::Imm32(4),
+                    Operand::Imm32(1),
+                ],
+            ),
+            (
+                Op::DefineGlobalVar,
+                vec![Operand::ConstIndex(2), Operand::Register(1)],
+            ),
+            (Op::ReturnUndefined, vec![]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("schema binding plan");
+        assert!(!plan.osr_only);
+
+        assert!(matches!(
+            plan.instructions[0].op,
+            TemplateOp::BindingValue {
+                semantics: BindingSemantics::Read(BindingRead::GlobalThis { .. }),
+                result: Some(0),
+                value0: None,
+                value1: None,
+            }
+        ));
+        assert!(matches!(
+            plan.instructions[1].op,
+            TemplateOp::BindingValue {
+                semantics: BindingSemantics::Write(BindingWrite::GlobalChecked { .. }),
+                result: None,
+                value0: Some(1),
+                value1: Some(3),
+            }
+        ));
+        assert!(matches!(
+            plan.instructions[2].op,
+            TemplateOp::BindingValue {
+                semantics: BindingSemantics::Write(BindingWrite::ShadowedUpvalue { .. }),
+                result: None,
+                value0: Some(1),
+                value1: None,
+            }
+        ));
+        assert!(matches!(
+            plan.instructions[3].op,
+            TemplateOp::BindingValue {
+                semantics: BindingSemantics::Delete(BindingDelete::ShadowedUpvalue { .. }),
+                result: Some(0),
+                value0: None,
+                value1: None,
+            }
+        ));
+        assert!(matches!(
+            plan.instructions[4].op,
+            TemplateOp::GlobalDeclarationValue {
+                semantics: GlobalDeclarationSemantics::DefineVar { .. },
+                value0: Some(1),
+                value1: None,
+            }
+        ));
     }
 
     /// A `Sub`/`Mul` run whose intermediate is dead fuses; the intermediate's

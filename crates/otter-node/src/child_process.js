@@ -170,9 +170,21 @@ class ChildProcess extends EventEmitter {
     this._handle = 0;
     this.stdout = new Readable({ read() {} });
     this.stderr = new Readable({ read() {} });
-    this.stdin = new Writable({ write(c, e, cb) { cb(); } });
+    const self = this;
+    this.stdin = new Writable({
+      write(chunk, encoding, cb) {
+        const payload = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding);
+        native.childStdinWrite(self._handle, payload);
+        cb();
+      },
+      final(cb) {
+        native.childStdinEnd(self._handle);
+        cb();
+      },
+    });
     this.stdio = [this.stdin, this.stdout, this.stderr];
     this._piped = [true, true, true];
+    this._streamEnded = [false, false, false];
   }
   // The low-level entry point Node exposes on the class itself. Its argument
   // checks run before anything is spawned, and its tests assert them verbatim.
@@ -311,16 +323,34 @@ class ChildProcess extends EventEmitter {
   }
 
   _endStreams() {
-    if (this.stdout) this.stdout.push(null);
-    if (this.stderr) this.stderr.push(null);
+    if (this.stdout && !this._streamEnded[1]) {
+      this._streamEnded[1] = true;
+      this.stdout.push(null);
+    }
+    if (this.stderr && !this._streamEnded[2]) {
+      this._streamEnded[2] = true;
+      this.stderr.push(null);
+    }
   }
 
-  // The native half reports the outcome once, when the child has run to
-  // completion and its output has been read to the end.
-  _exited(status, signal, stdout, stderr) {
+  // One live chunk from an output pipe; `null` marks that pipe's end.
+  _stdioChunk(which, chunk) {
+    const stream = which === 1 ? this.stdout : this.stderr;
+    if (!stream) return;
+    if (chunk === null) {
+      if (!this._streamEnded[which]) {
+        this._streamEnded[which] = true;
+        stream.push(null);
+      }
+      return;
+    }
+    stream.push(Buffer.from(chunk, 'latin1'));
+  }
+
+  // The native half reports the outcome once the child has exited and both
+  // output pipes reached end-of-stream (their chunks were delivered first).
+  _exited(status, signal) {
     children.delete(this._handle);
-    if (stdout && this.stdout) this.stdout.push(Buffer.from(stdout, 'latin1'));
-    if (stderr && this.stderr) this.stderr.push(Buffer.from(stderr, 'latin1'));
     this._endStreams();
     this.exitCode = status;
     this.signalCode = signal;
@@ -352,10 +382,16 @@ class ChildProcess extends EventEmitter {
 }
 
 // The native half dispatches here, on the isolate thread.
-globalThis.__otterChildExit = function exited(handle, status, signal, stdout, stderr) {
+globalThis.__otterChildStdio = function stdioChunk(handle, which, chunk) {
+  const child = children.get(handle);
+  if (!child) return;
+  child._stdioChunk(which, chunk);
+};
+
+globalThis.__otterChildExit = function exited(handle, status, signal) {
   const child = children.get(handle);
   if (child === undefined) return;
-  child._exited(status, signal, stdout, stderr);
+  child._exited(status, signal);
 };
 
 globalThis.__otterChildIpc = function channelEvent(handle, kind, payload) {
@@ -366,7 +402,7 @@ globalThis.__otterChildIpc = function channelEvent(handle, kind, payload) {
 
 function spawn(command, args, options) {
   const n = normalizeArgs(command, args, options);
-  const { streams, wantsChannel } = normalizeStdio(n.options.stdio, ['ignore', 'pipe', 'pipe']);
+  const { streams, wantsChannel } = normalizeStdio(n.options.stdio, ['pipe', 'pipe', 'pipe']);
   const cp = new ChildProcess();
   cp._run(n.command, n.args, { ...n.options, stdio: streams, ipc: wantsChannel });
   if (wantsChannel && cp._handle !== 0) {
@@ -438,4 +474,5 @@ module.exports = {
 // Host-dispatch hooks stay off the enumerable global surface: Node's
 // test harness treats any enumerable global it does not know as a leak.
 Object.defineProperty(globalThis, '__otterChildExit', { enumerable: false });
+Object.defineProperty(globalThis, '__otterChildStdio', { enumerable: false });
 Object.defineProperty(globalThis, '__otterChildIpc', { enumerable: false });

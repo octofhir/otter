@@ -143,8 +143,32 @@ pub(crate) fn install_global(
                 scope.set(process, "pid", pid)?;
                 let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
                 scope.set(process, "ppid", ppid)?;
+                // `exitCode` is an accessor with Node's validation; the value
+                // itself lives in a hidden slot so native readers can reach
+                // it without running the getter.
                 let undefined = scope.undefined();
-                scope.set(process, "exitCode", undefined)?;
+                scope.define(
+                    process,
+                    EXIT_CODE_SLOT,
+                    undefined,
+                    Attr {
+                        writable: true,
+                        enumerable: false,
+                        configurable: false,
+                    }
+                    .to_flags(),
+                )?;
+                let getter =
+                    scope.native_call("exitCode", 0, NativeCall::Static(exit_code_getter))?;
+                let setter =
+                    scope.native_call("exitCode", 1, NativeCall::Static(exit_code_setter))?;
+                scope.define_accessor(
+                    process,
+                    "exitCode",
+                    getter,
+                    setter,
+                    otter_vm::object::PropertyFlags::new(false, true, false),
+                )?;
 
                 let env = crate::process_env::build(
                     &mut scope,
@@ -162,6 +186,12 @@ pub(crate) fn install_global(
                     ("cwd", 0, cwd_call(working_directory.clone())),
                     ("exit", 1, NativeCall::Static(process_exit)),
                     ("reallyExit", 1, NativeCall::Static(process_really_exit)),
+                    ("_rawDebug", 0, NativeCall::Static(process_raw_debug)),
+                    (
+                        "setSourceMapsEnabled",
+                        1,
+                        NativeCall::Static(process_set_source_maps_enabled),
+                    ),
                     ("nextTick", 1, NativeCall::Static(process_next_tick)),
                     ("binding", 1, NativeCall::Static(process_binding)),
                     ("uptime", 0, uptime_call(start, uptime_base_secs)),
@@ -499,7 +529,8 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
     else {
         return 0;
     };
-    let Some(value) = otter_vm::object::get(process, interp.gc_heap(), "exitCode") else {
+    // The accessor's backing slot — `object::get` cannot run the getter.
+    let Some(value) = otter_vm::object::get(process, interp.gc_heap(), EXIT_CODE_SLOT) else {
         return 0;
     };
     normalize_exit_code(&value, interp.gc_heap()).unwrap_or(0)
@@ -646,7 +677,7 @@ fn process_exit(
     ctx.scope(|mut scope| {
         let process = scope.value(this_value);
         let code_value = scope.number(f64::from(code));
-        scope.set(process, "exitCode", code_value)?;
+        scope.set(process, EXIT_CODE_SLOT, code_value)?;
         let really_exit = scope.get(process, "reallyExit")?;
         if scope.is_callable(really_exit) {
             let code_value = scope.number(f64::from(code));
@@ -654,6 +685,94 @@ fn process_exit(
             return Ok(Value::undefined());
         }
         Err(NativeError::Exit { code })
+    })
+}
+
+/// `process._rawDebug(...)` — write the rendered arguments straight to
+/// stderr with a newline, bypassing every stream layer. The harness uses it
+/// to report from contexts where `console.error` is hijacked.
+fn process_raw_debug(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    use std::io::Write;
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|value| value.display_string(ctx.heap()))
+        .collect();
+    // `util.format`'s placeholder core: consume arguments for %s/%d/%i/%j,
+    // append the leftovers space-separated.
+    let mut out = String::new();
+    let mut next = 1;
+    if let Some(first) = rendered.first() {
+        let mut chars = first.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '%' {
+                match chars.peek() {
+                    Some('%') => {
+                        chars.next();
+                        out.push('%');
+                        continue;
+                    }
+                    Some('s' | 'd' | 'i' | 'j' | 'o' | 'O') if next < rendered.len() => {
+                        chars.next();
+                        out.push_str(&rendered[next]);
+                        next += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(character);
+        }
+    }
+    for rest in &rendered[next.min(rendered.len())..] {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(rest);
+    }
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "{out}");
+    let _ = err.flush();
+    Ok(Value::undefined())
+}
+
+/// `process.setSourceMapsEnabled(val)` — validate the flag Node's way and
+/// record it; source-map support itself is compile-time in this engine, so
+/// the setter only stores the observable state.
+fn process_set_source_maps_enabled(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    if value.as_boolean().is_none() {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"val\" argument must be of type boolean.{}",
+                crate::process_control::received_suffix(ctx, value)
+            ),
+        });
+    }
+    let enabled = value.as_boolean().unwrap_or(false);
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let enabled = scope.boolean(enabled);
+        scope.define(
+            process,
+            "__otter_source_maps_enabled__",
+            enabled,
+            Attr {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            }
+            .to_flags(),
+        )?;
+        Ok(Value::undefined())
     })
 }
 
@@ -673,6 +792,74 @@ fn process_really_exit(
 /// path cannot re-emit it.
 const EXIT_EMITTED_SLOT: &str = "__otter_exit_emitted__";
 
+/// Hidden storage behind the `process.exitCode` accessor.
+const EXIT_CODE_SLOT: &str = "__otter_exit_code__";
+
+fn exit_code_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let value = scope.get(process, EXIT_CODE_SLOT)?;
+        Ok(scope.finish(value))
+    })
+}
+
+/// `process.exitCode = value` — Node validation: `undefined`/`null` reset,
+/// an integer (or integer-shaped string) is stored, everything else throws
+/// `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`.
+fn exit_code_setter(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    if !(value.is_undefined() || value.is_null()) {
+        if let Some(string) = value.as_string(ctx.heap()) {
+            let text = string.to_lossy_string(ctx.heap());
+            if text.trim().is_empty() || text.trim().parse::<i64>().is_err() {
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::TypeError,
+                    code: "ERR_INVALID_ARG_TYPE",
+                    message: format!(
+                        "The \"code\" argument must be of type number.{}",
+                        crate::process_control::received_suffix(ctx, value)
+                    ),
+                });
+            }
+        } else if let Some(number) = value.as_number() {
+            let raw = number.as_f64();
+            if !raw.is_finite() || raw.fract() != 0.0 {
+                let rendered = value.display_string(ctx.heap());
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::RangeError,
+                    code: "ERR_OUT_OF_RANGE",
+                    message: format!(
+                        "The value of \"code\" is out of range. It must be an integer. Received {rendered}"
+                    ),
+                });
+            }
+        } else {
+            return Err(NativeError::Coded {
+                kind: otter_vm::ErrorKind::TypeError,
+                code: "ERR_INVALID_ARG_TYPE",
+                message: format!(
+                    "The \"code\" argument must be of type number.{}",
+                    crate::process_control::received_suffix(ctx, value)
+                ),
+            });
+        }
+    }
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let value = scope.value(value);
+        scope.set(process, EXIT_CODE_SLOT, value)?;
+        Ok(Value::undefined())
+    })
+}
+
 /// `process.__otterEmitExit(code)` — host hook the embedder calls once when a
 /// run completes. Emits the `'exit'` event exactly once with the final code
 /// and answers the (possibly listener-updated) exit code. A nested
@@ -684,6 +871,15 @@ fn process_emit_exit(
 ) -> Result<otter_vm::Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     let code = normalize_exit_code(&value, ctx.heap()).unwrap_or(0);
+    // A failing run (an uncaught exception) stamps its code onto
+    // `process.exitCode` the way Node's fatal path does; a clean completion
+    // leaves the property exactly as the program left it — `undefined` when
+    // it was never assigned.
+    let from_failure = args
+        .get(1)
+        .copied()
+        .and_then(|value| value.as_boolean())
+        .unwrap_or(false);
     let this_value = *ctx.this_value();
     ctx.scope(|mut scope| {
         let process = scope.value(this_value);
@@ -703,8 +899,10 @@ fn process_emit_exit(
             }
             .to_flags(),
         )?;
-        let code_value = scope.number(f64::from(code));
-        scope.set(process, "exitCode", code_value)?;
+        if from_failure {
+            let code_value = scope.number(f64::from(code));
+            scope.set(process, EXIT_CODE_SLOT, code_value)?;
+        }
         let emit = scope.get(process, "emit")?;
         if scope.is_callable(emit) {
             let event = scope.string("exit")?;
@@ -712,7 +910,7 @@ fn process_emit_exit(
             scope.call(emit, process, &[event, code_value])?;
         }
         // A listener may have reassigned `process.exitCode`.
-        let final_code = scope.get(process, "exitCode")?;
+        let final_code = scope.get(process, EXIT_CODE_SLOT)?;
         let final_code = scope
             .number_value(final_code)
             .ok()

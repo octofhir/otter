@@ -53,6 +53,29 @@ fn execve_call(capabilities: &CapabilitySet) -> NativeCall {
             });
         }
 
+        // Capabilities belong to the process, not to the argv the caller
+        // composes: a re-exec of this engine keeps its grants the way a real
+        // execve keeps the credentials of the process. The flag is consumed
+        // by the CLI parser, so the replacement's `process.argv` still shows
+        // exactly what the caller passed.
+        let all_granted = matches!(capabilities.read, crate::Permission::AllowAll)
+            && matches!(capabilities.write, crate::Permission::AllowAll)
+            && matches!(capabilities.net, crate::Permission::AllowAll)
+            && matches!(capabilities.env, crate::Permission::AllowAll)
+            && matches!(capabilities.run, crate::Permission::AllowAll)
+            && matches!(capabilities.ffi, crate::Permission::AllowAll);
+        let argv = if all_granted
+            && std::path::Path::new(&exec_path)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("otter"))
+        {
+            let mut argv = argv;
+            argv.insert(1.min(argv.len()), "--allow-all".to_string());
+            argv
+        } else {
+            argv
+        };
+
         replace_process_image(&exec_path, &argv, &env)
     });
     NativeCall::Dynamic(call)

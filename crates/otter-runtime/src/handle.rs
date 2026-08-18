@@ -2507,7 +2507,7 @@ impl IsolateRunner {
                 self.exit_finalized = true;
                 let code = u8::try_from(error.exit_code().clamp(0, 255)).unwrap_or(1);
                 let script = format!(
-                    "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}) : {code}"
+                    "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, true) : {code}"
                 );
                 let final_code = match self.runtime.eval(SourceInput::from_javascript(script)) {
                     Ok(emit_result) => emit_result
@@ -2528,7 +2528,7 @@ impl IsolateRunner {
         self.exit_finalized = true;
         let code = inner.exit_code();
         let script = format!(
-            "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}) : {code}"
+            "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, false) : {code}"
         );
         match self.runtime.eval(SourceInput::from_javascript(script)) {
             Ok(emit_result) => {

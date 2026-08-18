@@ -1155,6 +1155,38 @@ impl Interpreter {
         }
     }
 
+    /// Define an accessor property on the object handle `obj`, resolving all
+    /// handles through the arena at mutation time so the accessor-cell
+    /// allocation cannot leave them stale.
+    pub(crate) fn scoped_define_accessor(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Local<'_>,
+        key: &str,
+        getter: Local<'_>,
+        setter: Local<'_>,
+        flags: crate::object::PropertyFlags,
+    ) -> Result<(), VmError> {
+        let receiver = self.handle_arena.get(obj.index());
+        let Some(object) = receiver.as_object() else {
+            return Err(VmError::TypeMismatch);
+        };
+        let getter = self.handle_arena.get(getter.index());
+        let setter = self.handle_arena.get(setter.index());
+        let descriptor = crate::object::PropertyDescriptor {
+            kind: crate::object::DescriptorKind::Accessor {
+                getter: (!getter.is_undefined()).then_some(getter),
+                setter: (!setter.is_undefined()).then_some(setter),
+            },
+            flags,
+        };
+        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch)
+        }
+    }
+
     /// Make the object handle `obj` callable through the native callable held
     /// by `call`, resolving both handles through the arena at mutation time.
     pub(crate) fn scoped_set_call_native(

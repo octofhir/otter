@@ -357,9 +357,24 @@ impl Interpreter {
             ));
         };
         // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
-        // `false` in strict mode, throw a TypeError.
+        // `false` in strict mode, throw a TypeError. The receiver renders in
+        // V8's `#<Tag>` shape (`@@toStringTag` first, constructor name after),
+        // which the Node harness matches against.
         if !removed && strict {
-            return Err(self.err_type((format!("Cannot delete property '{name}'")).into()));
+            let receiver_tag = receiver
+                .as_object()
+                .and_then(|object| {
+                    let tag = self
+                        .well_known_symbols()
+                        .get(crate::symbol::WellKnown::ToStringTag);
+                    crate::object::get_symbol(object, &self.gc_heap, tag)
+                        .and_then(|value| value.as_string(&self.gc_heap))
+                        .map(|value| value.to_lossy_string(&self.gc_heap))
+                })
+                .unwrap_or_else(|| "Object".to_string());
+            return Err(self.err_type(
+                (format!("Cannot delete property '{name}' of #<{receiver_tag}>")).into(),
+            ));
         }
         write_register(frame, dst, Value::boolean(removed))?;
         frame.advance_pc()?;

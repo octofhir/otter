@@ -2037,14 +2037,33 @@ fn commonjs_native_to_error(err: otter_vm::NativeError) -> OtterError {
             message: reason,
         };
     }
-    let message = match err {
-        otter_vm::NativeError::Thrown { message, .. } => message,
+    // A JS value thrown out of the entry module is an uncaught exception —
+    // Node fails such a process with exit code 1, not an internal loader
+    // error. Only non-JS infrastructure failures stay internal.
+    let (message, uncaught) = match err {
+        otter_vm::NativeError::Thrown { message, .. } => (message, true),
         otter_vm::NativeError::TypeError { reason, .. }
         | otter_vm::NativeError::RangeError { reason, .. }
         | otter_vm::NativeError::ReferenceError { reason, .. }
-        | otter_vm::NativeError::URIError { reason, .. } => reason,
-        other => other.to_string(),
+        | otter_vm::NativeError::URIError { reason, .. } => (reason, true),
+        other => (other.to_string(), false),
     };
+    if uncaught {
+        return OtterError::Runtime {
+            diagnostic: Box::new(Diagnostic {
+                kind: DiagnosticKind::Type,
+                code: DiagnosticCode::Uncaught.as_str().to_string(),
+                message,
+                source_url: None,
+                range: None,
+                span: None,
+                help: None,
+                frames: Vec::new(),
+                cause: None,
+                aggregated_errors: Vec::new(),
+            }),
+        };
+    }
     OtterError::Internal {
         code: "COMMONJS_LOAD".to_string(),
         message,
@@ -5541,6 +5560,59 @@ impl Runtime {
                         return Ok(false);
                     };
 
+                    // A program may replace `process._fatalException`; a
+                    // non-function replacement is Node's "internal fatal
+                    // exception handler failure" (exit code 6).
+                    let fatal = scope.get(process, "_fatalException")?;
+                    if !scope.is_undefined(fatal) && !scope.is_callable(fatal) {
+                        return Err(otter_vm::NativeError::Coded {
+                            kind: otter_vm::ErrorKind::TypeError,
+                            code: "ERR_FATAL_HANDLER_INVALID",
+                            message: "process._fatalException is not a function".to_string(),
+                        });
+                    }
+                    if scope.is_undefined(fatal) {
+                        // `process` is a null-prototype object, so the probe
+                        // borrows `Object.prototype.hasOwnProperty`.
+                        let has_own = {
+                            let object_ctor = scope.global("Object");
+                            let probe = match object_ctor {
+                                Some(object_ctor) => {
+                                    let prototype = scope.get(object_ctor, "prototype")?;
+                                    Some(scope.get(prototype, "hasOwnProperty")?)
+                                }
+                                None => None,
+                            };
+                            match probe {
+                                Some(probe) if scope.is_callable(probe) => {
+                                    let key = scope.string("_fatalException")?;
+                                    let owned = scope.call(probe, process, &[key])?;
+                                    scope.boolean_value(owned).unwrap_or(false)
+                                }
+                                _ => false,
+                            }
+                        };
+                        if has_own {
+                            return Err(otter_vm::NativeError::Coded {
+                                kind: otter_vm::ErrorKind::TypeError,
+                                code: "ERR_FATAL_HANDLER_INVALID",
+                                message: "process._fatalException is not a function".to_string(),
+                            });
+                        }
+                    }
+
+                    // `uncaughtExceptionMonitor` observes every uncaught
+                    // exception before any handler — including the crash
+                    // path — and cannot mark it handled.
+                    {
+                        let emit = scope.get(process, "emit")?;
+                        if scope.is_callable(emit) {
+                            let event = scope.string("uncaughtExceptionMonitor")?;
+                            let origin = scope.string("uncaughtException")?;
+                            scope.call(emit, process, &[event, thrown, origin])?;
+                        }
+                    }
+
                     let capture = scope.get(process, process_control::CAPTURE_SLOT)?;
                     if scope.is_callable(capture) {
                         scope.call(capture, process, &[thrown])?;
@@ -5582,8 +5654,21 @@ impl Runtime {
                 self.pending_exit_code = Some(code);
                 Ok(true)
             }
+            // A replaced, non-callable `process._fatalException` is Node's
+            // "internal fatal exception handler failure" (exit code 6).
+            Err(otter_vm::NativeError::Coded {
+                code: "ERR_FATAL_HANDLER_INVALID",
+                message,
+                ..
+            }) => Err(OtterError::Internal {
+                code: "FATAL_HANDLER_INVALID".to_string(),
+                message,
+            }),
+            // A throw escaping the `uncaughtException` handler is Node's
+            // "internal fatal exception handler run-time failure": the
+            // process dies with code 7 and the handler's own error.
             Err(error) => Err(OtterError::Internal {
-                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                code: "UNCAUGHT_HANDLER_THREW".to_string(),
                 message: format!("uncaught exception handler failed: {error}"),
             }),
         }
@@ -6261,9 +6346,9 @@ pub(crate) fn program_looks_like_module(program: &oxc_ast::ast::Program<'_>) -> 
         fn visit_export_all_declaration(&mut self, _: &oxc_ast::ast::ExportAllDeclaration<'a>) {
             self.found = true;
         }
-        fn visit_import_expression(&mut self, _: &oxc_ast::ast::ImportExpression<'a>) {
-            self.found = true;
-        }
+        // Dynamic `import()` is deliberately NOT module syntax: it is legal
+        // inside CommonJS, and Node's own detect-module classifier keys only
+        // on static import/export and `import.meta`.
         fn visit_meta_property(&mut self, meta: &oxc_ast::ast::MetaProperty<'a>) {
             if meta.meta.name.as_str() == "import" && meta.property.name.as_str() == "meta" {
                 self.found = true;
@@ -6445,8 +6530,15 @@ pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &
 /// imports targeting non-`file://` URLs use a separate fetch
 /// path inside [`Runtime::load_dynamic_module`].
 fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
-    let trimmed = url.strip_prefix("file://")?;
-    Some(std::path::PathBuf::from(trimmed))
+    if let Some(trimmed) = url.strip_prefix("file://") {
+        return Some(std::path::PathBuf::from(trimmed));
+    }
+    // A CommonJS module's referrer is its filesystem path; dynamic `import()`
+    // is legal there and resolves against that file exactly as a URL one.
+    if std::path::Path::new(url).is_absolute() {
+        return Some(std::path::PathBuf::from(url));
+    }
+    None
 }
 
 /// Internal error type for [`Runtime::load_dynamic_module`]. Split

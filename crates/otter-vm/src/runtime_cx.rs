@@ -2741,6 +2741,24 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::set_symbol"))
     }
 
+    /// Define an accessor property with explicit descriptor flags. Pass the
+    /// scope's `undefined` for an absent getter or setter.
+    pub fn define_accessor(
+        &mut self,
+        object: Local<'_>,
+        key: &str,
+        getter: Local<'_>,
+        setter: Local<'_>,
+        flags: crate::object::PropertyFlags,
+    ) -> Result<(), NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_define_accessor(self.token, object, key, getter, setter, flags);
+        result.map_err(|error| self.vm_error(error, "NativeScope::define_accessor"))
+    }
+
     /// Define a data property with explicit descriptor flags.
     pub fn define(
         &mut self,

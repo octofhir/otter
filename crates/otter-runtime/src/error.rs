@@ -175,6 +175,10 @@ impl OtterError {
             OtterError::Timeout { .. } => 4,
             OtterError::OutOfMemory { .. } => 5,
             OtterError::Interrupted => 130,
+            // Node's "internal fatal exception handler failure".
+            OtterError::Internal { code, .. } if code == "FATAL_HANDLER_INVALID" => 6,
+            // Node's "internal fatal exception handler run-time failure".
+            OtterError::Internal { code, .. } if code == "UNCAUGHT_HANDLER_THREW" => 7,
             OtterError::Internal { .. } => 64,
         }
     }

@@ -414,6 +414,26 @@ impl Interpreter {
                         crate::object::PropertyFlags::new(true, false, true),
                     );
                 }
+                // Node's `ERR_*` classes render as `Name [CODE]: message`
+                // from `toString()` while `.name` stays clean. Syscall codes
+                // (`EPERM`, `ENOENT`, ...) are plain errors and keep the
+                // default rendering.
+                if code.starts_with("ERR_")
+                    && let Ok(to_string) = crate::native_function::native_value_static(
+                    &mut interp.gc_heap,
+                    "toString",
+                    0,
+                    coded_error_to_string,
+                ) {
+                    let to_string_h = interp.scoped_value(scope, to_string);
+                    let _ = interp.scoped_define_data(
+                        scope,
+                        obj_h,
+                        "toString",
+                        to_string_h,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    );
+                }
                 if let Some(payload) = &syscall_detail {
                     // Node reports the platform errno negated, and names the
                     // call plus the paths it was given.
@@ -489,6 +509,37 @@ impl Interpreter {
         }
         Some(Value::object(obj))
     }
+}
+
+/// Own `toString` for coded errors: `Name [CODE]: message`, degrading the
+/// same way `Error.prototype.toString` does when parts are absent.
+fn coded_error_to_string(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let this = *ctx.this_value();
+    let read = |ctx: &crate::NativeCtx<'_>, key: &str| -> Option<String> {
+        let object = this.as_object()?;
+        crate::object::get(object, ctx.heap(), key)
+            .and_then(|value| value.as_string(ctx.heap()))
+            .map(|value| value.to_lossy_string(ctx.heap()))
+    };
+    let name = read(ctx, "name").unwrap_or_else(|| "Error".to_string());
+    let code = read(ctx, "code");
+    let message = read(ctx, "message").unwrap_or_default();
+    let head = match code {
+        Some(code) if !code.is_empty() => format!("{name} [{code}]"),
+        _ => name,
+    };
+    let rendered = if message.is_empty() {
+        head
+    } else {
+        format!("{head}: {message}")
+    };
+    ctx.scope(|mut scope| {
+        let rendered = scope.string(&rendered)?;
+        Ok(scope.finish(rendered))
+    })
 }
 
 fn system_error_code(message: &str) -> &str {

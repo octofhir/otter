@@ -2561,6 +2561,16 @@ impl IsolateRunner {
         if initial.is_err() {
             return initial;
         }
+        // An explicit `process.exit` during entry evaluation terminates the
+        // run before any queued work: live listeners or timers must not hold
+        // the loop open past a requested exit.
+        if initial
+            .as_ref()
+            .map(ExecutionResult::explicit_exit)
+            .unwrap_or(false)
+        {
+            return initial;
+        }
         loop {
             // An exit requested from a task or timer callback completes the
             // run with that code, exactly as an exit during entry evaluation

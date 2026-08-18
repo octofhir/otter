@@ -473,10 +473,33 @@ const bindings = {
     getCategoryEnabledBuffer() { return new Uint8Array(1); },
     trace() {},
   },
-  stream_wrap: {
-    streamBaseState: new Int32Array(2),
-    kReadBytesOrError: 0,
-    kBytesWritten: 1,
+  get stream_wrap() {
+    return require('internal/otter/stream_wrap');
+  },
+  get tcp_wrap() {
+    return require('internal/otter/tcp_wrap');
+  },
+  get pipe_wrap() {
+    return require('internal/otter/pipe_wrap');
+  },
+  get cares_wrap() {
+    return require('internal/otter/cares_wrap');
+  },
+  fs: {
+    // The single fs surface the vendored net stack reads: synchronous
+    // fd writes for `makeSyncWrite`. Errors report through the ctx
+    // object the way the native binding does.
+    writeBuffer(fd, buffer, offset, length, position, _flags, ctx) {
+      try {
+        require('fs').writeSync(fd, buffer, offset, length, position ?? null);
+      } catch (error) {
+        if (ctx !== undefined && ctx !== null) {
+          ctx.errno = error.errno ?? -1;
+          ctx.code = error.code ?? 'EIO';
+          ctx.syscall = 'write';
+        }
+      }
+    },
   },
 };
 

@@ -82,6 +82,22 @@ function runOne(name, fn) {
   if (typeof fn !== 'function') return undefined; // pending/todo with no body
   const ctx = makeContext(name);
   try {
+    // A body declared as `(t, done)` completes through the callback; the
+    // returned promise keeps `await test(...)` callers working.
+    if (fn.length > 1) {
+      return new Promise((resolve) => {
+        const done = (err) => {
+          if (err != null) fail(name, err);
+          resolve(undefined);
+        };
+        try {
+          fn(ctx, done);
+        } catch (err) {
+          fail(name, err);
+          resolve(undefined);
+        }
+      });
+    }
     const result = fn(ctx);
     if (isThenable(result)) {
       return result.then(

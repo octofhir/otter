@@ -24,8 +24,16 @@ function getTimerDuration(msecs, name) {
   return msecs;
 }
 
+// Timer reuse on keep-alive paths: the cleared Timeout stays parked on
+// the stream under `kTimeout` so the next `setTimeout` can revive it.
+// The host clears timers fully, so revival is a fresh unref'd timer.
+function reuseOrCreateUnrefTimeout(_existing, callback, duration, arg) {
+  return setUnrefTimeout(callback, duration, arg);
+}
+
 module.exports = {
   setUnrefTimeout,
+  reuseOrCreateUnrefTimeout,
   getTimerDuration,
   kTimeout: Symbol('timeout'),
   kRefed: Symbol('refed'),

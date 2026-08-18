@@ -50,7 +50,19 @@ pub fn dgram_cjs_value<'scope>(
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
     let native = build_native(scope, capabilities, runtime_task_spawner)?;
     let globals = scope.global_this();
-    scope.set(globals, "__otterDgramNative", native)?;
+    // Non-enumerable: the Node test harness flags any enumerable global it
+    // does not recognize as a leak.
+    scope.define(
+        globals,
+        "__otterDgramNative",
+        native,
+        otter_vm::Attr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+        .to_flags(),
+    )?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:dgram",

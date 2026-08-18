@@ -325,10 +325,17 @@ fn raw_kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 
     #[cfg(unix)]
     {
-        // A signal number the platform does not define never reaches the
-        // kernel, and `EINVAL` is exactly what it would answer.
-        let Ok(signal) = nix::sys::signal::Signal::try_from(signal) else {
-            return Ok(Value::number_i32(-(nix::errno::Errno::EINVAL as i32)));
+        // Signal 0 is the existence probe: no signal is delivered, only the
+        // permission and liveness checks run.
+        let signal = if signal == 0 {
+            None
+        } else {
+            // A signal number the platform does not define never reaches the
+            // kernel, and `EINVAL` is exactly what it would answer.
+            let Ok(signal) = nix::sys::signal::Signal::try_from(signal) else {
+                return Ok(Value::number_i32(-(nix::errno::Errno::EINVAL as i32)));
+            };
+            Some(signal)
         };
         match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal) {
             Ok(()) => Ok(Value::number_i32(0)),
@@ -493,6 +500,20 @@ pub(crate) fn received_suffix(ctx: &mut NativeCtx<'_>, value: Value) -> String {
         let rendered = value.display_string(ctx.heap());
         return format!(" Received type boolean ({rendered})");
     }
+    if value.is_callable() {
+        // Node's `invalidArgTypeHelper`: `function ${name}` even when the
+        // name is empty — the trailing space is part of the contract.
+        let name = ctx
+            .get_value_property(value, "name")
+            .ok()
+            .and_then(|name| name.as_string(ctx.heap()))
+            .map(|name| name.to_lossy_string(ctx.heap()))
+            .unwrap_or_default();
+        return format!(" Received function {name}");
+    }
+    if value.as_array().is_some() {
+        return " Received an instance of Array".to_string();
+    }
     if value.as_object().is_some() {
         return format!(" Received an instance of {}", constructor_name(ctx, value));
     }
@@ -603,6 +624,27 @@ fn install_credentials(
     ] {
         crate::process::define_process_method(scope, process, name, 1, call)?;
     }
+    crate::process::define_process_method(
+        scope,
+        process,
+        "getgroups",
+        0,
+        NativeCall::Static(get_groups),
+    )?;
+    crate::process::define_process_method(
+        scope,
+        process,
+        "setgroups",
+        1,
+        NativeCall::Static(set_groups),
+    )?;
+    crate::process::define_process_method(
+        scope,
+        process,
+        "initgroups",
+        2,
+        NativeCall::Static(init_groups),
+    )?;
     Ok(())
 }
 
@@ -666,6 +708,172 @@ fn set_egid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     Ok(Value::undefined())
 }
 
+/// `process.getgroups()` — the supplementary group ids of the process.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn get_groups(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let groups =
+        nix::unistd::getgroups().map_err(|errno| credential_failure("getgroups", errno))?;
+    ctx.scope(|mut scope| {
+        let result = scope.array(groups.len())?;
+        for (index, gid) in groups.iter().enumerate() {
+            let gid = scope.number(f64::from(gid.as_raw()));
+            scope.set_index(result, index, gid)?;
+        }
+        Ok(scope.finish(result))
+    })
+}
+
+/// Apple targets: nix withholds the whole credential-group family (the
+/// libinfo/opendirectoryd interplay makes the raw syscalls unreliable there),
+/// and this crate forbids `unsafe`, so there is no direct syscall path. The
+/// group list of the current process is reported through `getgroups`'s
+/// documented failure instead of a fabricated answer.
+#[cfg(all(unix, target_vendor = "apple"))]
+fn get_groups(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Err(credential_failure("getgroups", nix::errno::Errno::ENOTSUP))
+}
+
+/// `process.setgroups(groups)` — validate the array Node's way (each entry a
+/// number in id range or a resolvable group name), then hand the ids to the
+/// syscall, which refuses unprivileged callers with `EPERM`.
+#[cfg(unix)]
+fn set_groups(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    if !ctx.is_array(value).unwrap_or(false) {
+        let suffix = received_suffix(ctx, value);
+        return Err(NativeError::Coded {
+            kind: ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!("The \"groups\" argument must be an instance of Array.{suffix}"),
+        });
+    }
+    let length = ctx
+        .array_length(value)
+        .or_else(|| {
+            ctx.get_value_property(value, "length")
+                .ok()
+                .and_then(number_arg)
+                .map(|length| length as usize)
+        })
+        .unwrap_or(0);
+    let mut ids: Vec<libc::gid_t> = Vec::with_capacity(length);
+    for index in 0..length {
+        let entry = ctx
+            .get_value_property(value, &index.to_string())
+            .unwrap_or_else(|_| Value::undefined());
+        if let Some(number) = number_arg(entry) {
+            if !(0.0..=u32::MAX as f64).contains(&number) || number.fract() != 0.0 {
+                return Err(NativeError::Coded {
+                    kind: ErrorKind::RangeError,
+                    code: "ERR_OUT_OF_RANGE",
+                    message: format!(
+                        "The value of \"groups[{index}]\" is out of range. It must be >= 0 && <= 4294967295. Received {number}"
+                    ),
+                });
+            }
+            ids.push(number as u32 as libc::gid_t);
+            continue;
+        }
+        if entry.as_string(ctx.heap()).is_some() {
+            let id = credential_id_from(ctx, entry, Credential::Group)?;
+            ids.push(id as libc::gid_t);
+            continue;
+        }
+        let suffix = received_suffix(ctx, entry);
+        return Err(NativeError::Coded {
+            kind: ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"groups[{index}]\" argument must be one of type number or string.{suffix}"
+            ),
+        });
+    }
+    apply_set_groups(&ids)?;
+    Ok(Value::undefined())
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn apply_set_groups(ids: &[libc::gid_t]) -> Result<(), NativeError> {
+    let ids: Vec<nix::unistd::Gid> = ids
+        .iter()
+        .map(|&gid| nix::unistd::Gid::from_raw(gid))
+        .collect();
+    nix::unistd::setgroups(&ids).map_err(|errno| credential_failure("setgroups", errno))
+}
+
+/// Apple: no safe syscall path (see [`get_groups`]); an unprivileged caller
+/// gets the `EPERM` the kernel would answer, a privileged one an explicit
+/// unsupported error rather than a silent no-op.
+#[cfg(all(unix, target_vendor = "apple"))]
+fn apply_set_groups(_ids: &[libc::gid_t]) -> Result<(), NativeError> {
+    let errno = if nix::unistd::geteuid().is_root() {
+        nix::errno::Errno::ENOTSUP
+    } else {
+        nix::errno::Errno::EPERM
+    };
+    Err(credential_failure("setgroups", errno))
+}
+
+/// `process.initgroups(user, extraGroup)` — validate both arguments, resolve
+/// the group first (Node reports the unknown group before touching the user
+/// table), then initialize the supplementary group list.
+#[cfg(unix)]
+fn init_groups(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let user = args.first().copied().unwrap_or_else(Value::undefined);
+    let extra_group = args.get(1).copied().unwrap_or_else(Value::undefined);
+    for (name, value) in [("user", user), ("extraGroup", extra_group)] {
+        if number_arg(value).is_none() && value.as_string(ctx.heap()).is_none() {
+            let suffix = received_suffix(ctx, value);
+            return Err(NativeError::Coded {
+                kind: ErrorKind::TypeError,
+                code: "ERR_INVALID_ARG_TYPE",
+                message: format!(
+                    "The \"{name}\" argument must be one of type number or string.{suffix}"
+                ),
+            });
+        }
+    }
+    let gid = credential_id_from(ctx, extra_group, Credential::Group)?;
+    let user_name = if let Some(string) = user.as_string(ctx.heap()) {
+        string.to_lossy_string(ctx.heap())
+    } else {
+        let uid = number_arg(user).expect("validated above") as i64 as u32;
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|user| user.name)
+            .ok_or(NativeError::Coded {
+                kind: ErrorKind::TypeError,
+                code: "ERR_UNKNOWN_CREDENTIAL",
+                message: format!("User identifier does not exist: {uid}"),
+            })?
+    };
+    let user_c = std::ffi::CString::new(user_name.clone()).map_err(|_| NativeError::Coded {
+        kind: ErrorKind::TypeError,
+        code: "ERR_UNKNOWN_CREDENTIAL",
+        message: format!("User identifier does not exist: {user_name}"),
+    })?;
+    apply_init_groups(&user_c, gid)?;
+    Ok(Value::undefined())
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn apply_init_groups(user: &std::ffi::CStr, gid: u32) -> Result<(), NativeError> {
+    nix::unistd::initgroups(user, nix::unistd::Gid::from_raw(gid))
+        .map_err(|errno| credential_failure("initgroups", errno))
+}
+
+/// Apple: same policy as [`apply_set_groups`].
+#[cfg(all(unix, target_vendor = "apple"))]
+fn apply_init_groups(_user: &std::ffi::CStr, _gid: u32) -> Result<(), NativeError> {
+    let errno = if nix::unistd::geteuid().is_root() {
+        nix::errno::Errno::ENOTSUP
+    } else {
+        nix::errno::Errno::EPERM
+    };
+    Err(credential_failure("initgroups", errno))
+}
+
 /// Which name table a credential argument is looked up in.
 #[cfg(unix)]
 #[derive(Clone, Copy)]
@@ -693,6 +901,17 @@ fn credential_id(
     credential: Credential,
 ) -> Result<u32, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
+    credential_id_from(ctx, value, credential)
+}
+
+/// [`credential_id`] over an already-extracted value, for callers whose
+/// credential is not the first argument.
+#[cfg(unix)]
+fn credential_id_from(
+    ctx: &mut NativeCtx<'_>,
+    value: Value,
+    credential: Credential,
+) -> Result<u32, NativeError> {
     if let Some(number) = number_arg(value) {
         // Node truncates to an unsigned 32-bit id, which is what the platform
         // takes; a value outside that range fails in the syscall, not here.

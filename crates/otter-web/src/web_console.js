@@ -211,5 +211,7 @@
   });
 
   console.Console = Console;
-  globalThis.Console = Console;
+  Object.defineProperty(globalThis, 'Console', {
+    value: Console, writable: true, enumerable: false, configurable: true,
+  });
 })(globalThis);

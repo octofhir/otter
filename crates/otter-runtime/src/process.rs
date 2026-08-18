@@ -92,7 +92,13 @@ pub(crate) fn install_global(
 
                 let argv = scope.array(process_argv.len())?;
                 for (index, arg) in process_argv.iter().enumerate() {
-                    let arg = scope.string(arg)?;
+                    // Node resolves `argv[0]` to `process.execPath`; the raw
+                    // spawn-time first argument survives only as `argv0`.
+                    let arg = if index == 0 {
+                        scope.string(&snapshot.exec_path)?
+                    } else {
+                        scope.string(arg)?
+                    };
                     scope.set_index(argv, index, arg)?;
                 }
                 scope.set(process, "argv", argv)?;
@@ -105,6 +111,9 @@ pub(crate) fn install_global(
                         process_argv.first().map(String::as_str).unwrap_or("otter"),
                     ),
                     ("execPath", snapshot.exec_path.as_str()),
+                    // Node's default title is the spawn path; a plain writable
+                    // property is enough until a real setproctitle lands.
+                    ("title", snapshot.exec_path.as_str()),
                     ("platform", node_platform()),
                     ("arch", node_arch()),
                     ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
@@ -152,10 +161,21 @@ pub(crate) fn install_global(
                 for (name, length, call) in [
                     ("cwd", 0, cwd_call(working_directory.clone())),
                     ("exit", 1, NativeCall::Static(process_exit)),
+                    ("reallyExit", 1, NativeCall::Static(process_really_exit)),
                     ("nextTick", 1, NativeCall::Static(process_next_tick)),
                     ("binding", 1, NativeCall::Static(process_binding)),
                     ("uptime", 0, uptime_call(start, uptime_base_secs)),
                     ("cpuUsage", 1, NativeCall::Static(process_cpu_usage)),
+                    (
+                        "threadCpuUsage",
+                        1,
+                        NativeCall::Static(process_thread_cpu_usage),
+                    ),
+                    (
+                        "loadEnvFile",
+                        1,
+                        load_env_file_call(working_directory.clone()),
+                    ),
                     ("memoryUsage", 0, NativeCall::Static(process_memory_usage)),
                     (
                         "availableMemory",
@@ -182,6 +202,24 @@ pub(crate) fn install_global(
                     "umask",
                     1,
                     NativeCall::Static(process_umask),
+                )?;
+                // Host-only exit hook: hidden from enumeration so `process`
+                // keeps Node's own key surface.
+                let emit_exit = scope.native_call(
+                    "__otterEmitExit",
+                    1,
+                    NativeCall::Static(process_emit_exit),
+                )?;
+                scope.define(
+                    process,
+                    "__otterEmitExit",
+                    emit_exit,
+                    Attr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    }
+                    .to_flags(),
                 )?;
 
                 crate::process_control::install(
@@ -217,6 +255,7 @@ pub(crate) fn install_global(
                     ("debug", false),
                     ("uv", true),
                     ("ipv6", true),
+                    ("dtls", false),
                     ("openssl_is_boringssl", false),
                     ("tls_alpn", false),
                     ("tls_sni", false),
@@ -249,13 +288,70 @@ fn process_bootstrap_error(error: NativeError) -> OtterError {
     }
 }
 
-/// `process.umask([mask])` — returns the previous mask. Otter does not change
-/// the process umask; it reports `0` so harness setup code proceeds.
+/// `process.umask([mask])` — read or set the process file-creation mask.
+/// A missing argument reads the mask without changing it (set to zero, then
+/// restore — the only portable read). The argument is a 32-bit unsigned
+/// integer or an octal string, exactly Node's `validateMode` contract.
 fn process_umask(
-    _ctx: &mut NativeCtx<'_>,
-    _args: &[otter_vm::Value],
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    Ok(Value::number(NumberValue::from_i32(0)))
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    if value.is_undefined() {
+        #[cfg(unix)]
+        {
+            let current = nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+            nix::sys::stat::umask(current);
+            return Ok(Value::number_i32(current.bits() as i32));
+        }
+        #[cfg(not(unix))]
+        return Ok(Value::number(NumberValue::from_i32(0)));
+    }
+
+    let mask = if let Some(number) = value.as_number() {
+        let raw = number.as_f64();
+        if raw.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&raw) {
+            return Err(umask_invalid_value(ctx, value));
+        }
+        raw as u32
+    } else if let Some(string) = value.as_string(ctx.heap()) {
+        let text = string.to_lossy_string(ctx.heap());
+        if text.is_empty() || !text.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+            return Err(umask_invalid_value(ctx, value));
+        }
+        u32::from_str_radix(&text, 8).map_err(|_| umask_invalid_value(ctx, value))?
+    } else {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"mask\" argument must be of type number or string.{}",
+                crate::process_control::received_suffix(ctx, value)
+            ),
+        });
+    };
+
+    #[cfg(unix)]
+    {
+        let previous = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask as _));
+        Ok(Value::number_i32(previous.bits() as i32))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mask;
+        Ok(Value::number(NumberValue::from_i32(0)))
+    }
+}
+
+fn umask_invalid_value(ctx: &mut NativeCtx<'_>, value: Value) -> NativeError {
+    NativeError::Coded {
+        kind: otter_vm::ErrorKind::RangeError,
+        code: "ERR_INVALID_ARG_VALUE",
+        message: format!(
+            "The argument 'mask' must be a 32-bit unsigned integer or an octal string.{}",
+            crate::process_control::received_suffix(ctx, value)
+        ),
+    }
 }
 
 /// Install `process.stdout` / `process.stderr` / `process.stdin` as minimal
@@ -406,7 +502,7 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
     let Some(value) = otter_vm::object::get(process, interp.gc_heap(), "exitCode") else {
         return 0;
     };
-    normalize_exit_code(&value).unwrap_or(0)
+    normalize_exit_code(&value, interp.gc_heap()).unwrap_or(0)
 }
 
 /// Patch the per-run values a restored `process` object carries from
@@ -533,18 +629,98 @@ fn cwd_call(cwd: crate::process_control::WorkingDirectory) -> NativeCall {
     NativeCall::Dynamic(call)
 }
 
+/// `process.exit([code])` — record the code on `exitCode` and dispatch
+/// through `this.reallyExit`, which is the documented seam a test replaces to
+/// observe an exit without performing one. When `reallyExit` has been
+/// replaced, the call returns and execution continues, exactly as in Node.
 fn process_exit(
-    _ctx: &mut NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    let code =
-        normalize_exit_code(args.first().unwrap_or(&Value::undefined())).ok_or_else(|| {
-            NativeError::TypeError {
-                name: "process.exit",
-                reason: "exit code must be a finite number between 0 and 255".to_string(),
-            }
-        })?;
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let code = normalize_exit_code(&value, ctx.heap()).ok_or_else(|| NativeError::TypeError {
+        name: "process.exit",
+        reason: "exit code must be a finite number between 0 and 255".to_string(),
+    })?;
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let code_value = scope.number(f64::from(code));
+        scope.set(process, "exitCode", code_value)?;
+        let really_exit = scope.get(process, "reallyExit")?;
+        if scope.is_callable(really_exit) {
+            let code_value = scope.number(f64::from(code));
+            scope.call(really_exit, process, &[code_value])?;
+            return Ok(Value::undefined());
+        }
+        Err(NativeError::Exit { code })
+    })
+}
+
+/// `process.reallyExit(code)` — the exit syscall seam. The builtin unwinds
+/// the run with the code; a test that replaces this property turns
+/// `process.exit` into an observable no-op.
+fn process_really_exit(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let code = normalize_exit_code(&value, ctx.heap()).unwrap_or(0);
     Err(NativeError::Exit { code })
+}
+
+/// Slot marking that the `'exit'` event already ran, so a second completion
+/// path cannot re-emit it.
+const EXIT_EMITTED_SLOT: &str = "__otter_exit_emitted__";
+
+/// `process.__otterEmitExit(code)` — host hook the embedder calls once when a
+/// run completes. Emits the `'exit'` event exactly once with the final code
+/// and answers the (possibly listener-updated) exit code. A nested
+/// `process.exit(newCode)` inside a listener unwinds through here and the
+/// embedder reads the replacement code off that unwind instead.
+fn process_emit_exit(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let code = normalize_exit_code(&value, ctx.heap()).unwrap_or(0);
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let emitted = scope.get(process, EXIT_EMITTED_SLOT)?;
+        if scope.boolean_value(emitted).unwrap_or(false) {
+            return Ok(Value::number_i32(i32::from(code)));
+        }
+        let flag = scope.boolean(true);
+        scope.define(
+            process,
+            EXIT_EMITTED_SLOT,
+            flag,
+            Attr {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            }
+            .to_flags(),
+        )?;
+        let code_value = scope.number(f64::from(code));
+        scope.set(process, "exitCode", code_value)?;
+        let emit = scope.get(process, "emit")?;
+        if scope.is_callable(emit) {
+            let event = scope.string("exit")?;
+            let code_value = scope.number(f64::from(code));
+            scope.call(emit, process, &[event, code_value])?;
+        }
+        // A listener may have reassigned `process.exitCode`.
+        let final_code = scope.get(process, "exitCode")?;
+        let final_code = scope
+            .number_value(final_code)
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| (n as i32).clamp(0, 255) as u8)
+            .unwrap_or(code);
+        Ok(Value::number_i32(i32::from(final_code)))
+    })
 }
 
 fn process_next_tick(
@@ -617,7 +793,7 @@ fn process_binding(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
             code: "ERR_INVALID_ARG_TYPE",
             message: format!(
                 "The \"module\" argument must be of type string.{}",
-                invalid_arg_type_suffix(&name, ctx.heap())
+                crate::process_control::received_suffix(ctx, name)
             ),
         });
     }
@@ -636,7 +812,7 @@ fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
                     code: "ERR_INVALID_ARG_TYPE",
                     message: format!(
                         "The \"prevValue\" argument must be of type object.{}",
-                        invalid_arg_type_suffix(value, ctx.heap())
+                        crate::process_control::received_suffix(ctx, *value)
                     ),
                 });
             };
@@ -666,14 +842,223 @@ fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     })
 }
 
-fn cpu_usage_field(ctx: &NativeCtx<'_>, name: &str, value: Value) -> Result<f64, NativeError> {
+/// `process.threadCpuUsage([previousValue])` — CPU time of the calling
+/// thread, split into `user` / `system` microseconds. Linux reads the thread
+/// itself (`RUSAGE_THREAD`); platforms without a per-thread getrusage answer
+/// the process-wide numbers, which satisfy the same finite-and-monotonic
+/// contract the callers rely on.
+fn process_thread_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let previous = match args.first() {
+        None => None,
+        Some(value) if value.is_undefined() => None,
+        Some(value) => {
+            let Some(object) = value.as_object() else {
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::TypeError,
+                    code: "ERR_INVALID_ARG_TYPE",
+                    message: format!(
+                        "The \"prevValue\" argument must be of type object.{}",
+                        crate::process_control::received_suffix(ctx, *value)
+                    ),
+                });
+            };
+            let user =
+                otter_vm::object::get(object, ctx.heap(), "user").unwrap_or_else(Value::undefined);
+            let system = otter_vm::object::get(object, ctx.heap(), "system")
+                .unwrap_or_else(Value::undefined);
+            let user = cpu_usage_field(ctx, "user", user)?;
+            let system = cpu_usage_field(ctx, "system", system)?;
+            Some((user, system))
+        }
+    };
+
+    let (mut user, mut system) = thread_cpu_times_micros();
+    if let Some((previous_user, previous_system)) = previous {
+        user = (user - previous_user).max(0.0);
+        system = (system - previous_system).max(0.0);
+    }
+
+    ctx.scope(|mut scope| {
+        let result = scope.bare_object()?;
+        let user = scope.number(user);
+        scope.set(result, "user", user)?;
+        let system = scope.number(system);
+        scope.set(result, "system", system)?;
+        Ok(scope.finish(result))
+    })
+}
+
+/// `process.loadEnvFile([path])` — read a dotenv file and fold its entries
+/// into `process.env`, skipping variables the environment already defines
+/// (Node's `--env-file` precedence). The default path is `./.env` under the
+/// process working directory.
+fn load_env_file_call(cwd: crate::process_control::WorkingDirectory) -> NativeCall {
+    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        let path_value = args.first().copied().unwrap_or_else(Value::undefined);
+        // Node reports the path exactly as the caller supplied it (the bare
+        // `.env` default included), while opening resolves against cwd.
+        let (path, reported_path) = if path_value.is_undefined() || path_value.is_null() {
+            (cwd.get().join(".env"), ".env".to_string())
+        } else if let Some(string) = path_value.as_string(ctx.heap()) {
+            let text = string.to_lossy_string(ctx.heap());
+            let candidate = PathBuf::from(&text);
+            let resolved = if candidate.is_absolute() {
+                candidate
+            } else {
+                cwd.get().join(candidate)
+            };
+            (resolved, text)
+        } else {
+            return Err(NativeError::Coded {
+                kind: otter_vm::ErrorKind::TypeError,
+                code: "ERR_INVALID_ARG_TYPE",
+                message: format!(
+                    "The \"path\" argument must be of type string.{}",
+                    crate::process_control::received_suffix(ctx, path_value)
+                ),
+            });
+        };
+
+        let content = std::fs::read_to_string(&path).map_err(|err| NativeError::Syscall {
+            code: match err.kind() {
+                std::io::ErrorKind::NotFound => "ENOENT",
+                std::io::ErrorKind::PermissionDenied => "EACCES",
+                _ => "EIO",
+            },
+            message: format!("{err}"),
+            syscall: "open",
+            path: Some(reported_path.clone()),
+            dest: None,
+            errno: err.raw_os_error().map(|raw| -raw).unwrap_or(-5),
+        })?;
+        let parsed = parse_env_content(&content);
+
+        let this_value = *ctx.this_value();
+        // `process.env` is a Proxy; writes must run through its trap, so the
+        // stores go through `Reflect.set` rather than a plain object write.
+        let reflect = ctx.global_value("Reflect").ok_or(NativeError::TypeError {
+            name: "process.loadEnvFile",
+            reason: "Reflect is not available".to_string(),
+        })?;
+        ctx.scope(|mut scope| {
+            let process = scope.value(this_value);
+            let env = scope.get(process, "env")?;
+            let reflect = scope.value(reflect);
+            let reflect_get = scope.get(reflect, "get")?;
+            let reflect_set = scope.get(reflect, "set")?;
+            for (key, value) in &parsed {
+                let key = scope.string(key)?;
+                let receiver = scope.undefined();
+                let existing = scope.call(reflect_get, receiver, &[env, key])?;
+                if !scope.is_undefined(existing) {
+                    continue;
+                }
+                let value = scope.string(value)?;
+                let receiver = scope.undefined();
+                scope.call(reflect_set, receiver, &[env, key, value])?;
+            }
+            Ok(Value::undefined())
+        })
+    });
+    NativeCall::Dynamic(call)
+}
+
+/// Parse dotenv content with Node's rules: optional `export ` prefix,
+/// `#` comment lines, quoted values (`"`, `'`, `` ` ``) running to the
+/// matching close quote across newlines, `\n`/`\r` unescaped inside double
+/// quotes, and inline `#` comments stripped from unquoted values.
+fn parse_env_content(source: &str) -> Vec<(String, String)> {
+    let src: Vec<char> = source.chars().collect();
+    let n = src.len();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    let find = |from: usize, needle: char| -> Option<usize> {
+        src[from.min(n)..]
+            .iter()
+            .position(|&c| c == needle)
+            .map(|p| from + p)
+    };
+    while i < n {
+        while i < n && matches!(src[i], ' ' | '\t' | '\r' | '\n') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let line_end = find(i, '\n').unwrap_or(n);
+        if src[i] == '#' {
+            i = line_end + 1;
+            continue;
+        }
+        let Some(eq) = find(i, '=').filter(|&eq| eq <= line_end) else {
+            i = line_end + 1;
+            continue;
+        };
+        let mut key: String = src[i..eq].iter().collect::<String>().trim().to_string();
+        if let Some(stripped) = key.strip_prefix("export ") {
+            key = stripped.trim().to_string();
+        }
+        let mut j = eq + 1;
+        while j < n && matches!(src[j], ' ' | '\t') {
+            j += 1;
+        }
+        if j < n && matches!(src[j], '"' | '\'' | '`') {
+            let quote = src[j];
+            if let Some(close) = find(j + 1, quote) {
+                let mut value: String = src[j + 1..close].iter().collect();
+                if quote == '"' {
+                    value = value.replace("\\n", "\n").replace("\\r", "\r");
+                }
+                if !key.is_empty() {
+                    out.push((key, value));
+                }
+                i = find(close, '\n').map(|p| p + 1).unwrap_or(n);
+                continue;
+            }
+        }
+        let mut value: String = src[j..line_end]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if let Some(hash) = value.find('#') {
+            value = value[..hash].trim().to_string();
+        }
+        if !key.is_empty() {
+            out.push((key, value));
+        }
+        i = line_end + 1;
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn thread_cpu_times_micros() -> (f64, f64) {
+    use nix::sys::time::TimeValLike;
+
+    nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_THREAD)
+        .map(|usage| {
+            (
+                usage.user_time().num_microseconds().max(0) as f64,
+                usage.system_time().num_microseconds().max(0) as f64,
+            )
+        })
+        .unwrap_or((0.0, 0.0))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_times_micros() -> (f64, f64) {
+    process_cpu_times_micros()
+}
+
+fn cpu_usage_field(ctx: &mut NativeCtx<'_>, name: &str, value: Value) -> Result<f64, NativeError> {
     let Some(value_number) = value.as_number() else {
         return Err(NativeError::Coded {
             kind: otter_vm::ErrorKind::TypeError,
             code: "ERR_INVALID_ARG_TYPE",
             message: format!(
                 "The \"prevValue.{name}\" property must be of type number.{}",
-                invalid_arg_type_suffix(&value, ctx.heap())
+                crate::process_control::received_suffix(ctx, value)
             ),
         });
     };
@@ -800,7 +1185,7 @@ fn hrtime_call(start: Instant) -> NativeCall {
                     code: "ERR_INVALID_ARG_TYPE",
                     message: format!(
                         "The \"time\" argument must be an instance of Array.{}",
-                        invalid_arg_type_suffix(argument, ctx.heap())
+                        crate::process_control::received_suffix(ctx, *argument)
                     ),
                 });
             };
@@ -847,13 +1232,26 @@ fn hrtime_bigint_call(start: Instant) -> NativeCall {
     NativeCall::Dynamic(call)
 }
 
-fn normalize_exit_code(value: &Value) -> Option<u8> {
-    if value.is_undefined() {
+fn normalize_exit_code(value: &Value, heap: &otter_gc::GcHeap) -> Option<u8> {
+    if value.is_undefined() || value.is_null() {
         return Some(0);
+    }
+    if let Some(string) = value.as_string(heap) {
+        // Node accepts an integer-shaped string ('2' exits with 2); anything
+        // else is a validation error.
+        let text = string.to_lossy_string(heap);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let parsed: i64 = trimmed.parse().ok()?;
+        return Some(parsed.clamp(0, 255) as u8);
     }
     match value.as_number()? {
         NumberValue::Smi(n) => Some(n.clamp(0, 255) as u8),
-        NumberValue::Double(n) if n.is_finite() => Some((n as i32).clamp(0, 255) as u8),
+        NumberValue::Double(n) if n.is_finite() && n.fract() == 0.0 => {
+            Some((n as i64).clamp(0, 255) as u8)
+        }
         _ => None,
     }
 }
@@ -863,22 +1261,6 @@ fn number_to_i64(value: &Value) -> Option<i64> {
         NumberValue::Smi(n) => Some(i64::from(n)),
         NumberValue::Double(n) if n.is_finite() => Some(n as i64),
         _ => None,
-    }
-}
-
-fn invalid_arg_type_suffix(value: &Value, heap: &otter_gc::GcHeap) -> String {
-    if value.is_undefined() {
-        " Received undefined".to_string()
-    } else if value.is_null() {
-        " Received null".to_string()
-    } else if value.is_string() {
-        format!(" Received type string ('{}')", value.display_string(heap))
-    } else if value.is_boolean() {
-        format!(" Received type boolean ({})", value.display_string(heap))
-    } else if value.is_number() {
-        format!(" Received type number ({})", value.display_string(heap))
-    } else {
-        format!(" Received {}", value.display_string(heap))
     }
 }
 
@@ -910,8 +1292,12 @@ struct RuntimeProcessSnapshot {
 
 fn runtime_process_snapshot() -> RuntimeProcessSnapshot {
     let fallback_pid = std::process::id();
+    // Node's `process.execPath` is the fully resolved binary path
+    // (`fs.realpathSync(process.execPath)` is an identity); a relative or
+    // symlinked spawn path must not leak through.
     let fallback_exec_path = std::env::current_exe()
         .ok()
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "otter".to_string());
     let Ok(pid) = sysinfo::get_current_pid() else {
@@ -941,6 +1327,7 @@ fn runtime_process_snapshot() -> RuntimeProcessSnapshot {
         ppid: process.parent().map(|pid| pid.as_u32()),
         exec_path: process
             .exe()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or(fallback_exec_path),
         run_time_secs: Some(process.run_time()),
@@ -1285,7 +1672,7 @@ codes.join(',')
             .unwrap();
         assert_eq!(
             result.completion_string(),
-            "cached_builtins,debug,inspector,ipv6,openssl_is_boringssl,quic,require_module,tls,tls_alpn,tls_ocsp,tls_sni,typescript,uv"
+            "cached_builtins,debug,dtls,inspector,ipv6,openssl_is_boringssl,quic,require_module,tls,tls_alpn,tls_ocsp,tls_sni,typescript,uv"
         );
     }
 

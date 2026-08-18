@@ -33,7 +33,19 @@ pub fn async_hooks_cjs_value<'scope>(
     // property is not part of the module's public shape.
     let native = build_native(scope)?;
     let globals = scope.global_this();
-    scope.set(globals, "__otterAsyncContextNative", native)?;
+    // Non-enumerable: the Node test harness flags any enumerable global it
+    // does not recognize as a leak.
+    scope.define(
+        globals,
+        "__otterAsyncContextNative",
+        native,
+        otter_vm::Attr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+        .to_flags(),
+    )?;
 
     otter_runtime::run_builtin_cjs_shim(
         scope,

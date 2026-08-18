@@ -640,6 +640,10 @@ pub struct ExecutionResult {
     completion: String,
     /// Process-style exit status requested by JS-visible runtime APIs.
     exit_code: u8,
+    /// True when the run ended through an explicit `process.exit` /
+    /// `reallyExit` unwind rather than by draining to idle. `beforeExit`
+    /// must not fire for such runs.
+    explicit_exit: bool,
     /// Wall-clock duration.
     pub duration: Duration,
     /// Diagnostic counter snapshot sampled after the run completed.
@@ -661,6 +665,7 @@ impl ExecutionResult {
         Self {
             completion: completion.display_string(heap),
             exit_code: 0,
+            explicit_exit: false,
             duration,
             stats: Box::default(),
             jit_debug_report: None,
@@ -674,6 +679,7 @@ impl ExecutionResult {
         Self {
             completion: "undefined".to_string(),
             exit_code: code,
+            explicit_exit: true,
             duration,
             stats: Box::default(),
             jit_debug_report: None,
@@ -706,9 +712,15 @@ impl ExecutionResult {
     }
 
     #[must_use]
-    fn with_exit_code(mut self, code: u8) -> Self {
+    pub(crate) fn with_exit_code(mut self, code: u8) -> Self {
         self.exit_code = code;
         self
+    }
+
+    /// See the `explicit_exit` field.
+    #[must_use]
+    pub(crate) fn explicit_exit(&self) -> bool {
+        self.explicit_exit
     }
 
     /// Render the completion value for CLI preview output.

@@ -50,8 +50,12 @@ enum EntryKind {
         shutdown: Arc<tokio::sync::Notify>,
     },
     Connection {
-        outgoing: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+        outgoing: Option<tokio::sync::mpsc::UnboundedSender<WriteMsg>>,
         socket: NetSocket,
+        /// Wakes the read loop when the entry is closed or reset, so the
+        /// task drops its stream clone and the kernel closes the socket
+        /// immediately instead of at the peer's next transition.
+        abort: Arc<tokio::sync::Notify>,
     },
 }
 
@@ -116,6 +120,31 @@ impl NetSocket {
         }
     }
 
+    /// Arm an immediate RST on close (SO_LINGER 0). Unix sockets have no
+    /// reset semantics; closing them is already abrupt. A zero linger never
+    /// blocks the closing thread — the kernel discards the send queue and
+    /// resets at once.
+    fn arm_reset(&self) {
+        if let Self::Tcp(_) = self {
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: the fd is owned by the live stream for the duration of
+            // this call, and `linger` is a valid, initialized option payload
+            // of the size passed.
+            unsafe {
+                libc::setsockopt(
+                    self.raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    std::ptr::from_ref(&linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+
     fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         match self {
@@ -123,6 +152,15 @@ impl NetSocket {
             Self::Unix(stream) => stream.as_raw_fd(),
         }
     }
+}
+
+/// One queued item for a connection's writer task.
+enum WriteMsg {
+    /// Bytes to send; a non-zero token requests a completion event.
+    Data(Vec<u8>, u32),
+    /// Flush everything queued before this marker, then close the write
+    /// half and report completion for the token.
+    End(u32),
 }
 
 type Table = Arc<Mutex<HashMap<u32, Entry>>>;
@@ -243,6 +281,7 @@ fn build_native<'scope>(
         &[],
         move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
             let id = handle_arg(args, 0);
+            let token = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             // A typed-array payload crosses as raw bytes; only string
             // payloads take the latin1 detour.
             if let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap())) {
@@ -250,7 +289,7 @@ fn build_native<'scope>(
                 let offset = view.byte_offset(heap);
                 let len = view.byte_length(heap);
                 let sent = view.buffer(heap).with_bytes(heap, |bytes| {
-                    write_bytes(&write_table, id, &bytes[offset..offset + len])
+                    write_bytes(&write_table, id, &bytes[offset..offset + len], token)
                 });
                 return Ok(RuntimeValue::boolean(sent));
             }
@@ -259,6 +298,7 @@ fn build_native<'scope>(
                 &write_table,
                 id,
                 &latin1_to_bytes(&payload),
+                token,
             )))
         },
     )?;
@@ -285,13 +325,15 @@ fn build_native<'scope>(
         &[],
         move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
             let id = handle_arg(args, 0);
+            let token = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             let mut table = end_table
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = table.get_mut(&id)
                 && let EntryKind::Connection { outgoing, .. } = &mut entry.kind
+                && let Some(sender) = outgoing.take()
             {
-                outgoing.take();
+                let _ = sender.send(WriteMsg::End(token));
             }
             Ok(RuntimeValue::undefined())
         },
@@ -369,6 +411,31 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "hold", hold)?;
+
+    let reset_table = table.clone();
+    let reset = scope.native_closure(
+        "reset",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let id = handle_arg(args, 0);
+            {
+                let table = reset_table
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(Entry {
+                    kind: EntryKind::Connection { socket, .. },
+                    ..
+                }) = table.get(&id)
+                {
+                    socket.arm_reset();
+                }
+            }
+            close_entry(&reset_table, id);
+            Ok(RuntimeValue::undefined())
+        },
+    )?;
+    scope.set(object, "reset", reset)?;
     Ok(object)
 }
 
@@ -532,8 +599,9 @@ fn adopt(
 ) -> u32 {
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let local = stream.local_addr();
-    let (outgoing, mut queued) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (outgoing, mut queued) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let abort = Arc::new(tokio::sync::Notify::new());
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -543,6 +611,7 @@ fn adopt(
                 kind: EntryKind::Connection {
                     outgoing: Some(outgoing),
                     socket: stream.clone(),
+                    abort: abort.clone(),
                 },
                 keep_alive: Some(keep_alive),
                 local,
@@ -551,14 +620,50 @@ fn adopt(
         );
 
     let writer_stream = stream.clone();
+    let writer_spawner = spawner.clone();
     tokio::spawn(async move {
-        while let Some(bytes) = queued.recv().await {
-            if write_all(&writer_stream, &bytes).await.is_err() {
-                return;
+        while let Some(message) = queued.recv().await {
+            match message {
+                WriteMsg::Data(bytes, token) => {
+                    if let Err(error) = write_all(&writer_stream, &bytes).await {
+                        let _ = writer_spawner.enqueue(
+                            NetEvent::WriteDone {
+                                connection: id,
+                                token,
+                                code: Some(io_code(&error)),
+                            },
+                            RuntimeLiveness::Ref,
+                        );
+                        return;
+                    }
+                    if token != 0 {
+                        let _ = writer_spawner.enqueue(
+                            NetEvent::WriteDone {
+                                connection: id,
+                                token,
+                                code: None,
+                            },
+                            RuntimeLiveness::Ref,
+                        );
+                    }
+                }
+                WriteMsg::End(token) => {
+                    // Everything queued ahead of the marker has been written;
+                    // close the write half and report the shutdown.
+                    shutdown_write(&writer_stream);
+                    let _ = writer_spawner.enqueue(
+                        NetEvent::ShutdownDone {
+                            connection: id,
+                            token,
+                        },
+                        RuntimeLiveness::Ref,
+                    );
+                    return;
+                }
             }
         }
-        // Nothing further will be written, which is what the peer reads as the
-        // end of this direction.
+        // The sender dropped without an End marker (hard close); the write
+        // half closes so the peer reads EOF.
         shutdown_write(&writer_stream);
     });
 
@@ -566,8 +671,18 @@ fn adopt(
     let reader_table = table.clone();
     tokio::spawn(async move {
         let mut chunk = vec![0u8; 65_536];
+        let mut read_error: Option<&'static str> = None;
         loop {
-            if stream.readable().await.is_err() {
+            let ready = tokio::select! {
+                ready = stream.readable() => ready,
+                () = abort.notified() => {
+                    // Closed or reset from the isolate side: drop the stream
+                    // clone without reporting anything — the JS handle is
+                    // already gone.
+                    return;
+                }
+            };
+            if ready.is_err() {
                 break;
             }
             match stream.try_read(&mut chunk) {
@@ -587,16 +702,26 @@ fn adopt(
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => break,
+                Err(error) => {
+                    read_error = Some(io_code(&error));
+                    break;
+                }
             }
         }
-        // The peer has nothing further to send. The connection stays open for
-        // this side to finish writing, so only its hold on the loop is
-        // released here. The EOF notification itself rides a Ref-class task:
-        // the hold is already gone, and an Unref event would be dropped if
-        // nothing else kept the loop alive.
+        // The peer has nothing further to send (or the read failed). The
+        // connection stays open for this side to finish writing, so only its
+        // hold on the loop is released here. The final notification rides a
+        // Ref-class task: the hold is already gone, and an Unref event would
+        // be dropped if nothing else kept the loop alive.
         release(&reader_table, id);
-        let _ = reader_spawner.enqueue(NetEvent::Ended { connection: id }, RuntimeLiveness::Ref);
+        let event = match read_error {
+            Some(code) => NetEvent::ReadFailed {
+                connection: id,
+                code,
+            },
+            None => NetEvent::Ended { connection: id },
+        };
+        let _ = reader_spawner.enqueue(event, RuntimeLiveness::Ref);
     });
     id
 }
@@ -866,6 +991,19 @@ enum NetEvent {
     Ended {
         connection: u32,
     },
+    ReadFailed {
+        connection: u32,
+        code: &'static str,
+    },
+    WriteDone {
+        connection: u32,
+        token: u32,
+        code: Option<&'static str>,
+    },
+    ShutdownDone {
+        connection: u32,
+        token: u32,
+    },
 }
 
 impl RuntimeTask for NetEvent {
@@ -942,6 +1080,34 @@ fn deliver(
                     let second = scope.undefined();
                     (name, connection, undefined, second)
                 }
+                NetEvent::WriteDone {
+                    connection,
+                    token,
+                    code,
+                } => {
+                    let name = scope.string("writeDone")?;
+                    let connection = scope.number(f64::from(*connection));
+                    let token = scope.number(f64::from(*token));
+                    let code = match code {
+                        Some(code) => scope.string(code)?,
+                        None => scope.undefined(),
+                    };
+                    (name, connection, token, code)
+                }
+                NetEvent::ShutdownDone { connection, token } => {
+                    let name = scope.string("shutdownDone")?;
+                    let connection = scope.number(f64::from(*connection));
+                    let token = scope.number(f64::from(*token));
+                    let undefined = scope.undefined();
+                    (name, connection, token, undefined)
+                }
+                NetEvent::ReadFailed { connection, code } => {
+                    let name = scope.string("readError")?;
+                    let connection = scope.number(f64::from(*connection));
+                    let code = scope.string(code)?;
+                    let undefined = scope.undefined();
+                    (name, connection, code, undefined)
+                }
             };
             let undefined = scope.undefined();
             let result = scope.call(dispatch, undefined, &[name, first, second, third])?;
@@ -962,7 +1128,7 @@ fn io_spawner(
     })
 }
 
-fn write_bytes(table: &Table, id: u32, bytes: &[u8]) -> bool {
+fn write_bytes(table: &Table, id: u32, bytes: &[u8], token: u32) -> bool {
     let table = table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -970,7 +1136,7 @@ fn write_bytes(table: &Table, id: u32, bytes: &[u8]) -> bool {
         Some(EntryKind::Connection {
             outgoing: Some(outgoing),
             ..
-        }) => outgoing.send(bytes.to_vec()).is_ok(),
+        }) => outgoing.send(WriteMsg::Data(bytes.to_vec(), token)).is_ok(),
         _ => false,
     }
 }
@@ -982,12 +1148,16 @@ fn close_entry(table: &Table, id: u32) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&id);
-    if let Some(Entry {
-        kind: EntryKind::Listener { ref shutdown },
-        ..
-    }) = removed
-    {
-        shutdown.notify_one();
+    match removed {
+        Some(Entry {
+            kind: EntryKind::Listener { ref shutdown },
+            ..
+        }) => shutdown.notify_one(),
+        Some(Entry {
+            kind: EntryKind::Connection { ref abort, .. },
+            ..
+        }) => abort.notify_one(),
+        None => {}
     }
 }
 

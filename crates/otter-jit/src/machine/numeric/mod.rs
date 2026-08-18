@@ -40,12 +40,13 @@
 //!   metadata and shape misses deopt at the original operation before effects.
 //!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
 //!   post-commit conditional generational barrier and its call clobbers.
-//! - Captured-binding reads walk the current frame's validated cell spine
-//!   without a runtime call and deopt at the original operation for TDZ or an
-//!   invalid layout.
-//! - Prepared global lexical and object reads carry their complete immutable
-//!   guard metadata into Machine IR. Their generated hits are non-allocating,
-//!   safepoint-free tagged loads with exact pre-operation deopt state.
+//! - Every schema-owned binding read, write, and delete expands before
+//!   allocation into explicit guard/hit/cold/status/join control. Stable
+//!   captured cells and prepared global lexical/object slots read or write on
+//!   the generated sibling; writes perform the generated barrier. A missing
+//!   layout proof, TDZ, const violation, accessor/Proxy path, or unresolved name
+//!   enters one rooted committed cold call and never deoptimizes or replays.
+//!   Dynamic and eval-shadowed bindings deliberately keep only that cold path.
 //! - Eagerly prepared string literals lower to one symbolic stable-cell
 //!   relocation and tagged load. No moving string handle, safepoint, deopt
 //!   state, or runtime-fill boundary survives selection.
@@ -91,18 +92,22 @@ use otter_vm::{
 use std::collections::{BTreeMap, BTreeSet};
 
 use self::hir::{
-    NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
+    NumericBindingTarget, NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
     NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFrameStatePurpose,
     NumericFunction, NumericNode, NumericPackedDoubleViewCachePlan, NumericTerminator, NumericType,
 };
 use self::semantics::CommittedValueOperation;
+#[cfg(test)]
+use super::is_explicit_binding_runtime_call;
 use super::{
     CallDescriptor, CallEffects, CallTarget, ColdCallKind, ControlFlow, DeoptId,
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
-    InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineInstructionId,
-    MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType, MachineRepresentation,
-    MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS, PackedDoubleViewCacheClearReason,
-    PhysicalRegister, SafepointKind, TargetRegisterFile, lower_deopt_table, lower_safepoints,
+    InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineInstruction,
+    MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType,
+    MachineRepresentation, MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
+    PackedDoubleViewCacheClearReason, PhysicalRegister, SafepointId, SafepointKind,
+    TargetRegisterFile, binding_guard_clobbers, binding_hit_clobbers,
+    binding_write_barrier_clobbers, lower_deopt_table, lower_safepoints,
 };
 use crate::{
     Unsupported,
@@ -120,6 +125,16 @@ use crate::{
 pub(super) struct MethodValuePacketFrame {
     pub(super) raw_start: u16,
     pub(super) raw_words: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BindingSelectedValues {
+    condition: MachineValue,
+    owner: MachineValue,
+    storage: MachineValue,
+    hit_value: Option<MachineValue>,
+    cold_payload: MachineValue,
+    status: MachineValue,
 }
 
 pub(super) fn method_value_packet_frame(
@@ -211,8 +226,13 @@ pub(crate) fn try_compile(
         &machine_frame_states(&hir),
     )
     .map_err(|_| Unsupported::OperandShape("scalar Machine IR deopt lowering"))?;
-    let mut exits = Vec::with_capacity(hir.frame_states.len());
-    for (index, state) in hir.frame_states.iter().enumerate() {
+    let mut exits = Vec::new();
+    for (index, state) in hir
+        .frame_states
+        .iter()
+        .filter(|state| frame_state_requires_deopt(&hir, state))
+        .enumerate()
+    {
         let logical_pc = view
             .instructions
             .iter()
@@ -398,87 +418,191 @@ fn select_with_packed_double_view_caches(
     }
 
     let selection_cfg = SelectionCfg::build(hir, packed_double_view_caches);
+    let mut binding_values = BTreeMap::new();
+    for (&block, selected) in &selection_cfg.bindings {
+        let (node, target, _) = binding_site(hir, block)
+            .ok_or(super::VerificationError::InvalidBlock(selected.join))?;
+        let NumericNode::Binding { semantics, .. } = hir.nodes[node.0] else {
+            unreachable!("binding site owns a binding node")
+        };
+        binding_values.insert(
+            block,
+            BindingSelectedValues {
+                condition: push_value(&mut representations, MachineRepresentation::Boolean),
+                owner: push_value(&mut representations, MachineRepresentation::Int64),
+                storage: push_value(&mut representations, MachineRepresentation::Int64),
+                hit_value: (target.is_some() && semantics.result_operand().is_some())
+                    .then(|| push_value(&mut representations, MachineRepresentation::Tagged)),
+                cold_payload: push_value(&mut representations, MachineRepresentation::Tagged),
+                status: push_value(&mut representations, MachineRepresentation::NativeStatus),
+            },
+        );
+    }
+    let mut binding_inputs = BTreeMap::<usize, [Option<MachineValue>; 2]>::new();
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
     let mut call_descriptors = Vec::<CallDescriptor>::new();
     let mut next_safepoint = 0_u32;
     let mut blocks = Vec::with_capacity(selection_cfg.order.len());
-    let frame_state_ids = hir
+    let frame_state_indices = hir
         .frame_states
         .iter()
+        .enumerate()
+        .map(|(index, state)| (state.point, index))
+        .collect::<BTreeMap<_, _>>();
+    let deopt_state_ids = hir
+        .frame_states
+        .iter()
+        .filter(|state| frame_state_requires_deopt(hir, state))
         .enumerate()
         .map(|(index, state)| (state.point, DeoptId(index as u32)))
         .collect::<BTreeMap<_, _>>();
     for selected in &selection_cfg.order {
         let first = MachineInstructionId(instructions.len() as u32);
-        let SelectedBlock::Original(block_index) = *selected else {
-            let SelectedBlock::SplitEdge {
+        let block_index = match *selected {
+            SelectedBlock::Original(block_index) => block_index,
+            SelectedBlock::BindingHit(block_index) => {
+                blocks.push(select_binding_hit_block(
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    binding_values[&block_index],
+                    binding_inputs[&block_index],
+                    &mut instructions,
+                )?);
+                continue;
+            }
+            SelectedBlock::BindingCold(block_index) => {
+                blocks.push(select_binding_cold_block(
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    binding_values[&block_index],
+                    binding_inputs[&block_index],
+                    &values,
+                    &representations,
+                    &frame_state_indices,
+                    &mut call_descriptors,
+                    &mut next_safepoint,
+                    &mut instructions,
+                )?);
+                continue;
+            }
+            SelectedBlock::BindingSuccess(block_index) => {
+                blocks.push(select_binding_success_block(
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    binding_values[&block_index],
+                    &mut instructions,
+                )?);
+                continue;
+            }
+            SelectedBlock::BindingThrow(block_index) => {
+                blocks.push(select_binding_throw_block(
+                    &selection_cfg,
+                    block_index,
+                    binding_values[&block_index],
+                    &mut instructions,
+                ));
+                continue;
+            }
+            SelectedBlock::BindingFatal(block_index) => {
+                blocks.push(select_binding_fatal_block(
+                    &selection_cfg,
+                    block_index,
+                    &mut instructions,
+                ));
+                continue;
+            }
+            SelectedBlock::BindingJoin(block_index) => {
+                blocks.push(select_binding_join_block(
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    &values,
+                    &mut instructions,
+                )?);
+                continue;
+            }
+            SelectedBlock::SplitEdge {
                 predecessor,
                 edge,
                 successor,
-            } = *selected
-            else {
-                unreachable!("selected block is original or split edge")
-            };
-            if is_exceptional_hir_edge(hir, predecessor, edge) {
-                let descriptor_index = intern_call_descriptor(
-                    &mut call_descriptors,
-                    caught_throw_acknowledgement_descriptor(),
-                );
-                let mut acknowledgement = MachineInstruction::plain(
-                    MachineOpcode::Call(descriptor_index as u32),
-                    Vec::new(),
-                );
-                acknowledgement.clobbers = call_descriptors[descriptor_index].clobbers.clone();
-                instructions.push(acknowledgement);
+            } => {
+                if is_exceptional_hir_edge(hir, predecessor, edge) {
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        caught_throw_acknowledgement_descriptor(),
+                    );
+                    let mut acknowledgement = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        Vec::new(),
+                    );
+                    acknowledgement.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    instructions.push(acknowledgement);
+                }
+                if successor <= predecessor {
+                    let point = NumericFramePoint::Backedge { predecessor, edge };
+                    let state_index = frame_state_indices[&point];
+                    let deopt = deopt_state_ids[&point];
+                    let mut poll =
+                        MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
+                    attach_frame_state(hir, &values, state_index, deopt, &mut poll);
+                    poll.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                    instructions.push(poll);
+                }
+                if packed_double_view_caches
+                    .caches
+                    .iter()
+                    .any(|cache| cache.entry_edges.contains(&(predecessor, edge)))
+                {
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::ClearPackedDoubleViewCaches(
+                            PackedDoubleViewCacheClearReason::LoopEntry,
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                let binding_exception = binding_site(hir, predecessor)
+                    .filter(|(_, _, exceptional)| *exceptional == Some(edge));
+                let successor_arguments = hir.blocks[predecessor].successor_arguments[edge]
+                    .iter()
+                    .zip(&hir.blocks[successor].parameters)
+                    .map(|(&argument, &parameter)| {
+                        if let Some((binding, _, _)) = binding_exception
+                            && argument == binding
+                        {
+                            return Ok(binding_values[&predecessor].cold_payload);
+                        }
+                        select_edge_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            argument,
+                            parameter,
+                            selection_cfg.originals[successor],
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+                jump.control = ControlFlow::Branch;
+                instructions.push(jump);
+                let end = MachineInstructionId(instructions.len() as u32);
+                blocks.push(MachineBlockData {
+                    first,
+                    end,
+                    predecessors: vec![if binding_exception.is_some() {
+                        selection_cfg.bindings[&predecessor].cold
+                    } else {
+                        selection_cfg.normal_exit(predecessor)
+                    }],
+                    successors: vec![selection_cfg.originals[successor]],
+                    parameters: Vec::new(),
+                    successor_arguments: vec![successor_arguments],
+                });
+                continue;
             }
-            if successor <= predecessor {
-                let point = NumericFramePoint::Backedge { predecessor, edge };
-                let deopt = frame_state_ids[&point];
-                let mut poll = MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
-                attach_frame_state(hir, &values, deopt, &mut poll);
-                poll.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
-                instructions.push(poll);
-            }
-            if packed_double_view_caches
-                .caches
-                .iter()
-                .any(|cache| cache.entry_edges.contains(&(predecessor, edge)))
-            {
-                instructions.push(MachineInstruction::plain(
-                    MachineOpcode::ClearPackedDoubleViewCaches(
-                        PackedDoubleViewCacheClearReason::LoopEntry,
-                    ),
-                    Vec::new(),
-                ));
-            }
-            let successor_arguments = hir.blocks[predecessor].successor_arguments[edge]
-                .iter()
-                .zip(&hir.blocks[successor].parameters)
-                .map(|(&argument, &parameter)| {
-                    select_edge_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        argument,
-                        parameter,
-                        selection_cfg.originals[successor],
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
-            jump.control = ControlFlow::Branch;
-            instructions.push(jump);
-            let end = MachineInstructionId(instructions.len() as u32);
-            blocks.push(MachineBlockData {
-                first,
-                end,
-                predecessors: vec![selection_cfg.originals[predecessor]],
-                successors: vec![selection_cfg.originals[successor]],
-                parameters: Vec::new(),
-                successor_arguments: vec![successor_arguments],
-            });
-            continue;
         };
         let block = &hir.blocks[block_index];
         if block_index == 0 {
@@ -528,9 +652,106 @@ fn select_with_packed_double_view_caches(
                     .collect(),
             ));
         }
+        let mut selected_binding_guard = false;
         for &node_value in &block.nodes {
             let result = values[node_value.0];
             let node = hir.nodes[node_value.0];
+            if let NumericNode::Binding {
+                semantics,
+                inputs,
+                target,
+                byte_pc,
+                ..
+            } = node
+            {
+                if block.nodes.last().copied() != Some(node_value) {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(
+                        MachineInstructionId(instructions.len() as u32),
+                    ));
+                }
+                let mut selected_inputs = [None, None];
+                for (selected, input) in selected_inputs.iter_mut().zip(inputs) {
+                    *selected = input.map(|input| {
+                        tagged_call_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            input,
+                        )
+                    });
+                }
+                binding_inputs.insert(block_index, selected_inputs);
+                let selected_values = binding_values[&block_index];
+                let target = target
+                    .map(machine_binding_target)
+                    .unwrap_or(MachineBindingTarget::Cold);
+                let mut operands = vec![
+                    MachineOperand::register_output(selected_values.condition),
+                    MachineOperand::register_output(selected_values.owner),
+                    MachineOperand::register_output(selected_values.storage),
+                ];
+                operands.extend(
+                    selected_inputs
+                        .into_iter()
+                        .flatten()
+                        .map(MachineOperand::location_input),
+                );
+                let mut guard = MachineInstruction::plain(
+                    MachineOpcode::BindingGuard {
+                        byte_pc,
+                        semantics,
+                        target,
+                    },
+                    operands,
+                );
+                guard.clobbers = binding_guard_clobbers();
+                instructions.push(guard);
+                let selected_blocks = selection_cfg.bindings[&block_index];
+                let (terminator, successors) = if let Some(hit) = selected_blocks.hit {
+                    (
+                        MachineInstruction::plain(
+                            MachineOpcode::BranchIf(true),
+                            vec![MachineOperand::register_input(selected_values.condition)],
+                        ),
+                        vec![hit, selected_blocks.cold],
+                    )
+                } else {
+                    (
+                        MachineInstruction::plain(MachineOpcode::Jump, Vec::new()),
+                        vec![selected_blocks.cold],
+                    )
+                };
+                let mut terminator = terminator;
+                terminator.control = ControlFlow::Branch;
+                instructions.push(terminator);
+                let end = MachineInstructionId(instructions.len() as u32);
+                let mut predecessors = incoming_edges(hir, block_index)
+                    .into_iter()
+                    .map(|(predecessor, edge)| {
+                        selection_cfg
+                            .split_edges
+                            .get(&(predecessor, edge))
+                            .copied()
+                            .unwrap_or_else(|| selection_cfg.normal_exit(predecessor))
+                    })
+                    .collect::<Vec<_>>();
+                predecessors.sort_unstable();
+                blocks.push(MachineBlockData {
+                    first,
+                    end,
+                    predecessors,
+                    successor_arguments: vec![Vec::new(); successors.len()],
+                    successors,
+                    parameters: block
+                        .parameters
+                        .iter()
+                        .map(|&value| machine_value(&values, value))
+                        .collect(),
+                });
+                selected_binding_guard = true;
+                break;
+            }
             if let NumericNode::FloatToInt32(source) = node {
                 let mut call = MachineInstruction::plain(
                     MachineOpcode::Float64ToInt32,
@@ -646,14 +867,6 @@ fn select_with_packed_double_view_caches(
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call
                 }
-                NumericNode::Upvalue { index, byte_pc } => {
-                    let mut load = MachineInstruction::plain(
-                        MachineOpcode::LoadUpvalue { index, byte_pc },
-                        vec![MachineOperand::register_output(result)],
-                    );
-                    load.clobbers = upvalue_load_clobbers();
-                    load
-                }
                 NumericNode::StringConstantCell { byte_pc, target } => {
                     let mut load = MachineInstruction::plain(
                         MachineOpcode::StringConstantCellLoad { byte_pc, target },
@@ -662,21 +875,8 @@ fn select_with_packed_double_view_caches(
                     load.clobbers = string_constant_cell_load_clobbers();
                     load
                 }
-                NumericNode::GlobalLexicalLoad { byte_pc, target } => {
-                    let mut load = MachineInstruction::plain(
-                        MachineOpcode::GlobalLexicalLoad { byte_pc, target },
-                        vec![MachineOperand::register_output(result)],
-                    );
-                    load.clobbers = global_lexical_load_clobbers();
-                    load
-                }
-                NumericNode::GlobalObjectLoad { byte_pc, target } => {
-                    let mut load = MachineInstruction::plain(
-                        MachineOpcode::GlobalObjectLoad { byte_pc, target },
-                        vec![MachineOperand::register_output(result)],
-                    );
-                    load.clobbers = global_object_load_clobbers();
-                    load
+                NumericNode::Binding { .. } => {
+                    unreachable!("binding nodes select their explicit CFG before ordinary nodes")
                 }
                 NumericNode::CommittedValue {
                     operation,
@@ -1692,15 +1892,27 @@ fn select_with_packed_double_view_caches(
                     unreachable!("numeric leaf calls are selected before ordinary nodes")
                 }
             };
-            if let Some(&deopt) = frame_state_ids.get(&NumericFramePoint::Node(node_value)) {
+            let frame_point = NumericFramePoint::Node(node_value);
+            if let Some(&state_index) = frame_state_indices.get(&frame_point) {
                 match node.frame_state_purpose() {
                     Some(NumericFrameStatePurpose::TaggedRoots) => {
-                        attach_frame_state_tagged_roots(hir, &values, deopt, &mut instruction);
+                        attach_frame_state_tagged_roots(
+                            hir,
+                            &values,
+                            state_index,
+                            &mut instruction,
+                        );
                     }
                     Some(
                         NumericFrameStatePurpose::ExactDeopt
                         | NumericFrameStatePurpose::RuntimeMetadata,
-                    ) => attach_frame_state(hir, &values, deopt, &mut instruction),
+                    ) => attach_frame_state(
+                        hir,
+                        &values,
+                        state_index,
+                        deopt_state_ids[&frame_point],
+                        &mut instruction,
+                    ),
                     None => {
                         return Err(super::VerificationError::OpcodeSignatureMismatch(
                             MachineInstructionId(instructions.len() as u32),
@@ -1710,6 +1922,10 @@ fn select_with_packed_double_view_caches(
             }
             attach_safepoint_roots(&representations, &mut instruction);
             instructions.push(instruction);
+        }
+
+        if selected_binding_guard {
+            continue;
         }
 
         let mut terminator = match block.terminator {
@@ -1801,6 +2017,329 @@ fn select_with_packed_double_view_caches(
     )
 }
 
+fn machine_binding_target(target: NumericBindingTarget) -> MachineBindingTarget {
+    match target {
+        NumericBindingTarget::GlobalThis => MachineBindingTarget::GlobalThis,
+        NumericBindingTarget::Upvalue { index } => MachineBindingTarget::Upvalue { index },
+        NumericBindingTarget::Global(proof) => MachineBindingTarget::Global(proof),
+    }
+}
+
+fn select_binding_hit_block(
+    hir: &NumericFunction,
+    cfg: &SelectionCfg,
+    block_index: usize,
+    values: BindingSelectedValues,
+    inputs: [Option<MachineValue>; 2],
+    instructions: &mut Vec<MachineInstruction>,
+) -> Result<MachineBlockData, super::VerificationError> {
+    let first = MachineInstructionId(instructions.len() as u32);
+    let (node_value, target, _) = binding_site(hir, block_index).ok_or(
+        super::VerificationError::InvalidBlock(cfg.originals[block_index]),
+    )?;
+    let NumericNode::Binding {
+        semantics, byte_pc, ..
+    } = hir.nodes[node_value.0]
+    else {
+        unreachable!("binding site owns a binding node")
+    };
+    let target = target
+        .map(machine_binding_target)
+        .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?;
+    let mut operands = vec![
+        MachineOperand::location_input(values.owner),
+        MachineOperand::location_input(values.storage),
+    ];
+    if matches!(
+        semantics,
+        otter_bytecode::opcode_schema::BindingSemantics::Write(_)
+    ) {
+        operands.push(MachineOperand::location_input(
+            inputs[0].ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?,
+        ));
+    }
+    if semantics.result_operand().is_some() {
+        operands.push(MachineOperand::register_output(
+            values
+                .hit_value
+                .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?,
+        ));
+    }
+    let mut hit = MachineInstruction::plain(
+        MachineOpcode::BindingHit {
+            byte_pc,
+            semantics,
+            target,
+        },
+        operands,
+    );
+    hit.clobbers = binding_hit_clobbers();
+    instructions.push(hit);
+    if matches!(
+        semantics,
+        otter_bytecode::opcode_schema::BindingSemantics::Write(_)
+    ) {
+        let mut barrier = MachineInstruction::plain(
+            MachineOpcode::BindingWriteBarrier,
+            vec![
+                MachineOperand::location_input(values.owner),
+                MachineOperand::location_input(
+                    inputs[0].ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?,
+                ),
+            ],
+        );
+        barrier.clobbers = binding_write_barrier_clobbers();
+        instructions.push(barrier);
+    }
+    let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+    jump.control = ControlFlow::Branch;
+    instructions.push(jump);
+    let end = MachineInstructionId(instructions.len() as u32);
+    let selected = cfg.bindings[&block_index];
+    Ok(MachineBlockData {
+        first,
+        end,
+        predecessors: vec![cfg.originals[block_index]],
+        successors: vec![selected.join],
+        parameters: Vec::new(),
+        successor_arguments: vec![values.hit_value.into_iter().collect()],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_binding_cold_block(
+    hir: &NumericFunction,
+    cfg: &SelectionCfg,
+    block_index: usize,
+    values: BindingSelectedValues,
+    inputs: [Option<MachineValue>; 2],
+    machine_values: &[MachineValue],
+    representations: &[MachineRepresentation],
+    frame_state_indices: &BTreeMap<NumericFramePoint, usize>,
+    call_descriptors: &mut Vec<CallDescriptor>,
+    next_safepoint: &mut u32,
+    instructions: &mut Vec<MachineInstruction>,
+) -> Result<MachineBlockData, super::VerificationError> {
+    let first = MachineInstructionId(instructions.len() as u32);
+    let (node_value, _, exceptional_edge) = binding_site(hir, block_index).ok_or(
+        super::VerificationError::InvalidBlock(cfg.originals[block_index]),
+    )?;
+    let NumericNode::Binding {
+        logical_pc,
+        byte_pc,
+        ..
+    } = hir.nodes[node_value.0]
+    else {
+        unreachable!("binding site owns a binding node")
+    };
+    let inputs = inputs.into_iter().flatten().collect::<Vec<_>>();
+    let semantic_arity = u8::try_from(inputs.len())
+        .map_err(|_| super::VerificationError::OpcodeSignatureMismatch(first))?;
+    let descriptor = binding_value_descriptor(logical_pc, byte_pc, semantic_arity);
+    let descriptor_index = intern_call_descriptor(call_descriptors, descriptor);
+    let mut operands = inputs
+        .iter()
+        .copied()
+        .map(MachineOperand::location_input)
+        .collect::<Vec<_>>();
+    operands.push(MachineOperand::register_output(values.cold_payload));
+    operands.push(MachineOperand::register_output(values.status));
+    append_unique_tagged_roots(&mut operands, inputs);
+    let mut call =
+        MachineInstruction::plain(MachineOpcode::Call(descriptor_index as u32), operands);
+    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+    call.safepoint = Some(SafepointId(*next_safepoint));
+    *next_safepoint = next_safepoint
+        .checked_add(1)
+        .expect("bounded scalar function safepoint count");
+    let state_index = frame_state_indices[&NumericFramePoint::Node(node_value)];
+    attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
+    attach_safepoint_roots(representations, &mut call);
+    instructions.push(call);
+    let mut branch = MachineInstruction::plain(
+        MachineOpcode::BranchNativeStatus,
+        vec![MachineOperand::register_input(values.status)],
+    );
+    branch.clobbers = vec![PhysicalRegister::integer(16)];
+    branch.control = ControlFlow::Branch;
+    instructions.push(branch);
+    let end = MachineInstructionId(instructions.len() as u32);
+    let selected = cfg.bindings[&block_index];
+    let throw = exceptional_edge.map_or_else(
+        || {
+            selected
+                .throw
+                .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))
+        },
+        |edge| {
+            cfg.split_edges
+                .get(&(block_index, edge))
+                .copied()
+                .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))
+        },
+    )?;
+    Ok(MachineBlockData {
+        first,
+        end,
+        predecessors: vec![cfg.originals[block_index]],
+        successors: vec![selected.success, throw, selected.fatal],
+        parameters: Vec::new(),
+        successor_arguments: vec![Vec::new(), Vec::new(), Vec::new()],
+    })
+}
+
+fn select_binding_success_block(
+    hir: &NumericFunction,
+    cfg: &SelectionCfg,
+    block_index: usize,
+    values: BindingSelectedValues,
+    instructions: &mut Vec<MachineInstruction>,
+) -> Result<MachineBlockData, super::VerificationError> {
+    let first = MachineInstructionId(instructions.len() as u32);
+    let (node_value, _, _) = binding_site(hir, block_index).ok_or(
+        super::VerificationError::InvalidBlock(cfg.originals[block_index]),
+    )?;
+    let NumericNode::Binding { semantics, .. } = hir.nodes[node_value.0] else {
+        unreachable!("binding site owns a binding node")
+    };
+    let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+    jump.control = ControlFlow::Branch;
+    instructions.push(jump);
+    Ok(MachineBlockData {
+        first,
+        end: MachineInstructionId(instructions.len() as u32),
+        predecessors: vec![cfg.bindings[&block_index].cold],
+        successors: vec![cfg.bindings[&block_index].join],
+        parameters: Vec::new(),
+        successor_arguments: vec![
+            semantics
+                .result_operand()
+                .map(|_| vec![values.cold_payload])
+                .unwrap_or_default(),
+        ],
+    })
+}
+
+fn select_binding_throw_block(
+    cfg: &SelectionCfg,
+    block_index: usize,
+    values: BindingSelectedValues,
+    instructions: &mut Vec<MachineInstruction>,
+) -> MachineBlockData {
+    let first = MachineInstructionId(instructions.len() as u32);
+    let mut throw = MachineInstruction::plain(
+        MachineOpcode::Throw,
+        vec![MachineOperand::register_input(values.cold_payload)],
+    );
+    throw.control = ControlFlow::Return;
+    instructions.push(throw);
+    MachineBlockData {
+        first,
+        end: MachineInstructionId(instructions.len() as u32),
+        predecessors: vec![cfg.bindings[&block_index].cold],
+        successors: Vec::new(),
+        parameters: Vec::new(),
+        successor_arguments: Vec::new(),
+    }
+}
+
+fn select_binding_fatal_block(
+    cfg: &SelectionCfg,
+    block_index: usize,
+    instructions: &mut Vec<MachineInstruction>,
+) -> MachineBlockData {
+    let first = MachineInstructionId(instructions.len() as u32);
+    let mut fatal = MachineInstruction::plain(MachineOpcode::Fatal, Vec::new());
+    fatal.control = ControlFlow::Return;
+    instructions.push(fatal);
+    MachineBlockData {
+        first,
+        end: MachineInstructionId(instructions.len() as u32),
+        predecessors: vec![cfg.bindings[&block_index].cold],
+        successors: Vec::new(),
+        parameters: Vec::new(),
+        successor_arguments: Vec::new(),
+    }
+}
+
+fn select_binding_join_block(
+    hir: &NumericFunction,
+    cfg: &SelectionCfg,
+    block_index: usize,
+    machine_values: &[MachineValue],
+    instructions: &mut Vec<MachineInstruction>,
+) -> Result<MachineBlockData, super::VerificationError> {
+    let first = MachineInstructionId(instructions.len() as u32);
+    let (node_value, target, exceptional_edge) = binding_site(hir, block_index).ok_or(
+        super::VerificationError::InvalidBlock(cfg.originals[block_index]),
+    )?;
+    let NumericNode::Binding {
+        semantics, byte_pc, ..
+    } = hir.nodes[node_value.0]
+    else {
+        unreachable!("binding site owns a binding node")
+    };
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::BindingJoin { byte_pc, semantics },
+        Vec::new(),
+    ));
+    if hir.blocks[block_index].terminator != NumericTerminator::Jump {
+        return Err(super::VerificationError::OpcodeSignatureMismatch(first));
+    }
+    let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+    jump.control = ControlFlow::Branch;
+    instructions.push(jump);
+    let normal_edges = hir.blocks[block_index]
+        .successors
+        .iter()
+        .enumerate()
+        .filter(|(edge, _)| Some(*edge) != exceptional_edge)
+        .collect::<Vec<_>>();
+    let successors = normal_edges
+        .iter()
+        .map(|&(edge, &successor)| {
+            cfg.split_edges
+                .get(&(block_index, edge))
+                .copied()
+                .unwrap_or(cfg.originals[successor])
+        })
+        .collect::<Vec<_>>();
+    let successor_arguments = normal_edges
+        .iter()
+        .map(|&(edge, _)| {
+            if cfg.split_edges.contains_key(&(block_index, edge)) {
+                Vec::new()
+            } else {
+                hir.blocks[block_index].successor_arguments[edge]
+                    .iter()
+                    .map(|&value| machine_value(machine_values, value))
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = cfg.bindings[&block_index];
+    let mut predecessors = Vec::with_capacity(2);
+    if target.is_some() {
+        predecessors.push(
+            selected
+                .hit
+                .expect("generated binding target has hit block"),
+        );
+    }
+    predecessors.push(selected.success);
+    Ok(MachineBlockData {
+        first,
+        end: MachineInstructionId(instructions.len() as u32),
+        predecessors,
+        successors,
+        parameters: semantics
+            .result_operand()
+            .map(|_| vec![machine_values[node_value.0]])
+            .unwrap_or_default(),
+        successor_arguments,
+    })
+}
+
 #[cfg(test)]
 fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::VerificationError> {
     select_with_packed_double_view_caches(hir, &NumericPackedDoubleViewCachePlan::default())
@@ -1838,29 +2377,8 @@ const fn property_store_value_is_non_cell(value_type: NumericType) -> bool {
     )
 }
 
-fn upvalue_load_clobbers() -> Vec<PhysicalRegister> {
-    [9, 10, 11, 13]
-        .into_iter()
-        .map(PhysicalRegister::integer)
-        .collect()
-}
-
-fn global_lexical_load_clobbers() -> Vec<PhysicalRegister> {
-    [9, 11, 13]
-        .into_iter()
-        .map(PhysicalRegister::integer)
-        .collect()
-}
-
 fn string_constant_cell_load_clobbers() -> Vec<PhysicalRegister> {
     [9, 13].into_iter().map(PhysicalRegister::integer).collect()
-}
-
-fn global_object_load_clobbers() -> Vec<PhysicalRegister> {
-    [9, 11, 12, 13, 14, 15]
-        .into_iter()
-        .map(PhysicalRegister::integer)
-        .collect()
 }
 
 fn tagged_nullish_equal_clobbers() -> Vec<PhysicalRegister> {
@@ -1887,7 +2405,7 @@ fn string_concat_call_descriptor() -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC),
         arguments: vec![MachineRepresentation::Tagged; 3],
-        result: Some(MachineRepresentation::Tagged),
+        results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP,
         clobbers,
         exceptional: ExceptionalEdge::None,
@@ -1901,7 +2419,7 @@ fn array_construct_call_descriptor() -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(STUB_ARRAY_CONSTRUCT_ALLOC),
         arguments: vec![MachineRepresentation::Tagged; 3],
-        result: Some(MachineRepresentation::Tagged),
+        results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP),
         clobbers,
         exceptional: ExceptionalEdge::None,
@@ -1913,7 +2431,7 @@ fn caught_throw_acknowledgement_descriptor() -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW),
         arguments: Vec::new(),
-        result: None,
+        results: Vec::new(),
         // This leaf mutates VM-owned diagnostic provenance. Describe it as a
         // write so it cannot be treated as a freely movable pure computation.
         effects: CallEffects::WRITES_HEAP,
@@ -1935,7 +2453,10 @@ fn generic_element_call_descriptor(
     CallDescriptor {
         target: CallTarget::RuntimeStub(target),
         arguments: vec![MachineRepresentation::Tagged; argument_count],
-        result: load.then_some(MachineRepresentation::Tagged),
+        results: load
+            .then_some(MachineRepresentation::Tagged)
+            .into_iter()
+            .collect(),
         effects: CallEffects::READS_HEAP
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
@@ -1984,7 +2505,7 @@ fn direct_call_descriptor(
             byte_pc,
         },
         arguments: vec![MachineRepresentation::Tagged; packet_words],
-        result: Some(MachineRepresentation::Tagged),
+        results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
@@ -2015,7 +2536,7 @@ fn cold_call_exit_descriptor(
             byte_pc,
         },
         arguments: Vec::new(),
-        result: Some(MachineRepresentation::Tagged),
+        results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::PURE,
         clobbers: Vec::new(),
         exceptional: landing_pad
@@ -2046,7 +2567,7 @@ fn committed_value_descriptor(
             semantic_arity,
         },
         arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
-        result: Some(MachineRepresentation::Tagged),
+        results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
@@ -2059,11 +2580,34 @@ fn committed_value_descriptor(
     }
 }
 
+fn binding_value_descriptor(logical_pc: u32, byte_pc: u32, semantic_arity: u8) -> CallDescriptor {
+    CallDescriptor {
+        target: CallTarget::CommittedRuntime {
+            target: otter_vm::native_abi::STUB_JIT_BINDING_VALUE,
+            logical_pc,
+            byte_pc,
+            semantic_arity,
+        },
+        arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
+        results: vec![
+            MachineRepresentation::Tagged,
+            MachineRepresentation::NativeStatus,
+        ],
+        effects: CallEffects::READS_HEAP
+            .union(CallEffects::WRITES_HEAP)
+            .union(CallEffects::INVALIDATES_SHAPES)
+            .union(CallEffects::REENTRANT),
+        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::Gc,
+    }
+}
+
 fn class_super_constructor_descriptor() -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
         arguments: vec![MachineRepresentation::Tagged],
-        result: Some(MachineRepresentation::Tagged),
+        results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP,
         clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
         exceptional: ExceptionalEdge::None,
@@ -2133,7 +2677,7 @@ fn leaf_boolean_call_descriptor(
     CallDescriptor {
         target: CallTarget::RuntimeStub(target),
         arguments: vec![MachineRepresentation::Tagged; argument_count],
-        result: Some(MachineRepresentation::Boolean),
+        results: vec![MachineRepresentation::Boolean],
         effects: CallEffects::READS_HEAP,
         clobbers,
         exceptional: ExceptionalEdge::None,
@@ -2172,10 +2716,11 @@ fn tagged_call_argument(
 fn attach_frame_state(
     hir: &NumericFunction,
     values: &[MachineValue],
+    state_index: usize,
     deopt: DeoptId,
     instruction: &mut MachineInstruction,
 ) {
-    let state = &hir.frame_states[deopt.0 as usize];
+    let state = &hir.frame_states[state_index];
     let mut values_at_exit = BTreeSet::new();
     for slot in &state.slots {
         let hir::NumericFrameSlot::Value(value) = slot else {
@@ -2193,10 +2738,10 @@ fn attach_frame_state(
 fn attach_frame_state_tagged_roots(
     hir: &NumericFunction,
     values: &[MachineValue],
-    state_id: DeoptId,
+    state_index: usize,
     instruction: &mut MachineInstruction,
 ) {
-    let state = &hir.frame_states[state_id.0 as usize];
+    let state = &hir.frame_states[state_index];
     append_unique_tagged_roots(
         &mut instruction.operands,
         state.slots.iter().filter_map(|slot| {
@@ -2209,9 +2754,20 @@ fn attach_frame_state_tagged_roots(
     );
 }
 
+fn frame_state_requires_deopt(hir: &NumericFunction, state: &hir::NumericFrameState) -> bool {
+    match state.point {
+        NumericFramePoint::Backedge { .. } => true,
+        NumericFramePoint::Node(node) => matches!(
+            hir.nodes[node.0].frame_state_purpose(),
+            Some(NumericFrameStatePurpose::ExactDeopt | NumericFrameStatePurpose::RuntimeMetadata)
+        ),
+    }
+}
+
 fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
     hir.frame_states
         .iter()
+        .filter(|state| frame_state_requires_deopt(hir, state))
         .enumerate()
         .map(|(index, state)| super::MachineFrameState {
             id: DeoptId(index as u32),
@@ -2239,12 +2795,29 @@ enum SelectedBlock {
         edge: usize,
         successor: usize,
     },
+    BindingHit(usize),
+    BindingCold(usize),
+    BindingSuccess(usize),
+    BindingThrow(usize),
+    BindingFatal(usize),
+    BindingJoin(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BindingSelectedBlocks {
+    hit: Option<MachineBlock>,
+    cold: MachineBlock,
+    success: MachineBlock,
+    throw: Option<MachineBlock>,
+    fatal: MachineBlock,
+    join: MachineBlock,
 }
 
 struct SelectionCfg {
     order: Vec<SelectedBlock>,
     originals: Vec<MachineBlock>,
     split_edges: BTreeMap<(usize, usize), MachineBlock>,
+    bindings: BTreeMap<usize, BindingSelectedBlocks>,
 }
 
 impl SelectionCfg {
@@ -2255,6 +2828,7 @@ impl SelectionCfg {
         let mut order = Vec::with_capacity(hir.blocks.len());
         let mut originals = vec![MachineBlock(u32::MAX); hir.blocks.len()];
         let mut split_edges = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
                 if is_critical_edge(hir, predecessor, successor)
@@ -2277,19 +2851,81 @@ impl SelectionCfg {
             }
             *original = MachineBlock(order.len() as u32);
             order.push(SelectedBlock::Original(successor));
+            let Some((_, target, exceptional_edge)) = binding_site(hir, successor) else {
+                continue;
+            };
+            let hit = target.map(|_| {
+                let block = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::BindingHit(successor));
+                block
+            });
+            let cold = MachineBlock(order.len() as u32);
+            order.push(SelectedBlock::BindingCold(successor));
+            let success = MachineBlock(order.len() as u32);
+            order.push(SelectedBlock::BindingSuccess(successor));
+            let throw = exceptional_edge.is_none().then(|| {
+                let block = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::BindingThrow(successor));
+                block
+            });
+            let fatal = MachineBlock(order.len() as u32);
+            order.push(SelectedBlock::BindingFatal(successor));
+            let join = MachineBlock(order.len() as u32);
+            order.push(SelectedBlock::BindingJoin(successor));
+            bindings.insert(
+                successor,
+                BindingSelectedBlocks {
+                    hit,
+                    cold,
+                    success,
+                    throw,
+                    fatal,
+                    join,
+                },
+            );
         }
         Self {
             order,
             originals,
             split_edges,
+            bindings,
         }
     }
+
+    fn normal_exit(&self, block: usize) -> MachineBlock {
+        self.bindings
+            .get(&block)
+            .map_or(self.originals[block], |binding| binding.join)
+    }
+}
+
+fn binding_site(
+    hir: &NumericFunction,
+    block: usize,
+) -> Option<(
+    hir::NumericValue,
+    Option<NumericBindingTarget>,
+    Option<usize>,
+)> {
+    let value = *hir.blocks.get(block)?.nodes.last()?;
+    let NumericNode::Binding {
+        target,
+        exceptional_edge,
+        ..
+    } = hir.nodes.get(value.0)?
+    else {
+        return None;
+    };
+    Some((value, *target, exceptional_edge.map(usize::from)))
 }
 
 fn is_exceptional_hir_edge(hir: &NumericFunction, predecessor: usize, edge: usize) -> bool {
     hir.blocks[predecessor].nodes.iter().any(|value| {
         let exceptional_edge = match hir.nodes[value.0] {
-            NumericNode::CommittedValue {
+            NumericNode::Binding {
+                exceptional_edge, ..
+            }
+            | NumericNode::CommittedValue {
                 exceptional_edge, ..
             }
             | NumericNode::DirectCall {
@@ -2408,7 +3044,7 @@ fn machine_block(
                 .split_edges
                 .get(&(predecessor, edge))
                 .copied()
-                .unwrap_or(selection_cfg.originals[predecessor])
+                .unwrap_or_else(|| selection_cfg.normal_exit(predecessor))
         })
         .collect::<Vec<_>>();
     predecessors.sort_unstable();
@@ -2466,11 +3102,14 @@ fn machine_value(values: &[MachineValue], value: hir::NumericValue) -> MachineVa
 
 #[cfg(test)]
 mod tests {
-    use otter_bytecode::{Op, Operand};
+    use otter_bytecode::opcode_schema::{
+        BindingRead, BindingSemantics, OPCODE_SCHEMA, OperandKind, RegisterAccess,
+    };
+    use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
     use otter_vm::{
         JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
         JitDirectCallThisMode, JitDirectCallee, JitFunctionCode, JitInlinePropertyLoad, Value,
-        jit::{JitDirectCallPlan, JitMethodGuard, JitTestInstruction},
+        jit::{BindingHitProof, JitDirectCallPlan, JitMethodGuard, JitTestInstruction},
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
         native_abi::{
             NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultDomain, NativeResultPair,
@@ -2861,7 +3500,9 @@ mod tests {
     fn committed_value_selection_hir(local_catch: bool) -> NumericFunction {
         let value = hir::NumericValue;
         let committed = NumericNode::CommittedValue {
-            operation: CommittedValueOperation::Scalar(otter_vm::ScalarValueOp::SameValue),
+            operation: CommittedValueOperation::Scalar(
+                otter_vm::native_abi::ScalarValueOp::SameValue,
+            ),
             inputs: [Some(value(0)), Some(value(1))],
             logical_pc: 6,
             byte_pc: 48,
@@ -5279,70 +5920,247 @@ mod tests {
         }
     }
 
-    fn global_selection_hir() -> NumericFunction {
-        let value = |index| hir::NumericValue(index);
-        NumericFunction {
-            function_id: 95,
-            nodes: vec![
-                NumericNode::Parameter {
-                    register: 0,
-                    value_type: NumericType::Tagged,
-                },
-                NumericNode::GlobalLexicalLoad {
-                    byte_pc: 24,
-                    target: otter_vm::jit::JitGlobalLexicalLoad {
-                        cell_offset: 0x1234,
-                    },
-                },
-                NumericNode::GlobalObjectLoad {
-                    byte_pc: 32,
-                    target: otter_vm::jit::JitGlobalObjectLoad {
-                        shape: 0x5678,
-                        dictionary: true,
-                        value_byte: 40,
-                        global_lexical_epoch: 9,
-                    },
-                },
+    fn binding_selection_hir() -> NumericFunction {
+        let mut view = JitCompileSnapshot::without_feedback(
+            95,
+            1,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadGlobalOrThrow,
+                    0,
+                    24,
+                    vec![Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadGlobalOrUndefined,
+                    1,
+                    32,
+                    vec![Operand::Register(2), Operand::ConstIndex(1)],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 2, 40, vec![Operand::Register(2)]),
             ],
-            blocks: vec![hir::NumericBlock {
-                logical_pc: 0,
-                osr_entry_allowed: true,
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                parameter_registers: Vec::new(),
-                successor_arguments: Vec::new(),
-                nodes: (0..3).map(value).collect(),
-                terminator: NumericTerminator::Return(value(2)),
-            }],
-            frame_states: vec![
-                hir::NumericFrameState {
-                    point: NumericFramePoint::Node(value(1)),
-                    function_id: 95,
-                    byte_pc: 24,
-                    slots: vec![
-                        hir::NumericFrameSlot::Value(value(0)),
-                        hir::NumericFrameSlot::Undefined,
-                        hir::NumericFrameSlot::Undefined,
-                    ],
-                },
-                hir::NumericFrameState {
-                    point: NumericFramePoint::Node(value(2)),
-                    function_id: 95,
-                    byte_pc: 32,
-                    slots: vec![
-                        hir::NumericFrameSlot::Value(value(0)),
-                        hir::NumericFrameSlot::Value(value(1)),
-                        hir::NumericFrameSlot::Undefined,
-                    ],
-                },
+        );
+        view.cage_base = 0x1000;
+        view.binding_hit_proofs.insert(
+            24,
+            BindingHitProof::GlobalLexical {
+                cell_offset: 0x1234,
+                writable: true,
+            },
+        );
+        view.binding_hit_proofs.insert(
+            32,
+            BindingHitProof::GlobalObject {
+                shape: 0x5678,
+                dictionary: true,
+                value_byte: 40,
+                global_lexical_epoch: 9,
+                writable: true,
+            },
+        );
+        NumericFunction::build(&view).expect("typed binding HIR")
+    }
+
+    fn schema_binding_hir(schema: &otter_bytecode::opcode_schema::OpcodeSchema) -> NumericFunction {
+        let semantics = schema.binding.expect("binding schema row");
+        let operands = schema
+            .operand_shape
+            .fixed()
+            .expect("binding opcodes have fixed operands")
+            .iter()
+            .map(|operand| match operand.kind {
+                OperandKind::Register => {
+                    Operand::Register(if operand.register_access == RegisterAccess::Write {
+                        1
+                    } else {
+                        0
+                    })
+                }
+                OperandKind::ConstIndex => Operand::ConstIndex(0),
+                OperandKind::Imm32 => Operand::Imm32(0),
+            })
+            .collect::<Vec<_>>();
+        let terminator = semantics.result_operand().map_or_else(
+            || JitTestInstruction::new(Op::ReturnUndefined, 1, 32, Vec::new()),
+            |destination| {
+                let Operand::Register(destination) = operands[usize::from(destination)] else {
+                    panic!("binding result is a register operand")
+                };
+                JitTestInstruction::new(
+                    Op::ReturnValue,
+                    1,
+                    32,
+                    vec![Operand::Register(destination)],
+                )
+            },
+        );
+        let view = JitCompileSnapshot::without_feedback(
+            196,
+            1,
+            2,
+            vec![
+                JitTestInstruction::new(schema.op, 0, 24, operands),
+                terminator,
             ],
-            direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
-            parameter_count: 1,
-            register_count: 3,
-            arithmetic_op_count: 0,
-        }
+        );
+        NumericFunction::build(&view)
+            .unwrap_or_else(|| panic!("schema binding {:?} must build cold Machine HIR", schema.op))
+    }
+
+    fn binding_catch_hir() -> NumericFunction {
+        let view = JitCompileSnapshot::without_feedback(
+            197,
+            0,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::EnterTry,
+                    0,
+                    0,
+                    vec![
+                        Operand::Imm32(3),
+                        Operand::Imm32(NO_HANDLER_OFFSET),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadGlobalOrThrow,
+                    1,
+                    8,
+                    vec![Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(1)]),
+                JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(2)]),
+            ],
+        );
+        NumericFunction::build(&view).expect("caught binding HIR")
+    }
+
+    fn binding_write_selection_hir() -> NumericFunction {
+        let mut view = JitCompileSnapshot::without_feedback(
+            198,
+            0,
+            2,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadInt32,
+                    0,
+                    0,
+                    vec![Operand::Register(0), Operand::Imm32(7)],
+                ),
+                JitTestInstruction::new(Op::LoadTrue, 1, 8, vec![Operand::Register(1)]),
+                JitTestInstruction::new(
+                    Op::StoreUpvalueChecked,
+                    2,
+                    16,
+                    vec![Operand::Register(0), Operand::Imm32(0)],
+                ),
+                JitTestInstruction::new(
+                    Op::StoreGlobalBinding,
+                    3,
+                    24,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Imm32(1),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::StoreGlobalChecked,
+                    4,
+                    32,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnUndefined, 5, 40, Vec::new()),
+            ],
+        );
+        view.cage_base = 0x1000;
+        view.binding_hit_proofs.insert(
+            24,
+            BindingHitProof::GlobalLexical {
+                cell_offset: 0x120,
+                writable: true,
+            },
+        );
+        view.binding_hit_proofs.insert(
+            32,
+            BindingHitProof::GlobalObject {
+                shape: 11,
+                dictionary: false,
+                value_byte: 24,
+                global_lexical_epoch: 4,
+                writable: true,
+            },
+        );
+        NumericFunction::build(&view).expect("generated binding-write HIR")
+    }
+
+    fn binding_followed_by_deopt_hir() -> NumericFunction {
+        let mut view = JitCompileSnapshot::without_feedback(
+            199,
+            1,
+            4,
+            vec![
+                JitTestInstruction::new(
+                    Op::LoadGlobalOrThrow,
+                    0,
+                    8,
+                    vec![Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                JitTestInstruction::new(
+                    Op::LoadGlobalOrThrow,
+                    1,
+                    16,
+                    vec![Operand::Register(2), Operand::ConstIndex(1)],
+                ),
+                JitTestInstruction::new(
+                    Op::Add,
+                    2,
+                    24,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(
+                    Op::Add,
+                    3,
+                    32,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(3),
+                        Operand::Register(0),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 4, 40, vec![Operand::Register(3)]),
+            ],
+        );
+        view.cage_base = 0x1000;
+        view.binding_hit_proofs.insert(
+            8,
+            BindingHitProof::GlobalLexical {
+                cell_offset: 0x140,
+                writable: true,
+            },
+        );
+        view.binding_hit_proofs.insert(
+            16,
+            BindingHitProof::GlobalObject {
+                shape: 13,
+                dictionary: false,
+                value_byte: 32,
+                global_lexical_epoch: 5,
+                writable: true,
+            },
+        );
+        NumericFunction::build(&view).expect("binding-to-deopt HIR")
     }
 
     fn string_constant_selection_hir() -> NumericFunction {
@@ -5601,7 +6419,7 @@ mod tests {
             CallTarget::RuntimeStub(STUB_ARRAY_CONSTRUCT_ALLOC)
         );
         assert_eq!(descriptor.arguments, [MachineRepresentation::Tagged; 3]);
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(descriptor.results, [MachineRepresentation::Tagged]);
         assert_eq!(
             descriptor.effects,
             CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP)
@@ -5771,7 +6589,7 @@ mod tests {
             }
         );
         assert_eq!(descriptor.arguments, Vec::new());
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(descriptor.results, [MachineRepresentation::Tagged]);
         assert_eq!(descriptor.effects, CallEffects::PURE);
         assert_eq!(descriptor.safepoint, SafepointKind::None);
         assert!(descriptor.clobbers.is_empty());
@@ -5907,79 +6725,327 @@ mod tests {
     }
 
     #[test]
-    fn selects_prepared_globals_as_tagged_exact_deopt_loads() {
-        let sequence = select(&global_selection_hir()).expect("global-load Machine IR");
+    fn selects_binding_reads_as_explicit_hit_cold_status_and_join_cfg() {
+        let sequence = select(&binding_selection_hir()).expect("binding Machine CFG");
 
-        let lexical = sequence
+        let guards = sequence
             .instructions()
             .iter()
-            .find(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::GlobalLexicalLoad {
-                        byte_pc: 24,
-                        target: otter_vm::jit::JitGlobalLexicalLoad {
-                            cell_offset: 0x1234
-                        }
-                    }
-                )
-            })
-            .expect("selected global lexical load");
-        assert_eq!(
-            lexical.operands,
-            [
-                MachineOperand::register_output(MachineValue(1)),
-                MachineOperand::deopt(MachineValue(0)),
-            ]
+            .filter(|instruction| matches!(instruction.opcode, MachineOpcode::BindingGuard { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(guards.len(), 2);
+        assert!(
+            guards
+                .iter()
+                .all(|guard| guard.deopt.is_none() && guard.safepoint.is_none())
         );
-        assert_eq!(lexical.clobbers, global_lexical_load_clobbers());
-        assert_eq!(lexical.deopt, Some(DeoptId(0)));
-        assert_eq!(lexical.safepoint, None);
-        assert_eq!(sequence.representations()[1], MachineRepresentation::Tagged);
+        assert!(guards.iter().any(|guard| matches!(
+            guard.opcode,
+            MachineOpcode::BindingGuard {
+                byte_pc: 24,
+                semantics: BindingSemantics::Read(BindingRead::Global { .. }),
+                target: MachineBindingTarget::Global(BindingHitProof::GlobalLexical {
+                    cell_offset: 0x1234,
+                    writable: true,
+                }),
+            }
+        )));
+        assert!(guards.iter().any(|guard| matches!(
+            guard.opcode,
+            MachineOpcode::BindingGuard {
+                byte_pc: 32,
+                semantics: BindingSemantics::Read(BindingRead::Global { .. }),
+                target: MachineBindingTarget::Global(BindingHitProof::GlobalObject {
+                    shape: 0x5678,
+                    dictionary: true,
+                    value_byte: 40,
+                    global_lexical_epoch: 9,
+                    writable: true,
+                }),
+            }
+        )));
 
-        let object = sequence
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction.opcode,
+                    MachineOpcode::BindingHit { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction.opcode,
+                    MachineOpcode::BindingJoin { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.opcode == MachineOpcode::BranchNativeStatus)
+                .count(),
+            2
+        );
+
+        let committed_calls = sequence
             .instructions()
             .iter()
-            .find(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::GlobalObjectLoad {
-                        byte_pc: 32,
-                        target: otter_vm::jit::JitGlobalObjectLoad {
-                            shape: 0x5678,
-                            dictionary: true,
-                            value_byte: 40,
-                            global_lexical_epoch: 9,
-                        }
-                    }
-                )
+            .filter_map(|instruction| {
+                let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                    return None;
+                };
+                let descriptor = &sequence.call_descriptors[descriptor as usize];
+                is_explicit_binding_runtime_call(descriptor).then_some((instruction, descriptor))
             })
-            .expect("selected global object load");
-        assert_eq!(
-            object.operands,
-            [
-                MachineOperand::register_output(MachineValue(2)),
-                MachineOperand::deopt(MachineValue(0)),
-                MachineOperand::deopt(MachineValue(1)),
-            ]
-        );
-        assert_eq!(
-            object.clobbers,
-            [9, 11, 12, 13, 14, 15]
-                .into_iter()
-                .map(PhysicalRegister::integer)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(object.deopt, Some(DeoptId(1)));
-        assert_eq!(object.safepoint, None);
-        assert_eq!(sequence.representations()[2], MachineRepresentation::Tagged);
+            .collect::<Vec<_>>();
+        assert_eq!(committed_calls.len(), 2);
+        for (call, descriptor) in committed_calls {
+            assert!(call.safepoint.is_some());
+            assert_eq!(call.deopt, None);
+            assert_eq!(
+                descriptor.results,
+                [
+                    MachineRepresentation::Tagged,
+                    MachineRepresentation::NativeStatus,
+                ]
+            );
+            assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
+        }
 
         let normalized = sequence.normalized();
-        assert!(normalized.contains("GlobalLexicalLoad { byte_pc: 24"));
-        assert!(normalized.contains("GlobalObjectLoad { byte_pc: 32"));
+        assert!(normalized.contains("BindingGuard { byte_pc: 24"));
+        assert!(normalized.contains("BindingHit { byte_pc: 32"));
+        assert!(normalized.contains("BranchNativeStatus"));
         sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
-            .expect("global-load allocation");
+            .expect("binding CFG allocation");
+    }
+
+    #[test]
+    fn generated_binding_writes_keep_direct_stores_and_explicit_barriers() {
+        let sequence = select(&binding_write_selection_hir()).expect("binding-write Machine CFG");
+        let write_hits = sequence
+            .instructions()
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    MachineOpcode::BindingHit {
+                        semantics: BindingSemantics::Write(_),
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(write_hits.len(), 3);
+        assert!(
+            write_hits
+                .iter()
+                .all(|instruction| instruction.deopt.is_none() && instruction.safepoint.is_none())
+        );
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.opcode == MachineOpcode::BindingWriteBarrier)
+                .count(),
+            write_hits.len()
+        );
+        assert_eq!(
+            sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                        return false;
+                    };
+                    is_explicit_binding_runtime_call(
+                        &sequence.call_descriptors[descriptor as usize],
+                    )
+                })
+                .count(),
+            write_hits.len()
+        );
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("binding-write allocation");
+    }
+
+    #[test]
+    fn binding_root_states_do_not_pollute_later_exact_deopt_metadata() {
+        let hir = binding_followed_by_deopt_hir();
+        assert!(hir.frame_states.iter().any(|state| matches!(
+            state.point,
+            NumericFramePoint::Node(node)
+                if hir.nodes[node.0].frame_state_purpose()
+                    == Some(NumericFrameStatePurpose::TaggedRoots)
+        )));
+        let sequence = select(&hir).expect("binding-to-deopt Machine CFG");
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("binding-to-deopt allocation");
+        let safepoints =
+            lower_safepoints(&sequence, &allocation).expect("binding-to-deopt safepoints");
+        let frame = arm64::frame_layout(&allocation, safepoints.root_slot_count())
+            .expect("binding-to-deopt frame");
+        let states = machine_frame_states(&hir);
+        assert!(states.len() < hir.frame_states.len());
+        lower_deopt_table(
+            &sequence,
+            &allocation,
+            frame,
+            arm64::GPR_BUDGET,
+            arm64::FP_BUDGET,
+            &states,
+        )
+        .expect("only exact/runtime-metadata states require allocator deopt locations");
+    }
+
+    #[test]
+    fn every_schema_binding_operation_uses_the_same_committed_machine_cfg() {
+        let mut covered = 0;
+        for schema in OPCODE_SCHEMA
+            .iter()
+            .filter(|schema| schema.binding.is_some())
+        {
+            covered += 1;
+            let semantics = schema.binding.expect("filtered binding schema");
+            let hir = schema_binding_hir(schema);
+            assert!(hir.nodes.iter().any(|node| matches!(
+                node,
+                NumericNode::Binding {
+                    semantics: copied,
+                    target: None,
+                    byte_pc: 24,
+                    ..
+                } if *copied == semantics
+            )));
+
+            let sequence =
+                select(&hir).unwrap_or_else(|error| panic!("select {:?}: {error:?}", schema.op));
+            assert_eq!(
+                sequence
+                    .instructions()
+                    .iter()
+                    .filter(|instruction| matches!(
+                        instruction.opcode,
+                        MachineOpcode::BindingGuard {
+                            semantics: copied,
+                            target: MachineBindingTarget::Cold,
+                            byte_pc: 24,
+                        } if copied == semantics
+                    ))
+                    .count(),
+                1,
+                "{:?}",
+                schema.op
+            );
+            assert!(sequence.instructions().iter().all(|instruction| !matches!(
+                instruction.opcode,
+                MachineOpcode::BindingHit { .. }
+            )));
+            let calls = sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                        return false;
+                    };
+                    is_explicit_binding_runtime_call(
+                        &sequence.call_descriptors[descriptor as usize],
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "{:?}", schema.op);
+            assert!(calls[0].safepoint.is_some(), "{:?}", schema.op);
+            assert_eq!(calls[0].deopt, None, "{:?}", schema.op);
+            assert_eq!(
+                sequence
+                    .instructions()
+                    .iter()
+                    .filter(|instruction| instruction.opcode == MachineOpcode::BranchNativeStatus)
+                    .count(),
+                1,
+                "{:?}",
+                schema.op
+            );
+            sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .unwrap_or_else(|error| panic!("allocate {:?}: {error:?}", schema.op));
+        }
+        assert!(covered > 0, "opcode schema must expose the binding family");
+    }
+
+    #[test]
+    fn caught_binding_throw_routes_exception_ssa_through_one_acknowledged_edge() {
+        let sequence = select(&binding_catch_hir()).expect("caught binding Machine CFG");
+        let (call_id, payload) = sequence
+            .instructions()
+            .iter()
+            .enumerate()
+            .find_map(|(id, instruction)| {
+                let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                    return None;
+                };
+                if !is_explicit_binding_runtime_call(
+                    &sequence.call_descriptors[descriptor as usize],
+                ) {
+                    return None;
+                }
+                instruction
+                    .operands
+                    .iter()
+                    .find(|operand| {
+                        operand.purpose == OperandPurpose::Output
+                            && sequence.representations[operand.value.0 as usize]
+                                == MachineRepresentation::Tagged
+                    })
+                    .map(|operand| (id, operand.value))
+            })
+            .expect("committed binding pair");
+        let cold = sequence
+            .blocks()
+            .iter()
+            .position(|block| block.first.0 <= call_id as u32 && (call_id as u32) < block.end.0)
+            .expect("binding cold block");
+        let throw_edge = sequence.blocks()[cold].successors[1];
+        let acknowledgement =
+            &sequence.instructions()[sequence.blocks()[throw_edge.0 as usize].first.0 as usize];
+        let MachineOpcode::Call(descriptor) = acknowledgement.opcode else {
+            panic!("caught throw edge must begin with explicit acknowledgement")
+        };
+        assert!(matches!(
+            sequence.call_descriptors[descriptor as usize].target,
+            CallTarget::RuntimeStub(target)
+                if target.id == otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW.id
+        ));
+        assert!(
+            sequence.blocks()[throw_edge.0 as usize]
+                .successor_arguments
+                .iter()
+                .flatten()
+                .any(|&argument| argument == payload),
+            "{}",
+            sequence.normalized()
+        );
+        assert!(
+            sequence
+                .instructions()
+                .iter()
+                .all(|instruction| instruction.opcode != MachineOpcode::Throw)
+        );
+        sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("caught binding allocation");
     }
 
     #[test]
@@ -6046,46 +7112,76 @@ mod tests {
     }
 
     #[test]
-    fn verifier_rejects_malformed_prepared_global_loads() {
-        let valid = select(&global_selection_hir()).expect("valid global loads");
-        let lexical_id = valid
+    fn verifier_rejects_binding_status_without_the_committed_pair_producer() {
+        let mut malformed = select(&binding_selection_hir()).expect("valid binding CFG");
+        let branch_id = malformed
+            .instructions
+            .iter()
+            .position(|instruction| instruction.opcode == MachineOpcode::BranchNativeStatus)
+            .expect("explicit native-status branch");
+        let expected = Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
+            MachineInstructionId(branch_id as u32),
+        ));
+
+        let unowned_status = MachineValue(malformed.representations.len() as u32);
+        malformed
+            .representations
+            .push(MachineRepresentation::NativeStatus);
+        malformed.instructions[branch_id].operands[0] =
+            MachineOperand::register_input(unowned_status);
+        assert_eq!(malformed.verify(), expected);
+    }
+
+    #[test]
+    fn verifier_confines_binding_raw_addresses_to_the_generated_hit_block() {
+        let valid = select(&binding_selection_hir()).expect("valid binding CFG");
+        let guard_id = valid
             .instructions
             .iter()
             .position(|instruction| {
-                matches!(instruction.opcode, MachineOpcode::GlobalLexicalLoad { .. })
+                matches!(instruction.opcode, MachineOpcode::BindingGuard { .. })
             })
-            .expect("global lexical load");
+            .expect("binding guard");
+        let owner = valid.instructions[guard_id].operands[1].value;
         let expected = Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
-            MachineInstructionId(lexical_id as u32),
+            MachineInstructionId(guard_id as u32),
         ));
 
-        let mut missing_output = valid.clone();
-        missing_output.instructions[lexical_id].operands.remove(0);
-        assert_eq!(missing_output.verify(), expected);
-
-        let mut ordinary_input = valid.clone();
-        ordinary_input.instructions[lexical_id]
+        let mut safepoint_escape = valid.clone();
+        let cold_call = safepoint_escape
+            .instructions
+            .iter()
+            .position(|instruction| {
+                let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                    return false;
+                };
+                is_explicit_binding_runtime_call(
+                    &safepoint_escape.call_descriptors[descriptor as usize],
+                )
+            })
+            .expect("binding cold call");
+        safepoint_escape.instructions[cold_call]
             .operands
-            .push(MachineOperand::location_input(MachineValue(0)));
-        assert_eq!(ordinary_input.verify(), expected);
+            .push(MachineOperand::tagged_root(owner));
+        assert_eq!(safepoint_escape.verify(), expected);
 
-        let mut output_in_preop_state = valid.clone();
-        output_in_preop_state.instructions[lexical_id]
-            .operands
-            .push(MachineOperand::deopt(MachineValue(1)));
-        assert_eq!(output_in_preop_state.verify(), expected);
-
-        let mut wrong_representation = valid.clone();
-        wrong_representation.representations[1] = MachineRepresentation::Int32;
-        assert_eq!(wrong_representation.verify(), expected);
-
-        let mut missing_deopt = valid.clone();
-        missing_deopt.instructions[lexical_id].deopt = None;
-        assert_eq!(missing_deopt.verify(), expected);
-
-        let mut spurious_safepoint = valid;
-        spurious_safepoint.instructions[lexical_id].safepoint = Some(SafepointId(9));
-        assert_eq!(spurious_safepoint.verify(), expected);
+        let mut edge_escape = valid;
+        let guard_block = edge_escape
+            .blocks
+            .iter()
+            .position(|block| block.first.0 <= guard_id as u32 && (guard_id as u32) < block.end.0)
+            .expect("guard block");
+        let hit = edge_escape.blocks[guard_block].successors[0];
+        let join = edge_escape.blocks[hit.0 as usize].successors[0];
+        let escaped_parameter = MachineValue(edge_escape.representations.len() as u32);
+        edge_escape
+            .representations
+            .push(MachineRepresentation::Int64);
+        edge_escape.blocks[hit.0 as usize].successor_arguments[0].push(owner);
+        edge_escape.blocks[join.0 as usize]
+            .parameters
+            .push(escaped_parameter);
+        assert_eq!(edge_escape.verify(), expected);
     }
 
     #[test]
@@ -6574,7 +7670,7 @@ mod tests {
         );
         assert_eq!(load_descriptor.safepoint, SafepointKind::Gc);
         assert_eq!(load_descriptor.exceptional, ExceptionalEdge::Propagate);
-        assert_eq!(load_descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(load_descriptor.results, [MachineRepresentation::Tagged]);
         assert_eq!(load.operands[0].constraint, OperandConstraint::Register);
         assert_eq!(load.operands[1].constraint, OperandConstraint::Register);
         assert_eq!(load.operands[2].constraint, OperandConstraint::Register);
@@ -6586,7 +7682,7 @@ mod tests {
             store_descriptor.target,
             CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT)
         );
-        assert_eq!(store_descriptor.result, None);
+        assert!(store_descriptor.results.is_empty());
         assert_eq!(store_descriptor.safepoint, SafepointKind::Gc);
         assert_eq!(store_descriptor.exceptional, ExceptionalEdge::Propagate);
         assert!(store.safepoint.is_some());
@@ -7472,7 +8568,7 @@ mod tests {
             descriptor.arguments,
             [MachineRepresentation::Tagged, MachineRepresentation::Tagged]
         );
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Boolean));
+        assert_eq!(descriptor.results, [MachineRepresentation::Boolean]);
         assert_eq!(descriptor.effects, CallEffects::READS_HEAP);
         assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
         assert_eq!(descriptor.safepoint, SafepointKind::None);
@@ -7612,7 +8708,7 @@ mod tests {
             descriptor.arguments,
             [MachineRepresentation::Tagged, MachineRepresentation::Tagged]
         );
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Boolean));
+        assert_eq!(descriptor.results, [MachineRepresentation::Boolean]);
         assert_eq!(descriptor.effects, CallEffects::READS_HEAP);
         assert_eq!(descriptor.exceptional, ExceptionalEdge::None);
         assert_eq!(descriptor.safepoint, SafepointKind::None);
@@ -7755,7 +8851,7 @@ mod tests {
             CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC)
         );
         assert_eq!(descriptor.arguments, [MachineRepresentation::Tagged; 3]);
-        assert_eq!(descriptor.result, Some(MachineRepresentation::Tagged));
+        assert_eq!(descriptor.results, [MachineRepresentation::Tagged]);
         assert_eq!(descriptor.safepoint, SafepointKind::Gc);
 
         let calls = sequence

@@ -299,7 +299,7 @@ impl Interpreter {
 }
 
 impl RuntimeCall<'_> {
-    fn published_opcode(&self) -> Result<Op, VmError> {
+    pub(super) fn published_opcode(&self) -> Result<Op, VmError> {
         let function_id = self.function_id();
         let instruction_pc = self.pc();
         let context = unsafe { self.context.as_ref() };
@@ -313,6 +313,42 @@ impl RuntimeCall<'_> {
             return Err(VmError::InvalidOperand);
         }
         Ok(function.op(instruction))
+    }
+
+    /// The published instruction's string-constant operand at `operand`.
+    pub(super) fn published_const_index(&self, operand: u8) -> Result<u32, VmError> {
+        let function_id = self.function_id();
+        let instruction_pc = self.pc();
+        let context = unsafe { self.context.as_ref() };
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let instruction = function
+            .instr_at_index(instruction_pc as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        if instruction.instruction_pc != instruction_pc {
+            return Err(VmError::InvalidOperand);
+        }
+        Ok(instruction.const_word(usize::from(operand)))
+    }
+
+    /// The published instruction's signed immediate operand at `operand`.
+    pub(super) fn published_imm32(&self, operand: u8) -> Result<i32, VmError> {
+        let function_id = self.function_id();
+        let instruction_pc = self.pc();
+        let context = unsafe { self.context.as_ref() };
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let instruction = function
+            .instr_at_index(instruction_pc as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        if instruction.instruction_pc != instruction_pc {
+            return Err(VmError::InvalidOperand);
+        }
+        function
+            .imm32(instruction, usize::from(operand))
+            .ok_or(VmError::InvalidOperand)
     }
 
     /// Complete the exact published object-protocol site over boxed values.

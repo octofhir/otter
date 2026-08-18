@@ -95,7 +95,15 @@ impl Interpreter {
             }
             value if value == Op::StoreDynamic as u8 => {
                 let value = frame.read(arg0 as u16)?;
-                self.store_dynamic_value(context, stack, frame.eval_env(), value, arg1 as u32)?;
+                self.store_dynamic_value(
+                    context,
+                    stack,
+                    frame.function_id(),
+                    frame.eval_env(),
+                    value,
+                    arg1 as u32,
+                    false,
+                )?;
                 frame.advance_pc()?;
             }
             value if value == Op::TypeofDynamic as u8 => {

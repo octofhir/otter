@@ -1602,8 +1602,36 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let name_idx = instr.const_word(1);
                     let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
+                    let eval_depth = function.imm32(instr, 3).unwrap_or(i32::MAX) as u32;
                     let frame = &mut stack[top_idx];
-                    self.run_load_shadowed_upvalue_reg(context, frame, dst, name_idx, uv_idx)?;
+                    self.run_load_shadowed_upvalue_reg(
+                        context, frame, dst, name_idx, uv_idx, eval_depth,
+                    )?;
+                    continue;
+                }
+                // §9.1 — the write/delete halves of the same shadowed-capture
+                // family: the eval chain is resolved at the operation point
+                // within the compiler's bounded physical depth.
+                Op::StoreShadowedUpvalueChecked => {
+                    let value_reg = instr.reg(0);
+                    let name_idx = instr.const_word(1);
+                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
+                    let policy = function.imm32(instr, 3).unwrap_or(0);
+                    let frame = &mut stack[top_idx];
+                    self.run_store_shadowed_upvalue_checked_reg(
+                        context, frame, value_reg, name_idx, uv_idx, policy,
+                    )?;
+                    continue;
+                }
+                Op::DeleteShadowedUpvalue => {
+                    let dst = instr.reg(0);
+                    let name_idx = instr.const_word(1);
+                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
+                    let eval_depth = function.imm32(instr, 3).unwrap_or(0) as u32;
+                    let frame = &mut stack[top_idx];
+                    self.run_delete_shadowed_upvalue_reg(
+                        context, frame, dst, name_idx, uv_idx, eval_depth,
+                    )?;
                     continue;
                 }
                 Op::LoadDynamic => {

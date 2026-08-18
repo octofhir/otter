@@ -151,6 +151,77 @@ pub fn eval_env_lookup_chain(
     None
 }
 
+/// Find `name` within at most `depth` physical records starting at `env`.
+///
+/// The shadowed-upvalue opcodes carry a compiler-computed bound: only eval
+/// records strictly inside the captured binding's declaration owner may
+/// shadow it, so the probe must not walk past them into outer scopes.
+#[must_use]
+pub fn eval_env_lookup_chain_bounded(
+    heap: &otter_gc::GcHeap,
+    env: EvalEnvHandle,
+    name: &str,
+    depth: u32,
+) -> Option<UpvalueCell> {
+    let mut current = Some(env);
+    let mut remaining = depth;
+    while let Some(handle) = current {
+        if remaining == 0 {
+            return None;
+        }
+        remaining -= 1;
+        let (found, parent) = heap.read_payload(handle, |body| {
+            let found = body
+                .names
+                .iter()
+                .position(|candidate| candidate == name)
+                .map(|index| body.cells[index]);
+            (found, body.parent)
+        });
+        if found.is_some() {
+            return found;
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Remove `name` from the nearest record within the bounded prefix.
+///
+/// Mirrors [`eval_env_delete_chain`] with the same compiler-computed bound as
+/// [`eval_env_lookup_chain_bounded`]: a binding declared outside the prefix is
+/// left intact and the delete reports `false`.
+pub fn eval_env_delete_chain_bounded(
+    heap: &mut otter_gc::GcHeap,
+    env: EvalEnvHandle,
+    name: &str,
+    depth: u32,
+) -> bool {
+    let mut current = Some(env);
+    let mut remaining = depth;
+    while let Some(handle) = current {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        let (removed, parent) = heap.with_payload(handle, |body| {
+            match body.names.iter().position(|n| n == name) {
+                Some(i) => {
+                    body.names.remove(i);
+                    body.cells.remove(i);
+                    (true, None)
+                }
+                None => (false, body.parent),
+            }
+        });
+        if removed {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 /// Insert a fresh binding into exactly the current record.
 ///
 /// Returns `false` without modifying the record when `name` already belongs to

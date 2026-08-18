@@ -14,7 +14,7 @@
 //! # See also
 //! - `crate::template::plan`, the machine-code consumer of these rules.
 
-use otter_bytecode::{Op, Operand};
+use otter_bytecode::{Op, Operand, opcode_schema::opcode_schema};
 use otter_vm::{
     JitCompileSnapshot,
     native_abi::{NO_FRAME_STATE, SafepointId, SafepointRecord},
@@ -160,7 +160,31 @@ pub(crate) struct EvalOperands {
     pub(crate) flags: i32,
 }
 
+/// Schema-derived boxed-value inputs and normal result of one binding access.
+///
+/// Immutable names, upvalue indices, strictness flags, and module identities
+/// stay in the published instruction. Generated code passes only these boxed
+/// values to the committed binding boundary; the VM decodes the exact site
+/// from the native frame's function/PC identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BindingValueOperands {
+    pub(crate) result: Option<u16>,
+    pub(crate) values: [Option<u16>; 2],
+}
+
+/// Boxed-value input of one global declaration/initialization operation.
+///
+/// Declaration metadata is site-owned just like binding metadata, but it is a
+/// distinct semantic family: declaration instantiation must never be confused
+/// with an ordinary binding read or write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalDeclarationOperands {
+    pub(crate) values: [Option<u16>; 2],
+}
+
 /// Typed named-import binding operands (`dst`, module URL, exported name).
+/// Module live bindings retain their existing typed module boundary; they are
+/// not part of the schema-owned lexical/global/dynamic binding family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImportBindingOperands {
     pub(crate) dst: u16,
@@ -183,14 +207,6 @@ pub(crate) struct PropertyStoreOperands {
     pub(crate) name: u32,
     pub(crate) value: u16,
     pub(crate) scratch: u16,
-}
-
-/// Typed captured-binding transfer operands. `value` is the load destination
-/// or store source according to the opcode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UpvalueOperands {
-    pub(crate) value: u16,
-    pub(crate) index: i32,
 }
 
 /// Range into a plan-owned homogeneous operand side buffer.
@@ -232,8 +248,8 @@ pub(crate) struct CallWithThisOperands {
     pub(crate) arguments: OperandRange,
 }
 
-/// Typed global-store operands. `extra` carries the strictness flag for
-/// `StoreGlobalBinding` and the `exists` register for `StoreGlobalChecked`.
+/// Typed register plus two scalar fields for unrelated fixed-arity helpers.
+/// Schema-owned binding/declaration operations never use this carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GlobalStoreOperands {
     pub(crate) value: u16,
@@ -315,14 +331,6 @@ pub(crate) struct ConditionalBranchOperands {
     pub(crate) condition: u16,
 }
 
-/// Dynamic-eval-aware captured binding read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ShadowedUpvalueOperands {
-    pub(crate) dst: u16,
-    pub(crate) name: u32,
-    pub(crate) index: i32,
-}
-
 /// Pre-resolved handlers installed by `EnterTry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExceptionRegionOperands {
@@ -354,10 +362,11 @@ enum LoweredOperands {
     ElementStore(ElementStoreOperands),
     Increment(IncrementOperands),
     Eval(EvalOperands),
+    BindingValue(BindingValueOperands),
+    GlobalDeclaration(GlobalDeclarationOperands),
     ImportBinding(ImportBindingOperands),
     PropertyLoad(PropertyLoadOperands),
     PropertyStore(PropertyStoreOperands),
-    Upvalue(UpvalueOperands),
     NewArray(NewArrayOperands),
     MakeClosure(MakeClosureOperands),
     Call(CallOperands),
@@ -372,7 +381,6 @@ enum LoweredOperands {
     MakeClass(MakeClassOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
-    ShadowedUpvalue(ShadowedUpvalueOperands),
     ExceptionRegion(ExceptionRegionOperands),
     JumpViaFinally(JumpViaFinallyOperands),
 }
@@ -479,6 +487,24 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn binding_value_operands(self) -> Result<BindingValueOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::BindingValue(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered binding-value operands")),
+        }
+    }
+
+    pub(crate) fn global_declaration_operands(
+        self,
+    ) -> Result<GlobalDeclarationOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::GlobalDeclaration(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape(
+                "lowered global-declaration operands",
+            )),
+        }
+    }
+
     pub(crate) fn import_binding_operands(self) -> Result<ImportBindingOperands, Unsupported> {
         match self.operands {
             LoweredOperands::ImportBinding(operands) => Ok(operands),
@@ -497,13 +523,6 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::PropertyStore(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered property-store operands")),
-        }
-    }
-
-    pub(crate) fn upvalue_operands(self) -> Result<UpvalueOperands, Unsupported> {
-        match self.operands {
-            LoweredOperands::Upvalue(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("lowered upvalue operands")),
         }
     }
 
@@ -611,15 +630,6 @@ impl LoweredInstr {
         }
     }
 
-    pub(crate) fn shadowed_upvalue_operands(self) -> Result<ShadowedUpvalueOperands, Unsupported> {
-        match self.operands {
-            LoweredOperands::ShadowedUpvalue(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape(
-                "lowered LoadShadowedUpvalue operands",
-            )),
-        }
-    }
-
     pub(crate) fn exception_region_operands(self) -> Result<ExceptionRegionOperands, Unsupported> {
         match self.operands {
             LoweredOperands::ExceptionRegion(operands) => Ok(operands),
@@ -679,6 +689,49 @@ impl BaselinePlan {
             }
 
             let operands = instr.operand_view(code_block);
+            let schema = opcode_schema(op);
+            if let Some(binding) = schema.binding {
+                let value_operands = binding.value_operands();
+                instructions.push(LoweredInstr {
+                    byte_pc: instr.byte_pc,
+                    instruction_pc: pc,
+                    op,
+                    operands: LoweredOperands::BindingValue(BindingValueOperands {
+                        result: binding
+                            .result_operand()
+                            .map(|position| reg(operands, usize::from(position)))
+                            .transpose()?,
+                        values: [
+                            value_operands[0]
+                                .map(|position| reg(operands, usize::from(position)))
+                                .transpose()?,
+                            value_operands[1]
+                                .map(|position| reg(operands, usize::from(position)))
+                                .transpose()?,
+                        ],
+                    }),
+                });
+                continue;
+            }
+            if let Some(declaration) = schema.global_declaration {
+                let value_operands = declaration.value_operands();
+                instructions.push(LoweredInstr {
+                    byte_pc: instr.byte_pc,
+                    instruction_pc: pc,
+                    op,
+                    operands: LoweredOperands::GlobalDeclaration(GlobalDeclarationOperands {
+                        values: [
+                            value_operands[0]
+                                .map(|position| reg(operands, usize::from(position)))
+                                .transpose()?,
+                            value_operands[1]
+                                .map(|position| reg(operands, usize::from(position)))
+                                .transpose()?,
+                        ],
+                    }),
+                });
+                continue;
+            }
             let operands = match op {
                 Op::EnterTry => {
                     let region = instr
@@ -707,32 +760,15 @@ impl BaselinePlan {
                 }
                 Op::NewObject
                 | Op::LoadThis
-                | Op::LoadGlobalThis
                 | Op::LoadNewTarget
                 | Op::CollectRest
                 | Op::CollectArguments => LoweredOperands::Destination(DestinationOperands {
                     dst: reg(operands, 0)?,
                 }),
-                Op::StoreGlobalBinding => LoweredOperands::GlobalStore(GlobalStoreOperands {
-                    value: reg(operands, 0)?,
-                    name: const_index(operands, 1)?,
-                    extra: imm32(operands, 2)? as u32,
-                }),
-                Op::StoreGlobalChecked => LoweredOperands::GlobalStore(GlobalStoreOperands {
-                    value: reg(operands, 0)?,
-                    name: const_index(operands, 1)?,
-                    extra: u32::from(reg(operands, 2)?),
-                }),
                 Op::MakeFunction
                 | Op::LoadString
                 | Op::LoadRegExp
                 | Op::LoadBigInt
-                | Op::LoadGlobalOrThrow
-                | Op::LoadGlobalOrUndefined
-                | Op::DeleteDynamic
-                | Op::LoadDynamic
-                | Op::StoreDynamic
-                | Op::TypeofDynamic
                 | Op::MathLoad
                 | Op::SymbolLoad
                 | Op::TemporalLoad
@@ -1026,30 +1062,6 @@ impl BaselinePlan {
                     name: 0,
                     extra: 0,
                 }),
-                Op::DeclareGlobalVar | Op::DeclareGlobalLex | Op::ValidateGlobalDecl => {
-                    LoweredOperands::GlobalStore(GlobalStoreOperands {
-                        value: 0,
-                        name: const_index(operands, 0)?,
-                        extra: imm32(operands, 1)? as u32,
-                    })
-                }
-                Op::DefineGlobalVar => LoweredOperands::GlobalStore(GlobalStoreOperands {
-                    value: reg(operands, 1)?,
-                    name: const_index(operands, 0)?,
-                    extra: 0,
-                }),
-                Op::DefineGlobalFunction => LoweredOperands::GlobalStore(GlobalStoreOperands {
-                    value: reg(operands, 1)?,
-                    name: const_index(operands, 0)?,
-                    extra: imm32(operands, 2)? as u32,
-                }),
-                Op::InitGlobalLex | Op::GlobalBindingExists => {
-                    LoweredOperands::GlobalStore(GlobalStoreOperands {
-                        value: reg(operands, 0)?,
-                        name: const_index(operands, 1)?,
-                        extra: 0,
-                    })
-                }
                 Op::ClassCheck => LoweredOperands::GlobalStore(GlobalStoreOperands {
                     value: reg(operands, 1)?,
                     name: imm32(operands, 0)? as u32,
@@ -1066,19 +1078,6 @@ impl BaselinePlan {
                     value: reg(operands, 2)?,
                     scratch: reg(operands, 3)?,
                 }),
-                Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked => {
-                    LoweredOperands::Upvalue(UpvalueOperands {
-                        value: reg(operands, 0)?,
-                        index: imm32(operands, 1)?,
-                    })
-                }
-                Op::LoadShadowedUpvalue => {
-                    LoweredOperands::ShadowedUpvalue(ShadowedUpvalueOperands {
-                        dst: reg(operands, 0)?,
-                        name: const_index(operands, 1)?,
-                        index: imm32(operands, 2)?,
-                    })
-                }
                 Op::Add
                 | Op::Sub
                 | Op::Mul

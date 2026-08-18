@@ -30,6 +30,7 @@
 //! - [`crate::jit::VmRuntimeActivation`] owns the opaque entry-lifetime record.
 //! - [`crate::active_frame`] validates the machine-published frame windows.
 
+mod bindings;
 mod class_ops;
 mod committed_values;
 mod control;

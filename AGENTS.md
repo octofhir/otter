@@ -372,10 +372,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     budget cost, and exact complete-pipeline rejection when a candidate cannot
     be spliced; `compilePrepared` reports `directConstructs`, `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
-    `globalLoadSites` counts analyzed global reads, `globalLexicalLoads`
-    counts permanent global-declarative cells, `stringConstantCells` counts
-    eagerly prepared stable traced literal cells,
-    and `globalObjectLoads` counts guarded global-object slots available for direct reads. Capture is
+  `bindingSites` counts schema-typed global, captured, dynamic, and shadowed
+  binding accesses; `bindingHitProofs` counts stable global-declarative cells
+  and guarded global-object slots available for generated hits;
+  `stringConstantCells` counts eagerly prepared stable traced literal cells. Capture is
     default-off and bounded to 16,384 events per top-level run; `truncated`
     and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still
@@ -400,12 +400,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - Direct global-lexical reads expose `globalLexicalCell` relocations keyed by
     byte PC. Exact addresses are redacted; the generated hit reads the live
     permanent cell and a TDZ hole retains the canonical throwing transition.
-    Guarded global-object reads prove the realm epoch, dictionary shape, and
-    property slot before reading the live value. Scalar Machine IR names these
-    non-allocating operations `machineGlobalLexicalLoad` and
-    `machineGlobalObjectLoad`; every failed TDZ, epoch, shape, or slab proof
-    exact-deoptimizes at the original `LoadGlobalOrThrow` before publishing its
-    result. In a completely generated,
+  Guarded global-object accesses prove the realm epoch, dictionary shape,
+  descriptor flags, and property slot before reading or writing the live value.
+  Scalar Machine IR exposes the whole binding family as
+  `machineBindingGuard`, `machineBindingHit`, `machineBindingCold`, and
+  `machineBindingJoin`. A failed TDZ, const, epoch, shape, slab, accessor,
+  Proxy, or unresolved proof enters the single committed boxed-value sibling;
+  it never deoptimizes and replays the binding operation. In a completely generated,
     non-reentrant outermost loop, `loopInvariantGlobalObjectLoadCache` marks a
     native-stack slot that retains the live property address after the first
     proof. It never caches the loaded value; entry, OSR, and every cold path
@@ -431,8 +432,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Machine direct data access is attributed by `machineElementLoad` /
     `machineElementStore`, `machinePackedDoubleElementLoad` /
     `machinePackedDoubleElementStore`, and `machinePropertyLoad` /
-    `machinePropertyStore`, each with `bytePc`; direct captured-cell reads use
-    `machineUpvalueLoad`, while prepared literals use
+  `machinePropertyStore`, each with `bytePc`; direct captured/global cell reads
+  and writes use the `machineBinding*` family, while prepared literals use
     `machineStringConstantLoad`. Ordinary packed-double Array operations prove the
     exact exotic and physical-kind guards, keep the element payload in Float64
     SSA, and use an exact Float64-to-Uint32 index check. Integral values and

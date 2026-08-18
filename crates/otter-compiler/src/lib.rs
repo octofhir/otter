@@ -1,9 +1,8 @@
-//! AST → bytecode lowering with full foundation TS erasure.
+//! OXC AST to Otter bytecode lowering for scripts, modules, and eval.
 //!
-//! The compiler walks the OXC AST produced by `otter-syntax` and
-//! emits an [`otter_bytecode::BytecodeModule`]. After task 08 the
-//! frontend handles the foundation TypeScript subset documented in the
-//! mdBook frontend chapter:
+//! The compiler walks the AST produced by `otter-syntax`, erases
+//! TypeScript-only syntax where it has no runtime meaning, and emits
+//! an [`otter_bytecode::BytecodeModule`]. Supported TypeScript forms include:
 //!
 //! - **Erased silently** (compile to nothing): `interface`, `type`
 //!   aliases, `declare` statements/functions, `import type`,
@@ -15,16 +14,14 @@
 //!   `namespace` (with runtime members), decorators. These return
 //!   [`CompileError::TypeScriptUnsupported`].
 //!
-//! Code surface accepted at this slice: empty scripts, `undefined;`
-//! statements, plus any of the above wrapped around them. Slice
-//! tasks `09`–`13` add real value loading, control flow, and calls.
-//!
 //! # Contents
 //! - [`compile_script_source`] / [`compile_script_source_to_module`] — script
 //!   source entry points.
 //! - [`compile_script_program`] — borrowed-AST script lowering.
 //! - [`compile_module_program`] / [`compile_module_program_to_module`] —
 //!   borrowed-AST ES-module lowering.
+//! - [`compile_eval_source`] — direct/indirect eval lowering with explicit
+//!   caller binding metadata.
 //! - [`CompileError`] — concrete error enum (`Syntax`,
 //!   `TypeScriptUnsupported`, `Unsupported`).
 //! - [`unwrap_ts_expr`] — strip TS-erasable expression wrappers.
@@ -36,6 +33,11 @@
 //!   plan §M2).
 //! - TypeScript erasure preserves the **original** spans — we never
 //!   re-emit JS source and re-parse.
+//! - Binding bytecode is emitted from the canonical typed opcode schema;
+//!   direct-eval passthrough captures are never reported as new caller bindings.
+//!
+//! # See also
+//! - [`otter_bytecode::opcode_schema`] for binding-family wire semantics.
 //!
 
 mod annex_b;
@@ -877,6 +879,393 @@ mod tests {
             "inner should StoreUpvalueChecked: {:?}",
             inner.code
         );
+    }
+
+    #[test]
+    fn leaking_eval_uses_one_shadowed_capture_family() {
+        let module = compile_script_src(
+            r#"
+function outer() {
+  let captured = 1;
+  function hot() {
+    eval("");
+    captured = 2;
+    captured += 3;
+    captured ||= 4;
+    delete captured;
+    return function descendant() { return captured; };
+  }
+  return hot;
+}
+"#,
+        );
+        let hot = module
+            .functions
+            .iter()
+            .find(|function| function.name == "hot")
+            .expect("hot function");
+        assert!(
+            hot.code
+                .iter()
+                .any(|instruction| instruction.op == Op::LoadShadowedUpvalue),
+            "compound/logical reads must probe eval shadow: {:?}",
+            hot.code
+        );
+        assert_eq!(
+            hot.code
+                .iter()
+                .filter(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+                .count(),
+            3,
+            "plain, compound, and logical stores share the typed family"
+        );
+        assert!(
+            hot.code
+                .iter()
+                .any(|instruction| instruction.op == Op::DeleteShadowedUpvalue),
+            "delete must retain the captured fallback while deleting eval hits"
+        );
+
+        let descendant = module
+            .functions
+            .iter()
+            .find(|function| function.name == "descendant")
+            .expect("descendant function");
+        assert!(
+            descendant
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::LoadShadowedUpvalue),
+            "a descendant closure inherits the leaking eval chain"
+        );
+        for instruction in hot.code.iter().filter(|instruction| {
+            matches!(
+                instruction.op,
+                Op::LoadShadowedUpvalue
+                    | Op::StoreShadowedUpvalueChecked
+                    | Op::DeleteShadowedUpvalue
+            )
+        }) {
+            let encoded = match hot.code.operand(instruction, 3) {
+                Some(Operand::Imm32(encoded)) => encoded,
+                other => panic!("shadow depth/policy must be an immediate: {other:?}"),
+            };
+            let depth = if instruction.op == Op::StoreShadowedUpvalueChecked {
+                otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(encoded)
+                    .expect("valid store policy")
+                    .eval_depth
+            } else {
+                u32::try_from(encoded).expect("positive eval depth")
+            };
+            assert_eq!(depth, 1);
+        }
+    }
+
+    #[test]
+    fn shadow_prefix_stops_at_the_captured_declaration_owner() {
+        let module = compile_script_src(
+            r#"
+function outer() {
+  eval("var x = 1");
+  return function middle() {
+    let x = 2;
+    return function inner() { eval("var y = 0"); x = 3; delete x; return x; };
+  };
+}
+"#,
+        );
+        let inner = module
+            .functions
+            .iter()
+            .find(|function| function.name == "inner")
+            .expect("inner function");
+        let shadowed = inner
+            .code
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction.op,
+                    Op::LoadShadowedUpvalue
+                        | Op::StoreShadowedUpvalueChecked
+                        | Op::DeleteShadowedUpvalue
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shadowed.len(),
+            3,
+            "read, write, and delete share the prefix"
+        );
+        for instruction in shadowed {
+            let encoded = match inner.code.operand(instruction, 3) {
+                Some(Operand::Imm32(encoded)) => encoded,
+                other => panic!("shadow depth/policy must be an immediate: {other:?}"),
+            };
+            let depth = if instruction.op == Op::StoreShadowedUpvalueChecked {
+                otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(encoded)
+                    .expect("valid store policy")
+                    .eval_depth
+            } else {
+                u32::try_from(encoded).expect("positive eval depth")
+            };
+            assert_eq!(
+                depth, 1,
+                "only inner's eval record is inside middle's declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_metadata_adopts_only_body_declared_passthrough_names() {
+        let caller = [EvalCallerBinding {
+            name: "x".to_string(),
+            lexical: false,
+            captured: true,
+            is_const: false,
+            fn_self_name: false,
+        }];
+        let compile = |source| {
+            compile_eval_source(
+                source,
+                SyntaxSourceKind::TypeScript,
+                "eval.ts",
+                false,
+                false,
+                Some(&caller),
+                true,
+                false,
+                false,
+            )
+            .expect("direct eval compiles")
+        };
+
+        let unrelated = compile("var y = 0; x;");
+        let x = unrelated
+            .main()
+            .direct_eval_bindings
+            .iter()
+            .find(|binding| binding.name == "x")
+            .expect("passthrough x metadata");
+        assert!(
+            x.captured,
+            "an unrelated declaration must not make captured x adoptable"
+        );
+        let y = unrelated
+            .main()
+            .direct_eval_bindings
+            .iter()
+            .find(|binding| binding.name == "y")
+            .expect("body var y metadata");
+        assert!(!y.captured, "the body-owned var must remain adoptable");
+
+        let declared = compile("var x; x;");
+        let x = declared
+            .main()
+            .direct_eval_bindings
+            .iter()
+            .find(|binding| binding.name == "x")
+            .expect("body-declared x metadata");
+        assert!(
+            !x.captured,
+            "a real body var declaration must replace the passthrough"
+        );
+
+        let lexical = compile("let x = 2; x;");
+        let x = lexical
+            .main()
+            .direct_eval_bindings
+            .iter()
+            .find(|binding| binding.name == "x")
+            .expect("body lexical x metadata");
+        assert!(!x.captured, "a body lexical must never be a passthrough");
+        assert!(x.lexical, "a body lexical must remain non-adoptable");
+    }
+
+    #[test]
+    fn shadow_depth_counts_strict_physical_records_inside_owner() {
+        let module = compile_script_src(
+            r#"
+function owner() {
+  let x = 1;
+  return function sloppy() {
+    eval("");
+    return function strictLeaf() {
+      "use strict";
+      eval("");
+      x = 2;
+      return x;
+    };
+  };
+}
+"#,
+        );
+        let leaf = module
+            .functions
+            .iter()
+            .find(|function| function.name == "strictLeaf")
+            .expect("strict leaf");
+        for instruction in leaf.code.iter().filter(|instruction| {
+            matches!(
+                instruction.op,
+                Op::LoadShadowedUpvalue | Op::StoreShadowedUpvalueChecked
+            )
+        }) {
+            let encoded = match leaf.code.operand(instruction, 3) {
+                Some(Operand::Imm32(encoded)) => encoded,
+                other => panic!("shadow depth/policy must be an immediate: {other:?}"),
+            };
+            let depth = if instruction.op == Op::StoreShadowedUpvalueChecked {
+                otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(encoded)
+                    .expect("valid store policy")
+                    .eval_depth
+            } else {
+                u32::try_from(encoded).expect("positive eval depth")
+            };
+            assert_eq!(
+                depth, 2,
+                "strict and sloppy direct-eval frames both occupy physical records"
+            );
+        }
+    }
+
+    #[test]
+    fn shadowed_const_store_carries_only_schema_fallback() {
+        use otter_bytecode::opcode_schema::{ShadowedUpvalueFallback, ShadowedUpvalueStorePolicy};
+
+        let module = compile_script_src(
+            r#"
+function outer() {
+  const captured = 1;
+  return function hot() { eval(""); captured = 2; };
+}
+"#,
+        );
+        let hot = module
+            .functions
+            .iter()
+            .find(|function| function.name == "hot")
+            .expect("hot function");
+        let store = hot
+            .code
+            .iter()
+            .find(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+            .expect("shadowed const store");
+        let policy = match hot.code.operand(store, 3) {
+            Some(Operand::Imm32(encoded)) => {
+                ShadowedUpvalueStorePolicy::from_imm32(encoded).expect("valid store policy")
+            }
+            other => panic!("shadow policy must be an immediate: {other:?}"),
+        };
+        assert_eq!(policy.eval_depth, 1);
+        assert_eq!(policy.fallback, ShadowedUpvalueFallback::ImmutableThrow);
+    }
+
+    #[test]
+    fn named_function_self_uses_shadow_family_inside_sloppy_eval_frame() {
+        use otter_bytecode::opcode_schema::{ShadowedUpvalueFallback, ShadowedUpvalueStorePolicy};
+
+        let module = compile_script_src(
+            r#"
+(function selfName() {
+  eval("var selfName = 3");
+  selfName = 4;
+  selfName += 1;
+  selfName ||= 6;
+  selfName++;
+  delete selfName;
+  return selfName;
+})();
+"#,
+        );
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "selfName")
+            .expect("named function expression");
+        assert!(
+            function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::LoadShadowedUpvalue)
+        );
+        assert!(
+            function
+                .code
+                .iter()
+                .any(|instruction| instruction.op == Op::DeleteShadowedUpvalue)
+        );
+        let stores = function
+            .code
+            .iter()
+            .filter(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+            .collect::<Vec<_>>();
+        assert!(
+            stores.len() >= 4,
+            "assignment family must share shadow stores"
+        );
+        for store in stores {
+            let policy = match function.code.operand(store, 3) {
+                Some(Operand::Imm32(encoded)) => {
+                    ShadowedUpvalueStorePolicy::from_imm32(encoded).expect("valid store policy")
+                }
+                other => panic!("shadow policy must be an immediate: {other:?}"),
+            };
+            assert_eq!(policy.eval_depth, 1);
+            assert_eq!(policy.fallback, ShadowedUpvalueFallback::ImmutableIgnore);
+        }
+    }
+
+    #[test]
+    fn rhs_eval_binding_keeps_store_resolution_after_rhs() {
+        let module = compile_script_src(
+            r#"
+function outer() {
+  let captured = 1;
+  return function hot() {
+    captured = eval("var captured; 2");
+    captured += eval("var captured; 3");
+    captured ||= eval("var captured; 4");
+    return captured;
+  };
+}
+"#,
+        );
+        let hot = module
+            .functions
+            .iter()
+            .find(|function| function.name == "hot")
+            .expect("hot function");
+        assert_eq!(
+            hot.code
+                .iter()
+                .filter(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+                .count(),
+            3,
+            "all assignment forms resolve the eval shadow at their store site"
+        );
+    }
+
+    #[test]
+    fn dynamic_store_site_owns_strict_global_fallback() {
+        let module = compile_script_src(
+            r#"
+function outer() {
+  eval("");
+  return function child() { "use strict"; missing = 1; };
+}
+"#,
+        );
+        let child = module
+            .functions
+            .iter()
+            .find(|function| function.name == "child")
+            .expect("strict child");
+        let store = child
+            .code
+            .iter()
+            .find(|instruction| instruction.op == Op::StoreDynamic)
+            .expect("dynamic store");
+        assert_eq!(child.code.operand(store, 2), Some(Operand::Imm32(1)));
     }
 
     #[test]

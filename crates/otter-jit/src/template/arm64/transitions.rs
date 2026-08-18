@@ -2,8 +2,6 @@
 //!
 //! # Contents
 //! - Reentrant transition emitters completing whole opcodes in the VM.
-//! - Direct reads from baked, non-moving global lexical cells and guarded
-//!   global-object property records.
 //! - The allocating call-packet emitter publishing a concrete safepoint.
 //!
 //! # Invariants
@@ -20,12 +18,6 @@
 //!   reuse — operands re-load from the rooted frame window.
 //! - Runtime entries, cage bases, and plan-owned operand slices are recorded
 //!   with stable semantic identities during the existing emission pass.
-//! - Baked global lexical cells are permanent old-space objects; their live
-//!   value is read on every execution, while a TDZ hole uses the canonical
-//!   throwing transition.
-//! - A baked global-object load proves the realm epoch, dictionary shape, and
-//!   property slot before reading the current value; any mismatch re-enters
-//!   the canonical global lookup.
 //!
 //! # See also
 //! - `crates/otter-vm/src/native_abi/runtime_stubs.rs` — the authoritative
@@ -39,8 +31,7 @@ use super::ic_probe::{
     DenseIndexForm, element_access_for, emit_element_address, emit_element_read, emit_element_write,
 };
 use super::values::{
-    emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_slab_base,
-    emit_store_reg,
+    emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_store_reg,
 };
 pub(super) use crate::entry::TransitionTable;
 use otter_vm::JitCompileSnapshot;
@@ -50,9 +41,7 @@ use crate::artifact::relocation::{
 };
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
-    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
-    NATIVE_FRAME_UPVALUE_BASE_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
-    VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
 };
 use crate::template::TemplateTail;
 
@@ -208,116 +197,6 @@ pub(super) fn emit_load_regexp(
         threw,
         fatal,
     );
-}
-
-pub(super) fn emit_load_global(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    view: &JitCompileSnapshot,
-    dst: u16,
-    name: u32,
-    code_block_id: u32,
-    byte_pc: u32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let miss = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    if let Some(target) = view.global_lexical_loads.get(&byte_pc)
-        && let Some(cell_addr) = view.cage_base.checked_add(target.cell_offset as usize)
-    {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            13,
-            cell_addr as u64,
-            RelocationTarget::GlobalLexicalCell {
-                function_id: view.code_block.id,
-                byte_pc,
-            },
-        );
-        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
-        emit_load_u64(ops, 11, VALUE_HOLE);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp x9, x11
-            ; b.eq =>miss
-        );
-        emit_store_reg(ops, 9, dst)?;
-        dynasm!(ops ; .arch aarch64 ; b =>done);
-    } else if let Some(target) = view.global_object_loads.get(&byte_pc) {
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x14, [x20, THREAD_OFFSET]
-            ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
-            ; cbz x14, =>miss
-            ; ldr x15, [x14]
-        );
-        emit_load_u64(ops, 11, target.global_lexical_epoch);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp x15, x11
-            ; b.ne =>miss
-            ; ldr x14, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET]
-            ; ldr w12, [x14]
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            14,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x14, x12
-            ; ldr w14, [x13, view.object_shape_byte]
-        );
-        if target.dictionary {
-            dynasm!(ops
-                ; .arch aarch64
-                ; cbnz w14, =>miss
-                ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
-            );
-            emit_load_u64(ops, 11, target.shape);
-            dynasm!(ops
-                ; .arch aarch64
-                ; cmp x14, x11
-                ; b.ne =>miss
-            );
-        } else {
-            emit_load_u64(ops, 11, target.shape);
-            dynasm!(ops
-                ; .arch aarch64
-                ; cmp w14, w11
-                ; b.ne =>miss
-            );
-        }
-        emit_slab_base(ops, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>miss
-            ; ldr x9, [x13, target.value_byte]
-        );
-        emit_store_reg(ops, 9, dst)?;
-        dynasm!(ops ; .arch aarch64 ; b =>done);
-    }
-    dynasm!(ops ; .arch aarch64 ; =>miss);
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_load_u64(ops, 2, u64::from(name));
-    emit_load_u64(ops, 3, u64::from(code_block_id));
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_LOAD_GLOBAL),
-        abi::STUB_JIT_LOAD_GLOBAL,
-        threw,
-        fatal,
-    );
-    dynasm!(ops ; .arch aarch64 ; =>done);
-    Ok(())
 }
 
 pub(super) fn emit_load_builtin_error(
@@ -582,95 +461,6 @@ pub(super) fn emit_store_element(
     );
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
-}
-
-pub(super) fn emit_load_upvalue(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    view: &JitCompileSnapshot,
-    dst: u16,
-    index: i32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let miss = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    // Inline captured-binding read: the spine holds 4-byte compressed cell
-    // handles, and the cell's captured Value sits at a fixed offset. Only a
-    // TDZ hole misses — the stub raises the ReferenceError with the right
-    // identity. Nothing here allocates.
-    if view.cage_base != 0 && index >= 0 {
-        let spine_offset = (index as u32) * 4;
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x9, [x21, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-            ; cbz x9, =>miss
-            ; ldr w9, [x9, spine_offset]
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            13,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x13, x9
-            ; ldr x9, [x13, view.upvalue_value_byte]
-        );
-        emit_load_u64(ops, 11, crate::entry::VALUE_HOLE);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp x9, x11
-            ; b.eq =>miss
-        );
-        emit_store_reg(ops, 9, dst)?;
-        dynasm!(ops ; .arch aarch64 ; b =>done);
-    }
-    dynasm!(ops ; .arch aarch64 ; =>miss);
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_load_u64(ops, 2, u64::from(index as u32));
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_LOAD_UPVALUE),
-        abi::STUB_JIT_LOAD_UPVALUE,
-        threw,
-        fatal,
-    );
-    dynasm!(ops ; .arch aarch64 ; =>done);
-    Ok(())
-}
-
-pub(super) fn emit_store_upvalue(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    src: u16,
-    index: i32,
-    checked: bool,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, src as u32);
-    emit_load_u64(ops, 2, u64::from(index as u32));
-    let descriptor = if checked {
-        abi::STUB_JIT_STORE_UPVALUE_CHECKED
-    } else {
-        abi::STUB_JIT_STORE_UPVALUE
-    };
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(descriptor),
-        descriptor,
-        threw,
-        fatal,
-    );
 }
 
 /// Interpreter-completing `+` delegate for coercive operands.

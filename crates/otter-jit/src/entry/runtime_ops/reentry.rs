@@ -7,8 +7,9 @@
 //! - Fast allocating and observable base-constructor receiver preparation,
 //!   plus return substitution.
 //! - Stack-owned built-in Array iterator collection and spread-result append.
-//! - Fixed committed boxed-value completion for object-protocol and scalar
-//!   families, plus typed value-load/class operations.
+//! - Fixed committed boxed-value completion for binding, declaration,
+//!   object-protocol, and scalar families, plus typed value-load/class
+//!   operations.
 //! - Pure-exception routing for Template propagation and local handlers.
 //! - Reentrant equality, typed numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
@@ -16,13 +17,13 @@
 //! # Invariants
 //! Every entry receives a live JIT context whose canonical
 //! [`NativeFrame`](otter_vm::native_abi::NativeFrame) publishes frame/register
-//! roots for the entire call. Object-protocol/scalar entries receive only boxed
-//! values; the published function/PC selects a typed operation before semantics
-//! begin. Their JavaScript throws return as pure exception values, while only
-//! structural `Fatal` failures remain parked. Numeric/load/class opcode
-//! words are decoded exactly once at their ABI edge. Built-in Array spread
-//! collection accepts both materialized and stack-owned frames; observable
-//! iterator overrides bail before effects.
+//! roots for the entire call. Binding/declaration/object-protocol/scalar entries
+//! receive only boxed values; the published function/PC selects a typed
+//! operation before semantics begin. Their JavaScript throws return as pure
+//! exception values, while only structural `Fatal` failures remain parked.
+//! Numeric/load/class opcode words are decoded exactly once at their ABI edge.
+//! Built-in Array spread collection accepts both materialized and stack-owned
+//! frames; observable iterator overrides bail before effects.
 //!
 //! # See also
 //! - `super::super::abi` — machine-visible entry context.
@@ -30,9 +31,11 @@
 
 use otter_bytecode::Op;
 use otter_vm::{
-    ClassRuntimeOp, CommittedValueError, JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp,
-    Value, ValueLoadRuntimeOp, VmError,
-    native_abi::{NativeResultPair, NativeResultStatus},
+    JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, Value, VmError,
+    native_abi::{
+        ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome, NativeResultPair,
+        NativeResultStatus, ValueLoadRuntimeOp,
+    },
 };
 
 use super::super::JitCtx;
@@ -494,10 +497,8 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
                 Err(err) => Err(err),
             };
             return match result {
-                Ok(otter_vm::IteratorRuntimeOutcome::Completed) => {
-                    NativeResultStatus::Success as u64
-                }
-                Ok(otter_vm::IteratorRuntimeOutcome::Bail) => NativeResultStatus::SideExit as u64,
+                Ok(IteratorRuntimeOutcome::Completed) => NativeResultStatus::Success as u64,
+                Ok(IteratorRuntimeOutcome::Bail) => NativeResultStatus::SideExit as u64,
                 Err(err) => {
                     park_jit_error(ctx, err);
                     NativeResultStatus::Throw as u64
@@ -551,30 +552,6 @@ pub(crate) extern "C" fn jit_static_call_op_stub(
         method,
         packed_args,
     ) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
-}
-
-/// Complete one dynamic control-family opcode (`LoadShadowedUpvalue`).
-/// `Success` commits, `SideExit` is pre-effect, and `Throw` reports a parked
-/// error.
-pub(crate) extern "C" fn jit_control_op_stub(
-    ctx: *mut JitCtx,
-    opcode: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = ctx
-        .runtime_call()
-        .and_then(|mut runtime| runtime.control_op(opcode as u8, arg0, arg1, arg2));
-    match result {
         Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1005,9 +982,49 @@ pub(crate) extern "C" fn jit_scalar_value_stub(
     committed_value_result(ctx, result)
 }
 
-/// Complete one `delete` opcode (`DeleteProperty`, `DeleteElement`,
-/// `DeleteDynamic`). Returns committed `Success`, pre-effect `SideExit`, or
-/// parked `Throw`.
+/// Complete the exact published schema-owned binding access from two boxed
+/// values. Function/PC identity selects the semantic operation and immutable
+/// name/index/flag operands; this boundary never returns a replay request.
+pub(crate) extern "C" fn jit_binding_value_stub(
+    ctx: *mut JitCtx,
+    value0_bits: u64,
+    value1_bits: u64,
+) -> NativeResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = ctx
+        .runtime_call()
+        .map_err(CommittedValueError::Fatal)
+        .and_then(|mut runtime| {
+            runtime.binding_values(Value::from_bits(value0_bits), Value::from_bits(value1_bits))
+        });
+    committed_value_result(ctx, result)
+}
+
+/// Complete the exact published schema-owned global declaration or
+/// initialization from two boxed values. Declarations remain a separate
+/// semantic family even though they share the committed physical ABI.
+pub(crate) extern "C" fn jit_global_declaration_value_stub(
+    ctx: *mut JitCtx,
+    value0_bits: u64,
+    value1_bits: u64,
+) -> NativeResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = ctx
+        .runtime_call()
+        .map_err(CommittedValueError::Fatal)
+        .and_then(|mut runtime| {
+            runtime.global_declaration_values(
+                Value::from_bits(value0_bits),
+                Value::from_bits(value1_bits),
+            )
+        });
+    committed_value_result(ctx, result)
+}
+
+/// Complete one object-property `delete` opcode (`DeleteProperty` or
+/// `DeleteElement`). Binding deletion uses [`jit_binding_value_stub`].
 pub(crate) extern "C" fn jit_delete_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -1052,33 +1069,6 @@ pub(crate) extern "C" fn jit_object_protocol_value_stub(
             )
         });
     committed_value_result(ctx, result)
-}
-
-/// Complete one global-access opcode (`LoadGlobalThis`,
-/// `LoadGlobalOrUndefined`, `StoreGlobalBinding`, `StoreGlobalChecked`).
-/// Returns committed `Success`, pre-effect `SideExit`, or parked `Throw`.
-pub(crate) extern "C" fn jit_global_op_stub(
-    ctx: *mut JitCtx,
-    opcode: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    if ctx.materialized_frame_index().is_err() {
-        return NativeResultStatus::SideExit as u64;
-    }
-    let result = ctx
-        .runtime_call()
-        .and_then(|mut runtime| runtime.global_op(opcode as u8, arg0, arg1, arg2));
-    match result {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
 }
 
 /// Complete one `Op::BindFunction`. `packed_meta` is

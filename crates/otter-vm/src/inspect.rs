@@ -936,5 +936,7 @@ mod tests {
         Op::PrivateBrandCheck,
         Op::LoadShadowedUpvalue,
         Op::GetTemplateObject,
+        Op::StoreShadowedUpvalueChecked,
+        Op::DeleteShadowedUpvalue,
     ];
 }

@@ -116,12 +116,31 @@ pub(crate) fn compile_unary(
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            if cx.lookup_binding(&name).is_some() || cx.resolve_capture(&name).is_some() {
+            if cx.lookup_binding(&name).is_some() {
                 // §9.1.1.1.7 DeleteBinding on a declarative
                 // environment record — bindings created by
                 // declarations are not deletable.
                 cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
-            } else if cx.any_enclosing_direct_eval() {
+            } else if let Some((index, _, eval_depth)) = cx.resolve_capture_with_info(&name) {
+                if eval_depth != 0 {
+                    let name_idx = cx.intern_string_constant(&name);
+                    cx.emit(
+                        Op::DeleteShadowedUpvalue,
+                        [
+                            Operand::Register(dst),
+                            Operand::ConstIndex(name_idx),
+                            Operand::Imm32(i32::from(index)),
+                            Operand::Imm32(
+                                i32::try_from(eval_depth).expect("eval-environment depth overflow"),
+                            ),
+                        ],
+                        span,
+                    );
+                } else {
+                    // The captured declarative fallback itself is fixed.
+                    cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
+                }
+            } else if cx.any_enclosing_leaking_direct_eval() {
                 // §19.2.1.3 — eval-created var bindings are
                 // CreateMutableBinding(vn, true): deletable. The name
                 // may live in the frame's eval-var map / captured
@@ -216,7 +235,7 @@ pub(crate) fn compile_unary(
             let name_idx = cx.intern_string_constant(name);
             // An eval-introduced frame binding shadows the global
             // fallback inside a function with a direct eval.
-            let op = if cx.any_enclosing_direct_eval() {
+            let op = if cx.any_enclosing_leaking_direct_eval() {
                 Op::TypeofDynamic
             } else {
                 Op::LoadGlobalOrUndefined
@@ -345,6 +364,7 @@ pub(crate) fn compile_update(
         Identifier {
             name: String,
             storage: Option<BindingStorage>,
+            capture: Option<(u16, BindingInfo, u32)>,
             with_ref: Option<WithBindingProbe>,
         },
         StaticMember {
@@ -373,16 +393,23 @@ pub(crate) fn compile_update(
     let target = match &u.argument {
         SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
-            if let Some(info) = cx.lookup_binding(&name).filter(|info| info.is_const) {
+            if let Some(info) = cx
+                .lookup_binding(&name)
+                .filter(|info| info.is_const || info.fn_self_name)
+            {
                 cx.emit_load_storage(old, info.storage, span);
-                return finish_const_update(cx, &name, old, u, span);
+                let throws = info.is_const || cx.is_strict;
+                return finish_immutable_update(cx, &name, old, u, span, throws);
             }
-            let storage = match cx.lookup_binding(&name) {
-                Some(info) => Some(info.storage),
-                None => cx
-                    .resolve_capture(&name)
-                    .map(|idx| BindingStorage::Upvalue { idx }),
+            let local = cx.lookup_binding(&name);
+            let capture = if local.is_none() {
+                cx.resolve_capture_with_info(&name)
+            } else {
+                None
             };
+            let storage = local
+                .map(|info| info.storage)
+                .or_else(|| capture.map(|(idx, _, _)| BindingStorage::Upvalue { idx }));
             let active_with_envs = cx.active_with_envs.clone();
             let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
             let mut with_done = None;
@@ -403,14 +430,23 @@ pub(crate) fn compile_update(
                 cx.patch_branch_to_here(fallback);
             }
             match storage {
+                Some(_) if capture.is_some() => {
+                    let (index, _, eval_depth) = capture.expect("captured update target");
+                    cx.emit_captured_binding_load(old, &name, index, eval_depth, span);
+                }
                 Some(s) => cx.emit_load_storage(old, s, span),
                 None => {
                     // §13.4.2 — GetValue resolves through the global
                     // environment (realm-wide lexicals first); a
                     // missing binding is a ReferenceError.
                     let name_idx = cx.intern_string_constant(&name);
+                    let op = if cx.any_enclosing_leaking_direct_eval() {
+                        Op::LoadDynamic
+                    } else {
+                        Op::LoadGlobalOrThrow
+                    };
                     cx.emit(
-                        Op::LoadGlobalOrThrow,
+                        op,
                         [Operand::Register(old), Operand::ConstIndex(name_idx)],
                         span,
                     );
@@ -422,6 +458,7 @@ pub(crate) fn compile_update(
             UpdateTarget::Identifier {
                 name,
                 storage,
+                capture,
                 with_ref,
             }
         }
@@ -555,6 +592,7 @@ pub(crate) fn compile_update(
         UpdateTarget::Identifier {
             name,
             storage,
+            capture,
             with_ref,
         } => {
             let mut with_store_done = None;
@@ -575,14 +613,21 @@ pub(crate) fn compile_update(
                 cx.patch_branch_to_here(fallback);
             }
             match storage {
+                Some(_) if capture.is_some() => {
+                    let (index, info, eval_depth) = capture.expect("captured update target");
+                    cx.emit_captured_binding_store(next, &name, index, info, eval_depth, span);
+                }
                 Some(s) => cx.emit_store_storage(next, s, span),
                 None => {
-                    // §9.1.1.4 global SetMutableBinding — realm-wide
-                    // lexicals shadow the object record.
                     let name_idx = cx.intern_string_constant(&name);
+                    let op = if cx.any_enclosing_leaking_direct_eval() {
+                        Op::StoreDynamic
+                    } else {
+                        Op::StoreGlobalBinding
+                    };
                     let strict = i32::from(cx.is_strict);
                     cx.emit(
-                        Op::StoreGlobalBinding,
+                        op,
                         [
                             Operand::Register(next),
                             Operand::ConstIndex(name_idx),
@@ -661,12 +706,13 @@ pub(crate) fn compile_update(
 /// §13.4.2-5 — update on a `const` binding: the old value still loads
 /// and coerces through ToNumeric (firing user `valueOf` /
 /// `[Symbol.toPrimitive]`), then PutValue throws TypeError at runtime.
-fn finish_const_update(
+fn finish_immutable_update(
     cx: &mut Compiler,
     name: &str,
     old: u16,
     u: &UpdateExpression<'_>,
     span: (u32, u32),
+    throws: bool,
 ) -> Result<u16, CompileError> {
     let _ = u;
     let old_prim = emit_to_primitive(cx, old, "number", span);
@@ -676,9 +722,13 @@ fn finish_const_update(
         [Operand::Register(cur), Operand::Register(old_prim)],
         span,
     );
-    Ok(crate::assignment::emit_assignment_type_error(
-        cx,
-        &format!("Assignment to constant variable '{name}'."),
-        span,
-    ))
+    if throws {
+        Ok(crate::assignment::emit_assignment_type_error(
+            cx,
+            &format!("Assignment to constant variable '{name}'."),
+            span,
+        ))
+    } else {
+        Ok(cur)
+    }
 }

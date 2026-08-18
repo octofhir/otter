@@ -1,11 +1,13 @@
 //! `delete` transition emission.
 //!
 //! # Contents
-//! - Reentrant calls to the VM-owned delete driver/fast-path helper.
+//! - Reentrant object-property deletion for `DeleteProperty`/`DeleteElement`.
 //! - Uniform success, throw, and exact pre-effect bailout routing.
 //!
 //! # Invariants
-//! - The VM helper commits every supported delete opcode before returning
+//! - Binding deletion is owned by the schema-driven binding family and never
+//!   enters this raw property helper.
+//! - The VM helper commits every supported property delete before returning
 //!   success, so generated code only falls through once.
 //! - A missing published activation is the sole bailout case and occurs before
 //!   any observable Proxy `deleteProperty` trap or property removal.

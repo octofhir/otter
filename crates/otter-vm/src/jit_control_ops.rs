@@ -18,11 +18,12 @@
 
 use otter_bytecode::Op;
 
-use crate::{ActiveFrameMut, ExecutionContext, Frame, Interpreter, VmError};
+use crate::{ActiveFrameMut, ExecutionContext, Frame, Interpreter, Value, VmError};
 
 impl Interpreter {
     /// Read a captured binding unless a direct-eval `var` shadows it in the
-    /// running frame's dynamic environment.
+    /// running frame's dynamic environment, probing at most `eval_depth`
+    /// physical eval records strictly inside the declaration owner.
     pub(crate) fn run_load_shadowed_upvalue_reg(
         &mut self,
         context: &ExecutionContext,
@@ -30,34 +31,179 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
         uv_idx: usize,
+        eval_depth: u32,
     ) -> Result<(), VmError> {
         let mut frame = ActiveFrameMut::materialized(frame);
-        self.run_load_shadowed_upvalue_active_reg(context, &mut frame, dst, name_idx, uv_idx)
+        let index = u32::try_from(uv_idx).map_err(|_| VmError::InvalidOperand)?;
+        let value =
+            self.load_shadowed_upvalue_value(context, &mut frame, name_idx, index, eval_depth)?;
+        frame.write(dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
     }
 
-    fn run_load_shadowed_upvalue_active_reg(
+    /// Value core of the shadowed-capture read, shared by interpreter
+    /// dispatch and the committed binding call.
+    pub(crate) fn load_shadowed_upvalue_value(
         &mut self,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
+        name_idx: u32,
+        index: u32,
+        eval_depth: u32,
+    ) -> Result<Value, VmError> {
+        let dynamic_cell = context
+            .string_constant_str_for_function(frame.function_id(), name_idx)
+            .and_then(|name| {
+                let env = frame.eval_env()?;
+                crate::eval_env::eval_env_lookup_chain_bounded(
+                    &self.gc_heap,
+                    env,
+                    name,
+                    eval_depth,
+                )
+            });
+        if let Some(cell) = dynamic_cell {
+            return Ok(crate::read_upvalue(&self.gc_heap, cell));
+        }
+        // Captured fallback keeps ordinary lexical semantics: reading the
+        // still-uninitialized declaration is a named TDZ ReferenceError.
+        let cell = frame.upvalue(index)?;
+        let value = crate::read_upvalue(&self.gc_heap, cell);
+        if value.is_hole() {
+            let name = context
+                .string_constant_str_for_function(frame.function_id(), name_idx)
+                .ok_or(VmError::InvalidOperand)?;
+            return Err(self.err_this_uninit(
+                (format!("Cannot access '{name}' before initialization")).into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Assign a captured binding whose name a live direct-eval `var` may
+    /// shadow. The eval chain is probed within the bounded physical depth at
+    /// store time; a hit always writes that cell, and the captured fallback
+    /// follows the policy's mutability alphabet.
+    pub(crate) fn run_store_shadowed_upvalue_checked_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        value_reg: u16,
         name_idx: u32,
         uv_idx: usize,
+        policy_imm: i32,
+    ) -> Result<(), VmError> {
+        let policy =
+            otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(policy_imm)
+                .ok_or(VmError::InvalidOperand)?;
+        let mut frame = ActiveFrameMut::materialized(frame);
+        let index = u32::try_from(uv_idx).map_err(|_| VmError::InvalidOperand)?;
+        let value = frame.read(value_reg)?;
+        self.store_shadowed_upvalue_value(
+            context,
+            &mut frame,
+            name_idx,
+            index,
+            policy.eval_depth,
+            policy.fallback,
+            value,
+        )?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Value core of the shadowed-capture write.
+    pub(crate) fn store_shadowed_upvalue_value(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        name_idx: u32,
+        index: u32,
+        eval_depth: u32,
+        fallback: otter_bytecode::opcode_schema::ShadowedUpvalueFallback,
+        value: Value,
     ) -> Result<(), VmError> {
         let dynamic_cell = context
             .string_constant_str_for_function(frame.function_id(), name_idx)
             .and_then(|name| {
                 let env = frame.eval_env()?;
-                crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, name)
+                crate::eval_env::eval_env_lookup_chain_bounded(
+                    &self.gc_heap,
+                    env,
+                    name,
+                    eval_depth,
+                )
             });
-        let cell = if let Some(cell) = dynamic_cell {
-            cell
-        } else {
-            frame.upvalue(u32::try_from(uv_idx).map_err(|_| VmError::InvalidOperand)?)?
-        };
-        let value = crate::read_upvalue(&self.gc_heap, cell);
-        frame.write(dst, value)?;
+        if let Some(cell) = dynamic_cell {
+            crate::store_upvalue(&mut self.gc_heap, cell, value);
+            return Ok(());
+        }
+        match fallback {
+            otter_bytecode::opcode_schema::ShadowedUpvalueFallback::Mutable => {
+                let cell = frame.upvalue(index)?;
+                if crate::read_upvalue(&self.gc_heap, cell).is_hole() {
+                    return Err(VmError::TemporalDeadZone { local_index: index });
+                }
+                crate::store_upvalue(&mut self.gc_heap, cell, value);
+            }
+            otter_bytecode::opcode_schema::ShadowedUpvalueFallback::ImmutableThrow => {
+                let name = context
+                    .string_constant_str_for_function(frame.function_id(), name_idx)
+                    .unwrap_or_default();
+                return Err(
+                    self.err_type((format!("Assignment to constant variable `{name}`")).into())
+                );
+            }
+            otter_bytecode::opcode_schema::ShadowedUpvalueFallback::ImmutableIgnore => {}
+        }
+        Ok(())
+    }
+
+    /// Delete a nearer eval-introduced binding only within the bounded inner
+    /// eval prefix. When the name still resolves to the captured declarative
+    /// binding, it stays intact and the result is `false`.
+    pub(crate) fn run_delete_shadowed_upvalue_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        name_idx: u32,
+        uv_idx: usize,
+        eval_depth: u32,
+    ) -> Result<(), VmError> {
+        let mut frame = ActiveFrameMut::materialized(frame);
+        let index = u32::try_from(uv_idx).map_err(|_| VmError::InvalidOperand)?;
+        let deleted =
+            self.delete_shadowed_upvalue_value(context, &mut frame, name_idx, index, eval_depth)?;
+        frame.write(dst, deleted)?;
         frame.advance_pc()?;
         Ok(())
+    }
+
+    /// Value core of the shadowed-capture delete.
+    pub(crate) fn delete_shadowed_upvalue_value(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        name_idx: u32,
+        _index: u32,
+        eval_depth: u32,
+    ) -> Result<Value, VmError> {
+        let deleted = context
+            .string_constant_str_for_function(frame.function_id(), name_idx)
+            .is_some_and(|name| {
+                let Some(env) = frame.eval_env() else {
+                    return false;
+                };
+                crate::eval_env::eval_env_delete_chain_bounded(
+                    &mut self.gc_heap,
+                    env,
+                    name,
+                    eval_depth,
+                )
+            });
+        Ok(crate::Value::boolean(deleted))
     }
 
     /// Complete one reentrant control-family opcode for a published compiled
@@ -76,13 +222,15 @@ impl Interpreter {
         let saved_pc = frame.pc();
         match opcode {
             value if value == Op::LoadShadowedUpvalue as u8 => {
-                self.run_load_shadowed_upvalue_active_reg(
+                let value = self.load_shadowed_upvalue_value(
                     context,
                     frame,
-                    arg0 as u16,
                     arg1 as u32,
-                    arg2 as usize,
+                    arg2 as u32,
+                    u32::MAX,
                 )?;
+                frame.write(arg0 as u16, value)?;
+                frame.advance_pc()?;
             }
             _ => return Err(VmError::InvalidOperand),
         }

@@ -345,31 +345,23 @@ pub(crate) fn compile_assignment(
     // `let` binding before its declaration's initializer ran is a TDZ
     // access. The lexical pre-pass declares the name (uninitialized) at
     // block entry, so the miss is observable statically.
-    let binding_uninitialized = matches!(
-        cx.lookup_binding(&name),
-        Some(info) if !info.is_const && !info.initialized
-    );
-    // A cross-function capture has no local binding, so its TDZ cannot be
-    // settled statically: the assignment store must runtime-check the
-    // upvalue cell for the hole. Same-function stores never need this —
-    // the static `binding_uninitialized` path covers their TDZ.
-    let mut capture_store = false;
+    let local_info = cx.lookup_binding(&name);
+    let binding_uninitialized =
+        matches!(local_info, Some(info) if !info.is_const && !info.initialized);
+    // Capture resolution also recovers declaration mutability. The cell itself
+    // stores only the moving value, so a shadowed post-RHS store carries this
+    // metadata in its schema-owned fallback immediate.
+    let captured = if local_info.is_none() {
+        cx.resolve_capture_with_info(&name)
+    } else {
+        None
+    };
     // §10.2.11 — a named function expression's self-name binding is
     // immutable: the RHS still evaluates, then strict mode throws
     // TypeError while sloppy mode silently drops the write. Covers
-    // both the local binding and a capture from an enclosing
-    // function-expression body (arrows).
-    let fn_self_target = match cx.lookup_binding(&name) {
-        Some(info) => info.fn_self_name,
-        None => cx.stack.iter().rev().skip(1).any(|frame| {
-            frame
-                .scopes
-                .iter()
-                .rev()
-                .find_map(|scope| scope.bindings.get(&name))
-                .is_some_and(|info| info.fn_self_name)
-        }),
-    };
+    // the local binding. A captured self-name is handled by the typed capture
+    // store below so a nearer eval binding can win.
+    let fn_self_target = local_info.is_some_and(|info| info.fn_self_name);
     if fn_self_target && compound_op.is_none() {
         let value = crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?;
         // §6.2.5.5 PutValue — a class-name binding assigned inside
@@ -431,7 +423,7 @@ pub(crate) fn compile_assignment(
         }
         return Ok(dst);
     }
-    let storage = match cx.lookup_binding(&name) {
+    let storage = match local_info {
         Some(info) if info.is_const => {
             // §13.15.2 PutValue on an immutable binding is a runtime
             // TypeError, not an early error: the RHS still evaluates
@@ -444,60 +436,36 @@ pub(crate) fn compile_assignment(
             ));
         }
         Some(info) => Some(info.storage),
-        // §10.2.4.1 PutValue fallback — assignment to an undeclared
-        // identifier in sloppy mode creates a property on the
-        // global object. Foundation lowers this as a `StoreProperty`
-        // against `globalThis` so harness-style code that pre-
-        // populates globals (e.g. `assert.sameValue = function …`
-        // before the first reference) keeps working.
-        // <https://tc39.es/ecma262/#sec-putvalue>
-        None => {
-            // A `const` captured from an enclosing function is not in
-            // this frame's scopes, so `lookup_binding` misses it. §13.15.2
-            // PutValue on an immutable binding throws TypeError at
-            // runtime after the RHS is evaluated for its side effects.
-            let captured_const = cx.stack.iter().rev().skip(1).any(|frame| {
-                frame
-                    .scopes
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.bindings.get(&name))
-                    .is_some_and(|info| info.is_const)
-            });
-            if captured_const {
-                let _ = compile_expr(cx, &a.right, span)?;
-                return Ok(emit_assignment_type_error(
-                    cx,
-                    &format!("Assignment to constant variable '{name}'."),
-                    span,
-                ));
-            }
-            let captured = cx
-                .resolve_capture(&name)
-                .map(|idx| BindingStorage::Upvalue { idx });
-            capture_store = captured.is_some();
-            captured
-        }
+        // §10.2.4.1 PutValue fallback — either a cross-function capture or an
+        // unresolved global. A capture retains its declaration metadata so the
+        // post-RHS shadowed store can distinguish mutable, immutable-throw, and
+        // immutable-silent fallbacks without a second runtime authority.
+        None => captured.map(|(idx, _, _)| BindingStorage::Upvalue { idx }),
     };
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+    let dynamic = storage.is_none() && cx.any_enclosing_leaking_direct_eval();
     // §6.2.5.6 — a strict assignment to an unresolvable identifier
     // throws off the reference resolved BEFORE the RHS runs: snapshot
     // the global binding's existence now so a RHS side effect that
     // creates the property cannot legitimize the store.
-    let strict_global_probe =
-        if storage.is_none() && cx.is_strict && with_ref.is_none() && compound_op.is_none() {
-            let exists = cx.alloc_scratch();
-            let name_idx = cx.intern_string_constant(&name);
-            cx.emit(
-                Op::GlobalBindingExists,
-                [Operand::Register(exists), Operand::ConstIndex(name_idx)],
-                span,
-            );
-            Some(exists)
-        } else {
-            None
-        };
+    let strict_global_probe = if storage.is_none()
+        && !dynamic
+        && cx.is_strict
+        && with_ref.is_none()
+        && compound_op.is_none()
+    {
+        let exists = cx.alloc_scratch();
+        let name_idx = cx.intern_string_constant(&name);
+        cx.emit(
+            Op::GlobalBindingExists,
+            [Operand::Register(exists), Operand::ConstIndex(name_idx)],
+            span,
+        );
+        Some(exists)
+    } else {
+        None
+    };
     let value = match compound_op {
         // §13.15.2 — plain `IdentifierRef = AnonymousFunctionDefinition`
         // performs NamedEvaluation, inferring the target's name.
@@ -529,11 +497,19 @@ pub(crate) fn compile_assignment(
                     let diag_idx = tdz_diag_index(storage);
                     cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
                 }
+                Some(_) if captured.is_some() => {
+                    let (index, _, eval_depth) = captured.expect("captured storage");
+                    cx.emit_captured_binding_load(current, &name, index, eval_depth, span);
+                }
                 Some(s) => cx.emit_load_storage(current, s, span),
                 None => {
                     let name_idx = cx.intern_string_constant(&name);
                     cx.emit(
-                        Op::LoadGlobalOrThrow,
+                        if dynamic {
+                            Op::LoadDynamic
+                        } else {
+                            Op::LoadGlobalOrThrow
+                        },
                         [Operand::Register(current), Operand::ConstIndex(name_idx)],
                         span,
                     );
@@ -578,8 +554,8 @@ pub(crate) fn compile_assignment(
             cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
         }
         Some(s) => {
-            if capture_store {
-                cx.emit_assign_storage(value, s, span);
+            if let Some((index, info, eval_depth)) = captured {
+                cx.emit_captured_binding_store(value, &name, index, info, eval_depth, span);
             } else {
                 cx.emit_store_storage(value, s, span);
             }
@@ -587,6 +563,23 @@ pub(crate) fn compile_assignment(
             cx.emit_module_export_mirror(&name, value, span);
         }
         None => {
+            if dynamic {
+                let name_idx = cx.intern_string_constant(&name);
+                let strict = i32::from(cx.is_strict);
+                cx.emit(
+                    Op::StoreDynamic,
+                    [
+                        Operand::Register(value),
+                        Operand::ConstIndex(name_idx),
+                        Operand::Imm32(strict),
+                    ],
+                    span,
+                );
+                if let Some(done) = with_store_done {
+                    cx.patch_branch_to_here(done);
+                }
+                return Ok(value);
+            }
             // §9.1.1.4 global SetMutableBinding — declarative record
             // (script lexicals) first, then the object record;
             // strict stores re-check the binding still exists.
@@ -652,8 +645,15 @@ pub(crate) fn compile_logical_assignment(
                     };
                     cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
                 }
-            } else if let Some(idx) = cx.resolve_capture(&name) {
-                cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
+            } else if let Some((idx, _, eval_depth)) = cx.resolve_capture_with_info(&name) {
+                cx.emit_captured_binding_load(load, &name, idx, eval_depth, span);
+            } else if cx.any_enclosing_leaking_direct_eval() {
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::LoadDynamic,
+                    [Operand::Register(load), Operand::ConstIndex(name_idx)],
+                    span,
+                );
             } else if cx.is_strict {
                 let name_idx = cx.intern_string_constant(&name);
                 cx.emit(
@@ -840,17 +840,11 @@ pub(crate) fn compile_logical_assignment(
             // strict mode throws while sloppy mode silently drops the
             // write. (TDZ was handled by the initial read above; const
             // bindings are rejected inside `assign_to_target`.)
-            let fn_self_target = match cx.lookup_binding(&name) {
-                Some(info) => info.fn_self_name,
-                None => cx.stack.iter().rev().skip(1).any(|frame| {
-                    frame
-                        .scopes
-                        .iter()
-                        .rev()
-                        .find_map(|scope| scope.bindings.get(&name))
-                        .is_some_and(|info| info.fn_self_name)
-                }),
-            };
+            // Captured self-name fallbacks stay in the typed shadowed store:
+            // a post-RHS eval binding may be the actual mutable target.
+            let fn_self_target = cx
+                .lookup_binding(&name)
+                .is_some_and(|info| info.fn_self_name);
             if fn_self_target {
                 if cx.is_strict {
                     emit_assignment_type_error(
@@ -1457,15 +1451,22 @@ pub(crate) fn store_identifier(
     value_reg: u16,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
-    // `store_identifier` is shared between binding *initialization*
-    // (rest parameters, `var` / `for` destructuring heads — where the
-    // target is legitimately uninitialized at the store) and genuine
-    // assignment (destructuring-assignment leaves). Only a cross-function
-    // capture needs the runtime TDZ store check; the static TDZ for a
-    // same-function `let` is enforced at its reference site.
-    let mut capture_store = false;
-    let storage = match cx.lookup_binding(name) {
-        Some(info) if info.is_const => {
+    // `store_identifier` is shared between binding initialization and
+    // destructuring/logical assignment leaves. Own bindings are statically
+    // authoritative; cross-function captures retain their declaration
+    // metadata and may be shadowed by a live eval environment.
+    if let Some(info) = cx.lookup_binding(name) {
+        if info.fn_self_name {
+            if cx.is_strict {
+                emit_assignment_type_error(
+                    cx,
+                    &format!("Assignment to constant variable `{name}`"),
+                    span,
+                );
+            }
+            return Ok(());
+        }
+        if info.is_const {
             emit_assignment_type_error(
                 cx,
                 &format!("Assignment to constant variable `{name}`"),
@@ -1473,71 +1474,44 @@ pub(crate) fn store_identifier(
             );
             return Ok(());
         }
-        Some(info) => Some(info.storage),
-        None => {
-            let captured_const = cx.stack.iter().rev().skip(1).any(|frame| {
-                frame
-                    .scopes
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.bindings.get(name))
-                    .is_some_and(|info| info.is_const)
-            });
-            if captured_const {
-                emit_assignment_type_error(
-                    cx,
-                    &format!("Assignment to constant variable `{name}`"),
-                    span,
-                );
-                return Ok(());
-            }
-            let captured = cx
-                .resolve_capture(name)
-                .map(|idx| BindingStorage::Upvalue { idx });
-            capture_store = captured.is_some();
-            captured
-        }
-    };
-    match storage {
-        Some(s) => {
-            if capture_store {
-                cx.emit_assign_storage(value_reg, s, span);
-            } else {
-                cx.emit_store_storage(value_reg, s, span);
-            }
-            cx.mark_initialized(name);
-            cx.emit_module_export_mirror(name, value_reg, span);
-        }
-        None => {
-            // §10.2.4.2 PutValue — inside a sloppy function with a
-            // direct eval the name may resolve to an eval-introduced
-            // frame binding before the global environment.
-            if cx.any_enclosing_direct_eval() && !cx.is_strict {
-                let name_idx = cx.intern_string_constant(name);
-                cx.emit(
-                    Op::StoreDynamic,
-                    [Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
-                    span,
-                );
-                return Ok(());
-            }
-            // §9.1.1.4 global SetMutableBinding — the declarative
-            // record (script lexicals, `const` → TypeError, TDZ →
-            // ReferenceError) shadows the object record; strict
-            // writes to a missing binding throw ReferenceError at
-            // runtime.
-            let name_idx = cx.intern_string_constant(name);
-            let strict = i32::from(cx.is_strict);
-            cx.emit(
-                Op::StoreGlobalBinding,
-                [
-                    Operand::Register(value_reg),
-                    Operand::ConstIndex(name_idx),
-                    Operand::Imm32(strict),
-                ],
-                span,
-            );
-        }
+        cx.emit_store_storage(value_reg, info.storage, span);
+        cx.mark_initialized(name);
+        cx.emit_module_export_mirror(name, value_reg, span);
+        return Ok(());
+    }
+    if let Some((index, info, eval_depth)) = cx.resolve_capture_with_info(name) {
+        cx.emit_captured_binding_store(value_reg, name, index, info, eval_depth, span);
+        return Ok(());
+    }
+    // §10.2.4.2 PutValue — a live eval chain may resolve the name before the
+    // global environment. StoreDynamic owns that complete fallback.
+    if cx.any_enclosing_leaking_direct_eval() {
+        let name_idx = cx.intern_string_constant(name);
+        let strict = i32::from(cx.is_strict);
+        cx.emit(
+            Op::StoreDynamic,
+            [
+                Operand::Register(value_reg),
+                Operand::ConstIndex(name_idx),
+                Operand::Imm32(strict),
+            ],
+            span,
+        );
+    } else {
+        // §9.1.1.4 global SetMutableBinding — the declarative record
+        // (script lexicals, `const` → TypeError, TDZ → ReferenceError)
+        // shadows the object record; strict writes to a missing binding throw.
+        let name_idx = cx.intern_string_constant(name);
+        let strict = i32::from(cx.is_strict);
+        cx.emit(
+            Op::StoreGlobalBinding,
+            [
+                Operand::Register(value_reg),
+                Operand::ConstIndex(name_idx),
+                Operand::Imm32(strict),
+            ],
+            span,
+        );
     }
     Ok(())
 }

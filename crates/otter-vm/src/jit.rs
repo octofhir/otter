@@ -278,6 +278,9 @@ pub struct JitCompileSnapshot {
     /// keyed by byte-PC. A store may not write through a prototype, so a
     /// settled store needs no hop check either.
     pub property_stores: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
+    /// Direct physical hit proofs for schema-owned binding sites, keyed by
+    /// byte-PC. See [`BindingHitProof`].
+    pub binding_hit_proofs: rustc_hash::FxHashMap<u32, BindingHitProof>,
     /// Constructor `StoreProperty` sites with a pre-reserved, guarded hidden
     /// class transition, keyed by byte-PC.
     pub constructor_field_transitions: rustc_hash::FxHashMap<u32, JitConstructorFieldTransition>,
@@ -900,6 +903,35 @@ pub struct JitDirectCallee {
     pub receiver_allocation: Option<JitReceiverAllocationPlan>,
 }
 
+/// Physical proof for one generated binding hit.
+///
+/// This enum deliberately contains no read/write/delete semantic variant. The
+/// authoritative operation and operand roles live in
+/// `otter_bytecode::opcode_schema::BindingSemantics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingHitProof {
+    /// Permanent global-declarative cell rooted by the environment record.
+    GlobalLexical {
+        /// Compressed GC-cage offset of the non-moving upvalue cell.
+        cell_offset: u32,
+        /// Whether assignment may update the live cell.
+        writable: bool,
+    },
+    /// Guarded own-data slot in the global object record.
+    GlobalObject {
+        /// Expected ordinary shape handle or dictionary structural id.
+        shape: u64,
+        /// Whether `shape` names a dictionary structural id.
+        dictionary: bool,
+        /// Byte offset of the property inside the object's value slab.
+        value_byte: u32,
+        /// Global declarative epoch that keeps later lexicals from shadowing it.
+        global_lexical_epoch: u64,
+        /// Whether the proven own data descriptor is writable.
+        writable: bool,
+    },
+}
+
 /// One permanent global-declarative binding available to generated code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitGlobalLexicalLoad {
@@ -1382,6 +1414,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_loads: rustc_hash::FxHashMap::default(),
             property_stores: rustc_hash::FxHashMap::default(),
+            binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
             property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_bail_pcs: std::collections::BTreeSet::new(),

@@ -1336,7 +1336,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
             RelocationTarget::RuntimeStub {
-                id: 18,
+                id: 17,
                 name: "jit_load_property_value",
                 signature: "reentrantNamedLoad",
             }
@@ -1344,7 +1344,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
             RelocationTarget::RuntimeStub {
-                id: 19,
+                id: 18,
                 name: "jit_store_property_value",
                 signature: "reentrantNamedStore",
             }
@@ -1352,7 +1352,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_METHOD_VALUE),
             RelocationTarget::RuntimeStub {
-                id: 93,
+                id: 86,
                 name: "jit_call_method_value",
                 signature: "reentrantValueSpan",
             }

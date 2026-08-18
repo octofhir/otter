@@ -4,10 +4,11 @@
 //! - Code-buffer ownership, per-PC labels, and branch fixups.
 //! - Prologue/epilogue establishing the shared compiled-entry ABI.
 //! - One emit dispatch per [`TemplateOp`], including inline tagged truthiness.
-//! - Direct live-value reads from baked global lexical cells.
+//! - Schema-owned binding and declaration fast/cold control flow.
 //! - Cooperative back-edge interrupt/fuel polling.
 //! - [`values`] — tagged encode/decode primitives.
 //! - [`arith`] — numeric, comparison, and bitwise emitters.
+//! - [`binding`] — typed binding/declaration family emission.
 //!
 //! # Invariants
 //! - Every instruction that can side-exit, transition, or poll stamps its
@@ -47,15 +48,14 @@
 #![allow(clippy::useless_conversion)]
 
 pub(crate) mod arith;
+mod binding;
 mod calls;
 mod class_ops;
 mod class_value;
 mod construct;
-mod control;
 mod delete;
 mod exceptions;
 mod functions;
-mod globals;
 pub(crate) mod ic_probe;
 mod iterators;
 mod module_op;
@@ -520,17 +520,42 @@ pub(super) fn compile(
                     fatal,
                 );
             }
-            TemplateOp::LoadGlobal { dst, name } => {
-                transitions::emit_load_global(
+            TemplateOp::BindingValue {
+                semantics,
+                result,
+                value0,
+                value1,
+            } => {
+                binding::emit_binding_value(
                     &mut ops,
                     &mut relocations,
                     transitions,
                     view,
-                    dst,
-                    name,
-                    code_block_id,
+                    semantics,
+                    result,
+                    value0,
+                    value1,
                     instr.byte_pc,
-                    threw,
+                    code_map.as_mut(),
+                    committed_throw,
+                    fatal,
+                )?;
+            }
+            TemplateOp::GlobalDeclarationValue {
+                semantics,
+                value0,
+                value1,
+            } => {
+                binding::emit_global_declaration_value(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    semantics,
+                    value0,
+                    value1,
+                    instr.byte_pc,
+                    code_map.as_mut(),
+                    committed_throw,
                     fatal,
                 )?;
             }
@@ -640,42 +665,6 @@ pub(super) fn compile(
                     committed_throw,
                     fatal,
                 )?;
-            }
-            TemplateOp::LoadUpvalue { dst, index } => {
-                transitions::emit_load_upvalue(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    dst,
-                    index,
-                    threw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::StoreUpvalue { src, index } => {
-                transitions::emit_store_upvalue(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    src,
-                    index,
-                    false,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::StoreUpvalueChecked { src, index } => {
-                transitions::emit_store_upvalue(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    src,
-                    index,
-                    true,
-                    threw,
-                    fatal,
-                );
             }
             TemplateOp::LoadProperty {
                 dst,
@@ -1012,25 +1001,6 @@ pub(super) fn compile(
                     fatal,
                 );
             }
-            TemplateOp::GlobalOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                globals::emit_global_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
             TemplateOp::ObjectProtocolValue {
                 operation,
                 result,
@@ -1245,25 +1215,6 @@ pub(super) fn compile(
                     packed_head,
                     method,
                     packed_args,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ControlOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                control::emit_control_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
                     bail,
                     threw,
                     fatal,

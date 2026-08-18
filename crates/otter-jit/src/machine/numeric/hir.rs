@@ -4,8 +4,8 @@
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
-//! - [`NumericNode`] — tagged/scalar parameters, constants, captured-binding
-//!   and prepared global reads, guarded coercions, ordinary properties,
+//! - [`NumericNode`] — tagged/scalar parameters, constants, the schema-owned
+//!   binding family, guarded coercions, ordinary properties,
 //!   indexed elements, arithmetic, comparison, typed array construction, and
 //!   typed plain/method calls.
 //! - [`NumericPackedDoubleViewCachePlan`] — bounded natural-loop sharing of
@@ -43,11 +43,13 @@
 //!   original bytecode. Named `.length` loads retain their exotic fast-path
 //!   marker; every property frame state describes the exact pre-access register
 //!   window.
-//! - Captured-binding reads require the GC cage and retain an exact pre-load
-//!   frame state so an invalid spine or TDZ hole resumes canonically.
-//! - Prepared global loads retain copied lexical-cell or guarded global-object
-//!   metadata plus an exact pre-load frame state. An absent prepared target
-//!   keeps the whole function on the Template baseline.
+//! - Every schema-owned binding read, write, and delete remains one typed HIR
+//!   family. Structurally proven global-this, upvalue, global lexical, and
+//!   global-object targets retain a generated sibling; dynamic/shadowed sites
+//!   and missing proofs use only the committed cold sibling. Guard miss, TDZ,
+//!   const/accessor/Proxy failure, and unresolved lookup never deopt or replay.
+//!   The pre-operation frame state exists solely to publish complete tagged
+//!   roots at the committed cold safepoint.
 //! - Loose numeric equality reuses the guarded numeric path. A tagged value may
 //!   compare directly with a static nullish literal, but the node retains an
 //!   exact pre-operation state so every Cell can deopt for HTMLDDA semantics.
@@ -92,7 +94,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use otter_bytecode::opcode_schema::{OperandKind, RegisterAccess, RegisterSource, operand_spec_at};
+use otter_bytecode::opcode_schema::{
+    BindingRead, BindingSemantics, BindingWrite, OperandKind, RegisterAccess, RegisterSource,
+    opcode_schema, operand_spec_at,
+};
 use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, JitElementBase, JitElementRepr, JitInstructionMetadata};
 
@@ -126,6 +131,17 @@ pub(super) enum NumericElementAccess {
     PackedDouble,
 }
 
+/// Structurally safe generated sibling of one binding operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericBindingTarget {
+    /// The realm-global object through the snapshot's stable global-this cell.
+    GlobalThis,
+    /// One stable captured cell in the current native-frame spine.
+    Upvalue { index: u32 },
+    /// One VM-baked stable global lexical or object target.
+    Global(otter_vm::jit::BindingHitProof),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum NumericNode {
     Parameter {
@@ -138,21 +154,17 @@ pub(super) enum NumericNode {
     TaggedToInt32(NumericValue),
     This,
     ClassSuperConstructor(NumericValue),
-    Upvalue {
-        index: i32,
+    Binding {
+        semantics: BindingSemantics,
+        inputs: [Option<NumericValue>; 2],
+        target: Option<NumericBindingTarget>,
+        logical_pc: u32,
         byte_pc: u32,
+        exceptional_edge: Option<u16>,
     },
     StringConstantCell {
         byte_pc: u32,
         target: otter_vm::jit::JitStringConstantCell,
-    },
-    GlobalLexicalLoad {
-        byte_pc: u32,
-        target: otter_vm::jit::JitGlobalLexicalLoad,
-    },
-    GlobalObjectLoad {
-        byte_pc: u32,
-        target: otter_vm::jit::JitGlobalObjectLoad,
     },
     CommittedValue {
         operation: CommittedValueOperation,
@@ -446,10 +458,8 @@ impl NumericNode {
             Self::TaggedConstant(..)
             | Self::This
             | Self::ClassSuperConstructor(..)
-            | Self::Upvalue { .. }
+            | Self::Binding { .. }
             | Self::StringConstantCell { .. }
-            | Self::GlobalLexicalLoad { .. }
-            | Self::GlobalObjectLoad { .. }
             | Self::CommittedValue { .. }
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
@@ -533,16 +543,15 @@ impl NumericNode {
     /// Authoritative selection use of an attached frame state.
     pub(super) const fn frame_state_purpose(self) -> Option<NumericFrameStatePurpose> {
         match self {
-            Self::CommittedValue { .. } => Some(NumericFrameStatePurpose::TaggedRoots),
+            Self::CommittedValue { .. } | Self::Binding { .. } => {
+                Some(NumericFrameStatePurpose::TaggedRoots)
+            }
             Self::GenericElementLoad { .. } | Self::GenericElementStore { .. } => {
                 Some(NumericFrameStatePurpose::RuntimeMetadata)
             }
             Self::ColdCallExit { .. }
             | Self::TaggedToNumber(..)
             | Self::TaggedToInt32(..)
-            | Self::GlobalLexicalLoad { .. }
-            | Self::GlobalObjectLoad { .. }
-            | Self::Upvalue { .. }
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
@@ -945,6 +954,14 @@ impl NumericFunction {
                     &mut requires_mixed_join,
                 )?;
             }
+            force_exception_parameters(
+                block_index,
+                &raw_blocks,
+                &mut registers,
+                &mut parameters,
+                &mut parameter_regs,
+                &mut nodes,
+            )?;
             let mut block_nodes = if block_index == 0 {
                 entry_nodes.clone()
             } else {
@@ -996,8 +1013,7 @@ impl NumericFunction {
                     &view.constructor_field_transitions,
                     &view.element_accesses,
                     &view.string_constant_cells,
-                    &view.global_lexical_loads,
-                    &view.global_object_loads,
+                    &view.binding_hit_proofs,
                     view.cage_base != 0,
                     &mut direct_call_targets,
                     &mut direct_call_arguments,
@@ -1281,7 +1297,8 @@ fn packed_double_cache_loop_is_safe(
                 function.nodes.get(node.0).is_some_and(|node| {
                     !matches!(
                         node,
-                        NumericNode::DirectCall { .. }
+                        NumericNode::Binding { .. }
+                            | NumericNode::DirectCall { .. }
                             | NumericNode::ColdCallExit { .. }
                             | NumericNode::ArrayConstruct { .. }
                             | NumericNode::TaggedStringConcat(..)
@@ -1579,16 +1596,17 @@ fn build_raw_blocks(
         .collect::<std::collections::BTreeSet<_>>();
     for (pc, instruction) in view.instructions.iter().enumerate() {
         let pc = u32::try_from(pc).ok()?;
-        if instruction_semantics
+        let op = instruction.op(code);
+        let binding = opcode_schema(op).binding.is_some();
+        let protected_throw = instruction_semantics
             .get(pc as usize)?
-            .has_implicit_exception_side_exit(instruction.op(code))
+            .has_implicit_exception_side_exit(op)
             && code
                 .control_flow()
                 .enclosing_exception_region(pc)
                 .and_then(|region| region.catch_pc)
-                .is_some()
-            && usize::try_from(pc + 1).ok()? < view.instructions.len()
-        {
+                .is_some();
+        if (binding || protected_throw) && usize::try_from(pc + 1).ok()? < view.instructions.len() {
             starts.insert(pc + 1);
         }
     }
@@ -2029,6 +2047,47 @@ fn force_loop_parameters(
     Some(())
 }
 
+fn force_exception_parameters(
+    block_index: usize,
+    blocks: &[RawBlock],
+    registers: &mut [RegisterState],
+    parameters: &mut Vec<NumericValue>,
+    parameter_registers: &mut Vec<u16>,
+    nodes: &mut Vec<NumericNode>,
+) -> Option<()> {
+    let exception_registers = blocks
+        .get(block_index)?
+        .predecessors
+        .iter()
+        .filter_map(|&predecessor| {
+            let source = blocks.get(predecessor)?;
+            let edge = source
+                .successors
+                .iter()
+                .position(|&successor| successor == block_index)?;
+            (source.exceptional_edge == Some(edge))
+                .then_some(source.exception_register)
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    for register in exception_registers {
+        if parameter_registers.contains(&register) {
+            continue;
+        }
+        let RegisterState::Value(value) = *registers.get(usize::from(register))? else {
+            return None;
+        };
+        if value_type(nodes, value)? != NumericType::Tagged {
+            return None;
+        }
+        let parameter = push(nodes, NumericNode::BlockParameter(NumericType::Tagged));
+        *registers.get_mut(usize::from(register))? = RegisterState::Value(parameter);
+        parameters.push(parameter);
+        parameter_registers.push(register);
+    }
+    Some(())
+}
+
 fn join_representation_types(left: NumericType, right: NumericType) -> Option<NumericType> {
     if left == right {
         return Some(left);
@@ -2117,6 +2176,110 @@ fn lower_committed_value(
     Some(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_binding(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    semantics: BindingSemantics,
+    registers: &mut [RegisterState],
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    live_in: &[bool],
+    frame_states: &mut Vec<NumericFrameState>,
+    function_id: u32,
+    logical_pc: u32,
+    binding_hit_proofs: &rustc_hash::FxHashMap<u32, otter_vm::jit::BindingHitProof>,
+    cage_available: bool,
+    exceptional_edge: Option<usize>,
+    exceptional_value: &mut Option<NumericValue>,
+) -> Option<()> {
+    let mut inputs = [None, None];
+    for (input, operand) in inputs
+        .iter_mut()
+        .zip(semantics.value_operands().into_iter().flatten())
+    {
+        let register = register(instruction, code, usize::from(operand))?;
+        *input = Some(read_value(registers, register)?);
+    }
+
+    let target = match semantics {
+        BindingSemantics::Read(BindingRead::GlobalThis { .. }) if cage_available => {
+            Some(NumericBindingTarget::GlobalThis)
+        }
+        BindingSemantics::Read(BindingRead::Upvalue { index, .. })
+        | BindingSemantics::Write(BindingWrite::Upvalue { index, .. })
+            if cage_available =>
+        {
+            u32::try_from(instruction.imm32(code, usize::from(index))?)
+                .ok()
+                .filter(|index| *index <= 4095)
+                .map(|index| NumericBindingTarget::Upvalue { index })
+        }
+        BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
+            if cage_available =>
+        {
+            binding_hit_proofs
+                .get(&instruction.byte_pc)
+                .copied()
+                .map(NumericBindingTarget::Global)
+        }
+        BindingSemantics::Write(
+            BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. },
+        ) if cage_available => binding_hit_proofs
+            .get(&instruction.byte_pc)
+            .copied()
+            .filter(|proof| match proof {
+                otter_vm::jit::BindingHitProof::GlobalLexical { writable, .. }
+                | otter_vm::jit::BindingHitProof::GlobalObject { writable, .. } => *writable,
+            })
+            .map(NumericBindingTarget::Global),
+        BindingSemantics::Read(
+            BindingRead::Dynamic { .. } | BindingRead::ShadowedUpvalue { .. },
+        )
+        | BindingSemantics::Write(
+            BindingWrite::Dynamic { .. } | BindingWrite::ShadowedUpvalue { .. },
+        )
+        | BindingSemantics::Delete(_) => None,
+        BindingSemantics::Read(BindingRead::GlobalThis { .. } | BindingRead::Upvalue { .. })
+        | BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
+        | BindingSemantics::Write(
+            BindingWrite::Global { .. }
+            | BindingWrite::GlobalChecked { .. }
+            | BindingWrite::Upvalue { .. },
+        ) => None,
+    };
+
+    let value = push(
+        nodes,
+        NumericNode::Binding {
+            semantics,
+            inputs,
+            target,
+            logical_pc,
+            byte_pc: instruction.byte_pc,
+            exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+        },
+    );
+    block_nodes.push(value);
+    push_frame_state(
+        frame_states,
+        NumericFramePoint::Node(value),
+        function_id,
+        instruction.byte_pc,
+        registers,
+        live_in,
+    );
+    record_exceptional_value(exceptional_value, exceptional_edge, value)?;
+    if let Some(destination) = semantics.result_operand() {
+        write(
+            registers,
+            register(instruction, code, usize::from(destination))?,
+            RegisterState::Value(value),
+        )?;
+    }
+    Some(())
+}
+
 fn lower_instruction(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
@@ -2138,8 +2301,7 @@ fn lower_instruction(
     >,
     element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
     string_constant_cells: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitStringConstantCell>,
-    global_lexical_loads: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitGlobalLexicalLoad>,
-    global_object_loads: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitGlobalObjectLoad>,
+    binding_hit_proofs: &rustc_hash::FxHashMap<u32, otter_vm::jit::BindingHitProof>,
     cage_available: bool,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
     direct_call_arguments: &mut Vec<NumericValue>,
@@ -2153,7 +2315,9 @@ fn lower_instruction(
     if exceptional_edge.is_some() != expects_exceptional_edge {
         return None;
     }
-    let pure_exception_value = semantics.committed_value.is_some()
+    let binding = opcode_schema(op).binding;
+    let pure_exception_value = binding.is_some()
+        || semantics.committed_value.is_some()
         || matches!(
             op,
             Op::Call
@@ -2166,6 +2330,24 @@ fn lower_instruction(
         );
     if exceptional_edge.is_some() && !pure_exception_value {
         return None;
+    }
+    if let Some(binding) = binding {
+        return lower_binding(
+            instruction,
+            code,
+            binding,
+            registers,
+            nodes,
+            block_nodes,
+            live_in,
+            frame_states,
+            function_id,
+            logical_pc,
+            binding_hit_proofs,
+            cage_available,
+            exceptional_edge,
+            exceptional_value,
+        );
     }
     if let Some(operation) = semantics.committed_value {
         return lower_committed_value(
@@ -2211,69 +2393,6 @@ fn lower_instruction(
                 byte_pc: instruction.byte_pc,
                 target: *string_constant_cells.get(&instruction.byte_pc)?,
             }
-        }
-        Op::LoadGlobalOrThrow => {
-            let _ = instruction.const_index(code, 1)?;
-            let node = if let Some(target) = global_lexical_loads.get(&instruction.byte_pc) {
-                NumericNode::GlobalLexicalLoad {
-                    byte_pc: instruction.byte_pc,
-                    target: *target,
-                }
-            } else if let Some(target) = global_object_loads.get(&instruction.byte_pc) {
-                NumericNode::GlobalObjectLoad {
-                    byte_pc: instruction.byte_pc,
-                    target: *target,
-                }
-            } else {
-                return None;
-            };
-            let value = push(nodes, node);
-            block_nodes.push(value);
-            push_frame_state(
-                frame_states,
-                NumericFramePoint::Node(value),
-                function_id,
-                instruction.byte_pc,
-                registers,
-                live_in,
-            );
-            write(
-                registers,
-                register(instruction, code, 0)?,
-                RegisterState::Value(value),
-            )?;
-            return Some(());
-        }
-        Op::LoadUpvalue => {
-            if !cage_available {
-                return None;
-            }
-            let index = instruction.imm32(code, 1)?;
-            if !(0..=4095).contains(&index) {
-                return None;
-            }
-            let value = push(
-                nodes,
-                NumericNode::Upvalue {
-                    index,
-                    byte_pc: instruction.byte_pc,
-                },
-            );
-            block_nodes.push(value);
-            push_frame_state(
-                frame_states,
-                NumericFramePoint::Node(value),
-                function_id,
-                instruction.byte_pc,
-                registers,
-                live_in,
-            );
-            write(
-                registers,
-                register(instruction, code, 0)?,
-                RegisterState::Value(value),
-            )?;
-            return Some(());
         }
         Op::GetPrototype if derived_constructor => {
             let value = push(
@@ -3612,9 +3731,8 @@ mod tests {
     use otter_vm::{
         JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
         jit::{
-            JitConstructorFieldTransition, JitDirectCallPlan, JitDirectMethod,
-            JitGlobalLexicalLoad, JitGlobalObjectLoad, JitMethodGuard, JitStringConstantCell,
-            JitTestInstruction,
+            BindingHitProof, JitConstructorFieldTransition, JitDirectCallPlan, JitDirectMethod,
+            JitMethodGuard, JitStringConstantCell, JitTestInstruction,
         },
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
         native_abi::NativeFrameKind,
@@ -4676,37 +4794,40 @@ mod tests {
     }
 
     #[test]
-    fn prepared_global_loads_build_tagged_nodes_with_exact_pre_operation_state() {
-        let lexical_target = JitGlobalLexicalLoad { cell_offset: 0x88 };
-        let object_target = JitGlobalObjectLoad {
+    fn global_binding_proofs_build_one_typed_family_with_exact_gc_state() {
+        let lexical_target = BindingHitProof::GlobalLexical {
+            cell_offset: 0x88,
+            writable: true,
+        };
+        let object_target = BindingHitProof::GlobalObject {
             shape: 0x1234,
             dictionary: true,
             value_byte: 40,
             global_lexical_epoch: 9,
+            writable: true,
         };
 
-        for lexical in [true, false] {
+        for target in [lexical_target, object_target] {
             let mut view = global_load_view();
-            if lexical {
-                view.global_lexical_loads.insert(24, lexical_target);
-            } else {
-                view.global_object_loads.insert(24, object_target);
-            }
-            let hir = NumericFunction::build(&view).expect("prepared global-load HIR");
+            view.cage_base = 0x1000;
+            view.binding_hit_proofs.insert(24, target);
+            let hir = NumericFunction::build(&view).expect("typed global-binding HIR");
             let global = hir
                 .nodes
                 .iter()
-                .position(|node| match node {
-                    NumericNode::GlobalLexicalLoad { byte_pc, target } => {
-                        lexical && (*byte_pc, *target) == (24, lexical_target)
-                    }
-                    NumericNode::GlobalObjectLoad { byte_pc, target } => {
-                        !lexical && (*byte_pc, *target) == (24, object_target)
-                    }
-                    _ => false,
+                .position(|node| {
+                    matches!(
+                        node,
+                        NumericNode::Binding {
+                            semantics: BindingSemantics::Read(BindingRead::Global { .. }),
+                            target: Some(NumericBindingTarget::Global(copied)),
+                            byte_pc: 24,
+                            ..
+                        } if *copied == target
+                    )
                 })
                 .map(NumericValue)
-                .expect("copied global-load metadata");
+                .expect("copied binding proof");
             assert_eq!(hir.nodes[global.0].value_type(), NumericType::Tagged);
 
             let parameter = hir
@@ -4727,7 +4848,7 @@ mod tests {
                 .frame_states
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(global))
-                .expect("exact pre-global-load state");
+                .expect("exact pre-binding GC state");
             assert_eq!(state.byte_pc, 24);
             assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
             assert_eq!(state.slots[1], NumericFrameSlot::Undefined);
@@ -4782,39 +4903,67 @@ mod tests {
     }
 
     #[test]
-    fn global_load_requires_prepared_metadata_and_prefers_lexical_binding() {
+    fn global_binding_without_proof_keeps_committed_cold_sibling() {
         let mut view = global_load_view();
-        assert!(
-            NumericFunction::build(&view).is_none(),
-            "an unprepared global load must keep the whole function on the Template baseline"
-        );
+        let hir = NumericFunction::build(&view).expect("cold global-binding HIR");
+        assert!(hir.nodes.iter().any(|node| {
+            matches!(
+                node,
+                NumericNode::Binding {
+                    semantics: BindingSemantics::Read(BindingRead::Global { .. }),
+                    target: None,
+                    byte_pc: 24,
+                    ..
+                }
+            )
+        }));
 
-        let lexical_target = JitGlobalLexicalLoad { cell_offset: 0x90 };
-        view.global_lexical_loads.insert(24, lexical_target);
-        view.global_object_loads.insert(
-            24,
-            JitGlobalObjectLoad {
+        let lexical_target = BindingHitProof::GlobalLexical {
+            cell_offset: 0x90,
+            writable: true,
+        };
+        view.cage_base = 0x1000;
+        view.binding_hit_proofs.insert(24, lexical_target);
+        let hir = NumericFunction::build(&view).expect("proved global-binding HIR");
+        assert!(hir.nodes.iter().any(|node| {
+            matches!(
+                node,
+                NumericNode::Binding {
+                    semantics: BindingSemantics::Read(BindingRead::Global { .. }),
+                    target: Some(NumericBindingTarget::Global(target)),
+                    byte_pc: 24,
+                    ..
+                } if *target == lexical_target
+            )
+        }));
+
+        for proof in [
+            BindingHitProof::GlobalLexical {
+                cell_offset: 0x98,
+                writable: true,
+            },
+            BindingHitProof::GlobalObject {
                 shape: 5,
                 dictionary: false,
                 value_byte: 16,
                 global_lexical_epoch: 2,
+                writable: true,
             },
-        );
-        let hir = NumericFunction::build(&view).expect("prepared lexical global-load HIR");
-        assert!(hir.nodes.iter().any(|node| {
-            matches!(
-                node,
-                NumericNode::GlobalLexicalLoad {
-                    byte_pc: 24,
-                    target
-                } if *target == lexical_target
-            )
-        }));
-        assert!(
-            hir.nodes
-                .iter()
-                .all(|node| !matches!(node, NumericNode::GlobalObjectLoad { .. }))
-        );
+        ] {
+            let mut no_cage = global_load_view();
+            no_cage.binding_hit_proofs.insert(24, proof);
+            let hir = NumericFunction::build(&no_cage).expect("cold no-cage binding HIR");
+            assert!(hir.nodes.iter().any(|node| {
+                matches!(
+                    node,
+                    NumericNode::Binding {
+                        byte_pc: 24,
+                        target: None,
+                        ..
+                    }
+                )
+            }));
+        }
     }
 
     #[test]
@@ -5649,7 +5798,7 @@ mod tests {
                     node,
                     NumericNode::CommittedValue {
                         operation: CommittedValueOperation::Scalar(
-                            otter_vm::ScalarValueOp::BindThisValue
+                            otter_vm::native_abi::ScalarValueOp::BindThisValue
                         ),
                         ..
                     }
@@ -5679,10 +5828,24 @@ mod tests {
                 ..
             } if usize::from(exceptional_edge) == edge
         ));
+        let parameter_index = hir.blocks[handler]
+            .parameter_registers
+            .iter()
+            .position(|&register| register == 1)
+            .expect("explicit exception parameter");
+        let exception = hir.blocks[handler].parameters[parameter_index];
+        assert!(matches!(
+            hir.nodes[exception.0],
+            NumericNode::BlockParameter(NumericType::Tagged)
+        ));
+        assert_eq!(
+            hir.blocks[source].successor_arguments[edge][parameter_index],
+            bind
+        );
         assert_eq!(
             hir.blocks[handler].terminator,
-            NumericTerminator::Return(bind),
-            "a single-predecessor catch consumes the committed exception value directly"
+            NumericTerminator::Return(exception),
+            "the catch consumes its explicit committed exception parameter"
         );
     }
 
@@ -5727,7 +5890,7 @@ mod tests {
                     node,
                     NumericNode::CommittedValue {
                         operation: CommittedValueOperation::ObjectProtocol(
-                            otter_vm::ObjectProtocolValueOp::Instanceof
+                            otter_vm::native_abi::ObjectProtocolValueOp::Instanceof
                         ),
                         exceptional_edge: Some(_),
                         ..
@@ -5758,10 +5921,24 @@ mod tests {
                 ..
             } if usize::from(exceptional_edge) == edge
         ));
+        let parameter_index = hir.blocks[handler]
+            .parameter_registers
+            .iter()
+            .position(|&register| register == 3)
+            .expect("explicit exception parameter");
+        let exception = hir.blocks[handler].parameters[parameter_index];
+        assert!(matches!(
+            hir.nodes[exception.0],
+            NumericNode::BlockParameter(NumericType::Tagged)
+        ));
+        assert_eq!(
+            hir.blocks[source].successor_arguments[edge][parameter_index],
+            instanceof
+        );
         assert_eq!(
             hir.blocks[handler].terminator,
-            NumericTerminator::Return(instanceof),
-            "a single-predecessor catch consumes the pure exception SSA value directly"
+            NumericTerminator::Return(exception),
+            "the catch consumes its explicit pure-exception parameter"
         );
     }
 
@@ -5797,10 +5974,24 @@ mod tests {
                 ..
             } if usize::from(exceptional_edge) == edge
         ));
+        let parameter_index = hir.blocks[handler]
+            .parameter_registers
+            .iter()
+            .position(|&register| register == 2)
+            .expect("explicit exception parameter");
+        let exception = hir.blocks[handler].parameters[parameter_index];
+        assert!(matches!(
+            hir.nodes[exception.0],
+            NumericNode::BlockParameter(NumericType::Tagged)
+        ));
+        assert_eq!(
+            hir.blocks[source].successor_arguments[edge][parameter_index],
+            direct_call
+        );
         assert_eq!(
             hir.blocks[handler].terminator,
-            NumericTerminator::Return(direct_call),
-            "the catch consumes only the direct call's returned exception value"
+            NumericTerminator::Return(exception),
+            "the catch consumes only the direct call's explicit exception parameter"
         );
     }
 

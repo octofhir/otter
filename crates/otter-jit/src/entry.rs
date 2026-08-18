@@ -201,16 +201,27 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             binding($descriptor, typed as *const () as usize)
         }};
     }
+    macro_rules! committed_value2_binding {
+        ($descriptor:expr, $entry:path) => {{
+            const _: () = assert!(matches!(
+                $descriptor.signature,
+                abi::RuntimeStubSignature::CommittedValue2
+            ));
+            const _: () = assert!($descriptor.argument_count == 2);
+            let typed: extern "C" fn(
+                *mut JitCtx,
+                u64,
+                u64,
+            ) -> otter_vm::native_abi::NativeResultPair = $entry;
+            binding($descriptor, typed as *const () as usize)
+        }};
+    }
     vec![
         binding(
             abi::STUB_JIT_BACKEDGE_POLL,
             jit_backedge_poll_stub as *const () as usize,
         ),
         binding(abi::STUB_JIT_ADD, jit_add_stub as *const () as usize),
-        binding(
-            abi::STUB_JIT_LOAD_GLOBAL,
-            jit_load_global_stub as *const () as usize,
-        ),
         binding(
             abi::STUB_JIT_LOAD_ELEMENT,
             jit_load_element_stub as *const () as usize,
@@ -284,23 +295,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_pop_native_activation_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_LOAD_UPVALUE,
-            jit_load_upvalue_stub as *const () as usize,
-        ),
-        context_words_binding!(
-            abi::STUB_JIT_LOAD_UPVALUE_VALUE,
-            jit_load_upvalue_value_stub,
-            1
-        ),
-        binding(
-            abi::STUB_JIT_STORE_UPVALUE,
-            jit_store_upvalue_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_STORE_UPVALUE_CHECKED,
-            jit_store_upvalue_checked_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_INLINE_CLOSURE_UPVALUES,
             jit_inline_closure_upvalues_stub as *const () as usize,
         ),
@@ -364,9 +358,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_BIND_FUNCTION,
             jit_bind_function_stub as *const () as usize,
         ),
-        binding(
-            abi::STUB_JIT_GLOBAL_OP,
-            jit_global_op_stub as *const () as usize,
+        committed_value2_binding!(abi::STUB_JIT_BINDING_VALUE, jit_binding_value_stub),
+        committed_value2_binding!(
+            abi::STUB_JIT_GLOBAL_DECLARATION_VALUE,
+            jit_global_declaration_value_stub
         ),
         binding(
             abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
@@ -411,10 +406,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_STATIC_CALL_OP,
             jit_static_call_op_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_CONTROL_OP,
-            jit_control_op_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_SPREAD_CALL_OP,
@@ -702,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn lowering_plan_publishes_property_and_upvalue_operands() {
+    fn lowering_plan_publishes_property_and_schema_binding_operands() {
         let v = view(&[
             (
                 Op::LoadProperty,
@@ -729,6 +720,18 @@ mod tests {
                 Op::StoreUpvalueChecked,
                 vec![Operand::Register(4), Operand::Imm32(5)],
             ),
+            (
+                Op::StoreGlobalChecked,
+                vec![
+                    Operand::Register(4),
+                    Operand::ConstIndex(7),
+                    Operand::Register(5),
+                ],
+            ),
+            (
+                Op::DefineGlobalVar,
+                vec![Operand::ConstIndex(7), Operand::Register(4)],
+            ),
             (Op::ReturnValue, vec![Operand::Register(4)]),
         ]);
         let plan = BaselinePlan::build(&v).expect("plan");
@@ -745,13 +748,24 @@ mod tests {
             (0, 7, 2, 3)
         );
         let load_upvalue = plan.instructions[2]
-            .upvalue_operands()
-            .expect("LoadUpvalue operands");
-        assert_eq!((load_upvalue.value, load_upvalue.index), (4, 5));
+            .binding_value_operands()
+            .expect("LoadUpvalue binding operands");
+        assert_eq!(load_upvalue.result, Some(4));
+        assert_eq!(load_upvalue.values, [None, None]);
         let store_upvalue = plan.instructions[3]
-            .upvalue_operands()
-            .expect("StoreUpvalueChecked operands");
-        assert_eq!((store_upvalue.value, store_upvalue.index), (4, 5));
+            .binding_value_operands()
+            .expect("StoreUpvalueChecked binding operands");
+        assert_eq!(store_upvalue.result, None);
+        assert_eq!(store_upvalue.values, [Some(4), None]);
+        let store_global = plan.instructions[4]
+            .binding_value_operands()
+            .expect("StoreGlobalChecked binding operands");
+        assert_eq!(store_global.result, None);
+        assert_eq!(store_global.values, [Some(4), Some(5)]);
+        let declaration = plan.instructions[5]
+            .global_declaration_operands()
+            .expect("DefineGlobalVar declaration operands");
+        assert_eq!(declaration.values, [Some(4), None]);
     }
 
     #[test]

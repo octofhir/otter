@@ -38,6 +38,14 @@ pub use metadata::*;
 pub use runtime_stubs::*;
 pub use safepoints::*;
 
+// Reentrant runtime-call surface re-exported beside the stub descriptors, so
+// generated-code entry points import one ABI namespace.
+pub use crate::runtime_activation::{
+    ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome, ObjectProtocolValueOp,
+    RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
+};
+pub use crate::{ActiveFrameMut, ActiveFrameRef};
+
 /// Dense identifier for one deopt/side-exit frame state.
 pub type FrameStateId = u32;
 /// Dense identifier for one code-object-owned safepoint.

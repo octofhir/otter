@@ -230,30 +230,9 @@ pub(crate) fn compile_identifier_without_with(
         return Ok(dst);
     }
     // Walk the parent chain for a closure capture.
-    if let Some(uv_idx) = cx.resolve_capture(name) {
+    if let Some((uv_idx, _, eval_depth)) = cx.resolve_capture_with_info(name) {
         let dst = cx.alloc_scratch();
-        // §9.1 — when THIS function body contains a direct eval, an
-        // eval-introduced var of the same name shadows the capture
-        // (it lands in this frame's variable environment, inner to
-        // the captured one).
-        if cx.contains_direct_eval && !cx.is_strict {
-            let name_idx = cx.intern_string_constant(name);
-            cx.emit(
-                Op::LoadShadowedUpvalue,
-                [
-                    Operand::Register(dst),
-                    Operand::ConstIndex(name_idx),
-                    Operand::Imm32(uv_idx as i32),
-                ],
-                span,
-            );
-            return Ok(dst);
-        }
-        cx.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
-            span,
-        );
+        cx.emit_captured_binding_load(dst, name, uv_idx, eval_depth, span);
         return Ok(dst);
     }
     // §10.2.4.1 ResolveBinding + §10.2.4.5 GetValue
@@ -272,7 +251,7 @@ pub(crate) fn compile_identifier_without_with(
     // <https://tc39.es/ecma262/#sec-getvalue>
     let dst = cx.alloc_scratch();
     let name_idx = cx.intern_string_constant(name);
-    let op = if cx.any_enclosing_direct_eval() {
+    let op = if cx.any_enclosing_leaking_direct_eval() {
         Op::LoadDynamic
     } else {
         Op::LoadGlobalOrThrow

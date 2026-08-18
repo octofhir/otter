@@ -206,12 +206,14 @@ impl Compiler {
             }));
     }
 
-    /// `true` when ANY function on the compile stack contains a
-    /// direct eval call site — free identifiers must then resolve
-    /// dynamically (the eval may have introduced the name into an
-    /// enclosing variable environment at runtime).
-    pub(crate) fn any_enclosing_direct_eval(&self) -> bool {
-        self.stack.iter().any(|frame| frame.contains_direct_eval)
+    /// `true` when a sloppy function on the compile stack contains a direct
+    /// eval call site. Only such eval code can leave a persistent var binding
+    /// in an activation's dynamic environment; strict eval owns its fresh
+    /// environment and cannot shadow later references.
+    pub(crate) fn any_enclosing_leaking_direct_eval(&self) -> bool {
+        self.stack
+            .iter()
+            .any(|frame| frame.contains_direct_eval && !frame.is_strict)
     }
 
     pub(crate) fn current_private_namespace(&self) -> Option<u32> {
@@ -322,20 +324,153 @@ impl Compiler {
         Some(current)
     }
 
-    /// Resolve the [`BindingInfo`] a captured name refers to by walking the
-    /// frame stack outward. Used to recover a captured binding's immutability
-    /// flags (`is_const`, `fn_self_name`) — e.g. a named function expression's
-    /// self-name cell — which are needed so a direct `eval` that writes the
-    /// captured binding enforces the same immutability the enclosing code does.
-    pub(crate) fn captured_binding_info(&self, name: &str) -> Option<BindingInfo> {
-        for frame in self.stack.iter().rev() {
+    /// Resolve the declaration-owner frame and [`BindingInfo`] for a captured
+    /// name. Passthrough `captured_uv` entries are deliberately ignored: an
+    /// eval record outside the actual declaration cannot shadow that binding.
+    pub(crate) fn captured_binding_owner(&self, name: &str) -> Option<(usize, BindingInfo)> {
+        for (frame_index, frame) in self.stack.iter().enumerate().rev() {
             for scope in frame.scopes.iter().rev() {
                 if let Some(info) = scope.bindings.get(name) {
-                    return Some(*info);
+                    return Some((frame_index, *info));
                 }
             }
         }
         None
+    }
+
+    /// Resolve one source-level capture, its declaration metadata, and the
+    /// exact physical eval-chain prefix allowed to shadow it.
+    ///
+    /// The declaration owner is excluded and the current frame is included.
+    /// A shadow operation is needed only when that slice contains a sloppy
+    /// direct-eval site. Once needed, the encoded depth counts every physical
+    /// direct-eval record in the slice, including strict empty records that
+    /// occupy a parent-chain node.
+    pub(crate) fn resolve_capture_with_info(
+        &mut self,
+        name: &str,
+    ) -> Option<(u16, BindingInfo, u32)> {
+        let (owner_index, info) = self.captured_binding_owner(name)?;
+        let inner_frames = &self.stack[(owner_index + 1)..];
+        let may_shadow = inner_frames
+            .iter()
+            .any(|frame| frame.contains_direct_eval && !frame.is_strict);
+        let eval_depth = if may_shadow {
+            u32::try_from(
+                inner_frames
+                    .iter()
+                    .filter(|frame| frame.contains_direct_eval)
+                    .count(),
+            )
+            .expect("eval-environment depth overflow")
+        } else {
+            0
+        };
+        let index = self.resolve_capture(name)?;
+        Some((index, info, eval_depth))
+    }
+
+    /// Emit the complete captured-binding read family.
+    ///
+    /// A live eval environment can be owned by this frame or inherited by a
+    /// descendant closure. In that case the runtime must probe the eval chain
+    /// before falling back to the statically captured cell.
+    pub(crate) fn emit_captured_binding_load(
+        &mut self,
+        destination: u16,
+        name: &str,
+        index: u16,
+        eval_depth: u32,
+        span: (u32, u32),
+    ) {
+        if eval_depth != 0 {
+            let name = self.intern_string_constant(name);
+            self.emit(
+                Op::LoadShadowedUpvalue,
+                [
+                    Operand::Register(destination),
+                    Operand::ConstIndex(name),
+                    Operand::Imm32(i32::from(index)),
+                    Operand::Imm32(
+                        i32::try_from(eval_depth).expect("eval-environment depth overflow"),
+                    ),
+                ],
+                span,
+            );
+        } else {
+            self.emit(
+                Op::LoadUpvalue,
+                [
+                    Operand::Register(destination),
+                    Operand::Imm32(i32::from(index)),
+                ],
+                span,
+            );
+        }
+    }
+
+    /// Emit the complete captured-binding assignment family.
+    ///
+    /// Shadow lookup intentionally occurs when the store executes, after RHS
+    /// evaluation. This matches the live eval-environment behavior of V8 for
+    /// plain, compound, logical, destructuring, and update assignments.
+    pub(crate) fn emit_captured_binding_store(
+        &mut self,
+        value: u16,
+        name: &str,
+        index: u16,
+        info: BindingInfo,
+        eval_depth: u32,
+        span: (u32, u32),
+    ) {
+        use otter_bytecode::opcode_schema::{ShadowedUpvalueFallback, ShadowedUpvalueStorePolicy};
+
+        let fallback = if info.fn_self_name {
+            if self.is_strict {
+                ShadowedUpvalueFallback::ImmutableThrow
+            } else {
+                ShadowedUpvalueFallback::ImmutableIgnore
+            }
+        } else if info.is_const {
+            ShadowedUpvalueFallback::ImmutableThrow
+        } else {
+            ShadowedUpvalueFallback::Mutable
+        };
+        if eval_depth != 0 {
+            let name = self.intern_string_constant(name);
+            let policy = ShadowedUpvalueStorePolicy {
+                eval_depth,
+                fallback,
+            }
+            .to_imm32()
+            .expect("shadowed-upvalue store policy overflow");
+            self.emit(
+                Op::StoreShadowedUpvalueChecked,
+                [
+                    Operand::Register(value),
+                    Operand::ConstIndex(name),
+                    Operand::Imm32(i32::from(index)),
+                    Operand::Imm32(policy),
+                ],
+                span,
+            );
+            return;
+        }
+        match fallback {
+            ShadowedUpvalueFallback::Mutable => self.emit(
+                Op::StoreUpvalueChecked,
+                [Operand::Register(value), Operand::Imm32(i32::from(index))],
+                span,
+            ),
+            ShadowedUpvalueFallback::ImmutableThrow => {
+                crate::assignment::emit_assignment_type_error(
+                    self,
+                    &format!("Assignment to constant variable '{name}'."),
+                    span,
+                );
+            }
+            ShadowedUpvalueFallback::ImmutableIgnore => {}
+        }
     }
 
     /// Mirror an assignment to an exported module binding through to

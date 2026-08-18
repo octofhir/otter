@@ -353,6 +353,362 @@ pub enum FeedbackKind {
     Binding,
 }
 
+/// Missing-binding behavior for one typed binding read.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingMissing {
+    /// An unresolved reference raises `ReferenceError`.
+    Throw,
+    /// An unresolved reference produces `undefined` (`typeof` semantics).
+    Undefined,
+}
+
+/// Typed read semantics and their authoritative operand roles.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum BindingRead {
+    /// Read the realm's stable `globalThis` value.
+    GlobalThis {
+        /// Result-register operand position.
+        destination: u8,
+    },
+    /// Read through the global Environment Record.
+    Global {
+        /// Result-register operand position.
+        destination: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Unresolved-reference behavior.
+        missing: BindingMissing,
+    },
+    /// Test whether the global Environment Record currently has a binding.
+    Exists {
+        /// Boolean result-register operand position.
+        destination: u8,
+        /// String-constant operand position.
+        name: u8,
+    },
+    /// Read one captured cell, including its TDZ check.
+    Upvalue {
+        /// Result-register operand position.
+        destination: u8,
+        /// Upvalue-index operand position.
+        index: u8,
+    },
+    /// Read the eval chain, then the global Environment Record.
+    Dynamic {
+        /// Result-register operand position.
+        destination: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Unresolved-reference behavior.
+        missing: BindingMissing,
+    },
+    /// Read the eval chain, then one captured cell.
+    ShadowedUpvalue {
+        /// Result-register operand position.
+        destination: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Captured-cell index operand position.
+        index: u8,
+        /// Number of physical eval-environment records that may shadow the
+        /// captured declaration.
+        eval_depth: u8,
+    },
+}
+
+/// Whether an upvalue store initializes a fresh cell or assigns a live binding.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingWriteCheck {
+    /// Binding initialization may replace the TDZ hole.
+    Initialize,
+    /// Assignment must reject a TDZ hole.
+    Checked,
+}
+
+/// Captured-binding behavior when a shadowed write finds no eval-chain cell.
+///
+/// The physical [`crate::Op::StoreShadowedUpvalueChecked`] site carries this
+/// because an [`otter_vm::UpvalueCell`](https://docs.rs/otter-vm) stores only
+/// the moving value, not the source binding's mutability. The eval-chain hit
+/// always writes; this alphabet governs only the captured fallback.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[repr(i32)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShadowedUpvalueFallback {
+    /// Assignment-check the captured cell and write it.
+    Mutable = 0,
+    /// Reject the captured fallback as an immutable binding.
+    ImmutableThrow = 1,
+    /// Silently retain an immutable named-function self binding.
+    ImmutableIgnore = 2,
+}
+
+impl ShadowedUpvalueFallback {
+    /// Decode the complete schema-owned immediate alphabet.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Mutable),
+            1 => Some(Self::ImmutableThrow),
+            2 => Some(Self::ImmutableIgnore),
+            _ => None,
+        }
+    }
+}
+
+/// One packed store policy for a shadowed captured binding.
+///
+/// The fixed-width instruction record has four inline operands. Packing the
+/// positive physical eval depth with the three-value fallback alphabet keeps
+/// `StoreShadowedUpvalueChecked` inline while this schema remains the sole
+/// encoder/decoder authority.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ShadowedUpvalueStorePolicy {
+    /// Number of physical eval-environment records permitted for lookup.
+    pub eval_depth: u32,
+    /// Captured-cell behavior when the bounded prefix has no matching name.
+    pub fallback: ShadowedUpvalueFallback,
+}
+
+impl ShadowedUpvalueStorePolicy {
+    const FALLBACK_CARDINALITY: u32 = 3;
+
+    /// Encode a positive depth and fallback into the schema-owned immediate.
+    #[must_use]
+    pub const fn to_imm32(self) -> Option<i32> {
+        if self.eval_depth == 0 {
+            return None;
+        }
+        let Some(depth) = self.eval_depth.checked_mul(Self::FALLBACK_CARDINALITY) else {
+            return None;
+        };
+        let Some(encoded) = depth.checked_add(self.fallback as u32) else {
+            return None;
+        };
+        if encoded > i32::MAX as u32 {
+            return None;
+        }
+        Some(encoded as i32)
+    }
+
+    /// Decode the complete packed policy domain.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        if value < Self::FALLBACK_CARDINALITY as i32 {
+            return None;
+        }
+        let encoded = value as u32;
+        let eval_depth = encoded / Self::FALLBACK_CARDINALITY;
+        let fallback = match encoded % Self::FALLBACK_CARDINALITY {
+            0 => ShadowedUpvalueFallback::Mutable,
+            1 => ShadowedUpvalueFallback::ImmutableThrow,
+            2 => ShadowedUpvalueFallback::ImmutableIgnore,
+            _ => return None,
+        };
+        Some(Self {
+            eval_depth,
+            fallback,
+        })
+    }
+}
+
+/// Typed write semantics and their authoritative operand roles.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum BindingWrite {
+    /// Write through the global Environment Record.
+    Global {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Strictness-immediate operand position.
+        strict: u8,
+    },
+    /// Strict global write guarded by a pre-RHS existence Boolean.
+    GlobalChecked {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Pre-RHS existence-register operand position.
+        exists: u8,
+    },
+    /// Write one captured cell.
+    Upvalue {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// Upvalue-index operand position.
+        index: u8,
+        /// Initialization versus assignment semantics.
+        check: BindingWriteCheck,
+    },
+    /// Write the eval chain, then the sloppy global Environment Record.
+    Dynamic {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Strictness-immediate operand position for the global fallback.
+        strict: u8,
+    },
+    /// Write the eval chain, then an assignment-checked captured cell.
+    ShadowedUpvalue {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Captured-cell index operand position.
+        index: u8,
+        /// Packed [`ShadowedUpvalueStorePolicy`] immediate operand position.
+        policy: u8,
+    },
+}
+
+/// Typed binding deletion semantics and authoritative operand roles.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum BindingDelete {
+    /// Delete an eval-chain binding, otherwise a global binding.
+    Dynamic {
+        /// Boolean result-register operand position.
+        destination: u8,
+        /// String-constant operand position.
+        name: u8,
+    },
+    /// Delete an eval-chain shadow, otherwise retain the captured binding.
+    ShadowedUpvalue {
+        /// Boolean result-register operand position.
+        destination: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Captured-cell index operand position used for structural validation.
+        index: u8,
+        /// Number of physical eval-environment records in which deletion is
+        /// permitted.
+        eval_depth: u8,
+    },
+}
+
+/// Single semantic authority for all bytecode binding accesses.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "access", content = "semantics")]
+pub enum BindingSemantics {
+    /// A result-producing binding read.
+    Read(BindingRead),
+    /// A binding mutation.
+    Write(BindingWrite),
+    /// A result-producing binding deletion.
+    Delete(BindingDelete),
+}
+
+impl BindingSemantics {
+    /// Result-register operand, when the operation produces a value.
+    #[must_use]
+    pub const fn result_operand(self) -> Option<u8> {
+        match self {
+            Self::Read(BindingRead::GlobalThis { destination })
+            | Self::Read(BindingRead::Global { destination, .. })
+            | Self::Read(BindingRead::Exists { destination, .. })
+            | Self::Read(BindingRead::Upvalue { destination, .. })
+            | Self::Read(BindingRead::Dynamic { destination, .. })
+            | Self::Read(BindingRead::ShadowedUpvalue { destination, .. })
+            | Self::Delete(BindingDelete::Dynamic { destination, .. })
+            | Self::Delete(BindingDelete::ShadowedUpvalue { destination, .. }) => Some(destination),
+            Self::Write(_) => None,
+        }
+    }
+
+    /// Boxed SSA input-register operands in ABI order.
+    #[must_use]
+    pub const fn value_operands(self) -> [Option<u8>; 2] {
+        match self {
+            Self::Write(BindingWrite::Global { value, .. })
+            | Self::Write(BindingWrite::Upvalue { value, .. })
+            | Self::Write(BindingWrite::Dynamic { value, .. })
+            | Self::Write(BindingWrite::ShadowedUpvalue { value, .. }) => [Some(value), None],
+            Self::Write(BindingWrite::GlobalChecked { value, exists, .. }) => {
+                [Some(value), Some(exists)]
+            }
+            Self::Read(_) | Self::Delete(_) => [None, None],
+        }
+    }
+}
+
+/// Separate global declaration/initialization family.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum GlobalDeclarationSemantics {
+    /// CreateGlobalVarBinding.
+    DeclareVar {
+        /// String-constant operand position.
+        name: u8,
+        /// Configurable-flag immediate operand position.
+        configurable: u8,
+    },
+    /// CreateMutableBinding/CreateImmutableBinding.
+    DeclareLexical {
+        /// String-constant operand position.
+        name: u8,
+        /// Constness immediate operand position.
+        is_const: u8,
+    },
+    /// Preflight one GlobalDeclarationInstantiation name.
+    Validate {
+        /// String-constant operand position.
+        name: u8,
+        /// Declaration-kind immediate operand position.
+        declaration_kind: u8,
+    },
+    /// Initialize/update one global var binding.
+    DefineVar {
+        /// String-constant operand position.
+        name: u8,
+        /// Boxed source-register operand position.
+        value: u8,
+    },
+    /// CreateGlobalFunctionBinding.
+    DefineFunction {
+        /// String-constant operand position.
+        name: u8,
+        /// Boxed function-value register operand position.
+        value: u8,
+        /// Deletable-flag immediate operand position.
+        deletable: u8,
+    },
+    /// Initialize one global lexical cell.
+    InitializeLexical {
+        /// Boxed initializer-register operand position.
+        value: u8,
+        /// String-constant operand position.
+        name: u8,
+    },
+}
+
+impl GlobalDeclarationSemantics {
+    /// Declaration operations do not produce a JavaScript result register.
+    #[must_use]
+    pub const fn result_operand(self) -> Option<u8> {
+        None
+    }
+
+    /// Boxed SSA input-register operands in ABI order.
+    #[must_use]
+    pub const fn value_operands(self) -> [Option<u8>; 2] {
+        match self {
+            Self::DefineVar { value, .. }
+            | Self::DefineFunction { value, .. }
+            | Self::InitializeLexical { value, .. } => [Some(value), None],
+            Self::DeclareVar { .. } | Self::DeclareLexical { .. } | Self::Validate { .. } => {
+                [None, None]
+            }
+        }
+    }
+}
+
 /// Current machine-code tier coverage policy.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -399,6 +755,10 @@ pub struct OpcodeSchema {
     pub exception_successor_shape: ExceptionSuccessorShape,
     /// Current feedback-vector family.
     pub feedback: FeedbackKind,
+    /// Typed binding semantics, when this is a binding access.
+    pub binding: Option<BindingSemantics>,
+    /// Typed global declaration/initialization semantics.
+    pub global_declaration: Option<GlobalDeclarationSemantics>,
     /// Conservative execution effects.
     pub effects: OpcodeEffects,
     /// Baseline-tier coverage policy.
@@ -417,7 +777,12 @@ impl OpcodeSchema {
             control_flow: control_flow(op),
             successor_shape: successor_shape(op),
             exception_successor_shape: exception_successor_shape(op),
-            feedback: feedback(op),
+            feedback: match binding_semantics(op) {
+                Some(_) => FeedbackKind::Binding,
+                None => feedback(op),
+            },
+            binding: binding_semantics(op),
+            global_declaration: global_declaration_semantics(op),
             effects: effects(op),
             baseline: baseline_support(op),
             optimizer: TierSupport::ExperimentalOnly,
@@ -624,6 +989,8 @@ opcode_schema! {
     (Op::EqualImm, 0xAF),
     (Op::NotEqualImm, 0xB0),
     (Op::SuperConstruct, 0xB1),
+    (Op::StoreShadowedUpvalueChecked, 0xB2),
+    (Op::DeleteShadowedUpvalue, 0xB3),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -789,7 +1156,7 @@ const READ_CONST_READ_WRITE: &[OperandSpec] = &[R, CONST, R, W];
 const READ_READ: &[OperandSpec] = &[R, R];
 const READ_READ_READ: &[OperandSpec] = &[R, R, R];
 const WRITE_WRITE_READ: &[OperandSpec] = &[W, W, R];
-const WRITE_CONST_IMM: &[OperandSpec] = &[W, CONST, IMM];
+const WRITE_CONST_IMM_IMM: &[OperandSpec] = &[W, CONST, IMM, IMM];
 const JUMP_VIA_FINALLY: &[OperandSpec] = &[IMM, IMM];
 const READ_CONST: &[OperandSpec] = &[R, CONST];
 const CONST_READ: &[OperandSpec] = &[CONST, R];
@@ -800,6 +1167,7 @@ const WRITE_READ_IMM: &[OperandSpec] = &[W, R, IMM];
 const CONST_READ_IMM: &[OperandSpec] = &[CONST, R, IMM];
 const CONST_IMM: &[OperandSpec] = &[CONST, IMM];
 const READ_CONST_IMM: &[OperandSpec] = &[R, CONST, IMM];
+const READ_CONST_IMM_IMM: &[OperandSpec] = &[R, CONST, IMM, IMM];
 
 const fn operand_shape(op: Op) -> OperandShape {
     match op {
@@ -874,7 +1242,10 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::LoadUpvalue => OperandShape::Fixed(WRITE_IMM),
         Op::StoreUpvalue | Op::StoreUpvalueChecked => OperandShape::Fixed(&[R, IMM]),
         Op::FreshUpvalue => OperandShape::Fixed(&[IMM]),
-        Op::LoadShadowedUpvalue => OperandShape::Fixed(WRITE_CONST_IMM),
+        Op::LoadShadowedUpvalue | Op::DeleteShadowedUpvalue => {
+            OperandShape::Fixed(WRITE_CONST_IMM_IMM)
+        }
+        Op::StoreShadowedUpvalueChecked => OperandShape::Fixed(READ_CONST_IMM_IMM),
         Op::JumpViaFinally => OperandShape::Fixed(JUMP_VIA_FINALLY),
         Op::PopParkedFinally => OperandShape::Fixed(&[IMM]),
         Op::QueueMicrotask => OperandShape::Variadic {
@@ -949,7 +1320,8 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::StarReexport => OperandShape::Fixed(READ_READ),
         Op::LoadImportBinding => OperandShape::Fixed(WRITE_CONST_CONST),
         Op::LoadDynamic | Op::TypeofDynamic | Op::DeleteDynamic => OperandShape::Fixed(WRITE_CONST),
-        Op::StoreDynamic | Op::InitGlobalLex => OperandShape::Fixed(READ_CONST),
+        Op::StoreDynamic => OperandShape::Fixed(READ_CONST_IMM),
+        Op::InitGlobalLex => OperandShape::Fixed(READ_CONST),
         Op::DefineGlobalFunction => OperandShape::Fixed(CONST_READ_IMM),
         Op::DeclareGlobalLex | Op::ValidateGlobalDecl => OperandShape::Fixed(CONST_IMM),
         Op::StoreGlobalBinding => OperandShape::Fixed(READ_CONST_IMM),
@@ -1092,6 +1464,121 @@ const fn control_flow(op: Op) -> ControlFlow {
     }
 }
 
+const fn binding_semantics(op: Op) -> Option<BindingSemantics> {
+    match op {
+        Op::LoadGlobalThis => Some(BindingSemantics::Read(BindingRead::GlobalThis {
+            destination: 0,
+        })),
+        Op::LoadGlobalOrThrow => Some(BindingSemantics::Read(BindingRead::Global {
+            destination: 0,
+            name: 1,
+            missing: BindingMissing::Throw,
+        })),
+        Op::LoadGlobalOrUndefined => Some(BindingSemantics::Read(BindingRead::Global {
+            destination: 0,
+            name: 1,
+            missing: BindingMissing::Undefined,
+        })),
+        Op::GlobalBindingExists => Some(BindingSemantics::Read(BindingRead::Exists {
+            destination: 0,
+            name: 1,
+        })),
+        Op::LoadUpvalue => Some(BindingSemantics::Read(BindingRead::Upvalue {
+            destination: 0,
+            index: 1,
+        })),
+        Op::LoadDynamic => Some(BindingSemantics::Read(BindingRead::Dynamic {
+            destination: 0,
+            name: 1,
+            missing: BindingMissing::Throw,
+        })),
+        Op::TypeofDynamic => Some(BindingSemantics::Read(BindingRead::Dynamic {
+            destination: 0,
+            name: 1,
+            missing: BindingMissing::Undefined,
+        })),
+        Op::LoadShadowedUpvalue => Some(BindingSemantics::Read(BindingRead::ShadowedUpvalue {
+            destination: 0,
+            name: 1,
+            index: 2,
+            eval_depth: 3,
+        })),
+        Op::StoreGlobalBinding => Some(BindingSemantics::Write(BindingWrite::Global {
+            value: 0,
+            name: 1,
+            strict: 2,
+        })),
+        Op::StoreGlobalChecked => Some(BindingSemantics::Write(BindingWrite::GlobalChecked {
+            value: 0,
+            name: 1,
+            exists: 2,
+        })),
+        Op::StoreUpvalue => Some(BindingSemantics::Write(BindingWrite::Upvalue {
+            value: 0,
+            index: 1,
+            check: BindingWriteCheck::Initialize,
+        })),
+        Op::StoreUpvalueChecked => Some(BindingSemantics::Write(BindingWrite::Upvalue {
+            value: 0,
+            index: 1,
+            check: BindingWriteCheck::Checked,
+        })),
+        Op::StoreDynamic => Some(BindingSemantics::Write(BindingWrite::Dynamic {
+            value: 0,
+            name: 1,
+            strict: 2,
+        })),
+        Op::StoreShadowedUpvalueChecked => {
+            Some(BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
+                value: 0,
+                name: 1,
+                index: 2,
+                policy: 3,
+            }))
+        }
+        Op::DeleteDynamic => Some(BindingSemantics::Delete(BindingDelete::Dynamic {
+            destination: 0,
+            name: 1,
+        })),
+        Op::DeleteShadowedUpvalue => {
+            Some(BindingSemantics::Delete(BindingDelete::ShadowedUpvalue {
+                destination: 0,
+                name: 1,
+                index: 2,
+                eval_depth: 3,
+            }))
+        }
+        _ => None,
+    }
+}
+
+const fn global_declaration_semantics(op: Op) -> Option<GlobalDeclarationSemantics> {
+    match op {
+        Op::DeclareGlobalVar => Some(GlobalDeclarationSemantics::DeclareVar {
+            name: 0,
+            configurable: 1,
+        }),
+        Op::DeclareGlobalLex => Some(GlobalDeclarationSemantics::DeclareLexical {
+            name: 0,
+            is_const: 1,
+        }),
+        Op::ValidateGlobalDecl => Some(GlobalDeclarationSemantics::Validate {
+            name: 0,
+            declaration_kind: 1,
+        }),
+        Op::DefineGlobalVar => Some(GlobalDeclarationSemantics::DefineVar { name: 0, value: 1 }),
+        Op::DefineGlobalFunction => Some(GlobalDeclarationSemantics::DefineFunction {
+            name: 0,
+            value: 1,
+            deletable: 2,
+        }),
+        Op::InitGlobalLex => {
+            Some(GlobalDeclarationSemantics::InitializeLexical { value: 0, name: 1 })
+        }
+        _ => None,
+    }
+}
+
 const fn feedback(op: Op) -> FeedbackKind {
     match op {
         Op::Add
@@ -1120,19 +1607,6 @@ const fn feedback(op: Op) -> FeedbackKind {
         | Op::NewSpread
         | Op::SuperConstruct
         | Op::SuperConstructSpread => FeedbackKind::Call,
-        Op::LoadGlobalThis
-        | Op::LoadGlobalOrThrow
-        | Op::LoadGlobalOrUndefined
-        | Op::GlobalBindingExists
-        | Op::StoreGlobalBinding
-        | Op::StoreGlobalChecked
-        | Op::LoadUpvalue
-        | Op::StoreUpvalue
-        | Op::StoreUpvalueChecked
-        | Op::LoadDynamic
-        | Op::StoreDynamic
-        | Op::TypeofDynamic
-        | Op::LoadShadowedUpvalue => FeedbackKind::Binding,
         _ => FeedbackKind::None,
     }
 }
@@ -1275,13 +1749,165 @@ mod tests {
             Op::StoreDynamic,
             Op::TypeofDynamic,
             Op::LoadShadowedUpvalue,
+            Op::DeleteDynamic,
+            Op::StoreShadowedUpvalueChecked,
+            Op::DeleteShadowedUpvalue,
         ]);
         let actual = OPCODE_SCHEMA
             .iter()
-            .filter_map(|schema| (schema.feedback == FeedbackKind::Binding).then_some(schema.op))
+            .filter_map(|schema| schema.binding.map(|_| schema.op))
             .collect::<HashSet<_>>();
 
         assert_eq!(actual, expected);
+        for schema in OPCODE_SCHEMA {
+            assert_eq!(
+                schema.feedback == FeedbackKind::Binding,
+                schema.binding.is_some(),
+                "{:?} has divergent binding feedback/schema authority",
+                schema.op
+            );
+        }
+    }
+
+    #[test]
+    fn shadowed_store_policy_owns_the_complete_packed_domain() {
+        for fallback in [
+            ShadowedUpvalueFallback::Mutable,
+            ShadowedUpvalueFallback::ImmutableThrow,
+            ShadowedUpvalueFallback::ImmutableIgnore,
+        ] {
+            for eval_depth in [1, 2, 17, 1_000_000] {
+                let policy = ShadowedUpvalueStorePolicy {
+                    eval_depth,
+                    fallback,
+                };
+                let encoded = policy.to_imm32().expect("representable policy");
+                assert_eq!(
+                    ShadowedUpvalueStorePolicy::from_imm32(encoded),
+                    Some(policy)
+                );
+            }
+        }
+        assert_eq!(
+            ShadowedUpvalueStorePolicy {
+                eval_depth: 0,
+                fallback: ShadowedUpvalueFallback::Mutable,
+            }
+            .to_imm32(),
+            None
+        );
+        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(-1), None);
+        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(0), None);
+        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(1), None);
+        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(2), None);
+        assert_eq!(
+            ShadowedUpvalueStorePolicy {
+                eval_depth: u32::MAX,
+                fallback: ShadowedUpvalueFallback::ImmutableIgnore,
+            }
+            .to_imm32(),
+            None
+        );
+    }
+
+    #[test]
+    fn binding_semantic_operands_agree_with_wire_roles() {
+        let assert_operand =
+            |schema: &OpcodeSchema, index: u8, kind: OperandKind, access: RegisterAccess| {
+                let actual = operand_spec_at(schema.op, usize::from(index));
+                assert_eq!(
+                    actual,
+                    Some(OperandSpec {
+                        kind,
+                        register_access: access,
+                        register_source: (access != RegisterAccess::None)
+                            .then_some(RegisterSource::RegisterOperand),
+                    }),
+                    "{:?} operand {index}",
+                    schema.op
+                );
+            };
+        for schema in OPCODE_SCHEMA {
+            let Some(binding) = schema.binding else {
+                continue;
+            };
+            if let Some(result) = binding.result_operand() {
+                assert_operand(schema, result, OperandKind::Register, RegisterAccess::Write);
+            }
+            for value in binding.value_operands().into_iter().flatten() {
+                assert_operand(schema, value, OperandKind::Register, RegisterAccess::Read);
+            }
+            match binding {
+                BindingSemantics::Read(BindingRead::GlobalThis { .. }) => {}
+                BindingSemantics::Read(BindingRead::Upvalue { index, .. }) => {
+                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+                }
+                BindingSemantics::Read(BindingRead::Global { name, .. })
+                | BindingSemantics::Read(BindingRead::Exists { name, .. })
+                | BindingSemantics::Read(BindingRead::Dynamic { name, .. })
+                | BindingSemantics::Delete(BindingDelete::Dynamic { name, .. }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                }
+                BindingSemantics::Read(BindingRead::ShadowedUpvalue {
+                    name,
+                    index,
+                    eval_depth,
+                    ..
+                })
+                | BindingSemantics::Delete(BindingDelete::ShadowedUpvalue {
+                    name,
+                    index,
+                    eval_depth,
+                    ..
+                }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+                    assert_operand(schema, eval_depth, OperandKind::Imm32, RegisterAccess::None);
+                }
+                BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                    assert_operand(schema, strict, OperandKind::Imm32, RegisterAccess::None);
+                }
+                BindingSemantics::Write(BindingWrite::GlobalChecked { name, .. }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                }
+                BindingSemantics::Write(BindingWrite::Dynamic { name, strict, .. }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                    assert_operand(schema, strict, OperandKind::Imm32, RegisterAccess::None);
+                }
+                BindingSemantics::Write(BindingWrite::Upvalue { index, .. }) => {
+                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+                }
+                BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
+                    name,
+                    index,
+                    policy,
+                    ..
+                }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+                    assert_operand(schema, policy, OperandKind::Imm32, RegisterAccess::None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_declaration_family_is_disjoint_from_binding_accesses() {
+        let expected = HashSet::from([
+            Op::DeclareGlobalVar,
+            Op::DeclareGlobalLex,
+            Op::ValidateGlobalDecl,
+            Op::DefineGlobalVar,
+            Op::DefineGlobalFunction,
+            Op::InitGlobalLex,
+        ]);
+        let actual = OPCODE_SCHEMA
+            .iter()
+            .filter_map(|schema| schema.global_declaration.map(|_| schema.op))
+            .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|op| opcode_schema(*op).binding.is_none()));
     }
 
     #[test]

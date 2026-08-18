@@ -50,9 +50,12 @@
 //!   proven non-cell before boxing omit that barrier entirely. Dense-array and
 //!   primitive-string `.length` reads use the shared exotic layout guard before
 //!   that chain.
-//! - Captured-binding reads validate the current native frame's cell count,
-//!   spine, cell type, and TDZ state, then load directly without reentry. Any
-//!   miss deoptimizes at the original read.
+//! - Typed binding guards validate global-this cells, captured-cell spines,
+//!   TDZ/writability, or baked global lexical/object proofs. A hit reads or
+//!   writes directly and stores run the generated barrier. Every miss enters
+//!   the single rooted committed binding call, whose payload and descriptor-
+//!   owned status remain explicit SSA through Success/Throw/Fatal control;
+//!   no emitter-hidden status branch, deopt, or replay exists.
 //! - Backedge polls run before allocator edge edits and preserve every value
 //!   live into the loop header across the leaf runtime call. An `x29` local
 //!   countdown amortizes shared interrupt and fuel-cell traffic over the same
@@ -77,26 +80,31 @@
 #![allow(clippy::useless_conversion)]
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
+use otter_bytecode::opcode_schema::{
+    BindingRead, BindingSemantics, BindingWrite, BindingWriteCheck,
+};
 use otter_vm::{
     JitCompileSnapshot, JitElementAccess, UPVALUE_CELL_TYPE_TAG, Value,
     deopt::DeoptRuntime,
     native_abi::{
         NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor, RuntimeStubResultAbi,
         RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT,
-        STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE, STUB_JIT_CALL_METHOD_VALUE,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR,
+        STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_ELEMENT,
+        STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
+        STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC,
+        STUB_TO_BOOLEAN_LEAF,
     },
 };
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallDescriptor,
     CallTarget, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
-    InstructionSequence, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrInput,
-    MachineOsrType, MachineRepresentation, MachineSafepointSite, MachineSafepointTable,
-    MachineValue, PackedDoubleViewCacheId,
+    InstructionSequence, MachineBindingTarget, MachineFrameLayout, MachineInstructionId,
+    MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation, MachineSafepointSite,
+    MachineSafepointTable, MachineValue, PackedDoubleViewCacheId, binding_target_matches_semantics,
+    is_explicit_binding_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -711,7 +719,7 @@ fn emit_committed_runtime_call(
         || target.result_abi != RuntimeStubResultAbi::NativePair
         || target.result_domain != NativeResultDomain::Committed
         || descriptor.arguments.len() != semantic_arity
-        || descriptor.result != Some(MachineRepresentation::Tagged)
+        || descriptor.results != [MachineRepresentation::Tagged]
         || instruction.deopt.is_some()
     {
         return Err(Unsupported::OperandShape(
@@ -837,6 +845,398 @@ fn emit_committed_runtime_call(
     emit_reload_safepoint_roots(ops, frame, site)?;
     emit_store_allocated_tagged(ops, frame, result_location, 17, 0)?;
     Ok(byte_pc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_binding_runtime_call(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &TransitionTable,
+    sequence: &InstructionSequence,
+    frame: MachineFrameLayout,
+    instruction: &super::super::MachineInstruction,
+    id: MachineInstructionId,
+    descriptor: &CallDescriptor,
+    locations: &[AllocatedLocation],
+    safepoints: &MachineSafepointTable,
+) -> Result<u32, Unsupported> {
+    let CallTarget::CommittedRuntime {
+        target,
+        logical_pc,
+        byte_pc,
+        semantic_arity,
+    } = &descriptor.target
+    else {
+        return Err(Unsupported::OperandShape("scalar binding runtime target"));
+    };
+    let logical_pc = *logical_pc;
+    let byte_pc = *byte_pc;
+    let semantic_arity = usize::from(*semantic_arity);
+    if !is_explicit_binding_runtime_call(descriptor)
+        || *target != STUB_JIT_BINDING_VALUE
+        || semantic_arity > 2
+        || target.signature != RuntimeStubSignature::CommittedValue2
+        || target.result_abi != RuntimeStubResultAbi::NativePair
+        || target.result_domain != NativeResultDomain::Committed
+        || descriptor.arguments.len() != semantic_arity
+        || instruction.deopt.is_some()
+    {
+        return Err(Unsupported::OperandShape("scalar binding runtime contract"));
+    }
+    let arguments = instruction
+        .operands
+        .iter()
+        .filter(|operand| operand.purpose == super::super::OperandPurpose::Input)
+        .map(|operand| operand.value)
+        .collect::<Vec<_>>();
+    let outputs = instruction
+        .operands
+        .iter()
+        .enumerate()
+        .filter(|(_, operand)| operand.purpose == super::super::OperandPurpose::Output)
+        .collect::<Vec<_>>();
+    let [payload, status] = outputs.as_slice() else {
+        return Err(Unsupported::OperandShape(
+            "scalar binding runtime result pair",
+        ));
+    };
+    let payload_location = *locations.get(payload.0).ok_or(Unsupported::OperandShape(
+        "scalar binding payload allocation",
+    ))?;
+    let status_location = *locations.get(status.0).ok_or(Unsupported::OperandShape(
+        "scalar binding status allocation",
+    ))?;
+    if arguments.len() != semantic_arity {
+        return Err(Unsupported::OperandShape(
+            "scalar binding runtime semantic arity",
+        ));
+    }
+    let site = safepoints
+        .site(id)
+        .filter(|site| instruction.safepoint == Some(site.id))
+        .ok_or(Unsupported::OperandShape(
+            "scalar binding runtime safepoint",
+        ))?;
+
+    emit_clear_packed_double_view_caches(ops, frame, sequence.packed_double_view_cache_count())?;
+    emit_save_safepoint_roots(ops, frame, site)?;
+    emit_publish_machine_roots(ops, frame, site)?;
+    emit_load_u64(ops, 1, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; mov x2, x1);
+    for (index, value) in arguments.iter().copied().enumerate() {
+        emit_load_safepoint_root(
+            ops,
+            frame,
+            site,
+            value,
+            u8::try_from(index + 1)
+                .map_err(|_| Unsupported::OperandShape("scalar binding runtime argument"))?,
+            MACHINE_ROOT_RECORD_SIZE,
+        )?;
+    }
+    emit_load_u64(ops, 15, u64::from(logical_pc));
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+        ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
+        ; mov x0, x19
+    );
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        16,
+        transitions.entry(*target),
+        RelocationTarget::runtime_stub(*target),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        // Preserve the physical pair outside the allocator bank while moving
+        // roots are restored. No status decision is legal in this emitter.
+        ; mov x17, x0
+        ; mov x15, x1
+    );
+    emit_clear_machine_roots(ops);
+    emit_reload_safepoint_roots(ops, frame, site)?;
+    emit_store_allocated_tagged(ops, frame, payload_location, 17, 0)?;
+    emit_store_allocated_tagged(ops, frame, status_location, 15, 0)?;
+    Ok(byte_pc)
+}
+
+fn binding_requires_live_cell(semantics: BindingSemantics) -> bool {
+    matches!(
+        semantics,
+        BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Upvalue { .. })
+            | BindingSemantics::Write(
+                BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. }
+            )
+            | BindingSemantics::Write(BindingWrite::Upvalue {
+                check: BindingWriteCheck::Checked,
+                ..
+            })
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_binding_guard(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    frame: MachineFrameLayout,
+    semantics: BindingSemantics,
+    target: MachineBindingTarget,
+    byte_pc: u32,
+    locations: &[AllocatedLocation],
+) -> Result<(), Unsupported> {
+    if locations.len() != 3 + semantics.value_operands().into_iter().flatten().count()
+        || !binding_target_matches_semantics(semantics, target)
+    {
+        return Err(Unsupported::OperandShape("scalar binding guard"));
+    }
+    let condition = integer_register(locations[0])?;
+    let owner = integer_register(locations[1])?;
+    let storage = integer_register(locations[2])?;
+    let upvalue_value_byte = view.upvalue_value_byte;
+    let upvalue_cell_type_tag = UPVALUE_CELL_TYPE_TAG as u32;
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+
+    if matches!(
+        semantics,
+        BindingSemantics::Write(BindingWrite::GlobalChecked { .. })
+    ) {
+        emit_load_allocated_tagged(ops, frame, locations[4], 9, 0)?;
+        emit_load_u64(ops, 11, Value::boolean(true).to_bits());
+        dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.ne =>miss);
+    }
+
+    match target {
+        MachineBindingTarget::Cold => dynasm!(ops ; .arch aarch64 ; b =>miss),
+        MachineBindingTarget::GlobalThis => {
+            if view.cage_base == 0 {
+                return Err(Unsupported::OperandShape("scalar global-this binding cage"));
+            }
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x14, [x19, GLOBAL_THIS_OFFSET_PTR_OFFSET]
+                ; cbz x14, =>miss
+                ; ldr w12, [x14]
+                ; cbz w12, =>miss
+            );
+            emit_load_symbolic_u64(
+                ops,
+                relocations,
+                13,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            emit_load_u64(ops, 16, u64::from(upvalue_value_byte));
+            dynasm!(ops
+                ; .arch aarch64
+                ; add X(owner), x13, x12
+                ; mov X(storage), x14
+            );
+        }
+        MachineBindingTarget::Upvalue { index } => {
+            if view.cage_base == 0 || index > 4095 {
+                return Err(Unsupported::OperandShape("scalar upvalue binding target"));
+            }
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
+                ; ldr w11, [x10, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+                ; cmp w11, index
+                ; b.ls =>miss
+                ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+                ; cbz x9, =>miss
+                ; ldr w9, [x9, index * 4]
+                ; cbz w9, =>miss
+            );
+            emit_load_symbolic_u64(
+                ops,
+                relocations,
+                13,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            emit_load_u64(ops, 16, u64::from(upvalue_value_byte));
+            dynasm!(ops
+                ; .arch aarch64
+                ; add X(owner), x13, x9
+                ; ldrb w10, [X(owner)]
+                ; cmp w10, upvalue_cell_type_tag
+                ; b.ne =>miss
+                ; add X(storage), X(owner), x16
+            );
+            if binding_requires_live_cell(semantics) {
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [X(storage)]);
+                emit_load_u64(ops, 11, VALUE_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
+            }
+        }
+        MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalLexical {
+            cell_offset,
+            writable,
+        }) => {
+            if view.cage_base == 0 {
+                return Err(Unsupported::OperandShape(
+                    "scalar global lexical binding cage",
+                ));
+            }
+            if matches!(semantics, BindingSemantics::Write(_)) && !writable {
+                return Err(Unsupported::OperandShape("scalar writable lexical binding"));
+            }
+            let cell_addr = view.cage_base.checked_add(cell_offset as usize).ok_or(
+                Unsupported::OperandShape("scalar global lexical binding cell"),
+            )?;
+            emit_load_symbolic_u64(
+                ops,
+                relocations,
+                13,
+                cell_addr as u64,
+                RelocationTarget::GlobalLexicalCell {
+                    function_id: view.code_block.id,
+                    byte_pc,
+                },
+            );
+            emit_load_u64(ops, 16, u64::from(upvalue_value_byte));
+            dynasm!(ops
+                ; .arch aarch64
+                ; mov X(owner), x13
+                ; add X(storage), x13, x16
+            );
+            if binding_requires_live_cell(semantics) {
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [X(storage)]);
+                emit_load_u64(ops, 11, VALUE_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
+            }
+        }
+        MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalObject {
+            shape,
+            dictionary,
+            value_byte,
+            global_lexical_epoch,
+            writable,
+        }) => {
+            if view.cage_base == 0 {
+                return Err(Unsupported::OperandShape(
+                    "scalar global object binding cage",
+                ));
+            }
+            if matches!(semantics, BindingSemantics::Write(_)) && !writable {
+                return Err(Unsupported::OperandShape("scalar writable object binding"));
+            }
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x14, [x19, THREAD_OFFSET]
+                ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
+                ; cbz x14, =>miss
+                ; ldr x15, [x14]
+            );
+            emit_load_u64(ops, 11, global_lexical_epoch);
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x15, x11
+                ; b.ne =>miss
+                ; ldr x14, [x19, GLOBAL_THIS_OFFSET_PTR_OFFSET]
+                ; cbz x14, =>miss
+                ; ldr w12, [x14]
+            );
+            emit_load_symbolic_u64(
+                ops,
+                relocations,
+                14,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x13, x14, x12
+                ; mov X(owner), x13
+                ; ldr w14, [x13, view.object_shape_byte]
+            );
+            if dictionary {
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cbnz w14, =>miss
+                    ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
+                );
+                emit_load_u64(ops, 11, shape);
+                dynasm!(ops ; .arch aarch64 ; cmp x14, x11 ; b.ne =>miss);
+            } else {
+                emit_load_u64(ops, 11, shape);
+                dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);
+            }
+            emit_slab_base(ops, view, 13, 14);
+            emit_load_u64(ops, 16, u64::from(value_byte));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbz x13, =>miss
+                ; add X(storage), x13, x16
+            );
+        }
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov W(condition), #1
+        ; b =>done
+        ; =>miss
+        ; mov W(condition), wzr
+        ; mov X(owner), xzr
+        ; mov X(storage), xzr
+        ; =>done
+    );
+    Ok(())
+}
+
+fn emit_binding_hit(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    semantics: BindingSemantics,
+    target: MachineBindingTarget,
+    locations: &[AllocatedLocation],
+) -> Result<(), Unsupported> {
+    if matches!(target, MachineBindingTarget::Cold)
+        || !binding_target_matches_semantics(semantics, target)
+    {
+        return Err(Unsupported::OperandShape("scalar binding hit target"));
+    }
+    match semantics {
+        BindingSemantics::Read(read) => {
+            if locations.len() != 3 {
+                return Err(Unsupported::OperandShape("scalar binding read hit"));
+            }
+            match read {
+                BindingRead::GlobalThis { .. } => {
+                    emit_load_allocated_integer(ops, frame, locations[1], 13, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; ldr w9, [x13]);
+                }
+                BindingRead::Exists { .. } => {
+                    emit_load_u64(ops, 9, Value::boolean(true).to_bits());
+                }
+                BindingRead::Global { .. } | BindingRead::Upvalue { .. } => {
+                    emit_load_allocated_integer(ops, frame, locations[1], 13, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
+                }
+                BindingRead::Dynamic { .. } | BindingRead::ShadowedUpvalue { .. } => {
+                    return Err(Unsupported::OperandShape("scalar dynamic binding hit"));
+                }
+            }
+            emit_store_allocated_tagged(ops, frame, locations[2], 9, 0)?;
+        }
+        BindingSemantics::Write(_) => {
+            if locations.len() != 3 {
+                return Err(Unsupported::OperandShape("scalar binding write hit"));
+            }
+            emit_load_allocated_integer(ops, frame, locations[1], 13, 0)?;
+            emit_load_allocated_tagged(ops, frame, locations[2], 9, 0)?;
+            dynasm!(ops ; .arch aarch64 ; str x9, [x13]);
+        }
+        BindingSemantics::Delete(_) => {
+            return Err(Unsupported::OperandShape("scalar delete binding hit"));
+        }
+    }
+    Ok(())
 }
 
 fn emit_save_committed_element_caller_bank(ops: &mut dynasmrt::aarch64::Assembler) {
@@ -1026,103 +1426,57 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::GlobalLexicalLoad { byte_pc, target } => {
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+            MachineOpcode::BindingGuard {
+                byte_pc,
+                semantics,
+                target,
+            } => {
                 let start = ops.offset().0;
-                let cell_addr = view
-                    .cage_base
-                    .checked_add(target.cell_offset as usize)
-                    .ok_or(Unsupported::OperandShape(
-                        "scalar global lexical cell address",
-                    ))?;
-                emit_load_symbolic_u64(
+                emit_binding_guard(
                     &mut ops,
                     &mut relocations,
-                    13,
-                    cell_addr as u64,
-                    RelocationTarget::GlobalLexicalCell {
-                        function_id: view.code_block.id,
-                        byte_pc,
-                    },
-                );
-                dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
-                emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp x9, x11
-                    ; b.eq =>deopt
-                );
-                emit_store_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                    view,
+                    frame,
+                    semantics,
+                    target,
+                    byte_pc,
+                    locations,
+                )?;
                 structural_regions.push((
-                    "machineGlobalLexicalLoad",
+                    "machineBindingGuard",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::GlobalObjectLoad { byte_pc, target } => {
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+            MachineOpcode::BindingHit {
+                byte_pc,
+                semantics,
+                target,
+            } => {
                 let start = ops.offset().0;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x14, [x19, THREAD_OFFSET]
-                    ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
-                    ; cbz x14, =>deopt
-                    ; ldr x15, [x14]
-                );
-                emit_load_u64(&mut ops, 11, target.global_lexical_epoch);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp x15, x11
-                    ; b.ne =>deopt
-                    ; ldr x14, [x19, GLOBAL_THIS_OFFSET_PTR_OFFSET]
-                    ; ldr w12, [x14]
-                );
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    14,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; add x13, x14, x12
-                    ; ldr w14, [x13, view.object_shape_byte]
-                );
-                if target.dictionary {
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; cbnz w14, =>deopt
-                        ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
-                    );
-                    emit_load_u64(&mut ops, 11, target.shape);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; cmp x14, x11
-                        ; b.ne =>deopt
-                    );
-                } else {
-                    emit_load_u64(&mut ops, 11, target.shape);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; cmp w14, w11
-                        ; b.ne =>deopt
-                    );
-                }
-                emit_slab_base(&mut ops, view, 13, 14);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cbz x13, =>deopt
-                    ; ldr x9, [x13, target.value_byte]
-                );
-                emit_store_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                emit_binding_hit(&mut ops, frame, semantics, target, locations)?;
                 structural_regions.push((
-                    "machineGlobalObjectLoad",
+                    "machineBindingHit",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
                 ));
+            }
+            MachineOpcode::BindingWriteBarrier => {
+                if locations.len() != 2 {
+                    return Err(Unsupported::OperandShape("scalar binding write barrier"));
+                }
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 12, 0)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                let done = ops.new_dynamic_label();
+                emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, done);
+                emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 9, 19);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+            }
+            MachineOpcode::BindingJoin { byte_pc, .. } => {
+                let offset = ops.offset().0;
+                structural_regions.push(("machineBindingJoin", Some(byte_pc), offset, offset));
             }
             MachineOpcode::TaggedConstant(bits) => {
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
@@ -1550,56 +1904,6 @@ pub(super) fn emit(
                 integer_register(locations[0])?,
                 integer_register(locations[1])?,
             ),
-            MachineOpcode::LoadUpvalue { index, byte_pc } => {
-                let index = u32::try_from(index)
-                    .ok()
-                    .filter(|index| *index <= 4095)
-                    .ok_or(Unsupported::OperandShape("scalar upvalue load index"))?;
-                if view.cage_base == 0 {
-                    return Err(Unsupported::OperandShape("scalar upvalue load cage"));
-                }
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
-                let start = ops.offset().0;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
-                    ; ldr w11, [x10, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-                    ; cmp w11, index
-                    ; b.ls =>deopt
-                    ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                    ; cbz x9, =>deopt
-                    ; ldr w9, [x9, index * 4]
-                    ; cbz w9, =>deopt
-                );
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    13,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; add x13, x13, x9
-                    ; ldrb w10, [x13]
-                    ; cmp w10, UPVALUE_CELL_TYPE_TAG as u32
-                    ; b.ne =>deopt
-                    ; ldr x9, [x13, view.upvalue_value_byte]
-                );
-                emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp x9, x11
-                    ; b.eq =>deopt
-                );
-                emit_store_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                structural_regions.push((
-                    "machineUpvalueLoad",
-                    Some(byte_pc),
-                    start,
-                    ops.offset().0,
-                ));
-            }
             MachineOpcode::PropertyLoad {
                 byte_pc,
                 exotic_length,
@@ -2381,6 +2685,32 @@ pub(super) fn emit(
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
             }
+            MachineOpcode::BranchNativeStatus => {
+                let status = integer_register(locations[0])?;
+                let throw_status = NativeResultStatus::Throw as u32;
+                let block = &sequence.blocks()[block_index];
+                let [success, throw, fatal_target] = block.successors.as_slice() else {
+                    return Err(Unsupported::OperandShape("scalar native-status successors"));
+                };
+                let success = block_labels[success.0 as usize];
+                let throw = block_labels[throw.0 as usize];
+                let fatal_target = block_labels[fatal_target.0 as usize];
+                emit_load_u64(&mut ops, 16, u64::from(throw_status));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cbz X(status), =>success
+                    ; cmp X(status), x16
+                    ; b.eq =>throw
+                    ; b =>fatal_target
+                );
+            }
+            MachineOpcode::Throw => {
+                let exception = integer_register(locations[0])?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, X(exception) ; b =>throw_value);
+            }
+            MachineOpcode::Fatal => {
+                dynasm!(ops ; .arch aarch64 ; b =>fatal);
+            }
             MachineOpcode::Call(descriptor_index) => {
                 let descriptor = sequence
                     .call_descriptors()
@@ -2799,6 +3129,36 @@ pub(super) fn emit(
                         ));
                         continue;
                     }
+                    if is_explicit_binding_runtime_call(descriptor) {
+                        let start = ops.offset().0;
+                        let byte_pc = emit_binding_runtime_call(
+                            &mut ops,
+                            &mut relocations,
+                            transitions,
+                            sequence,
+                            frame,
+                            instruction,
+                            id,
+                            descriptor,
+                            locations,
+                            safepoints,
+                        )?;
+                        structural_regions.push((
+                            "machineBindingCold",
+                            Some(byte_pc),
+                            start,
+                            ops.offset().0,
+                        ));
+                        if !is_terminator {
+                            emit_edits(
+                                &mut ops,
+                                allocation.edits(),
+                                AllocationPoint::After(id),
+                                frame,
+                            )?;
+                        }
+                        continue;
+                    }
                     if matches!(&descriptor.target, CallTarget::CommittedRuntime { .. }) {
                         let start = ops.offset().0;
                         let byte_pc = emit_committed_runtime_call(
@@ -2837,7 +3197,7 @@ pub(super) fn emit(
                         && target == STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW
                     {
                         if !descriptor.arguments.is_empty()
-                            || descriptor.result.is_some()
+                            || !descriptor.results.is_empty()
                             || descriptor.exceptional != ExceptionalEdge::None
                             || instruction.safepoint.is_some()
                             || !locations.is_empty()
@@ -4268,19 +4628,20 @@ mod tests {
     use super::{
         COMMITTED_ELEMENT_CALLER_SAVE_BYTES, COMMITTED_ELEMENT_COLD_STACK_BYTES,
         COMMITTED_ELEMENT_FP_SAVE_PAIRS, COMMITTED_ELEMENT_GPR_SAVE_PAIRS,
-        COMMITTED_ELEMENT_ROOT_RECORD_BYTES, CommittedElementKey, committed_element_key, emit,
-        frame_layout,
+        COMMITTED_ELEMENT_ROOT_RECORD_BYTES, CommittedElementKey, RelocationCapture,
+        committed_element_key, emit, emit_binding_guard, emit_load_u64, frame_layout,
     };
     use crate::{
         entry::TransitionTable,
         machine::{
             AllocatedLocation, CallDescriptor, CallEffects, CallTarget, ControlFlow,
-            ExceptionalEdge, InstructionSequence, MachineBlock, MachineBlockData,
-            MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand,
-            MachineRepresentation, MachineValue, PhysicalRegister, SafepointId, SafepointKind,
-            TargetRegisterFile, lower_safepoints,
+            ExceptionalEdge, InstructionSequence, MachineBindingTarget, MachineBlock,
+            MachineBlockData, MachineInstruction, MachineInstructionId, MachineOpcode,
+            MachineOperand, MachineRepresentation, MachineValue, PhysicalRegister, SafepointId,
+            SafepointKind, TargetRegisterFile, lower_safepoints,
         },
     };
+    use otter_bytecode::opcode_schema::{BindingMissing, BindingRead, BindingSemantics};
     use otter_vm::{JitCompileSnapshot, deopt::DeoptRuntime};
 
     fn committed_runtime_sequence(semantic_arity: u8) -> InstructionSequence {
@@ -4338,7 +4699,7 @@ mod tests {
                     semantic_arity,
                 },
                 arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
-                result: Some(MachineRepresentation::Tagged),
+                results: vec![MachineRepresentation::Tagged],
                 effects: complete_effects,
                 clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
                 exceptional: ExceptionalEdge::Propagate,
@@ -4419,7 +4780,7 @@ mod tests {
                         semantic_arity: 0,
                     },
                     arguments: Vec::new(),
-                    result: Some(MachineRepresentation::Tagged),
+                    results: vec![MachineRepresentation::Tagged],
                     effects: complete_effects,
                     clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
                     exceptional: ExceptionalEdge::LandingPad(MachineBlock(2)),
@@ -4430,7 +4791,7 @@ mod tests {
                         otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
                     ),
                     arguments: Vec::new(),
-                    result: None,
+                    results: Vec::new(),
                     effects: CallEffects::WRITES_HEAP,
                     clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
                     exceptional: ExceptionalEdge::None,
@@ -4768,6 +5129,99 @@ mod tests {
             f64::from(u32::MAX) + 1.0,
         ] {
             assert_eq!(checked_element_index_model(rejected), None, "{rejected}");
+        }
+    }
+
+    #[test]
+    fn upvalue_binding_guard_materializes_the_value_field_offset() {
+        let sequence = committed_runtime_sequence(0);
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("fixture allocation");
+        let frame = frame_layout(&allocation, 1).expect("fixture frame");
+        let mut view = JitCompileSnapshot::without_feedback(19, 0, 1, Vec::new());
+        view.cage_base = 0x1000;
+        view.upvalue_value_byte = 0x38;
+        let mut assembler = dynasmrt::aarch64::Assembler::new().expect("binding assembler");
+        let mut relocations = RelocationCapture::default();
+        emit_binding_guard(
+            &mut assembler,
+            &mut relocations,
+            &view,
+            frame,
+            BindingSemantics::Read(BindingRead::Upvalue {
+                destination: 0,
+                index: 1,
+            }),
+            MachineBindingTarget::Upvalue { index: 3 },
+            24,
+            &[
+                AllocatedLocation::Register(PhysicalRegister::integer(0)),
+                AllocatedLocation::Register(PhysicalRegister::integer(1)),
+                AllocatedLocation::Register(PhysicalRegister::integer(2)),
+            ],
+        )
+        .expect("upvalue binding guard emission");
+        let code = assembler.finalize().expect("binding guard code");
+
+        let mut expected = dynasmrt::aarch64::Assembler::new().expect("expected assembler");
+        emit_load_u64(&mut expected, 16, u64::from(view.upvalue_value_byte));
+        let expected = expected.finalize().expect("offset load code");
+        assert!(
+            code.as_ref()
+                .windows(expected.len())
+                .any(|window| window == expected.as_ref()),
+            "generated upvalue storage address must materialize upvalue_value_byte"
+        );
+    }
+
+    #[test]
+    fn global_binding_guards_defensively_reject_a_missing_cage() {
+        let sequence = committed_runtime_sequence(0);
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("fixture allocation");
+        let frame = frame_layout(&allocation, 1).expect("fixture frame");
+        let view = JitCompileSnapshot::without_feedback(20, 0, 1, Vec::new());
+        let semantics = BindingSemantics::Read(BindingRead::Global {
+            destination: 0,
+            name: 1,
+            missing: BindingMissing::Throw,
+        });
+        let locations = [
+            AllocatedLocation::Register(PhysicalRegister::integer(0)),
+            AllocatedLocation::Register(PhysicalRegister::integer(1)),
+            AllocatedLocation::Register(PhysicalRegister::integer(2)),
+        ];
+        for target in [
+            MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalLexical {
+                cell_offset: 0x40,
+                writable: true,
+            }),
+            MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalObject {
+                shape: 7,
+                dictionary: false,
+                value_byte: 16,
+                global_lexical_epoch: 3,
+                writable: true,
+            }),
+        ] {
+            let mut assembler = dynasmrt::aarch64::Assembler::new().expect("binding assembler");
+            let mut relocations = RelocationCapture::default();
+            assert!(
+                emit_binding_guard(
+                    &mut assembler,
+                    &mut relocations,
+                    &view,
+                    frame,
+                    semantics,
+                    target,
+                    24,
+                    &locations,
+                )
+                .is_err(),
+                "global proof without a cage must not become generated code"
+            );
         }
     }
 }

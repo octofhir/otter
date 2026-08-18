@@ -37,19 +37,25 @@
 //!   and constructor targets remain monomorphic. A cold call exit owns no
 //!   inputs, effects, clobbers, roots, or safepoint and must carry an exact
 //!   pre-call deoptimization state.
-//! - Committed runtime calls own zero to two true tagged inputs, one tagged
-//!   completion value, a GC safepoint, and an explicit throw edge. Their typed
-//!   ABI cannot report a guard miss or request deoptimization/replay. Trailing
-//!   `TaggedRoot` metadata contains every true input plus the complete live
-//!   tagged state and may therefore be a strict superset of semantic operands.
+//! - Committed runtime calls own zero to two true tagged inputs and one GC
+//!   safepoint. Ordinary committed descriptors expose the tagged completion and
+//!   one exceptional edge; the binding descriptor instead exposes the physical
+//!   tagged payload plus descriptor-domain status to explicit Machine control.
+//!   Neither form can report a guard miss or request deoptimization/replay.
+//!   Trailing `TaggedRoot` metadata contains every true input plus the complete
+//!   live tagged state and may therefore be a strict superset of semantic
+//!   operands.
+//! - The schema-owned binding family expands before allocation into an explicit
+//!   guard, generated hit, committed `NativeResultPair` cold call, three-way
+//!   Success/Throw/Fatal branch, and join. Guard-produced owner/storage
+//!   addresses are untraced and verifier-confined to the generated hit block;
+//!   no safepoint, block argument, or backedge may retain them.
 //! - Root and deopt maps are built from the same per-operand allocation table
 //!   consumed by the emitter; there is no pre-allocation location fallback.
 //! - OSR sources are immutable entry metadata aligned with ordinary late-use
 //!   operands; their target locations come from that same allocation table.
 //! - Guarded element operands are late location uses, so target emission may
 //!   materialize stack or register homes without overwriting a live input.
-//! - Prepared global reads define exactly one tagged register value, carry one
-//!   exact pre-operation deopt state, and neither allocate nor own a safepoint.
 //! - Tagged nullish loose equality deoptimizes before its Boolean definition
 //!   for every non-nullish cell so canonical HTMLDDA semantics remain visible.
 //! - Target register files enumerate physical registers explicitly. There is
@@ -174,6 +180,12 @@ pub enum MachineRepresentation {
     Uint32,
     /// Unboxed 64-bit integer or address-sized scalar.
     Int64,
+    /// Whole-word status produced by the sole native result-pair ABI.
+    ///
+    /// This is deliberately not an integer value: only the descriptor-owned
+    /// native-status terminator may consume it, so ordinary arithmetic cannot
+    /// accidentally reinterpret an ABI state word.
+    NativeStatus,
     /// Unboxed IEEE-754 binary64 value.
     Float64,
 }
@@ -186,7 +198,8 @@ impl MachineRepresentation {
             | Self::Int32
             | Self::Boolean
             | Self::Uint32
-            | Self::Int64 => regalloc2::RegClass::Int,
+            | Self::Int64
+            | Self::NativeStatus => regalloc2::RegClass::Int,
             Self::Float64 => regalloc2::RegClass::Float,
         }
     }
@@ -505,7 +518,10 @@ pub enum CallTarget {
     /// ABI. The physical entry always receives two values; operands beyond the
     /// semantic arity are canonical `undefined` and are not Machine inputs.
     /// Trailing `TaggedRoot` operands independently publish the complete live
-    /// moving state, including unrelated values at a zero-arity operation.
+    /// moving state, including unrelated values at a zero-arity operation. A
+    /// descriptor may either collapse the committed status into an exceptional
+    /// edge or expose the physical payload/status pair to an explicit
+    /// [`MachineOpcode::BranchNativeStatus`]; both use this one target shape.
     CommittedRuntime {
         /// Typed VM-owned completion entry.
         target: otter_vm::native_abi::RuntimeStubDescriptor,
@@ -548,6 +564,61 @@ pub enum CallTarget {
     },
 }
 
+/// Structurally safe generated target for one typed binding operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineBindingTarget {
+    /// No generated target is proven; guard transfers directly to cold.
+    Cold,
+    /// Realm-global object reached through the snapshot's global-this cell.
+    GlobalThis,
+    /// One stable captured cell in the current native-frame spine.
+    Upvalue {
+        /// Zero-based stable cell index.
+        index: u32,
+    },
+    /// VM-baked global lexical/object proof.
+    Global(otter_vm::jit::BindingHitProof),
+}
+
+fn binding_target_matches_semantics(
+    semantics: otter_bytecode::opcode_schema::BindingSemantics,
+    target: MachineBindingTarget,
+) -> bool {
+    use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
+
+    matches!(
+        (semantics, target),
+        (
+            BindingSemantics::Read(BindingRead::GlobalThis { .. }),
+            MachineBindingTarget::GlobalThis,
+        ) | (
+            BindingSemantics::Read(BindingRead::Upvalue { .. })
+                | BindingSemantics::Write(BindingWrite::Upvalue { .. }),
+            MachineBindingTarget::Upvalue { .. },
+        ) | (
+            BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
+                | BindingSemantics::Write(
+                    BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. },
+                ),
+            MachineBindingTarget::Global(_),
+        ) | (_, MachineBindingTarget::Cold)
+    )
+}
+
+fn binding_guard_clobbers() -> Vec<PhysicalRegister> {
+    (9..=16).map(PhysicalRegister::integer).collect()
+}
+
+fn binding_hit_clobbers() -> Vec<PhysicalRegister> {
+    vec![PhysicalRegister::integer(9)]
+}
+
+fn binding_write_barrier_clobbers() -> Vec<PhysicalRegister> {
+    [0, 1, 2, 9, 11, 12, 14, 15, 16]
+        .map(PhysicalRegister::integer)
+        .into()
+}
+
 /// Complete target-neutral call contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallDescriptor {
@@ -555,8 +626,13 @@ pub struct CallDescriptor {
     pub target: CallTarget,
     /// Ordered argument representations.
     pub arguments: Vec<MachineRepresentation>,
-    /// Result representation, or no result.
-    pub result: Option<MachineRepresentation>,
+    /// Ordered result representations.
+    ///
+    /// Ordinary calls expose zero or one result. A committed descriptor that
+    /// keeps its physical `NativeResultPair` explicit has two: tagged payload
+    /// followed by [`MachineRepresentation::NativeStatus`]. The result domain
+    /// remains owned exclusively by the runtime-stub descriptor.
+    pub results: Vec<MachineRepresentation>,
     /// Memory, shape, and reentrancy effects.
     pub effects: CallEffects,
     /// Physical registers destroyed by the selected target ABI.
@@ -565,6 +641,24 @@ pub struct CallDescriptor {
     pub exceptional: ExceptionalEdge,
     /// GC interaction.
     pub safepoint: SafepointKind,
+}
+
+fn is_explicit_binding_runtime_call(descriptor: &CallDescriptor) -> bool {
+    matches!(
+        &descriptor.target,
+        CallTarget::CommittedRuntime { target, .. }
+            if *target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE
+                && target.result_abi
+                    == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
+                && target.result_domain
+                    == otter_vm::native_abi::NativeResultDomain::Committed
+                && descriptor.results
+                    == [
+                        MachineRepresentation::Tagged,
+                        MachineRepresentation::NativeStatus,
+                    ]
+                && descriptor.exceptional == ExceptionalEdge::None
+    )
 }
 
 fn is_caught_throw_acknowledgement_target(descriptor: &CallDescriptor) -> bool {
@@ -700,13 +794,35 @@ pub enum MachineOpcode {
     BoxUint32,
     /// Canonically box one Boolean represented as integer 0 or 1.
     BoxBoolean,
-    /// Read one captured binding from the current native frame's stable cell
-    /// spine, deoptimizing at the source operation on a TDZ or invalid layout.
-    LoadUpvalue {
-        /// Zero-based cell handle in the upvalue spine.
-        index: i32,
-        /// Source bytecode offset used by artifacts and exact deoptimization.
+    /// Prove one generated binding target without performing the semantic
+    /// read or write. Outputs are hit Boolean, owner address, and storage
+    /// address; every miss transfers to the committed cold sibling.
+    BindingGuard {
+        /// Source byte offset used by artifacts.
         byte_pc: u32,
+        /// Schema-owned read/write/delete semantics.
+        semantics: otter_bytecode::opcode_schema::BindingSemantics,
+        /// Structurally safe target, or an explicit always-cold guard.
+        target: MachineBindingTarget,
+    },
+    /// Perform the non-allocating read/write after its guard has succeeded.
+    BindingHit {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Schema-owned read/write/delete semantics.
+        semantics: otter_bytecode::opcode_schema::BindingSemantics,
+        /// Proven generated target.
+        target: MachineBindingTarget,
+    },
+    /// Explicit post-store generational/incremental barrier. This is a
+    /// separate Machine effect, never hidden in [`MachineOpcode::BindingHit`].
+    BindingWriteBarrier,
+    /// Structural join marker for a completed binding operation.
+    BindingJoin {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Schema-owned operation identity.
+        semantics: otter_bytecode::opcode_schema::BindingSemantics,
     },
     /// Read one eagerly prepared primitive string from its address-stable,
     /// GC-traced constant cell. The relocation contains no moving handle.
@@ -715,22 +831,6 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Stable traced-cell target copied from the compile snapshot.
         target: otter_vm::jit::JitStringConstantCell,
-    },
-    /// Read one VM-baked permanent global-declarative cell, deoptimizing at
-    /// the source operation if the live value is still in TDZ.
-    GlobalLexicalLoad {
-        /// Source bytecode offset used by artifacts and exact deoptimization.
-        byte_pc: u32,
-        /// Stable GC-cage cell identity copied from the compile snapshot.
-        target: otter_vm::jit::JitGlobalLexicalLoad,
-    },
-    /// Guard the live global-declarative epoch, global-object shape, and own
-    /// data slot before reading one VM-baked global-object property.
-    GlobalObjectLoad {
-        /// Source bytecode offset used by artifacts and exact deoptimization.
-        byte_pc: u32,
-        /// Complete epoch, shape, dictionary, and slot guard program.
-        target: otter_vm::jit::JitGlobalObjectLoad,
     },
     /// Guard and load one VM-baked indexed element. Every guard, bounds, or
     /// hole miss boxes a scalar index only on the cold sibling and completes
@@ -794,6 +894,14 @@ pub enum MachineOpcode {
     /// Conditional control transfer; branch when the integer condition equals
     /// the encoded polarity.
     BranchIf(bool),
+    /// Three-way descriptor-domain branch. Success, Throw, and Fatal are
+    /// successors zero, one, and two respectively; corrupt statuses take the
+    /// Fatal edge.
+    BranchNativeStatus,
+    /// Propagate one pure exception SSA value through the compiled abrupt exit.
+    Throw,
+    /// Leave through the shared fatal runtime exit.
+    Fatal,
     /// Function return.
     Return,
 }
@@ -1377,6 +1485,32 @@ impl InstructionSequence {
             }
             for instruction_index in block.first.0..block.end.0 {
                 let instruction = &self.instructions[instruction_index as usize];
+                if instruction.opcode == MachineOpcode::BranchNativeStatus {
+                    if let Some(&target) = block.successors.get(1)
+                        && self
+                            .blocks
+                            .get(target.0 as usize)
+                            .is_some_and(|target_block| {
+                                self.instructions
+                                    .get(target_block.first.0 as usize)
+                                    .and_then(|instruction| {
+                                        let MachineOpcode::Call(descriptor) = instruction.opcode
+                                        else {
+                                            return None;
+                                        };
+                                        self.call_descriptors.get(descriptor as usize)
+                                    })
+                                    .is_some_and(is_caught_throw_acknowledgement_target)
+                            })
+                        && let Some(uses) = landing_pad_uses.get_mut(target.0 as usize)
+                    {
+                        uses.push((
+                            MachineInstructionId(instruction_index),
+                            MachineBlock(source_index as u32),
+                        ));
+                    }
+                    continue;
+                }
                 let MachineOpcode::Call(descriptor_index) = instruction.opcode else {
                     continue;
                 };
@@ -1506,7 +1640,12 @@ impl InstructionSequence {
                         MachineOpcode::BranchIf(_) if normal_successor_count != 2 => {
                             return Err(VerificationError::TerminatorSuccessors(block_id));
                         }
-                        MachineOpcode::Return if !block.successors.is_empty() => {
+                        MachineOpcode::BranchNativeStatus if normal_successor_count != 3 => {
+                            return Err(VerificationError::TerminatorSuccessors(block_id));
+                        }
+                        MachineOpcode::Return | MachineOpcode::Throw | MachineOpcode::Fatal
+                            if !block.successors.is_empty() =>
+                        {
                             return Err(VerificationError::TerminatorSuccessors(block_id));
                         }
                         _ => {}
@@ -1554,49 +1693,241 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
-                if matches!(
-                    instruction.opcode,
-                    MachineOpcode::GlobalLexicalLoad { .. }
-                        | MachineOpcode::GlobalObjectLoad { .. }
-                ) {
-                    let Some((output, metadata)) = instruction.operands.split_first() else {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    };
-                    let output_is_tagged_register = *output
-                        == MachineOperand::register_output(output.value)
-                        && self.representations[output.value.0 as usize]
-                            == MachineRepresentation::Tagged;
-                    let mut deopt_values = std::collections::BTreeSet::new();
-                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::deopt(operand.value)
-                            && operand.value != output.value
-                            && deopt_values.insert(operand.value)
-                    });
-                    let clobbers_are_exact = match &instruction.opcode {
-                        MachineOpcode::GlobalLexicalLoad { .. } => {
-                            instruction.clobbers
-                                == [
-                                    PhysicalRegister::integer(9),
-                                    PhysicalRegister::integer(11),
-                                    PhysicalRegister::integer(13),
-                                ]
+                match &instruction.opcode {
+                    MachineOpcode::BindingGuard {
+                        semantics, target, ..
+                    } => {
+                        let Some((outputs, inputs)) = instruction.operands.split_at_checked(3)
+                        else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let expected_inputs =
+                            semantics.value_operands().into_iter().flatten().count();
+                        let valid_outputs = outputs
+                            .iter()
+                            .zip([
+                                MachineRepresentation::Boolean,
+                                MachineRepresentation::Int64,
+                                MachineRepresentation::Int64,
+                            ])
+                            .all(|(operand, representation)| {
+                                *operand == MachineOperand::register_output(operand.value)
+                                    && self.representations[operand.value.0 as usize]
+                                        == representation
+                            });
+                        let valid_inputs = inputs.len() == expected_inputs
+                            && inputs.iter().all(|operand| {
+                                *operand == MachineOperand::location_input(operand.value)
+                                    && self.representations[operand.value.0 as usize]
+                                        == MachineRepresentation::Tagged
+                            });
+                        let raw_addresses = [outputs[1].value, outputs[2].value];
+                        let hit_block = (!matches!(target, MachineBindingTarget::Cold))
+                            .then(|| block.successors.first().copied())
+                            .flatten();
+                        let raw_addresses_are_hit_local = self.blocks.iter().enumerate().all(
+                            |(candidate_block_index, candidate_block)| {
+                                if candidate_block
+                                    .parameters
+                                    .iter()
+                                    .chain(candidate_block.successor_arguments.iter().flatten())
+                                    .any(|value| raw_addresses.contains(value))
+                                {
+                                    return false;
+                                }
+                                for candidate_index in
+                                    candidate_block.first.0..candidate_block.end.0
+                                {
+                                    let Some(candidate) =
+                                        self.instructions.get(candidate_index as usize)
+                                    else {
+                                        return false;
+                                    };
+                                    for (operand_index, operand) in
+                                        candidate.operands.iter().enumerate()
+                                    {
+                                        if operand.role != OperandRole::Use
+                                            || !raw_addresses.contains(&operand.value)
+                                        {
+                                            continue;
+                                        }
+                                        let in_hit_block = hit_block
+                                            == Some(MachineBlock(candidate_block_index as u32));
+                                        let allowed = in_hit_block
+                                            && operand.purpose == OperandPurpose::Input
+                                            && match candidate.opcode {
+                                                MachineOpcode::BindingHit { .. } => {
+                                                    (operand_index == 0
+                                                        && operand.value == raw_addresses[0])
+                                                        || (operand_index == 1
+                                                            && operand.value == raw_addresses[1])
+                                                }
+                                                MachineOpcode::BindingWriteBarrier => {
+                                                    operand_index == 0
+                                                        && operand.value == raw_addresses[0]
+                                                }
+                                                _ => false,
+                                            };
+                                        if !allowed {
+                                            return false;
+                                        }
+                                    }
+                                }
+                                true
+                            },
+                        );
+                        let writable = !matches!(
+                            semantics,
+                            otter_bytecode::opcode_schema::BindingSemantics::Write(_)
+                        ) || match target {
+                            MachineBindingTarget::Global(
+                                otter_vm::jit::BindingHitProof::GlobalLexical { writable, .. }
+                                | otter_vm::jit::BindingHitProof::GlobalObject { writable, .. },
+                            ) => *writable,
+                            MachineBindingTarget::Cold
+                            | MachineBindingTarget::GlobalThis
+                            | MachineBindingTarget::Upvalue { .. } => true,
+                        };
+                        if !valid_outputs
+                            || !valid_inputs
+                            || !binding_target_matches_semantics(*semantics, *target)
+                            || !raw_addresses_are_hit_local
+                            || !writable
+                            || instruction.clobbers != binding_guard_clobbers()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
-                        MachineOpcode::GlobalObjectLoad { .. } => {
-                            instruction.clobbers
-                                == [9, 11, 12, 13, 14, 15]
-                                    .map(PhysicalRegister::integer)
-                                    .as_slice()
+                    }
+                    MachineOpcode::BindingHit {
+                        semantics, target, ..
+                    } => {
+                        if matches!(target, MachineBindingTarget::Cold) {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
-                        _ => false,
-                    };
-                    if !output_is_tagged_register
-                        || !metadata_is_exact_deopt
-                        || !clobbers_are_exact
-                        || instruction.deopt.is_none()
-                        || instruction.safepoint.is_some()
+                        let expected_output = usize::from(semantics.result_operand().is_some());
+                        let expected_inputs = 2 + usize::from(matches!(
+                            semantics,
+                            otter_bytecode::opcode_schema::BindingSemantics::Write(_)
+                        ));
+                        let (inputs, outputs) = instruction
+                            .operands
+                            .split_at_checked(expected_inputs)
+                            .ok_or(VerificationError::OpcodeSignatureMismatch(id))?;
+                        let valid_addresses = inputs.get(..2).is_some_and(|addresses| {
+                            addresses.iter().all(|operand| {
+                                *operand == MachineOperand::location_input(operand.value)
+                                    && self.representations[operand.value.0 as usize]
+                                        == MachineRepresentation::Int64
+                            })
+                        });
+                        let valid_value = inputs.get(2).is_none_or(|operand| {
+                            *operand == MachineOperand::location_input(operand.value)
+                                && self.representations[operand.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                        });
+                        let valid_output = outputs.len() == expected_output
+                            && outputs.iter().all(|operand| {
+                                *operand == MachineOperand::register_output(operand.value)
+                                    && self.representations[operand.value.0 as usize]
+                                        == MachineRepresentation::Tagged
+                            });
+                        if !valid_addresses
+                            || !valid_value
+                            || !valid_output
+                            || !binding_target_matches_semantics(*semantics, *target)
+                            || instruction.clobbers != binding_hit_clobbers()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::BindingWriteBarrier => {
+                        let [owner, value] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *owner != MachineOperand::location_input(owner.value)
+                            || self.representations[owner.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || *value != MachineOperand::location_input(value.value)
+                            || self.representations[value.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || instruction.clobbers != binding_write_barrier_clobbers()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::BindingJoin { .. } => {
+                        if !instruction.operands.is_empty()
+                            || !instruction.clobbers.is_empty()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::BranchNativeStatus => {
+                        let [status] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let producers = self
+                            .instructions
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.operands.iter().any(|operand| {
+                                    operand.purpose == OperandPurpose::Output
+                                        && operand.value == status.value
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let committed_pair_status = if let [producer] = producers.as_slice() {
+                            let MachineOpcode::Call(descriptor) = producer.opcode else {
+                                return Err(VerificationError::OpcodeSignatureMismatch(id));
+                            };
+                            self.call_descriptors
+                                .get(descriptor as usize)
+                                .is_some_and(is_explicit_binding_runtime_call)
+                        } else {
+                            false
+                        };
+                        if *status != MachineOperand::register_input(status.value)
+                            || self.representations[status.value.0 as usize]
+                                != MachineRepresentation::NativeStatus
+                            || !committed_pair_status
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                            || instruction.clobbers != [PhysicalRegister::integer(16)]
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::Throw => {
+                        let [exception] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *exception != MachineOperand::register_input(exception.value)
+                            || self.representations[exception.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || !instruction.clobbers.is_empty()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::Fatal
+                        if !instruction.operands.is_empty()
+                            || !instruction.clobbers.is_empty()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some() =>
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
+                    _ => {}
                 }
                 if matches!(instruction.opcode, MachineOpcode::TaggedNullishEqual { .. }) {
                     let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
@@ -1922,7 +2253,7 @@ impl InstructionSequence {
                         {
                             *target == otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW
                                 && descriptor.arguments.is_empty()
-                                && descriptor.result.is_none()
+                                && descriptor.results.is_empty()
                                 && descriptor.effects == CallEffects::WRITES_HEAP
                                 && descriptor.clobbers
                                     == TargetRegisterFile::aarch64_scalar_call_clobbers()
@@ -1943,11 +2274,15 @@ impl InstructionSequence {
                                 .union(CallEffects::WRITES_HEAP)
                                 .union(CallEffects::INVALIDATES_SHAPES)
                                 .union(CallEffects::REENTRANT);
-                            let input_values = instruction
+                            let inputs = instruction
                                 .operands
                                 .iter()
                                 .filter(|operand| operand.purpose == OperandPurpose::Input)
-                                .map(|operand| operand.value)
+                                .collect::<Vec<_>>();
+                            let outputs = instruction
+                                .operands
+                                .iter()
+                                .filter(|operand| operand.purpose == OperandPurpose::Output)
                                 .collect::<Vec<_>>();
                             let roots = instruction
                                 .operands
@@ -1955,6 +2290,12 @@ impl InstructionSequence {
                                 .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
                                 .map(|operand| operand.value)
                                 .collect::<std::collections::BTreeSet<_>>();
+                            let collapses_status = descriptor.results
+                                == [MachineRepresentation::Tagged]
+                                && descriptor.exceptional != ExceptionalEdge::None
+                                && *target != otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
+                            let exposes_binding_status =
+                                is_explicit_binding_runtime_call(descriptor);
                             semantic_arity <= 2
                                 && target.signature
                                     == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
@@ -1971,15 +2312,26 @@ impl InstructionSequence {
                                 && descriptor.arguments.iter().all(|representation| {
                                     *representation == MachineRepresentation::Tagged
                                 })
-                                && descriptor.result == Some(MachineRepresentation::Tagged)
+                                && (collapses_status || exposes_binding_status)
                                 && descriptor.effects == complete_effects
                                 && descriptor.clobbers
                                     == TargetRegisterFile::aarch64_scalar_call_clobbers()
                                 && descriptor.safepoint == SafepointKind::Gc
-                                && descriptor.exceptional != ExceptionalEdge::None
                                 && instruction.deopt.is_none()
-                                && input_values.len() == semantic_arity
-                                && input_values.iter().all(|value| roots.contains(value))
+                                && inputs.len() == semantic_arity
+                                && inputs.iter().all(|operand| {
+                                    **operand == MachineOperand::location_input(operand.value)
+                                        && roots.contains(&operand.value)
+                                })
+                                && outputs.iter().all(|operand| {
+                                    operand.role == OperandRole::Definition
+                                        && operand.timing == OperandTiming::Late
+                                        && matches!(
+                                            operand.constraint,
+                                            OperandConstraint::Register
+                                                | OperandConstraint::Fixed(_)
+                                        )
+                                })
                         }
                         CallTarget::Direct {
                             kind, candidates, ..
@@ -2009,7 +2361,7 @@ impl InstructionSequence {
                         }
                         CallTarget::ColdCallExit { .. } => {
                             descriptor.arguments.is_empty()
-                                && descriptor.result == Some(MachineRepresentation::Tagged)
+                                && descriptor.results == [MachineRepresentation::Tagged]
                                 && descriptor.effects == CallEffects::PURE
                                 && descriptor.clobbers.is_empty()
                                 && descriptor.safepoint == SafepointKind::None
@@ -2031,7 +2383,7 @@ impl InstructionSequence {
                         .map(|operand| self.representations[operand.value.0 as usize])
                         .collect::<Vec<_>>();
                     if !inputs.eq(descriptor.arguments.iter().copied())
-                        || outputs.as_slice() != descriptor.result.as_slice()
+                        || outputs.as_slice() != descriptor.results.as_slice()
                     {
                         return Err(VerificationError::CallSignatureMismatch(id));
                     }
@@ -2176,7 +2528,7 @@ mod tests {
                     semantic_arity,
                 },
                 arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
-                result: Some(MachineRepresentation::Tagged),
+                results: vec![MachineRepresentation::Tagged],
                 effects: complete_effects,
                 clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
                 exceptional: ExceptionalEdge::Propagate,
@@ -2223,7 +2575,7 @@ mod tests {
                 byte_pc: 0,
             },
             arguments: Vec::new(),
-            result: Some(MachineRepresentation::Tagged),
+            results: vec![MachineRepresentation::Tagged],
             effects: CallEffects::REENTRANT,
             clobbers: Vec::new(),
             exceptional: ExceptionalEdge::Propagate,
@@ -2424,6 +2776,19 @@ mod tests {
             Err(VerificationError::InvalidCallTarget(call_id))
         );
 
+        let mut hidden_binding_status = committed_runtime_sequence(2);
+        let CallTarget::CommittedRuntime { target, .. } =
+            &mut hidden_binding_status.call_descriptors[0].target
+        else {
+            panic!("committed target fixture")
+        };
+        *target = otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
+        assert_eq!(
+            hidden_binding_status.verify(),
+            Err(VerificationError::InvalidCallTarget(call_id)),
+            "binding status must remain explicit Machine SSA"
+        );
+
         let mut too_wide = committed_runtime_sequence(2);
         let CallTarget::CommittedRuntime { semantic_arity, .. } =
             &mut too_wide.call_descriptors[0].target
@@ -2622,55 +2987,6 @@ mod tests {
             ],
         )
         .expect("valid checked-opcode sequence")
-    }
-
-    #[test]
-    fn verifier_rejects_missing_global_load_scratch_clobbers() {
-        let input = MachineValue(0);
-        let result = MachineValue(1);
-        let cases = [
-            (
-                MachineOpcode::GlobalLexicalLoad {
-                    byte_pc: 8,
-                    target: otter_vm::jit::JitGlobalLexicalLoad { cell_offset: 32 },
-                },
-                [9, 11, 13].as_slice(),
-            ),
-            (
-                MachineOpcode::GlobalObjectLoad {
-                    byte_pc: 8,
-                    target: otter_vm::jit::JitGlobalObjectLoad {
-                        shape: 7,
-                        dictionary: false,
-                        value_byte: 16,
-                        global_lexical_epoch: 3,
-                    },
-                },
-                [9, 11, 12, 13, 14, 15].as_slice(),
-            ),
-        ];
-        for (opcode, clobbers) in cases {
-            let mut load = MachineInstruction::plain(
-                opcode,
-                vec![
-                    MachineOperand::register_output(result),
-                    MachineOperand::deopt(input),
-                ],
-            );
-            load.clobbers = clobbers
-                .iter()
-                .copied()
-                .map(PhysicalRegister::integer)
-                .collect();
-            let mut sequence = checked_instruction_sequence(MachineRepresentation::Tagged, load);
-            sequence.instructions[1].clobbers.clear();
-            assert_eq!(
-                sequence.verify(),
-                Err(VerificationError::OpcodeSignatureMismatch(
-                    MachineInstructionId(1)
-                ))
-            );
-        }
     }
 
     #[test]

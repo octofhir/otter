@@ -596,7 +596,10 @@ fn run_one_test(
         }
     };
     command
-        .current_dir(workspace_root)
+        // Node's own test runner executes from the checkout root; tests that
+        // touch `process.cwd()` (chdir into `lib/`, resolve `./.env`) assume
+        // exactly that directory.
+        .current_dir(workspace_root.join(NODE_CHECKOUT))
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     configure_watchdog_process_group(&mut command);

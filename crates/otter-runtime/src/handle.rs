@@ -628,6 +628,7 @@ impl RuntimeActivityAccounting for RuntimeCounters {
         self.cancelled_host_ops.fetch_add(1, Ordering::Relaxed);
     }
 
+
     fn move_host_activity(&self, from: RuntimeLiveness, to: RuntimeLiveness) {
         decrement_liveness(
             from,
@@ -2190,11 +2191,11 @@ impl IsolateRunner {
                     Ok(TimerFireOutcome::Missing) => {}
                     Ok(TimerFireOutcome::Fired { repeat }) => {
                         self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
-                        if !repeat {
-                            let liveness = self
-                                .counters
-                                .timer_take(token.0)
-                                .unwrap_or(RuntimeLiveness::Ref);
+                        // `None` means the callback itself cleared the timer
+                        // and the cancel path already released the hold; a
+                        // second decrement would free a hold someone else
+                        // still counts on.
+                        if !repeat && let Some(liveness) = self.counters.timer_take(token.0) {
                             decrement_liveness(
                                 liveness,
                                 &self.counters.pending_ref_timers,
@@ -2204,15 +2205,13 @@ impl IsolateRunner {
                     }
                     Err(error) => {
                         self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
-                        let liveness = self
-                            .counters
-                            .timer_take(token.0)
-                            .unwrap_or(RuntimeLiveness::Ref);
-                        decrement_liveness(
-                            liveness,
-                            &self.counters.pending_ref_timers,
-                            &self.counters.pending_unref_timers,
-                        );
+                        if let Some(liveness) = self.counters.timer_take(token.0) {
+                            decrement_liveness(
+                                liveness,
+                                &self.counters.pending_ref_timers,
+                                &self.counters.pending_unref_timers,
+                            );
+                        }
                         // A timer that fires between shutdown's cooperative
                         // interrupt and the Shutdown message observing it is
                         // torn down on purpose — that interruption is not a

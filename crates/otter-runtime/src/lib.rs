@@ -4180,7 +4180,11 @@ impl Runtime {
             None => return Ok(TimerFireOutcome::Missing),
         };
         let repeat = entry.repeat_ms.is_some();
-        if !repeat {
+        // A one-shot Timeout stays visible to `getActiveResourcesInfo()`
+        // while its own callback runs — Node destroys it after the callback
+        // returns. An Immediate is gone before its callback, also as in Node.
+        let immediate = matches!(entry.kind, otter_vm::TimerKind::Immediate);
+        if !repeat && immediate {
             self.interp.timer_callbacks_mut().remove(token);
         }
         let context = entry.context.clone();
@@ -4197,6 +4201,9 @@ impl Runtime {
             otter_vm::Value::undefined(),
             args,
         );
+        if !repeat && !immediate {
+            self.interp.timer_callbacks_mut().remove(token);
+        }
         if let Err(error) = called {
             // An exit requested inside the callback is not an exception —
             // record it for the runner and end the fire cleanly.

@@ -37,6 +37,7 @@ pub(crate) struct CliExecutionConfig {
     jit_osr_threshold: Option<u32>,
     warning_options: WarningOptions,
     process_title: Option<String>,
+    expose_gc: bool,
 }
 
 impl Default for CliExecutionConfig {
@@ -50,6 +51,7 @@ impl Default for CliExecutionConfig {
             jit_osr_threshold: None,
             warning_options: WarningOptions::default(),
             process_title: None,
+            expose_gc: false,
         }
     }
 }
@@ -77,6 +79,7 @@ impl CliExecutionConfig {
             jit_osr_threshold: legacy_jit_osr_threshold(),
             warning_options: WarningOptions::default(),
             process_title: None,
+            expose_gc: false,
         }
     }
 
@@ -91,12 +94,18 @@ impl CliExecutionConfig {
         self.process_title = title;
     }
 
+    /// Enable the global `gc()` captured from `--expose-gc`.
+    pub(crate) fn set_expose_gc(&mut self, expose: bool) {
+        self.expose_gc = expose;
+    }
+
     pub(crate) fn apply_otter_builder(&self, builder: OtterBuilder) -> OtterBuilder {
         let mut builder = builder
             .jit_selection(self.jit_selection)
             .jit_debug(self.jit_debug_request())
             .warning_options(self.warning_options.clone())
-            .process_title(self.process_title.clone());
+            .process_title(self.process_title.clone())
+            .expose_gc(self.expose_gc);
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }

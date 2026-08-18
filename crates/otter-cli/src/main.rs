@@ -161,6 +161,11 @@ struct Cli {
     #[arg(long = "title", value_name = "name", global = true)]
     title: Option<String>,
 
+    /// Install a global `gc()` forcing a full collection
+    /// (Node's `--expose-gc`).
+    #[arg(long = "expose-gc", global = true)]
+    expose_gc: bool,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
@@ -590,6 +595,7 @@ async fn main() -> ExitCode {
         disabled: cli.disable_warning.clone(),
     });
     execution.set_process_title(cli.title.clone());
+    execution.set_expose_gc(cli.expose_gc);
     let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();

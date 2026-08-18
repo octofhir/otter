@@ -1675,6 +1675,7 @@ pub(crate) struct RuntimeConfig {
     process_env_overlay: std::collections::BTreeMap<String, String>,
     warning_options: WarningOptions,
     process_title: Option<String>,
+    expose_gc: bool,
     tracer_factory: Option<TracerFactory>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
@@ -1978,6 +1979,7 @@ impl Default for RuntimeConfig {
             process_cwd: process::default_cwd(),
             warning_options: WarningOptions::default(),
             process_title: None,
+            expose_gc: false,
             process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
             jit_selection: JitSelection::default(),
@@ -2381,6 +2383,14 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn process_title(mut self, title: Option<String>) -> Self {
         self.config.process_title = title;
+        self
+    }
+
+    /// Install a global `gc()` that forces a full collection
+    /// (the CLI's `--expose-gc`).
+    #[must_use]
+    pub fn expose_gc(mut self, expose: bool) -> Self {
+        self.config.expose_gc = expose;
         self
     }
 
@@ -2901,6 +2911,9 @@ impl Runtime {
                             config.process_title.as_deref(),
                             runtime_task_spawner.as_ref(),
                         )?;
+                    }
+                    if config.expose_gc {
+                        install_expose_gc_global(&mut *interp)?;
                     }
                     // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
                     // `new Function(...)` reach a real parse + compile path.
@@ -4290,6 +4303,13 @@ impl Runtime {
                 ))
             }
         }
+    }
+
+    /// Force a full garbage collection over the complete runtime root set —
+    /// the `--expose-gc` collection, also run before the `'exit'` event so
+    /// finalization WeakRefs resolve the way Node's do at shutdown.
+    pub fn force_full_gc(&mut self) {
+        self.interp.collect_full_tracing_runtime_roots();
     }
 
     /// Configured heap cap in bytes (`0` = disabled).
@@ -6141,6 +6161,14 @@ impl OtterBuilder {
         self
     }
 
+    /// Install a global `gc()` that forces a full collection
+    /// (the CLI's `--expose-gc`).
+    #[must_use]
+    pub fn expose_gc(mut self, expose: bool) -> Self {
+        self.runtime = self.runtime.expose_gc(expose);
+        self
+    }
+
     /// Override capability decisions while retaining runtime-level mandatory
     /// filters such as the environment secret denylist.
     #[must_use]
@@ -7047,6 +7075,51 @@ fn enrich_runtime_diagnostic_with_cause(
     diagnostic.cause = chain.cause;
     diagnostic.aggregated_errors = chain.aggregated_errors;
     OtterError::Runtime { diagnostic }
+}
+
+
+/// Install the `--expose-gc` global: `gc()` forces a full collection over the
+/// complete runtime root set — the same collection GC stress testing runs.
+fn install_expose_gc_global(interp: &mut Interpreter) -> Result<(), OtterError> {
+    let global_object = *interp.global_this();
+    let result: Result<(), otter_vm::NativeError> = NativeCtx::with_host_context(
+        interp,
+        NativeCallInfo::default_call(),
+        None,
+        |ctx| {
+            ctx.scope(|mut scope| {
+                let global_object = scope.value(otter_vm::Value::object(global_object));
+                let gc = scope.native_call(
+                    "gc",
+                    0,
+                    otter_vm::NativeCall::Static(force_gc_native),
+                )?;
+                scope.define(
+                    global_object,
+                    "gc",
+                    gc,
+                    otter_vm::Attr {
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    }
+                    .to_flags(),
+                )
+            })
+        },
+    );
+    result.map_err(|error| OtterError::Internal {
+        code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+        message: format!("--expose-gc bootstrap failed: {error}"),
+    })
+}
+
+fn force_gc_native(
+    ctx: &mut otter_vm::NativeCtx<'_>,
+    _args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, otter_vm::NativeError> {
+    ctx.interp_mut().collect_full_tracing_runtime_roots();
+    Ok(otter_vm::Value::undefined())
 }
 
 fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {

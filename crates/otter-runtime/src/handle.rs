@@ -2525,6 +2525,9 @@ impl IsolateRunner {
         // From here on the run is over in Node terms: callbacks scheduled by
         // an exit listener, and timers still in flight, must never execute.
         self.exit_finalized = true;
+        // Sweep before the listeners run so finalization WeakRefs answer
+        // `undefined` for anything the program let go of.
+        self.runtime.force_full_gc();
         let code = inner.exit_code();
         let script = format!(
             "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, false) : {code}"

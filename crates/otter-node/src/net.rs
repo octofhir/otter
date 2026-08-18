@@ -169,6 +169,16 @@ enum WriteMsg {
 
 type Table = Arc<Mutex<HashMap<u32, Entry>>>;
 
+/// Deliver one event to the isolate without dropping or reordering it.
+/// See [`RuntimeTaskSpawner::enqueue_ordered`].
+async fn enqueue_ordered(
+    spawner: &RuntimeTaskSpawner,
+    event: NetEvent,
+    liveness: RuntimeLiveness,
+) -> bool {
+    spawner.enqueue_ordered(event, liveness).await
+}
+
 /// Build the CommonJS export of `internal/otter/net` — the raw dial,
 /// listen, and byte-transport surface the compat `tcp_wrap`/`pipe_wrap`
 /// handle classes drive. Vendored `net` never touches this directly.
@@ -598,16 +608,16 @@ fn listen(
                 &accept_ids,
                 &accept_spawner,
             );
-            if accept_spawner
-                .enqueue(
-                    NetEvent::Accepted {
-                        server: id,
-                        connection,
-                        remote: Some(remote),
-                    },
-                    RuntimeLiveness::Unref,
-                )
-                .is_err()
+            if !enqueue_ordered(
+                &accept_spawner,
+                NetEvent::Accepted {
+                    server: id,
+                    connection,
+                    remote: Some(remote),
+                },
+                RuntimeLiveness::Unref,
+            )
+            .await
             {
                 return;
             }
@@ -665,38 +675,46 @@ fn adopt(
             match message {
                 WriteMsg::Data(bytes, token) => {
                     if let Err(error) = write_all(&writer_stream, &bytes).await {
-                        let _ = writer_spawner.enqueue(
+                        enqueue_ordered(
+                            &writer_spawner,
                             NetEvent::WriteDone {
                                 connection: id,
                                 token,
                                 code: Some(io_code(&error)),
                             },
                             RuntimeLiveness::Ref,
-                        );
+                        )
+                        .await;
                         return;
                     }
-                    if token != 0 {
-                        let _ = writer_spawner.enqueue(
+                    if token != 0
+                        && !enqueue_ordered(
+                            &writer_spawner,
                             NetEvent::WriteDone {
                                 connection: id,
                                 token,
                                 code: None,
                             },
                             RuntimeLiveness::Ref,
-                        );
+                        )
+                        .await
+                    {
+                        return;
                     }
                 }
                 WriteMsg::End(token) => {
                     // Everything queued ahead of the marker has been written;
                     // close the write half and report the shutdown.
                     shutdown_write(&writer_stream);
-                    let _ = writer_spawner.enqueue(
+                    enqueue_ordered(
+                        &writer_spawner,
                         NetEvent::ShutdownDone {
                             connection: id,
                             token,
                         },
                         RuntimeLiveness::Ref,
-                    );
+                    )
+                    .await;
                     return;
                 }
             }
@@ -727,15 +745,15 @@ fn adopt(
             match stream.try_read(&mut chunk) {
                 Ok(0) => break,
                 Ok(length) => {
-                    if reader_spawner
-                        .enqueue(
-                            NetEvent::Data {
-                                connection: id,
-                                payload: bytes_to_latin1(&chunk[..length]),
-                            },
-                            RuntimeLiveness::Unref,
-                        )
-                        .is_err()
+                    if !enqueue_ordered(
+                        &reader_spawner,
+                        NetEvent::Data {
+                            connection: id,
+                            payload: bytes_to_latin1(&chunk[..length]),
+                        },
+                        RuntimeLiveness::Unref,
+                    )
+                    .await
                     {
                         return;
                     }
@@ -760,7 +778,7 @@ fn adopt(
             },
             None => NetEvent::Ended { connection: id },
         };
-        let _ = reader_spawner.enqueue(event, RuntimeLiveness::Ref);
+        enqueue_ordered(&reader_spawner, event, RuntimeLiveness::Ref).await;
     });
     id
 }
@@ -904,21 +922,25 @@ fn connect_unix(
                     &connect_ids,
                     &connect_spawner,
                 );
-                let _ = connect_spawner.enqueue(
+                enqueue_ordered(
+                    &connect_spawner,
                     NetEvent::Connected { token, connection },
                     RuntimeLiveness::Unref,
-                );
+                    )
+                    .await;
             }
             Err(error) => {
                 let code = io_code(&error);
-                let _ = connect_spawner.enqueue(
+                enqueue_ordered(
+                    &connect_spawner,
                     NetEvent::ConnectFailed {
                         token,
                         code,
                         message: format!("connect {code} {path}"),
                     },
                     RuntimeLiveness::Unref,
-                );
+                    )
+                    .await;
             }
         }
     });
@@ -967,14 +989,16 @@ fn connect(
             Err(_) => None,
         };
         let Some(target) = target else {
-            let _ = connect_spawner.enqueue(
+            enqueue_ordered(
+                &connect_spawner,
                 NetEvent::ConnectFailed {
                     token,
                     code: "ENOTFOUND",
                     message: format!("getaddrinfo ENOTFOUND {host}"),
                 },
                 RuntimeLiveness::Unref,
-            );
+                )
+                .await;
             return;
         };
         match tokio::net::TcpStream::connect(target).await {
@@ -986,21 +1010,25 @@ fn connect(
                     &connect_ids,
                     &connect_spawner,
                 );
-                let _ = connect_spawner.enqueue(
+                enqueue_ordered(
+                    &connect_spawner,
                     NetEvent::Connected { token, connection },
                     RuntimeLiveness::Unref,
-                );
+                    )
+                    .await;
             }
             Err(error) => {
                 let code = io_code(&error);
-                let _ = connect_spawner.enqueue(
+                enqueue_ordered(
+                    &connect_spawner,
                     NetEvent::ConnectFailed {
                         token,
                         code,
                         message: format!("connect {code} {target}"),
                     },
                     RuntimeLiveness::Unref,
-                );
+                    )
+                    .await;
             }
         }
     });
@@ -1008,6 +1036,7 @@ fn connect(
 }
 
 /// Everything the shim is told about, in the order it happened.
+#[derive(Clone)]
 enum NetEvent {
     Accepted {
         server: u32,

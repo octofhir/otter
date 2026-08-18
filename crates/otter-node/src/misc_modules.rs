@@ -200,3 +200,19 @@ pub fn vm_cjs_value<'scope>(
 ) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:vm", VM_SHIM, module, require)
 }
+
+const CONSTANTS_SHIM: &str = include_str!("constants.js");
+
+/// CommonJS export: the legacy `node:constants` aggregate namespace.
+///
+/// # Errors
+/// Returns a native error when the shim fails to allocate or evaluate.
+pub fn constants_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    otter_runtime::run_builtin_cjs_shim(scope, "node:constants", CONSTANTS_SHIM, module, require)
+}

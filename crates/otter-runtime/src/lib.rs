@@ -1674,6 +1674,7 @@ pub(crate) struct RuntimeConfig {
     process_cwd: PathBuf,
     process_env_overlay: std::collections::BTreeMap<String, String>,
     warning_options: WarningOptions,
+    process_title: Option<String>,
     tracer_factory: Option<TracerFactory>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
@@ -1976,6 +1977,7 @@ impl Default for RuntimeConfig {
             process_argv: process::default_argv(),
             process_cwd: process::default_cwd(),
             warning_options: WarningOptions::default(),
+            process_title: None,
             process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
             jit_selection: JitSelection::default(),
@@ -2372,6 +2374,13 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn warning_options(mut self, options: WarningOptions) -> Self {
         self.config.warning_options = options;
+        self
+    }
+
+    /// Set the initial `process.title` (the CLI's `--title`).
+    #[must_use]
+    pub fn process_title(mut self, title: Option<String>) -> Self {
+        self.config.process_title = title;
         self
     }
 
@@ -2889,6 +2898,7 @@ impl Runtime {
                             &config.capabilities,
                             &config.hooks,
                             &config.warning_options,
+                            config.process_title.as_deref(),
                             runtime_task_spawner.as_ref(),
                         )?;
                     }
@@ -6121,6 +6131,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn warning_options(mut self, options: WarningOptions) -> Self {
         self.runtime = self.runtime.warning_options(options);
+        self
+    }
+
+    /// Set the initial `process.title` (the CLI's `--title`).
+    #[must_use]
+    pub fn process_title(mut self, title: Option<String>) -> Self {
+        self.runtime = self.runtime.process_title(title);
         self
     }
 

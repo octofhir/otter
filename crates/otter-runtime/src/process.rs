@@ -47,6 +47,7 @@ pub(crate) fn install_global(
     capabilities: &CapabilitySet,
     hooks: &RuntimeHooks,
     warning_options: &crate::WarningOptions,
+    process_title: Option<&str>,
     runtime_task_spawner: Option<&crate::RuntimeTaskSpawner>,
 ) -> Result<(), OtterError> {
     // Claimed before `process.env` is built, so the variable naming the
@@ -112,9 +113,10 @@ pub(crate) fn install_global(
                         process_argv.first().map(String::as_str).unwrap_or("otter"),
                     ),
                     ("execPath", snapshot.exec_path.as_str()),
-                    // Node's default title is the spawn path; a plain writable
-                    // property is enough until a real setproctitle lands.
-                    ("title", snapshot.exec_path.as_str()),
+                    // Node's default title is the spawn path (`--title`
+                    // overrides it); a plain writable property is enough
+                    // until a real setproctitle lands.
+                    ("title", process_title.unwrap_or(snapshot.exec_path.as_str())),
                     ("platform", node_platform()),
                     ("arch", node_arch()),
                     ("version", concat!("v", env!("CARGO_PKG_VERSION"))),

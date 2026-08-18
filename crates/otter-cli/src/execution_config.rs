@@ -36,6 +36,7 @@ pub(crate) struct CliExecutionConfig {
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
     warning_options: WarningOptions,
+    process_title: Option<String>,
 }
 
 impl Default for CliExecutionConfig {
@@ -48,6 +49,7 @@ impl Default for CliExecutionConfig {
             jit_selection: JitSelection::ProductionTiered,
             jit_osr_threshold: None,
             warning_options: WarningOptions::default(),
+            process_title: None,
         }
     }
 }
@@ -74,6 +76,7 @@ impl CliExecutionConfig {
             jit_selection,
             jit_osr_threshold: legacy_jit_osr_threshold(),
             warning_options: WarningOptions::default(),
+            process_title: None,
         }
     }
 
@@ -83,11 +86,17 @@ impl CliExecutionConfig {
         self.warning_options = options;
     }
 
+    /// Set the initial `process.title` captured from `--title`.
+    pub(crate) fn set_process_title(&mut self, title: Option<String>) {
+        self.process_title = title;
+    }
+
     pub(crate) fn apply_otter_builder(&self, builder: OtterBuilder) -> OtterBuilder {
         let mut builder = builder
             .jit_selection(self.jit_selection)
             .jit_debug(self.jit_debug_request())
-            .warning_options(self.warning_options.clone());
+            .warning_options(self.warning_options.clone())
+            .process_title(self.process_title.clone());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }

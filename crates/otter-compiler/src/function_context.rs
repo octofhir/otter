@@ -257,7 +257,12 @@ impl FunctionContext {
         if !self.captured_names.contains(name) && !self.mapped_argument_names.contains(name) {
             return None;
         }
-        if let Some(&idx) = self.reserved_own_upvalues.get(name) {
+        // A reserved slot answers only the FIRST declaration of the name.
+        // The capture pre-pass is name-keyed, so a later block-scoped
+        // declaration shadowing the same name must get its own fresh cell —
+        // sharing the slot would alias two distinct bindings (an inner
+        // `let i` loop counter overwriting the outer one).
+        if let Some(idx) = self.reserved_own_upvalues.remove(name) {
             return Some(idx);
         }
         let idx = self.own_upvalue_count;

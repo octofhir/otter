@@ -1,8 +1,9 @@
-//! Native half of `node:dgram`: UDP sockets.
+//! Native transport under the vendored `dgram` stack: UDP sockets.
 //!
 //! # Contents
-//! - [`dgram_cjs_value`] installs the module's JavaScript shim.
-//! - A socket table owned by the natives, keyed by the handle the shim holds.
+//! - [`dgram_binding_cjs_value`] exports the raw bind/send/option surface as
+//!   `internal/otter/dgram` for the compat `udp_wrap` handle.
+//! - A socket table owned by the natives, keyed by the handle the wrap holds.
 //! - A receive loop per bound socket, delivering datagrams onto the isolate
 //!   thread.
 //!
@@ -11,12 +12,12 @@
 //!   capability, checked against the address involved.
 //! - The receive loop runs on the host's IO runtime and never touches VM
 //!   state; it hands owned bytes to a task that re-enters JavaScript on the
-//!   isolate thread.
+//!   isolate thread, in order and without dropping.
 //! - A socket holds the runtime open while it is bound, so a program waiting
 //!   for a datagram does not exit early.
 //!
 //! # See also
-//! - `dgram.js`
+//! - `nodelib/compat/internal_udp_wrap.js`
 
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;

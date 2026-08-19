@@ -41,16 +41,23 @@ type SocketTable = Arc<Mutex<HashMap<u32, SocketEntry>>>;
 ///
 /// # Errors
 /// Returns a native error when the shim fails to allocate or evaluate.
-pub fn dgram_cjs_value<'scope>(
+/// The raw socket surface the compat `udp_wrap` drives, exported as
+/// `internal/otter/dgram`.
+///
+/// # Errors
+/// Returns a native error when the surface fails to allocate.
+pub fn dgram_binding_cjs_value<'scope>(
     scope: &mut RuntimeNativeScope<'scope, '_>,
     capabilities: &CapabilitySet,
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: RuntimeLocal<'scope>,
-    require: RuntimeLocal<'scope>,
+    _module: RuntimeLocal<'scope>,
+    _require: RuntimeLocal<'scope>,
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
     let native = build_native(scope, capabilities, runtime_task_spawner)?;
     let globals = scope.global_this();
-    // Non-enumerable: the Node test harness flags any enumerable global it
+    // The receive loop dispatches through a global the compat handle
+    // installs, so the native surface is reachable from it too. Both stay
+    // non-enumerable: the Node test harness flags any enumerable global it
     // does not recognize as a leak.
     scope.define(
         globals,
@@ -63,13 +70,7 @@ pub fn dgram_cjs_value<'scope>(
         }
         .to_flags(),
     )?;
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:dgram",
-        include_str!("dgram.js"),
-        module,
-        require,
-    )
+    Ok(native)
 }
 
 fn build_native<'scope>(
@@ -162,6 +163,36 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "membership", membership)?;
+
+    // A program may say it is not waiting on a socket, the way it can for
+    // a timer, without closing it.
+    let hold_sockets = sockets.clone();
+    let hold = scope.native_closure(
+        "hold",
+        2,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let id = handle_arg(args, 0);
+            let referenced = args
+                .get(1)
+                .and_then(|value| value.as_boolean())
+                .unwrap_or(true);
+            let mut table = hold_sockets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = table.get_mut(&id)
+                && let Some(keep_alive) = &entry.keep_alive
+            {
+                if referenced {
+                    keep_alive.ref_();
+                } else {
+                    keep_alive.unref();
+                }
+            }
+            Ok(RuntimeValue::undefined())
+        },
+    )?;
+    scope.set(object, "hold", hold)?;
 
     let resolve_caps = capabilities.clone();
     let resolve = scope.native_closure(
@@ -369,7 +400,7 @@ fn resolve_peer(
         .ok_or_else(|| option_error("connect", "ENOTFOUND", 0))?;
     ctx.scope(|mut scope| {
         let result = scope.object()?;
-        let address = scope.string(&target.ip().to_string())?;
+        let address = scope.string(&address_text(&target))?;
         scope.set(result, "address", address)?;
         let port = scope.number(f64::from(target.port()));
         scope.set(result, "port", port)?;
@@ -413,7 +444,15 @@ fn io_code(error: &std::io::Error) -> &'static str {
         std::io::ErrorKind::AddrNotAvailable => "EADDRNOTAVAIL",
         std::io::ErrorKind::PermissionDenied => "EACCES",
         std::io::ErrorKind::ConnectionRefused => "ECONNREFUSED",
-        _ => "EINVAL",
+        // A datagram larger than the socket's send buffer is refused by
+        // the kernel, and the caller is told which limit it hit.
+        _ => match error.raw_os_error() {
+            Some(errno) if errno == libc::EMSGSIZE => "EMSGSIZE",
+            Some(errno) if errno == libc::ENOBUFS => "ENOBUFS",
+            Some(errno) if errno == libc::EHOSTUNREACH => "EHOSTUNREACH",
+            Some(errno) if errno == libc::ENETUNREACH => "ENETUNREACH",
+            _ => "EINVAL",
+        },
     }
 }
 
@@ -456,9 +495,10 @@ fn bind_socket(
 
     // A bind address may be a name, and a name resolves to both families; only
     // the one matching the socket type can be bound.
+    let flags = args.get(3).and_then(|value| value.as_f64()).unwrap_or(0.0) as u32;
     let target = resolve_target(&address, port, kind != "udp6")
         .ok_or_else(|| option_error("bind", "ENOTFOUND", 0))?;
-    let bound = std::net::UdpSocket::bind(target)
+    let bound = bind_datagram_socket(target, flags)
         .and_then(|socket| {
             socket.set_nonblocking(true)?;
             Ok(socket)
@@ -510,13 +550,16 @@ fn bind_socket(
                     let datagram = Datagram {
                         id,
                         payload: buffer[..length].to_vec(),
-                        address: from.ip().to_string(),
+                        address: address_text(&from),
                         port: from.port(),
                         family: if from.is_ipv4() { "IPv4" } else { "IPv6" },
                     };
-                    if delivery_spawner
-                        .enqueue(datagram, RuntimeLiveness::Unref)
-                        .is_err()
+                    // Ordered delivery retries on backpressure: a bounded
+                    // inbox that dropped would silently lose datagrams the
+                    // kernel had already handed over.
+                    if !delivery_spawner
+                        .enqueue_ordered(datagram, RuntimeLiveness::Unref)
+                        .await
                     {
                         return;
                     }
@@ -530,7 +573,7 @@ fn bind_socket(
         let result = scope.object()?;
         let handle = scope.number(f64::from(id));
         scope.set(result, "handle", handle)?;
-        let address = scope.string(&local.ip().to_string())?;
+        let address = scope.string(&address_text(&local))?;
         scope.set(result, "address", address)?;
         let port = scope.number(f64::from(local.port()));
         scope.set(result, "port", port)?;
@@ -540,7 +583,135 @@ fn bind_socket(
     })
 }
 
+/// libuv's `uv_udp_bind` flags, as the JS handle passes them through.
+const UV_UDP_IPV6ONLY: u32 = 1;
+const UV_UDP_REUSEADDR: u32 = 4;
+const UV_UDP_REUSEPORT: u32 = 8;
+
+/// Bind a UDP socket, applying the bind-time flags the caller asked for.
+///
+/// `ipv6Only`, address reuse and port reuse all have to be set on the
+/// socket before it is bound, so the socket is built by hand rather than
+/// by `UdpSocket::bind`.
+fn bind_datagram_socket(
+    address: std::net::SocketAddr,
+    flags: u32,
+) -> std::io::Result<std::net::UdpSocket> {
+    if flags == 0 {
+        return std::net::UdpSocket::bind(address);
+    }
+    let domain = if address.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    // SAFETY: a plain socket creation; the fd is adopted below and closed
+    // exactly once by the `UdpSocket` that owns it.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a live socket this function owns from here on.
+    let socket = unsafe { <std::net::UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let set = |level: libc::c_int, option: libc::c_int| -> std::io::Result<()> {
+        let enable: libc::c_int = 1;
+        // SAFETY: `socket` owns the fd for the call, and `enable` is a
+        // valid, initialized option payload of the size passed.
+        let outcome = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                option,
+                std::ptr::from_ref(&enable).cast(),
+                std::mem::size_of_val(&enable) as libc::socklen_t,
+            )
+        };
+        if outcome != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    if flags & UV_UDP_IPV6ONLY != 0 && address.is_ipv6() {
+        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)?;
+    }
+    if flags & UV_UDP_REUSEADDR != 0 {
+        set(libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
+    }
+    if flags & UV_UDP_REUSEPORT != 0 {
+        set(libc::SOL_SOCKET, libc::SO_REUSEPORT)?;
+    }
+    let (storage, length) = socket_address_bytes(address);
+    // SAFETY: `storage` holds a correctly sized `sockaddr_in`/`sockaddr_in6`
+    // for `length`, and `fd` is the socket being bound.
+    let outcome = unsafe { libc::bind(fd, std::ptr::from_ref(&storage).cast(), length) };
+    if outcome != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(socket)
+}
+
+/// A socket address in the platform's own layout, with its length.
+fn socket_address_bytes(
+    address: std::net::SocketAddr,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match address {
+        std::net::SocketAddr::V4(v4) => {
+            let target = std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in>();
+            // SAFETY: the storage is large enough for `sockaddr_in` and is
+            // zeroed, so every field is initialized before the write.
+            unsafe {
+                (*target).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*target).sin_port = v4.port().to_be();
+                (*target).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            }
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let target = std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in6>();
+            // SAFETY: as above, for the v6 layout.
+            unsafe {
+                (*target).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*target).sin6_port = v6.port().to_be();
+                (*target).sin6_addr.s6_addr = v6.ip().octets();
+                (*target).sin6_scope_id = v6.scope_id();
+            }
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
+/// The textual form of an address, with the zone id a link-local IPv6
+/// address carries. `fe80::1` alone does not name a destination — the
+/// interface it is local to is part of the address.
+fn address_text(address: &std::net::SocketAddr) -> String {
+    let std::net::SocketAddr::V6(v6) = address else {
+        return address.ip().to_string();
+    };
+    let scope = v6.scope_id();
+    if scope == 0 || !v6.ip().is_unicast_link_local() {
+        return address.ip().to_string();
+    }
+    let mut name = [0i8; libc::IF_NAMESIZE];
+    // SAFETY: `name` is `IF_NAMESIZE` bytes, which is the buffer size
+    // `if_indextoname` documents; it writes a NUL-terminated string or null.
+    let resolved = unsafe { libc::if_indextoname(scope, name.as_mut_ptr()) };
+    if resolved.is_null() {
+        return format!("{}%{scope}", v6.ip());
+    }
+    // SAFETY: `if_indextoname` returned its own buffer, NUL-terminated.
+    let text = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    format!("{}%{}", v6.ip(), text.to_string_lossy())
+}
+
 /// One received datagram, handed to the isolate thread.
+#[derive(Clone)]
 struct Datagram {
     id: u32,
     payload: Vec<u8>,
@@ -654,7 +825,7 @@ fn socket_address(
     };
     ctx.scope(|mut scope| {
         let result = scope.object()?;
-        let address = scope.string(&local.ip().to_string())?;
+        let address = scope.string(&address_text(&local))?;
         scope.set(result, "address", address)?;
         let port = scope.number(f64::from(local.port()));
         scope.set(result, "port", port)?;

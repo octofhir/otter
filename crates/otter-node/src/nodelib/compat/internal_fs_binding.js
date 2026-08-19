@@ -214,37 +214,42 @@ module.exports = {
     return dispatch(req, () => native.close(handle));
   },
   read(fd, buffer, offset, length, position, req) {
-    return dispatch(req, () => native.read(fd, buffer, offset, length, position ?? -1));
+    const handle = validatedFd(fd);
+    return dispatch(req, () => native.read(handle, buffer, offset, length, position ?? -1));
   },
   readBuffers(fd, buffers, position, req) {
+    const handle = validatedFd(fd);
     return dispatch(req, () => {
       let total = 0;
       for (const buffer of buffers) {
         const at = position === null || position === undefined || position < 0
           ? -1
           : position + total;
-        total += native.read(fd, buffer, 0, buffer.byteLength, at);
+        total += native.read(handle, buffer, 0, buffer.byteLength, at);
       }
       return total;
     });
   },
   writeBuffer(fd, buffer, offset, length, position, req) {
-    return dispatch(req, () => native.writeBuffer(fd, buffer, offset, length, position ?? -1));
+    const handle = validatedFd(fd);
+    return dispatch(req, () => native.writeBuffer(handle, buffer, offset, length, position ?? -1));
   },
   writeBuffers(fd, buffers, position, req) {
+    const handle = validatedFd(fd);
     return dispatch(req, () => {
       let total = 0;
       for (const buffer of buffers) {
         const at = position === null || position === undefined || position < 0
           ? -1
           : position + total;
-        total += native.writeBuffer(fd, buffer, 0, buffer.byteLength, at);
+        total += native.writeBuffer(handle, buffer, 0, buffer.byteLength, at);
       }
       return total;
     });
   },
   writeString(fd, value, position, encoding, req) {
-    return dispatch(req, () => native.writeString(fd, value, position ?? -1, encoding));
+    const handle = validatedFd(fd);
+    return dispatch(req, () => native.writeString(handle, value, position ?? -1, encoding));
   },
   fstat(fd, useBigint, req, doNotThrow) {
     if (doNotThrow) {

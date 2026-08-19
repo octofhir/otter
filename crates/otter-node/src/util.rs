@@ -72,6 +72,40 @@ fn proxy_details(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     })
 }
 
+
+/// `ownNonIndexKeys(value)` — the own string keys of a byte view that are
+/// not element indices, or `undefined` when the value is not one.
+///
+/// A view's own string keys are its element indices plus whatever expando
+/// keys were set on it. Asking the ordinary reflection surface for them
+/// materialises one string per element, which for a megabyte-sized buffer
+/// is a million strings the caller then throws away.
+fn own_non_index_keys(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let heap = ctx.heap();
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let expando = if let Some(view) = value.as_typed_array(heap) {
+        view.expando(heap)
+    } else if let Some(view) = value.as_data_view() {
+        view.expando(heap)
+    } else {
+        return Ok(Value::undefined());
+    };
+    let keys: Vec<String> = match expando {
+        Some(bag) => otter_vm::object::with_properties(bag, heap, |properties| {
+            properties.keys().map(ToString::to_string).collect()
+        }),
+        None => Vec::new(),
+    };
+    ctx.scope(|mut scope| {
+        let list = scope.array(keys.len())?;
+        for (index, key) in keys.iter().enumerate() {
+            let text = scope.string(key)?;
+            scope.set_index(list, index, text)?;
+        }
+        Ok(scope.finish(list))
+    })
+}
+
 fn typed_arrays_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let heap = ctx.heap();
     let Some(left) = args.first().and_then(|value| value.as_typed_array(heap)) else {
@@ -179,6 +213,7 @@ pub fn otter_natives_cjs_value<'scope>(
     let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
     let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
     let proxy_details = scope.native_method("proxyDetails", 1, proxy_details)?;
+    let own_non_index_keys = scope.native_method("ownNonIndexKeys", 1, own_non_index_keys)?;
     let flags = Attr {
         writable: false,
         enumerable: true,
@@ -188,6 +223,7 @@ pub fn otter_natives_cjs_value<'scope>(
     scope.define(export, "captureCallSites", callsites, flags)?;
     scope.define(export, "typedArraysEqual", typed_arrays_equal, flags)?;
     scope.define(export, "proxyDetails", proxy_details, flags)?;
+    scope.define(export, "ownNonIndexKeys", own_non_index_keys, flags)?;
     Ok(export)
 }
 

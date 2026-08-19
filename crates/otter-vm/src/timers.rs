@@ -303,8 +303,15 @@ fn coerce_delay_ms(value: Option<&Value>, heap: &otter_gc::GcHeap) -> u64 {
     }
 }
 
-fn ensure_callable(value: &Value, native: &'static str) -> Result<(), NativeError> {
-    if crate::is_callable_value(value) {
+fn ensure_callable(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    native: &'static str,
+) -> Result<(), NativeError> {
+    // The heapless check cannot see an ordinary object carrying a native
+    // `[[Call]]` slot, and `Function.prototype` is one — Node's own cluster
+    // uses it as its no-op timer callback.
+    if crate::abstract_ops::is_callable_in_heap(value, heap) {
         Ok(())
     } else {
         Err(NativeError::TypeError {
@@ -321,7 +328,7 @@ fn schedule_timer_common(
     native_name: &'static str,
 ) -> Result<Value, NativeError> {
     let callback = args.first().cloned().unwrap_or(Value::undefined());
-    ensure_callable(&callback, native_name)?;
+    ensure_callable(&callback, ctx.heap(), native_name)?;
     let delay_ms = coerce_delay_ms(args.get(1), ctx.heap());
     let extra: SmallVec<[Value; 4]> = args.iter().skip(2).cloned().collect();
     let context = ctx
@@ -402,7 +409,7 @@ fn clear_interval_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 /// extra callback argument (there is no delay parameter).
 fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let callback = args.first().cloned().unwrap_or(Value::undefined());
-    ensure_callable(&callback, "setImmediate")?;
+    ensure_callable(&callback, ctx.heap(), "setImmediate")?;
     let extra: SmallVec<[Value; 4]> = args.iter().skip(1).cloned().collect();
     let context = ctx
         .execution_context()

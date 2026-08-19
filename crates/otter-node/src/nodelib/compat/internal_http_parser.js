@@ -83,11 +83,13 @@ class HTTPParser {
     this[kOnTimeout] = null;
     this._consumed = null;
     this._priorOnread = null;
+    this._errored = false;
     this._reset(0);
   }
 
   _reset(type) {
     this._type = type;
+    this._errored = false;
     this._stash = Buffer.alloc(0);
     this._paused = false;
     this._upgraded = false;
@@ -201,7 +203,7 @@ class HTTPParser {
   }
 
   finish() {
-    if (this._upgraded || this._paused) return;
+    if (this._upgraded || this._paused || this._errored) return;
     if (this._state === 'line' && this._stash.length === 0) return;
     if (this._state === 'body-eof') {
       this._finishMessage();
@@ -232,6 +234,10 @@ class HTTPParser {
       if (result === 'wait') break;
       if (result instanceof Error) {
         result.bytesParsed = Math.max(0, Math.min(consumed - prior, chunkLength));
+        // A message that failed to parse stays failed: llhttp reports the
+        // first error and nothing after it, so EOF on the dead connection
+        // must not raise a second one.
+        this._errored = true;
         return result;
       }
       if (result === 'upgraded') {
@@ -239,6 +245,29 @@ class HTTPParser {
       }
     }
     return chunkLength;
+  }
+
+  // Where the current line ends, as an index of its CR, or -1 when more
+  // bytes are needed. llhttp terminates every line with CRLF: a CR with
+  // anything but LF behind it is HPE_LF_EXPECTED, and a bare LF inside a
+  // line is not a separator at all. Request smuggling lives on either
+  // byte being taken for a line break.
+  _lineEnd() {
+    const stash = this._stash;
+    for (let i = 0; i < stash.length; i++) {
+      const byte = stash[i];
+      if (byte === 13) {
+        if (i + 1 >= stash.length) return -1;
+        if (stash[i + 1] !== 10) {
+          return parseError('HPE_LF_EXPECTED', 'Expected LF after CR');
+        }
+        return i;
+      }
+      if (byte === 10) {
+        return parseError('HPE_INVALID_HEADER_TOKEN', 'Invalid header token');
+      }
+    }
+    return -1;
   }
 
   // One transition. Returns 'more' (progress), 'wait' (need bytes),
@@ -253,7 +282,8 @@ class HTTPParser {
         const err = this._checkMethodPrefix();
         if (err) return err;
       }
-      const idx = this._stash.indexOf(CRLF);
+      const idx = this._lineEnd();
+      if (idx instanceof Error) return idx;
       if (idx === -1) {
         if (this._stash.length > this._maxHeaderSize) {
           return parseError('HPE_HEADER_OVERFLOW', 'Header overflow');
@@ -284,7 +314,8 @@ class HTTPParser {
       return 'more';
     }
     if (state === 'headers') {
-      const idx = this._stash.indexOf(CRLF);
+      const idx = this._lineEnd();
+      if (idx instanceof Error) return idx;
       if (idx === -1) {
         if (this._headerBytes + this._stash.length > this._maxHeaderSize) {
           return parseError('HPE_HEADER_OVERFLOW', 'Header overflow');
@@ -338,7 +369,8 @@ class HTTPParser {
       return 'wait';
     }
     if (state === 'chunk-size') {
-      const idx = this._stash.indexOf(CRLF);
+      const idx = this._lineEnd();
+      if (idx instanceof Error) return idx;
       if (idx === -1) {
         if (this._stash.length > 1024) {
           return parseError('HPE_INVALID_CHUNK_SIZE', 'Invalid character in chunk size');
@@ -375,7 +407,8 @@ class HTTPParser {
       return 'more';
     }
     if (state === 'trailers') {
-      const idx = this._stash.indexOf(CRLF);
+      const idx = this._lineEnd();
+      if (idx instanceof Error) return idx;
       if (idx === -1) return 'wait';
       const line = this._stash.subarray(0, idx).toString('latin1');
       this._stash = this._stash.subarray(idx + 2);
@@ -453,8 +486,8 @@ class HTTPParser {
     let connection = '';
     let upgradeHeader = false;
     let contentLength = -1;
-    let chunked = false;
     let transferEncoding = false;
+    const transferCodings = [];
     for (let i = 0; i < raw.length; i += 2) {
       const name = raw[i].toLowerCase();
       const value = raw[i + 1];
@@ -467,14 +500,27 @@ class HTTPParser {
         if (!Number.isFinite(parsed)) {
           return parseError('HPE_INVALID_CONTENT_LENGTH', 'Invalid character in Content-Length');
         }
-        if (contentLength !== -1 && contentLength !== parsed) {
-          return parseError('HPE_INVALID_CONTENT_LENGTH', 'Duplicate Content-Length');
+        if (contentLength !== -1) {
+          return parseError('HPE_UNEXPECTED_CONTENT_LENGTH', 'Duplicate Content-Length');
         }
         contentLength = parsed;
       } else if (name === 'transfer-encoding') {
         transferEncoding = true;
-        if (/(?:^|\W)chunked(?:$|\W)/i.test(value)) chunked = true;
+        // Only the final coding decides the framing, and repeated headers
+        // continue one list: `chunked` followed by anything else leaves the
+        // body undelimited, which is the smuggling primitive.
+        for (const coding of value.split(',')) {
+          const token = coding.trim().toLowerCase();
+          if (token.length > 0) transferCodings.push(token);
+        }
       }
+    }
+    const chunked = transferCodings[transferCodings.length - 1] === 'chunked';
+    // The framing has to be decided before the headers callback: llhttp
+    // errors while parsing them, so a message with two disagreeing framings
+    // never reaches a request handler.
+    if (transferEncoding && (!chunked || contentLength !== -1)) {
+      return parseError('HPE_INVALID_TRANSFER_ENCODING', 'Invalid transfer encoding');
     }
     const versionOnePlus = this._versionMajor === 1 && this._versionMinor >= 1;
     let keepAlive = versionOnePlus || this._versionMajor > 1;
@@ -517,14 +563,6 @@ class HTTPParser {
     // An upgrade request still carries its declared body (llhttp parses it
     // and only then reports the upgrade index); CONNECT never has one.
     this._skipBody = ret === 1 || ret === 2 || isConnect;
-    // §llhttp — a Transfer-Encoding whose final coding is not chunked has
-    // no defined body framing for a request; the message errors after the
-    // headers callback, so the request object exists but sees no body.
-    if (transferEncoding && !chunked && !this._skipBody &&
-        this._type === HTTPParser.REQUEST && contentLength === -1) {
-      return parseError('HPE_INVALID_TRANSFER_ENCODING', 'Invalid transfer encoding');
-    }
-
     const bodyless = isResponse &&
       (this._statusCode === 204 || this._statusCode === 304 ||
        (this._statusCode >= 100 && this._statusCode < 200));

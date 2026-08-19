@@ -768,6 +768,17 @@ impl Interpreter {
                         value_dst,
                         yielded,
                     );
+                    // §27.6.3.9 — a delegating suspension in an async
+                    // generator settles the outer request the same way an
+                    // ordinary `yield` does; a sync one bubbles the inner
+                    // result record out to `resume_generator`.
+                    if owner.is_async(&self.gc_heap) {
+                        owner.set_async_state(
+                            &mut self.gc_heap,
+                            crate::generator::AsyncGeneratorState::SuspendedYield,
+                        );
+                        self.async_generator_yield_awaited(stack, context, &owner, yielded)?;
+                    }
                     return Ok(Value::undefined());
                 }
                 Op::Yield => {

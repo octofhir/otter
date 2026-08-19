@@ -51,58 +51,6 @@ pub(crate) fn compile_yield(
             }
         };
         let arg_reg = compile_expr(cx, arg, span)?;
-        if cx.is_async_generator {
-            let iter_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::GetAsyncIterator,
-                [Operand::Register(iter_reg), Operand::Register(arg_reg)],
-                span,
-            );
-            let result_reg = cx.alloc_scratch();
-            let awaited_reg = cx.alloc_scratch();
-            let done_reg = cx.alloc_scratch();
-            let value_reg = cx.alloc_scratch();
-            let resume_arg_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(resume_arg_reg)], span);
-            let next_name = cx.intern_string_constant("next");
-            let loop_top = cx.next_pc();
-            cx.emit(
-                Op::CallMethodValue,
-                vec![
-                    Operand::Register(result_reg),
-                    Operand::Register(iter_reg),
-                    Operand::ConstIndex(next_name),
-                    Operand::ConstIndex(1),
-                    Operand::Register(resume_arg_reg),
-                ],
-                span,
-            );
-            cx.emit(
-                Op::Await,
-                [
-                    Operand::Register(awaited_reg),
-                    Operand::Register(result_reg),
-                ],
-                span,
-            );
-            cx.emit_load_property(done_reg, awaited_reg, "done", span);
-            let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
-            cx.emit_load_property(value_reg, awaited_reg, "value", span);
-            cx.emit(
-                Op::Yield,
-                [
-                    Operand::Register(resume_arg_reg),
-                    Operand::Register(value_reg),
-                ],
-                span,
-            );
-            let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
-            cx.patch_branch(back_jmp, loop_top);
-            cx.patch_branch_to_here(exit_jmp);
-            let dst = cx.alloc_scratch();
-            cx.emit_load_property(dst, awaited_reg, "value", span);
-            return Ok(dst);
-        }
         // §27.5.3.7 sync `yield*` — full delegation state machine.
         // The resume kind code (0 = next, 1 = throw, 2 = return) is
         // delivered by `Op::YieldDelegate` so abrupt resumes forward
@@ -114,42 +62,57 @@ pub(crate) fn compile_yield(
         // `Op::GetIterator` (whose internal IteratorState wrapper
         // hides the iterator's own `next` / `throw` / `return`
         // methods from the delegation loop).
-        let iter_sym = cx.alloc_scratch();
-        let iter_sym_idx = cx.intern_string_constant("iterator");
-        cx.emit(
-            Op::SymbolLoad,
-            [
-                Operand::Register(iter_sym),
-                Operand::ConstIndex(iter_sym_idx),
-            ],
-            span,
-        );
-        let iter_method = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadElement,
-            vec![
-                Operand::Register(iter_method),
-                Operand::Register(arg_reg),
-                Operand::Register(iter_sym),
-            ],
-            span,
-        );
-        let no_iter = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(iter_method), span);
-        let have_iter = cx.emit_branch_placeholder(Op::Jump, None, span);
-        cx.patch_branch_to_here(no_iter);
-        emit_yield_star_type_error(cx, "yield* argument is not iterable", span);
-        cx.patch_branch_to_here(have_iter);
+        let is_async = cx.is_async_generator;
+        // §27.6.3.9 — an async `yield*` resolves its operand through
+        // GetIterator(value, async), which wraps a synchronous iterable in
+        // the async-from-sync adapter. A sync `yield*` reads `@@iterator`
+        // itself rather than through `Op::GetIterator`, whose internal
+        // record hides the iterator's own `next` / `throw` / `return` from
+        // the delegation loop.
         let iter_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::CallWithThis,
-            vec![
-                Operand::Register(iter_reg),
-                Operand::Register(iter_method),
-                Operand::Register(arg_reg),
-                Operand::ConstIndex(0),
-            ],
-            span,
-        );
+        if is_async {
+            cx.emit(
+                Op::GetAsyncIterator,
+                [Operand::Register(iter_reg), Operand::Register(arg_reg)],
+                span,
+            );
+        } else {
+            let iter_sym = cx.alloc_scratch();
+            let iter_sym_idx = cx.intern_string_constant("iterator");
+            cx.emit(
+                Op::SymbolLoad,
+                [
+                    Operand::Register(iter_sym),
+                    Operand::ConstIndex(iter_sym_idx),
+                ],
+                span,
+            );
+            let iter_method = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(iter_method),
+                    Operand::Register(arg_reg),
+                    Operand::Register(iter_sym),
+                ],
+                span,
+            );
+            let no_iter = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(iter_method), span);
+            let have_iter = cx.emit_branch_placeholder(Op::Jump, None, span);
+            cx.patch_branch_to_here(no_iter);
+            emit_yield_star_type_error(cx, "yield* argument is not iterable", span);
+            cx.patch_branch_to_here(have_iter);
+            cx.emit(
+                Op::CallWithThis,
+                vec![
+                    Operand::Register(iter_reg),
+                    Operand::Register(iter_method),
+                    Operand::Register(arg_reg),
+                    Operand::ConstIndex(0),
+                ],
+                span,
+            );
+        }
         // §7.4.3 GetIterator step 3 — the `next` method is read once
         // and cached in the iterator record.
         let next_m = cx.alloc_scratch();
@@ -212,6 +175,16 @@ pub(crate) fn compile_yield(
             ],
             span,
         );
+        if is_async {
+            // §27.6.3.9 — `innerResult` is awaited before its shape is
+            // checked, so a sync iterator's promise-valued step and an async
+            // iterator's promised record are both settled by here.
+            cx.emit(
+                Op::Await,
+                [Operand::Register(inner_reg), Operand::Register(inner_reg)],
+                span,
+            );
+        }
         let next_to_check = cx.emit_branch_placeholder(Op::Jump, None, span);
 
         // kind == throw (§27.5.3.7 step 7.b).
@@ -230,6 +203,16 @@ pub(crate) fn compile_yield(
             ],
             span,
         );
+        if is_async {
+            // §27.6.3.9 — `innerResult` is awaited before its shape is
+            // checked, so a sync iterator's promise-valued step and an async
+            // iterator's promised record are both settled by here.
+            cx.emit(
+                Op::Await,
+                [Operand::Register(inner_reg), Operand::Register(inner_reg)],
+                span,
+            );
+        }
         let throw_to_check = cx.emit_branch_placeholder(Op::Jump, None, span);
         // No `throw` method: close the inner iterator, then raise
         // TypeError (protocol violation).
@@ -253,6 +236,16 @@ pub(crate) fn compile_yield(
             ],
             span,
         );
+        if is_async {
+            // §27.6.3.9 — `innerResult` is awaited before its shape is
+            // checked, so a sync iterator's promise-valued step and an async
+            // iterator's promised record are both settled by here.
+            cx.emit(
+                Op::Await,
+                [Operand::Register(inner_reg), Operand::Register(inner_reg)],
+                span,
+            );
+        }
         let return_to_check = cx.emit_branch_placeholder(Op::Jump, None, span);
         // No `return` method: GeneratorReturn(received.value).
         cx.patch_branch_to_here(return_absent);
@@ -319,12 +312,22 @@ pub(crate) fn compile_yield(
         let done_reg = cx.alloc_scratch();
         cx.emit_load_property(done_reg, inner_reg, "done", span);
         let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+        // A sync delegation surfaces the inner result record verbatim; an
+        // async one hands out the value, which is what its consumer's
+        // `{value, done}` is built from.
+        let suspend_reg = if is_async {
+            let value_reg = cx.alloc_scratch();
+            cx.emit_load_property(value_reg, inner_reg, "value", span);
+            value_reg
+        } else {
+            inner_reg
+        };
         cx.emit(
             Op::YieldDelegate,
             [
                 Operand::Register(kind_reg),
                 Operand::Register(recv_reg),
-                Operand::Register(inner_reg),
+                Operand::Register(suspend_reg),
             ],
             span,
         );

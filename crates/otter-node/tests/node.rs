@@ -189,12 +189,14 @@ fn node_fs_promises_file_handle_round_trips() {
     )
     .unwrap();
 
-    let mut runtime = Runtime::builder()
+    // `fs.promises` completes its work on the event loop, so this one runs
+    // on the loop-driving runtime rather than the bare synchronous one.
+    let otter = otter_runtime::Otter::builder()
         .capabilities(CapabilitySet::allow_all())
         .with_node_apis()
         .build()
         .unwrap();
-    runtime.run_module(&main).unwrap();
+    otter.blocking_run_module(&main).unwrap();
 }
 
 /// Key derivation answers the RFC vectors byte for byte, and its argument

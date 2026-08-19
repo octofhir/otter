@@ -374,10 +374,31 @@ module.exports = {
     return native.cpSyncCopyDir(pathText(src), pathText(dest), !!force, !!dereference,
                                 !!errorOnExist, !!verbatimSymlinks, !!preserveTimestamps);
   },
+  // Both of these take a path or an already-open descriptor. A descriptor
+  // is read and written where it stands and is left open; only the path
+  // form opens and closes a file of its own.
   readFileUtf8(path, flags) {
+    if (typeof path === 'number') {
+      const chunks = [];
+      const chunk = Buffer.allocUnsafe(65536);
+      let read;
+      while ((read = native.read(validatedFd(path), chunk, 0, chunk.byteLength, -1)) > 0) {
+        chunks.push(Buffer.from(chunk.subarray(0, read)));
+      }
+      return Buffer.concat(chunks).toString('utf8');
+    }
     return native.readFileUtf8(pathText(path), flags);
   },
   writeFileUtf8(path, data, flags, mode) {
+    if (typeof path === 'number') {
+      const fd = validatedFd(path);
+      const bytes = Buffer.from(data, 'utf8');
+      let written = 0;
+      while (written < bytes.byteLength) {
+        written += native.writeBuffer(fd, bytes, written, bytes.byteLength - written, -1);
+      }
+      return undefined;
+    }
     return native.writeFileUtf8(pathText(path), data, flags, mode);
   },
 };

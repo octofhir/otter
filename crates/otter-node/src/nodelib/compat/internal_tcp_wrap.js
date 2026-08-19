@@ -28,14 +28,15 @@ class TCP extends StreamHandle {
     return 0;
   }
 
-  bind6(address, port, _flags) {
+  bind6(address, port, flags) {
+    this._ipv6Only = ((flags | 0) & constants.UV_TCP_IPV6ONLY) !== 0;
     return this.bind(address, port);
   }
 
   listen(_backlog) {
     const address = this._boundAddress ?? '0.0.0.0';
     const port = this._boundPort;
-    const err = startListen(this, () => native.listen(address, port));
+    const err = startListen(this, () => native.listen(address, port, this._ipv6Only === true));
     if (err === 0) {
       handleClassByServer.set(this._serverId, TCP);
       const name = native.address(this._serverId, 'local');
@@ -47,8 +48,16 @@ class TCP extends StreamHandle {
     return err;
   }
 
+  // A bound handle dials from the address it was bound to: `connect`
+  // carries the near end so the kernel binds it before connecting.
   connect(req, address, port) {
-    return startConnect(this, req, (token) => native.connect(address, port, token));
+    return startConnect(this, req, (token) => native.connect(
+      address,
+      port,
+      token,
+      this._boundAddress ?? '',
+      this._boundPort,
+    ));
   }
 
   connect6(req, address, port) {

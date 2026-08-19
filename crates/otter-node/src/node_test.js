@@ -32,7 +32,161 @@ function isThenable(v) {
   return v != null && typeof v.then === 'function';
 }
 
-// A no-op async-aware mock/diagnostic surface; expanded as tests demand.
+
+// ---- mocking (node:test MockTracker) ----
+
+// A mock replaces a function or a property and records what was called with
+// what, so a test can both stub behaviour and assert on it. Every mock a
+// tracker hands out is remembered, which is what lets `restoreAll` put the
+// originals back.
+
+class MockFunctionContext {
+  #calls = [];
+  #implementation;
+  #onceImplementations = new Map();
+  #restore;
+  #times;
+
+  constructor(implementation, restore, times) {
+    this.#implementation = implementation;
+    this.#restore = restore;
+    this.#times = times;
+  }
+
+  get calls() { return this.#calls.slice(); }
+
+  callCount() { return this.#calls.length; }
+
+  mockImplementation(implementation) {
+    this.#implementation = implementation;
+  }
+
+  mockImplementationOnce(implementation, onCall) {
+    const at = onCall ?? this.#calls.length;
+    this.#onceImplementations.set(at, implementation);
+  }
+
+  resetCalls() { this.#calls = []; }
+
+  restore() { this.#restore(); }
+
+  // Used by the mock function itself.
+  _implementationFor(index) {
+    if (this.#onceImplementations.has(index)) {
+      const once = this.#onceImplementations.get(index);
+      this.#onceImplementations.delete(index);
+      return once;
+    }
+    if (typeof this.#times === 'number' && index >= this.#times) return null;
+    return this.#implementation;
+  }
+
+  _record(entry) { this.#calls.push(entry); }
+}
+
+function makeMockFunction(original, implementation, options, restore) {
+  const times = options?.times;
+  const context = new MockFunctionContext(implementation, restore ?? (() => {}), times);
+  const mocked = function mocked(...args) {
+    const index = context.callCount();
+    const chosen = context._implementationFor(index) ?? original;
+    const entry = { arguments: args, this: this, target: new.target, error: undefined, result: undefined };
+    try {
+      const result = new.target
+        ? Reflect.construct(chosen, args, new.target)
+        : Reflect.apply(chosen ?? (() => {}), this, args);
+      entry.result = result;
+      return result;
+    } catch (error) {
+      entry.error = error;
+      throw error;
+    } finally {
+      context._record(entry);
+    }
+  };
+  Object.defineProperty(mocked, 'mock', { value: context, enumerable: false, configurable: true });
+  if (original !== undefined && original !== null) {
+    Object.defineProperty(mocked, 'wrappedMethod', {
+      value: original, enumerable: false, configurable: true, writable: true,
+    });
+  }
+  return mocked;
+}
+
+class MockTracker {
+  #mocks = [];
+
+  fn(original, implementation, options) {
+    // `fn(impl)`, `fn(original, impl)` and `fn(original, impl, options)`.
+    if (typeof original === 'object' && original !== null) {
+      options = original;
+      original = undefined;
+    } else if (typeof implementation === 'object' && implementation !== null) {
+      options = implementation;
+      implementation = undefined;
+    }
+    const impl = implementation ?? original;
+    const mocked = makeMockFunction(impl, impl, options, () => {});
+    this.#mocks.push(mocked);
+    return mocked;
+  }
+
+  method(target, name, implementation, options = {}) {
+    if (typeof target !== 'object' && typeof target !== 'function') {
+      const error = new TypeError('The "object" argument must be of type object.');
+      error.code = 'ERR_INVALID_ARG_TYPE';
+      throw error;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(target, name);
+    const accessor = options.getter ? 'get' : (options.setter ? 'set' : null);
+    const original = accessor ? descriptor?.[accessor] : target[name];
+    const impl = typeof implementation === 'function' ? implementation : original;
+    const restore = () => {
+      if (descriptor === undefined) {
+        delete target[name];
+      } else {
+        Object.defineProperty(target, name, descriptor);
+      }
+    };
+    const mocked = makeMockFunction(original, impl, options, restore);
+    if (accessor) {
+      Object.defineProperty(target, name, {
+        ...(descriptor ?? { configurable: true, enumerable: true }),
+        [accessor]: mocked,
+      });
+    } else {
+      Object.defineProperty(target, name, {
+        value: mocked,
+        writable: descriptor?.writable ?? true,
+        enumerable: descriptor?.enumerable ?? true,
+        configurable: true,
+      });
+    }
+    this.#mocks.push(mocked);
+    return mocked;
+  }
+
+  getter(target, name, implementation, options = {}) {
+    return this.method(target, name, implementation, { ...options, getter: true });
+  }
+
+  setter(target, name, implementation, options = {}) {
+    return this.method(target, name, implementation, { ...options, setter: true });
+  }
+
+  reset() {
+    this.restoreAll();
+    this.#mocks = [];
+  }
+
+  restoreAll() {
+    for (const mocked of this.#mocks) mocked.mock.restore();
+  }
+
+  timers = { enable() {}, reset() {}, tick() {} };
+}
+
+// The per-test context: assertions, lifecycle hooks and its own tracker.
 function makeContext(name) {
   const t = {
     name,
@@ -46,13 +200,7 @@ function makeContext(name) {
     after() {},
     beforeEach() {},
     afterEach() {},
-    mock: {
-      fn(impl) { return impl || (() => {}); },
-      method() {},
-      reset() {},
-      restoreAll() {},
-      timers: { enable() {}, reset() {}, tick() {} },
-    },
+    mock: new MockTracker(),
     test: subtest,
     it: subtest,
   };
@@ -168,11 +316,5 @@ module.exports.before = noop;
 module.exports.after = noop;
 module.exports.beforeEach = noop;
 module.exports.afterEach = noop;
-module.exports.mock = {
-  fn(impl) { return impl || (() => {}); },
-  method() {},
-  reset() {},
-  restoreAll() {},
-  timers: { enable() {}, reset() {}, tick() {} },
-};
+module.exports.mock = new MockTracker();
 module.exports.default = test;

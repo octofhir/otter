@@ -617,13 +617,22 @@ fn listen(
         .io_handle()
         .ok_or_else(|| runtime_type_error("net.listen", "no IO runtime".to_string()))?;
 
+    let ipv6_only = args
+        .get(2)
+        .and_then(|value| value.as_boolean())
+        .unwrap_or(false);
     let target = resolve(&host, port).ok_or_else(|| system_error_code("ENOTFOUND", "listen"))?;
-    let listener = std::net::TcpListener::bind(target)
-        .and_then(|listener| {
-            listener.set_nonblocking(true)?;
-            Ok(listener)
-        })
-        .map_err(|error| system_error(&error, "listen", &host))?;
+    // The socket has to exist before the bind for `ipv6Only` to be set on
+    // it, so the listener is built by hand rather than by `bind`.
+    let listener = {
+        let _guard = io.enter();
+        bind_listener(target, ipv6_only)
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })
+            .map_err(|error| system_error(&error, "listen", &host))?
+    };
     let local = listener
         .local_addr()
         .map_err(|error| system_error(&error, "listen", &host))?;
@@ -1051,6 +1060,11 @@ fn connect(
         .io_handle()
         .ok_or_else(|| runtime_type_error("net.connect", "no IO runtime".to_string()))?;
 
+    // `socket.connect({ localAddress, localPort })` binds the near end
+    // before dialing, which is what makes the connect error carry a
+    // `Local (addr:port)` tail.
+    let local_address = string_arg(ctx, args, 3).filter(|text| !text.is_empty());
+    let local_port = args.get(4).and_then(|value| value.as_f64()).unwrap_or(0.0) as u16;
     let connect_table = table.clone();
     let connect_ids = next_id.clone();
     let connect_spawner = spawner.clone();
@@ -1077,7 +1091,7 @@ fn connect(
                 .await;
             return;
         };
-        match tokio::net::TcpStream::connect(target).await {
+        match dial(target, local_address.as_deref(), local_port).await {
             Ok(stream) => {
                 let connection = adopt(
                     NetSocket::Tcp(Arc::new(stream)),
@@ -1109,6 +1123,63 @@ fn connect(
         }
     });
     Ok(RuntimeValue::undefined())
+}
+
+/// Connect to `target`, from `local` when the caller named a near end.
+async fn dial(
+    target: std::net::SocketAddr,
+    local_address: Option<&str>,
+    local_port: u16,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let Some(local_address) = local_address else {
+        return tokio::net::TcpStream::connect(target).await;
+    };
+    let socket = if target.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    let local: std::net::IpAddr = local_address
+        .parse()
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
+    socket.bind(std::net::SocketAddr::new(local, local_port))?;
+    socket.connect(target).await
+}
+
+/// Bind a listening socket, honoring `ipv6Only` on a v6 address.
+///
+/// A dual-stack listener is the platform default; `ipv6Only` turns it off,
+/// which has to happen on the socket before the bind.
+fn bind_listener(
+    address: std::net::SocketAddr,
+    ipv6_only: bool,
+) -> std::io::Result<std::net::TcpListener> {
+    let socket = if address.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    socket.set_reuseaddr(true)?;
+    if address.is_ipv6() && ipv6_only {
+        let enable: libc::c_int = 1;
+        // SAFETY: the socket owns the fd for the duration of the call and
+        // `enable` is a valid, initialized option payload of the size passed.
+        let outcome = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                std::ptr::from_ref(&enable).cast(),
+                std::mem::size_of_val(&enable) as libc::socklen_t,
+            )
+        };
+        if outcome != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    socket.bind(address)?;
+    let listener = socket.listen(511)?;
+    listener.into_std()
 }
 
 /// Everything the shim is told about, in the order it happened.

@@ -991,6 +991,8 @@ opcode_schema! {
     (Op::SuperConstruct, 0xB1),
     (Op::StoreShadowedUpvalueChecked, 0xB2),
     (Op::DeleteShadowedUpvalue, 0xB3),
+    (Op::AsyncIteratorReturn, 0xB4),
+    (Op::CheckIteratorResult, 0xB5),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1235,9 +1237,11 @@ const fn operand_shape(op: Op) -> OperandShape {
         }
         Op::StoreElement => OperandShape::Fixed(READ_READ_READ),
         Op::IteratorNext => OperandShape::Fixed(WRITE_WRITE_READ),
-        Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => {
-            OperandShape::Fixed(&[R])
-        }
+        Op::IteratorClose
+        | Op::IteratorCloseStart
+        | Op::IteratorCloseEnd
+        | Op::CheckIteratorResult => OperandShape::Fixed(&[R]),
+        Op::AsyncIteratorReturn => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::ForInKeys => OperandShape::Fixed(WRITE_READ),
         Op::LoadUpvalue => OperandShape::Fixed(WRITE_IMM),
         Op::StoreUpvalue | Op::StoreUpvalueChecked => OperandShape::Fixed(&[R, IMM]),

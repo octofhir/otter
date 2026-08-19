@@ -941,6 +941,42 @@ impl Interpreter {
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
+                Op::AsyncIteratorReturn => {
+                    let result_reg = instr.reg(0);
+                    let called_reg = instr.reg(1);
+                    let iter_reg = instr.reg(2);
+                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    // §7.4.11 steps 3-5: an iterator without a `return`
+                    // is already closed, and the caller skips the await.
+                    self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
+                    let outcome = self.async_iterator_return_call(stack, context, iterator)?;
+                    let frame = &mut stack[top_idx];
+                    match outcome {
+                        Some(result) => {
+                            write_register(frame, result_reg, result)?;
+                            write_register(frame, called_reg, Value::boolean(true))?;
+                        }
+                        None => {
+                            write_register(frame, result_reg, Value::undefined())?;
+                            write_register(frame, called_reg, Value::boolean(false))?;
+                        }
+                    }
+                    frame.advance_pc()?;
+                    continue;
+                }
+                Op::CheckIteratorResult => {
+                    let value_reg = instr.reg(0);
+                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    // §7.4.11 step 8 — the awaited `return` result is an
+                    // Object or the close is a TypeError.
+                    if !value.is_object() && !value.is_proxy() {
+                        return Err(self.err_type(
+                            ("iterator `return` did not yield an object".to_string()).into(),
+                        ));
+                    }
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
                 Op::IteratorCloseStart => {
                     let iter_reg = instr.reg(0);
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;

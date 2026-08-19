@@ -442,6 +442,7 @@ fn supported_test_flags(file_path: &Path) -> Vec<String> {
         "--expose_gc",
         "--expose-internals",
         "--expose_internals",
+        "--experimental-stream-iter",
         "--network-family-autoselection",
         "--no-network-family-autoselection",
         "--no-warnings",

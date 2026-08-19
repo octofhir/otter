@@ -176,6 +176,11 @@ struct Cli {
     #[arg(long = "max-http-header-size", value_name = "bytes", global = true)]
     max_http_header_size: Option<u32>,
 
+    /// Enable the `stream/iter` API
+    /// (Node's `--experimental-stream-iter`).
+    #[arg(long = "experimental-stream-iter", global = true)]
+    experimental_stream_iter: bool,
+
     /// Try the address families of a name in parallel when connecting
     /// (Node's `--network-family-autoselection`).
     #[arg(
@@ -391,6 +396,9 @@ fn build_path_perm(allow: Option<&str>, deny: Option<&str>) -> Permission<PathBu
 /// where a vendored module looks for `--max-http-header-size` and friends.
 fn node_option_switches(cli: &Cli) -> Vec<String> {
     let mut switches = Vec::new();
+    if cli.experimental_stream_iter {
+        switches.push("--experimental-stream-iter".to_string());
+    }
     if let Some(bytes) = cli.max_http_header_size {
         switches.push(format!("--max-http-header-size={bytes}"));
     }

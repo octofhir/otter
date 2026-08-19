@@ -13,6 +13,7 @@ const defaults = new Map([
   ['--frozen-intrinsics', false],
   ['--max-http-header-size', 16384],
   ['--insecure-http-parser', false],
+  ['--experimental-stream-iter', false],
   ['--network-family-autoselection', true],
   ['--network-family-autoselection-attempt-timeout', 500],
 ]);

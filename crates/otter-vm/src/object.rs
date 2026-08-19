@@ -3199,7 +3199,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
 pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>(
     heap: &mut otter_gc::GcHeap,
     shape: ShapeHandle,
-    data: T,
+    mut data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     // The sidecar is allocated before the object exists, so installing
@@ -3229,11 +3229,33 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
         },
         &mut visit,
     )?;
+    // The sidecar is an old-space body from birth, so the host slots just
+    // installed never crossed the mutator write barrier. Record each
+    // child edge now, or an old(sidecar)→young(child) reference is
+    // missing from the remembered set and the first scavenge strands the
+    // slot on the vacated from-space copy.
+    let mut children: smallvec::SmallVec<[RawGc; 4]> = smallvec::SmallVec::new();
+    {
+        let mut collect = |slot: *mut RawGc| {
+            // SAFETY: the tracer hands pointers to live slots inside `data`.
+            let child = unsafe { *slot };
+            if !child.is_null() {
+                children.push(child);
+            }
+        };
+        let mut tracer = HostDataTracer {
+            visitor: &mut collect,
+        };
+        data.trace_gc_slots(&mut tracer);
+    }
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Traced(Box::new(data)));
         true
     });
     heap.record_write(object, &sidecar);
+    for child in children {
+        heap.record_write_edge(sidecar, child);
+    }
     Ok(object)
 }
 

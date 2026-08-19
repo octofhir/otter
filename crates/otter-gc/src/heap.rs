@@ -2305,6 +2305,16 @@ impl GcHeap {
     /// Type-erased write barrier for callers that hold the
     /// child as a [`RawGc`] rather than a typed `Gc<U>`.
     /// Equivalent to [`Self::write_barrier`] otherwise.
+    /// Record one parent→child edge from a raw child handle.
+    ///
+    /// For writes performed outside the typed mutation helpers — e.g. host
+    /// payloads installed into an old-space body right after allocation,
+    /// where the children were collected through a trace visitor rather
+    /// than a `GcStore` value.
+    pub fn record_write_edge<T: ?Sized>(&mut self, parent: Gc<T>, child: RawGc) {
+        self.write_barrier_raw(parent, child);
+    }
+
     pub(crate) fn write_barrier_raw<T: ?Sized>(&mut self, parent: Gc<T>, child: RawGc) {
         if parent.is_null() {
             return;

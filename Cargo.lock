@@ -2729,6 +2729,7 @@ dependencies = [
  "libz-rs-sys",
  "md-5",
  "nix",
+ "notify",
  "otter-runtime",
  "otter-vm",
  "sha1",

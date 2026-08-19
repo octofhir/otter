@@ -34,6 +34,7 @@ pub mod events;
 pub mod fs;
 mod fs_binding;
 mod fs_cp;
+mod fs_watch;
 pub mod globals;
 pub mod internal_errors_ext;
 pub mod internal_test_binding_ext;
@@ -158,6 +159,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         zlib_stream::zlib_stream_binding_cjs_value,
     ),
     HostedModule::cjs_only("internal/otter/fs", fs_binding::fs_binding_cjs_value),
+    HostedModule::cjs_only(
+        "internal/otter/fs_watch",
+        fs_watch::fs_watch_binding_cjs_value,
+    ),
     HostedModule::cjs_only("internal/otter/stream_wrap", nodelib::internal_stream_wrap),
     HostedModule::cjs_only(
         "internal/otter/stream_handle",

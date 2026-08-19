@@ -2379,10 +2379,7 @@ impl RuntimeBuilder {
     /// [...process.execArgv, ...])` and the test harness's flag check)
     /// reproduces the current configuration.
     #[must_use]
-    pub fn process_exec_argv(
-        mut self,
-        argv: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn process_exec_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.config.process_exec_argv = argv.into_iter().map(Into::into).collect();
         self
     }
@@ -6217,10 +6214,7 @@ impl OtterBuilder {
     /// Engine flags surfaced as `process.execArgv` (the CLI's node-style
     /// switches), so re-execs reproduce the configuration.
     #[must_use]
-    pub fn process_exec_argv(
-        mut self,
-        argv: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn process_exec_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.runtime = self.runtime.process_exec_argv(argv);
         self
     }
@@ -6724,7 +6718,7 @@ pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &
 /// `None` for any other scheme (e.g. `https://`) — dynamic
 /// imports targeting non-`file://` URLs use a separate fetch
 /// path inside [`Runtime::load_dynamic_module`].
-fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
     if let Some(trimmed) = url.strip_prefix("file://") {
         return Some(std::path::PathBuf::from(trimmed));
     }
@@ -7151,23 +7145,16 @@ fn enrich_runtime_diagnostic_with_cause(
     OtterError::Runtime { diagnostic }
 }
 
-
 /// Install the `--expose-gc` global: `gc()` forces a full collection over the
 /// complete runtime root set — the same collection GC stress testing runs.
 fn install_expose_gc_global(interp: &mut Interpreter) -> Result<(), OtterError> {
     let global_object = *interp.global_this();
-    let result: Result<(), otter_vm::NativeError> = NativeCtx::with_host_context(
-        interp,
-        NativeCallInfo::default_call(),
-        None,
-        |ctx| {
+    let result: Result<(), otter_vm::NativeError> =
+        NativeCtx::with_host_context(interp, NativeCallInfo::default_call(), None, |ctx| {
             ctx.scope(|mut scope| {
                 let global_object = scope.value(otter_vm::Value::object(global_object));
-                let gc = scope.native_call(
-                    "gc",
-                    0,
-                    otter_vm::NativeCall::Static(force_gc_native),
-                )?;
+                let gc =
+                    scope.native_call("gc", 0, otter_vm::NativeCall::Static(force_gc_native))?;
                 scope.define(
                     global_object,
                     "gc",
@@ -7180,8 +7167,7 @@ fn install_expose_gc_global(interp: &mut Interpreter) -> Result<(), OtterError> 
                     .to_flags(),
                 )
             })
-        },
-    );
+        });
     result.map_err(|error| OtterError::Internal {
         code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
         message: format!("--expose-gc bootstrap failed: {error}"),

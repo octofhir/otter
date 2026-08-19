@@ -698,7 +698,10 @@ fn run_module_test(
         }
     }
     // Module entry must live on disk (the loader uses the parent
-    // directory as the resolution base).
+    // directory as the resolution base). The staged directory declares
+    // itself a module package: a `flags: [module]` test and the `_FIXTURE`
+    // files it imports are ES modules even when they contain no import or
+    // export, and that is what `package.json#type` says.
     let (dir, entry) = match stage_test_entry(body, test_path, "entry.mjs") {
         Ok(staged) => staged,
         Err(reason) => {
@@ -708,6 +711,13 @@ fn run_module_test(
             };
         }
     };
+    let manifest = dir.path().join("package.json");
+    if let Err(err) = std::fs::write(&manifest, "{\"type\":\"module\"}\n") {
+        return Outcome::Fail {
+            reason: format!("module package manifest write failed: {err}"),
+            stack: None,
+        };
+    }
     let outcome = run_with_watchdog(runtime, timeout, |rt| rt.run_module(&entry));
     let mapped = map_watchdog_outcome(outcome);
     drop(dir); // explicit; the temp dir auto-cleans on drop anyway

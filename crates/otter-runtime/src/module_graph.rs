@@ -382,8 +382,21 @@ impl<'a> ModuleGraphBuilder<'a> {
         // A dependency with no module syntax is a CommonJS file. ES module
         // linking resolves bindings before evaluation, so it cannot import one
         // directly: wrap it in a module that requires it and re-exports what it
-        // assigns. `.mjs` is always a module and never takes this path.
-        let text = if url.ends_with(".mjs") {
+        // assigns. `.mjs` is always a module and never takes this path, and
+        // neither does the entry: a caller that asked for a module graph named
+        // its entry, and a module with no imports and no exports is still the
+        // module it asked for.
+        let is_entry = url == self.entry_url;
+        // `package.json#type: module` makes a `.js` file in that scope an ES
+        // module regardless of what syntax it happens to use, which is how a
+        // module with neither imports nor exports still loads as one.
+        let in_module_package = crate::url_to_path(&url).is_some_and(|path: std::path::PathBuf| {
+            matches!(
+                self.loader.package_type_for_path(&path),
+                Some(crate::module_loader::LoaderPackageType::Module)
+            )
+        });
+        let text = if url.ends_with(".mjs") || is_entry || in_module_package {
             text
         } else {
             let shim = with_program(text.as_str(), kind, |program| {

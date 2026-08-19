@@ -820,7 +820,7 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
-        let value = self.load_regexp_literal_value(context, idx)?;
+        let value = self.load_regexp_literal_value(context, frame.function_id, idx)?;
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
@@ -828,13 +828,19 @@ impl Interpreter {
 
     /// Compile/materialize a fresh RegExp literal as a representation-neutral
     /// value operation shared by interpreter and compiled tiers.
+    ///
+    /// The pattern is read from the pool of the chunk that owns
+    /// `function_id`, not from the ambient context: a frame driven by a
+    /// builtin (an `Array.prototype` callback, say) runs under its caller's
+    /// context, and a literal in another chunk indexes a different pool.
     pub(crate) fn load_regexp_literal_value(
         &mut self,
         context: &ExecutionContext,
+        function_id: u32,
         idx: u32,
     ) -> Result<Value, VmError> {
         let (pattern_utf16, flags) = context
-            .regexp_constant(idx)
+            .regexp_constant_for_function(function_id, idx)
             .ok_or(VmError::InvalidOperand)?;
         // A regex literal evaluates to a fresh RegExp each time, but the
         // *compiled* program is a pure function of pattern + flags, so
@@ -864,7 +870,8 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
-        let value = self.load_regexp_literal_value(context, idx)?;
+        let function_id = frame.function_id();
+        let value = self.load_regexp_literal_value(context, function_id, idx)?;
         frame.write(dst, value)
     }
 

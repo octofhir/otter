@@ -206,6 +206,7 @@ nodelib_module!(node_http, "node:http", vendored "nodelib/http.js");
 nodelib_module!(parse_args, "internal/util/parse_args/parse_args", vendored "nodelib/internal/util/parse_args/parse_args.js");
 nodelib_module!(parse_args_utils, "internal/util/parse_args/utils", vendored "nodelib/internal/util/parse_args/utils.js");
 nodelib_module!(internal_mime, "internal/mime", vendored "nodelib/internal/mime.js");
+nodelib_module!(internal_deps_minimatch, "internal/deps/minimatch/index", vendored "nodelib/internal/deps/minimatch/index.js");
 nodelib_module!(internal_util_diff, "internal/util/diff", vendored "nodelib/internal/util/diff.js");
 nodelib_module!(internal_myers_diff, "internal/assert/myers_diff", vendored "nodelib/internal/assert/myers_diff.js");
 nodelib_module!(internal_trace_sigint, "internal/util/trace_sigint", vendored "nodelib/internal/util/trace_sigint.js");

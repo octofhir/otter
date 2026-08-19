@@ -408,6 +408,7 @@ pub fn run_one(
             &rel_path,
             test_path,
             features.iter().any(|feature| feature == "dynamic-import"),
+            frontmatter.is_async(),
         );
         invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout)
     } else {
@@ -423,6 +424,7 @@ pub fn run_one(
                 &rel_path,
                 test_path,
                 stage_script,
+                frontmatter.is_async(),
             );
             let mapped = invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout);
             if !matches!(mapped, Outcome::Pass) {
@@ -448,6 +450,7 @@ pub fn run_one(
                 &rel_path,
                 test_path,
                 stage_script,
+                frontmatter.is_async(),
             );
             let mapped = invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout);
             if !matches!(mapped, Outcome::Pass) {
@@ -503,6 +506,7 @@ fn run_script_with_fresh_runtime(
     rel_path: &str,
     test_path: &Path,
     stage_on_disk: bool,
+    is_async: bool,
 ) -> Outcome {
     let mut runtime = match per_test_runtime(exec, allow_blocking_atomics_wait) {
         Ok(rt) => rt,
@@ -539,6 +543,7 @@ fn run_script_with_fresh_runtime(
         test_path,
         stage_on_disk,
         exec.timeout,
+        is_async,
     )
 }
 
@@ -586,6 +591,7 @@ fn run_script_test(
     test_path: &Path,
     stage_on_disk: bool,
     timeout: Duration,
+    is_async: bool,
 ) -> Outcome {
     if stage_on_disk {
         let (dir, entry) = match stage_test_entry(source, test_path, "entry.js") {
@@ -604,13 +610,65 @@ fn run_script_test(
         });
         let mapped = map_watchdog_outcome(outcome);
         drop(dir);
-        return mapped;
+        return finish_async_test(runtime, mapped, timeout, is_async);
     }
     let outcome = run_with_watchdog(runtime, timeout, |rt| {
         rt.run_script(SourceInput::from_javascript(source.to_string()), rel_path)
     });
-    map_watchdog_outcome(outcome)
+    let mapped = map_watchdog_outcome(outcome);
+    finish_async_test(runtime, mapped, timeout, is_async)
 }
+
+/// A `flags: [async]` test reports through `$DONE`, not through the
+/// completion of its own script: the body only starts the work. Reading
+/// the recorded call is what turns "the script did not throw" into a real
+/// result — without it every asynchronous assertion passes by default.
+fn finish_async_test(
+    runtime: &mut Runtime,
+    outcome: Outcome,
+    timeout: Duration,
+    is_async: bool,
+) -> Outcome {
+    if !is_async || !matches!(outcome, Outcome::Pass) {
+        return outcome;
+    }
+    let probe = run_with_watchdog(runtime, timeout, |rt| {
+        rt.run_script(
+            SourceInput::from_javascript(DONE_PROBE.to_string()),
+            "test262-done-probe.js",
+        )
+    });
+    let reported = match probe {
+        WatchdogOutcome::Ok(result) => result.completion_string().to_string(),
+        other => return map_watchdog_outcome(other),
+    };
+    match reported.as_str() {
+        "ok" => Outcome::Pass,
+        "pending" => Outcome::Fail {
+            reason: "$DONE was never called".to_string(),
+            stack: None,
+        },
+        _ => Outcome::Fail {
+            reason: reported
+                .strip_prefix("fail:")
+                .unwrap_or(&reported)
+                .to_string(),
+            stack: None,
+        },
+    }
+}
+
+/// Reads back what `$DONE` recorded, after letting the queued reactions
+/// that would call it run.
+const DONE_PROBE: &str = r#"
+(function () {
+  for (var i = 0; i < 4; i++) { Promise.resolve(); }
+  if (!globalThis.__OTTER_TEST262_DONE_FIRED) { return 'pending'; }
+  var reason = globalThis.__OTTER_TEST262_DONE_RESULT;
+  if (reason === undefined || reason === null) { return 'ok'; }
+  return 'fail:' + (reason && reason.stack ? reason.stack : String(reason));
+})()
+"#;
 
 fn run_module_test(
     runtime: &mut Runtime,

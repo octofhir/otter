@@ -530,10 +530,15 @@ class HTTPParser {
       }
     }
     const chunked = transferCodings[transferCodings.length - 1] === 'chunked';
-    // The framing has to be decided before the headers callback: llhttp
-    // errors while parsing them, so a message with two disagreeing framings
-    // never reaches a request handler.
-    if (transferEncoding && (!chunked || contentLength !== -1)) {
+    // Two framings that disagree are settled while the headers parse, before
+    // any request object exists: a Content-Length beside a Transfer-Encoding,
+    // and a `chunked` that is not the final coding — the body would end
+    // somewhere both sides read differently, which is the smuggling
+    // primitive. A Transfer-Encoding that never says `chunked` is a
+    // different case: the message is simply unframed, and llhttp reports
+    // that after the headers callback (see below).
+    const chunkedNotLast = transferCodings.includes('chunked') && !chunked;
+    if (transferEncoding && (contentLength !== -1 || chunkedNotLast)) {
       return parseError('HPE_INVALID_TRANSFER_ENCODING', 'Invalid transfer encoding');
     }
     const versionOnePlus = this._versionMajor === 1 && this._versionMinor >= 1;
@@ -577,6 +582,13 @@ class HTTPParser {
     // An upgrade request still carries its declared body (llhttp parses it
     // and only then reports the upgrade index); CONNECT never has one.
     this._skipBody = ret === 1 || ret === 2 || isConnect;
+    // A request whose Transfer-Encoding names no `chunked` coding has no
+    // defined body framing; the message errors here, so the request object
+    // exists and sees no body.
+    if (transferEncoding && !chunked && !this._skipBody &&
+        this._type === HTTPParser.REQUEST && contentLength === -1) {
+      return parseError('HPE_INVALID_TRANSFER_ENCODING', 'Invalid transfer encoding');
+    }
     const bodyless = isResponse &&
       (this._statusCode === 204 || this._statusCode === 304 ||
        (this._statusCode >= 100 && this._statusCode < 200));

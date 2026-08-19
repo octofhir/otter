@@ -174,11 +174,7 @@ pub(crate) fn coded_error(
 ) -> RuntimeNativeError {
     // A capability refusal says so in the message: the runtime's own gate is
     // what stopped the call, not the platform.
-    let reason = if code == "EACCES" {
-        "permission denied"
-    } else {
-        "operation failed"
-    };
+    let reason = io_description(code);
     RuntimeNativeError::Syscall {
         code,
         message: format!("{code}: {reason}, {syscall} '{}'", path.display()),
@@ -243,11 +239,50 @@ pub(crate) fn io_failure(
     let code = io_code(error);
     RuntimeNativeError::Syscall {
         code,
-        message: format!("{code}: {error}, {syscall} '{}'", path.display()),
+        message: format!(
+            "{code}: {}, {syscall} '{}'",
+            io_description(code),
+            path.display()
+        ),
         syscall,
         path: Some(path.display().to_string()),
         dest: None,
-        errno: error.raw_os_error().unwrap_or(0),
+        // Node reports the platform errno negated, the way libuv hands it up.
+        errno: -error.raw_os_error().unwrap_or(0).abs(),
+    }
+}
+
+/// The description Node prints for a code. The platform's own `strerror`
+/// text differs from system to system and from Node's, and callers match on
+/// the message.
+fn io_description(code: &str) -> &'static str {
+    match code {
+        "ENOENT" => "no such file or directory",
+        "EACCES" => "permission denied",
+        "EPERM" => "operation not permitted",
+        "EEXIST" => "file already exists",
+        "EINVAL" => "invalid argument",
+        "EISDIR" => "illegal operation on a directory",
+        "ENOTDIR" => "not a directory",
+        "ENOTEMPTY" => "directory not empty",
+        "ENAMETOOLONG" => "name too long",
+        "ELOOP" => "too many symbolic links encountered",
+        "EMFILE" => "too many open files",
+        "ENFILE" => "file table overflow",
+        "EBADF" => "bad file descriptor",
+        "ENOSPC" => "no space left on device",
+        "EROFS" => "read-only file system",
+        "EXDEV" => "cross-device link not permitted",
+        "EFBIG" => "file too large",
+        "ESPIPE" => "invalid seek",
+        "EAGAIN" => "resource temporarily unavailable",
+        "EBUSY" => "resource busy or locked",
+        "ENODEV" => "no such device",
+        "ENXIO" => "no such device or address",
+        "EOVERFLOW" => "value too large for defined data type",
+        "ERANGE" => "result too large",
+        "ENOTSUP" => "operation not supported on socket",
+        _ => "i/o error",
     }
 }
 

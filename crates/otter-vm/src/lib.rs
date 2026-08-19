@@ -262,7 +262,6 @@ use arithmetic_dispatch::{
 };
 pub(crate) use error_ops::{
     native_to_vm_error, native_to_vm_error_with_stack, snapshot_frames, symbol_to_vm_error,
-    vm_err_to_value,
 };
 pub use executable::code_block_cfg::{
     ActiveCatchRegionError, ActiveCatchRegions, CodeBlockControlFlowView, CodeBlockExceptionRegion,

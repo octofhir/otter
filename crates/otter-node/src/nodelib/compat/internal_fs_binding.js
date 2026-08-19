@@ -14,6 +14,11 @@ const native = require('internal/otter/fs');
 // Stats arrive as the 18 numbers `getStatsFromBinding` reads.
 const kStatsFields = 18;
 
+// The shared array the last plain (non-bigint) stat left behind.
+// `fs.realpathSync` reads it to classify a path it already stat'd rather
+// than stat'ing it a second time.
+const statValues = new Float64Array(kStatsFields * 2);
+
 class FSReqCallback {
   constructor(bigint = false) {
     this.oncomplete = null;
@@ -26,6 +31,9 @@ function statsFrom(values, bigint) {
   const view = bigint ? new BigInt64Array(kStatsFields) : new Float64Array(kStatsFields);
   for (let i = 0; i < kStatsFields; i++) {
     view[i] = bigint ? BigInt(Math.trunc(values[i])) : values[i];
+  }
+  if (!bigint) {
+    for (let i = 0; i < kStatsFields; i++) statValues[i] = values[i];
   }
   return view;
 }
@@ -200,6 +208,7 @@ module.exports = {
   FSReqCallback,
   StatWatcher,
   kUsePromises,
+  statValues,
   kFsStatsFieldsNumber: kStatsFields,
 
   openFileHandle(path, flags, mode, req) {

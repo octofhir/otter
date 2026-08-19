@@ -1514,7 +1514,25 @@ fn native_error_rejection_value(interp: &mut Interpreter, err: NativeError) -> V
         );
     }
     let vm_error = crate::native_to_vm_error(interp, err);
-    crate::error_ops::vm_err_to_value(interp, &vm_error)
+    // Building the VM error already made the instance the failure stands
+    // for and parked it as the pending throw; that object is the reason,
+    // not a rendering of it.
+    if let Some(value) = interp.take_pending_uncaught_throw() {
+        return value;
+    }
+    rejection_value_for(interp, &vm_error)
+}
+
+/// The value a promise rejects with when the failure is the engine's own.
+///
+/// A caller writes `err instanceof TypeError`, so the reason has to be the
+/// error object the failure stands for; the rendered message is only a
+/// last resort for a failure that has no class.
+pub(crate) fn rejection_value_for(interp: &mut Interpreter, err: &crate::VmError) -> Value {
+    let empty = ActivationStack::new();
+    interp
+        .vm_error_to_throwable_with_stack_roots(None, &empty, err)
+        .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, err))
 }
 
 fn native_error_rejection_value_preserving_throw(
@@ -1900,11 +1918,11 @@ fn static_try_generic(
         match call_result {
             Ok(value) => call_capability_resolve(interp, stack, &mut cap, value)?,
             Err(crate::VmError::Uncaught) => {
-                let reason = crate::error_ops::vm_err_to_value(interp, &crate::VmError::Uncaught);
+                let reason = rejection_value_for(interp, &crate::VmError::Uncaught);
                 call_capability_reject(interp, stack, &mut cap, reason)?;
             }
             Err(other) => {
-                let reason = crate::error_ops::vm_err_to_value(interp, &other);
+                let reason = rejection_value_for(interp, &other);
                 call_capability_reject(interp, stack, &mut cap, reason)?;
             }
         }
@@ -3314,6 +3332,29 @@ fn resolve_native_body(
             return Ok(Value::undefined());
         }
 
+        // §27.2.1.3.2 step 6 — resolving a promise with itself is a
+        // TypeError, not a wait for something that can never arrive.
+        if scope.raw(value) == scope.raw(promise) {
+            let promise_handle = scope
+                .raw(promise)
+                .as_promise()
+                .expect("resolver promise remains rooted");
+            let reason = scope.with_turn_parts(|interp, stack| {
+                interp
+                    .make_error_instance_with_stack_roots(
+                        stack,
+                        crate::error_classes::ErrorKind::TypeError,
+                        Some("Chaining cycle detected for promise".to_string()),
+                        &Value::undefined(),
+                    )
+                    .map_or_else(|_| Value::undefined(), Value::object)
+            });
+            let interp = scope.context().interp_mut();
+            let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
+            drain_jobs(interp, jobs);
+            return Ok(Value::undefined());
+        }
+
         if scope.raw(value).is_promise() {
             let promise_handle = scope
                 .raw(promise)
@@ -3476,6 +3517,28 @@ pub(crate) fn resolve_promise_from_interpreter(
             return Ok(());
         }
 
+        // §27.2.1.3.2 step 6 — resolving a promise with itself is a
+        // TypeError, not a wait for something that can never arrive.
+        if interp.escape_scoped(value) == interp.escape_scoped(promise) {
+            let promise_handle = interp
+                .escape_scoped(promise)
+                .as_promise()
+                .expect("async resolver promise remains rooted");
+            let empty = ActivationStack::new();
+            let reason = interp
+                .make_error_instance_with_stack_roots(
+                    &empty,
+                    crate::error_classes::ErrorKind::TypeError,
+                    Some("Chaining cycle detected for promise".to_string()),
+                    &Value::undefined(),
+                )
+                .map(Value::object)
+                .unwrap_or_else(|_| Value::undefined());
+            let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
+            drain_jobs(interp, jobs);
+            return Ok(());
+        }
+
         // §27.2.1.3.2 steps 8-13 — an ordinary object with a callable
         // `then` is a thenable and is adopted through the job queue, not
         // fulfilled as itself. An async function returning one must settle
@@ -3599,7 +3662,7 @@ fn make_resolve_thenable_job(
                         let reason = scope.with_turn_parts(|interp, _| {
                             interp
                                 .take_pending_uncaught_throw()
-                                .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, &err))
+                                .unwrap_or_else(|| rejection_value_for(interp, &err))
                         });
                         let reason = scope.value(reason);
                         let on_reject = scope.raw(on_reject);
@@ -3658,7 +3721,7 @@ fn make_resolve_thenable_job_runtime_rooted(
                 let reason = ctx.with_turn_parts(|interp, _| {
                     interp
                         .take_pending_uncaught_throw()
-                        .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, &err))
+                        .unwrap_or_else(|| rejection_value_for(interp, &err))
                 });
                 let _ = ctx.with_turn_parts(|interp, stack| {
                     interp.run_callable_sync_rooted(

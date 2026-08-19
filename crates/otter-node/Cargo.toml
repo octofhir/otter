@@ -16,6 +16,10 @@ sha1 = { workspace = true }
 md-5 = "0.10"
 getrandom = { workspace = true }
 flate2 = { workspace = true }
+crc32fast = { workspace = true }
+libz-rs-sys = { workspace = true }
+brotli = { workspace = true }
+zstd-safe = { workspace = true }
 tokio = { workspace = true }
 idna = "1.1"
 libloading = "0.8"

@@ -51,7 +51,7 @@ pub mod timers;
 pub mod tty;
 pub mod url;
 pub mod util;
-pub mod zlib;
+pub mod zlib_stream;
 
 use otter_runtime::{HostedModule, OtterBuilder, RuntimeBuilder};
 
@@ -114,9 +114,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("node:crypto", crypto::crypto_cjs_value),
     HostedModule::cjs_only("crypto", crypto::crypto_cjs_value),
     HostedModule::cjs_only("__cryptonative", crypto::crypto_native_cjs_value),
-    HostedModule::cjs_only("node:zlib", zlib::zlib_cjs_value),
-    HostedModule::cjs_only("zlib", zlib::zlib_cjs_value),
-    HostedModule::cjs_only("__zlibnative", zlib::zlib_native_cjs_value),
+    HostedModule::cjs_only("node:zlib", nodelib::node_zlib),
+    HostedModule::cjs_only("zlib", nodelib::node_zlib),
     HostedModule::cjs_only("node:perf_hooks", misc_modules::perf_hooks_cjs_value),
     HostedModule::cjs_only("perf_hooks", misc_modules::perf_hooks_cjs_value),
     HostedModule::cjs_only("node:v8", misc_modules::v8_cjs_value),
@@ -152,6 +151,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("net", nodelib::node_net),
     HostedModule::cjs_only("internal/otter/net", net::net_binding_cjs_value),
     HostedModule::cjs_only("internal/otter/dgram", dgram::dgram_binding_cjs_value),
+    HostedModule::cjs_only("internal/otter/zlib", zlib_stream::zlib_stream_binding_cjs_value),
     HostedModule::cjs_only("internal/otter/stream_wrap", nodelib::internal_stream_wrap),
     HostedModule::cjs_only(
         "internal/otter/stream_handle",
@@ -160,6 +160,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/otter/tcp_wrap", nodelib::internal_tcp_wrap),
     HostedModule::cjs_only("internal/otter/pipe_wrap", nodelib::internal_pipe_wrap),
     HostedModule::cjs_only("internal/otter/udp_wrap", nodelib::internal_udp_wrap),
+    HostedModule::cjs_only("internal/otter/zlib_handle", nodelib::internal_zlib_handle),
     HostedModule::cjs_only("internal/dgram", nodelib::internal_dgram),
     HostedModule::cjs_only("internal/otter/cares_wrap", nodelib::internal_cares_wrap),
     HostedModule::cjs_only("internal/otter/ip", nodelib::internal_otter_ip),

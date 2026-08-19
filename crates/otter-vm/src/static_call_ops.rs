@@ -203,15 +203,8 @@ impl Interpreter {
             (dst, target)
         };
         let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
-        let args_root = [target];
         let names = self.scoped_key_strings(&keys)?;
-        let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-            stack,
-            names,
-            &[],
-            &[&args_root],
-        )?;
-        finish_static_call(&mut stack[top_idx], dst, Value::array(array))
+        finish_static_call(&mut stack[top_idx], dst, names)
     }
 
     /// `Op::CopyDataProperties` — §7.3.31 CopyDataProperties applied
@@ -671,14 +664,7 @@ impl Interpreter {
             M::ForInKeys => {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
                 let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
-                let names = self.scoped_key_strings(&keys)?;
-                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    names,
-                    &[],
-                    &[args],
-                )?;
-                Ok(Some(Value::array(array)))
+                Ok(Some(self.scoped_key_strings(&keys)?))
             }
             M::Keys => {
                 let owned: Vec<String> = match args.first() {
@@ -714,14 +700,7 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let names = self.scoped_key_strings(&owned)?;
-                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    names,
-                    &[],
-                    &[args],
-                )?;
-                Ok(Some(Value::array(array)))
+                Ok(Some(self.scoped_key_strings(&owned)?))
             }
             M::Values => {
                 let values: Vec<Value> = match args.first() {
@@ -1251,14 +1230,7 @@ impl Interpreter {
                 } else {
                     return Err(VmError::TypeMismatch);
                 };
-                let names = self.scoped_key_strings(&owned)?;
-                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    names,
-                    &[],
-                    &[args],
-                )?;
-                Ok(Some(Value::array(array)))
+                Ok(Some(self.scoped_key_strings(&owned)?))
             }
             M::GetOwnPropertySymbols => {
                 let Some(target) = args.first() else {

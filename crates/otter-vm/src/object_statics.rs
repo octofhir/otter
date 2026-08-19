@@ -2045,14 +2045,7 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let names = interp.scoped_key_strings(&owned)?;
-            let gc_heap = interp.gc_heap_for_cx_mut();
-            Ok(Value::array(rooted_array_from_elements(
-                gc_heap,
-                names,
-                &[],
-                &[args],
-            )?))
+            Ok(interp.scoped_key_strings(&owned)?)
         }
         // §20.1.2.22 Object.values(O) — enumerable own data values.
         // <https://tc39.es/ecma262/#sec-object.values>
@@ -2237,14 +2230,7 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let names = interp.scoped_key_strings(&owned)?;
-            let gc_heap = interp.gc_heap_for_cx_mut();
-            Ok(Value::array(rooted_array_from_elements(
-                gc_heap,
-                names,
-                &[],
-                &[args],
-            )?))
+            Ok(interp.scoped_key_strings(&owned)?)
         }
         // §20.1.2.13 Object.getOwnPropertySymbols(O) — every own
         // symbol-keyed property. Foundation property bag is

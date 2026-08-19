@@ -460,7 +460,8 @@ impl Interpreter {
                     }
                     Err(vm_err) => {
                         if result_capability.is_some() {
-                            let reason = vm_err_to_value(self, &vm_err);
+                            let reason =
+                                crate::promise_dispatch::rejection_value_for(self, &vm_err);
                             self.settle_microtask_capability(
                                 context,
                                 result_capability.take(),
@@ -508,10 +509,9 @@ impl Interpreter {
                         // stringified `vm_err_to_value` rendering so
                         // identity is preserved per §27.2.1.3.2 step
                         // 1.f.iii.
-                        let reason = self
-                            .pending_uncaught_throw
-                            .take()
-                            .unwrap_or_else(|| vm_err_to_value(self, &vm_err));
+                        let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
+                            crate::promise_dispatch::rejection_value_for(self, &vm_err)
+                        });
                         self.settle_microtask_capability(
                             context,
                             result_capability.take(),
@@ -671,10 +671,9 @@ impl Interpreter {
                     // [`Self::unwind_throw_with_uncaught`] preserves
                     // it on `pending_uncaught_throw` for exactly this
                     // hop.
-                    let reason = self
-                        .pending_uncaught_throw
-                        .take()
-                        .unwrap_or_else(|| vm_err_to_value(self, &error));
+                    let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
+                        crate::promise_dispatch::rejection_value_for(self, &error)
+                    });
                     self.settle_microtask_capability(
                         context,
                         result_capability.take(),

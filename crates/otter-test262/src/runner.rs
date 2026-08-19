@@ -658,11 +658,12 @@ fn finish_async_test(
     }
 }
 
-/// Reads back what `$DONE` recorded, after letting the queued reactions
-/// that would call it run.
+/// Reads back what `$DONE` recorded. The test's own run already drained
+/// the queued reactions, and the probe touches nothing a test may have
+/// replaced — a test that redefines `Promise.resolve` to throw is a test,
+/// not a failure of the probe.
 const DONE_PROBE: &str = r#"
 (function () {
-  for (var i = 0; i < 4; i++) { Promise.resolve(); }
   if (!globalThis.__OTTER_TEST262_DONE_FIRED) { return 'pending'; }
   var reason = globalThis.__OTTER_TEST262_DONE_RESULT;
   if (reason === undefined || reason === null) { return 'ok'; }

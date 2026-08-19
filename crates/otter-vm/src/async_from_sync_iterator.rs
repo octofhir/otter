@@ -204,6 +204,57 @@ impl Interpreter {
     }
 }
 
+/// IfAbruptRejectPromise — every one of the adapter's methods answers with
+/// a promise, so a failure becomes a rejection rather than a throw.
+fn rejected_promise(
+    ctx: &mut NativeCtx<'_>,
+    context: &ExecutionContext,
+    err: VmError,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let reason = ctx.with_turn_parts(|interp, stack| {
+        interp.take_pending_uncaught_throw().unwrap_or_else(|| {
+            interp
+                .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
+                .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, &err))
+        })
+    });
+    reject_with(ctx, context, reason, name)
+}
+
+/// A promise already rejected with `reason`.
+fn reject_with(
+    ctx: &mut NativeCtx<'_>,
+    context: &ExecutionContext,
+    reason: Value,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    ctx.with_turn_parts(|interp, stack| {
+        crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .rejected_stack_rooted(interp, stack, reason, &[&reason], &[])
+            .map(Value::promise)
+            .map_err(|_| NativeError::TypeError {
+                name,
+                reason: "rejection allocation failed".to_string(),
+            })
+    })
+}
+
+/// A `TypeError` instance, as a value.
+fn type_error_value(ctx: &mut NativeCtx<'_>, message: &str) -> Value {
+    let message = message.to_string();
+    ctx.with_turn_parts(|interp, stack| {
+        interp
+            .make_error_instance_with_stack_roots(
+                stack,
+                crate::error_classes::ErrorKind::TypeError,
+                Some(message),
+                &Value::undefined(),
+            )
+            .map_or_else(|_| Value::undefined(), Value::object)
+    })
+}
+
 /// The shape of one wrapper method: the sync iterator plus the argument the
 /// caller passed.
 type StepFn = fn(&mut NativeCtx<'_>, Value, Option<Value>) -> Result<Value, NativeError>;
@@ -243,12 +294,22 @@ fn step_return(
     argument: Option<Value>,
 ) -> Result<Value, NativeError> {
     step(ctx, sync_iterator, "return", argument, false, |ctx, arg| {
-        // A sync iterator with no `return` is already finished.
-        Some(iter_result_object(
-            ctx,
-            arg.unwrap_or_else(Value::undefined),
-            true,
-        ))
+        // A sync iterator with no `return` is already finished, and the
+        // answer is still a promise.
+        let context = ctx.execution_context().cloned()?;
+        let record = match iter_result_object(ctx, arg.unwrap_or_else(Value::undefined), true) {
+            Ok(record) => record,
+            Err(err) => return Some(Err(err)),
+        };
+        Some(ctx.with_turn_parts(|interp, stack| {
+            crate::promise_dispatch::PromiseBuilder::with_context(context)
+                .fulfilled_stack_rooted(interp, stack, record, &[&record], &[])
+                .map(Value::promise)
+                .map_err(|_| NativeError::TypeError {
+                    name: "AsyncFromSyncIterator.return",
+                    reason: "promise allocation failed".to_string(),
+                })
+        }))
     })
 }
 
@@ -258,16 +319,29 @@ fn step_throw(
     sync_iterator: Value,
     argument: Option<Value>,
 ) -> Result<Value, NativeError> {
-    step(ctx, sync_iterator, "throw", argument, true, |ctx, arg| {
-        // A sync iterator with no `throw` is closed and the reason is
-        // handed back to the caller.
-        let reason = arg.unwrap_or_else(Value::undefined);
-        ctx.interp_mut().set_pending_uncaught_throw(reason);
-        Some(Err(NativeError::Thrown {
-            name: "AsyncFromSyncIterator.throw",
-            message: String::new(),
-        }))
-    })
+    step(
+        ctx,
+        sync_iterator,
+        "throw",
+        argument,
+        true,
+        move |ctx, _arg| {
+            // §27.1.4.2.3 — a sync iterator with no `throw` is closed, and the
+            // caller learns that the protocol was not there, not what it tried
+            // to throw.
+            let context = ctx.execution_context().cloned()?;
+            ctx.with_turn_parts(|interp, stack| {
+                let _ = interp.iterator_close_sync(stack, &context, &sync_iterator);
+            });
+            let reason = type_error_value(ctx, "iterator has no 'throw' method");
+            Some(reject_with(
+                ctx,
+                &context,
+                reason,
+                "AsyncFromSyncIterator.throw",
+            ))
+        },
+    )
 }
 
 /// Drive one step of the sync iterator and hand its result to the
@@ -291,14 +365,17 @@ fn step(
     let method = ctx.with_turn_parts(|interp, stack| {
         interp.iterator_member(stack, &context, sync_iterator, name)
     });
-    let method = method.map_err(|err| vm_error(ctx, err, name))?;
+    let method = match method {
+        Ok(method) => method,
+        Err(err) => return rejected_promise(ctx, &context, err, name),
+    };
     if method.is_nullish() {
         return match missing(ctx, argument) {
             Some(answer) => answer,
-            None => Err(NativeError::TypeError {
-                name,
-                reason: format!("iterator has no '{name}' method"),
-            }),
+            None => {
+                let reason = type_error_value(ctx, "iterator has no 'next' method");
+                reject_with(ctx, &context, reason, name)
+            }
         };
     }
 
@@ -309,14 +386,15 @@ fn step(
     let result = ctx.with_turn_parts(|interp, stack| {
         interp.run_callable_sync_rooted(stack, &context, &method, sync_iterator, args)
     });
-    let result = result.map_err(|err| vm_error(ctx, err, name))?;
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => return rejected_promise(ctx, &context, err, name),
+    };
     if !is_object_like(&result) {
-        return Err(NativeError::TypeError {
-            name,
-            reason: format!("'{name}' did not answer with an object"),
-        });
+        let reason = type_error_value(ctx, "iterator result is not an object");
+        return reject_with(ctx, &context, reason, name);
     }
-    ctx.with_turn_parts(|interp, stack| {
+    let outcome = ctx.with_turn_parts(|interp, stack| {
         interp.async_from_sync_continuation(
             stack,
             &context,
@@ -324,16 +402,15 @@ fn step(
             sync_iterator,
             close_on_rejection,
         )
-    })
-    .map_err(|err| vm_error(ctx, err, name))
+    });
+    match outcome {
+        Ok(promise) => Ok(promise),
+        Err(err) => rejected_promise(ctx, &context, err, name),
+    }
 }
 
 /// Whether an iterator step answered with something that can carry
 /// `value` / `done`.
 fn is_object_like(value: &Value) -> bool {
     value.is_object_type() || value.is_proxy()
-}
-
-fn vm_error(ctx: &mut NativeCtx<'_>, err: VmError, name: &'static str) -> NativeError {
-    crate::native_function::vm_to_native_error(ctx.interp_mut(), err, name)
 }

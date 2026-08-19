@@ -384,56 +384,163 @@ const promises = {
 };
 
 // ---- streams ----
+// The file is read where the consumer asks for it: one positional read
+// per `_read`, bounded by the stream's high water mark, so a large file
+// never has to fit in memory at once and `start`/`end` name a window
+// rather than a slice of an already-read buffer.
 class ReadStream extends Readable {
   constructor(path, options = {}) {
-    super(typeof options === 'object' ? options : {});
-    this.path = pathStr(path);
+    const settings = typeof options === 'object' && options !== null ? options : {};
+    super(settings);
+    this.path = path === null || path === undefined ? null : pathStr(path);
     this.bytesRead = 0;
-    const enc = encodingOf(options);
-    setTimeout(() => {
+    this.fd = typeof settings.fd === 'number' ? settings.fd : null;
+    this.flags = settings.flags ?? 'r';
+    this.mode = settings.mode ?? 0o666;
+    this.start = settings.start ?? 0;
+    this.end = settings.end === undefined ? Infinity : settings.end;
+    this.autoClose = settings.autoClose !== false;
+    this._encoding = encodingOf(settings);
+    this._position = this.start;
+    this._opening = false;
+    if (this.fd === null) {
+      this._openFile();
+    } else {
+      process.nextTick(() => { this.emit('open', this.fd); this.emit('ready'); });
+    }
+  }
+
+  _openFile() {
+    this._opening = true;
+    process.nextTick(() => {
       try {
-        const buf = readFileSync(this.path);
-        this.emit('open', 0);
+        this.fd = openSync(this.path, this.flags, this.mode);
+        this._opening = false;
+        this.emit('open', this.fd);
         this.emit('ready');
-        const start = options.start || 0;
-        const end = options.end !== undefined ? options.end + 1 : buf.length;
-        const slice = buf.slice(start, end);
-        this.bytesRead = slice.length;
-        this.push(enc ? slice.toString(enc) : slice);
-        this.push(null);
-        this.emit('close');
-      } catch (err) { this.destroy(err); }
+        // A read may have been asked for while the file was opening.
+        if (this._pendingRead) {
+          this._pendingRead = false;
+          this._read(this.readableHighWaterMark);
+        }
+      } catch (err) {
+        this._opening = false;
+        this.destroy(err);
+      }
     });
   }
-  close(cb) { if (cb) setTimeout(cb); }
+
+  _read(size) {
+    if (this.fd === null) {
+      this._pendingRead = true;
+      return;
+    }
+    const remaining = this.end === Infinity ? size : (this.end - this._position + 1);
+    if (remaining <= 0) {
+      this.push(null);
+      return;
+    }
+    const want = Math.max(1, Math.min(size || this.readableHighWaterMark, remaining));
+    const buffer = Buffer.allocUnsafe(want);
+    let read;
+    try {
+      read = readSync(this.fd, buffer, 0, want, this._position);
+    } catch (err) {
+      this.destroy(err);
+      return;
+    }
+    if (read === 0) {
+      this.push(null);
+      return;
+    }
+    this._position += read;
+    this.bytesRead += read;
+    const chunk = buffer.subarray(0, read);
+    this.push(this._encoding ? chunk.toString(this._encoding) : chunk);
+  }
+
+  _destroy(error, callback) {
+    const fd = this.fd;
+    this.fd = null;
+    if (fd !== null && this.autoClose) {
+      try { closeSync(fd); } catch { /* the descriptor is already gone */ }
+    }
+    callback(error);
+  }
+
+  close(cb) {
+    if (cb) this.once('close', cb);
+    this.destroy();
+  }
 }
+// Each chunk is written where it lands, so a stream's memory is one
+// chunk rather than the whole file.
 class WriteStream extends Writable {
   constructor(path, options = {}) {
-    super(typeof options === 'object' ? options : {});
-    this.path = pathStr(path);
+    const settings = typeof options === 'object' && options !== null ? options : {};
+    super(settings);
+    this.path = path === null || path === undefined ? null : pathStr(path);
     this.bytesWritten = 0;
-    this._chunks = [];
-    const flags = (options && options.flags) || 'w';
-    this._append = flags.includes('a');
-    setTimeout(() => { this.emit('open', 0); this.emit('ready'); });
+    this.fd = typeof settings.fd === 'number' ? settings.fd : null;
+    this.flags = settings.flags ?? 'w';
+    this.mode = settings.mode ?? 0o666;
+    this.start = settings.start;
+    this.autoClose = settings.autoClose !== false;
+    this._encoding = settings.encoding ?? 'utf8';
+    this._position = this.start ?? null;
+    this._queued = [];
+    if (this.fd === null) {
+      process.nextTick(() => {
+        try {
+          this.fd = openSync(this.path, this.flags, this.mode);
+          this.emit('open', this.fd);
+          this.emit('ready');
+          const queued = this._queued;
+          this._queued = [];
+          for (const pending of queued) pending();
+        } catch (err) {
+          this.destroy(err);
+        }
+      });
+    } else {
+      process.nextTick(() => { this.emit('open', this.fd); this.emit('ready'); });
+    }
   }
+
   _write(chunk, encoding, cb) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding || 'utf8');
-    this._chunks.push(buf);
-    this.bytesWritten += buf.length;
-    cb();
+    const buffer = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(String(chunk), encoding === 'buffer' ? this._encoding : (encoding || this._encoding));
+    const run = () => {
+      try {
+        const written = writeSync(this.fd, buffer, 0, buffer.length, this._position);
+        if (this._position !== null) this._position += written;
+        this.bytesWritten += written;
+        cb();
+      } catch (err) {
+        cb(err);
+      }
+    };
+    if (this.fd === null) {
+      this._queued.push(run);
+      return;
+    }
+    run();
   }
-  _final(cb) {
-    try {
-      const all = Buffer.concat(this._chunks);
-      if (this._append) appendFileSync(this.path, all);
-      else writeFileSync(this.path, all);
-      // 'close' comes from the stream machinery's autoDestroy after finish;
-      // emitting it here doubled the event.
-      cb();
-    } catch (err) { cb(err); }
+
+  _destroy(error, callback) {
+    const fd = this.fd;
+    this.fd = null;
+    if (fd !== null && this.autoClose) {
+      try { closeSync(fd); } catch { /* the descriptor is already gone */ }
+    }
+    callback(error);
   }
-  close(cb) { if (cb) this.once('close', cb); this.end(); }
+
+  close(cb) {
+    if (cb) this.once('close', cb);
+    this.end();
+  }
 }
 function createReadStream(path, options) { return new ReadStream(path, options); }
 function createWriteStream(path, options) { return new WriteStream(path, options); }

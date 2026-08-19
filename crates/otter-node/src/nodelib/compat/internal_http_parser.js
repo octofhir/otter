@@ -8,6 +8,12 @@
 // boundaries (bodyHead = d.slice(ret)).
 
 const { Buffer } = require('buffer');
+const { internalBinding } = require('internal/bootstrap/realm');
+const {
+  streamBaseState,
+  kReadBytesOrError,
+  kArrayBufferOffset,
+} = internalBinding('stream_wrap');
 
 const methods = [
   'DELETE', 'GET', 'HEAD', 'POST', 'PUT', 'CONNECT', 'OPTIONS', 'TRACE',
@@ -75,6 +81,8 @@ class HTTPParser {
     this[kOnMessageComplete] = null;
     this[kOnExecute] = null;
     this[kOnTimeout] = null;
+    this._consumed = null;
+    this._priorOnread = null;
     this._reset(0);
   }
 
@@ -123,8 +131,45 @@ class HTTPParser {
 
   close() {}
   free() {}
-  consume(_handle) {}
-  unconsume() {}
+
+  // A consumed stream feeds the parser directly: the handle's read
+  // callback becomes the parser's, so bytes never travel through the
+  // socket's JS readable. `unconsume` gives the handle back.
+  consume(handle) {
+    if (!handle || this._consumed) return;
+    this._consumed = handle;
+    this._priorOnread = handle.onread;
+    const parser = this;
+    handle.onread = function onConsumedRead(buffer) {
+      const nread = streamBaseState[kReadBytesOrError];
+      if (nread <= 0) {
+        // EOF or a read error belongs to the stream, not the parser.
+        if (typeof parser._priorOnread === 'function') {
+          return parser._priorOnread.call(this, buffer);
+        }
+        return;
+      }
+      const offset = streamBaseState[kArrayBufferOffset];
+      const chunk = Buffer.from(buffer.buffer ?? buffer, offset, nread);
+      const ret = parser.execute(chunk);
+      const onExecute = parser[kOnExecute];
+      if (typeof onExecute === 'function') {
+        onExecute.call(parser, ret, chunk);
+      }
+    };
+    if (typeof handle.readStart === 'function' && !handle.reading) {
+      handle.readStart();
+    }
+  }
+
+  unconsume() {
+    const handle = this._consumed;
+    if (!handle) return;
+    this._consumed = null;
+    handle.onread = this._priorOnread ?? null;
+    this._priorOnread = null;
+  }
+
   remove() {
     if (this._connections) {
       this._connections._parsers.delete(this);

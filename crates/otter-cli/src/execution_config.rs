@@ -38,6 +38,7 @@ pub(crate) struct CliExecutionConfig {
     warning_options: WarningOptions,
     process_title: Option<String>,
     expose_gc: bool,
+    expose_internals: bool,
 }
 
 impl Default for CliExecutionConfig {
@@ -52,6 +53,7 @@ impl Default for CliExecutionConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
         }
     }
 }
@@ -80,6 +82,7 @@ impl CliExecutionConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
         }
     }
 
@@ -99,6 +102,13 @@ impl CliExecutionConfig {
         self.expose_gc = expose;
     }
 
+    /// Record `--expose-internals`. The engine's `internal/*` modules are
+    /// always requirable; the flag is what a flag-checking harness reads
+    /// back out of `process.execArgv`.
+    pub(crate) fn set_expose_internals(&mut self, expose: bool) {
+        self.expose_internals = expose;
+    }
+
     /// The node-style engine flags this process is running with, in the
     /// spelling `process.execArgv` reports so a flag-checking harness or a
     /// `spawn(process.execPath, [...process.execArgv, ...])` re-exec
@@ -108,6 +118,9 @@ impl CliExecutionConfig {
         let mut argv = Vec::new();
         if self.expose_gc {
             argv.push("--expose-gc".to_string());
+        }
+        if self.expose_internals {
+            argv.push("--expose-internals".to_string());
         }
         if w.no_warnings {
             argv.push("--no-warnings".to_string());
@@ -390,6 +403,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
         };
         let disabled = CliExecutionConfig {
             timeout: Some(Duration::ZERO),
@@ -411,6 +425,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
         };
         target.clear();
         assert_eq!(config.trace_target.as_deref(), Some("trace.log"));
@@ -436,6 +451,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
         };
         target.clear();
         assert!(config.jit_events_enabled());
@@ -452,6 +468,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
         };
         assert!(artifacts.jit_artifacts_enabled());
         assert!(!artifacts.jit_events_enabled());

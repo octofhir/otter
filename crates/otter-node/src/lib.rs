@@ -238,6 +238,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/util/parse_args/parse_args", nodelib::parse_args),
     HostedModule::cjs_only("internal/util/parse_args/utils", nodelib::parse_args_utils),
     HostedModule::cjs_only("internal/mime", nodelib::internal_mime),
+    HostedModule::cjs_only(
+        "internal/deps/minimatch/index",
+        nodelib::internal_deps_minimatch,
+    ),
     HostedModule::cjs_only("internal/util/diff", nodelib::internal_util_diff),
     HostedModule::cjs_only("internal/assert/myers_diff", nodelib::internal_myers_diff),
     HostedModule::cjs_only("internal/util/trace_sigint", nodelib::internal_trace_sigint),

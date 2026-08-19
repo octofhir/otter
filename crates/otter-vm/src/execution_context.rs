@@ -588,6 +588,37 @@ impl ExecutionContext {
         }
     }
 
+    /// Resolve a RegExp literal constant in the chunk that owns
+    /// `function_id`.
+    ///
+    /// A frame can run under an ambient caller context rather than its own:
+    /// a builtin re-entering a callback keeps the caller's context for every
+    /// frame it drives, and JIT runtime helpers do the same. Constant indices
+    /// are local to the owning chunk, so a literal in a sibling chunk (a
+    /// vendored module, an eval chunk) must be read from that chunk's pool.
+    #[must_use]
+    pub(crate) fn regexp_constant_for_function(
+        &self,
+        function_id: u32,
+        idx: u32,
+    ) -> Option<(&[u16], &str)> {
+        if self.local_function_index(function_id).is_some() {
+            return self.regexp_constant(idx);
+        }
+        match self
+            .sibling_tables(function_id)?
+            .module
+            .constants
+            .get(idx as usize)
+        {
+            Some(Constant::RegExp {
+                pattern_utf16,
+                flags,
+            }) => Some((pattern_utf16.as_slice(), flags.as_str())),
+            _ => None,
+        }
+    }
+
     /// Resolve a module import edge from the bytecode resolution table.
     /// The key is the whole request — referrer, specifier, and the `type`
     /// import attribute — because one module may import one specifier under

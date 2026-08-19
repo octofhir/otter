@@ -48,6 +48,7 @@ use crate::{
 mod define;
 mod descriptors;
 mod get;
+pub(crate) use get::byte_view_expando;
 mod keys;
 mod set_delete;
 

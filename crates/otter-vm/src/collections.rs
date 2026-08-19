@@ -1307,6 +1307,24 @@ fn with_weak_map_table<R>(
     })
 }
 
+/// Look a key up without borrowing the heap mutably.
+///
+/// The table borrow is already shared; a reader — a prototype or
+/// own-property lookup on the key's behalf — has no reason to demand
+/// exclusive access to the heap.
+pub(crate) fn weak_map_get_shared(
+    map: JsWeakMap,
+    heap: &otter_gc::GcHeap,
+    key: &Value,
+) -> Option<Value> {
+    let key = weak_collection_key(key, heap).ok()?;
+    with_weak_map_table(heap, map, None, |table| {
+        table
+            .position(&key)
+            .map(|position| table.entries()[position].value)
+    })
+}
+
 /// `WeakMap.prototype.get` — Spec §24.3.3.3.
 pub fn weak_map_get(
     map: JsWeakMap,

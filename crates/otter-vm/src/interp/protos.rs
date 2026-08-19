@@ -41,13 +41,51 @@ impl Interpreter {
         value: &Value,
         heap: &otter_gc::GcHeap,
     ) -> Option<usize> {
-        if let Some(intl) = value.as_intl(heap) {
-            return Some(intl.identity_addr() as usize);
-        }
-        if let Some(iter) = value.as_iterator() {
-            return Some(iter.as_header_ptr() as usize);
-        }
-        None
+        // `Intl` payloads are `Rc`-backed, so their identity address is
+        // stable. Iterators are ordinary GC bodies and move, which is why
+        // their side state lives in the weak tables below instead.
+        value.as_intl(heap).map(|intl| intl.identity_addr() as usize)
+    }
+
+    /// Side state for iterator exotics lives in weak tables keyed by the
+    /// iterator itself: the entry follows the body across a collection,
+    /// and it disappears with it rather than being inherited by whatever
+    /// later occupies the address.
+    fn iterator_side_key(value: &Value) -> Option<Value> {
+        value.as_iterator().map(|_| *value)
+    }
+
+    fn iterator_side_lookup(
+        &self,
+        table: Option<crate::collections::JsWeakMap>,
+        key: &Value,
+    ) -> Option<Value> {
+        crate::collections::weak_map_get_shared(table?, &self.gc_heap, key)
+    }
+
+    fn iterator_side_store(
+        &mut self,
+        table: &mut Option<crate::collections::JsWeakMap>,
+        key: Value,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let map = match *table {
+            Some(map) => map,
+            None => {
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    key.trace_value_slots(visitor);
+                    value.trace_value_slots(visitor);
+                };
+                let map = crate::collections::alloc_weak_map_with_roots(
+                    &mut self.gc_heap,
+                    &mut external_visit,
+                )?;
+                *table = Some(map);
+                map
+            }
+        };
+        let _ = crate::collections::weak_map_set(map, &mut self.gc_heap, key, value);
+        Ok(())
     }
 
     /// Store the allocation-time `[[Prototype]]` selected by
@@ -80,6 +118,15 @@ impl Interpreter {
             }
             return;
         }
+        if let Some(key) = Self::iterator_side_key(value) {
+            if let Some(proto) = proto {
+                let mut table = self.iterator_prototype_overrides.take();
+                let stored = self.iterator_side_store(&mut table, key, proto);
+                self.iterator_prototype_overrides = table;
+                let _ = stored;
+            }
+            return;
+        }
         let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
             return;
         };
@@ -103,11 +150,21 @@ impl Interpreter {
         if let Some(array) = value.as_typed_array(&self.gc_heap) {
             return array.custom_proto(&self.gc_heap);
         }
+        if let Some(key) = Self::iterator_side_key(value) {
+            let table = self.iterator_prototype_overrides;
+            return self.iterator_side_lookup(table, &key);
+        }
         let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
         self.non_gc_exotic_prototype_overrides.get(&key).cloned()
     }
 
     pub(crate) fn non_gc_exotic_user_props(&self, value: &Value) -> Option<JsObject> {
+        if let Some(key) = Self::iterator_side_key(value) {
+            let table = self.iterator_user_props;
+            return self
+                .iterator_side_lookup(table, &key)
+                .and_then(|value| value.as_object());
+        }
         let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
         self.non_gc_exotic_user_props.get(&key).copied()
     }
@@ -116,6 +173,22 @@ impl Interpreter {
         &mut self,
         value: &Value,
     ) -> Result<Option<JsObject>, VmError> {
+        if let Some(key) = Self::iterator_side_key(value) {
+            if let Some(existing) = self.non_gc_exotic_user_props(value) {
+                return Ok(Some(existing));
+            }
+            let receiver = key;
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                receiver.trace_value_slots(visitor);
+            };
+            let bag =
+                crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+            let mut table = self.iterator_user_props.take();
+            let stored = self.iterator_side_store(&mut table, key, Value::object(bag));
+            self.iterator_user_props = table;
+            stored?;
+            return Ok(Some(bag));
+        }
         let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
             return Ok(None);
         };

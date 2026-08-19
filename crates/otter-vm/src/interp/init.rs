@@ -299,6 +299,8 @@ impl Interpreter {
             function_deleted_metadata: std::collections::HashSet::new(),
             non_gc_exotic_prototype_overrides: std::collections::HashMap::new(),
             non_gc_exotic_user_props: std::collections::HashMap::new(),
+            iterator_prototype_overrides: None,
+            iterator_user_props: None,
             persistent_roots: persistent_roots::PersistentRoots::new(),
             console_sink: console::default_console_sink(),
             timer_scheduler: None,

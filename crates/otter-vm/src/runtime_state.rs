@@ -188,6 +188,7 @@ impl<'a> RuntimeState<'a> {
         for obj in interp.non_gc_exotic_user_props_for_trace() {
             obj.trace_gc_roots(visitor);
         }
+        interp.trace_iterator_side_tables(visitor);
         // 7) GC-managed hidden-class root/key/transition side tables.
         if include_shape_runtime {
             interp.shape_runtime_for_trace().trace_roots(visitor);

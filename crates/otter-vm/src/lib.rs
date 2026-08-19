@@ -1381,6 +1381,13 @@ pub struct Interpreter {
     /// ordinary objects for user-visible own properties even though
     /// their internal slots live in compact non-object payloads.
     non_gc_exotic_user_props: std::collections::HashMap<usize, JsObject>,
+    /// Subclass `[[Prototype]]` stamped on an iterator at construction,
+    /// keyed weakly by the iterator: an iterator body moves, so its
+    /// address is not an identity, and an entry that outlived its
+    /// iterator would be inherited by whatever reused the address.
+    iterator_prototype_overrides: Option<crate::collections::JsWeakMap>,
+    /// Own properties written onto an iterator, held the same way.
+    iterator_user_props: Option<crate::collections::JsWeakMap>,
     /// Generic persistent roots owned by host resources. Host data stores root
     /// ids from this table rather than raw JS values.
     persistent_roots: persistent_roots::PersistentRoots,

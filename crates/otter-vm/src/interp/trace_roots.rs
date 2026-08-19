@@ -171,7 +171,21 @@ impl Interpreter {
         self.non_gc_exotic_prototype_overrides.values()
     }
 
-    /// Iterator over non-GC exotic own-property bags.
+    /// The weak side tables holding iterator prototype overrides and own
+    /// properties. The tables themselves are roots; their entries stay
+    /// weak through the ephemeron registry.
+    pub fn trace_iterator_side_tables(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        for table in [&self.iterator_prototype_overrides, &self.iterator_user_props] {
+            if let Some(map) = table.as_ref() {
+                // Hand over the field's own storage: the scavenger rewrites
+                // the handle in place when the table moves.
+                let slot = std::ptr::from_ref(map) as *mut otter_gc::raw::RawGc;
+                visitor(slot);
+            }
+        }
+    }
+
+    /// Own-property bags for non-GC exotic payloads.
     pub fn non_gc_exotic_user_props_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         self.non_gc_exotic_user_props.values()
     }

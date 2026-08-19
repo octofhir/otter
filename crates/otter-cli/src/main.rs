@@ -163,12 +163,12 @@ struct Cli {
 
     /// Install a global `gc()` forcing a full collection
     /// (Node's `--expose-gc`).
-    #[arg(long = "expose-gc", global = true)]
+    #[arg(long = "expose-gc", alias = "expose_gc", global = true)]
     expose_gc: bool,
 
     /// Let a script require the engine's `internal/*` modules
     /// (Node's `--expose-internals`).
-    #[arg(long = "expose-internals", global = true)]
+    #[arg(long = "expose-internals", alias = "expose_internals", global = true)]
     expose_internals: bool,
 
     /// Capability flags (Deno-style).
@@ -602,6 +602,10 @@ async fn main() -> ExitCode {
     execution.set_process_title(cli.title.clone());
     execution.set_expose_gc(cli.expose_gc);
     execution.set_expose_internals(cli.expose_internals);
+    // A node-style switch is accepted in both spellings; `process.execArgv`
+    // reports the one the caller actually wrote, which is what a
+    // flag-checking harness compares against.
+    execution.set_flag_spellings(std::env::args().collect());
     let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();

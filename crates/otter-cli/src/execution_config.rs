@@ -39,6 +39,7 @@ pub(crate) struct CliExecutionConfig {
     process_title: Option<String>,
     expose_gc: bool,
     expose_internals: bool,
+    flag_spellings: Vec<String>,
 }
 
 impl Default for CliExecutionConfig {
@@ -54,6 +55,7 @@ impl Default for CliExecutionConfig {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            flag_spellings: Vec::new(),
         }
     }
 }
@@ -83,6 +85,7 @@ impl CliExecutionConfig {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            flag_spellings: Vec::new(),
         }
     }
 
@@ -109,6 +112,21 @@ impl CliExecutionConfig {
         self.expose_internals = expose;
     }
 
+    /// The process's own argv, so `execArgv` can echo a switch back in the
+    /// spelling it arrived in rather than the canonical one.
+    pub(crate) fn set_flag_spellings(&mut self, argv: Vec<String>) {
+        self.flag_spellings = argv;
+    }
+
+    /// `canonical` unless the caller wrote a recognized alias of it.
+    fn spelled(&self, canonical: &str) -> String {
+        let alias = format!("--{}", canonical.trim_start_matches('-').replace('-', "_"));
+        if self.flag_spellings.iter().any(|arg| arg == &alias) {
+            return alias;
+        }
+        canonical.to_string()
+    }
+
     /// The node-style engine flags this process is running with, in the
     /// spelling `process.execArgv` reports so a flag-checking harness or a
     /// `spawn(process.execPath, [...process.execArgv, ...])` re-exec
@@ -117,10 +135,10 @@ impl CliExecutionConfig {
         let w = &self.warning_options;
         let mut argv = Vec::new();
         if self.expose_gc {
-            argv.push("--expose-gc".to_string());
+            argv.push(self.spelled("--expose-gc"));
         }
         if self.expose_internals {
-            argv.push("--expose-internals".to_string());
+            argv.push(self.spelled("--expose-internals"));
         }
         if w.no_warnings {
             argv.push("--no-warnings".to_string());
@@ -404,6 +422,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            flag_spellings: Vec::new(),
         };
         let disabled = CliExecutionConfig {
             timeout: Some(Duration::ZERO),
@@ -426,6 +445,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            flag_spellings: Vec::new(),
         };
         target.clear();
         assert_eq!(config.trace_target.as_deref(), Some("trace.log"));
@@ -452,6 +472,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            flag_spellings: Vec::new(),
         };
         target.clear();
         assert!(config.jit_events_enabled());
@@ -469,6 +490,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            flag_spellings: Vec::new(),
         };
         assert!(artifacts.jit_artifacts_enabled());
         assert!(!artifacts.jit_events_enabled());

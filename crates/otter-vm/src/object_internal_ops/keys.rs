@@ -297,6 +297,25 @@ impl Interpreter {
         symbols: &mut [Value],
         name: &str,
     ) -> Result<(), VmError> {
+        self.push_own_key_strings(keys, target, symbols, std::iter::once(name))
+    }
+
+    /// Append several own string keys at once.
+    ///
+    /// The accumulated set is parked before the first allocation and read
+    /// back after the last, so a collection during any of them rewrites it
+    /// in place. Doing that per key instead is what made enumerating a
+    /// large object quadratic.
+    ///
+    /// # Errors
+    /// Returns the failure behind allocating a key string.
+    pub(crate) fn push_own_key_strings<'a>(
+        &mut self,
+        keys: &mut Vec<Value>,
+        target: &mut Value,
+        symbols: &mut [Value],
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), VmError> {
         self.with_handle_scope(|interp, scope| {
             let key_handles: Vec<Local> = keys
                 .iter()
@@ -307,9 +326,13 @@ impl Interpreter {
                 .iter()
                 .map(|s| interp.scoped_value(scope, *s))
                 .collect();
-            let new_key = interp.scoped_string(scope, name)?;
-            // The string allocation above is the only collection point; read the
-            // (now collector-updated) arena slots back into the caller's locals.
+            let mut fresh: Vec<Local> = Vec::new();
+            for name in names {
+                fresh.push(interp.scoped_string(scope, name)?);
+            }
+            // Every allocation above is a collection point; read the
+            // (now collector-updated) arena slots back into the caller's
+            // locals.
             for (slot, handle) in keys.iter_mut().zip(&key_handles) {
                 *slot = interp.escape_scoped(*handle);
             }
@@ -317,7 +340,10 @@ impl Interpreter {
             for (slot, handle) in symbols.iter_mut().zip(&symbol_handles) {
                 *slot = interp.escape_scoped(*handle);
             }
-            keys.push(interp.escape_scoped(new_key));
+            keys.reserve(fresh.len());
+            for handle in fresh {
+                keys.push(interp.escape_scoped(handle));
+            }
             Ok(())
         })
     }
@@ -351,9 +377,13 @@ impl Interpreter {
             && object::module_namespace_env(obj, &self.gc_heap).is_some()
         {
             let mut keys: Vec<Value> = Vec::new();
-            for name in self.module_namespace_export_names(obj) {
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &name)?;
-            }
+            let names = self.module_namespace_export_names(obj);
+            self.push_own_key_strings(
+                &mut keys,
+                &mut target,
+                &mut [],
+                names.iter().map(String::as_str),
+            )?;
             // Re-read the receiver: the key allocations above may have moved
             // it; `target` is rewritten in place by the rooted visitor.
             let obj = target.as_object().ok_or(VmError::InvalidOperand)?;
@@ -391,9 +421,13 @@ impl Interpreter {
             if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
                 let len = t.length(&self.gc_heap);
                 keys.reserve(len);
-                for idx in 0..len {
-                    self.push_own_key_string(&mut keys, &mut target, &mut [], &idx.to_string())?;
-                }
+                let names: Vec<String> = (0..len).map(|idx| idx.to_string()).collect();
+                self.push_own_key_strings(
+                    &mut keys,
+                    &mut target,
+                    &mut [],
+                    names.iter().map(String::as_str),
+                )?;
             }
             // Re-read the receiver after the index-key allocations above.
             let t = target
@@ -407,9 +441,12 @@ impl Interpreter {
                             p.symbol_keys().map(Value::symbol).collect(),
                         )
                     });
-                for name in strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &name)?;
-                }
+                self.push_own_key_strings(
+                    &mut keys,
+                    &mut target,
+                    &mut symbols,
+                    strings.iter().map(String::as_str),
+                )?;
                 keys.extend(symbols);
             }
             return Ok(keys);
@@ -450,18 +487,24 @@ impl Interpreter {
                         None => non_index_strings.push(key),
                     }
                 }
-                for index in indexed {
-                    let key = index.to_string();
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
-                }
-                self.push_own_key_string(&mut keys, &mut target, &mut symbols, "length")?;
-                for key in non_index_strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
-                }
+                let indexed: Vec<String> = indexed.into_iter().map(|i| i.to_string()).collect();
+                self.push_own_key_strings(
+                    &mut keys,
+                    &mut target,
+                    &mut symbols,
+                    indexed
+                        .iter()
+                        .map(String::as_str)
+                        .chain(std::iter::once("length"))
+                        .chain(non_index_strings.iter().map(String::as_str)),
+                )?;
             } else {
-                for key in ordinary_strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
-                }
+                self.push_own_key_strings(
+                    &mut keys,
+                    &mut target,
+                    &mut symbols,
+                    ordinary_strings.iter().map(String::as_str),
+                )?;
             }
             keys.extend(symbols);
             return Ok(keys);
@@ -469,15 +512,18 @@ impl Interpreter {
         if let Some(arr) = target.as_array() {
             let (indices, string_keys) = array::own_index_and_string_keys(arr, &self.gc_heap);
             let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + string_keys.len() + 2);
-            for idx in indices {
-                let key = idx.to_string();
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &key)?;
-            }
+            let indices: Vec<String> = indices.into_iter().map(|idx| idx.to_string()).collect();
             // §10.4.2 Array exotic objects always expose `length`.
-            self.push_own_key_string(&mut keys, &mut target, &mut [], "length")?;
-            for key in string_keys {
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &key)?;
-            }
+            self.push_own_key_strings(
+                &mut keys,
+                &mut target,
+                &mut [],
+                indices
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once("length"))
+                    .chain(string_keys.iter().map(String::as_str)),
+            )?;
             // §10.4.2 — own symbol-keyed properties follow the
             // string keys per §7.3.22 OrdinaryOwnPropertyKeys
             // ordering. Re-read the receiver after the key
@@ -497,33 +543,45 @@ impl Interpreter {
             let owner = target.as_closure(&self.gc_heap);
             let names = self.ordinary_function_own_property_keys(context, owner, function_id);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-            for n in names {
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &n)?;
-            }
+            self.push_own_key_strings(
+                &mut keys,
+                &mut target,
+                &mut [],
+                names.iter().map(String::as_str),
+            )?;
             return Ok(keys);
         }
         if let Some(native) = target.as_native_function() {
             let names = native.own_property_keys(&self.gc_heap);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-            for n in names {
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &n)?;
-            }
+            self.push_own_key_strings(
+                &mut keys,
+                &mut target,
+                &mut [],
+                names.iter().map(String::as_str),
+            )?;
             return Ok(keys);
         }
         if let Some(bound) = target.as_bound_function() {
             let names = function_metadata::bound_own_property_keys(&bound, &self.gc_heap);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-            for n in names {
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &n)?;
-            }
+            self.push_own_key_strings(
+                &mut keys,
+                &mut target,
+                &mut [],
+                names.iter().map(String::as_str),
+            )?;
             return Ok(keys);
         }
         if let Some(class) = target.as_class_constructor() {
             let names = self.class_constructor_own_property_keys(Some(context), class)?;
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-            for n in names {
-                self.push_own_key_string(&mut keys, &mut target, &mut [], &n)?;
-            }
+            self.push_own_key_strings(
+                &mut keys,
+                &mut target,
+                &mut [],
+                names.iter().map(String::as_str),
+            )?;
             // §10.1.11 — symbol keys follow the string keys. A class
             // constructor's own symbol-keyed properties (e.g. a static
             // `[sym]() {}` method) live on its statics object. Re-read

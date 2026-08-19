@@ -693,16 +693,36 @@ impl Interpreter {
     /// are handed straight to the caller's single array allocation — which
     /// traces the pending element vector itself — with no intervening
     /// allocation, so the post-scope reads are current.
-    pub(crate) fn scoped_key_strings(&mut self, keys: &[String]) -> Result<Vec<Value>, VmError> {
+    pub(crate) fn scoped_key_strings(&mut self, keys: &[String]) -> Result<Value, VmError> {
+        // The answer array is built first and each name is written straight
+        // into it. Parking the whole set of names as handles instead makes
+        // the work quadratic: every allocation drives collections that
+        // re-trace the arena, which by then holds one live handle per name.
+        let array = self.alloc_runtime_rooted_array_from_values(
+            std::iter::repeat_n(Value::undefined(), keys.len()),
+            &[],
+            &[],
+        )?;
         self.with_handle_scope(|interp, scope| {
-            let mut handles = Vec::with_capacity(keys.len());
-            for key in keys {
-                handles.push(interp.scoped_string(scope, key)?);
+            let parked = interp.scoped_value(scope, Value::array(array));
+            for (index, key) in keys.iter().enumerate() {
+                let string = JsString::from_str(key, &mut interp.gc_heap)?;
+                // The allocation above may have moved the array; the parked
+                // handle reads back the live one. The slot already exists,
+                // so the write cannot allocate and the fresh string needs no
+                // root of its own.
+                let array = interp
+                    .escape_scoped(parked)
+                    .as_array()
+                    .ok_or(VmError::InvalidOperand)?;
+                crate::array::define_index_value(
+                    array,
+                    &mut interp.gc_heap,
+                    index,
+                    Value::string(string),
+                )?;
             }
-            Ok(handles
-                .into_iter()
-                .map(|handle| interp.escape_scoped(handle))
-                .collect())
+            Ok(interp.escape_scoped(parked))
         })
     }
 
@@ -1340,7 +1360,6 @@ impl Interpreter {
             })
             .expect("minor GC");
     }
-
 }
 
 #[cfg(test)]

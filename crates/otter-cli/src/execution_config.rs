@@ -40,6 +40,7 @@ pub(crate) struct CliExecutionConfig {
     expose_gc: bool,
     expose_internals: bool,
     flag_spellings: Vec<String>,
+    node_options: Vec<String>,
 }
 
 impl Default for CliExecutionConfig {
@@ -56,6 +57,7 @@ impl Default for CliExecutionConfig {
             expose_gc: false,
             expose_internals: false,
             flag_spellings: Vec::new(),
+            node_options: Vec::new(),
         }
     }
 }
@@ -86,6 +88,7 @@ impl CliExecutionConfig {
             expose_gc: false,
             expose_internals: false,
             flag_spellings: Vec::new(),
+            node_options: Vec::new(),
         }
     }
 
@@ -118,6 +121,12 @@ impl CliExecutionConfig {
         self.flag_spellings = argv;
     }
 
+    /// Node-style option switches carried into `process.execArgv`, which is
+    /// where `internal/options` reads them.
+    pub(crate) fn set_node_options(&mut self, switches: Vec<String>) {
+        self.node_options = switches;
+    }
+
     /// `canonical` unless the caller wrote a recognized alias of it.
     fn spelled(&self, canonical: &str) -> String {
         let alias = format!("--{}", canonical.trim_start_matches('-').replace('-', "_"));
@@ -140,6 +149,7 @@ impl CliExecutionConfig {
         if self.expose_internals {
             argv.push(self.spelled("--expose-internals"));
         }
+        argv.extend(self.node_options.iter().cloned());
         if w.no_warnings {
             argv.push("--no-warnings".to_string());
         }
@@ -423,6 +433,7 @@ mod tests {
             expose_gc: false,
             expose_internals: false,
             flag_spellings: Vec::new(),
+            node_options: Vec::new(),
         };
         let disabled = CliExecutionConfig {
             timeout: Some(Duration::ZERO),
@@ -446,6 +457,7 @@ mod tests {
             expose_gc: false,
             expose_internals: false,
             flag_spellings: Vec::new(),
+            node_options: Vec::new(),
         };
         target.clear();
         assert_eq!(config.trace_target.as_deref(), Some("trace.log"));
@@ -473,6 +485,7 @@ mod tests {
             expose_gc: false,
             expose_internals: false,
             flag_spellings: Vec::new(),
+            node_options: Vec::new(),
         };
         target.clear();
         assert!(config.jit_events_enabled());
@@ -491,6 +504,7 @@ mod tests {
             expose_gc: false,
             expose_internals: false,
             flag_spellings: Vec::new(),
+            node_options: Vec::new(),
         };
         assert!(artifacts.jit_artifacts_enabled());
         assert!(!artifacts.jit_events_enabled());

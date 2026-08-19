@@ -783,6 +783,10 @@ enum RuntimeCommand {
     Eval {
         id: CommandId,
         source: SourceInput,
+        /// Directory whose CommonJS scope the snippet runs in, if any: the
+        /// `-e`/`-p` snippet sees `require`, `module` and the builtin
+        /// modules the way a Node one does.
+        commonjs_scope: Option<std::path::PathBuf>,
         reply: RunReply,
     },
 }
@@ -1106,9 +1110,24 @@ impl RuntimeHandle {
 
     /// Evaluate a source bundle and retain partial JIT diagnostics on failure.
     pub async fn eval_with_diagnostics(&self, source: SourceInput) -> ExecutionAttempt {
+        self.eval_in_commonjs_scope(source, None).await
+    }
+
+    /// Evaluate a snippet with the CommonJS scope of `commonjs_scope`
+    /// installed first, which is what makes `-e`/`-p` a Node snippet.
+    pub async fn eval_in_commonjs_scope(
+        &self,
+        source: SourceInput,
+        commonjs_scope: Option<std::path::PathBuf>,
+    ) -> ExecutionAttempt {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        if let Err(error) = self.submit(RuntimeCommand::Eval { id, source, reply }) {
+        if let Err(error) = self.submit(RuntimeCommand::Eval {
+            id,
+            source,
+            commonjs_scope,
+            reply,
+        }) {
             return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
@@ -2436,8 +2455,19 @@ impl IsolateRunner {
                 let attempt = self.runtime.finish_jit_debug_attempt(result);
                 send_run_reply(reply, attempt, &self.counters);
             }
-            RuntimeCommand::Eval { source, reply, .. } => {
-                let result = self.runtime.eval(source);
+            RuntimeCommand::Eval {
+                source,
+                commonjs_scope,
+                reply,
+                ..
+            } => {
+                let result = match commonjs_scope {
+                    Some(cwd) => self
+                        .runtime
+                        .install_commonjs_eval_scope(&cwd)
+                        .and_then(|()| self.runtime.eval(source)),
+                    None => self.runtime.eval(source),
+                };
                 let result = self.drive_event_loop_to_idle(result);
                 let (result, exit_override) = self.finalize_process_exit(result);
                 let attempt = self

@@ -434,12 +434,16 @@ fn supported_test_flags(file_path: &Path) -> Vec<String> {
     const SUPPORTED_PREFIXES: &[&str] = &[
         "--title=",
         "--disable-warning=",
+        "--max-http-header-size=",
+        "--network-family-autoselection-attempt-timeout=",
     ];
     const SUPPORTED_EXACT: &[&str] = &[
         "--expose-gc",
         "--expose_gc",
         "--expose-internals",
         "--expose_internals",
+        "--network-family-autoselection",
+        "--no-network-family-autoselection",
         "--no-warnings",
         "--no-deprecation",
         "--throw-deprecation",

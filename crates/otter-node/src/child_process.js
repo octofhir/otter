@@ -455,8 +455,9 @@ function exec(command, options, cb) {
 // A forked child runs this same binary and joins a channel opened for it, so
 // `child.send` here and `process.send` there are the two ends of one channel.
 function fork(modulePath, args, options) {
+  // `args` is optional: `fork(path, options)` puts the settings second.
   const a = Array.isArray(args) ? args : [];
-  const given = options || {};
+  const given = (Array.isArray(args) ? options : args) || options || {};
   // A forked child shares this process's output unless the caller asked for it
   // on a stream of its own, which is what `silent` means. Either way it gets a
   // channel, which is what makes it a fork rather than a spawn.

@@ -140,6 +140,9 @@ impl CliExecutionConfig {
             .warning_options(self.warning_options.clone())
             .process_title(self.process_title.clone())
             .process_exec_argv(self.exec_argv())
+            // Node lets the main thread park in `Atomics.wait`; the CLI owns a
+            // watchdog and an interrupt handle, so the park is cancellable.
+            .allow_blocking_atomics_wait(true)
             .expose_gc(self.expose_gc);
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
@@ -162,6 +165,9 @@ impl CliExecutionConfig {
         let mut builder = builder
             .jit_selection(self.jit_selection)
             .jit_debug(self.jit_debug_request())
+            // Node lets the main thread park in `Atomics.wait`; the CLI owns a
+            // watchdog and an interrupt handle, so the park is cancellable.
+            .allow_blocking_atomics_wait(true)
             .warning_options(self.warning_options.clone());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);

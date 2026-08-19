@@ -880,7 +880,10 @@ fn listen_unix(
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let path = string_arg(ctx, args, 0).unwrap_or_default();
     if path.is_empty() {
-        return Err(runtime_type_error("net.listen", "missing socket path".to_string()));
+        return Err(runtime_type_error(
+            "net.listen",
+            "missing socket path".to_string(),
+        ));
     }
     if !capabilities.net.matches(&path) {
         return Err(runtime_type_error(
@@ -896,7 +899,8 @@ fn listen_unix(
     // Binding registers with the reactor and needs the runtime in scope.
     let listener = {
         let _guard = io.enter();
-        tokio::net::UnixListener::bind(&path).map_err(|error| system_error(&error, "listen", &path))?
+        tokio::net::UnixListener::bind(&path)
+            .map_err(|error| system_error(&error, "listen", &path))?
     };
 
     let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -979,7 +983,10 @@ fn connect_unix(
     let path = string_arg(ctx, args, 0).unwrap_or_default();
     let token = handle_arg(args, 1);
     if path.is_empty() {
-        return Err(runtime_type_error("net.connect", "missing socket path".to_string()));
+        return Err(runtime_type_error(
+            "net.connect",
+            "missing socket path".to_string(),
+        ));
     }
     if !capabilities.net.matches(&path) {
         return Err(runtime_type_error(
@@ -1011,8 +1018,8 @@ fn connect_unix(
                     &connect_spawner,
                     NetEvent::Connected { token, connection },
                     RuntimeLiveness::Unref,
-                    )
-                    .await;
+                )
+                .await;
             }
             Err(error) => {
                 let code = io_code(&error);
@@ -1024,8 +1031,8 @@ fn connect_unix(
                         message: format!("connect {code} {path}"),
                     },
                     RuntimeLiveness::Unref,
-                    )
-                    .await;
+                )
+                .await;
             }
         }
     });
@@ -1087,8 +1094,8 @@ fn connect(
                     message: format!("getaddrinfo ENOTFOUND {host}"),
                 },
                 RuntimeLiveness::Unref,
-                )
-                .await;
+            )
+            .await;
             return;
         };
         match dial(target, local_address.as_deref(), local_port).await {
@@ -1104,8 +1111,8 @@ fn connect(
                     &connect_spawner,
                     NetEvent::Connected { token, connection },
                     RuntimeLiveness::Unref,
-                    )
-                    .await;
+                )
+                .await;
             }
             Err(error) => {
                 let code = io_code(&error);
@@ -1117,8 +1124,8 @@ fn connect(
                         message: format!("connect {code} {target}"),
                     },
                     RuntimeLiveness::Unref,
-                    )
-                    .await;
+                )
+                .await;
             }
         }
     });
@@ -1377,18 +1384,14 @@ fn try_write_bytes(table: &Table, id: u32, bytes: &[u8]) -> usize {
             socket,
             queued,
             ..
-        }) if queued.load(Ordering::SeqCst) == 0 => {
-            socket.try_write(bytes).unwrap_or_default()
-        }
+        }) if queued.load(Ordering::SeqCst) == 0 => socket.try_write(bytes).unwrap_or_default(),
         _ => 0,
     }
 }
 
 /// Decrement `counter` when the returned guard drops, so every writer-task
 /// message is accounted exactly once even on early returns.
-fn scopeguard_decrement(
-    counter: &Arc<std::sync::atomic::AtomicUsize>,
-) -> impl Drop + use<> {
+fn scopeguard_decrement(counter: &Arc<std::sync::atomic::AtomicUsize>) -> impl Drop + use<> {
     struct Guard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for Guard {
         fn drop(&mut self) {

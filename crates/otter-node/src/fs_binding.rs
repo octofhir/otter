@@ -290,7 +290,12 @@ fn io_description(code: &str) -> &'static str {
 /// are the platform's own, which is why they come from `libc` rather than
 /// being written out.
 fn open_options(flags: i32) -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut options = std::fs::OpenOptions::new();
+    // Flags the options below do not model — `O_SYMLINK`, `O_DIRECTORY`,
+    // `O_NOFOLLOW`, `O_SYNC` — still have to reach `open(2)`; `lchmod`
+    // opens the link itself and would otherwise chmod its target.
+    options.custom_flags(flags);
     match flags & libc::O_ACCMODE {
         libc::O_WRONLY => {
             options.write(true);
@@ -786,10 +791,19 @@ fn mkdir_path(
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let path = path_of(ctx, args, 0)?;
     allow_write(&path, capabilities, "mkdir")?;
+    // Only the permission bits of the requested mode reach the directory;
+    // a caller may pass file-type bits above them, which `mkdir(2)` ignores.
+    let mode = args.get(1).and_then(|value| value.as_f64()).unwrap_or(0.0) as u32 & 0o7777;
     let recursive = args
         .get(2)
         .and_then(|value| value.as_boolean())
         .unwrap_or(false);
+    let builder = || {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(mode);
+        builder
+    };
     // A recursive mkdir answers with the first directory it created, which
     // is what `fs.mkdirSync(path, { recursive: true })` returns.
     let first_created = if recursive {
@@ -802,10 +816,15 @@ fn mkdir_path(
                 _ => break,
             }
         }
-        std::fs::create_dir_all(&path).map_err(|error| io_failure(&error, "mkdir", &path))?;
+        builder()
+            .recursive(true)
+            .create(&path)
+            .map_err(|error| io_failure(&error, "mkdir", &path))?;
         missing
     } else {
-        std::fs::create_dir(&path).map_err(|error| io_failure(&error, "mkdir", &path))?;
+        builder()
+            .create(&path)
+            .map_err(|error| io_failure(&error, "mkdir", &path))?;
         None
     };
     match first_created {

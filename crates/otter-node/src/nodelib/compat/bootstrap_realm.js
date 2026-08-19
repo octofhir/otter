@@ -286,6 +286,8 @@ const bindings = {
     // its string flags onto the `O_*` values and reads the file type out
     // of a mode with `S_IF*`.
     fs: {
+      // `fs.constants` is handed out as-is, and Node's has no prototype.
+      __proto__: null,
       UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
       O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
       UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2,

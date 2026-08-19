@@ -465,7 +465,6 @@ fn spawn_start(
     })
 }
 
-
 /// Switch a pipe descriptor to non-blocking mode, which is what tokio's
 /// `from_std` conversions require of a handle they adopt.
 #[cfg(unix)]
@@ -529,7 +528,9 @@ fn reap(mut child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
         // The exit report itself holds the loop: the child's own Ref hold is
         // released right after, and an Unref message could otherwise still be
         // in the inbox when the loop finds nothing left to wait for.
-        exit_spawner.enqueue_ordered(exit, RuntimeLiveness::Ref).await;
+        exit_spawner
+            .enqueue_ordered(exit, RuntimeLiveness::Ref)
+            .await;
         drop(keep_alive);
     });
 }

@@ -241,7 +241,10 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(handle) = table.get_mut(&id) else {
-                return Err(runtime_type_error("zlib.reset", "unknown handle".to_string()));
+                return Err(runtime_type_error(
+                    "zlib.reset",
+                    "unknown handle".to_string(),
+                ));
             };
             if handle.initialized {
                 let stream = &raw mut *handle.stream.0;
@@ -280,7 +283,10 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(handle) = table.get_mut(&id) else {
-                return Err(runtime_type_error("zlib.params", "unknown handle".to_string()));
+                return Err(runtime_type_error(
+                    "zlib.params",
+                    "unknown handle".to_string(),
+                ));
             };
             if !handle.initialized || !is_deflate(handle.mode) {
                 return Ok(RuntimeValue::undefined());
@@ -443,7 +449,10 @@ fn init_stream(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(handle) = table.get_mut(&id) else {
-        return Err(runtime_type_error("zlib.init", "unknown handle".to_string()));
+        return Err(runtime_type_error(
+            "zlib.init",
+            "unknown handle".to_string(),
+        ));
     };
     if is_codec(handle.mode) {
         // Brotli takes its quality and window from the parameter array the
@@ -452,13 +461,20 @@ fn init_stream(
             BROTLI_ENCODE => Codec::BrotliEncode(Box::new(brotli::CompressorWriter::new(
                 Vec::new(),
                 4096,
-                if level < 0 { 11 } else { (level as u32).min(11) },
-                if window_bits <= 0 { 22 } else { (window_bits as u32).clamp(10, 24) },
+                if level < 0 {
+                    11
+                } else {
+                    (level as u32).min(11)
+                },
+                if window_bits <= 0 {
+                    22
+                } else {
+                    (window_bits as u32).clamp(10, 24)
+                },
             ))),
-            BROTLI_DECODE => Codec::BrotliDecode(Box::new(brotli::DecompressorWriter::new(
-                Vec::new(),
-                4096,
-            ))),
+            BROTLI_DECODE => {
+                Codec::BrotliDecode(Box::new(brotli::DecompressorWriter::new(Vec::new(), 4096)))
+            }
             ZSTD_COMPRESS => {
                 let mut context = zstd_safe::CCtx::create();
                 if level > 0 {
@@ -723,10 +739,12 @@ fn run_codec(
             }
         }
         Some(Codec::BrotliDecode(writer)) => {
-            writer.write_all(input).map_err(|_| {
-                "Brotli decompression failed".to_string()
-            })?;
-            writer.flush().map_err(|_| "Brotli decompression failed".to_string())?;
+            writer
+                .write_all(input)
+                .map_err(|_| "Brotli decompression failed".to_string())?;
+            writer
+                .flush()
+                .map_err(|_| "Brotli decompression failed".to_string())?;
             drained.append(writer.get_mut());
         }
         Some(Codec::ZstdCompress(context)) => {

@@ -828,6 +828,8 @@ mod tests {
         Op::GetAsyncIterator,
         Op::IteratorNext,
         Op::IteratorClose,
+        Op::AsyncIteratorReturn,
+        Op::CheckIteratorResult,
         Op::IteratorCloseStart,
         Op::IteratorCloseEnd,
         Op::ArrayPush,

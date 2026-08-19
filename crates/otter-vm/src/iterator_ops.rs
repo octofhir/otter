@@ -2187,6 +2187,63 @@ impl Interpreter {
         })
     }
 
+    /// §7.4.11 AsyncIteratorClose steps 3-5: read `iterator.return` and
+    /// call it. `None` means the iterator has no `return`, which leaves
+    /// nothing to await and nothing to check.
+    ///
+    /// The awaiting and the "result is an Object" check belong to the
+    /// caller: an async close awaits the result before inspecting it,
+    /// which a synchronous close cannot do.
+    pub(crate) fn async_iterator_return_call(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iterator: Value,
+    ) -> Result<Option<Value>, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let iterator = interp.scoped_value(scope, iterator);
+            let current = interp.escape_scoped(iterator);
+            let return_method = match interp.ordinary_get_value(
+                stack,
+                context,
+                current,
+                current,
+                &VmPropertyKey::String("return"),
+                0,
+            )? {
+                VmGetOutcome::Value(value) => interp.scoped_value(scope, value),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let getter = interp.scoped_value(scope, getter);
+                    let value = interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &interp.escape_scoped(getter),
+                        interp.escape_scoped(iterator),
+                        SmallVec::new(),
+                    )?;
+                    interp.scoped_value(scope, value)
+                }
+            };
+            let return_value = interp.escape_scoped(return_method);
+            if return_value.is_undefined() || return_value.is_null() {
+                return Ok(None);
+            }
+            if !interp.is_callable_runtime(&return_value) {
+                return Err(
+                    interp.err_type(("iterator `return` is not callable".to_string()).into())
+                );
+            }
+            let result = interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &interp.escape_scoped(return_method),
+                interp.escape_scoped(iterator),
+                SmallVec::new(),
+            )?;
+            Ok(Some(result))
+        })
+    }
+
     pub(crate) fn iterator_close_value_sync(
         &mut self,
         stack: &mut ActivationStack,

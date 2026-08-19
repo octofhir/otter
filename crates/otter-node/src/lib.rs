@@ -322,6 +322,9 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         nodelib::streams_iter_ringbuffer,
     ),
     HostedModule::cjs_only("internal/streams/iter/share", nodelib::streams_iter_share),
+    HostedModule::cjs_only("internal/streams/iter/transform", nodelib::streams_iter_transform),
+    HostedModule::cjs_only("zlib/iter", nodelib::zlib_iter),
+    HostedModule::cjs_only("node:zlib/iter", nodelib::zlib_iter),
     HostedModule::cjs_only("stream/iter", nodelib::stream_iter),
     HostedModule::cjs_only("node:stream/iter", nodelib::stream_iter),
 ];

@@ -392,6 +392,17 @@ pub enum Op {
     /// Remove a registered iterator after destructuring completes.
     /// Operands: `Register(iter)`.
     IteratorCloseEnd,
+    /// §7.4.11 AsyncIteratorClose steps 3-5: read the iterator's
+    /// `return`, and call it when it is neither `undefined` nor `null`.
+    /// Operands: `Register(result_dst), Register(called_dst),
+    /// Register(iter)`. `called_dst` is `false` when there was no
+    /// `return` to call, in which case the caller skips the await and
+    /// the result check.
+    AsyncIteratorReturn,
+    /// §7.4.11 AsyncIteratorClose step 8: the awaited result of an
+    /// iterator's `return` must be an Object. Operands:
+    /// `Register(result)`.
+    CheckIteratorResult,
     /// Append `r<value>` to the array in `r<arr>`. Operands:
     /// `Register(arr), Register(value)`. No result. Used by the
     /// spread lowering for array literals.
@@ -1366,6 +1377,8 @@ impl Op {
             Op::GetAsyncIterator => "GET_ASYNC_ITERATOR",
             Op::IteratorNext => "ITERATOR_NEXT",
             Op::IteratorClose => "ITERATOR_CLOSE",
+            Op::AsyncIteratorReturn => "ASYNC_ITERATOR_RETURN",
+            Op::CheckIteratorResult => "CHECK_ITERATOR_RESULT",
             Op::IteratorCloseStart => "ITERATOR_CLOSE_START",
             Op::IteratorCloseEnd => "ITERATOR_CLOSE_END",
             Op::ArrayPush => "ARRAY_PUSH",
@@ -1545,6 +1558,7 @@ impl Op {
             | Op::IteratorClose
             | Op::IteratorCloseStart
             | Op::IteratorCloseEnd
+            | Op::CheckIteratorResult
             | Op::CollectArguments
             | Op::FreshUpvalue
             | Op::MarkModuleEvaluated
@@ -1658,6 +1672,7 @@ impl Op {
             | Op::NewWeakRef
             | Op::NewFinalizationRegistry => 2,
             Op::IteratorNext => 3,
+            Op::AsyncIteratorReturn => 3,
             Op::NewCollection => 3,
             Op::CallSpread => 4,
             Op::NewSpread | Op::SuperConstructSpread => 3,

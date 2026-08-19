@@ -143,6 +143,8 @@ nodelib_module!(streams_iter_pull, "internal/streams/iter/pull", vendored "nodel
 nodelib_module!(streams_iter_push, "internal/streams/iter/push", vendored "nodelib/internal/streams/iter/push.js");
 nodelib_module!(streams_iter_ringbuffer, "internal/streams/iter/ringbuffer", vendored "nodelib/internal/streams/iter/ringbuffer.js");
 nodelib_module!(streams_iter_share, "internal/streams/iter/share", vendored "nodelib/internal/streams/iter/share.js");
+nodelib_module!(streams_iter_transform, "internal/streams/iter/transform", vendored "nodelib/internal/streams/iter/transform.js");
+nodelib_module!(zlib_iter, "node:zlib/iter", vendored "nodelib/zlib/iter.js");
 nodelib_module!(stream_iter, "stream/iter", vendored "nodelib/stream/iter.js");
 nodelib_module!(internal_fixed_queue, "internal/fixed_queue", vendored "nodelib/internal/fixed_queue.js");
 nodelib_module!(internal_events_symbols, "internal/events/symbols", vendored "nodelib/internal/events/symbols.js");

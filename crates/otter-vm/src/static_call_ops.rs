@@ -1280,6 +1280,18 @@ impl Interpreter {
                     || target.is_string()
                 {
                     Vec::new()
+                } else if let Some(bag) = crate::object_internal_ops::byte_view_expando(target, &self.gc_heap)
+                {
+                    // A byte view's own keys are its element indices plus its
+                    // expandos. Building the whole key list to keep the
+                    // symbols would spell out one string per element and
+                    // discard every one of them.
+                    match bag {
+                        Some(bag) => crate::object::with_properties(bag, &self.gc_heap, |p| {
+                            p.symbol_keys().map(Value::symbol).collect()
+                        }),
+                        None => Vec::new(),
+                    }
                 } else if own_property_names_uses_internal_methods(target) {
                     self.own_property_keys_value(stack, context, target)?
                         .into_iter()

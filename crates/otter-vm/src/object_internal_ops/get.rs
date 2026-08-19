@@ -1819,8 +1819,21 @@ impl Interpreter {
             }
             M::GetOwnPropertySymbols => {
                 let target_clone = *target;
-                let trap_keys = self.own_property_keys_value(stack, context, &target_clone)?;
-                let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_symbol()).collect();
+                // A byte view's own keys are its element indices plus its
+                // expandos. Building the whole key list to keep the symbols
+                // would spell out one string per element and discard every
+                // one of them, which is quadratic on a large buffer.
+                let values: Vec<Value> = if let Some(bag) = byte_view_expando(&target_clone, &self.gc_heap) {
+                    match bag {
+                        Some(bag) => crate::object::with_properties(bag, &self.gc_heap, |p| {
+                            p.symbol_keys().map(Value::symbol).collect()
+                        }),
+                        None => Vec::new(),
+                    }
+                } else {
+                    let trap_keys = self.own_property_keys_value(stack, context, &target_clone)?;
+                    trap_keys.into_iter().filter(|v| v.is_symbol()).collect()
+                };
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     values,
@@ -1832,4 +1845,16 @@ impl Interpreter {
             _ => Ok(None),
         }
     }
+}
+
+/// The expando bag of a byte view, wrapped so the caller can tell "not a
+/// byte view" from "a byte view with no expandos".
+pub(crate) fn byte_view_expando(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Option<Option<crate::object::JsObject>> {
+    if let Some(view) = value.as_typed_array(heap) {
+        return Some(view.expando(heap));
+    }
+    value.as_data_view().map(|view| view.expando(heap))
 }

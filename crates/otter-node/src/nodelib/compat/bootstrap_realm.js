@@ -282,7 +282,30 @@ const bindings = {
       dlopen: {},
       priority: {},
     },
-    fs: {},
+    // POSIX file constants, as this platform defines them. `fs.js` maps
+    // its string flags onto the `O_*` values and reads the file type out
+    // of a mode with `S_IF*`.
+    fs: {
+      UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
+      O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
+      UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2,
+      UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5,
+      UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7,
+      S_IFMT: 0o170000, S_IFREG: 0o100000, S_IFDIR: 0o040000,
+      S_IFCHR: 0o020000, S_IFBLK: 0o060000, S_IFIFO: 0o010000,
+      S_IFLNK: 0o120000, S_IFSOCK: 0o140000,
+      O_CREAT: 0x0200, O_EXCL: 0x0800, O_NOCTTY: 0x20000, O_TRUNC: 0x0400,
+      O_APPEND: 0x0008, O_DIRECTORY: 0x100000, O_NOFOLLOW: 0x0100,
+      O_SYNC: 0x0080, O_DSYNC: 0x400000, O_SYMLINK: 0x200000,
+      O_NONBLOCK: 0x0004,
+      S_IRWXU: 0o700, S_IRUSR: 0o400, S_IWUSR: 0o200, S_IXUSR: 0o100,
+      S_IRWXG: 0o070, S_IRGRP: 0o040, S_IWGRP: 0o020, S_IXGRP: 0o010,
+      S_IRWXO: 0o007, S_IROTH: 0o004, S_IWOTH: 0o002, S_IXOTH: 0o001,
+      F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1,
+      UV_FS_COPYFILE_EXCL: 1, COPYFILE_EXCL: 1,
+      UV_FS_COPYFILE_FICLONE: 2, COPYFILE_FICLONE: 2,
+      UV_FS_COPYFILE_FICLONE_FORCE: 4, COPYFILE_FICLONE_FORCE: 4,
+    },
     crypto: {},
     // zlib's own constants, plus the stream modes and the flush values
     // Node's binding exports under the same name.
@@ -540,7 +563,16 @@ const bindings = {
   get cares_wrap() {
     return require('internal/otter/cares_wrap');
   },
-  fs: {
+  get fs() {
+    return require('internal/otter/fs_binding');
+  },
+  get fs_dir() {
+    return require('internal/otter/fs_dir');
+  },
+  get fs_event_wrap() {
+    return require('internal/otter/fs_event_wrap');
+  },
+  fs_legacy: {
     // The single fs surface the vendored net stack reads: synchronous
     // fd writes for `makeSyncWrite`. Errors report through the ctx
     // object the way the native binding does.

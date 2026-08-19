@@ -32,6 +32,7 @@ pub mod diagnostics_channel;
 pub mod dns;
 pub mod events;
 pub mod fs;
+mod fs_binding;
 pub mod globals;
 pub mod internal_errors_ext;
 pub mod internal_test_binding_ext;
@@ -57,8 +58,8 @@ use otter_runtime::{HostedModule, OtterBuilder, RuntimeBuilder};
 
 /// Active Node-compatible hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[
-    HostedModule::new_with_cjs_value("node:fs", fs::install_fs_module, fs::fs_cjs_value),
-    HostedModule::new_with_cjs_value("fs", fs::install_fs_module, fs::fs_cjs_value),
+    HostedModule::cjs_only("node:fs", nodelib::node_fs),
+    HostedModule::cjs_only("fs", nodelib::node_fs),
     HostedModule::cjs_only("__fsnative", fs::fs_native_cjs_value),
     HostedModule::cjs_only("node:fs/promises", fs::fs_promises_cjs_value),
     HostedModule::cjs_only("fs/promises", fs::fs_promises_cjs_value),
@@ -152,6 +153,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/otter/net", net::net_binding_cjs_value),
     HostedModule::cjs_only("internal/otter/dgram", dgram::dgram_binding_cjs_value),
     HostedModule::cjs_only("internal/otter/zlib", zlib_stream::zlib_stream_binding_cjs_value),
+    HostedModule::cjs_only("internal/otter/fs", fs_binding::fs_binding_cjs_value),
     HostedModule::cjs_only("internal/otter/stream_wrap", nodelib::internal_stream_wrap),
     HostedModule::cjs_only(
         "internal/otter/stream_handle",
@@ -161,6 +163,27 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/otter/pipe_wrap", nodelib::internal_pipe_wrap),
     HostedModule::cjs_only("internal/otter/udp_wrap", nodelib::internal_udp_wrap),
     HostedModule::cjs_only("internal/otter/zlib_handle", nodelib::internal_zlib_handle),
+    HostedModule::cjs_only("internal/otter/fs_binding", nodelib::internal_fs_binding),
+    HostedModule::cjs_only("internal/otter/fs_dir", nodelib::internal_fs_dir),
+    HostedModule::cjs_only("internal/otter/fs_event_wrap", nodelib::internal_fs_event_wrap),
+    HostedModule::cjs_only("internal/readline/interface", nodelib::readline_interface),
+    HostedModule::cjs_only("internal/readline/callbacks", nodelib::readline_callbacks),
+    HostedModule::cjs_only("internal/readline/utils", nodelib::readline_utils),
+    HostedModule::cjs_only("internal/repl/history", nodelib::repl_history),
+    HostedModule::cjs_only("internal/streams/fast-utf8-stream", nodelib::streams_fast_utf8),
+    HostedModule::cjs_only("internal/process/permission", nodelib::internal_process_permission),
+    HostedModule::cjs_only("internal/fs/utils", nodelib::fs_utils),
+    HostedModule::cjs_only("internal/fs/streams", nodelib::fs_streams),
+    HostedModule::cjs_only("internal/fs/promises", nodelib::fs_promises),
+    HostedModule::cjs_only("internal/fs/dir", nodelib::fs_dir),
+    HostedModule::cjs_only("internal/fs/watchers", nodelib::fs_watchers),
+    HostedModule::cjs_only("internal/fs/rimraf", nodelib::fs_rimraf),
+    HostedModule::cjs_only("internal/fs/sync_write_stream", nodelib::fs_sync_write_stream),
+    HostedModule::cjs_only("internal/fs/glob", nodelib::fs_glob),
+    HostedModule::cjs_only("internal/fs/cp/cp", nodelib::fs_cp),
+    HostedModule::cjs_only("internal/fs/cp/cp-sync", nodelib::fs_cp_sync),
+    HostedModule::cjs_only("internal/fs/read/context", nodelib::fs_read_context),
+    HostedModule::cjs_only("internal/fs/recursive_watch", nodelib::fs_recursive_watch),
     HostedModule::cjs_only("internal/dgram", nodelib::internal_dgram),
     HostedModule::cjs_only("internal/otter/cares_wrap", nodelib::internal_cares_wrap),
     HostedModule::cjs_only("internal/otter/ip", nodelib::internal_otter_ip),

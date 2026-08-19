@@ -204,6 +204,85 @@ impl MethodOperands<'_> {
 }
 
 impl Interpreter {
+    /// §27.5.3 / §27.6.3 — resume a generator for `next` / `return` /
+    /// `throw`, answering with the iterator result or, for an async
+    /// generator, the promise for one.
+    ///
+    /// Both the method-call opcode and `%GeneratorPrototype%`'s own
+    /// methods land here, so `gen.next()` and `gen.next.call(gen)` drive
+    /// the same machinery.
+    ///
+    /// # Errors
+    /// Propagates whatever the generator body threw.
+    pub(crate) fn generator_resume_request(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        g: crate::generator::JsGenerator,
+        recv_value: Value,
+        kind: GeneratorResumeKind,
+    ) -> Result<Value, VmError> {
+        let is_async_gen = g.is_async(&self.gc_heap);
+        if is_async_gen {
+            // §27.6.3 — async-generator method calls always
+            // return a Promise. Queue the request; only a
+            // suspended generator resumes immediately.
+            let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_stack_rooted(self, stack, &[&recv_value], &[])?;
+            let promise = cap.promise;
+
+            if g.async_state(&self.gc_heap) == crate::generator::AsyncGeneratorState::Completed {
+                match kind {
+                    GeneratorResumeKind::Throw(reason) => {
+                        self.async_generator_settle_capability(context, &cap, Err(reason), true)?;
+                    }
+                    GeneratorResumeKind::Next(_) => {
+                        self.async_generator_settle_capability(
+                            context,
+                            &cap,
+                            Ok(Value::undefined()),
+                            true,
+                        )?;
+                    }
+                    GeneratorResumeKind::Return(value) => {
+                        self.async_generator_settle_capability(context, &cap, Ok(value), true)?;
+                    }
+                }
+            } else {
+                let state = g.async_state(&self.gc_heap);
+                // §27.6.3.2 AsyncGeneratorResumeNext — a throw
+                // completion delivered while the body is still
+                // suspended-start closes the generator without
+                // ever resuming it; the request settles as a
+                // rejection.
+                if matches!(state, crate::generator::AsyncGeneratorState::SuspendedStart)
+                    && let GeneratorResumeKind::Throw(reason) = kind
+                {
+                    g.mark_done(&mut self.gc_heap);
+                    g.set_async_state(
+                        &mut self.gc_heap,
+                        crate::generator::AsyncGeneratorState::Completed,
+                    );
+                    self.async_generator_settle_capability(context, &cap, Err(reason), true)?;
+                } else {
+                    g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
+                    if matches!(
+                        state,
+                        crate::generator::AsyncGeneratorState::SuspendedStart
+                            | crate::generator::AsyncGeneratorState::SuspendedYield
+                    ) {
+                        let resume = g
+                            .front_async_resume(&self.gc_heap)
+                            .ok_or(VmError::InvalidOperand)?;
+                        self.resume_generator(stack, context, &g, resume)?;
+                    }
+                }
+            }
+            return Ok(promise);
+        }
+        self.resume_generator(stack, context, &g, kind)
+    }
+
     /// §22.1.3 — pre-coerce the arguments of a `String.prototype`
     /// method in place: index-like operands run full `ToNumber`
     /// (`ToIntegerOrInfinity`'s first step, so Symbol / BigInt raise
@@ -561,90 +640,7 @@ impl Interpreter {
                 _ => None,
             };
             if let Some(kind) = kind {
-                let is_async_gen = g.is_async(&self.gc_heap);
-                if is_async_gen {
-                    // §27.6.3 — async-generator method calls always
-                    // return a Promise. Queue the request; only a
-                    // suspended generator resumes immediately.
-                    let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                        .capability_stack_rooted(
-                            self,
-                            stack,
-                            &[&recv_value],
-                            &[arg_values.as_slice()],
-                        )?;
-                    let promise = cap.promise;
-
-                    if g.async_state(&self.gc_heap)
-                        == crate::generator::AsyncGeneratorState::Completed
-                    {
-                        match kind {
-                            GeneratorResumeKind::Throw(reason) => {
-                                self.async_generator_settle_capability(
-                                    context,
-                                    &cap,
-                                    Err(reason),
-                                    true,
-                                )?;
-                            }
-                            GeneratorResumeKind::Next(_) => {
-                                self.async_generator_settle_capability(
-                                    context,
-                                    &cap,
-                                    Ok(Value::undefined()),
-                                    true,
-                                )?;
-                            }
-                            GeneratorResumeKind::Return(value) => {
-                                self.async_generator_settle_capability(
-                                    context,
-                                    &cap,
-                                    Ok(value),
-                                    true,
-                                )?;
-                            }
-                        }
-                    } else {
-                        let state = g.async_state(&self.gc_heap);
-                        // §27.6.3.2 AsyncGeneratorResumeNext — a throw
-                        // completion delivered while the body is still
-                        // suspended-start closes the generator without
-                        // ever resuming it; the request settles as a
-                        // rejection.
-                        if matches!(state, crate::generator::AsyncGeneratorState::SuspendedStart)
-                            && let GeneratorResumeKind::Throw(reason) = kind
-                        {
-                            g.mark_done(&mut self.gc_heap);
-                            g.set_async_state(
-                                &mut self.gc_heap,
-                                crate::generator::AsyncGeneratorState::Completed,
-                            );
-                            self.async_generator_settle_capability(
-                                context,
-                                &cap,
-                                Err(reason),
-                                true,
-                            )?;
-                        } else {
-                            g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
-                            if matches!(
-                                state,
-                                crate::generator::AsyncGeneratorState::SuspendedStart
-                                    | crate::generator::AsyncGeneratorState::SuspendedYield
-                            ) {
-                                let resume = g
-                                    .front_async_resume(&self.gc_heap)
-                                    .ok_or(VmError::InvalidOperand)?;
-                                self.resume_generator(stack, context, &g, resume)?;
-                            }
-                        }
-                    }
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, promise)?;
-                    frame.advance_pc()?;
-                    return Ok(());
-                }
-                match self.resume_generator(stack, context, &g, kind) {
+                match self.generator_resume_request(stack, context, g, recv_value, kind) {
                     Ok(result) => {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         write_register(frame, dst, result)?;
@@ -652,11 +648,11 @@ impl Interpreter {
                         return Ok(());
                     }
                     Err(err) => {
-                        // If the generator body unwound an
-                        // uncaught throw, re-raise the *original*
-                        // value on the caller's frame stack so a
-                        // surrounding `try { gen.throw(x) } catch`
-                        // observes the right payload.
+                        // If the generator body unwound an uncaught throw,
+                        // re-raise the *original* value on the caller's
+                        // frame stack so a surrounding
+                        // `try { gen.throw(x) } catch` observes the right
+                        // payload.
                         if let Some(thrown) = self.pending_generator_throw.take() {
                             self.unwind_throw(context, stack, thrown)?;
                             return Ok(());

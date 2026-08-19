@@ -256,7 +256,48 @@ impl Interpreter {
             }
         }
 
-        self.run_get_iterator_regs(stack, top_idx, dst, src)
+        // §27.1.4 — an iterable with no `@@asyncIterator` is driven through
+        // an adapter, so each step's *value* is awaited and not just the
+        // result record. Without it `for await` over an array of promises
+        // hands the body the promises themselves.
+        let iterator = self.get_sync_iterator_object(stack, context, value)?;
+        let wrapped = self.create_async_from_sync_iterator(iterator)?;
+        write_register(&mut stack[top_idx], dst, wrapped)?;
+        stack[top_idx].advance_pc()?;
+        Ok(())
+    }
+
+    /// §7.4.2 GetIterator(obj, sync) — the object `@@iterator` produced,
+    /// kept whole so the async adapter can call `next` / `return` on it.
+    fn get_sync_iterator_object(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
+        let method = match self.ordinary_get_value(
+            stack,
+            context,
+            value,
+            value,
+            &VmPropertyKey::Symbol(iterator_sym),
+            0,
+        )? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync_rooted(stack, context, &getter, value, SmallVec::new())?
+            }
+        };
+        if !is_callable(&method) {
+            return Err(VmError::TypeMismatch);
+        }
+        let produced =
+            self.run_callable_sync_rooted(stack, context, &method, value, SmallVec::new())?;
+        if !produced.is_object_type() && !produced.is_proxy() {
+            return Err(VmError::TypeMismatch);
+        }
+        Ok(produced)
     }
 
     /// §7.4.2 GetIteratorDirect — wrap the object returned by a user
@@ -2535,6 +2576,112 @@ impl Interpreter {
         };
         self.pop_iteration_anchors_to(anchor_depth - 1);
         result
+    }
+
+    /// §27.6.3.8 AsyncGeneratorYield step 5 — `Set value to ? Await(value)`.
+    ///
+    /// A yielded thenable is adopted before the request settles, so
+    /// `yield somePromise` hands the consumer what it resolves to; a plain
+    /// value still costs the one tick the await takes. A rejection is
+    /// delivered back into the body as a throw at the `yield`, which is
+    /// where the `?` in that step leads.
+    ///
+    /// # Errors
+    /// Returns the failure behind allocating the promise or its reactions.
+    pub(crate) fn async_generator_yield_awaited(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        owner: &crate::generator::JsGenerator,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let owner_value = Value::generator(*owner);
+        let inner_value = self.promise_resolve_value(stack, context, value)?;
+
+        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "AsyncGeneratorYield",
+            smallvec::smallvec![owner_value],
+            &mut |visitor| inner_value.trace_value_slots(visitor),
+            move |ctx, args, captures| {
+                let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
+                    return Ok(Value::undefined());
+                };
+                let value = args.first().copied().unwrap_or_else(Value::undefined);
+                ctx.with_turn_parts(|interp, _stack| {
+                    if let Some(context) = interp.realm_execution_context() {
+                        let _ = interp.async_generator_complete_step(
+                            &context,
+                            &owner,
+                            Ok(value),
+                            false,
+                        );
+                    }
+                });
+                Ok(Value::undefined())
+            },
+        )?;
+        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "AsyncGeneratorYieldRejected",
+            smallvec::smallvec![owner_value],
+            &mut |visitor| {
+                inner_value.trace_value_slots(visitor);
+                on_fulfilled.trace_value_slots(visitor);
+            },
+            move |ctx, args, captures| {
+                let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
+                    return Ok(Value::undefined());
+                };
+                let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                ctx.with_turn_parts(|interp, stack| {
+                    let Some(context) = interp.realm_execution_context() else {
+                        return;
+                    };
+                    let outcome = interp.resume_generator(
+                        stack,
+                        &context,
+                        &owner,
+                        crate::GeneratorResumeKind::Throw(reason),
+                    );
+                    if outcome.is_err() {
+                        // The body did not handle the failure, so the
+                        // generator ends on it and the pending request is
+                        // what carries it out.
+                        let _ = interp.async_generator_complete_step(
+                            &context,
+                            &owner,
+                            Err(reason),
+                            true,
+                        );
+                        let _ = interp.async_generator_drain_done(&context, &owner);
+                    }
+                });
+                Ok(Value::undefined())
+            },
+        )?;
+        let capability = crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_stack_rooted(
+                self,
+                stack,
+                &[&on_fulfilled, &on_rejected, &inner_value],
+                &[],
+            )?;
+        let inner = inner_value.as_promise().ok_or(VmError::InvalidOperand)?;
+        let async_context = self.async_context();
+        let outcome = crate::promise::JsPromise::perform_then_with_context(
+            &inner,
+            &mut self.gc_heap,
+            Some(on_fulfilled),
+            Some(on_rejected),
+            capability,
+            Some(context.clone()),
+            async_context,
+        );
+        if let Some(job) = outcome.immediate_job {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
     }
 
     /// Complete the front async-generator request.

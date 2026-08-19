@@ -1823,7 +1823,9 @@ impl Interpreter {
                 // expandos. Building the whole key list to keep the symbols
                 // would spell out one string per element and discard every
                 // one of them, which is quadratic on a large buffer.
-                let values: Vec<Value> = if let Some(bag) = byte_view_expando(&target_clone, &self.gc_heap) {
+                let values: Vec<Value> = if let Some(bag) =
+                    byte_view_expando(&target_clone, &self.gc_heap)
+                {
                     match bag {
                         Some(bag) => crate::object::with_properties(bag, &self.gc_heap, |p| {
                             p.symbol_keys().map(Value::symbol).collect()

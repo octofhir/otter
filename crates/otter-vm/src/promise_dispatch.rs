@@ -579,6 +579,82 @@ impl PromiseBuilder {
     }
 }
 
+impl Interpreter {
+    /// `Get(promise, "constructor")` — an ordinary read, so a user-defined
+    /// accessor runs where the spec says it does.
+    fn promise_resolve_constructor_of(
+        &mut self,
+        stack: &mut crate::activation_stack::ActivationStack,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<Value, crate::VmError> {
+        match self.ordinary_get_value(
+            stack,
+            context,
+            value,
+            value,
+            &crate::VmPropertyKey::String("constructor"),
+            0,
+        )? {
+            crate::VmGetOutcome::Value(found) => Ok(found),
+            crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+                stack,
+                context,
+                &getter,
+                value,
+                smallvec::SmallVec::new(),
+            ),
+        }
+    }
+
+    /// §27.2.4.7 `PromiseResolve(%Promise%, value)` — the promise a value
+    /// stands for.
+    ///
+    /// The capability's own resolve function is what runs, because that is
+    /// where the thenable job lives: a plain object with a `then` method is
+    /// adopted exactly once, which a direct fulfilment would skip.
+    ///
+    /// # Errors
+    /// Propagates whatever the value's `then` threw.
+    pub(crate) fn promise_resolve_value(
+        &mut self,
+        stack: &mut crate::activation_stack::ActivationStack,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<Value, crate::VmError> {
+        // §27.2.4.7 steps 1-2 — a promise whose `constructor` is this
+        // realm's `%Promise%` is already the promise it stands for. The
+        // lookup is observable and the shortcut saves the two ticks a
+        // fresh capability would cost.
+        if value.is_promise() {
+            let constructor = self.promise_resolve_constructor_of(stack, context, value)?;
+            let promise_constructor =
+                crate::object::get(self.global_this, &self.gc_heap, "Promise")
+                    .unwrap_or_else(Value::undefined);
+            if crate::abstract_ops::same_value(&constructor, &promise_constructor, &self.gc_heap) {
+                return Ok(value);
+            }
+        }
+        let capability = PromiseBuilder::with_context(context.clone()).capability_stack_rooted(
+            self,
+            stack,
+            &[&value],
+            &[],
+        )?;
+        let promise = capability.promise;
+        let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        args.push(value);
+        self.run_callable_sync_rooted(
+            stack,
+            context,
+            &capability.resolve,
+            Value::undefined(),
+            args,
+        )?;
+        Ok(promise)
+    }
+}
+
 /// Construct a pending promise while visiting the interpreter runtime roots and
 /// caller-provided temporary roots.
 pub fn pending_runtime_rooted(
@@ -3400,6 +3476,73 @@ pub(crate) fn resolve_promise_from_interpreter(
             return Ok(());
         }
 
+        // §27.2.1.3.2 steps 8-13 — an ordinary object with a callable
+        // `then` is a thenable and is adopted through the job queue, not
+        // fulfilled as itself. An async function returning one must settle
+        // on what that thenable resolves to.
+        // The caller may have no context of its own (an async frame
+        // completing), and the thenable's `then` still has to run: fall back
+        // to the realm's.
+        let exec = context.clone().or_else(|| interp.realm_execution_context());
+        if interp.escape_scoped(value).is_object_type()
+            && let Some(exec) = exec
+        {
+            let raw_value = interp.escape_scoped(value);
+            let mut probe = ActivationStack::new();
+            let then = get_property_runtime(
+                interp,
+                &mut probe,
+                &exec,
+                raw_value,
+                "then",
+                "Promise resolve",
+            );
+            let then = match then {
+                Ok(then) => then,
+                Err(err) => {
+                    let promise_handle = interp
+                        .escape_scoped(promise)
+                        .as_promise()
+                        .expect("async resolver promise remains rooted");
+                    let reason = native_error_rejection_value_preserving_throw(interp, err);
+                    let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
+                    drain_jobs(interp, jobs);
+                    return Ok(());
+                }
+            };
+            let then = interp.scoped_value(scope, then);
+            if interp.is_callable_runtime(&interp.escape_scoped(then)) {
+                let promise_handle = interp
+                    .escape_scoped(promise)
+                    .as_promise()
+                    .expect("async resolver promise remains rooted");
+                let (on_fulfill, on_reject) =
+                    make_resolve_adoption_handlers_runtime_rooted(interp, promise_handle, &[], &[])
+                        .map_err(crate::oom_to_vm)?;
+                let on_fulfill = interp.scoped_value(scope, on_fulfill);
+                let on_reject = interp.scoped_value(scope, on_reject);
+                let job = make_resolve_thenable_job_runtime_rooted(
+                    interp,
+                    interp.escape_scoped(value),
+                    interp.escape_scoped(then),
+                    interp.escape_scoped(on_fulfill),
+                    interp.escape_scoped(on_reject),
+                    exec.clone(),
+                )?;
+                let async_context = interp.async_context();
+                interp.microtasks.enqueue(crate::microtask::Microtask {
+                    callee: job,
+                    this_value: Value::undefined(),
+                    args: smallvec::SmallVec::new(),
+                    context: Some(exec),
+                    result_capability: None,
+                    kind: crate::microtask::MicrotaskKind::Call,
+                    async_context,
+                });
+                return Ok(());
+            }
+        }
+
         let promise = interp
             .escape_scoped(promise)
             .as_promise()
@@ -3477,6 +3620,60 @@ fn make_resolve_thenable_job(
         },
     )
     .map_err(|_| oom_native("PromiseResolveThenableJob"))
+}
+
+/// §27.2.1.3.2 PromiseResolveThenableJob, built from the interpreter
+/// rather than from a native call frame.
+fn make_resolve_thenable_job_runtime_rooted(
+    interp: &mut Interpreter,
+    thenable: Value,
+    then: Value,
+    on_fulfill: Value,
+    on_reject: Value,
+    exec: ExecutionContext,
+) -> Result<Value, crate::VmError> {
+    let captures: SmallVec<[Value; 4]> = smallvec![thenable, then, on_fulfill, on_reject];
+    crate::native_function::native_value_with_captures_unchecked_with_roots(
+        interp.gc_heap_mut(),
+        "PromiseResolveThenableJob",
+        captures,
+        &mut |_visitor| {},
+        move |ctx, _args, captures| {
+            let thenable = captures[0];
+            let then = captures[1];
+            let on_fulfill = captures[2];
+            let on_reject = captures[3];
+            let call_result = ctx.with_turn_parts(|interp, stack| {
+                interp.run_callable_sync_rooted(
+                    stack,
+                    &exec,
+                    &then,
+                    thenable,
+                    smallvec![on_fulfill, on_reject],
+                )
+            });
+            if let Err(err) = call_result {
+                // An abrupt `then` call rejects the promise with the thrown
+                // value, keeping its identity.
+                let reason = ctx.with_turn_parts(|interp, _| {
+                    interp
+                        .take_pending_uncaught_throw()
+                        .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, &err))
+                });
+                let _ = ctx.with_turn_parts(|interp, stack| {
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        &exec,
+                        &on_reject,
+                        Value::undefined(),
+                        smallvec![reason],
+                    )
+                });
+            }
+            Ok(Value::undefined())
+        },
+    )
+    .map_err(crate::oom_to_vm)
 }
 
 fn make_resolve_adoption_handlers_runtime_rooted(

@@ -12,8 +12,8 @@
 //! # Contents
 //! - [`ARRAY_STATIC_METHODS`] — methods installed on the `Array`
 //!   constructor during bootstrap.
-//! - Minimal `Array.fromAsync` metadata surface; the async collection
-//!   algorithm is intentionally separate from this descriptor hook.
+//! - `Array.fromAsync` dispatches into [`crate::array_from_async`], which
+//!   owns the promise chain the collection runs on.
 //!
 //! # Invariants
 //! - The compiler's [`otter_bytecode::Op::ArrayOf`] /
@@ -118,18 +118,11 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     })
 }
 
-/// §23.1.2.2 `Array.fromAsync(items, mapFn?, thisArg?)`.
-///
-/// Otter does not yet implement the async iterator / promise
-/// collection algorithm, but Test262 exposes the finalized builtin's
-/// reflective surface independently. Installing the real callable
-/// shape keeps descriptor conformance visible while a direct call
-/// still reports the missing runtime semantics.
-fn native_from_async(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Err(NativeError::TypeError {
-        name: "Array.fromAsync",
-        reason: "Array.fromAsync collection is not implemented".to_string(),
-    })
+/// §23.1.2.1 `Array.fromAsync(items, mapFn?, thisArg?)` — collect an async
+/// iterable, a sync iterable, or an array-like of promises into a new array,
+/// answering with the promise for it.
+fn native_from_async(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    crate::array_from_async::native_from_async(ctx, args)
 }
 
 fn vm_to_native_array_static(

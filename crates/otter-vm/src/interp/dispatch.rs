@@ -793,7 +793,7 @@ impl Interpreter {
                             &mut self.gc_heap,
                             crate::generator::AsyncGeneratorState::SuspendedYield,
                         );
-                        self.async_generator_complete_step(context, &owner, Ok(yielded), false)?;
+                        self.async_generator_yield_awaited(stack, context, &owner, yielded)?;
                     }
                     return Ok(yielded);
                 }

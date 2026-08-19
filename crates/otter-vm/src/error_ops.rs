@@ -123,7 +123,7 @@ impl Interpreter {
         Ok(Some(self.coerce_to_string(stack, context, value)?))
     }
 
-    fn make_error_instance_with_stack_roots(
+    pub(crate) fn make_error_instance_with_stack_roots(
         &mut self,
         stack: &ActivationStack,
         kind: ErrorKind,
@@ -420,11 +420,12 @@ impl Interpreter {
                 // default rendering.
                 if code.starts_with("ERR_")
                     && let Ok(to_string) = crate::native_function::native_value_static(
-                    &mut interp.gc_heap,
-                    "toString",
-                    0,
-                    coded_error_to_string,
-                ) {
+                        &mut interp.gc_heap,
+                        "toString",
+                        0,
+                        coded_error_to_string,
+                    )
+                {
                     let to_string_h = interp.scoped_value(scope, to_string);
                     let _ = interp.scoped_define_data(
                         scope,

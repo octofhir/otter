@@ -32,6 +32,7 @@ function reuseOrCreateUnrefTimeout(_existing, callback, duration, arg) {
 }
 
 module.exports = {
+  TIMEOUT_MAX,
   setUnrefTimeout,
   reuseOrCreateUnrefTimeout,
   getTimerDuration,

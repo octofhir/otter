@@ -260,6 +260,23 @@ const privateSymbols = {
 };
 
 const bindings = {
+  // `internalBinding('errors')` — the exit codes Node's own C++ names, as
+  // the JavaScript that reads them expects to find them.
+  errors: {
+    exitCodes: {
+      kNoFailure: 0,
+      kUncaughtException: 1,
+      kGenericUserError: 1,
+      kInternalJSParseError: 3,
+      kInternalJSEvaluationFailure: 4,
+      kV8FatalError: 5,
+      kBootstrapFailure: 6,
+      kExceptionInFatalExceptionHandler: 7,
+      kInvalidCommandLineArgument: 9,
+      kInvalidFatalExceptionMonkeyPatching: 10,
+      kOutOfMemory: 134,
+    },
+  },
   uv: {
     errname(code) {
       return uvErrmap.get(code)?.[0] ?? `UNKNOWN`;

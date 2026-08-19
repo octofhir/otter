@@ -213,6 +213,16 @@ nodelib_module!(internal_trace_sigint, "internal/util/trace_sigint", vendored "n
 nodelib_module!(internal_watchdog, "internal/watchdog", compat "nodelib/compat/internal_watchdog.js");
 nodelib_module!(internal_string_decoder, "internal/string_decoder_binding", compat "nodelib/compat/internal_string_decoder.js");
 nodelib_module!(node_string_decoder, "node:string_decoder", vendored "nodelib/string_decoder.js");
+nodelib_module!(internal_linkedlist, "internal/linkedlist", vendored "nodelib/internal/linkedlist.js");
+nodelib_module!(internal_util_inspector, "internal/util/inspector", vendored "nodelib/internal/util/inspector.js");
+nodelib_module!(internal_cluster_utils, "internal/cluster/utils", vendored "nodelib/internal/cluster/utils.js");
+nodelib_module!(internal_cluster_worker, "internal/cluster/worker", vendored "nodelib/internal/cluster/worker.js");
+nodelib_module!(internal_cluster_shared_handle, "internal/cluster/shared_handle", vendored "nodelib/internal/cluster/shared_handle.js");
+nodelib_module!(internal_cluster_round_robin_handle, "internal/cluster/round_robin_handle", vendored "nodelib/internal/cluster/round_robin_handle.js");
+nodelib_module!(internal_cluster_child, "internal/cluster/child", vendored "nodelib/internal/cluster/child.js");
+nodelib_module!(internal_cluster_primary, "internal/cluster/primary", vendored "nodelib/internal/cluster/primary.js");
+nodelib_module!(internal_otter_cluster, "internal/otter/cluster", vendored "nodelib/cluster.js");
+nodelib_module!(node_cluster, "node:cluster", compat "nodelib/compat/node_cluster.js");
 
 /// The vendored `events` module plus a one-time process-prototype graft:
 /// Node's `process` inherits from `EventEmitter` through an intermediate

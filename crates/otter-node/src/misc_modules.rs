@@ -18,7 +18,6 @@ use otter_runtime::{
 const PERF_HOOKS_SHIM: &str = include_str!("perf_hooks.js");
 const V8_SHIM: &str = include_str!("v8.js");
 const MODULE_SHIM: &str = include_str!("module_builtin.js");
-const CLUSTER_SHIM: &str = include_str!("cluster.js");
 const INTERNAL_UTIL_SHIM: &str = include_str!("internal_util.js");
 const VM_SHIM: &str = include_str!("vm.js");
 
@@ -58,17 +57,6 @@ pub fn internal_event_target_cjs_value<'scope>(
         module,
         require,
     )
-}
-
-/// `node:cluster` — single-process stub (always primary, no workers).
-pub fn cluster_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:cluster", CLUSTER_SHIM, module, require)
 }
 
 /// `node:https` — the http surface with TLS defaults (port 443).

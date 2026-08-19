@@ -533,9 +533,11 @@ fn node_cluster_reports_the_primary_role() {
         if (typeof cluster.Worker !== "function") throw new Error("Worker class is missing");
 
         // Settings name the program a worker would run, which is this one.
-        const settings = cluster.setupPrimary();
+        // `setupPrimary` records them on the module rather than answering
+        // with them.
+        cluster.setupPrimary();
+        const settings = cluster.settings;
         if (settings.exec !== process.argv[1]) throw new Error("exec is " + settings.exec);
-        if (cluster.settings !== settings) throw new Error("settings were not kept");
 
         // A primary schedules round-robin unless told otherwise, and the
         // policy names are the ones a program compares against.

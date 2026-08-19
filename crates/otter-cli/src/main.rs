@@ -166,6 +166,11 @@ struct Cli {
     #[arg(long = "expose-gc", global = true)]
     expose_gc: bool,
 
+    /// Let a script require the engine's `internal/*` modules
+    /// (Node's `--expose-internals`).
+    #[arg(long = "expose-internals", global = true)]
+    expose_internals: bool,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
@@ -596,6 +601,7 @@ async fn main() -> ExitCode {
     });
     execution.set_process_title(cli.title.clone());
     execution.set_expose_gc(cli.expose_gc);
+    execution.set_expose_internals(cli.expose_internals);
     let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();

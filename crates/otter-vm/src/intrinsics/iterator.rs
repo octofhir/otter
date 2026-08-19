@@ -1971,25 +1971,6 @@ fn create_owned_iterator_result(
     })
 }
 
-/// §27.1.5.1.4 `%IteratorPrototype%.throw(value)` — propagate the
-/// argument as a thrown completion. Built-in (non-generator)
-/// iterators have no `[[Throw]]` handler, so the abstract algorithm
-/// degrades to "throw value".
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.throw>
-fn iterator_proto_throw(
-    ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, crate::NativeError> {
-    let _handle = iterator_receiver_builtin(ctx, "Iterator.prototype.throw")?;
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
-    Err(crate::NativeError::Thrown {
-        name: "Iterator.prototype.throw",
-        message: arg.display_string(ctx.heap()),
-    })
-}
-
 fn iterator_predicate_drain(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
@@ -3183,11 +3164,32 @@ fn async_generator_resumption(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
     name: &'static str,
-    method: crate::native_function::NativeFastFn,
+    resume: fn(Value) -> crate::GeneratorResumeKind,
 ) -> Result<Value, crate::NativeError> {
     if let Some(rejected) = async_generator_validate(ctx, name)? {
         return Ok(rejected);
     }
+    let receiver = *ctx.this_value();
+    let argument = args.first().copied().unwrap_or_else(Value::undefined);
+    let method = move |ctx: &mut crate::NativeCtx<'_>, _args: &[Value]| {
+        let Some(generator) = receiver.as_generator() else {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "receiver is not an async generator object".to_string(),
+            });
+        };
+        let Some(exec_ctx) = ctx.execution_context().cloned() else {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            });
+        };
+        ctx.with_turn_parts(|interp, stack| {
+            interp
+                .generator_resume_request(stack, &exec_ctx, generator, receiver, resume(argument))
+                .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
+        })
+    };
     match method(ctx, args) {
         Ok(value) => Ok(value),
         Err(err) => {
@@ -3219,12 +3221,9 @@ pub(crate) fn async_generator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    async_generator_resumption(
-        ctx,
-        args,
-        "AsyncGenerator.prototype.next",
-        iterator_proto_next,
-    )
+    async_generator_resumption(ctx, args, "AsyncGenerator.prototype.next", |value| {
+        crate::GeneratorResumeKind::Next(value)
+    })
 }
 
 /// §27.6.1.3 `%AsyncGeneratorPrototype%.return(value)`.
@@ -3232,12 +3231,9 @@ pub(crate) fn async_generator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    async_generator_resumption(
-        ctx,
-        args,
-        "AsyncGenerator.prototype.return",
-        iterator_proto_return,
-    )
+    async_generator_resumption(ctx, args, "AsyncGenerator.prototype.return", |value| {
+        crate::GeneratorResumeKind::Return(value)
+    })
 }
 
 /// §27.6.1.4 `%AsyncGeneratorPrototype%.throw(exception)`.
@@ -3245,12 +3241,9 @@ pub(crate) fn async_generator_proto_throw(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    async_generator_resumption(
-        ctx,
-        args,
-        "AsyncGenerator.prototype.throw",
-        iterator_proto_throw,
-    )
+    async_generator_resumption(ctx, args, "AsyncGenerator.prototype.throw", |value| {
+        crate::GeneratorResumeKind::Throw(value)
+    })
 }
 
 /// §27.1.3.1 `%AsyncIteratorPrototype%[@@asyncIterator]` — returns

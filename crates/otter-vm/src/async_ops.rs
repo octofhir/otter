@@ -44,23 +44,12 @@ impl Interpreter {
         stack: &mut ActivationStack,
         value: Value,
     ) -> Result<crate::promise::JsPromiseHandle, VmError> {
-        if let Some(p) = value.as_promise() {
-            return Ok(p);
-        }
-        let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(self, stack, &[&value], &[])?;
-        let resolve = cap.resolve;
-        self.run_callable_sync_rooted(
-            stack,
-            context,
-            &resolve,
-            Value::undefined(),
-            smallvec::smallvec![value],
-        )?;
-        Ok(cap
-            .promise
-            .as_promise()
-            .expect("promise capability holds a promise"))
+        // §27.2.4.7 PromiseResolve — a promise is handed back as itself
+        // only once its `constructor` proves to be this realm's; that read
+        // is observable, and skipping it also skipped the ticks a
+        // mismatched constructor costs.
+        let promise = self.promise_resolve_value(stack, context, value)?;
+        promise.as_promise().ok_or(VmError::InvalidOperand)
     }
 
     /// Handle [`otter_bytecode::Op::Await`]: park the current

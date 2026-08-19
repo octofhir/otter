@@ -1280,7 +1280,8 @@ impl Interpreter {
                     || target.is_string()
                 {
                     Vec::new()
-                } else if let Some(bag) = crate::object_internal_ops::byte_view_expando(target, &self.gc_heap)
+                } else if let Some(bag) =
+                    crate::object_internal_ops::byte_view_expando(target, &self.gc_heap)
                 {
                     // A byte view's own keys are its element indices plus its
                     // expandos. Building the whole key list to keep the

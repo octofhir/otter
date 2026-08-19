@@ -7,9 +7,18 @@
 // copy with an extra binding — the copy is what later continuations inherit.
 
 const native = globalThis.__otterAsyncContextNative;
+// The id machinery, the hook list and `AsyncResource` live in
+// `internal/async_hooks`; this module is their public face plus the
+// context-carrying storage built on the isolate's async context.
+const {
+  AsyncResource,
+  createHook,
+  executionAsyncId,
+  triggerAsyncId,
+  executionAsyncResource,
+} = require('internal/async_hooks');
 
 const kStore = Symbol('kStore');
-let nextResourceId = 1;
 
 function currentFrame() {
   const frame = native.getContext();
@@ -117,67 +126,10 @@ class AsyncLocalStorage {
   }
 }
 
-class AsyncResource {
-  #context;
-  #id;
-  #type;
-
-  constructor(type, options = {}) {
-    if (typeof type !== 'string') {
-      const err = new TypeError('The "type" argument must be of type string.');
-      err.code = 'ERR_INVALID_ARG_TYPE';
-      throw err;
-    }
-    this.#type = type;
-    this.#id = nextResourceId++;
-    // The resource remembers the context it was created in; every
-    // `runInAsyncScope` re-enters that one.
-    this.#context = native.getContext();
-    void options;
-  }
-
-  runInAsyncScope(fn, thisArg, ...args) {
-    const previous = native.getContext();
-    native.setContext(this.#context);
-    try {
-      return fn.apply(thisArg, args);
-    } finally {
-      native.setContext(previous);
-    }
-  }
-
-  bind(fn, thisArg) {
-    const resource = this;
-    const bound = function boundAsyncResource(...args) {
-      return resource.runInAsyncScope(fn, thisArg ?? this, ...args);
-    };
-    Object.defineProperty(bound, 'length', { value: fn.length, configurable: true });
-    bound.asyncResource = this;
-    return bound;
-  }
-
-  asyncId() { return this.#id; }
-  triggerAsyncId() { return 0; }
-  emitDestroy() { return this; }
-  get type() { return this.#type; }
-
-  static bind(fn, type, thisArg) {
-    const resource = new AsyncResource(type ?? fn.name ?? 'bound-anonymous-fn');
-    return resource.bind(fn, thisArg);
-  }
-}
-
-// `executionAsyncId` needs per-callback ids the engine does not assign yet, so
-// it reports the root. `createHook` is deliberately absent rather than a stub
-// that never fires: a caller can then detect it instead of silently observing
-// nothing.
-function executionAsyncId() { return 1; }
-function triggerAsyncId() { return 0; }
-function executionAsyncResource() { return currentFrame() ?? Object.create(null); }
-
 module.exports = {
   AsyncLocalStorage,
   AsyncResource,
+  createHook,
   executionAsyncId,
   triggerAsyncId,
   executionAsyncResource,

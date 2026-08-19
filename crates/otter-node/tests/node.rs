@@ -440,7 +440,9 @@ fn node_dgram_validates_before_it_opens_a_socket() {
         if (codeOf(() => socket.disconnect()) !== "ERR_SOCKET_DGRAM_NOT_CONNECTED") {
             throw new Error("disconnect() on an unconnected socket");
         }
-        if (codeOf(() => socket.send("payload")) !== "ERR_SOCKET_DGRAM_NOT_CONNECTED") {
+        // The port is validated before the connection state, so a send
+        // with neither reports the port.
+        if (codeOf(() => socket.send("payload")) !== "ERR_SOCKET_BAD_PORT") {
             throw new Error("send() without a port on an unconnected socket");
         }
 
@@ -464,19 +466,28 @@ fn node_dgram_validates_before_it_opens_a_socket() {
             throw new Error("bindSync(null)");
         }
 
-        // The option setters type-check their argument before reaching the socket.
+        // The numeric and string option setters type-check their argument
+        // before reaching the socket.
         const wrongTypes = [
             () => socket.setTTL("2"),
             () => socket.setMulticastTTL("2"),
-            () => socket.setBroadcast(1),
             () => socket.setMulticastInterface(1),
-            () => socket.addMembership(1),
-            () => socket.dropMembership(1),
         ];
         for (const run of wrongTypes) {
             if (codeOf(run) !== "ERR_INVALID_ARG_TYPE") {
                 throw new Error("option setter accepted a wrong type: " + run);
             }
+        }
+        // Membership takes its address to the socket, which has none yet.
+        for (const run of [() => socket.addMembership(1), () => socket.dropMembership(1)]) {
+            if (codeOf(run) !== "EINVAL") {
+                throw new Error("membership on an unbound socket: " + run);
+            }
+        }
+        // A broadcast flag is not type-checked; the unbound socket is what
+        // refuses it.
+        if (codeOf(() => socket.setBroadcast(1)) !== "EBADF") {
+            throw new Error("setBroadcast on an unbound socket");
         }
         "#,
     )

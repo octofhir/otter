@@ -232,7 +232,12 @@ const uvErrors = [
   ['EEXIST', -17, 'file already exists'],
   ['EINVAL', -22, 'invalid argument'],
   ['EISDIR', -21, 'illegal operation on a directory'],
+  ['EHOSTUNREACH', -65, 'host is unreachable'],
   ['EMFILE', -24, 'too many open files'],
+  ['EMSGSIZE', -40, 'message too long'],
+  ['ENETUNREACH', -51, 'network is unreachable'],
+  ['ENOTSOCK', -38, 'socket operation on non-socket'],
+  ['ENOTSUP', -45, 'operation not supported'],
   ['ENFILE', -23, 'file table overflow'],
   ['ENOBUFS', -55, 'no buffer space available'],
   ['ENOENT', -2, 'no such file or directory'],
@@ -481,6 +486,9 @@ const bindings = {
   },
   get pipe_wrap() {
     return require('internal/otter/pipe_wrap');
+  },
+  get udp_wrap() {
+    return require('internal/otter/udp_wrap');
   },
   get cares_wrap() {
     return require('internal/otter/cares_wrap');

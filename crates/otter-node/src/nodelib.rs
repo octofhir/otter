@@ -159,6 +159,9 @@ nodelib_module!(internal_stream_wrap, "internal/otter/stream_wrap", compat "node
 nodelib_module!(internal_otter_stream_handle, "internal/otter/stream_handle", compat "nodelib/compat/internal_otter_stream_handle.js");
 nodelib_module!(internal_tcp_wrap, "internal/otter/tcp_wrap", compat "nodelib/compat/internal_tcp_wrap.js");
 nodelib_module!(internal_pipe_wrap, "internal/otter/pipe_wrap", compat "nodelib/compat/internal_pipe_wrap.js");
+nodelib_module!(internal_udp_wrap, "internal/otter/udp_wrap", compat "nodelib/compat/internal_udp_wrap.js");
+nodelib_module!(internal_dgram, "internal/dgram", vendored "nodelib/internal/dgram.js");
+nodelib_module!(node_dgram, "node:dgram", vendored "nodelib/dgram.js");
 nodelib_module!(internal_cares_wrap, "internal/otter/cares_wrap", compat "nodelib/compat/internal_cares_wrap.js");
 nodelib_module!(internal_otter_ip, "internal/otter/ip", compat "nodelib/compat/internal_otter_ip.js");
 nodelib_module!(internal_blocklist, "internal/blocklist", compat "nodelib/compat/internal_blocklist.js");

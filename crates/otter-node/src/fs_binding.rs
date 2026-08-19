@@ -82,11 +82,15 @@ pub fn fs_binding_cjs_value<'scope>(
     method!("stat", 2, |ctx: &mut RuntimeNativeCtx<'_>,
                         args: &[RuntimeValue],
                         caps: &CapabilitySet,
-                        _t: &Table| { stat_path(ctx, args, caps, false) });
+                        _t: &Table| {
+        stat_path(ctx, args, caps, false)
+    });
     method!("lstat", 2, |ctx: &mut RuntimeNativeCtx<'_>,
                          args: &[RuntimeValue],
                          caps: &CapabilitySet,
-                         _t: &Table| { stat_path(ctx, args, caps, true) });
+                         _t: &Table| {
+        stat_path(ctx, args, caps, true)
+    });
     method!("ftruncate", 2, ftruncate_file);
     method!("fsync", 1, fsync_file);
     method!("fdatasync", 1, fdatasync_file);
@@ -99,7 +103,9 @@ pub fn fs_binding_cjs_value<'scope>(
     method!("fchown", 3, |_ctx: &mut RuntimeNativeCtx<'_>,
                           _args: &[RuntimeValue],
                           _caps: &CapabilitySet,
-                          _t: &Table| { Ok(RuntimeValue::undefined()) });
+                          _t: &Table| {
+        Ok(RuntimeValue::undefined())
+    });
     method!("copyFile", 3, copy_file);
     method!("rename", 2, rename_path);
     method!("unlink", 1, unlink_path);
@@ -116,7 +122,31 @@ pub fn fs_binding_cjs_value<'scope>(
     method!("lutimes", 3, utimes_path);
     method!("statfs", 2, statfs_path);
     method!("existsSync", 1, exists_sync);
-    method!("internalModuleStat", 2, internal_module_stat);
+    method!("internalModuleStat", 1, internal_module_stat);
+    method!(
+        "cpSyncCheckPaths",
+        4,
+        |ctx: &mut RuntimeNativeCtx<'_>,
+         args: &[RuntimeValue],
+         caps: &CapabilitySet,
+         _t: &Table| { crate::fs_cp::check_paths(ctx, args, caps) }
+    );
+    method!(
+        "cpSyncOverrideFile",
+        4,
+        |ctx: &mut RuntimeNativeCtx<'_>,
+         args: &[RuntimeValue],
+         caps: &CapabilitySet,
+         _t: &Table| { crate::fs_cp::override_file(ctx, args, caps) }
+    );
+    method!(
+        "cpSyncCopyDir",
+        7,
+        |ctx: &mut RuntimeNativeCtx<'_>,
+         args: &[RuntimeValue],
+         caps: &CapabilitySet,
+         _t: &Table| { crate::fs_cp::copy_dir(ctx, args, caps) }
+    );
     method!("readFileUtf8", 2, read_file_utf8);
     method!("writeFileUtf8", 5, write_file_utf8);
 
@@ -124,7 +154,7 @@ pub fn fs_binding_cjs_value<'scope>(
 }
 
 /// The capability-checked path of an argument.
-fn path_of(
+pub(crate) fn path_of(
     ctx: &mut RuntimeNativeCtx<'_>,
     args: &[RuntimeValue],
     index: usize,
@@ -137,7 +167,11 @@ fn path_of(
 }
 
 /// An error in the shape Node's `UVException` carries.
-fn coded_error(code: &'static str, syscall: &'static str, path: &Path) -> RuntimeNativeError {
+pub(crate) fn coded_error(
+    code: &'static str,
+    syscall: &'static str,
+    path: &Path,
+) -> RuntimeNativeError {
     // A capability refusal says so in the message: the runtime's own gate is
     // what stopped the call, not the platform.
     let reason = if code == "EACCES" {
@@ -155,7 +189,40 @@ fn coded_error(code: &'static str, syscall: &'static str, path: &Path) -> Runtim
     }
 }
 
-fn io_code(error: &std::io::Error) -> &'static str {
+pub(crate) fn io_code(error: &std::io::Error) -> &'static str {
+    // The platform's own errno is the precise answer, and the one Node
+    // reports; `ErrorKind` is the fallback for errors that never came from
+    // a system call.
+    if let Some(errno) = error.raw_os_error() {
+        match errno {
+            libc::ENOENT => return "ENOENT",
+            libc::EACCES => return "EACCES",
+            libc::EPERM => return "EPERM",
+            libc::EEXIST => return "EEXIST",
+            libc::EINVAL => return "EINVAL",
+            libc::EISDIR => return "EISDIR",
+            libc::ENOTDIR => return "ENOTDIR",
+            libc::ENOTEMPTY => return "ENOTEMPTY",
+            libc::ENAMETOOLONG => return "ENAMETOOLONG",
+            libc::ELOOP => return "ELOOP",
+            libc::EMFILE => return "EMFILE",
+            libc::ENFILE => return "ENFILE",
+            libc::EBADF => return "EBADF",
+            libc::ENOSPC => return "ENOSPC",
+            libc::EROFS => return "EROFS",
+            libc::EXDEV => return "EXDEV",
+            libc::EFBIG => return "EFBIG",
+            libc::ESPIPE => return "ESPIPE",
+            libc::EAGAIN => return "EAGAIN",
+            libc::EBUSY => return "EBUSY",
+            libc::ENODEV => return "ENODEV",
+            libc::ENXIO => return "ENXIO",
+            libc::EOVERFLOW => return "EOVERFLOW",
+            libc::ERANGE => return "ERANGE",
+            libc::EOPNOTSUPP => return "ENOTSUP",
+            _ => {}
+        }
+    }
     match error.kind() {
         std::io::ErrorKind::NotFound => "ENOENT",
         std::io::ErrorKind::PermissionDenied => "EACCES",
@@ -168,7 +235,11 @@ fn io_code(error: &std::io::Error) -> &'static str {
     }
 }
 
-fn io_failure(error: &std::io::Error, syscall: &'static str, path: &Path) -> RuntimeNativeError {
+pub(crate) fn io_failure(
+    error: &std::io::Error,
+    syscall: &'static str,
+    path: &Path,
+) -> RuntimeNativeError {
     let code = io_code(error);
     RuntimeNativeError::Syscall {
         code,
@@ -504,7 +575,11 @@ fn stats_array(
 }
 
 /// Whether a path may be read, as an error if not.
-fn allow_read(path: &Path, capabilities: &CapabilitySet, syscall: &'static str) -> Result<(), RuntimeNativeError> {
+pub(crate) fn allow_read(
+    path: &Path,
+    capabilities: &CapabilitySet,
+    syscall: &'static str,
+) -> Result<(), RuntimeNativeError> {
     if capabilities.read.matches_path(path) {
         return Ok(());
     }
@@ -512,7 +587,11 @@ fn allow_read(path: &Path, capabilities: &CapabilitySet, syscall: &'static str) 
 }
 
 /// Whether a path may be written, as an error if not.
-fn allow_write(path: &Path, capabilities: &CapabilitySet, syscall: &'static str) -> Result<(), RuntimeNativeError> {
+pub(crate) fn allow_write(
+    path: &Path,
+    capabilities: &CapabilitySet,
+    syscall: &'static str,
+) -> Result<(), RuntimeNativeError> {
     if capabilities.write.matches_path(path) {
         return Ok(());
     }
@@ -747,8 +826,7 @@ fn readdir_path(
         .unwrap_or(false);
     let mut names = Vec::new();
     let mut kinds = Vec::new();
-    let entries =
-        std::fs::read_dir(&path).map_err(|error| io_failure(&error, "scandir", &path))?;
+    let entries = std::fs::read_dir(&path).map_err(|error| io_failure(&error, "scandir", &path))?;
     for entry in entries {
         let entry = entry.map_err(|error| io_failure(&error, "scandir", &path))?;
         names.push(entry.file_name().to_string_lossy().into_owned());
@@ -888,7 +966,11 @@ fn statfs_path(
         (outcome, stats)
     };
     if outcome != 0 {
-        return Err(io_failure(&std::io::Error::last_os_error(), "statfs", &path));
+        return Err(io_failure(
+            &std::io::Error::last_os_error(),
+            "statfs",
+            &path,
+        ));
     }
     let values = [
         f64::from(stats.f_type),
@@ -931,7 +1013,7 @@ fn internal_module_stat(
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     // The loader's probe: 0 is a file, 1 a directory, anything negative is
     // "not there".
-    let path = PathBuf::from(runtime_arg_to_string(args, 1, ctx.heap()));
+    let path = PathBuf::from(runtime_arg_to_string(args, 0, ctx.heap()));
     let answer = match std::fs::metadata(&path) {
         Ok(metadata) if metadata.is_dir() => 1,
         Ok(_) => 0,

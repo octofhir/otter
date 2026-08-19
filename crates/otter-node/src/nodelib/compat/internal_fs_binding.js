@@ -30,6 +30,18 @@ function statsFrom(values, bigint) {
   return view;
 }
 
+// `statSync` and friends answer nothing rather than throwing when the
+// caller passed `throwIfNoEntry: false` and the path is simply absent.
+// Every other failure is still a failure.
+function statOrNothing(work) {
+  try {
+    return work();
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
 // The promise API asks for its result by passing this in place of a
 // request object.
 const kUsePromises = Symbol('kUsePromises');
@@ -84,6 +96,7 @@ class FileHandleBinding {
 module.exports = {
   FSReqCallback,
   kUsePromises,
+  kFsStatsFieldsNumber: kStatsFields,
 
   openFileHandle(path, flags, mode, req) {
     return dispatch(req, () => new FileHandleBinding(native.open(`${path}`, flags, mode)));
@@ -128,8 +141,8 @@ module.exports = {
   writeString(fd, value, position, encoding, req) {
     return dispatch(req, () => native.writeString(fd, value, position ?? -1, encoding));
   },
-  fstat(fd, useBigint, req, shouldNotThrow) {
-    if (shouldNotThrow) {
+  fstat(fd, useBigint, req, doNotThrow) {
+    if (doNotThrow) {
       try {
         return statsFrom(native.fstat(fd), useBigint);
       } catch {
@@ -138,23 +151,15 @@ module.exports = {
     }
     return dispatch(req, () => statsFrom(native.fstat(fd), useBigint));
   },
-  stat(path, useBigint, req, shouldNotThrow) {
-    if (shouldNotThrow) {
-      try {
-        return statsFrom(native.stat(`${path}`), useBigint);
-      } catch {
-        return undefined;
-      }
+  stat(path, useBigint, req, throwIfNoEntry) {
+    if (req === undefined && throwIfNoEntry === false) {
+      return statOrNothing(() => statsFrom(native.stat(`${path}`), useBigint));
     }
     return dispatch(req, () => statsFrom(native.stat(`${path}`), useBigint));
   },
-  lstat(path, useBigint, req, shouldNotThrow) {
-    if (shouldNotThrow) {
-      try {
-        return statsFrom(native.lstat(`${path}`), useBigint);
-      } catch {
-        return undefined;
-      }
+  lstat(path, useBigint, req, throwIfNoEntry) {
+    if (req === undefined && throwIfNoEntry === false) {
+      return statOrNothing(() => statsFrom(native.lstat(`${path}`), useBigint));
     }
     return dispatch(req, () => statsFrom(native.lstat(`${path}`), useBigint));
   },
@@ -239,8 +244,18 @@ module.exports = {
   existsSync(path) {
     return native.existsSync(`${path}`);
   },
-  internalModuleStat(receiver, path) {
-    return native.internalModuleStat(receiver, `${path}`);
+  internalModuleStat(path) {
+    return native.internalModuleStat(`${path}`);
+  },
+  cpSyncCheckPaths(src, dest, dereference, recursive) {
+    return native.cpSyncCheckPaths(`${src}`, `${dest}`, !!dereference, !!recursive);
+  },
+  cpSyncOverrideFile(src, dest, mode, preserveTimestamps) {
+    return native.cpSyncOverrideFile(`${src}`, `${dest}`, mode | 0, !!preserveTimestamps);
+  },
+  cpSyncCopyDir(src, dest, force, dereference, errorOnExist, verbatimSymlinks, preserveTimestamps) {
+    return native.cpSyncCopyDir(`${src}`, `${dest}`, !!force, !!dereference,
+                                !!errorOnExist, !!verbatimSymlinks, !!preserveTimestamps);
   },
   readFileUtf8(path, flags) {
     return native.readFileUtf8(`${path}`, flags);

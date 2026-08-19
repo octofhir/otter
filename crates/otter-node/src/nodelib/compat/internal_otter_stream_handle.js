@@ -5,8 +5,8 @@
 // and installs the host event dispatcher the native loops call into
 // (`__otterNetDeliver`).
 //
-// The native surface delivers reads eagerly; `readStop` parks incoming
-// chunks in a per-handle queue that `readStart` replays in order, so the
+// `readStop` stops the native read loop and parks whatever is already in
+// flight in a per-handle queue that `readStart` replays in order, so the
 // `onread` contract (including `streamBaseState` words and EOF) matches
 // what vendored `internal/stream_base_commons` expects. Writes and
 // shutdowns complete asynchronously through `writeDone`/`shutdownDone`
@@ -115,6 +115,7 @@ class StreamHandle {
 
   readStart() {
     this.reading = true;
+    if (this.fd !== -1 && !this._closed) native.setReading(this.fd, true);
     this._updateHold();
     if (this._parkedChunks.length > 0 || this._eofPending) {
       queueMicrotask(() => this._drainParked());
@@ -122,8 +123,12 @@ class StreamHandle {
     return 0;
   }
 
+  // Stopping the socket, not only the delivery: a peer flooding a paused
+  // connection backs up in its own send buffer instead of being read into
+  // an unbounded park queue.
   readStop() {
     this.reading = false;
+    if (this.fd !== -1 && !this._closed) native.setReading(this.fd, false);
     this._updateHold();
     return 0;
   }
@@ -315,8 +320,15 @@ class StreamHandle {
 
   // ---- socket options (accepted, mostly no-ops on the host) ----
 
+  // libuv reports option failures through the return code; a socket that
+  // closed under a deferred `setNoDelay` must not throw into the caller.
   setNoDelay(enable) {
-    if (this.fd !== -1) native.setOption(this.fd, 'setNoDelay', enable !== false);
+    if (this.fd === -1 || this._closed) return uvCode('EBADF');
+    try {
+      native.setOption(this.fd, 'setNoDelay', enable !== false);
+    } catch (error) {
+      return uvCode(error?.code ?? 'EINVAL');
+    }
     return 0;
   }
 

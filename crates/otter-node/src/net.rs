@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
@@ -60,7 +60,49 @@ enum EntryKind {
         /// direct `tryWrite` is only allowed while this is zero, or bytes
         /// would overtake the queue.
         queued: Arc<std::sync::atomic::AtomicUsize>,
+        /// Gate the read loop obeys, driven by the handle's
+        /// `readStart`/`readStop`.
+        read_gate: Arc<ReadGate>,
     },
+}
+
+/// Whether a connection's read loop may pull more bytes.
+///
+/// `readStop` on the JS handle has to stop the socket, not just park what
+/// already arrived: a peer flooding a paused connection must back up in its
+/// own send buffer the way it does on Node, instead of being read into
+/// unbounded isolate-side memory.
+struct ReadGate {
+    flowing: AtomicBool,
+    resumed: tokio::sync::Notify,
+}
+
+impl ReadGate {
+    fn new() -> Self {
+        Self {
+            flowing: AtomicBool::new(true),
+            resumed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn set(&self, flowing: bool) {
+        self.flowing.store(flowing, Ordering::SeqCst);
+        if flowing {
+            self.resumed.notify_waiters();
+        }
+    }
+
+    /// Resolve once reading is allowed. The waiter is registered before the
+    /// flag is re-read, so a `set(true)` racing this call cannot be missed.
+    async fn flowing(&self) {
+        loop {
+            let resumed = self.resumed.notified();
+            if self.flowing.load(Ordering::SeqCst) {
+                return;
+            }
+            resumed.await;
+        }
+    }
 }
 
 /// A carried connection: TCP or a Unix domain socket. Both sides of the I/O
@@ -416,6 +458,34 @@ fn build_native<'scope>(
     )?;
     scope.set(object, "address", address)?;
 
+    // Reading is driven by the handle: `readStop` must stop the socket, not
+    // only park what already arrived.
+    let reading_table = table.clone();
+    let set_reading = scope.native_closure(
+        "setReading",
+        2,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let id = handle_arg(args, 0);
+            let flowing = args
+                .get(1)
+                .and_then(|value| value.as_boolean())
+                .unwrap_or(true);
+            let table = reading_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(Entry {
+                kind: EntryKind::Connection { read_gate, .. },
+                ..
+            }) = table.get(&id)
+            {
+                read_gate.set(flowing);
+            }
+            Ok(RuntimeValue::undefined())
+        },
+    )?;
+    scope.set(object, "setReading", set_reading)?;
+
     let option_table = table.clone();
     let option = scope.native_closure(
         "setOption",
@@ -648,6 +718,7 @@ fn adopt(
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let abort = Arc::new(tokio::sync::Notify::new());
     let queued_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let read_gate = Arc::new(ReadGate::new());
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -659,6 +730,7 @@ fn adopt(
                     socket: stream.clone(),
                     abort: abort.clone(),
                     queued: queued_count.clone(),
+                    read_gate: read_gate.clone(),
                 },
                 keep_alive: Some(keep_alive),
                 local,
@@ -730,6 +802,10 @@ fn adopt(
         let mut chunk = vec![0u8; 65_536];
         let mut read_error: Option<&'static str> = None;
         loop {
+            tokio::select! {
+                () = read_gate.flowing() => {}
+                () = abort.notified() => return,
+            }
             let ready = tokio::select! {
                 ready = stream.readable() => ready,
                 () = abort.notified() => {

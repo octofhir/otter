@@ -226,7 +226,10 @@
   def('CustomEvent', CustomEvent);
 
   // ---- EventTarget (DOM § EventTarget) ----
-  const kListeners = Symbol('listeners');
+  // Node's `events` module reads listener bookkeeping off this map
+  // (`getEventListeners`, `listenerCount`), so the registry keeps Node's
+  // shape: type -> root `{ size, next }` heading a chain of handlers.
+  const kListeners = Symbol.for('otter.EventTarget.events');
 
   function normalizeOptions(options) {
     if (typeof options === 'boolean') return { capture: options, once: false, passive: false };
@@ -251,25 +254,32 @@
       }
       type = String(type);
       const { capture, once, passive } = normalizeOptions(options);
-      let list = this[kListeners].get(type);
-      if (!list) { list = []; this[kListeners].set(type, list); }
-      for (const entry of list) {
-        if (entry.listener === listener && entry.capture === capture) return;
+      let root = this[kListeners].get(type);
+      if (!root) { root = { size: 0, next: undefined }; this[kListeners].set(type, root); }
+      let tail = root;
+      while (tail.next !== undefined) {
+        tail = tail.next;
+        if (tail.listener === listener && tail.capture === capture) return;
       }
-      list.push({ listener, capture, once, passive });
+      tail.next = { listener, capture, once, passive, next: undefined };
+      root.size++;
     }
 
     removeEventListener(type, listener, options) {
       if (listener == null) return;
       type = String(type);
       const { capture } = normalizeOptions(options);
-      const list = this[kListeners].get(type);
-      if (!list) return;
-      for (let i = 0; i < list.length; i++) {
-        if (list[i].listener === listener && list[i].capture === capture) {
-          list.splice(i, 1);
-          break;
+      const root = this[kListeners].get(type);
+      if (!root) return;
+      let previous = root;
+      while (previous.next !== undefined) {
+        const handler = previous.next;
+        if (handler.listener === listener && handler.capture === capture) {
+          previous.next = handler.next;
+          root.size--;
+          return;
         }
+        previous = handler;
       }
     }
 
@@ -287,9 +297,13 @@
       event[kTarget] = this;
       event.currentTarget = this;
       event.eventPhase = Event.AT_TARGET;
-      const list = this[kListeners].get(event.type);
-      if (list) {
-        for (const entry of list.slice()) {
+      const root = this[kListeners].get(event.type);
+      if (root) {
+        const entries = [];
+        for (let handler = root.next; handler !== undefined; handler = handler.next) {
+          entries.push(handler);
+        }
+        for (const entry of entries) {
           if (event[kStopImmediate]) break;
           if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
           const fn = typeof entry.listener === 'function'

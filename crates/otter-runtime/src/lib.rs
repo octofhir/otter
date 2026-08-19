@@ -6206,6 +6206,16 @@ impl OtterBuilder {
         self
     }
 
+    /// Allow the main thread to park in `Atomics.wait`.
+    ///
+    /// Node permits the block; an embedder without a cancellation path
+    /// leaves it off.
+    #[must_use]
+    pub fn allow_blocking_atomics_wait(mut self, allow: bool) -> Self {
+        self.runtime = self.runtime.allow_blocking_atomics_wait(allow);
+        self
+    }
+
     /// Override capability decisions while retaining runtime-level mandatory
     /// filters such as the environment secret denylist.
     #[must_use]

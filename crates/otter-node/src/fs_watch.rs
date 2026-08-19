@@ -341,33 +341,48 @@ fn start_poll(
 
     let delivery = spawner.clone();
     io.spawn(async move {
-        // The stat the poll starts from is the baseline: a caller learns
-        // about the changes after it started watching, not about the state
-        // it already asked for.
-        let mut previous = stat_slots(&path);
+        // The poll reports a change, and what counts as one differs by which
+        // side of the stat succeeded. A first poll that finds nothing is
+        // itself news — the caller asked to be told when the file appears —
+        // while a first poll that succeeds only establishes the baseline.
+        // A repeated failure with the same reason is not news either.
+        let mut stored = [0.0; SLOTS];
+        let mut reported: i32 = 0;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(interval as u64)).await;
-            if !running.load(Ordering::Relaxed) {
+            let poll = match stat_slots(&path) {
+                Err(code) => {
+                    if reported == code {
+                        None
+                    } else {
+                        reported = code;
+                        Some(PollResult {
+                            id,
+                            status: f64::from(code),
+                            current: [0.0; SLOTS],
+                            previous: stored,
+                        })
+                    }
+                }
+                Ok(now) => {
+                    let news = reported != 0 && (reported < 0 || now != stored);
+                    let previous = stored;
+                    stored = now;
+                    reported = 1;
+                    news.then_some(PollResult {
+                        id,
+                        status: 0.0,
+                        current: now,
+                        previous,
+                    })
+                }
+            };
+            if let Some(poll) = poll
+                && !delivery.enqueue_ordered(poll, RuntimeLiveness::Unref).await
+            {
                 return;
             }
-            let current = stat_slots(&path);
-            let changed = match (&previous, &current) {
-                (Some(before), Some(now)) => before != now,
-                (None, None) => false,
-                _ => true,
-            };
-            if !changed {
-                continue;
-            }
-            let status = if current.is_some() { 0.0 } else { UV_ENOENT };
-            let poll = PollResult {
-                id,
-                status,
-                current: current.unwrap_or([0.0; SLOTS]),
-                previous: previous.unwrap_or([0.0; SLOTS]),
-            };
-            previous = current;
-            if !delivery.enqueue_ordered(poll, RuntimeLiveness::Unref).await {
+            tokio::time::sleep(std::time::Duration::from_millis(interval as u64)).await;
+            if !running.load(Ordering::Relaxed) {
                 return;
             }
         }
@@ -380,12 +395,15 @@ fn start_poll(
 /// `getStatsFromBinding` reads.
 const SLOTS: usize = 18;
 
-/// One stat, in the layout the binding hands to JavaScript, or nothing when
-/// the path could not be stat'd.
-fn stat_slots(path: &Path) -> Option<[f64; SLOTS]> {
+/// One stat, in the layout the binding hands to JavaScript, or the uv error
+/// number behind a stat that could not be taken.
+fn stat_slots(path: &Path) -> Result<[f64; SLOTS], i32> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path).ok()?;
-    Some([
+    let metadata = std::fs::metadata(path).map_err(|error| match error.raw_os_error() {
+        Some(errno) => -errno,
+        None => -1,
+    })?;
+    Ok([
         metadata.dev() as f64,
         f64::from(metadata.mode()),
         metadata.nlink() as f64,

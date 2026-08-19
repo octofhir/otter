@@ -385,6 +385,23 @@ fn with_file<R>(
     body(file).map_err(|error| io_failure(&error, syscall, Path::new("")))
 }
 
+/// The buffer and byte offset behind any byte view a caller may hand the
+/// binding. `fs.read` and `fs.write` accept every `ArrayBufferView`, and a
+/// `DataView` is one: taking only typed arrays left a `DataView` write
+/// silently moving zero bytes, which `writeAll` retries forever.
+fn view_buffer(
+    ctx: &mut RuntimeNativeCtx<'_>,
+    value: Option<&RuntimeValue>,
+) -> Option<(otter_vm::binary::JsArrayBuffer, usize)> {
+    let value = value?;
+    let heap = ctx.heap();
+    if let Some(view) = value.as_typed_array(heap) {
+        return Some((view.buffer(heap), view.byte_offset(heap)));
+    }
+    let view = value.as_data_view()?;
+    Some((view.buffer(heap), view.byte_offset(heap)))
+}
+
 fn read_file(
     ctx: &mut RuntimeNativeCtx<'_>,
     args: &[RuntimeValue],
@@ -403,11 +420,10 @@ fn read_file(
         file.read(&mut buffer)
     })?;
     if read > 0
-        && let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap()))
+        && let Some((target, base)) = view_buffer(ctx, args.get(1))
     {
         let heap = ctx.heap_mut();
-        let base = view.byte_offset(heap);
-        view.buffer(heap).with_bytes_mut(heap, |bytes| {
+        target.with_bytes_mut(heap, |bytes| {
             let start = base + offset;
             let end = (start + read).min(bytes.len());
             if start < end {
@@ -428,13 +444,10 @@ fn write_buffer(
     let offset = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as usize;
     let length = args.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as usize;
     let position = args.get(4).and_then(|v| v.as_f64());
-    let bytes = args
-        .get(1)
-        .and_then(|v| v.as_typed_array(ctx.heap()))
-        .map(|view| {
+    let bytes = view_buffer(ctx, args.get(1))
+        .map(|(source, base)| {
             let heap = ctx.heap();
-            let base = view.byte_offset(heap);
-            view.buffer(heap).with_bytes(heap, |bytes| {
+            source.with_bytes(heap, |bytes| {
                 let start = (base + offset).min(bytes.len());
                 let end = (start + length).min(bytes.len());
                 bytes[start..end].to_vec()

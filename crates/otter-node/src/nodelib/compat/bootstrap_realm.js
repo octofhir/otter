@@ -414,8 +414,11 @@ const bindings = {
         Object.getOwnPropertyDescriptor(object, key)?.enumerable === true;
       const out = [];
       if ((filter & 8) === 0) {
-        for (const k of Object.getOwnPropertyNames(object)) {
-          if (/^(?:0|[1-9]\d*)$/.test(k)) continue;
+        // A byte view answers directly: walking its own names would spell
+        // out one string per element before discarding every one of them.
+        const direct = require('internal/otter/natives').ownNonIndexKeys(object);
+        for (const k of direct ?? Object.getOwnPropertyNames(object)) {
+          if (direct === undefined && /^(?:0|[1-9]\d*)$/.test(k)) continue;
           if (keep(k)) out.push(k);
         }
       }

@@ -34,6 +34,9 @@ const kOnExecute = 5;
 const kOnTimeout = 6;
 
 const DEFAULT_MAX_HEADER_SIZE = 16 * 1024;
+// A chunk's size line carries its extensions; llhttp bounds them the same
+// way it bounds a header block, and the server answers 413.
+const MAX_CHUNK_EXTENSIONS_SIZE = 16 * 1024;
 const CRLF = Buffer.from('\r\n');
 
 function parseError(code, reason) {
@@ -81,6 +84,8 @@ class HTTPParser {
     this[kOnMessageComplete] = null;
     this[kOnExecute] = null;
     this[kOnTimeout] = null;
+    // 0 means no cap; `_http_server`/`_http_client` set the real one.
+    this.maxHeaderPairs = 0;
     this._consumed = null;
     this._priorOnread = null;
     this._errored = false;
@@ -348,7 +353,13 @@ class HTTPParser {
       if (!TOKEN.test(name)) {
         return parseError('HPE_INVALID_HEADER_TOKEN', 'Invalid header token');
       }
-      this._rawHeaders.push(name, line.slice(colon + 1).trim());
+      // `maxHeaderPairs` caps how much of the header block is kept — the
+      // rest still parses, it is simply not collected, which is what
+      // `server.maxHeadersCount` bounds.
+      if (this.maxHeaderPairs <= 0 ||
+          this._rawHeaders.length < this.maxHeaderPairs) {
+        this._rawHeaders.push(name, line.slice(colon + 1).trim());
+      }
       return 'more';
     }
     if (state === 'body-length') {
@@ -372,10 +383,13 @@ class HTTPParser {
       const idx = this._lineEnd();
       if (idx instanceof Error) return idx;
       if (idx === -1) {
-        if (this._stash.length > 1024) {
-          return parseError('HPE_INVALID_CHUNK_SIZE', 'Invalid character in chunk size');
+        if (this._stash.length > MAX_CHUNK_EXTENSIONS_SIZE) {
+          return parseError('HPE_CHUNK_EXTENSIONS_OVERFLOW', 'Chunk extensions overflow');
         }
         return 'wait';
+      }
+      if (idx > MAX_CHUNK_EXTENSIONS_SIZE) {
+        return parseError('HPE_CHUNK_EXTENSIONS_OVERFLOW', 'Chunk extensions overflow');
       }
       const line = this._stash.subarray(0, idx).toString('latin1');
       const sizeToken = line.split(';', 1)[0].trim();

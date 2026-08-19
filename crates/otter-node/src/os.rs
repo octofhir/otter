@@ -398,12 +398,219 @@ fn os_cpus(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeErro
 }
 
 fn os_network_interfaces(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    // Minimal: an empty interface map. Sufficient for callers that enumerate
-    // entries; per-interface detail lands when a test requires it.
+    let interfaces = host_network_interfaces();
     ctx.scope(|mut scope| {
         let object = scope.object()?;
+        for (name, addresses) in &interfaces {
+            let list = scope.array(addresses.len())?;
+            for (index, address) in addresses.iter().enumerate() {
+                let entry = scope.object()?;
+                let value = scope.string(&address.address)?;
+                scope.set(entry, "address", value)?;
+                let value = scope.string(&address.netmask)?;
+                scope.set(entry, "netmask", value)?;
+                let value = scope.string(address.family)?;
+                scope.set(entry, "family", value)?;
+                let value = scope.string(&address.mac)?;
+                scope.set(entry, "mac", value)?;
+                let value = scope.boolean(address.internal);
+                scope.set(entry, "internal", value)?;
+                if let Some(scope_id) = address.scope_id {
+                    let value = scope.number(f64::from(scope_id));
+                    scope.set(entry, "scopeid", value)?;
+                }
+                let value = match &address.cidr {
+                    Some(cidr) => scope.string(cidr)?,
+                    None => scope.null(),
+                };
+                scope.set(entry, "cidr", value)?;
+                scope.set_index(list, index, entry)?;
+            }
+            scope.set(object, name, list)?;
+        }
         Ok(scope.finish(object))
     })
+}
+
+/// One address of one interface, in the shape `os.networkInterfaces` reports.
+struct InterfaceAddress {
+    address: String,
+    netmask: String,
+    family: &'static str,
+    mac: String,
+    internal: bool,
+    scope_id: Option<u32>,
+    cidr: Option<String>,
+}
+
+/// Enumerate the host's interfaces, addresses grouped by interface name.
+///
+/// Link-layer entries carry the hardware address rather than an IP one, so
+/// they are folded into the MAC of the interface's IP addresses instead of
+/// being reported as addresses of their own — which is what Node does.
+fn host_network_interfaces() -> Vec<(String, Vec<InterfaceAddress>)> {
+    let mut list: Vec<(String, Vec<InterfaceAddress>)> = Vec::new();
+    let mut macs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with an owned list on success, which
+    // is released by the matching `freeifaddrs` below.
+    if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
+        return list;
+    }
+    let mut current = head;
+    while !current.is_null() {
+        // SAFETY: the loop walks the list `getifaddrs` returned; each node is
+        // live until `freeifaddrs`.
+        let entry = unsafe { &*current };
+        current = entry.ifa_next;
+        if entry.ifa_name.is_null() || entry.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: `ifa_name` is a NUL-terminated string owned by the list.
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: `ifa_addr` points at a `sockaddr` whose family selects the
+        // concrete layout read below.
+        let family = i32::from(unsafe { (*entry.ifa_addr).sa_family });
+        if let Some(mac) = link_layer_mac(entry.ifa_addr, family) {
+            macs.insert(name, mac);
+            continue;
+        }
+        let Some((address, scope_id)) = socket_address_text(entry.ifa_addr, family) else {
+            continue;
+        };
+        let netmask = socket_address_text(entry.ifa_netmask, family)
+            .map(|(text, _)| text)
+            .unwrap_or_default();
+        let prefix = netmask_prefix_length(entry.ifa_netmask, family);
+        let internal = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
+        let address_entry = InterfaceAddress {
+            cidr: prefix.map(|bits| format!("{address}/{bits}")),
+            address,
+            netmask,
+            family: if family == libc::AF_INET6 {
+                "IPv6"
+            } else {
+                "IPv4"
+            },
+            mac: String::new(),
+            internal,
+            scope_id,
+        };
+        match list.iter_mut().find(|(existing, _)| existing == &name) {
+            Some((_, addresses)) => addresses.push(address_entry),
+            None => list.push((name, vec![address_entry])),
+        }
+    }
+    // SAFETY: `head` came from `getifaddrs` and is released exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    for (name, addresses) in &mut list {
+        let mac = macs
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "00:00:00:00:00:00".to_string());
+        for address in addresses.iter_mut() {
+            address.mac.clone_from(&mac);
+        }
+    }
+    list
+}
+
+/// The hardware address of a link-layer entry, if this is one.
+fn link_layer_mac(addr: *const libc::sockaddr, family: i32) -> Option<String> {
+    #[cfg(target_vendor = "apple")]
+    {
+        if family != libc::AF_LINK {
+            return None;
+        }
+        // SAFETY: `AF_LINK` selects the `sockaddr_dl` layout.
+        let link = unsafe { &*addr.cast::<libc::sockaddr_dl>() };
+        let start = link.sdl_nlen as usize;
+        let len = link.sdl_alen as usize;
+        if len == 0 {
+            return Some("00:00:00:00:00:00".to_string());
+        }
+        // `sockaddr_dl` is variable length: the name and the hardware
+        // address follow the header, past the declared `sdl_data` array.
+        // SAFETY: the kernel wrote `sdl_nlen + sdl_alen` bytes there, and
+        // the node is live for the walk.
+        let data = unsafe { std::slice::from_raw_parts(link.sdl_data.as_ptr().add(start), len) };
+        Some(
+            data.iter()
+                .map(|byte| format!("{:02x}", *byte as u8))
+                .collect::<Vec<_>>()
+                .join(":"),
+        )
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        if family != libc::AF_PACKET {
+            return None;
+        }
+        // SAFETY: `AF_PACKET` selects the `sockaddr_ll` layout.
+        let link = unsafe { &*addr.cast::<libc::sockaddr_ll>() };
+        let len = link.sll_halen as usize;
+        if len == 0 {
+            return Some("00:00:00:00:00:00".to_string());
+        }
+        Some(
+            link.sll_addr[..len]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":"),
+        )
+    }
+}
+
+/// Textual address of a `sockaddr`, with the scope id for a link-local v6 one.
+fn socket_address_text(addr: *const libc::sockaddr, family: i32) -> Option<(String, Option<u32>)> {
+    if addr.is_null() {
+        return None;
+    }
+    match family {
+        libc::AF_INET => {
+            // SAFETY: `AF_INET` selects the `sockaddr_in` layout.
+            let v4 = unsafe { &*addr.cast::<libc::sockaddr_in>() };
+            let octets = u32::from_be(v4.sin_addr.s_addr).to_be_bytes();
+            Some((std::net::Ipv4Addr::from(octets).to_string(), None))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: `AF_INET6` selects the `sockaddr_in6` layout.
+            let v6 = unsafe { &*addr.cast::<libc::sockaddr_in6>() };
+            let address = std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr);
+            Some((address.to_string(), Some(v6.sin6_scope_id)))
+        }
+        _ => None,
+    }
+}
+
+/// Prefix length of a netmask, counting its leading one bits.
+fn netmask_prefix_length(addr: *const libc::sockaddr, family: i32) -> Option<u32> {
+    if addr.is_null() {
+        return None;
+    }
+    match family {
+        libc::AF_INET => {
+            // SAFETY: `AF_INET` selects the `sockaddr_in` layout.
+            let v4 = unsafe { &*addr.cast::<libc::sockaddr_in>() };
+            Some(u32::from_be(v4.sin_addr.s_addr).leading_ones())
+        }
+        libc::AF_INET6 => {
+            // SAFETY: `AF_INET6` selects the `sockaddr_in6` layout.
+            let v6 = unsafe { &*addr.cast::<libc::sockaddr_in6>() };
+            let mut bits = 0;
+            for byte in v6.sin6_addr.s6_addr {
+                bits += byte.leading_ones();
+                if byte != 0xff {
+                    break;
+                }
+            }
+            Some(bits)
+        }
+        _ => None,
+    }
 }
 
 fn os_user_info(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

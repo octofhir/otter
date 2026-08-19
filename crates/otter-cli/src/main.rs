@@ -171,6 +171,34 @@ struct Cli {
     #[arg(long = "expose-internals", alias = "expose_internals", global = true)]
     expose_internals: bool,
 
+    /// Largest HTTP header block the parser accepts, in bytes
+    /// (Node's `--max-http-header-size`).
+    #[arg(long = "max-http-header-size", value_name = "bytes", global = true)]
+    max_http_header_size: Option<u32>,
+
+    /// Try the address families of a name in parallel when connecting
+    /// (Node's `--network-family-autoselection`).
+    #[arg(
+        long = "network-family-autoselection",
+        overrides_with = "no_network_family_autoselection",
+        global = true
+    )]
+    network_family_autoselection: bool,
+
+    /// Connect to one address family only
+    /// (Node's `--no-network-family-autoselection`).
+    #[arg(long = "no-network-family-autoselection", global = true)]
+    no_network_family_autoselection: bool,
+
+    /// How long an autoselected family attempt may take, in milliseconds
+    /// (Node's `--network-family-autoselection-attempt-timeout`).
+    #[arg(
+        long = "network-family-autoselection-attempt-timeout",
+        value_name = "ms",
+        global = true
+    )]
+    network_family_autoselection_attempt_timeout: Option<u32>,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
@@ -356,6 +384,25 @@ fn build_path_perm(allow: Option<&str>, deny: Option<&str>) -> Permission<PathBu
             deny_list: parse_paths(deny_list),
         },
     }
+}
+
+/// The node-style option switches this run carries, in `process.execArgv`
+/// spelling. `internal/options` reads them back out of `execArgv`, which is
+/// where a vendored module looks for `--max-http-header-size` and friends.
+fn node_option_switches(cli: &Cli) -> Vec<String> {
+    let mut switches = Vec::new();
+    if let Some(bytes) = cli.max_http_header_size {
+        switches.push(format!("--max-http-header-size={bytes}"));
+    }
+    if cli.no_network_family_autoselection {
+        switches.push("--no-network-family-autoselection".to_string());
+    } else if cli.network_family_autoselection {
+        switches.push("--network-family-autoselection".to_string());
+    }
+    if let Some(ms) = cli.network_family_autoselection_attempt_timeout {
+        switches.push(format!("--network-family-autoselection-attempt-timeout={ms}"));
+    }
+    switches
 }
 
 fn build_string_perm(allow: Option<&str>, deny: Option<&str>) -> Permission<String> {
@@ -606,6 +653,7 @@ async fn main() -> ExitCode {
     // reports the one the caller actually wrote, which is what a
     // flag-checking harness compares against.
     execution.set_flag_spellings(std::env::args().collect());
+    execution.set_node_options(node_option_switches(&cli));
     let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
@@ -1897,7 +1945,12 @@ async fn run_eval(
         .process_argv(argv)
         .build()?;
     startup_timer.mark("runtime_build");
-    let attempt = otter.eval_with_diagnostics(source).await;
+    // `-e`/`-p` is Node's `[eval]` module: the snippet runs in the working
+    // directory's CommonJS scope.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let attempt = otter
+        .eval_in_commonjs_scope_with_diagnostics(source, cwd)
+        .await;
     // See `run_file`: a failed run's 'exit' listener may replace the code.
     let exit_override = attempt.exit_code_override();
     let result = match finish_jit_debug_attempt(execution, attempt) {

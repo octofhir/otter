@@ -373,8 +373,16 @@ impl Interpreter {
         // an ordinary method and overrides that slot (step 20 runs after step
         // 17). Only fill the placeholder here: if the slot already holds a real
         // value, a class element claimed it and must not be clobbered.
-        let placeholder_pending = crate::object::get_own(prototype, &self.gc_heap, "constructor")
-            .is_none_or(|value| value.is_undefined());
+        // The placeholder is a data slot holding `undefined`; an accessor a
+        // class element installed is neither, and reading it as a value
+        // would answer `undefined` and lose the accessor.
+        let placeholder_pending =
+            crate::object::get_own_descriptor(prototype, &self.gc_heap, "constructor").is_none_or(
+                |descriptor| match descriptor.kind {
+                    object::DescriptorKind::Data { value } => value.is_undefined(),
+                    object::DescriptorKind::Accessor { .. } => false,
+                },
+            );
         if placeholder_pending {
             let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
         }

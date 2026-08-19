@@ -5800,6 +5800,18 @@ impl Runtime {
     /// # Errors
     /// See [`OtterError`] variants — compile failures, capability denials, and
     /// errors thrown while loading the module or its dependencies.
+    /// Install the CommonJS scope a `-e`/`-p` snippet runs in: the `[eval]`
+    /// module's own `require`/`module`/`exports` on the global object, and a
+    /// lazy global per builtin module.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub(crate) fn install_commonjs_eval_scope(&mut self, cwd: &Path) -> Result<(), OtterError> {
+        let source = SourceInput::from_javascript(include_str!("eval_scope.js"));
+        self.run_commonjs_file(&cwd.join("[eval]"), source)
+            .map(|_| ())
+    }
+
     pub(crate) fn run_commonjs_file(
         &mut self,
         path: &Path,
@@ -6069,6 +6081,21 @@ impl Otter {
     pub async fn eval_with_diagnostics(&self, source: &str) -> ExecutionAttempt {
         self.handle
             .eval_with_diagnostics(SourceInput::from_javascript(source).with_top_level_await())
+            .await
+    }
+
+    /// Evaluate a snippet inside `cwd`'s CommonJS scope, the way `node -e`
+    /// runs one: `require`, `module` and the builtin modules are in scope.
+    pub async fn eval_in_commonjs_scope_with_diagnostics(
+        &self,
+        source: &str,
+        cwd: std::path::PathBuf,
+    ) -> ExecutionAttempt {
+        self.handle
+            .eval_in_commonjs_scope(
+                SourceInput::from_javascript(source).with_top_level_await(),
+                Some(cwd),
+            )
             .await
     }
 

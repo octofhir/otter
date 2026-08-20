@@ -623,8 +623,10 @@ class ChildProcess extends EventEmitter {
       else process.nextTick(() => this.emit('error', err));
       return false;
     }
-    const prepared = prepareSend(message, sendHandle, options);
-    const accepted = native.ipcSend(this._handle, prepared.text, prepared.fd);
+    const prepared = prepareSend(message, sendHandle, options, this._handle);
+    const accepted = native.ipcSend(this._handle, prepared.text, prepared.fd, prepared.token);
+    // A message that never left takes what it carried with it.
+    if (!accepted && prepared.token !== 0) globalThis.__otterIpcSent(prepared.token);
     if (typeof callback === 'function') {
       // A message the channel would not take says so by name: a caller that
       // knows a closed channel is one of the ways this can end tells that
@@ -746,6 +748,9 @@ class ChildProcess extends EventEmitter {
   // the reader sees the end of the stream when it goes.
   _exited(status, signal) {
     children.delete(this._handle);
+    // A child that has gone hears nothing more, so what was still on its way
+    // to it is let go of.
+    globalThis.__otterIpcSentAll(this._handle);
     // A child that has gone reads nothing more, so the end this side kept of
     // its input is let go of here rather than held for a writer with nowhere
     // to write.
@@ -783,9 +788,14 @@ class ChildProcess extends EventEmitter {
       this.emit(event, inner, handle);
       return;
     }
+    if (kind === 'sent') {
+      globalThis.__otterIpcSent(Number(payload));
+      return;
+    }
     if (!this.connected) return;
     this.connected = false;
     this.channel = null;
+    globalThis.__otterIpcSentAll(this._handle);
     this.emit('disconnect');
   }
 }
@@ -868,6 +878,34 @@ function envelope(message, carried) {
   };
 }
 
+// Messages that have handed something over and are still on their way out.
+// What was handed over is let go of when the message has gone, not when it was
+// written down: until it has crossed, this side is still the only one holding
+// it open.
+const pendingSends = new Map();
+let nextSendToken = 1;
+
+// Let go of what a message carried, now that the message has left.
+globalThis.__otterIpcSent = function sent(token) {
+  const pending = pendingSends.get(token);
+  if (pending === undefined) return;
+  pendingSends.delete(token);
+  if (pending.carried.keepOpen) return;
+  const handle = pending.carried.handle;
+  if (handle !== undefined && handle !== null) {
+    try { handle.close(); } catch { /* already gone */ }
+  }
+};
+
+// A channel that has gone carries nothing further: what was still on its way
+// out is let go of here, or it would be held open for a crossing that will
+// never happen.
+globalThis.__otterIpcSentAll = function sentAll(owner) {
+  for (const [token, pending] of [...pendingSends]) {
+    if (pending.owner === owner) globalThis.__otterIpcSent(token);
+  }
+};
+
 // A sent connection is a connection this side no longer has: the peer owns
 // it now, and two readers on one socket would race for its bytes.
 function detachSent(carried) {
@@ -882,8 +920,11 @@ function detachSent(carried) {
   }
   socket._handle = null;
   if (typeof socket.setTimeout === 'function') socket.setTimeout(0);
+  // Reading stops at once — the bytes are the peer's from here on — but the
+  // descriptor itself is held until the message carrying it has crossed.
   handle.onread = null;
-  try { handle.close(); } catch { /* already gone */ }
+  handle.reading = false;
+  if (typeof handle.readStop === 'function') handle.readStop();
 }
 
 // A duplicate made for a crossing that never happened is closed here rather
@@ -914,7 +955,7 @@ function validateSendArguments(sendHandle, options) {
 // The text and descriptor one message crosses as. A sent connection is
 // detached here rather than on the acknowledgement: the duplicate already
 // holds the socket open, so this side has nothing left to keep.
-function prepareSend(message, sendHandle, options) {
+function prepareSend(message, sendHandle, options, owner = 0) {
   validateSendArguments(sendHandle, options);
   const carried = describeHandle(sendHandle, options);
   let text;
@@ -928,8 +969,11 @@ function prepareSend(message, sendHandle, options) {
     if (carried !== null) closeSent(carried);
     throw invalidArgType('message', 'one of type string, object, number, or boolean', message);
   }
-  if (carried !== null) detachSent(carried);
-  return { text, fd: carried === null ? -1 : carried.fd };
+  if (carried === null) return { text, fd: -1, token: 0 };
+  detachSent(carried);
+  const token = nextSendToken++;
+  pendingSends.set(token, { carried, owner });
+  return { text, fd: carried.fd, token };
 }
 
 // The other end: what arrived becomes the kind the sender named.
@@ -1312,6 +1356,6 @@ Object.defineProperty(globalThis, '__otterChildIpc', { enumerable: false });
 // through these hooks.
 globalThis.__otterIpcPrepareSend = prepareSend;
 globalThis.__otterIpcDeliver = unwrap;
-for (const name of ['__otterIpcPrepareSend', '__otterIpcDeliver']) {
+for (const name of ['__otterIpcPrepareSend', '__otterIpcDeliver', '__otterIpcSent', '__otterIpcSentAll']) {
   Object.defineProperty(globalThis, name, { enumerable: false });
 }

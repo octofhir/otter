@@ -112,7 +112,10 @@ function fileURLToPath(input, options) {
   const windows = options && options.windows !== undefined ? Boolean(options.windows) :
     (typeof process !== 'undefined' && process.platform === 'win32');
   if (!windows && url.hostname && url.hostname !== 'localhost') {
-    const error = new TypeError('File URL host must be empty or localhost');
+    // The message names the platform, the way every error of this family
+    // does: a host is allowed on Windows and nowhere else.
+    const error = new TypeError(
+      `File URL host must be "localhost" or empty on ${process.platform}`);
     error.code = 'ERR_INVALID_FILE_URL_HOST';
     throw error;
   }

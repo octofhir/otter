@@ -228,7 +228,10 @@ fn file_url_to_path_string(input: &str) -> Result<String, NativeError> {
     } else {
         return Err(NativeError::TypeError {
             name: "fileURLToPath",
-            reason: "File URL host must be empty or localhost".to_string(),
+            reason: format!(
+                "File URL host must be \"localhost\" or empty on {}",
+                otter_runtime::node_platform()
+            ),
         });
     };
     percent_decode_path(&path)

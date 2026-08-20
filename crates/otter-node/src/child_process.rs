@@ -323,7 +323,9 @@ fn spawn_start(
         .map(|value| read_string_array(ctx, value))
         .unwrap_or_default();
     let opts = args.get(2).copied();
-    let cwd = opt_string(ctx, opts, "cwd");
+    // A directory named as nothing is not a directory to change to; the child
+    // starts where this process is.
+    let cwd = opt_string(ctx, opts, "cwd").filter(|dir| !dir.is_empty());
     let argv0 = opt_string(ctx, opts, "argv0");
     let env = opt_env(ctx, opts)?;
     let wants_channel = opt_flag(ctx, opts, "ipc");
@@ -384,11 +386,11 @@ fn spawn_start(
     // handing a child an extra descriptor is doing.
     let plans = match stdio_plans(ctx, opts) {
         Ok(plans) => plans,
-        Err(error) => return spawn_error_result(ctx, &command, &error),
+        Err(error) => return spawn_error_result(ctx, &command, &error, &[]),
     };
     let wired = match wire_stdio(&mut cmd, plans) {
         Ok(wired) => wired,
-        Err(error) => return spawn_error_result(ctx, &command, &error),
+        Err(error) => return spawn_error_result(ctx, &command, &error, &[]),
     };
     let ours: Vec<std::os::fd::RawFd> = wired.kept.iter().map(fd_number).collect();
 
@@ -398,7 +400,15 @@ fn spawn_start(
     drop(wired.theirs);
     let child = match spawned {
         Ok(child) => child,
-        Err(err) => return spawn_error_result(ctx, &command, &err),
+        Err(err) => {
+            // A launch that failed still leaves the caller with the streams it
+            // asked for: they end at once, because the other end of each went
+            // with the child that never was.
+            for fd in wired.kept.into_iter().flatten() {
+                let _ = std::os::fd::IntoRawFd::into_raw_fd(fd);
+            }
+            return spawn_error_result(ctx, &command, &err, &ours);
+        }
     };
     let pid = child.id();
     // The ends this process kept are handed to the program, which carries them
@@ -805,7 +815,9 @@ fn spawn_sync_raw(
         .map(|v| read_string_array(ctx, v))
         .unwrap_or_default();
     let opts = args.get(2).copied();
-    let cwd = opt_string(ctx, opts, "cwd");
+    // A directory named as nothing is not a directory to change to; the child
+    // starts where this process is.
+    let cwd = opt_string(ctx, opts, "cwd").filter(|dir| !dir.is_empty());
     let input = opt_string(ctx, opts, "input");
     let argv0 = opt_string(ctx, opts, "argv0");
     let kill_signal = opt_string(ctx, opts, "killSignal").unwrap_or_else(|| "SIGTERM".to_string());
@@ -833,24 +845,24 @@ fn spawn_sync_raw(
     // else was asked for — it has to arrive somewhere.
     let mut plans = match stdio_plans(ctx, opts) {
         Ok(plans) => plans,
-        Err(error) => return spawn_error_result(ctx, &command, &error),
+        Err(error) => return spawn_error_result(ctx, &command, &error, &[]),
     };
     if input.is_some() && !matches!(plans.first(), Some(StdioPlan::Pipe { .. })) {
         match open_pipe(0) {
             Ok(pipe) => plans[0] = pipe,
-            Err(error) => return spawn_error_result(ctx, &command, &error),
+            Err(error) => return spawn_error_result(ctx, &command, &error, &[]),
         }
     }
     let wired = match wire_stdio(&mut cmd, plans) {
         Ok(wired) => wired,
-        Err(error) => return spawn_error_result(ctx, &command, &error),
+        Err(error) => return spawn_error_result(ctx, &command, &error, &[]),
     };
 
     let spawn_result = cmd.spawn();
     drop(wired.theirs);
     let mut child = match spawn_result {
         Ok(child) => child,
-        Err(err) => return spawn_error_result(ctx, &command, &err),
+        Err(err) => return spawn_error_result(ctx, &command, &err, &[]),
     };
     let pid = child.id();
 
@@ -902,7 +914,7 @@ fn spawn_sync_raw(
     let (stdout, stderr) = streams.finish(cap);
     let Some(status) = status else {
         let err = std::io::Error::other("child could not be waited for");
-        return spawn_error_result(ctx, &command, &err);
+        return spawn_error_result(ctx, &command, &err, &[]);
     };
 
     let status_code = status.code();
@@ -1125,6 +1137,7 @@ fn spawn_error_result(
     ctx: &mut NativeCtx<'_>,
     command: &str,
     err: &std::io::Error,
+    streams: &[std::os::fd::RawFd],
 ) -> Result<Value, NativeError> {
     let code = if err.kind() == std::io::ErrorKind::NotFound {
         "ENOENT"
@@ -1145,6 +1158,12 @@ fn spawn_error_result(
         scope.set(object, "error", error)?;
         let error_code = scope.string(code)?;
         scope.set(object, "errorCode", error_code)?;
+        let list = scope.array(streams.len())?;
+        for (slot, fd) in streams.iter().enumerate() {
+            let value = scope.number(f64::from(*fd));
+            scope.set_index(list, slot, value)?;
+        }
+        scope.set(object, "stdio", list)?;
         Ok(scope.finish(object))
     })
 }

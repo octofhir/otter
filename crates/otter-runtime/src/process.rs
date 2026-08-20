@@ -1579,7 +1579,10 @@ fn number_to_i64(value: &Value) -> Option<i64> {
     }
 }
 
-fn node_platform() -> &'static str {
+/// The name this platform answers to, as a program launched on it expects to
+/// read it back.
+#[must_use]
+pub fn node_platform() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",

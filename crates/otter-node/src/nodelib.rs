@@ -95,7 +95,10 @@ nodelib_module!(internal_options, "internal/options", compat "nodelib/compat/int
 nodelib_module!(internal_deps_undici, "internal/deps/undici/undici", compat "nodelib/compat/internal_deps_undici.js");
 nodelib_module!(internal_events_abort_listener, "internal/events/abort_listener", compat "nodelib/compat/internal_events_abort_listener.js");
 nodelib_module!(internal_abort_controller, "internal/abort_controller", compat "nodelib/compat/internal_abort_controller.js");
-nodelib_module!(internal_webstreams_adapters, "internal/webstreams/adapters", compat "nodelib/compat/internal_webstreams_adapters.js");
+nodelib_module!(internal_webstreams_adapters, "internal/webstreams/adapters", vendored "nodelib/internal/webstreams/adapters.js");
+nodelib_module!(internal_webstreams_readablestream, "internal/webstreams/readablestream", compat "nodelib/compat/internal_webstreams_readablestream.js");
+nodelib_module!(internal_webstreams_writablestream, "internal/webstreams/writablestream", compat "nodelib/compat/internal_webstreams_writablestream.js");
+nodelib_module!(internal_webstreams_queuingstrategies, "internal/webstreams/queuingstrategies", compat "nodelib/compat/internal_webstreams_queuingstrategies.js");
 nodelib_module!(internal_event_target, "internal/event_target", compat "nodelib/compat/internal_event_target.js");
 nodelib_module!(internal_v8_startup_snapshot, "internal/v8/startup_snapshot", compat "nodelib/compat/internal_v8_startup_snapshot.js");
 nodelib_module!(internal_modules_helpers, "internal/modules/helpers", compat "nodelib/compat/internal_modules_helpers.js");

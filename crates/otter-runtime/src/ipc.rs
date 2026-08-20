@@ -26,6 +26,8 @@
 //! # See also
 //! - [`crate::process_ipc`] — the `process` members a joined child gets.
 
+#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,15 +40,23 @@ pub const CHANNEL_VAR: &str = "OTTER_CHANNEL";
 
 /// What arrives on a channel.
 pub enum IpcEvent {
-    /// A message the peer sent, as the text the sender encoded.
-    Message(String),
+    /// A message the peer sent, as the text the sender encoded, together
+    /// with any open files it carried.
+    Message(String, Vec<RawFd>),
     /// The peer is gone; nothing further will arrive.
     Closed,
 }
 
+/// A message on its way out, with the open files it carries.
+#[cfg(unix)]
+pub struct OutgoingFrame {
+    bytes: Vec<u8>,
+    handles: Vec<RawFd>,
+}
+
 /// One end of a channel.
 pub struct IpcChannel {
-    outgoing: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    outgoing: Mutex<Option<tokio::sync::mpsc::UnboundedSender<OutgoingFrame>>>,
     /// Shared with the task carrying the channel: whichever of the two ends it
     /// first — this side disconnecting, or the peer going away — releases the
     /// hold, so a process is never kept running by a channel nobody is on.
@@ -188,8 +198,11 @@ impl IpcChannel {
     fn new(
         spawner: &RuntimeTaskSpawner,
         address: Option<PathBuf>,
-    ) -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
-        let (outgoing, queued) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
+    ) {
+        let (outgoing, queued) = tokio::sync::mpsc::unbounded_channel::<OutgoingFrame>();
         // An open channel is a reason to keep running only while the program
         // is listening to it, which it says by referencing the channel. A
         // process that never asks for a message must be free to finish.
@@ -232,6 +245,16 @@ impl IpcChannel {
     /// Queue one message. Answers whether it was accepted; a disconnected
     /// channel accepts nothing.
     pub fn send(&self, payload: &str) -> bool {
+        self.send_with_handles(payload, Vec::new())
+    }
+
+    /// Send one message together with the open files it carries.
+    ///
+    /// The descriptors ride the same datagram as the message's first byte, so
+    /// the peer can tell which message they belong to without a protocol of
+    /// their own.
+    #[must_use]
+    pub fn send_with_handles(&self, payload: &str, handles: Vec<RawFd>) -> bool {
         if !self.connected() {
             return false;
         }
@@ -242,9 +265,14 @@ impl IpcChannel {
         frame.extend_from_slice(&length.to_le_bytes());
         frame.extend_from_slice(payload.as_bytes());
         let queue = self.outgoing.lock().unwrap_or_else(|p| p.into_inner());
-        queue
-            .as_ref()
-            .is_some_and(|outgoing| outgoing.send(frame).is_ok())
+        queue.as_ref().is_some_and(|outgoing| {
+            outgoing
+                .send(OutgoingFrame {
+                    bytes: frame,
+                    handles,
+                })
+                .is_ok()
+        })
     }
 
     /// Close this end. Messages already queued are still written, then the peer
@@ -278,7 +306,7 @@ impl Drop for IpcChannel {
 #[cfg(unix)]
 async fn carry<T, F>(
     stream: tokio::net::UnixStream,
-    mut queued: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut queued: tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
     connected: Arc<AtomicBool>,
     keep_alive: Arc<Mutex<Option<RuntimeKeepAlive>>>,
     spawner: RuntimeTaskSpawner,
@@ -292,7 +320,13 @@ async fn carry<T, F>(
     // channel, so the writer task owns it and nothing else holds it.
     tokio::spawn(async move {
         while let Some(frame) = queued.recv().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
+            let outcome = write_frame(&mut writer, &frame.bytes, &frame.handles).await;
+            // The peer has its own copies now; these were duplicated for the
+            // crossing and are this side's to close.
+            for handle in &frame.handles {
+                let _ = nix::unistd::close(*handle);
+            }
+            if outcome.is_err() {
                 return;
             }
         }
@@ -317,19 +351,43 @@ async fn read_loop<T, F>(
 {
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 8192];
+    // Descriptors arrive with the byte their sender attached them to, which
+    // is the first byte of the message that carries them. Remembering where
+    // in the stream that byte fell is what pairs them with that message and
+    // no other.
+    let mut arrived: std::collections::VecDeque<(u64, RawFd)> = std::collections::VecDeque::new();
+    let mut consumed: u64 = 0;
     loop {
         if stream.readable().await.is_err() {
             break;
         }
-        match stream.try_read(&mut chunk) {
-            Ok(0) => break,
-            Ok(length) => pending.extend_from_slice(&chunk[..length]),
+        let read = match receive_with_fds(stream, &mut chunk) {
+            Ok((0, _)) => break,
+            Ok((length, handles)) => {
+                let offset = consumed + pending.len() as u64;
+                for handle in handles {
+                    arrived.push_back((offset, handle));
+                }
+                length
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => break,
-        }
-        while let Some(payload) = take_frame(&mut pending) {
+        };
+        pending.extend_from_slice(&chunk[..read]);
+        while let Some((payload, frame_len)) = take_frame_sized(&mut pending) {
+            let end = consumed + frame_len as u64;
+            let mut handles = Vec::new();
+            while arrived.front().is_some_and(|(offset, _)| *offset < end) {
+                if let Some((_, handle)) = arrived.pop_front() {
+                    handles.push(handle);
+                }
+            }
+            consumed = end;
             if spawner
-                .enqueue(deliver(IpcEvent::Message(payload)), RuntimeLiveness::Unref)
+                .enqueue(
+                    deliver(IpcEvent::Message(payload, handles)),
+                    RuntimeLiveness::Unref,
+                )
                 .is_err()
             {
                 return;
@@ -343,18 +401,96 @@ async fn read_loop<T, F>(
 async fn write_frame(
     stream: &mut tokio::net::unix::OwnedWriteHalf,
     frame: &[u8],
+    handles: &[RawFd],
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    stream.write_all(frame).await
+    if handles.is_empty() {
+        return stream.write_all(frame).await;
+    }
+    // The descriptors go with the frame's first byte; the rest of the frame
+    // follows as ordinary bytes on the same stream, so the peer pairs them
+    // by position.
+    loop {
+        stream.writable().await?;
+        match stream.as_ref().try_io(tokio::io::Interest::WRITABLE, || {
+            send_with_fds(stream, &frame[..1], handles)
+        }) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    stream.write_all(&frame[1..]).await
 }
 
-/// Split off the first whole message, if the buffer holds one yet.
+/// `sendmsg` with the descriptors in an `SCM_RIGHTS` control message.
+#[cfg(unix)]
+fn send_with_fds(
+    stream: &tokio::net::unix::OwnedWriteHalf,
+    bytes: &[u8],
+    handles: &[RawFd],
+) -> std::io::Result<usize> {
+    use std::io::IoSlice;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let control = [nix::sys::socket::ControlMessage::ScmRights(handles)];
+    let iov = [IoSlice::new(bytes)];
+    nix::sys::socket::sendmsg::<()>(
+        stream.as_ref().as_fd().as_raw_fd(),
+        &iov,
+        &control,
+        nix::sys::socket::MsgFlags::empty(),
+        None,
+    )
+    .map_err(std::io::Error::from)
+}
+
+/// `recvmsg` that also collects any descriptors the peer attached.
+#[cfg(unix)]
+fn receive_with_fds(
+    stream: &tokio::net::unix::OwnedReadHalf,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, Vec<RawFd>)> {
+    use std::io::IoSliceMut;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    // The read goes through tokio's readiness bookkeeping, which a bare
+    // `recvmsg` would bypass: an unconsumed readiness flag turns the loop
+    // into a spin that starves every other task on the runtime.
+    stream.as_ref().try_io(tokio::io::Interest::READABLE, || {
+        let mut iov = [IoSliceMut::new(buffer)];
+        let mut space = nix::cmsg_space!([RawFd; MAX_HANDLES_PER_MESSAGE]);
+        let received = nix::sys::socket::recvmsg::<()>(
+            stream.as_ref().as_fd().as_raw_fd(),
+            &mut iov,
+            Some(&mut space),
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let mut handles = Vec::new();
+        for message in received.cmsgs().map_err(std::io::Error::from)? {
+            if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = message {
+                handles.extend(fds);
+            }
+        }
+        Ok((received.bytes, handles))
+    })
+}
+
+/// The most descriptors one message may carry.
+#[cfg(unix)]
+const MAX_HANDLES_PER_MESSAGE: usize = 4;
+
+/// Split off the first whole message, if the buffer holds one yet, and say
+/// how many bytes it occupied.
 ///
-/// A message is its byte length followed by its text, so a reader never has to
-/// guess where one ends — which a delimiter would force it to do, and which
-/// would then constrain what a message may contain.
-fn take_frame(buffer: &mut Vec<u8>) -> Option<String> {
+/// A message is its byte length followed by its text, so a reader never has
+/// to guess where one ends — which a delimiter would force it to do, and
+/// which would then constrain what a message may contain. The size is what
+/// pairs a message with the descriptors that arrived inside it.
+fn take_frame_sized(buffer: &mut Vec<u8>) -> Option<(String, usize)> {
     if buffer.len() < 4 {
         return None;
     }
@@ -364,12 +500,12 @@ fn take_frame(buffer: &mut Vec<u8>) -> Option<String> {
     }
     let payload = String::from_utf8(buffer[4..4 + length].to_vec()).ok();
     buffer.drain(..4 + length);
-    payload
+    payload.map(|text| (text, 4 + length))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::take_frame;
+    use super::take_frame_sized;
 
     fn frame(payload: &str) -> Vec<u8> {
         let mut bytes = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
@@ -382,7 +518,7 @@ mod tests {
         let whole = frame("hello");
         for split in 0..whole.len() {
             let mut buffer = whole[..split].to_vec();
-            assert!(take_frame(&mut buffer).is_none(), "split at {split}");
+            assert!(take_frame_sized(&mut buffer).is_none(), "split at {split}");
             assert_eq!(buffer.len(), split);
         }
     }
@@ -393,10 +529,25 @@ mod tests {
         for payload in ["one", "", "three"] {
             buffer.extend_from_slice(&frame(payload));
         }
-        assert_eq!(take_frame(&mut buffer).as_deref(), Some("one"));
-        assert_eq!(take_frame(&mut buffer).as_deref(), Some(""));
-        assert_eq!(take_frame(&mut buffer).as_deref(), Some("three"));
-        assert!(take_frame(&mut buffer).is_none());
+        assert_eq!(
+            take_frame_sized(&mut buffer)
+                .map(|(text, _)| text)
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            take_frame_sized(&mut buffer)
+                .map(|(text, _)| text)
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            take_frame_sized(&mut buffer)
+                .map(|(text, _)| text)
+                .as_deref(),
+            Some("three")
+        );
+        assert!(take_frame_sized(&mut buffer).is_none());
         assert!(buffer.is_empty());
     }
 
@@ -404,7 +555,12 @@ mod tests {
     fn a_message_may_contain_anything_a_delimiter_would_have_claimed() {
         let payload = "{\"line\":\"a\\nb\",\"nul\":\"\\u0000\"}\n\n";
         let mut buffer = frame(payload);
-        assert_eq!(take_frame(&mut buffer).as_deref(), Some(payload));
+        assert_eq!(
+            take_frame_sized(&mut buffer)
+                .map(|(text, _)| text)
+                .as_deref(),
+            Some(payload)
+        );
         assert!(buffer.is_empty());
     }
 }

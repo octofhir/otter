@@ -244,7 +244,14 @@ class ChildProcess extends EventEmitter {
     if (!this.killed) this.kill('SIGTERM');
   }
 
-  send(message, callback) {
+  send(message, sendHandle, options, callback) {
+    // Node's argument shuffle: everything after the message is optional and
+    // a function anywhere in it is the callback.
+    if (typeof sendHandle === 'function') {
+      callback = sendHandle; sendHandle = undefined; options = undefined;
+    } else if (typeof options === 'function') {
+      callback = options; options = undefined;
+    }
     if (arguments.length === 0) {
       const err = new TypeError('The "message" argument must be specified');
       err.code = 'ERR_MISSING_ARGS';
@@ -267,7 +274,7 @@ class ChildProcess extends EventEmitter {
       throw invalidArgType(
         'message', 'one of type string, object, number, boolean, or null', message);
     }
-    const accepted = native.ipcSend(this._handle, payload);
+    const accepted = native.ipcSend(this._handle, payload, handleFd(sendHandle));
     if (typeof callback === 'function') {
       setTimeout(() => callback(accepted ? null : new Error('Channel closed')), 0);
     }
@@ -360,12 +367,17 @@ class ChildProcess extends EventEmitter {
     setTimeout(() => this.emit('close', status, signal), 0);
   }
 
-  _channelEvent(kind, payload) {
+  _channelEvent(kind, payload, handleFdIn) {
     if (kind === 'message') {
       let message;
       try {
         message = JSON.parse(payload);
       } catch {
+        return;
+      }
+      const received = adoptHandle(handleFdIn);
+      if (received !== undefined) {
+        this.emit(isInternal(message) ? 'internalMessage' : 'message', message, received);
         return;
       }
       // A module built on the channel coordinates with its peer over the same
@@ -394,11 +406,44 @@ globalThis.__otterChildExit = function exited(handle, status, signal) {
   child._exited(status, signal);
 };
 
-globalThis.__otterChildIpc = function channelEvent(handle, kind, payload) {
+globalThis.__otterChildIpc = function channelEvent(handle, kind, payload, handleFdIn) {
   const child = children.get(handle);
   if (child === undefined) return;
-  child._channelEvent(kind, payload);
+  child._channelEvent(kind, payload, handleFdIn);
 };
+
+
+// A socket or server crosses the channel as a duplicate of its descriptor.
+// `undefined` means the message carries nothing but itself.
+function handleFd(sendHandle) {
+  if (sendHandle === undefined || sendHandle === null) return -1;
+  const inner = sendHandle._handle ?? sendHandle;
+  // A connection names itself by the id the host carries it under; a server
+  // names itself by its listener's.
+  const id = typeof inner?.fd === 'number' && inner.fd !== -1
+    ? inner.fd
+    : inner?._serverId;
+  if (typeof id !== 'number' || id === -1) return -1;
+  return netNative().dupFd(id);
+}
+
+// The other end: a descriptor becomes the socket the receiver is handed.
+function adoptHandle(fd) {
+  if (typeof fd !== 'number' || fd < 0) return undefined;
+  const id = netNative().adoptFd(fd);
+  if (id < 0) return undefined;
+  const net = require('net');
+  return new net.Socket({ handle: makeAdoptedHandle(id), readable: true, writable: true });
+}
+
+function netNative() {
+  return require('internal/otter/net');
+}
+
+function makeAdoptedHandle(id) {
+  const { TCP } = require('internal/otter/tcp_wrap');
+  return TCP.adopt(id);
+}
 
 function spawn(command, args, options) {
   const n = normalizeArgs(command, args, options);
@@ -477,3 +522,8 @@ module.exports = {
 Object.defineProperty(globalThis, '__otterChildExit', { enumerable: false });
 Object.defineProperty(globalThis, '__otterChildStdio', { enumerable: false });
 Object.defineProperty(globalThis, '__otterChildIpc', { enumerable: false });
+
+// The other end of the same crossing: a descriptor that arrives on this
+// process's own channel becomes the socket its `message` listener is handed.
+globalThis.__otterIpcAdoptHandle = adoptHandle;
+Object.defineProperty(globalThis, '__otterIpcAdoptHandle', { enumerable: false });

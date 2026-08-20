@@ -47,6 +47,15 @@ class SendWrap {
 }
 
 class UDP {
+  // A bound socket that arrived over a channel is already carried by the
+  // host; this is the handle that stands for it here.
+  static adopt(id) {
+    const handle = new UDP();
+    handle.fd = id;
+    handles.set(id, handle);
+    return handle;
+  }
+
   constructor() {
     this.fd = -1;
     this.type = 'udp4';
@@ -147,6 +156,7 @@ class UDP {
   recvStart() {
     if (this.fd === -1) return uvCode('EBADF');
     this.reading = true;
+    native.setReading?.(this.fd, true);
     if (this._parked.length > 0) {
       const parked = this._parked;
       this._parked = [];
@@ -157,6 +167,7 @@ class UDP {
 
   recvStop() {
     this.reading = false;
+    native.setReading?.(this.fd, false);
     return 0;
   }
 

@@ -417,19 +417,39 @@ globalThis.__otterChildIpc = function channelEvent(handle, kind, payload, handle
 // `undefined` means the message carries nothing but itself.
 function handleFd(sendHandle) {
   if (sendHandle === undefined || sendHandle === null) return -1;
-  const inner = sendHandle._handle ?? sendHandle;
+  const inner = dgramHandleOf(sendHandle) ?? sendHandle._handle ?? sendHandle;
   // A connection names itself by the id the host carries it under; a server
   // names itself by its listener's.
   const id = typeof inner?.fd === 'number' && inner.fd !== -1
     ? inner.fd
     : inner?._serverId;
   if (typeof id !== 'number' || id === -1) return -1;
-  return netNative().dupFd(id);
+  // A datagram socket lives in its own table, so it is asked for its own
+  // duplicate.
+  const fd = inner instanceof require('internal/otter/udp_wrap').UDP
+    ? require('internal/otter/dgram').dupFd(id)
+    : netNative().dupFd(id);
+  return fd;
+}
+
+// `dgram` keeps its handle behind a private symbol rather than on `_handle`,
+// so the module that owns that symbol is the one asked for it.
+function dgramHandleOf(value) {
+  const { kStateSymbol } = require('internal/dgram');
+  return value?.[kStateSymbol]?.handle;
 }
 
 // The other end: a descriptor becomes the socket the receiver is handed.
 function adoptHandle(fd) {
   if (typeof fd !== 'number' || fd < 0) return undefined;
+  // The descriptor says what it is; the kernel is the one that knows.
+  const kind = netNative().socketKind(fd);
+  if (kind === 2) {
+    const id = require('internal/otter/dgram').adoptFd(fd);
+    if (id < 0) return undefined;
+    const { UDP } = require('internal/otter/udp_wrap');
+    return UDP.adopt(id);
+  }
   const id = netNative().adoptFd(fd);
   if (id < 0) return undefined;
   const net = require('net');

@@ -34,6 +34,12 @@ use otter_runtime::{
 struct SocketEntry {
     socket: Arc<tokio::net::UdpSocket>,
     keep_alive: Option<RuntimeKeepAlive>,
+    /// Whether this process is the one taking this socket's datagrams. A
+    /// socket held only to be shared with another process must leave them in
+    /// the kernel for whoever is reading.
+    reading: Arc<std::sync::atomic::AtomicBool>,
+    /// Woken when `reading` turns on, so the loop does not poll for it.
+    resumed: Arc<tokio::sync::Notify>,
 }
 
 type SocketTable = Arc<Mutex<HashMap<u32, SocketEntry>>>;
@@ -205,7 +211,193 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "resolve", resolve)?;
+
+    // A bound socket can cross a channel to another process. What crosses is
+    // a duplicate of the descriptor, so this process keeps its own.
+    let dup_sockets = sockets.clone();
+    let dup_fd = scope.native_closure(
+        "dupFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            use std::os::fd::AsRawFd;
+            let id = handle_arg(args, 0);
+            let raw = dup_sockets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&id)
+                .map(|entry| entry.socket.as_raw_fd());
+            let Some(raw) = raw else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            // SAFETY: `raw` names a descriptor this table owns and keeps open
+            // for the duration of the call; `dup` only reads it.
+            let copy = unsafe { libc::dup(raw) };
+            Ok(RuntimeValue::number_i32(copy))
+        },
+    )?;
+    scope.set(object, "dupFd", dup_fd)?;
+
+    // Taking datagrams is something a process asks for. One that holds a
+    // socket only to hand it to another must leave them in the kernel.
+    let reading_sockets = sockets.clone();
+    let set_reading = scope.native_closure(
+        "setReading",
+        2,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let id = handle_arg(args, 0);
+            let wanted = args
+                .get(1)
+                .and_then(|value| value.as_boolean())
+                .unwrap_or(true);
+            let table = reading_sockets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = table.get(&id) {
+                entry.reading.store(wanted, Ordering::Relaxed);
+                if wanted {
+                    // A stored permit, not a broadcast: the loop may not have
+                    // parked yet, and a wake it never sees is a socket that
+                    // never reads.
+                    entry.resumed.notify_one();
+                }
+            }
+            Ok(RuntimeValue::undefined())
+        },
+    )?;
+    scope.set(object, "setReading", set_reading)?;
+
+    let adopt_sockets = sockets.clone();
+    let adopt_ids = next_id.clone();
+    let adopt_spawner = spawner.clone();
+    let adopt_fd = scope.native_closure(
+        "adoptFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            let Some(spawner) = adopt_spawner.as_ref() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            if raw < 0 {
+                return Ok(RuntimeValue::number_i32(-1));
+            }
+            // SAFETY: the descriptor arrived from the channel, which handed
+            // ownership over with it; nothing else in this process holds it.
+            let std_socket =
+                unsafe { <std::net::UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            if std_socket.set_nonblocking(true).is_err() {
+                return Ok(RuntimeValue::number_i32(-1));
+            }
+            Ok(adopt_udp(&adopt_sockets, &adopt_ids, spawner, std_socket)
+                .map_or(RuntimeValue::number_i32(-1), |id| {
+                    RuntimeValue::number_i32(id as i32)
+                }))
+        },
+    )?;
+    scope.set(object, "adoptFd", adopt_fd)?;
     Ok(object)
+}
+
+/// Carry one bound socket's datagrams onto the isolate thread until it closes.
+fn spawn_receive_loop(
+    id: u32,
+    socket: Arc<tokio::net::UdpSocket>,
+    sockets: SocketTable,
+    spawner: RuntimeTaskSpawner,
+    io: &tokio::runtime::Handle,
+    reading: Arc<std::sync::atomic::AtomicBool>,
+    resumed: Arc<tokio::sync::Notify>,
+) {
+    io.spawn(async move {
+        let mut buffer = vec![0u8; 65_536];
+        loop {
+            while !reading.load(Ordering::Relaxed) {
+                let still_open = sockets
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&id);
+                if !still_open {
+                    return;
+                }
+                resumed.notified().await;
+            }
+            let received = socket.recv_from(&mut buffer).await;
+            let still_open = sockets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&id);
+            if !still_open {
+                return;
+            }
+            match received {
+                Ok((length, from)) => {
+                    let datagram = Datagram {
+                        id,
+                        payload: buffer[..length].to_vec(),
+                        address: address_text(&from),
+                        port: from.port(),
+                        family: if from.is_ipv4() { "IPv4" } else { "IPv6" },
+                    };
+                    // Ordered delivery retries on backpressure: a bounded
+                    // inbox that dropped would silently lose datagrams the
+                    // kernel had already handed over.
+                    if !spawner
+                        .enqueue_ordered(datagram, RuntimeLiveness::Unref)
+                        .await
+                    {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// Take a bound UDP socket over and start carrying its datagrams.
+fn adopt_udp(
+    sockets: &SocketTable,
+    next_id: &Arc<AtomicU32>,
+    spawner: &RuntimeTaskSpawner,
+    std_socket: std::net::UdpSocket,
+) -> Option<u32> {
+    let io = spawner.io_handle()?;
+    // `from_std` registers with the reactor and needs the runtime in scope.
+    let socket = {
+        let _guard = io.enter();
+        Arc::new(tokio::net::UdpSocket::from_std(std_socket).ok()?)
+    };
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let reading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resumed = Arc::new(tokio::sync::Notify::new());
+    sockets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            id,
+            SocketEntry {
+                socket: socket.clone(),
+                keep_alive: Some(keep_alive),
+                reading: reading.clone(),
+                resumed: resumed.clone(),
+            },
+        );
+    spawn_receive_loop(
+        id,
+        socket,
+        sockets.clone(),
+        spawner.clone(),
+        &io,
+        reading,
+        resumed,
+    );
+    Some(id)
 }
 
 /// Names the shim may pass to `setOption`, paired with what each one does.
@@ -522,6 +714,8 @@ fn bind_socket(
     // A bound socket is work the program is waiting on, so it holds the loop
     // open the way a pending timer does.
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let reading = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resumed = Arc::new(tokio::sync::Notify::new());
     sockets
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -530,45 +724,20 @@ fn bind_socket(
             SocketEntry {
                 socket: socket.clone(),
                 keep_alive: Some(keep_alive),
+                reading: reading.clone(),
+                resumed: resumed.clone(),
             },
         );
 
-    let delivery_spawner = spawner.clone();
-    let delivery_sockets = sockets.clone();
-    io.spawn(async move {
-        let mut buffer = vec![0u8; 65_536];
-        loop {
-            let received = socket.recv_from(&mut buffer).await;
-            let still_open = delivery_sockets
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(&id);
-            if !still_open {
-                return;
-            }
-            match received {
-                Ok((length, from)) => {
-                    let datagram = Datagram {
-                        id,
-                        payload: buffer[..length].to_vec(),
-                        address: address_text(&from),
-                        port: from.port(),
-                        family: if from.is_ipv4() { "IPv4" } else { "IPv6" },
-                    };
-                    // Ordered delivery retries on backpressure: a bounded
-                    // inbox that dropped would silently lose datagrams the
-                    // kernel had already handed over.
-                    if !delivery_spawner
-                        .enqueue_ordered(datagram, RuntimeLiveness::Unref)
-                        .await
-                    {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
+    spawn_receive_loop(
+        id,
+        socket,
+        sockets.clone(),
+        spawner.clone(),
+        &io,
+        reading,
+        resumed,
+    );
 
     ctx.scope(|mut scope| {
         let result = scope.object()?;
@@ -784,8 +953,10 @@ fn send_datagram(
         .map(|local| local.is_ipv4())
         .unwrap_or(true);
     // An omitted address means the loopback of the socket's own family, which
-    // is what Node documents `send` to default to.
-    let address = if address.is_empty() {
+    // is what Node documents `send` to default to. The unspecified address
+    // means the same thing as a destination — it names this host, not a route
+    // to nowhere, and sending to it verbatim is what the platform refuses.
+    let address = if address.is_empty() || address == "0.0.0.0" || address == "::" {
         if want_ipv4 { "127.0.0.1" } else { "::1" }.to_string()
     } else {
         address

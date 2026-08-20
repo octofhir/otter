@@ -639,6 +639,37 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "adoptFd", adopt_fd)?;
+
+    // A descriptor that arrived over a channel says what it is: the kernel
+    // knows whether it carries a stream or datagrams, so the receiver does
+    // not need the sender to tell it.
+    let socket_kind = scope.native_closure(
+        "socketKind",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            use std::os::fd::{AsRawFd, BorrowedFd};
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            if raw < 0 {
+                return Ok(RuntimeValue::number_i32(0));
+            }
+            // SAFETY: the descriptor is open for the duration of this call
+            // and only queried, never closed or duplicated here.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+            let kind = nix::sys::socket::getsockopt(&borrowed, nix::sys::socket::sockopt::SockType);
+            let _ = borrowed.as_raw_fd();
+            let answer = match kind {
+                Ok(nix::sys::socket::SockType::Stream) => 1,
+                Ok(nix::sys::socket::SockType::Datagram) => 2,
+                _ => 0,
+            };
+            Ok(RuntimeValue::number_i32(answer))
+        },
+    )?;
+    scope.set(object, "socketKind", socket_kind)?;
     Ok(object)
 }
 

@@ -47,6 +47,52 @@ pub enum IpcEvent {
     Closed,
 }
 
+impl IpcEvent {
+    /// Take the open files off this event.
+    ///
+    /// A consumer that cannot report the message is the last holder of what it
+    /// carried, and closes what it takes here.
+    pub fn take_handles(&mut self) -> Vec<RawFd> {
+        match self {
+            Self::Message(_, handles) => std::mem::take(handles),
+            Self::Closed => Vec::new(),
+        }
+    }
+}
+
+/// The open files one message arrived with, held until someone takes them.
+///
+/// Whatever is left when this goes away was never handed to anyone, and is
+/// closed rather than leaked.
+pub struct CarriedHandles(Vec<RawFd>);
+
+impl CarriedHandles {
+    /// Take ownership of what a message arrived with.
+    #[must_use]
+    pub fn new(handles: Vec<RawFd>) -> Self {
+        Self(handles)
+    }
+
+    /// The one descriptor a message is allowed to carry. Anything past the
+    /// first is not part of the protocol and is closed here.
+    pub fn take_first(&mut self) -> Option<RawFd> {
+        let mut handles = std::mem::take(&mut self.0).into_iter();
+        let first = handles.next();
+        for extra in handles {
+            let _ = nix::unistd::close(extra);
+        }
+        first
+    }
+}
+
+impl Drop for CarriedHandles {
+    fn drop(&mut self) {
+        for handle in std::mem::take(&mut self.0) {
+            let _ = nix::unistd::close(handle);
+        }
+    }
+}
+
 /// A message on its way out, with the open files it carries.
 #[cfg(unix)]
 pub struct OutgoingFrame {
@@ -57,6 +103,25 @@ pub struct OutgoingFrame {
     /// with unsent work — the socket takes only a buffer's worth at a time, so
     /// a large message needs turns of the loop that must still happen.
     in_flight: Option<RuntimeKeepAlive>,
+}
+
+#[cfg(unix)]
+impl OutgoingFrame {
+    /// A frame carrying descriptors that never reached the socket still has to
+    /// let go of them: they were duplicated for a crossing that did not
+    /// happen, and nobody else holds a name for them.
+    fn drop_handles(&mut self) {
+        for handle in std::mem::take(&mut self.handles) {
+            let _ = nix::unistd::close(handle);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OutgoingFrame {
+    fn drop(&mut self) {
+        self.drop_handles();
+    }
 }
 
 /// One end of a channel.
@@ -311,26 +376,28 @@ impl IpcChannel {
     /// their own.
     #[must_use]
     pub fn send_with_handles(&self, payload: &str, handles: Vec<RawFd>) -> bool {
+        // The descriptors belong to the frame from here on, so every way out
+        // of this call closes them exactly once: the writer does it once they
+        // have crossed, and dropping the frame does it if they never do.
+        let mut frame = OutgoingFrame {
+            bytes: Vec::new(),
+            handles,
+            in_flight: None,
+        };
         if !self.connected() {
             return false;
         }
         let Ok(length) = u32::try_from(payload.len()) else {
             return false;
         };
-        let mut frame = Vec::with_capacity(4 + payload.len());
-        frame.extend_from_slice(&length.to_le_bytes());
-        frame.extend_from_slice(payload.as_bytes());
-        let in_flight = Some(self.spawner.retain_keep_alive(RuntimeLiveness::Ref));
+        frame.bytes.reserve(4 + payload.len());
+        frame.bytes.extend_from_slice(&length.to_le_bytes());
+        frame.bytes.extend_from_slice(payload.as_bytes());
+        frame.in_flight = Some(self.spawner.retain_keep_alive(RuntimeLiveness::Ref));
         let queue = self.outgoing.lock().unwrap_or_else(|p| p.into_inner());
-        queue.as_ref().is_some_and(|outgoing| {
-            outgoing
-                .send(OutgoingFrame {
-                    bytes: frame,
-                    handles,
-                    in_flight,
-                })
-                .is_ok()
-        })
+        queue
+            .as_ref()
+            .is_some_and(|outgoing| outgoing.send(frame).is_ok())
     }
 
     /// Close this end. Messages already queued are still written, then the peer
@@ -383,9 +450,7 @@ async fn carry<T, F>(
             let outcome = write_frame(&mut writer, &frame.bytes, &frame.handles).await;
             // The peer has its own copies now; these were duplicated for the
             // crossing and are this side's to close.
-            for handle in &frame.handles {
-                let _ = nix::unistd::close(*handle);
-            }
+            frame.drop_handles();
             // The hold this frame had on the run loop is let go of on the loop
             // itself: dropping it here would lower the count without waking
             // the thread that reads it, and a program with nothing left to do
@@ -440,7 +505,7 @@ async fn read_loop<T, F>(
     // no other.
     let mut arrived: std::collections::VecDeque<(u64, RawFd)> = std::collections::VecDeque::new();
     let mut consumed: u64 = 0;
-    loop {
+    'reading: loop {
         if stream.readable().await.is_err() {
             break;
         }
@@ -466,6 +531,9 @@ async fn read_loop<T, F>(
                 }
             }
             consumed = end;
+            // A message that cannot be reported is a message nobody will take
+            // the descriptors off, so they are closed here instead.
+            let carried = handles.clone();
             if spawner
                 .enqueue(
                     deliver(IpcEvent::Message(payload, handles)),
@@ -473,9 +541,21 @@ async fn read_loop<T, F>(
                 )
                 .is_err()
             {
-                return;
+                close_all(carried);
+                break 'reading;
             }
         }
+    }
+    // Descriptors that arrived attached to a message the peer never finished
+    // sending are this side's to close.
+    close_all(arrived.into_iter().map(|(_, handle)| handle));
+}
+
+/// Close descriptors nothing will take ownership of.
+#[cfg(unix)]
+fn close_all(handles: impl IntoIterator<Item = RawFd>) {
+    for handle in handles {
+        let _ = nix::unistd::close(handle);
     }
 }
 

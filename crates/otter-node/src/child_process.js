@@ -689,6 +689,7 @@ class ChildProcess extends EventEmitter {
       try {
         message = JSON.parse(payload);
       } catch {
+        closeFd(handleFdIn);
         return;
       }
       // A module built on the channel coordinates with its peer over the same
@@ -724,7 +725,12 @@ globalThis.__otterChildExit = function exited(handle, status, signal) {
 
 globalThis.__otterChildIpc = function channelEvent(handle, kind, payload, handleFdIn) {
   const child = children.get(handle);
-  if (child === undefined) return;
+  if (child === undefined) {
+    // Nobody is left to take what the message carried, so it is closed here
+    // rather than held open for a child this process has already let go of.
+    closeFd(handleFdIn);
+    return;
+  }
   child._channelEvent(kind, payload, handleFdIn);
 };
 
@@ -809,7 +815,13 @@ function detachSent(carried) {
 // A duplicate made for a crossing that never happened is closed here rather
 // than leaked.
 function closeSent(carried) {
-  try { netNative().closeFd(carried.fd); } catch { /* already gone */ }
+  closeFd(carried.fd);
+}
+
+// Let go of a descriptor nothing took ownership of.
+function closeFd(fd) {
+  if (typeof fd !== 'number' || fd < 0) return;
+  try { netNative().closeFd(fd); } catch { /* already gone */ }
 }
 
 // What a channel can be asked to carry: a handle it knows how to hand over,
@@ -851,9 +863,7 @@ function unwrap(message, fd) {
   const wrapped = message !== null && typeof message === 'object' &&
     message.cmd === HANDLE_ENVELOPE;
   if (!wrapped) {
-    if (typeof fd === 'number' && fd >= 0) {
-      try { netNative().closeFd(fd); } catch { /* already gone */ }
-    }
+    closeFd(fd);
     return { event: isInternal(message) ? 'internalMessage' : 'message', message };
   }
   const inner = message.msg;
@@ -868,7 +878,12 @@ function adoptHandle(fd, type, dgramType) {
   if (kind === 2) return adoptDatagram(fd, type, dgramType);
   if (kind === 3) return adoptListener(fd, type);
   const id = netNative().adoptFd(fd);
-  if (id < 0) return undefined;
+  // A descriptor the host would not take is one this side still holds the
+  // only name for.
+  if (id < 0) {
+    closeFd(fd);
+    return undefined;
+  }
   const { TCP } = require('internal/otter/tcp_wrap');
   const handle = TCP.adopt(id);
   if (type === 'net.Native') return handle;
@@ -878,7 +893,10 @@ function adoptHandle(fd, type, dgramType) {
 
 function adoptDatagram(fd, type, dgramType) {
   const id = require('internal/otter/dgram').adoptFd(fd);
-  if (id < 0) return undefined;
+  if (id < 0) {
+    closeFd(fd);
+    return undefined;
+  }
   const { UDP } = require('internal/otter/udp_wrap');
   const handle = UDP.adopt(id);
   if (type !== 'dgram.Socket') return handle;
@@ -890,7 +908,10 @@ function adoptDatagram(fd, type, dgramType) {
 
 function adoptListener(fd, type) {
   const id = netNative().adoptListenerFd(fd);
-  if (id < 0) return undefined;
+  if (id < 0) {
+    closeFd(fd);
+    return undefined;
+  }
   const { TCP } = require('internal/otter/tcp_wrap');
   const handle = TCP.adoptListener(id);
   if (type !== 'net.Server') return handle;

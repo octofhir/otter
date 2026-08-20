@@ -21,11 +21,11 @@
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
-    CapabilitySet, IpcChannel, IpcEvent, OtterError, Runtime, RuntimeLiveness,
+    CapabilitySet, CarriedHandles, IpcChannel, IpcEvent, OtterError, Runtime, RuntimeLiveness,
     RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
     RuntimeNativeScope as NativeScope, RuntimeTask, RuntimeTaskSpawner, RuntimeValue as Value,
     runtime_arg_to_string,
@@ -220,6 +220,42 @@ fn lookup_channel(children: &ChildTable, id: u32) -> Option<Arc<IpcChannel>> {
 struct ChildEntry {
     channel: Option<Arc<IpcChannel>>,
     stdin: Option<tokio::sync::mpsc::UnboundedSender<StdinMessage>>,
+    /// Whether the child has already been reported as gone. An entry is kept
+    /// only while something about the child is still live: its channel can
+    /// close after it exits, and it can exit with its channel still open.
+    exited: bool,
+}
+
+/// Forget a child once neither its channel nor the child itself is left.
+///
+/// Called on both of those endings, in whichever order they happen, so the
+/// table holds only children a program can still act on.
+fn retire(children: &ChildTable, id: u32, gone: Ending) {
+    let mut table = children
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = table.get_mut(&id) else {
+        return;
+    };
+    match gone {
+        // A child that has exited reads nothing more, so its stdin pipe is
+        // closed here rather than held for a writer that has nowhere to write.
+        Ending::Child => {
+            entry.exited = true;
+            entry.stdin = None;
+        }
+        Ending::Channel => entry.channel = None,
+    }
+    if entry.exited && entry.channel.is_none() {
+        table.remove(&id);
+    }
+}
+
+/// Which half of a child has ended.
+#[derive(Clone, Copy)]
+enum Ending {
+    Child,
+    Channel,
 }
 
 /// One instruction for a child's stdin writer task.
@@ -234,26 +270,28 @@ type ChildTable = Arc<Mutex<HashMap<u32, ChildEntry>>>;
 struct ChildIpcEvent {
     id: u32,
     event: IpcEvent,
+    children: ChildTable,
 }
 
 impl RuntimeTask for ChildIpcEvent {
-    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+    fn run(mut self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        // The descriptor is handed over as itself; the module that asked for
+        // the message is what turns it into a socket. Until it is handed over
+        // it is held here, so an event nobody hears still closes what it
+        // carried.
+        let mut carried = CarriedHandles::new(self.event.take_handles());
+        if matches!(self.event, IpcEvent::Closed) {
+            retire(&self.children, self.id, Ending::Channel);
+        }
         let Some(context) = runtime.realm_execution_context() else {
             return Ok(());
         };
-        let (kind, payload, handles) = match &self.event {
-            IpcEvent::Message(payload, handles) => {
-                ("message", payload.as_str(), handles.as_slice())
-            }
-            IpcEvent::Closed => ("disconnect", "", [].as_slice()),
+        let id = self.id;
+        let (kind, payload) = match self.event {
+            IpcEvent::Message(payload, _) => ("message", payload),
+            IpcEvent::Closed => ("disconnect", String::new()),
         };
-        // The descriptor is handed over as itself; the module that asked for
-        // the message is what turns it into a socket.
-        let handle_fd = handles.first().copied();
-        for extra in handles.iter().skip(1) {
-            let _ = nix::unistd::close(*extra);
-        }
-        runtime.run_native_event(&context, |ctx| {
+        runtime.run_native_event(&context, move |ctx| {
             ctx.scope(|mut scope| {
                 let globals = scope.global_this();
                 let dispatcher = scope.get(globals, "__otterChildIpc")?;
@@ -261,9 +299,10 @@ impl RuntimeTask for ChildIpcEvent {
                     let undefined = scope.undefined();
                     return Ok(scope.finish(undefined));
                 }
-                let id = scope.number(f64::from(self.id));
+                let handle_fd = carried.take_first();
+                let id = scope.number(f64::from(id));
                 let kind = scope.string(kind)?;
-                let payload = scope.string(payload)?;
+                let payload = scope.string(&payload)?;
                 let handle = match handle_fd {
                     Some(fd) => scope.number(f64::from(fd)),
                     None => scope.undefined(),
@@ -319,10 +358,12 @@ struct ChildExit {
     id: u32,
     status: Option<i32>,
     signal: Option<String>,
+    children: ChildTable,
 }
 
 impl RuntimeTask for ChildExit {
     fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        retire(&self.children, self.id, Ending::Child);
         let Some(context) = runtime.realm_execution_context() else {
             return Ok(());
         };
@@ -400,8 +441,13 @@ fn spawn_start(
     // The channel is opened before the child starts, so the address it is told
     // to join is already listening when it gets there.
     let channel = if wants_channel {
+        let events = children.clone();
         let (channel, address) =
-            IpcChannel::listen(spawner, move |event| ChildIpcEvent { id, event })
+            IpcChannel::listen(spawner, move |event| ChildIpcEvent {
+                id,
+                event,
+                children: events.clone(),
+            })
                 .map_err(|error| crate::type_error("child_process", error.to_string()))?;
         Some((channel, address))
     } else {
@@ -486,10 +532,11 @@ fn spawn_start(
             ChildEntry {
                 channel: channel.map(|(channel, _)| channel),
                 stdin: stdin_sender,
+                exited: false,
             },
         );
 
-    reap(child, id, spawner);
+    reap(child, id, spawner, children.clone());
 
     ctx.scope(|mut scope| {
         let object = scope.object()?;
@@ -523,8 +570,20 @@ fn set_nonblocking<F>(_pipe: &F) -> bool {
 /// there. Output pipes stream live chunks as they arrive; the exit report is
 /// enqueued only after both pipes reached end-of-stream, so listeners always
 /// see every chunk before 'exit'.
-fn reap(mut child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
+fn reap(
+    mut child: std::process::Child,
+    id: u32,
+    spawner: &RuntimeTaskSpawner,
+    children: ChildTable,
+) {
     let Some(io) = spawner.io_handle() else {
+        // Without an IO runtime there is nowhere to wait from, and a child
+        // nobody waits for stays on the process table as a zombie. Waiting for
+        // it on a thread of its own is what keeps that from happening.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        retire(&children, id, Ending::Child);
         return;
     };
     // A running child is work the program is waiting on, so it holds the run
@@ -554,11 +613,13 @@ fn reap(mut child: std::process::Child, id: u32, spawner: &RuntimeTaskSpawner) {
                 id,
                 status: status.code(),
                 signal: exit_signal(&status),
+                children,
             },
             _ => ChildExit {
                 id,
                 status: None,
                 signal: None,
+                children,
             },
         };
         // The exit report itself holds the loop: the child's own Ref hold is
@@ -809,25 +870,12 @@ fn spawn_sync_raw(
     };
     let pid = child.id();
 
-    if let (Some(input), Some(mut stdin)) = (&input, child.stdin.take()) {
-        use std::io::Write;
-        let _ = stdin.write_all(&latin1_to_bytes(input));
-    }
-
     let cap = if max_buffer.is_finite() && max_buffer >= 0.0 {
         max_buffer as usize
     } else {
         usize::MAX
     };
-    let overflowed = Arc::new(AtomicBool::new(false));
-    let out_reader = child
-        .stdout
-        .take()
-        .map(|pipe| drain_capped(pipe, cap, overflowed.clone()));
-    let err_reader = child
-        .stderr
-        .take()
-        .map(|pipe| drain_capped(pipe, cap, overflowed.clone()));
+    let mut streams = SyncStreams::adopt(&mut child, input.as_deref());
 
     let deadline = if timeout_ms > 0.0 {
         Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
@@ -835,15 +883,24 @@ fn spawn_sync_raw(
         None
     };
     let mut failure: Option<&'static str> = None;
+    // One thread moves every byte and waits for the child, so nothing outlives
+    // this call: a reader on a thread of its own would still be holding a pipe
+    // open after the child that shared it is gone.
     let status = loop {
+        let moved = streams.pump(cap);
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {}
-            Err(err) => break Err(err),
+            // A child this process can no longer ask about is stopped and
+            // waited for, rather than left behind on the process table.
+            Err(_) => {
+                signal_child(pid, "SIGKILL");
+                break child.wait().ok();
+            }
         }
         // A child that has already written more than the caller will keep is
         // stopped rather than left running to fill a buffer nobody reads.
-        if failure.is_none() && overflowed.load(Ordering::SeqCst) {
+        if failure.is_none() && streams.overflowed {
             failure = Some("ENOBUFS");
             signal_child(pid, &kill_signal);
         }
@@ -851,14 +908,18 @@ fn spawn_sync_raw(
             failure = Some("ETIMEDOUT");
             signal_child(pid, &kill_signal);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        if !moved {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     };
-    let status = match status {
-        Ok(status) => status,
-        Err(err) => return spawn_error_result(ctx, &command, &err),
+    // What the child wrote before it went is still in the pipes; what a
+    // grandchild that inherited them writes afterwards is no longer this
+    // call's to wait for.
+    let (stdout, stderr) = streams.finish(cap);
+    let Some(status) = status else {
+        let err = std::io::Error::other("child could not be waited for");
+        return spawn_error_result(ctx, &command, &err);
     };
-    let stdout = out_reader.map(|reader| reader.join().unwrap_or_default());
-    let stderr = err_reader.map(|reader| reader.join().unwrap_or_default());
 
     let status_code = status.code();
     let signal = exit_signal(&status);
@@ -933,33 +994,135 @@ impl SyncStdio {
     }
 }
 
-/// Read a pipe until it ends or the caller's limit is passed.
+/// The pipes a synchronous run holds while its child is alive.
 ///
-/// A read is kept whole: the limit is what the caller agreed to hold, and it
-/// is noticed after the read that crosses it rather than by cutting that read
-/// in half.
-fn drain_capped(
-    mut pipe: impl std::io::Read + Send + 'static,
-    cap: usize,
-    overflowed: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut kept: Vec<u8> = Vec::new();
+/// Every byte moves on the thread that made the call: a reader thread would
+/// still be blocked on a pipe a grandchild inherited long after the child that
+/// shared it is gone, and this call has to be over when the child is.
+struct SyncStreams {
+    /// What is left to hand the child, and the pipe to hand it on. The pipe is
+    /// let go of once the last byte is in it, which is the end the child reads.
+    input: Option<(std::process::ChildStdin, Vec<u8>, usize)>,
+    out_pipe: Option<std::process::ChildStdout>,
+    err_pipe: Option<std::process::ChildStderr>,
+    /// Collected output, `None` for a stream the caller did not ask for.
+    out: Option<Vec<u8>>,
+    err: Option<Vec<u8>>,
+    /// Whether either stream passed what the caller agreed to hold.
+    overflowed: bool,
+}
+
+impl SyncStreams {
+    /// Take the child's pipes, and put them in the mode that lets one thread
+    /// tend all three without ever waiting on any single one.
+    fn adopt(child: &mut std::process::Child, input: Option<&str>) -> Self {
+        // A child whose stdin is a pipe nobody writes to reads end-of-file, so
+        // the writing end is kept only while there is something to write.
+        let stdin = child.stdin.take().filter(|pipe| {
+            input.is_some() && set_nonblocking(pipe)
+        });
+        let input = stdin.map(|pipe| (pipe, latin1_to_bytes(input.unwrap_or_default()), 0));
+        let out_pipe = child.stdout.take().filter(set_nonblocking);
+        let err_pipe = child.stderr.take().filter(set_nonblocking);
+        Self {
+            out: out_pipe.as_ref().map(|_| Vec::new()),
+            err: err_pipe.as_ref().map(|_| Vec::new()),
+            input,
+            out_pipe,
+            err_pipe,
+            overflowed: false,
+        }
+    }
+
+    /// Move whatever the pipes will take or give right now. Answers whether
+    /// anything moved, which is what tells the caller it is worth trying again
+    /// before waiting.
+    fn pump(&mut self, cap: usize) -> bool {
+        let wrote = self.push_input();
+        let read_out = Self::pull(&mut self.out_pipe, &mut self.out, cap, &mut self.overflowed);
+        let read_err = Self::pull(&mut self.err_pipe, &mut self.err, cap, &mut self.overflowed);
+        wrote || read_out || read_err
+    }
+
+    /// Hand the child as much of its input as the pipe will take.
+    fn push_input(&mut self) -> bool {
+        use std::io::Write;
+        let Some((pipe, bytes, sent)) = self.input.as_mut() else {
+            return false;
+        };
+        let moved = match pipe.write(&bytes[*sent..]) {
+            Ok(0) => {
+                self.input = None;
+                return false;
+            }
+            Ok(written) => {
+                *sent += written;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+            // A child that is not reading its input is not going to: the pipe
+            // is closed so it sees the end rather than waiting for more.
+            Err(_) => {
+                self.input = None;
+                return false;
+            }
+        };
+        if *sent == bytes.len() {
+            self.input = None;
+        }
+        moved
+    }
+
+    /// Read one pipe as far as it will go right now.
+    ///
+    /// A read is kept whole: the limit is what the caller agreed to hold, and
+    /// it is noticed after the read that crosses it rather than by cutting
+    /// that read in half.
+    fn pull<P: std::io::Read>(
+        pipe: &mut Option<P>,
+        kept: &mut Option<Vec<u8>>,
+        cap: usize,
+        overflowed: &mut bool,
+    ) -> bool {
+        let (Some(source), Some(kept)) = (pipe.as_mut(), kept.as_mut()) else {
+            return false;
+        };
         let mut chunk = [0u8; 65_536];
+        let mut moved = false;
         loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+            match source.read(&mut chunk) {
+                Ok(0) => {
+                    *pipe = None;
+                    return moved;
+                }
                 Ok(read) => {
                     kept.extend_from_slice(&chunk[..read]);
+                    moved = true;
                     if kept.len() > cap {
-                        overflowed.store(true, Ordering::SeqCst);
-                        break;
+                        *overflowed = true;
+                        *pipe = None;
+                        return moved;
                     }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return moved,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    *pipe = None;
+                    return moved;
                 }
             }
         }
-        kept
-    })
+    }
+
+    /// Take what the child left in its pipes, then let them go.
+    fn finish(mut self, cap: usize) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        // The child has gone, so what is in the pipes now is everything it
+        // wrote. A pipe that still has a writer is one a grandchild inherited,
+        // and this call does not wait on a process it did not start.
+        while Self::pull(&mut self.out_pipe, &mut self.out, cap, &mut self.overflowed) {}
+        while Self::pull(&mut self.err_pipe, &mut self.err, cap, &mut self.overflowed) {}
+        (self.out, self.err)
+    }
 }
 
 #[cfg(unix)]

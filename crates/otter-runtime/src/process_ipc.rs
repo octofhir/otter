@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use otter_vm::{Attr, ErrorKind, Local, NativeCall, NativeError, NativeFn, NativeScope, Value};
 
-use crate::ipc::{IpcChannel, IpcEvent};
+use crate::ipc::{CarriedHandles, IpcChannel, IpcEvent};
 use crate::{OtterError, Runtime};
 
 /// Give `process` its channel members.
@@ -314,7 +314,11 @@ impl ProcessIpcEvent {
 }
 
 impl crate::RuntimeTask for ProcessIpcEvent {
-    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+    fn run(mut self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        // What the message carried is held apart from the event, so that every
+        // way out of this delivery — including one that fails partway — closes
+        // it exactly once.
+        let mut carried = CarriedHandles::new(self.event.take_handles());
         let Some(context) = runtime.realm_execution_context() else {
             return Ok(());
         };
@@ -324,7 +328,7 @@ impl crate::RuntimeTask for ProcessIpcEvent {
             runtime_task_spawner: runtime.runtime_task_spawner.clone(),
             addon_loader: runtime.config.commonjs_addon_loader,
         });
-        runtime.run_native_event(&context, |ctx| {
+        runtime.run_native_event(&context, move |ctx| {
             ctx.scope(|mut scope| {
                 let globals = scope.global_this();
                 let process = scope.get(globals, "process")?;
@@ -338,7 +342,7 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                     return Ok(scope.finish(undefined));
                 }
                 match &self.event {
-                    IpcEvent::Message(payload, handles) => {
+                    IpcEvent::Message(payload, _) => {
                         let json = scope.get(globals, "JSON")?;
                         let parse = scope.get(json, "parse")?;
                         let text = scope.string(payload)?;
@@ -350,11 +354,7 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                         // message goes through its hook, which answers the
                         // event, the message the program sees, and the object
                         // the descriptor became.
-                        let first = handles.first().copied();
-                        for extra in handles.iter().skip(1) {
-                            let _ = nix::unistd::close(*extra);
-                        }
-                        let Some(first) = first else {
+                        let Some(first) = carried.take_first() else {
                             let event = event_name(&mut scope, message)?;
                             let name = scope.string(event)?;
                             scope.call(emit, process, &[name, message])?;
@@ -372,13 +372,14 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                             let undefined = scope.undefined();
                             return Ok(scope.finish(undefined));
                         }
+                        // The hook owns the descriptor from the call on.
                         let fd = scope.number(f64::from(first));
                         let undefined = scope.undefined();
                         let delivered = scope.call(deliver, undefined, &[message, fd])?;
                         let event = scope.get(delivered, "event")?;
                         let inner = scope.get(delivered, "message")?;
-                        let carried = scope.get(delivered, "handle")?;
-                        scope.call(emit, process, &[event, inner, carried])?;
+                        let handle = scope.get(delivered, "handle")?;
+                        scope.call(emit, process, &[event, inner, handle])?;
                     }
                     IpcEvent::Closed => {
                         mark_disconnected(&mut scope, process)?;

@@ -382,6 +382,7 @@ fn spawn_start(
         .unwrap_or_default();
     let opts = args.get(2).copied();
     let cwd = opt_string(ctx, opts, "cwd");
+    let argv0 = opt_string(ctx, opts, "argv0");
     let env = opt_env(ctx, opts)?;
     let wants_channel = opt_flag(ctx, opts, "ipc");
     if should_propagate_allow_all(ctx, &command, caps) {
@@ -409,6 +410,12 @@ fn spawn_start(
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
+    // The name a child sees itself under is the caller's to choose, and is not
+    // the same thing as the file that was run.
+    #[cfg(unix)]
+    if let Some(argv0) = &argv0 {
+        std::os::unix::process::CommandExt::arg0(&mut cmd, argv0);
+    }
     if let Some(dir) = &cwd {
         cmd.current_dir(dir);
     }

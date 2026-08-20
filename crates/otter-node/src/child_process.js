@@ -27,19 +27,30 @@ const SIGNAL_NUMBERS = {
 // deprecation is news once per process rather than once per call.
 let shellArgsWarned = false;
 
-function outOfRange(name, expectation, value) {
-  const err = new RangeError(
-    `The value of "${name}" is out of range. It must be ${expectation}. Received ${value}`);
-  err.code = 'ERR_OUT_OF_RANGE';
+// A Node error names its code where it is read: the string form of one
+// carries the code in brackets, which is what callers match on.
+function coded(err, code) {
+  err.code = code;
+  Object.defineProperty(err, 'toString', {
+    value() { return `${this.name} [${code}]: ${this.message}`; },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
   return err;
+}
+
+function outOfRange(name, expectation, value) {
+  return coded(new RangeError(
+    `The value of "${name}" is out of range. It must be ${expectation}. Received ${value}`),
+  'ERR_OUT_OF_RANGE');
 }
 
 function invalidArgValue(name, value, reason, isProperty = false) {
   const kind = isProperty ? 'property' : 'argument';
   const shown = typeof value === 'string' ? `'${value}'` : String(value);
-  const err = new TypeError(`The ${kind} '${name}' ${reason}. Received ${shown}`);
-  err.code = 'ERR_INVALID_ARG_VALUE';
-  return err;
+  return coded(new TypeError(`The ${kind} '${name}' ${reason}. Received ${shown}`),
+               'ERR_INVALID_ARG_VALUE');
 }
 
 // A NUL ends a string for the platform, so a string carrying one would reach
@@ -56,8 +67,9 @@ function nullByteCheckAll(values, name) {
 }
 
 function validateTimeout(timeout) {
-  if (timeout !== undefined && timeout !== null &&
-      !(Number.isInteger(timeout) && timeout >= 0)) {
+  if (timeout === undefined || timeout === null) return;
+  if (typeof timeout !== 'number') throw invalidArgType('timeout', 'of type number', timeout);
+  if (!(Number.isInteger(timeout) && timeout >= 0)) {
     throw outOfRange('timeout', 'an unsigned integer', timeout);
   }
 }
@@ -75,15 +87,11 @@ function sanitizeKillSignal(killSignal) {
     for (const name of Object.keys(SIGNAL_NUMBERS)) {
       if (SIGNAL_NUMBERS[name] === killSignal) return name;
     }
-    const err = new TypeError(`Unknown signal: ${killSignal}`);
-    err.code = 'ERR_UNKNOWN_SIGNAL';
-    throw err;
+    throw coded(new TypeError(`Unknown signal: ${killSignal}`), 'ERR_UNKNOWN_SIGNAL');
   }
   if (typeof killSignal === 'string') {
     if (SIGNAL_NUMBERS[killSignal] === undefined) {
-      const err = new TypeError(`Unknown signal: ${killSignal}`);
-      err.code = 'ERR_UNKNOWN_SIGNAL';
-      throw err;
+      throw coded(new TypeError(`Unknown signal: ${killSignal}`), 'ERR_UNKNOWN_SIGNAL');
     }
     return killSignal;
   }
@@ -154,12 +162,23 @@ function normalizeSpawnArguments(file, args, options) {
   // once: an object with a `toString` must not be asked twice.
   args = args.map((arg) => (typeof arg === 'string' ? arg : String(arg)));
 
-  if (options === undefined || options === null) options = {};
-  else if (typeof options !== 'object') throw invalidArgType('options', 'of type object', options);
+  if (options === undefined) options = {};
+  else if (options === null || Array.isArray(options) || typeof options !== 'object') {
+    throw invalidArgType('options', 'of type object', options);
+  }
 
-  const cwd = options.cwd;
+  let cwd = options.cwd;
   if (cwd !== undefined && cwd !== null) {
-    if (typeof cwd !== 'string') throw invalidArgType('options.cwd', 'of type string', cwd, true);
+    // A directory may be named by a `file:` URL, and only by that scheme:
+    // nothing else names a place on this machine.
+    if (typeof cwd === 'object' && typeof cwd.href === 'string') {
+      if (cwd.protocol !== 'file:') {
+        throw coded(new TypeError('The URL must be of scheme file'), 'ERR_INVALID_URL_SCHEME');
+      }
+      cwd = require('url').fileURLToPath(cwd);
+    } else if (typeof cwd !== 'string') {
+      throw invalidArgType('options.cwd', 'of type string', cwd, true);
+    }
     nullByteCheck(cwd, 'options.cwd', true);
   }
   for (const name of ['detached', 'windowsHide', 'windowsVerbatimArguments']) {
@@ -170,9 +189,12 @@ function normalizeSpawnArguments(file, args, options) {
   }
   for (const name of ['uid', 'gid']) {
     const value = options[name];
-    if (value !== undefined && value !== null &&
-        !(Number.isInteger(value) && value >= -2147483648 && value <= 2147483647)) {
-      throw invalidArgType(`options.${name}`, 'of type int32', value, true);
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'number') {
+      throw invalidArgType(`options.${name}`, 'of type number', value, true);
+    }
+    if (!(Number.isInteger(value) && value >= -2147483648 && value <= 2147483647)) {
+      throw outOfRange(`options.${name}`, '>= -2147483648 && <= 2147483647', value);
     }
   }
   if (options.shell !== undefined && options.shell !== null &&
@@ -190,14 +212,22 @@ function normalizeSpawnArguments(file, args, options) {
   // What reaches the child's environment is text the platform reads up to its
   // first NUL, so a name or value carrying one would arrive meaning something
   // else.
-  if (options.env !== undefined && options.env !== null && typeof options.env === 'object') {
-    for (const key of Object.keys(options.env)) {
-      const value = options.env[key];
+  let env = options.env;
+  if (env !== undefined && env !== null && typeof env === 'object') {
+    const pairs = {};
+    // What a child inherits is everything the object answers for, including
+    // what it answers for through its prototype.
+    for (const key in env) {
+      const value = env[key];
+      // A variable named with nothing behind it is a variable the child was
+      // never given, not one holding the word `undefined`.
       if (value === undefined) continue;
       nullByteCheck(key, `options.env['${key}']`, true);
-      nullByteCheck(typeof value === 'string' ? value : String(value),
-                    `options.env['${key}']`, true);
+      const text = typeof value === 'string' ? value : String(value);
+      nullByteCheck(text, `options.env['${key}']`, true);
+      pairs[key] = text;
     }
+    env = pairs;
   }
 
   let argv0 = typeof options.argv0 === 'string' ? options.argv0 : undefined;
@@ -219,7 +249,7 @@ function normalizeSpawnArguments(file, args, options) {
     argv0 = argv0 ?? file;
   }
 
-  return { ...options, file, args, cwd, argv0 };
+  return { ...options, file, args, cwd, env, argv0 };
 }
 
 // `execFile(file[, args][, options][, callback])` — everything after the file
@@ -387,9 +417,8 @@ function receivedTail(value) {
 
 function invalidArgType(name, expectation, value, isProperty = false) {
   const subject = isProperty ? `The "${name}" property must be` : `The "${name}" argument must be`;
-  const err = new TypeError(`${subject} ${expectation}.${receivedTail(value)}`);
-  err.code = 'ERR_INVALID_ARG_TYPE';
-  return err;
+  return coded(new TypeError(`${subject} ${expectation}.${receivedTail(value)}`),
+               'ERR_INVALID_ARG_TYPE');
 }
 
 // `envPairs` is a list of `KEY=VALUE` strings, which is the shape the platform
@@ -444,6 +473,8 @@ class ChildProcess extends EventEmitter {
   constructor() {
     super();
     this.pid = undefined;
+    this.spawnfile = undefined;
+    this.spawnargs = [];
     this.exitCode = null;
     this.signalCode = null;
     this.killed = false;
@@ -498,9 +529,7 @@ class ChildProcess extends EventEmitter {
     // An unknown signal name is refused before anything is sent, which is what
     // Node does and what its tests assert.
     if (typeof name === 'string' && !KNOWN_SIGNALS.includes(name)) {
-      const err = new TypeError(`Unknown signal: ${name}`);
-      err.code = 'ERR_UNKNOWN_SIGNAL';
-      throw err;
+      throw coded(new TypeError(`Unknown signal: ${name}`), 'ERR_UNKNOWN_SIGNAL');
     }
     this.killed = true;
     if (typeof this.pid === 'number') {
@@ -534,28 +563,22 @@ class ChildProcess extends EventEmitter {
     } else if (typeof options === 'function') {
       callback = options; options = undefined;
     }
-    if (arguments.length === 0) {
-      const err = new TypeError('The "message" argument must be specified');
-      err.code = 'ERR_MISSING_ARGS';
-      throw err;
+    // `undefined` is not a message: `JSON.stringify` answers the text
+    // `undefined`, which nothing can read back.
+    if (message === undefined) {
+      throw coded(new TypeError('The "message" argument must be specified'),
+                  'ERR_MISSING_ARGS');
     }
+    validateSendArguments(sendHandle, options);
+    // A channel that is gone is news the caller learns from the answer and
+    // from the error, not from a throw: a send is not a promise to arrive.
     if (!this.connected) {
-      const err = new Error('Channel closed');
-      err.code = 'ERR_IPC_CHANNEL_CLOSED';
-      if (typeof callback === 'function') { callback(err); return false; }
-      throw err;
+      const err = coded(new Error('Channel closed'), 'ERR_IPC_CHANNEL_CLOSED');
+      if (typeof callback === 'function') process.nextTick(callback, err);
+      else process.nextTick(() => this.emit('error', err));
+      return false;
     }
-    let prepared;
-    try {
-      prepared = prepareSend(message, sendHandle, options);
-    } catch (error) {
-      if (typeof callback === 'function') { callback(error); return false; }
-      throw error;
-    }
-    if (prepared === undefined) {
-      throw invalidArgType(
-        'message', 'one of type string, object, number, boolean, or null', message);
-    }
+    const prepared = prepareSend(message, sendHandle, options);
     const accepted = native.ipcSend(this._handle, prepared.text, prepared.fd);
     if (typeof callback === 'function') {
       setTimeout(() => callback(accepted ? null : new Error('Channel closed')), 0);
@@ -571,6 +594,10 @@ class ChildProcess extends EventEmitter {
     setTimeout(() => this.emit('disconnect'), 0);
   }
   _run(command, args, options) {
+    // What was actually started, as the caller can read it back: the file and
+    // the argument vector, whose first entry is the name the child sees.
+    this.spawnfile = command;
+    this.spawnargs = [options?.argv0 ?? command, ...args];
     // A stream the child was not given a pipe for is not a stream this side
     // can read, and Node reports that as `null` rather than as a stream that
     // never yields anything.
@@ -617,14 +644,19 @@ class ChildProcess extends EventEmitter {
   }
 
   _endStreams() {
-    if (this.stdout && !this._streamEnded[1]) {
-      this._streamEnded[1] = true;
-      this.stdout.push(null);
-    }
-    if (this.stderr && !this._streamEnded[2]) {
-      this._streamEnded[2] = true;
-      this.stderr.push(null);
-    }
+    this._endStream(1);
+    this._endStream(2);
+  }
+
+  // End-of-stream is the pipe's news, not the reader's: a stream nobody is
+  // pulling from still has to reach its end, so the read that settles it is
+  // made here rather than waited for.
+  _endStream(which) {
+    const stream = which === 1 ? this.stdout : this.stderr;
+    if (!stream || this._streamEnded[which]) return;
+    this._streamEnded[which] = true;
+    stream.push(null);
+    stream.read(0);
   }
 
   // One live chunk from an output pipe; `null` marks that pipe's end.
@@ -632,10 +664,7 @@ class ChildProcess extends EventEmitter {
     const stream = which === 1 ? this.stdout : this.stderr;
     if (!stream) return;
     if (chunk === null) {
-      if (!this._streamEnded[which]) {
-        this._streamEnded[which] = true;
-        stream.push(null);
-      }
+      this._endStream(which);
       return;
     }
     stream.push(Buffer.from(chunk, 'latin1'));
@@ -783,10 +812,24 @@ function closeSent(carried) {
   try { netNative().closeFd(carried.fd); } catch { /* already gone */ }
 }
 
+// What a channel can be asked to carry: a handle it knows how to hand over,
+// and settings that are settings.
+function validateSendArguments(sendHandle, options) {
+  if (options !== undefined && (options === null || typeof options !== 'object')) {
+    throw invalidArgType('options', 'of type object', options);
+  }
+  if (sendHandle === undefined || sendHandle === null) return;
+  if (typeof sendHandle !== 'object') {
+    throw coded(new TypeError('This handle type cannot be sent'),
+                'ERR_INVALID_HANDLE_TYPE');
+  }
+}
+
 // The text and descriptor one message crosses as. A sent connection is
 // detached here rather than on the acknowledgement: the duplicate already
 // holds the socket open, so this side has nothing left to keep.
 function prepareSend(message, sendHandle, options) {
+  validateSendArguments(sendHandle, options);
   const carried = describeHandle(sendHandle, options);
   let text;
   try {
@@ -797,7 +840,7 @@ function prepareSend(message, sendHandle, options) {
   }
   if (text === undefined) {
     if (carried !== null) closeSent(carried);
-    return undefined;
+    throw invalidArgType('message', 'one of type string, object, number, or boolean', message);
   }
   if (carried !== null) detachSent(carried);
   return { text, fd: carried === null ? -1 : carried.fd };
@@ -1015,8 +1058,8 @@ function execFile(file, args, options, callback) {
       if (kept[name] > settings.maxBuffer) {
         const room = settings.maxBuffer - (kept[name] - length);
         collected[name].push(chunk.slice(0, room));
-        failure = new RangeError(`${name} maxBuffer length exceeded`);
-        failure.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+        failure = coded(new RangeError(`${name} maxBuffer length exceeded`),
+                        'ERR_CHILD_PROCESS_STDIO_MAXBUFFER');
         stop();
         return;
       }
@@ -1077,6 +1120,20 @@ for (const [run, target] of [[exec, exec], [execFile, execFile]]) {
   });
 }
 
+// A place on this machine, named either as a path or as the `file:` URL that
+// stands for one. No other scheme names a place here.
+function validatedPath(value, name) {
+  if (typeof value === 'object' && value !== null && typeof value.href === 'string') {
+    if (value.protocol !== 'file:') {
+      throw coded(new TypeError('The URL must be of scheme file'), 'ERR_INVALID_URL_SCHEME');
+    }
+    value = require('url').fileURLToPath(value);
+  }
+  if (typeof value !== 'string') throw invalidArgType(name, 'of type string', value);
+  nullByteCheck(value, name);
+  return value;
+}
+
 // What a one-word `stdio` stands for, plus the channel a fork always has.
 function stdioStringToArray(stdio, channel) {
   let streams;
@@ -1099,19 +1156,19 @@ function stdioStringToArray(stdio, channel) {
 // A forked child runs this same binary and joins a channel opened for it, so
 // `child.send` here and `process.send` there are the two ends of one channel.
 function fork(modulePath, args, options) {
-  nullByteCheck(modulePath, 'modulePath');
+  modulePath = validatedPath(modulePath, 'modulePath');
   if (Array.isArray(args)) {
     args = args.slice(0);
   } else if (args === undefined || args === null) {
     args = [];
   } else if (typeof args !== 'object') {
-    throw invalidArgValue('args', args, 'is invalid');
+    throw invalidArgType('args', 'of type object', args);
   } else {
     options = args;
     args = [];
   }
   if (options === undefined || options === null) options = {};
-  else if (typeof options !== 'object') throw invalidArgValue('options', options, 'is invalid');
+  else if (typeof options !== 'object') throw invalidArgType('options', 'of type object', options);
   else options = { ...options };
 
   // A fork is this binary running a module, not a command line for a shell.
@@ -1121,17 +1178,16 @@ function fork(modulePath, args, options) {
   const execArgv = options.execArgv || process.execArgv || [];
   nullByteCheckAll(execArgv, 'options.execArgv');
 
-  args = [...execArgv, String(modulePath), ...args];
+  args = [...execArgv, modulePath, ...args];
 
   if (typeof options.stdio === 'string') {
     options.stdio = stdioStringToArray(options.stdio, 'ipc');
   } else if (!Array.isArray(options.stdio)) {
     options.stdio = stdioStringToArray(options.silent ? 'pipe' : 'inherit', 'ipc');
   } else if (!options.stdio.includes('ipc')) {
-    const err = new Error('Forked processes must have an IPC channel, ' +
-                          'missing value \'ipc\' in options.stdio');
-    err.code = 'ERR_CHILD_PROCESS_IPC_REQUIRED';
-    throw err;
+    throw coded(new Error('Forked processes must have an IPC channel, ' +
+                          'missing value \'ipc\' in options.stdio'),
+    'ERR_CHILD_PROCESS_IPC_REQUIRED');
   }
 
   return spawn(options.execPath, args, options);

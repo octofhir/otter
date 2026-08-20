@@ -1611,14 +1611,26 @@ async fn run_script_file_sequence(
     Ok(ExitCode::from(result.exit_code()))
 }
 
+/// The name this process was started under.
+///
+/// Not the same thing as the file that was run: whoever launched this process
+/// chose the name, and `process.argv0` is where that choice is readable.
+fn spawn_name() -> String {
+    std::env::args_os()
+        .next()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "otter".to_string())
+}
+
 fn process_argv_for_file_sequence(paths: &[PathBuf], args: &[String]) -> Vec<String> {
     let mut argv = Vec::with_capacity(args.len() + paths.len() + 1);
-    argv.push(
-        std::env::current_exe()
-            .ok()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "otter".to_string()),
-    );
+    argv.push(spawn_name());
     argv.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
     argv.extend(args.iter().cloned());
     argv
@@ -1626,12 +1638,7 @@ fn process_argv_for_file_sequence(paths: &[PathBuf], args: &[String]) -> Vec<Str
 
 fn process_argv_for_file(path: &Path, args: &[String]) -> Vec<String> {
     let mut argv = Vec::with_capacity(args.len() + 2);
-    argv.push(
-        std::env::current_exe()
-            .ok()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "otter".to_string()),
-    );
+    argv.push(spawn_name());
     argv.push(path.to_string_lossy().to_string());
     argv.extend(args.iter().cloned());
     argv

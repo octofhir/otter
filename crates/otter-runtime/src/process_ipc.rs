@@ -174,6 +174,15 @@ fn event_name(
 /// What marks a message as belonging to a module rather than to the program.
 pub(crate) const INTERNAL_PREFIX: &str = "NODE_";
 
+/// Load the module that turns a received descriptor into a socket, so its
+/// hook is in place before the message that carries one is delivered.
+fn install_handle_adoption(
+    scope: &mut NativeScope<'_, '_>,
+    cfg: &Arc<crate::commonjs::CjsConfig>,
+) -> Result<(), NativeError> {
+    crate::commonjs::cjs_load_builtin(scope, cfg, "child_process").map(|_| ())
+}
+
 /// Record on `process` that nothing further will cross the channel.
 fn mark_disconnected(
     scope: &mut NativeScope<'_, '_>,
@@ -204,6 +213,12 @@ impl crate::RuntimeTask for ProcessIpcEvent {
         let Some(context) = runtime.realm_execution_context() else {
             return Ok(());
         };
+        let cjs_config = Arc::new(crate::commonjs::CjsConfig {
+            capabilities: runtime.config.capabilities.clone(),
+            hosted: runtime.config.hosted_modules.clone(),
+            runtime_task_spawner: runtime.runtime_task_spawner.clone(),
+            addon_loader: runtime.config.commonjs_addon_loader,
+        });
         runtime.run_native_event(&context, |ctx| {
             ctx.scope(|mut scope| {
                 let globals = scope.global_this();
@@ -233,7 +248,15 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                         // than leaked.
                         let mut carried = scope.undefined();
                         for (index, handle) in handles.iter().enumerate() {
-                            let adopt = scope.get(globals, "__otterIpcAdoptHandle")?;
+                            let mut adopt = scope.get(globals, "__otterIpcAdoptHandle")?;
+                            if index == 0 && !scope.is_callable(adopt) {
+                                // The hook belongs to the module that owns
+                                // sockets. A program that never required it
+                                // can still be handed one, so it is loaded
+                                // the first time a descriptor arrives.
+                                install_handle_adoption(&mut scope, &cjs_config)?;
+                                adopt = scope.get(globals, "__otterIpcAdoptHandle")?;
+                            }
                             if index == 0 && scope.is_callable(adopt) {
                                 let fd = scope.number(f64::from(*handle));
                                 let undefined = scope.undefined();

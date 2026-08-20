@@ -138,6 +138,7 @@ pub use hooks::{
     RuntimeResolveRequest, default_check_capability, default_compile_source,
 };
 pub use ipc::{CarriedHandles, IpcChannel, IpcEvent};
+pub use process::node_platform;
 pub use otter_compiler::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
     CompiledSourceSpan, LiveBindingSlot,

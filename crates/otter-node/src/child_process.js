@@ -257,21 +257,24 @@ function normalizeSpawnArguments(file, args, options) {
 function normalizeExecFileArgs(file, args, options, callback) {
   if (Array.isArray(args)) {
     args = args.slice(0);
-  } else if (typeof args === 'function') {
-    callback = args;
-    options = undefined;
-    args = [];
   } else if (args !== undefined && args !== null && typeof args === 'object') {
     callback = options;
     options = args;
-    args = [];
-  } else {
-    args = [];
+    args = null;
+  } else if (typeof args === 'function') {
+    callback = args;
+    options = null;
+    args = null;
   }
+  // Anything else stays where the caller wrote it: an argument list that is
+  // not one is refused where argument lists are checked, and refusing it here
+  // by quietly dropping it would let a wrong call through.
+  args ??= [];
+
   if (typeof options === 'function') {
     callback = options;
-    options = undefined;
-  } else if (options !== undefined && options !== null && typeof options !== 'object') {
+  } else if (options !== undefined && options !== null &&
+             (Array.isArray(options) || typeof options !== 'object')) {
     throw invalidArgType('options', 'of type object', options);
   }
   if (callback !== undefined && callback !== null && typeof callback !== 'function') {
@@ -661,6 +664,9 @@ class ChildProcess extends EventEmitter {
       return;
     }
     if (started.error) {
+      // The caller still holds the streams it asked for; they end at once,
+      // because the other end of each went with the child that never was.
+      this._openStreams(started.stdio);
       const failure = errnoException(started.errorCode ?? 'EIO', `spawn ${command}`);
       failure.path = command;
       failure.spawnargs = args.slice(0);
@@ -1261,9 +1267,11 @@ function fork(modulePath, args, options) {
     options = args;
     args = [];
   }
+  // An argument list is not settings, whichever position it was written in.
   if (options === undefined || options === null) options = {};
-  else if (typeof options !== 'object') throw invalidArgType('options', 'of type object', options);
-  else options = { ...options };
+  else if (Array.isArray(options) || typeof options !== 'object') {
+    throw invalidArgType('options', 'of type object', options);
+  } else options = { ...options };
 
   // A fork is this binary running a module, not a command line for a shell.
   options.shell = false;

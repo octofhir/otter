@@ -337,6 +337,7 @@ fn spawn_start(
     let cwd = opt_string(ctx, opts, "cwd").filter(|dir| !dir.is_empty());
     let argv0 = opt_string(ctx, opts, "argv0");
     let env = opt_env(ctx, opts)?;
+    let credentials = opt_credentials(ctx, opts);
     let wants_channel = opt_flag(ctx, opts, "ipc");
 
     let Some(spawner) = spawner else {
@@ -365,6 +366,7 @@ fn spawn_start(
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
+    credentials.apply(&mut cmd);
     // The name a child sees itself under is the caller's to choose, and is not
     // the same thing as the file that was run.
     #[cfg(unix)]
@@ -550,6 +552,35 @@ enum StdioPlan {
     /// A descriptor the caller named. The child gets a copy of it, so closing
     /// the child's streams never takes the caller's own away.
     Fd(std::os::fd::OwnedFd),
+}
+
+/// Who the child runs as, when the caller said.
+#[derive(Clone, Copy, Default)]
+struct Credentials {
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+impl Credentials {
+    /// Tell a command who to become. Whether it may is the platform's answer,
+    /// which arrives as the launch failing.
+    fn apply(self, cmd: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        if let Some(uid) = self.uid {
+            cmd.uid(uid);
+        }
+        if let Some(gid) = self.gid {
+            cmd.gid(gid);
+        }
+    }
+}
+
+/// The user and group the caller named for the child.
+fn opt_credentials(ctx: &mut NativeCtx<'_>, opts: Option<Value>) -> Credentials {
+    Credentials {
+        uid: opt_number(ctx, opts, "uid").map(|uid| uid as u32),
+        gid: opt_number(ctx, opts, "gid").map(|gid| gid as u32),
+    }
 }
 
 /// Read what the caller asked each of the child's streams to be.
@@ -829,6 +860,7 @@ fn spawn_sync_raw(
     let cwd = opt_string(ctx, opts, "cwd").filter(|dir| !dir.is_empty());
     let input = opt_string(ctx, opts, "input");
     let argv0 = opt_string(ctx, opts, "argv0");
+    let credentials = opt_credentials(ctx, opts);
     let kill_signal = opt_string(ctx, opts, "killSignal").unwrap_or_else(|| "SIGTERM".to_string());
     let max_buffer = opt_number(ctx, opts, "maxBuffer").unwrap_or(f64::INFINITY);
     let timeout_ms = opt_number(ctx, opts, "timeout").unwrap_or(0.0);
@@ -836,6 +868,7 @@ fn spawn_sync_raw(
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
+    credentials.apply(&mut cmd);
     #[cfg(unix)]
     if let Some(argv0) = &argv0 {
         std::os::unix::process::CommandExt::arg0(&mut cmd, argv0);
@@ -1148,10 +1181,10 @@ fn spawn_error_result(
     err: &std::io::Error,
     streams: &[std::os::fd::RawFd],
 ) -> Result<Value, NativeError> {
-    let code = if err.kind() == std::io::ErrorKind::NotFound {
-        "ENOENT"
-    } else {
-        "EIO"
+    let code = match err.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EPERM",
+        _ => "EIO",
     };
     let message = format!("{code}: spawn {command} {err}");
     ctx.scope(|mut scope| {

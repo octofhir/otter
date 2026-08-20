@@ -640,7 +640,13 @@ class ChildProcess extends EventEmitter {
   }
 
   disconnect() {
-    if (!this.connected) return;
+    // Disconnecting a channel that has already gone is an error the caller
+    // hears about, the same way it hears about every other channel failure.
+    if (!this.connected) {
+      this.emit('error', coded(new Error('IPC channel is already disconnected'),
+                               'ERR_IPC_DISCONNECTED'));
+      return;
+    }
     this.connected = false;
     this.channel = null;
     native.ipcDisconnect(this._handle);
@@ -672,6 +678,11 @@ class ChildProcess extends EventEmitter {
       const failure = errnoException(started.errorCode ?? 'EIO', `spawn ${command}`);
       failure.path = command;
       failure.spawnargs = args.slice(0);
+      // A file that is not there is news about the child, and arrives as the
+      // child's own error. Anything else is news about the call itself — the
+      // caller asked for something this process may not do — and is answered
+      // where the call was made.
+      if (failure.code !== 'ENOENT') throw failure;
       setTimeout(() => this._failed(failure), 0);
       return;
     }

@@ -711,10 +711,14 @@ fn set_egid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 }
 
 /// `process.getgroups()` — the supplementary group ids of the process.
-#[cfg(all(unix, not(target_vendor = "apple")))]
+///
+/// `nix` withholds this family on Apple targets, so the ids are asked for
+/// through `rustix`, which answers with the same syscall everywhere.
+#[cfg(unix)]
 fn get_groups(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let groups =
-        nix::unistd::getgroups().map_err(|errno| credential_failure("getgroups", errno))?;
+    let groups = rustix::process::getgroups().map_err(|errno| {
+        credential_failure("getgroups", nix::errno::Errno::from_raw(errno.raw_os_error()))
+    })?;
     ctx.scope(|mut scope| {
         let result = scope.array(groups.len())?;
         for (index, gid) in groups.iter().enumerate() {
@@ -723,16 +727,6 @@ fn get_groups(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeE
         }
         Ok(scope.finish(result))
     })
-}
-
-/// Apple targets: nix withholds the whole credential-group family (the
-/// libinfo/opendirectoryd interplay makes the raw syscalls unreliable there),
-/// and this crate forbids `unsafe`, so there is no direct syscall path. The
-/// group list of the current process is reported through `getgroups`'s
-/// documented failure instead of a fabricated answer.
-#[cfg(all(unix, target_vendor = "apple"))]
-fn get_groups(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Err(credential_failure("getgroups", nix::errno::Errno::ENOTSUP))
 }
 
 /// `process.setgroups(groups)` — validate the array Node's way (each entry a

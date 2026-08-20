@@ -38,6 +38,7 @@ url = "2"
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 nix = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

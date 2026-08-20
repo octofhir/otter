@@ -126,6 +126,12 @@ class UDP {
     return 0;
   }
 
+  // Whether this handle is holding the loop open. `dgram`'s handle
+  // replacement reads it to carry the old handle's state onto the new one.
+  hasRef() {
+    return this._refed !== false;
+  }
+
   ref() {
     this._refed = true;
     if (this.fd !== -1) native.hold?.(this.fd, true);

@@ -10,46 +10,309 @@ const { Buffer } = require('buffer');
 const EventEmitter = require('events');
 const { Readable, Writable } = require('stream');
 
-function normalizeArgs(command, args, options) {
-  if (!Array.isArray(args)) { options = args; args = []; }
-  return { command: String(command), args: (args || []).map(String), options: options || {} };
+const MAX_BUFFER = 1024 * 1024;
+
+// The numbers this platform gives its signals. A caller may name a signal or
+// number it, and both have to reach the same one.
+const SIGNAL_NUMBERS = {
+  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6,
+  SIGEMT: 7, SIGFPE: 8, SIGKILL: 9, SIGBUS: 10, SIGSEGV: 11, SIGSYS: 12,
+  SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGURG: 16, SIGSTOP: 17, SIGTSTP: 18,
+  SIGCONT: 19, SIGCHLD: 20, SIGTTIN: 21, SIGTTOU: 22, SIGIO: 23, SIGXCPU: 24,
+  SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGINFO: 29,
+  SIGUSR1: 30, SIGUSR2: 31,
+};
+
+// The concatenation a shell run is built on is a deprecation, and a
+// deprecation is news once per process rather than once per call.
+let shellArgsWarned = false;
+
+function outOfRange(name, expectation, value) {
+  const err = new RangeError(
+    `The value of "${name}" is out of range. It must be ${expectation}. Received ${value}`);
+  err.code = 'ERR_OUT_OF_RANGE';
+  return err;
 }
 
-function rawSpawn(command, args, options) {
-  let input;
-  if (options.input !== undefined && options.input !== null) {
-    const b = Buffer.isBuffer(options.input) ? options.input : Buffer.from(String(options.input));
-    input = b.toString('latin1');
+function invalidArgValue(name, value, reason, isProperty = false) {
+  const kind = isProperty ? 'property' : 'argument';
+  const shown = typeof value === 'string' ? `'${value}'` : String(value);
+  const err = new TypeError(`The ${kind} '${name}' ${reason}. Received ${shown}`);
+  err.code = 'ERR_INVALID_ARG_VALUE';
+  return err;
+}
+
+// A NUL ends a string for the platform, so a string carrying one would reach
+// the child truncated and meaning something else. Node refuses it instead.
+function nullByteCheck(value, name, isProperty = false) {
+  if (typeof value === 'string' && value.includes('\u0000')) {
+    throw invalidArgValue(name, value, 'must be a string without null bytes', isProperty);
   }
-  return native.spawnSyncRaw(command, args, {
-    cwd: options.cwd ? String(options.cwd) : undefined,
-    input,
-    env: options.env === undefined || options.env === null
+}
+
+function nullByteCheckAll(values, name) {
+  if (!Array.isArray(values)) return;
+  for (let i = 0; i < values.length; i++) nullByteCheck(values[i], `${name}[${i}]`);
+}
+
+function validateTimeout(timeout) {
+  if (timeout !== undefined && timeout !== null &&
+      !(Number.isInteger(timeout) && timeout >= 0)) {
+    throw outOfRange('timeout', 'an unsigned integer', timeout);
+  }
+}
+
+function validateMaxBuffer(maxBuffer) {
+  if (maxBuffer !== undefined && maxBuffer !== null &&
+      !(typeof maxBuffer === 'number' && maxBuffer >= 0)) {
+    throw outOfRange('options.maxBuffer', 'a positive number', maxBuffer);
+  }
+}
+
+function sanitizeKillSignal(killSignal) {
+  if (killSignal === undefined || killSignal === null) return 'SIGTERM';
+  if (typeof killSignal === 'number') {
+    for (const name of Object.keys(SIGNAL_NUMBERS)) {
+      if (SIGNAL_NUMBERS[name] === killSignal) return name;
+    }
+    const err = new TypeError(`Unknown signal: ${killSignal}`);
+    err.code = 'ERR_UNKNOWN_SIGNAL';
+    throw err;
+  }
+  if (typeof killSignal === 'string') {
+    if (SIGNAL_NUMBERS[killSignal] === undefined) {
+      const err = new TypeError(`Unknown signal: ${killSignal}`);
+      err.code = 'ERR_UNKNOWN_SIGNAL';
+      throw err;
+    }
+    return killSignal;
+  }
+  throw invalidArgType('options.killSignal', 'one of type string or number', killSignal, true);
+}
+
+function validateAbortSignal(signal, name) {
+  if (signal === undefined || signal === null) return;
+  const isSignal = typeof signal === 'object' && typeof signal.addEventListener === 'function' &&
+    'aborted' in signal;
+  if (!isSignal) throw invalidArgType(name, 'an instance of AbortSignal', signal, true);
+}
+
+function abortError(reason) {
+  const err = new Error('The operation was aborted');
+  err.name = 'AbortError';
+  err.code = 'ABORT_ERR';
+  if (reason !== undefined) err.cause = reason;
+  return err;
+}
+
+// The number this platform gives a libuv error name, which is what
+// `util.getSystemErrorName` reads back.
+function uvErrno(code) {
+  const { internalBinding } = require('internal/bootstrap/realm');
+  const number = internalBinding('uv')[`UV_${code}`];
+  return typeof number === 'number' ? number : -1;
+}
+
+// A failure the platform reported, named the way Node names it: the call that
+// failed, then the code.
+function errnoException(code, syscall) {
+  const err = new Error(`${syscall} ${code}`);
+  err.errno = uvErrno(code);
+  err.code = code;
+  err.syscall = syscall;
+  return err;
+}
+
+// An error that carries a child's outcome rather than a platform code.
+function outcomeError(message, outcome) {
+  const err = new Error(message);
+  for (const key of ['status', 'signal', 'output', 'pid', 'stdout', 'stderr', 'code', 'killed']) {
+    if (outcome[key] !== undefined) err[key] = outcome[key];
+  }
+  return err;
+}
+
+// Everything `spawn` and its synchronous twin agree on: what to run, with
+// which arguments, and under which of the documented options.
+function normalizeSpawnArguments(file, args, options) {
+  if (typeof file !== 'string') throw invalidArgType('file', 'of type string', file);
+  nullByteCheck(file, 'file');
+  if (file.length === 0) throw invalidArgValue('file', file, 'cannot be empty');
+
+  if (Array.isArray(args)) {
+    args = args.slice(0);
+  } else if (args === undefined || args === null) {
+    args = [];
+  } else if (typeof args !== 'object') {
+    throw invalidArgType('args', 'of type object', args);
+  } else {
+    options = args;
+    args = [];
+  }
+  nullByteCheckAll(args, 'args');
+  // What reaches the platform is text, and each argument becomes it exactly
+  // once: an object with a `toString` must not be asked twice.
+  args = args.map((arg) => (typeof arg === 'string' ? arg : String(arg)));
+
+  if (options === undefined || options === null) options = {};
+  else if (typeof options !== 'object') throw invalidArgType('options', 'of type object', options);
+
+  const cwd = options.cwd;
+  if (cwd !== undefined && cwd !== null) {
+    if (typeof cwd !== 'string') throw invalidArgType('options.cwd', 'of type string', cwd, true);
+    nullByteCheck(cwd, 'options.cwd', true);
+  }
+  for (const name of ['detached', 'windowsHide', 'windowsVerbatimArguments']) {
+    const value = options[name];
+    if (value !== undefined && value !== null && typeof value !== 'boolean') {
+      throw invalidArgType(`options.${name}`, 'of type boolean', value, true);
+    }
+  }
+  for (const name of ['uid', 'gid']) {
+    const value = options[name];
+    if (value !== undefined && value !== null &&
+        !(Number.isInteger(value) && value >= -2147483648 && value <= 2147483647)) {
+      throw invalidArgType(`options.${name}`, 'of type int32', value, true);
+    }
+  }
+  if (options.shell !== undefined && options.shell !== null &&
+      typeof options.shell !== 'boolean' && typeof options.shell !== 'string') {
+    throw invalidArgType('options.shell', 'one of type boolean or string', options.shell, true);
+  }
+  nullByteCheck(options.shell, 'options.shell', true);
+  if (options.argv0 !== undefined && options.argv0 !== null) {
+    if (typeof options.argv0 !== 'string') {
+      throw invalidArgType('options.argv0', 'of type string', options.argv0, true);
+    }
+    nullByteCheck(options.argv0, 'options.argv0', true);
+  }
+
+  // What reaches the child's environment is text the platform reads up to its
+  // first NUL, so a name or value carrying one would arrive meaning something
+  // else.
+  if (options.env !== undefined && options.env !== null && typeof options.env === 'object') {
+    for (const key of Object.keys(options.env)) {
+      const value = options.env[key];
+      if (value === undefined) continue;
+      nullByteCheck(key, `options.env['${key}']`, true);
+      nullByteCheck(typeof value === 'string' ? value : String(value),
+                    `options.env['${key}']`, true);
+    }
+  }
+
+  let argv0 = typeof options.argv0 === 'string' ? options.argv0 : undefined;
+  // A shell run is one command line handed to a shell, so the file becomes
+  // the shell and everything the caller named becomes its argument.
+  if (options.shell) {
+    // A shell builds its command line by concatenation, so an argument that
+    // carries shell syntax is shell syntax by the time the shell sees it.
+    if (args.length > 0 && !shellArgsWarned) {
+      shellArgsWarned = true;
+      process.emitWarning(
+        'Passing args to a child process with shell option true can lead to security ' +
+        'vulnerabilities, as the arguments are not escaped, only concatenated.',
+        'DeprecationWarning', 'DEP0190');
+    }
+    const command = [file, ...args].join(' ');
+    file = typeof options.shell === 'string' ? options.shell : '/bin/sh';
+    args = ['-c', command];
+    argv0 = argv0 ?? file;
+  }
+
+  return { ...options, file, args, cwd, argv0 };
+}
+
+// `execFile(file[, args][, options][, callback])` — everything after the file
+// is optional, and a function anywhere in it is the callback.
+function normalizeExecFileArgs(file, args, options, callback) {
+  if (Array.isArray(args)) {
+    args = args.slice(0);
+  } else if (typeof args === 'function') {
+    callback = args;
+    options = undefined;
+    args = [];
+  } else if (args !== undefined && args !== null && typeof args === 'object') {
+    callback = options;
+    options = args;
+    args = [];
+  } else {
+    args = [];
+  }
+  if (typeof options === 'function') {
+    callback = options;
+    options = undefined;
+  } else if (options !== undefined && options !== null && typeof options !== 'object') {
+    throw invalidArgType('options', 'of type object', options);
+  }
+  if (callback !== undefined && callback !== null && typeof callback !== 'function') {
+    throw invalidArgType('callback', 'of type function', callback);
+  }
+  nullByteCheck(options?.argv0, 'options.argv0', true);
+  return { file, args, options, callback };
+}
+
+// `exec` is `execFile` through a shell: the whole command is one string the
+// shell parses, so the file is that string and `shell` is on by default.
+function normalizeExecArgs(command, options, callback) {
+  nullByteCheck(command, 'command');
+  if (typeof options === 'function') {
+    callback = options;
+    options = undefined;
+  }
+  nullByteCheck(options?.argv0, 'options.argv0', true);
+  options = { ...options };
+  options.shell = typeof options.shell === 'string' ? options.shell : true;
+  return { file: command, options, callback };
+}
+
+function spawnSync(file, args, options) {
+  const normalized = normalizeSpawnArguments(file, args, options);
+  validateTimeout(normalized.timeout);
+  const maxBuffer = normalized.maxBuffer === undefined ? MAX_BUFFER : normalized.maxBuffer;
+  validateMaxBuffer(maxBuffer);
+  const killSignal = sanitizeKillSignal(normalized.killSignal);
+
+  let input;
+  if (normalized.input !== undefined && normalized.input !== null) {
+    if (typeof normalized.input === 'string') {
+      input = Buffer.from(normalized.input, normalized.encoding === 'buffer'
+        ? undefined
+        : normalized.encoding);
+    } else if (ArrayBuffer.isView(normalized.input)) {
+      input = Buffer.from(normalized.input.buffer,
+                          normalized.input.byteOffset,
+                          normalized.input.byteLength);
+    } else {
+      throw invalidArgType('options.stdio[0]',
+                           'one of type Buffer, TypedArray, DataView, or string',
+                           normalized.input, true);
+    }
+  }
+
+  const { streams } = normalizeStdio(normalized.stdio, ['pipe', 'pipe', 'pipe']);
+  const raw = native.spawnSyncRaw(normalized.file, normalized.args, {
+    cwd: normalized.cwd === undefined || normalized.cwd === null
+      ? undefined
+      : String(normalized.cwd),
+    argv0: normalized.argv0,
+    input: input === undefined ? undefined : input.toString('latin1'),
+    env: normalized.env === undefined || normalized.env === null
       ? { ...process.env }
-      : options.env,
+      : normalized.env,
+    stdio: streams,
+    maxBuffer,
+    timeout: normalized.timeout ?? 0,
+    killSignal,
   });
-}
 
-function buildError(raw, command) {
-  const e = new Error(raw.error);
-  e.code = raw.errorCode;
-  e.errno = -2;
-  e.syscall = `spawn ${command}`;
-  e.path = command;
-  e.spawnargs = [];
-  return e;
-}
-
-function spawnSync(command, args, options) {
-  const n = normalizeArgs(command, args, options);
-  const raw = rawSpawn(n.command, n.args, n.options);
-  const enc = n.options.encoding;
-  const decode = (s) => {
-    const b = Buffer.from(s, 'latin1');
-    return enc && enc !== 'buffer' ? b.toString(enc) : b;
+  const encoding = normalized.encoding;
+  const decode = (view) => {
+    if (view === null || view === undefined) return null;
+    const bytes = Buffer.from(view);
+    return encoding && encoding !== 'buffer' ? bytes.toString(encoding) : bytes;
   };
-  const stdout = raw.error ? null : decode(raw.stdout);
-  const stderr = raw.error ? null : decode(raw.stderr);
+  const stdout = decode(raw.stdout);
+  const stderr = decode(raw.stderr);
   const result = {
     pid: raw.pid,
     output: [null, stdout, stderr],
@@ -58,38 +321,57 @@ function spawnSync(command, args, options) {
     status: raw.status,
     signal: raw.signal,
   };
-  if (raw.error) result.error = buildError(raw, n.command);
+  if (raw.errorCode) {
+    result.error = errnoException(raw.errorCode, `spawnSync ${normalized.file}`);
+    result.error.path = normalized.file;
+    result.error.spawnargs = normalized.args.slice(0);
+  }
   return result;
 }
 
-function checkSyncResult(result, command) {
-  if (result.error) throw result.error;
-  if (result.status !== 0 && result.status !== null) {
-    const e = new Error(`Command failed: ${command}` + (result.stderr ? `\n${result.stderr.toString()}` : ''));
-    e.status = result.status;
-    e.signal = result.signal;
-    e.output = result.output;
-    e.pid = result.pid;
-    e.stdout = result.stdout;
-    e.stderr = result.stderr;
-    throw e;
+// A synchronous run reports failure by throwing, and the throw carries the
+// whole outcome — status, signal, and whatever the child managed to say.
+function checkExecSyncError(result, args, command) {
+  if (!result.error && result.status === 0) return undefined;
+  let message = `Command failed: ${command ?? args.join(' ')}`;
+  if (result.stderr && result.stderr.length > 0) message += `\n${result.stderr.toString()}`;
+  const err = outcomeError(message, result);
+  if (result.error) {
+    err.code = result.error.code;
+    err.errno = result.error.errno;
+    err.syscall = result.error.syscall;
+    err.path = result.error.path;
+    err.spawnargs = result.error.spawnargs;
   }
-  return result.stdout;
+  return err;
 }
 
 function execFileSync(file, args, options) {
-  const n = normalizeArgs(file, args, options);
-  const result = spawnSync(n.command, n.args, n.options);
-  return checkSyncResult(result, n.command);
+  const normalized = normalizeExecFileArgs(file, args, options);
+  // Without an explicit `stdio`, the child's diagnostics are the caller's:
+  // Node passes them straight through to this process's own error stream.
+  const inheritStderr = !normalized.options?.stdio;
+  const result = spawnSync(normalized.file, normalized.args, normalized.options);
+  if (inheritStderr && result.stderr && result.stderr.length > 0) {
+    process.stderr.write(result.stderr);
+  }
+  const err = checkExecSyncError(
+    result, [normalized.options?.argv0 || normalized.file, ...normalized.args]);
+  if (err) throw err;
+  return result.stdout;
 }
 
 function execSync(command, options) {
-  options = options || {};
-  const shell = typeof options.shell === 'string' ? options.shell : '/bin/sh';
-  const result = spawnSync(shell, ['-c', String(command)], options);
-  return checkSyncResult(result, command);
+  const normalized = normalizeExecArgs(command, options, null);
+  const inheritStderr = !normalized.options.stdio;
+  const result = spawnSync(normalized.file, [], normalized.options);
+  if (inheritStderr && result.stderr && result.stderr.length > 0) {
+    process.stderr.write(result.stderr);
+  }
+  const err = checkExecSyncError(result, undefined, command);
+  if (err) throw err;
+  return result.stdout;
 }
-
 
 // Node names a property `options.x` and an argument `"x"`, and renders the
 // offending value the same way in both.
@@ -314,13 +596,18 @@ class ChildProcess extends EventEmitter {
       return;
     }
     if (started.error) {
-      const raw = started;
-      setTimeout(() => this._failed(buildError(raw, command)), 0);
+      const failure = errnoException(started.errorCode ?? 'EIO', `spawn ${command}`);
+      failure.path = command;
+      failure.spawnargs = args.slice(0);
+      setTimeout(() => this._failed(failure), 0);
       return;
     }
     this.pid = started.pid;
     this._handle = started.id;
     children.set(started.id, this);
+    // A child that started is news the caller can act on, and it arrives on
+    // the turn after `spawn` returned so the object is theirs first.
+    process.nextTick(() => this.emit('spawn'));
   }
 
   _failed(error) {
@@ -581,72 +868,273 @@ function netNative() {
   return require('internal/otter/net');
 }
 
-function spawn(command, args, options) {
-  const n = normalizeArgs(command, args, options);
-  const { streams, wantsChannel } = normalizeStdio(n.options.stdio, ['pipe', 'pipe', 'pipe']);
+function spawn(file, args, options) {
+  const normalized = normalizeSpawnArguments(file, args, options);
+  validateTimeout(normalized.timeout);
+  validateAbortSignal(normalized.signal, 'options.signal');
+  const killSignal = sanitizeKillSignal(normalized.killSignal);
+  const { streams, wantsChannel } = normalizeStdio(normalized.stdio, ['pipe', 'pipe', 'pipe']);
   const cp = new ChildProcess();
-  cp._run(n.command, n.args, { ...n.options, stdio: streams, ipc: wantsChannel });
+  cp._run(normalized.file, normalized.args, { ...normalized, stdio: streams, ipc: wantsChannel });
   if (wantsChannel && cp._handle !== 0) {
     cp.connected = true;
     cp.channel = { ref() {}, unref() {} };
   }
+
+  // A child that outlives its welcome is stopped, and the timer that would
+  // stop it is dropped the moment it leaves on its own.
+  if (normalized.timeout > 0) {
+    let timer = setTimeout(() => {
+      timer = null;
+      try {
+        cp.kill(killSignal);
+      } catch (error) {
+        cp.emit('error', error);
+      }
+    }, normalized.timeout);
+    cp.once('exit', () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    });
+  }
+
+  const signal = normalized.signal;
+  if (signal !== undefined && signal !== null) {
+    const onAbort = () => {
+      try {
+        if (cp.kill(killSignal)) cp.emit('error', abortError(signal.reason));
+      } catch (error) {
+        cp.emit('error', error);
+      }
+    };
+    if (signal.aborted) {
+      process.nextTick(onAbort);
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+      cp.once('exit', () => signal.removeEventListener('abort', onAbort));
+    }
+  }
   return cp;
 }
 
-function collect(cp, options, cb) {
-  const enc = options.encoding === undefined ? 'utf8' : options.encoding;
-  const out = []; const err = [];
-  cp.stdout.on('data', (d) => out.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
-  cp.stderr.on('data', (d) => err.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
-  cp.on('error', (e) => { if (cb) cb(e, decodeAll(out, enc), decodeAll(err, enc)); cb = null; });
-  cp.on('close', (status, signal) => {
-    if (!cb) return;
-    const stdout = decodeAll(out, enc); const stderr = decodeAll(err, enc);
-    if (status !== 0 && status !== null) {
-      const e = new Error(`Command failed`);
-      e.code = status; e.killed = false; e.signal = signal;
-      cb(e, stdout, stderr);
-    } else {
-      cb(null, stdout, stderr);
+// A stream read as text joins as text; one read as bytes concatenates.
+function joinCollected(chunks, encoding, stream) {
+  if (encoding || stream?.readableEncoding) return chunks.join('');
+  return Buffer.concat(chunks);
+}
+
+function execFile(file, args, options, callback) {
+  const normalized = normalizeExecFileArgs(file, args, options, callback);
+  file = normalized.file;
+  args = normalized.args;
+  callback = normalized.callback;
+  const settings = {
+    encoding: 'utf8',
+    timeout: 0,
+    maxBuffer: MAX_BUFFER,
+    killSignal: 'SIGTERM',
+    shell: false,
+    ...normalized.options,
+  };
+  validateTimeout(settings.timeout);
+  validateMaxBuffer(settings.maxBuffer);
+  settings.killSignal = sanitizeKillSignal(settings.killSignal);
+
+  const child = spawn(file, args, {
+    cwd: settings.cwd,
+    env: settings.env,
+    gid: settings.gid,
+    uid: settings.uid,
+    shell: settings.shell,
+    signal: settings.signal,
+    windowsHide: settings.windowsHide,
+    windowsVerbatimArguments: settings.windowsVerbatimArguments,
+  });
+
+  const encoding = settings.encoding !== 'buffer' && Buffer.isEncoding(settings.encoding)
+    ? settings.encoding
+    : null;
+  const collected = { stdout: [], stderr: [] };
+  const kept = { stdout: 0, stderr: 0 };
+  let failure = null;
+  let exited = false;
+  let timer = null;
+  let command = file;
+
+  function stop() {
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    try {
+      child.kill(settings.killSignal);
+    } catch (error) {
+      failure = error;
+      finish();
     }
+  }
+
+  function finish(status, signal) {
+    if (exited) return;
+    exited = true;
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (!callback) return;
+    const stdout = joinCollected(collected.stdout, encoding, child.stdout);
+    const stderr = joinCollected(collected.stderr, encoding, child.stderr);
+    if (!failure && status === 0 && signal === null) {
+      callback(null, stdout, stderr);
+      return;
+    }
+    if (args?.length) command += ` ${args.join(' ')}`;
+    if (!failure) {
+      // A negative status is not an exit code but a platform failure, and it
+      // reports itself by name the way every other one does.
+      failure = outcomeError(`Command failed: ${command}\n${stderr}`, {
+        code: status < 0 ? require('util').getSystemErrorName(status) : status,
+        killed: child.killed,
+        signal,
+      });
+    }
+    failure.cmd = command;
+    callback(failure, stdout, stderr);
+  }
+
+  // A stream is collected only as far as the caller agreed to hold it: past
+  // that the run has failed, and the child is stopped rather than left
+  // filling a buffer nobody will read.
+  function watch(name, stream) {
+    if (!stream) return;
+    if (encoding) stream.setEncoding(encoding);
+    stream.on('data', (chunk) => {
+      const chunkEncoding = stream.readableEncoding;
+      const length = chunkEncoding ? Buffer.byteLength(chunk, chunkEncoding) : chunk.length;
+      kept[name] += length;
+      if (kept[name] > settings.maxBuffer) {
+        const room = settings.maxBuffer - (kept[name] - length);
+        collected[name].push(chunk.slice(0, room));
+        failure = new RangeError(`${name} maxBuffer length exceeded`);
+        failure.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+        stop();
+        return;
+      }
+      collected[name].push(chunk);
+    });
+  }
+  watch('stdout', child.stdout);
+  watch('stderr', child.stderr);
+
+  if (settings.timeout > 0) {
+    timer = setTimeout(() => {
+      timer = null;
+      stop();
+    }, settings.timeout);
+  }
+
+  child.addListener('close', finish);
+  child.addListener('error', (error) => {
+    failure = error;
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    finish();
+  });
+  return child;
+}
+
+function exec(command, options, callback) {
+  const normalized = normalizeExecArgs(command, options, callback);
+  return execFile(normalized.file, normalized.options, normalized.callback);
+}
+
+// `util.promisify` on either of these answers `{ stdout, stderr }`, and a
+// failure carries the same two on the error it rejects with.
+function promisifiedRun(run) {
+  return function promisified(...args) {
+    let resolve;
+    let reject;
+    const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+    promise.child = run(...args, (error, stdout, stderr) => {
+      if (error !== null && error !== undefined) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+    return promise;
+  };
+}
+
+for (const [run, target] of [[exec, exec], [execFile, execFile]]) {
+  Object.defineProperty(target, require('util').promisify.custom, {
+    value: promisifiedRun(run),
+    enumerable: false,
+    writable: false,
+    configurable: true,
   });
 }
 
-function decodeAll(chunks, enc) {
-  const b = Buffer.concat(chunks);
-  return enc && enc !== 'buffer' ? b.toString(enc) : b;
-}
-
-function execFile(file, args, options, cb) {
-  if (typeof args === 'function') { cb = args; args = []; options = {}; }
-  else if (typeof options === 'function') { cb = options; options = {}; }
-  const n = normalizeArgs(file, args, options || {});
-  const cp = spawn(n.command, n.args, n.options);
-  collect(cp, n.options, cb);
-  return cp;
-}
-
-function exec(command, options, cb) {
-  if (typeof options === 'function') { cb = options; options = {}; }
-  options = options || {};
-  const shell = typeof options.shell === 'string' ? options.shell : '/bin/sh';
-  return execFile(shell, ['-c', String(command)], options, cb);
+// What a one-word `stdio` stands for, plus the channel a fork always has.
+function stdioStringToArray(stdio, channel) {
+  let streams;
+  switch (stdio) {
+    case 'ignore':
+    case 'overlapped':
+    case 'pipe':
+      streams = [stdio, stdio, stdio];
+      break;
+    case 'inherit':
+      streams = ['inherit', 'inherit', 'inherit'];
+      break;
+    default:
+      throw invalidArgValue('stdio', stdio, 'is invalid');
+  }
+  if (channel) streams.push(channel);
+  return streams;
 }
 
 // A forked child runs this same binary and joins a channel opened for it, so
 // `child.send` here and `process.send` there are the two ends of one channel.
 function fork(modulePath, args, options) {
-  // `args` is optional: `fork(path, options)` puts the settings second.
-  const a = Array.isArray(args) ? args : [];
-  const given = (Array.isArray(args) ? options : args) || options || {};
-  // A forked child shares this process's output unless the caller asked for it
-  // on a stream of its own, which is what `silent` means. Either way it gets a
-  // channel, which is what makes it a fork rather than a spawn.
-  const inherited = given.silent ? 'pipe' : 'inherit';
-  const stdio = given.stdio ?? [inherited, inherited, inherited];
-  const settings = { ...given, stdio: [...(Array.isArray(stdio) ? stdio : [stdio, stdio, stdio]), 'ipc'] };
-  const execPath = (typeof process !== 'undefined' && process.execPath) || 'node';
-  return spawn(execPath, [String(modulePath), ...a.map(String)], settings);
+  nullByteCheck(modulePath, 'modulePath');
+  if (Array.isArray(args)) {
+    args = args.slice(0);
+  } else if (args === undefined || args === null) {
+    args = [];
+  } else if (typeof args !== 'object') {
+    throw invalidArgValue('args', args, 'is invalid');
+  } else {
+    options = args;
+    args = [];
+  }
+  if (options === undefined || options === null) options = {};
+  else if (typeof options !== 'object') throw invalidArgValue('options', options, 'is invalid');
+  else options = { ...options };
+
+  // A fork is this binary running a module, not a command line for a shell.
+  options.shell = false;
+  options.execPath = options.execPath || process.execPath;
+  nullByteCheck(options.execPath, 'options.execPath', true);
+  const execArgv = options.execArgv || process.execArgv || [];
+  nullByteCheckAll(execArgv, 'options.execArgv');
+
+  args = [...execArgv, String(modulePath), ...args];
+
+  if (typeof options.stdio === 'string') {
+    options.stdio = stdioStringToArray(options.stdio, 'ipc');
+  } else if (!Array.isArray(options.stdio)) {
+    options.stdio = stdioStringToArray(options.silent ? 'pipe' : 'inherit', 'ipc');
+  } else if (!options.stdio.includes('ipc')) {
+    const err = new Error('Forked processes must have an IPC channel, ' +
+                          'missing value \'ipc\' in options.stdio');
+    err.code = 'ERR_CHILD_PROCESS_IPC_REQUIRED';
+    throw err;
+  }
+
+  return spawn(options.execPath, args, options);
 }
 
 module.exports = {

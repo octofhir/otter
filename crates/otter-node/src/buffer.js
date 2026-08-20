@@ -219,51 +219,15 @@ if (!Buffer) {
   // surrogates, and > U+10FFFF are impossible by construction), an invalid
   // byte is never consumed by the failed sequence (maximal subpart resync),
   // and each failure yields exactly one replacement.
-  function utf8Slice(buf, start, end) {
-    let res = '';
-    let i = start;
-    while (i < end) {
-      const b0 = buf[i];
-      if (b0 < 0x80) { res += String.fromCharCode(b0); i += 1; continue; }
-      let size; let cp; let lower = 0x80; let upper = 0xbf;
-      if (b0 >= 0xc2 && b0 <= 0xdf) { size = 2; cp = b0 & 0x1f; }
-      else if (b0 === 0xe0) { size = 3; cp = 0; lower = 0xa0; }
-      else if (b0 >= 0xe1 && b0 <= 0xec) { size = 3; cp = b0 & 0x0f; }
-      else if (b0 === 0xed) { size = 3; cp = 0x0d; upper = 0x9f; }
-      else if (b0 === 0xee || b0 === 0xef) { size = 3; cp = b0 & 0x0f; }
-      else if (b0 === 0xf0) { size = 4; cp = 0; lower = 0x90; }
-      else if (b0 >= 0xf1 && b0 <= 0xf3) { size = 4; cp = b0 & 0x07; }
-      else if (b0 === 0xf4) { size = 4; cp = 4; upper = 0x8f; }
-      else { res += '�'; i += 1; continue; }
-      i += 1;
-      let ok = true;
-      for (let j = 1; j < size; j++) {
-        if (i >= end) { ok = false; break; }
-        const b = buf[i];
-        if (b < (j === 1 ? lower : 0x80) || b > (j === 1 ? upper : 0xbf)) {
-          ok = false;
-          break;
-        }
-        cp = (cp << 6) | (b & 0x3f);
-        i += 1;
-      }
-      if (!ok) { res += '�'; continue; }
-      if (cp > 0xffff) {
-        cp -= 0x10000;
-        res += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-      } else {
-        res += String.fromCharCode(cp);
-      }
-    }
-    return res;
+  // The host half of this module, loaded the first time text is asked for.
+  let bytesToText = null;
+  function decoder() {
+    bytesToText ??= require('__bufdecode');
+    return bytesToText;
   }
 
+
   const hexChars = '0123456789abcdef';
-  function hexSlice(buf, start, end) {
-    let out = '';
-    for (let i = start; i < end; i++) out += hexChars[buf[i] >> 4] + hexChars[buf[i] & 0xf];
-    return out;
-  }
   function hexNibble(code) {
     if (code >= 48 && code <= 57) return code - 48; // 0-9
     if (code >= 97 && code <= 102) return code - 87; // a-f
@@ -297,13 +261,6 @@ if (!Buffer) {
     const out = new Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
     return out;
-  }
-  function base64Slice(buf, start, end, url) {
-    let bin = '';
-    for (let i = start; i < end; i++) bin += String.fromCharCode(buf[i]);
-    let b = (typeof btoa === 'function') ? btoa(bin) : '';
-    if (url) b = b.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    return b;
   }
 
   function base64ByteLength(str) {
@@ -481,15 +438,17 @@ if (!Buffer) {
         err.code = 'ERR_STRING_TOO_LONG';
         throw err;
       }
+      // Bytes become text in one pass through the host: building the result a
+      // character at a time costs a rope node per byte, which a megabyte of
+      // output turns into an exhausted heap.
       switch (e) {
-        case 'utf8': return utf8Slice(this, start, end);
-        case 'ascii': { let s = ''; for (let i = start; i < end; i++) s += String.fromCharCode(this[i] & 0x7f); return s; }
-        case 'latin1': { let s = ''; for (let i = start; i < end; i++) s += String.fromCharCode(this[i]); return s; }
-        case 'utf16le': { let s = ''; for (let i = start; i + 1 < end; i += 2) s += String.fromCharCode(this[i] | (this[i + 1] << 8)); return s; }
-        case 'hex': return hexSlice(this, start, end);
-        case 'base64': return base64Slice(this, start, end, false);
-        case 'base64url': return base64Slice(this, start, end, true);
-        default: return utf8Slice(this, start, end);
+        case 'ascii': return decoder().asciiSlice(this, start, end);
+        case 'latin1': return decoder().latin1Slice(this, start, end);
+        case 'utf16le': return decoder().utf16leSlice(this, start, end);
+        case 'hex': return decoder().hexSlice(this, start, end);
+        case 'base64': return decoder().base64Slice(this, start, end);
+        case 'base64url': return decoder().base64urlSlice(this, start, end);
+        default: return decoder().utf8Slice(this, start, end);
       }
     }
 

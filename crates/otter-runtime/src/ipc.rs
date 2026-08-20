@@ -52,11 +52,18 @@ pub enum IpcEvent {
 pub struct OutgoingFrame {
     bytes: Vec<u8>,
     handles: Vec<RawFd>,
+    /// Held until the frame has left this process. A message the program
+    /// handed to the channel is work in flight, and a program does not finish
+    /// with unsent work — the socket takes only a buffer's worth at a time, so
+    /// a large message needs turns of the loop that must still happen.
+    in_flight: Option<RuntimeKeepAlive>,
 }
 
 /// One end of a channel.
 pub struct IpcChannel {
     outgoing: Mutex<Option<tokio::sync::mpsc::UnboundedSender<OutgoingFrame>>>,
+    /// What a frame in flight holds the run loop open with.
+    spawner: RuntimeTaskSpawner,
     /// Whether this end is pulling messages off the socket yet. A channel is
     /// read because someone is listening on it; until then what the peer sent
     /// waits in the socket, which is what lets a message sent to a process
@@ -248,6 +255,7 @@ impl IpcChannel {
         let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Unref);
         let channel = Arc::new(Self {
             outgoing: Mutex::new(Some(outgoing)),
+            spawner: spawner.clone(),
             reading: Arc::new(ReadGate::new(reading)),
             keep_alive: Arc::new(Mutex::new(Some(keep_alive))),
             connected: Arc::new(AtomicBool::new(true)),
@@ -312,12 +320,14 @@ impl IpcChannel {
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&length.to_le_bytes());
         frame.extend_from_slice(payload.as_bytes());
+        let in_flight = Some(self.spawner.retain_keep_alive(RuntimeLiveness::Ref));
         let queue = self.outgoing.lock().unwrap_or_else(|p| p.into_inner());
         queue.as_ref().is_some_and(|outgoing| {
             outgoing
                 .send(OutgoingFrame {
                     bytes: frame,
                     handles,
+                    in_flight,
                 })
                 .is_ok()
         })
@@ -367,13 +377,21 @@ async fn carry<T, F>(
     let (reader, mut writer) = stream.into_split();
     // Dropping the write half is what lets the peer observe the end of the
     // channel, so the writer task owns it and nothing else holds it.
+    let writer_spawner = spawner.clone();
     tokio::spawn(async move {
-        while let Some(frame) = queued.recv().await {
+        while let Some(mut frame) = queued.recv().await {
             let outcome = write_frame(&mut writer, &frame.bytes, &frame.handles).await;
             // The peer has its own copies now; these were duplicated for the
             // crossing and are this side's to close.
             for handle in &frame.handles {
                 let _ = nix::unistd::close(*handle);
+            }
+            // The hold this frame had on the run loop is let go of on the loop
+            // itself: dropping it here would lower the count without waking
+            // the thread that reads it, and a program with nothing left to do
+            // would keep waiting to be told so.
+            if let Some(in_flight) = frame.in_flight.take() {
+                let _ = writer_spawner.enqueue(FrameWritten { in_flight }, RuntimeLiveness::Unref);
             }
             if outcome.is_err() {
                 return;
@@ -386,6 +404,19 @@ async fn carry<T, F>(
     // not the program ever calls `disconnect` itself.
     release(&keep_alive);
     let _ = spawner.enqueue(deliver(IpcEvent::Closed), RuntimeLiveness::Unref);
+}
+
+/// A frame has left this process; running this on the loop is what lets go of
+/// the hold it had.
+struct FrameWritten {
+    in_flight: RuntimeKeepAlive,
+}
+
+impl RuntimeTask for FrameWritten {
+    fn run(self: Box<Self>, _runtime: &mut crate::Runtime) -> Result<(), OtterError> {
+        drop(self.in_flight);
+        Ok(())
+    }
 }
 
 /// Read whole messages until the peer's end goes away.

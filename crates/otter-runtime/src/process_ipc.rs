@@ -58,31 +58,31 @@ pub(crate) fn install(
             // optional and a function anywhere in it is the callback. What is
             // left is the socket to hand over, and its options.
             let mut callback = None;
-            let mut send_handle = None;
-            let mut options = None;
-            for value in &rest {
+            let mut positional = [None, None];
+            for (index, value) in rest.iter().enumerate() {
                 let value = scope.value(*value);
                 if scope.is_callable(value) {
                     if callback.is_none() {
                         callback = Some(value);
                     }
-                } else if !scope.is_object(value) || scope.is_null(value) {
-                    continue;
-                } else if send_handle.is_none() {
-                    send_handle = Some(value);
-                } else if options.is_none() {
-                    options = Some(value);
+                } else if index < positional.len() {
+                    positional[index] = Some(value);
                 }
             }
-            // A message may hand an open socket to the peer. What that socket
-            // is meant to be on arrival is the sockets module's protocol, so
-            // the message is shaped there and the channel only moves it.
-            let (text, handle) = match send_handle {
-                Some(send_handle) => {
-                    let options = options.unwrap_or_else(|| scope.undefined());
-                    prepare_send(&mut scope, &cfg, message, send_handle, options)?
-                }
-                None => (encode(&mut scope, message)?, -1),
+            // A message may hand an open socket to the peer, and what that
+            // socket is meant to be on arrival is the sockets module's
+            // protocol — as is what counts as a socket at all. Anything given
+            // past the message goes there to be shaped and refused; the
+            // channel only moves the result.
+            let carries = positional.iter().any(|slot| {
+                slot.is_some_and(|value| !scope.is_undefined(value))
+            });
+            let (text, handle) = if carries {
+                let send_handle = positional[0].unwrap_or_else(|| scope.undefined());
+                let options = positional[1].unwrap_or_else(|| scope.undefined());
+                prepare_send(&mut scope, &cfg, message, send_handle, options)?
+            } else {
+                (encode(&mut scope, message)?, -1)
             };
             let accepted = if handle >= 0 {
                 sender.send_with_handles(&text, vec![handle])
@@ -278,7 +278,7 @@ fn prepare_send(
             kind: ErrorKind::TypeError,
             code: "ERR_INVALID_ARG_TYPE",
             message: "The \"message\" argument must be one of type string, object, number, \
-                      boolean, or null"
+                      or boolean"
                 .to_string(),
         });
     }

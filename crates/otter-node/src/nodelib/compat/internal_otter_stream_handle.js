@@ -340,7 +340,15 @@ class StreamHandle {
   setPendingInstances(_instances) { return 0; }
   fchmod(_mode) { return 0; }
 
-  open(_fd) { return uvCode('ENOTSUP'); }
+  // Take over a descriptor the program already has. The host carries it the
+  // way it carries a connection, so everything below this line — reading,
+  // writing, the hold on the loop — is the same as for a dialled socket.
+  open(fd) {
+    const id = native.openFd(fd);
+    if (id < 0) return uvCode('EINVAL');
+    this._adoptFd(id);
+    return 0;
+  }
 
   // §net.Socket.resetAndDestroy — SO_LINGER 0 close: the peer reads
   // ECONNRESET instead of a clean EOF.

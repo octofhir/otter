@@ -451,7 +451,9 @@ const bindings = {
         ? new SharedArrayBuffer(byteLength)
         : undefined;
     },
-    guessHandleType() { return 'PIPE'; },
+    guessHandleType(fd) {
+      return require('internal/otter/net').guessHandleType(fd);
+    },
     defineLazyProperties(target, moduleName, names) {
       for (const name of names) {
         Object.defineProperty(target, name, {

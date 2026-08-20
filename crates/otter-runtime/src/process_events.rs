@@ -279,12 +279,14 @@ fn add_listener(
             scope.set_index(events, length, record)?;
         }
         refresh_event_count(&mut scope, process, events)?;
-        // Listening for messages is what opens the channel this process was
+        // Listening on the channel is what opens the one this process was
         // launched with: until then what the peer sent waits in the socket
-        // rather than being announced to nobody.
+        // rather than being announced to nobody. The end of the channel is
+        // news a program can ask for on its own — a program that only sends
+        // still has to hear when there is nobody left to send to.
         if scope.is_string(event) {
             let name = scope.display_string(event);
-            if name == "message" || name == "internalMessage" {
+            if name == "message" || name == "internalMessage" || name == "disconnect" {
                 let start = scope.get(process, crate::process_ipc::CHANNEL_READ_SLOT)?;
                 if scope.is_callable(start) {
                     let undefined = scope.undefined();

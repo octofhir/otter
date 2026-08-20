@@ -39,6 +39,8 @@ pub(crate) struct CliExecutionConfig {
     process_title: Option<String>,
     expose_gc: bool,
     expose_internals: bool,
+    /// How much stack a call may use, in kilobytes, as `--stack-size` named it.
+    stack_size: Option<u32>,
     flag_spellings: Vec<String>,
     node_options: Vec<String>,
 }
@@ -56,6 +58,7 @@ impl Default for CliExecutionConfig {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            stack_size: None,
             flag_spellings: Vec::new(),
             node_options: Vec::new(),
         }
@@ -87,6 +90,7 @@ impl CliExecutionConfig {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            stack_size: None,
             flag_spellings: Vec::new(),
             node_options: Vec::new(),
         }
@@ -106,6 +110,26 @@ impl CliExecutionConfig {
     /// Enable the global `gc()` captured from `--expose-gc`.
     pub(crate) fn set_expose_gc(&mut self, expose: bool) {
         self.expose_gc = expose;
+    }
+
+    /// How much stack a call may use, as `--stack-size` named it.
+    pub(crate) fn set_stack_size(&mut self, kilobytes: Option<u32>) {
+        self.stack_size = kilobytes;
+    }
+
+    /// The call depth a stack of the asked-for size holds.
+    ///
+    /// The switch is written in kilobytes because that is what the platform it
+    /// comes from counts; this engine counts frames, so the size is read as
+    /// the share of the default stack the run asked for and the depth follows
+    /// it. A run asking for a quarter of the usual stack overflows about four
+    /// times as soon, which is what asking for it means.
+    fn stack_depth(&self) -> Option<u32> {
+        const NODE_DEFAULT_STACK_KB: u64 = 984;
+        let kilobytes = u64::from(self.stack_size?);
+        let frames = u64::from(otter_runtime::DEFAULT_MAX_STACK_DEPTH) * kilobytes
+            / NODE_DEFAULT_STACK_KB;
+        Some(u32::try_from(frames.max(1)).unwrap_or(u32::MAX))
     }
 
     /// Record `--expose-internals`. The engine's `internal/*` modules are
@@ -149,6 +173,9 @@ impl CliExecutionConfig {
         if self.expose_internals {
             argv.push(self.spelled("--expose-internals"));
         }
+        if let Some(kilobytes) = self.stack_size {
+            argv.push(format!("--stack-size={kilobytes}"));
+        }
         argv.extend(self.node_options.iter().cloned());
         if w.no_warnings {
             argv.push("--no-warnings".to_string());
@@ -185,6 +212,9 @@ impl CliExecutionConfig {
             // watchdog and an interrupt handle, so the park is cancellable.
             .allow_blocking_atomics_wait(true)
             .expose_gc(self.expose_gc);
+        if let Some(depth) = self.stack_depth() {
+            builder = builder.max_stack_depth(depth);
+        }
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }
@@ -432,6 +462,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            stack_size: None,
             flag_spellings: Vec::new(),
             node_options: Vec::new(),
         };
@@ -456,6 +487,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            stack_size: None,
             flag_spellings: Vec::new(),
             node_options: Vec::new(),
         };
@@ -484,6 +516,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            stack_size: None,
             flag_spellings: Vec::new(),
             node_options: Vec::new(),
         };
@@ -503,6 +536,7 @@ mod tests {
             process_title: None,
             expose_gc: false,
             expose_internals: false,
+            stack_size: None,
             flag_spellings: Vec::new(),
             node_options: Vec::new(),
         };

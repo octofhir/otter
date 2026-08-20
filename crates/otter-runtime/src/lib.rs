@@ -1161,6 +1161,39 @@ impl CapabilitySet {
         }
     }
 
+    /// What this process hands to the ones it starts, or `None` when it hands
+    /// them nothing.
+    ///
+    /// A process trusted with everything trusts what it starts with the same:
+    /// it can already do anything its children could, and a program that
+    /// launches a helper through a shell has no other way to say so. Anything
+    /// short of everything is not passed on — a narrowed grant is about this
+    /// program's own reach, and widening it for a child would be guessing.
+    #[must_use]
+    pub fn inherited_grant(&self) -> Option<&'static str> {
+        self.is_allow_all().then_some(GRANT_EVERYTHING)
+    }
+
+    /// Whether every capability is granted.
+    #[must_use]
+    pub fn is_allow_all(&self) -> bool {
+        self.read.is_allow_all()
+            && self.write.is_allow_all()
+            && self.net.is_allow_all()
+            && self.env.is_allow_all()
+            && self.run.is_allow_all()
+            && self.ffi.is_allow_all()
+    }
+
+    /// What the process that started this one granted it, if anything.
+    #[must_use]
+    pub fn from_inherited_grant() -> Option<Self> {
+        match std::env::var(GRANT_VAR).ok()?.as_str() {
+            GRANT_EVERYTHING => Some(Self::allow_all()),
+            _ => None,
+        }
+    }
+
     /// Grant everything unconditionally. The CLI maps `--allow-all`
     /// to this. Development / testing only.
     #[must_use]
@@ -1175,6 +1208,14 @@ impl CapabilitySet {
         }
     }
 }
+
+/// Names what a launched process was granted by the one that started it. The
+/// environment is the only thing that survives a shell standing between the
+/// two, which is how a program most often launches another.
+pub const GRANT_VAR: &str = "OTTER_GRANT";
+
+/// The one grant that is passed on: everything.
+const GRANT_EVERYTHING: &str = "all";
 
 fn env_name_is_builtin_denied(name: &str) -> bool {
     ENV_BUILTIN_DENY_PATTERNS

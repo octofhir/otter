@@ -713,7 +713,10 @@ fn build_native<'scope>(
                     &adopt_table,
                     &adopt_ids,
                     spawner,
-                    true,
+                    // Nothing is pulled off a descriptor that arrived until
+                    // the program that asked for it has a handle to hear
+                    // about it: bytes read before then are read for nobody.
+                    false,
                 )
             };
             Ok(RuntimeValue::number_i32(id as i32))

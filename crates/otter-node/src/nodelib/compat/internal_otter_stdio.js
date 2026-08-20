@@ -37,8 +37,17 @@ function readableStream(fd) {
 function makeStdin() {
   const stdin = readableStream(0);
   stdin.fd = 0;
-  // Standard input starts paused: a program that never reads it must not be
-  // held open by it, and one that reads it says so by listening or resuming.
+  // Pausing standard input has to stop the descriptor, not only the stream:
+  // an open handle nobody is reading is still a reason for the loop to wait,
+  // and a program that never asks for its input must be free to finish.
+  stdin.on('pause', () => {
+    const handle = stdin._handle;
+    if (handle === null || handle === undefined) return;
+    stdin._readableState.reading = false;
+    handle.reading = false;
+    if (typeof handle.readStop === 'function') handle.readStop();
+  });
+  // It starts paused: reading begins when the program says it is listening.
   stdin.pause();
   // `process.stdin` is the program's, not a connection the program owns:
   // destroying it must not take the descriptor away from whatever else in the

@@ -48,6 +48,10 @@ enum EntryKind {
         /// racing a just-closed server must be refused, never accepted by
         /// the kernel backlog and then reset.
         shutdown: Arc<tokio::sync::Notify>,
+        /// The listening descriptor, so a server can cross a channel the way
+        /// a connection does. The accept task owns the socket, so the number
+        /// is what stays reachable here.
+        fd: std::os::fd::RawFd,
     },
     Connection {
         outgoing: Option<tokio::sync::mpsc::UnboundedSender<WriteMsg>>,
@@ -63,6 +67,11 @@ enum EntryKind {
         /// Gate the read loop obeys, driven by the handle's
         /// `readStart`/`readStop`.
         read_gate: Arc<ReadGate>,
+        /// Whether a copy of this socket left the process. A hard close
+        /// reaches the peer as a shutdown of the write half, which is this
+        /// process speaking for the socket — and once another process holds a
+        /// copy, the socket is no longer only this one's to speak for.
+        shared: Arc<AtomicBool>,
     },
 }
 
@@ -568,10 +577,19 @@ fn build_native<'scope>(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match table.get(&id) {
                     Some(Entry {
-                        kind: EntryKind::Connection { socket, .. },
+                        kind: EntryKind::Connection { socket, shared, .. },
                         ..
-                    }) => Some(socket.raw_fd()),
-                    _ => None,
+                    }) => {
+                        // A copy is about to leave; the socket stops being
+                        // this process's alone from here on.
+                        shared.store(true, Ordering::SeqCst);
+                        Some(socket.raw_fd())
+                    }
+                    Some(Entry {
+                        kind: EntryKind::Listener { fd, .. },
+                        ..
+                    }) => Some(*fd),
+                    None => None,
                 }
             };
             let Some(raw) = raw else {
@@ -584,6 +602,25 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "dupFd", dup_fd)?;
+
+    // A duplicate made for a crossing that never happened is closed rather
+    // than leaked.
+    let close_fd = scope.native_closure(
+        "closeFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            if raw >= 0 {
+                let _ = nix::unistd::close(raw);
+            }
+            Ok(RuntimeValue::undefined())
+        },
+    )?;
+    scope.set(object, "closeFd", close_fd)?;
 
     let adopt_table = table.clone();
     let adopt_ids = next_id.clone();
@@ -640,6 +677,57 @@ fn build_native<'scope>(
     )?;
     scope.set(object, "adoptFd", adopt_fd)?;
 
+    // A listening socket crosses a channel the same way a connection does.
+    // What arrives is already listening, so this side only has to start
+    // accepting on it.
+    let adopt_listener_table = table.clone();
+    let adopt_listener_ids = next_id.clone();
+    let adopt_listener_spawner = spawner.clone();
+    let adopt_listener = scope.native_closure(
+        "adoptListenerFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            let Some(spawner) = adopt_listener_spawner.as_ref() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let Some(io) = spawner.io_handle() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            if raw < 0 {
+                return Ok(RuntimeValue::number_i32(-1));
+            }
+            // SAFETY: the descriptor arrived from the channel, which handed
+            // ownership over with it; nothing else in this process holds it.
+            let std_listener =
+                unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            if std_listener.set_nonblocking(true).is_err() {
+                return Ok(RuntimeValue::number_i32(-1));
+            }
+            let local = std_listener.local_addr().ok();
+            // `from_std` and the accept task both register with the reactor
+            // and need the runtime in scope.
+            let _guard = io.enter();
+            let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let id = serve_tcp_listener(
+                listener,
+                local,
+                &adopt_listener_table,
+                &adopt_listener_ids,
+                spawner,
+                &io,
+            );
+            Ok(RuntimeValue::number_i32(id as i32))
+        },
+    )?;
+    scope.set(object, "adoptListenerFd", adopt_listener)?;
+
     // A descriptor that arrived over a channel says what it is: the kernel
     // knows whether it carries a stream or datagrams, so the receiver does
     // not need the sender to tell it.
@@ -660,8 +748,14 @@ fn build_native<'scope>(
             // and only queried, never closed or duplicated here.
             let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
             let kind = nix::sys::socket::getsockopt(&borrowed, nix::sys::socket::sockopt::SockType);
+            let listening = nix::sys::socket::getsockopt(
+                &borrowed,
+                nix::sys::socket::sockopt::AcceptConn,
+            )
+            .unwrap_or(false);
             let _ = borrowed.as_raw_fd();
             let answer = match kind {
+                Ok(nix::sys::socket::SockType::Stream) if listening => 3,
                 Ok(nix::sys::socket::SockType::Stream) => 1,
                 Ok(nix::sys::socket::SockType::Datagram) => 2,
                 _ => 0,
@@ -762,6 +856,29 @@ fn listen(
             .map_err(|error| system_error(&error, "listen", &host))?
     };
 
+    let id = serve_tcp_listener(listener, Some(local), table, next_id, &spawner, &io);
+
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+        let handle = scope.number(f64::from(id));
+        scope.set(result, "handle", handle)?;
+        let address = address_object(&mut scope, local)?;
+        scope.set(result, "address", address)?;
+        Ok(scope.finish(result))
+    })
+}
+
+/// Take ownership of a listening socket and deliver each connection it
+/// accepts, answering the id the shim carries it under.
+fn serve_tcp_listener(
+    listener: tokio::net::TcpListener,
+    local: Option<std::net::SocketAddr>,
+    table: &Table,
+    next_id: &Arc<AtomicU32>,
+    spawner: &RuntimeTaskSpawner,
+    io: &tokio::runtime::Handle,
+) -> u32 {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -773,9 +890,10 @@ fn listen(
             Entry {
                 kind: EntryKind::Listener {
                     shutdown: shutdown.clone(),
+                    fd,
                 },
                 keep_alive: Some(keep_alive),
-                local: Some(local),
+                local,
                 remote: None,
             },
         );
@@ -821,15 +939,7 @@ fn listen(
             }
         }
     });
-
-    ctx.scope(|mut scope| {
-        let result = scope.object()?;
-        let handle = scope.number(f64::from(id));
-        scope.set(result, "handle", handle)?;
-        let address = address_object(&mut scope, local)?;
-        scope.set(result, "address", address)?;
-        Ok(scope.finish(result))
-    })
+    id
 }
 
 /// Take ownership of a connected stream and start carrying it.
@@ -847,6 +957,7 @@ fn adopt(
     let abort = Arc::new(tokio::sync::Notify::new());
     let queued_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let read_gate = Arc::new(ReadGate::new());
+    let shared = Arc::new(AtomicBool::new(false));
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -859,6 +970,7 @@ fn adopt(
                     abort: abort.clone(),
                     queued: queued_count.clone(),
                     read_gate: read_gate.clone(),
+                    shared: shared.clone(),
                 },
                 keep_alive: Some(keep_alive),
                 local,
@@ -869,6 +981,7 @@ fn adopt(
     let writer_stream = stream.clone();
     let writer_spawner = spawner.clone();
     let writer_queued = queued_count;
+    let writer_shared = shared;
     tokio::spawn(async move {
         while let Some(message) = queued.recv().await {
             let _decrement = scopeguard_decrement(&writer_queued);
@@ -920,8 +1033,12 @@ fn adopt(
             }
         }
         // The sender dropped without an End marker (hard close); the write
-        // half closes so the peer reads EOF.
-        shutdown_write(&writer_stream);
+        // half closes so the peer reads EOF without waiting for every task
+        // holding this socket to let go of it. A socket a copy of which left
+        // the process is not this process's to close for everyone.
+        if !writer_shared.load(Ordering::SeqCst) {
+            shutdown_write(&writer_stream);
+        }
     });
 
     let reader_spawner = spawner.clone();
@@ -1025,6 +1142,7 @@ fn listen_unix(
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let shutdown = Arc::new(tokio::sync::Notify::new());
+    let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1033,6 +1151,7 @@ fn listen_unix(
             Entry {
                 kind: EntryKind::Listener {
                     shutdown: shutdown.clone(),
+                    fd: listener_fd,
                 },
                 keep_alive: Some(keep_alive),
                 local: None,
@@ -1529,7 +1648,7 @@ fn close_entry(table: &Table, id: u32) {
         .remove(&id);
     match removed {
         Some(Entry {
-            kind: EntryKind::Listener { ref shutdown },
+            kind: EntryKind::Listener { ref shutdown, .. },
             ..
         }) => shutdown.notify_one(),
         Some(Entry {

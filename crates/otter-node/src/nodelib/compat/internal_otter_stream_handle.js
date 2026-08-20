@@ -394,6 +394,20 @@ function startListen(handle, bind) {
   return 0;
 }
 
+// A listening socket that arrived over a channel is already accepting; the
+// wrap only stands for it here, so it registers the id instead of binding.
+function adoptServer(handle, id) {
+  handle._serverId = id;
+  servers.set(id, handle);
+  handleClassByServer.set(id, handle.constructor);
+  const name = native.address(id, 'local');
+  if (name !== undefined && name !== null) {
+    handle._boundAddress = name.address;
+    handle._boundPort = name.port;
+  }
+  if (!handle._refed) native.hold(id, false);
+}
+
 function makeConnectionHandle(HandleClass, fd, remote) {
   const client = new HandleClass();
   client._adoptFd(fd);
@@ -490,6 +504,7 @@ Object.defineProperty(globalThis, '__otterNetDeliver', { enumerable: false });
 
 module.exports = {
   StreamHandle,
+  adoptServer,
   startConnect,
   startListen,
   handleClassByServer,

@@ -57,12 +57,46 @@ pub struct OutgoingFrame {
 /// One end of a channel.
 pub struct IpcChannel {
     outgoing: Mutex<Option<tokio::sync::mpsc::UnboundedSender<OutgoingFrame>>>,
+    /// Whether this end is pulling messages off the socket yet. A channel is
+    /// read because someone is listening on it; until then what the peer sent
+    /// waits in the socket, which is what lets a message sent to a process
+    /// still starting up survive until its program is there to hear it.
+    reading: Arc<ReadGate>,
     /// Shared with the task carrying the channel: whichever of the two ends it
     /// first — this side disconnecting, or the peer going away — releases the
     /// hold, so a process is never kept running by a channel nobody is on.
     keep_alive: Arc<Mutex<Option<RuntimeKeepAlive>>>,
     connected: Arc<AtomicBool>,
     address: Option<PathBuf>,
+}
+
+/// The signal a channel's reader waits on before it pulls anything.
+struct ReadGate {
+    open: AtomicBool,
+    opened: tokio::sync::Notify,
+}
+
+impl ReadGate {
+    fn new(open: bool) -> Self {
+        Self {
+            open: AtomicBool::new(open),
+            opened: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn open(&self) {
+        if !self.open.swap(true, Ordering::SeqCst) {
+            // A stored permit, not a broadcast: the reader may not have parked
+            // yet, and a missed wake is a channel that never reads again.
+            self.opened.notify_one();
+        }
+    }
+
+    async fn wait(&self) {
+        while !self.open.load(Ordering::SeqCst) {
+            self.opened.notified().await;
+        }
+    }
 }
 
 fn host_error(message: impl Into<String>) -> OtterError {
@@ -118,7 +152,8 @@ impl IpcChannel {
                 .map_err(|error| host_error(format!("IPC channel: {error}")))?
         };
 
-        let (channel, outgoing) = Self::new(spawner, Some(address.clone()));
+        let (channel, outgoing) = Self::new_gated(spawner, Some(address.clone()), true);
+        let accept_gate = channel.reading.clone();
         let accept_address = address.clone();
         let accept_connected = channel.connected.clone();
         let accept_keep_alive = channel.keep_alive.clone();
@@ -140,6 +175,7 @@ impl IpcChannel {
                 accept_connected,
                 accept_keep_alive,
                 accept_spawner,
+                accept_gate,
                 deliver,
             )
             .await;
@@ -177,8 +213,9 @@ impl IpcChannel {
                 .map_err(|error| host_error(format!("IPC channel: {error}")))?
         };
 
-        let (channel, outgoing) = Self::new(spawner, None);
+        let (channel, outgoing) = Self::new_gated(spawner, None, false);
         let connected = channel.connected.clone();
+        let gate = channel.reading.clone();
         let keep_alive = channel.keep_alive.clone();
         let join_spawner = spawner.clone();
         io.spawn(async move {
@@ -188,6 +225,7 @@ impl IpcChannel {
                 connected,
                 keep_alive,
                 join_spawner,
+                gate,
                 deliver,
             )
             .await;
@@ -195,9 +233,10 @@ impl IpcChannel {
         Ok(channel)
     }
 
-    fn new(
+    fn new_gated(
         spawner: &RuntimeTaskSpawner,
         address: Option<PathBuf>,
+        reading: bool,
     ) -> (
         Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
@@ -209,11 +248,20 @@ impl IpcChannel {
         let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Unref);
         let channel = Arc::new(Self {
             outgoing: Mutex::new(Some(outgoing)),
+            reading: Arc::new(ReadGate::new(reading)),
             keep_alive: Arc::new(Mutex::new(Some(keep_alive))),
             connected: Arc::new(AtomicBool::new(true)),
             address,
         });
         (channel, queued)
+    }
+
+    /// Start pulling messages off this channel.
+    ///
+    /// A process joins the channel it was launched with before its program
+    /// runs, so nothing is read until the program says it is listening.
+    pub fn start_reading(&self) {
+        self.reading.open();
     }
 
     /// Whether the peer is still reachable.
@@ -310,6 +358,7 @@ async fn carry<T, F>(
     connected: Arc<AtomicBool>,
     keep_alive: Arc<Mutex<Option<RuntimeKeepAlive>>>,
     spawner: RuntimeTaskSpawner,
+    reading: Arc<ReadGate>,
     deliver: F,
 ) where
     F: Fn(IpcEvent) -> T + Send + Sync + 'static,
@@ -331,7 +380,7 @@ async fn carry<T, F>(
             }
         }
     });
-    read_loop(&reader, &spawner, &deliver).await;
+    read_loop(&reader, &spawner, &reading, &deliver).await;
     connected.store(false, Ordering::SeqCst);
     // The peer is gone, so this end stops holding the run loop open whether or
     // not the program ever calls `disconnect` itself.
@@ -344,11 +393,14 @@ async fn carry<T, F>(
 async fn read_loop<T, F>(
     stream: &tokio::net::unix::OwnedReadHalf,
     spawner: &RuntimeTaskSpawner,
+    reading: &ReadGate,
     deliver: &F,
 ) where
     F: Fn(IpcEvent) -> T + Send + Sync + 'static,
     T: RuntimeTask,
 {
+    // Nothing leaves the socket before someone is there to hear it.
+    reading.wait().await;
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 8192];
     // Descriptors arrive with the byte their sender attached them to, which

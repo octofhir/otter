@@ -166,6 +166,7 @@ nodelib_module!(internal_zlib_handle, "internal/otter/zlib_handle", compat "node
 nodelib_module!(internal_fs_binding, "internal/otter/fs_binding", compat "nodelib/compat/internal_fs_binding.js");
 nodelib_module!(internal_fs_dir, "internal/otter/fs_dir", compat "nodelib/compat/internal_fs_dir.js");
 nodelib_module!(internal_otter_stdio, "internal/otter/stdio", compat "nodelib/compat/internal_otter_stdio.js");
+nodelib_module!(internal_child_process, "internal/child_process", compat "nodelib/compat/internal_child_process.js");
 nodelib_module!(internal_fs_event_wrap, "internal/otter/fs_event_wrap", compat "nodelib/compat/internal_fs_event_wrap.js");
 nodelib_module!(readline_interface, "internal/readline/interface", vendored "nodelib/internal/readline/interface.js");
 nodelib_module!(readline_callbacks, "internal/readline/callbacks", vendored "nodelib/internal/readline/callbacks.js");

@@ -84,13 +84,15 @@ enum EntryKind {
 struct ReadGate {
     flowing: AtomicBool,
     resumed: tokio::sync::Notify,
+    stopped: tokio::sync::Notify,
 }
 
 impl ReadGate {
-    fn new() -> Self {
+    fn new(flowing: bool) -> Self {
         Self {
-            flowing: AtomicBool::new(true),
+            flowing: AtomicBool::new(flowing),
             resumed: tokio::sync::Notify::new(),
+            stopped: tokio::sync::Notify::new(),
         }
     }
 
@@ -98,6 +100,8 @@ impl ReadGate {
         self.flowing.store(flowing, Ordering::SeqCst);
         if flowing {
             self.resumed.notify_waiters();
+        } else {
+            self.stopped.notify_waiters();
         }
     }
 
@@ -110,6 +114,22 @@ impl ReadGate {
                 return;
             }
             resumed.await;
+        }
+    }
+
+    /// Resolve once reading is no longer allowed.
+    ///
+    /// A reader already waiting on the socket has to be told, not only the one
+    /// about to ask: `readStop` means the next byte is not this side's, and a
+    /// wait that outlived the stop would take exactly one chunk from whoever
+    /// the stream was handed to.
+    async fn stopped(&self) {
+        loop {
+            let stopped = self.stopped.notified();
+            if !self.flowing.load(Ordering::SeqCst) {
+                return;
+            }
+            stopped.await;
         }
     }
 }
@@ -693,6 +713,7 @@ fn build_native<'scope>(
                     &adopt_table,
                     &adopt_ids,
                     spawner,
+                    true,
                 )
             };
             Ok(RuntimeValue::number_i32(id as i32))
@@ -791,6 +812,7 @@ fn build_native<'scope>(
                     &open_table,
                     &open_ids,
                     spawner,
+                    false,
                 )
             };
             Ok(RuntimeValue::number_i32(id as i32))
@@ -1011,6 +1033,7 @@ fn serve_tcp_listener(
                 &accept_table,
                 &accept_ids,
                 &accept_spawner,
+                true,
             );
             if !enqueue_ordered(
                 &accept_spawner,
@@ -1031,12 +1054,18 @@ fn serve_tcp_listener(
 }
 
 /// Take ownership of a connected stream and start carrying it.
+///
+/// `reading` says whether bytes may be pulled before the handle asks. A
+/// connection this process dialled or accepted is read at once; a descriptor
+/// the program handed over is not, because only the program knows whether it
+/// is something to read at all.
 fn adopt(
     stream: NetSocket,
     remote: Option<std::net::SocketAddr>,
     table: &Table,
     next_id: &Arc<AtomicU32>,
     spawner: &RuntimeTaskSpawner,
+    reading: bool,
 ) -> u32 {
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let local = stream.local_addr();
@@ -1044,7 +1073,7 @@ fn adopt(
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let abort = Arc::new(tokio::sync::Notify::new());
     let queued_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let read_gate = Arc::new(ReadGate::new());
+    let read_gate = Arc::new(ReadGate::new(reading));
     let shared = Arc::new(AtomicBool::new(false));
     table
         .lock()
@@ -1141,6 +1170,10 @@ fn adopt(
             }
             let ready = tokio::select! {
                 ready = stream.readable() => ready,
+                // Stopped from the isolate side while waiting: back to the
+                // gate without reading, so the bytes are still there for
+                // whoever the stream now belongs to.
+                () = read_gate.stopped() => continue,
                 () = abort.notified() => {
                     // Closed or reset from the isolate side: drop the stream
                     // clone without reporting anything — the JS handle is
@@ -1272,6 +1305,7 @@ fn listen_unix(
                 &accept_table,
                 &accept_ids,
                 &accept_spawner,
+                true,
             );
             if accept_spawner
                 .enqueue(
@@ -1339,6 +1373,7 @@ fn connect_unix(
                     &connect_table,
                     &connect_ids,
                     &connect_spawner,
+                    true,
                 );
                 enqueue_ordered(
                     &connect_spawner,
@@ -1432,6 +1467,7 @@ fn connect(
                     &connect_table,
                     &connect_ids,
                     &connect_spawner,
+                    true,
                 );
                 enqueue_ordered(
                     &connect_spawner,

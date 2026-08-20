@@ -319,7 +319,7 @@ function spawnSync(file, args, options) {
     }
   }
 
-  const { streams } = normalizeStdio(normalized.stdio, ['pipe', 'pipe', 'pipe']);
+  const { streams } = normalizeStdio(normalized.stdio, ['pipe', 'pipe', 'pipe'], true);
   const raw = native.spawnSyncRaw(normalized.file, normalized.args, {
     cwd: normalized.cwd === undefined || normalized.cwd === null
       ? undefined
@@ -448,20 +448,60 @@ const children = new Map();
 // What marks a message as belonging to a module rather than to the program.
 const INTERNAL_PREFIX = 'NODE_';
 
-// `stdio` names what happens to each standard stream, and may carry an `ipc`
-// slot — which is how a caller asks `spawn` for a channel, the same one `fork`
-// opens by default.
-function normalizeStdio(stdio, fallback) {
-  const named = stdio === undefined ? fallback : stdio;
-  const list = Array.isArray(named) ? named : [named, named, named];
-  const streams = [];
-  let wantsChannel = false;
-  for (const entry of list) {
-    if (entry === 'ipc') { wantsChannel = true; continue; }
-    if (streams.length < 3) streams.push(entry === undefined ? 'pipe' : String(entry));
+// `stdio` names what happens to each of the child's streams, and may carry an
+// `ipc` slot — which is how a caller asks `spawn` for a channel, the same one
+// `fork` opens by default. What each slot was asked to be is checked once,
+// before anything is started, and named here in the words the launch takes.
+function normalizeStdio(stdio, fallback, sync) {
+  const { getValidStdio } = require('internal/child_process');
+  const named = stdio === undefined || stdio === null ? fallback : stdio;
+  const { stdio: plan, ipc } = getValidStdio(named, sync === true);
+  const streams = plan.map((slot) => {
+    // The channel is not one of the child's streams — it is arranged
+    // separately — but it keeps its place, so the slots after it are the
+    // numbers the caller meant.
+    if (slot.ipc === true) return 'ignore';
+    switch (slot.type) {
+      case 'ignore':
+        return 'ignore';
+      case 'inherit':
+        return 'inherit';
+      case 'fd':
+        return slot.fd;
+      // A stream the caller handed over is named by the descriptor behind it;
+      // one the host carries without a descriptor of its own is asked for a
+      // duplicate to hand to the child.
+      case 'wrap': {
+        const handle = slot.handle;
+        const fd = typeof handle?.fd === 'number' && handle.fd >= 0
+          ? handle.fd
+          : netNative().dupFd(handle?._id ?? -1);
+        stopReading(slot);
+        return typeof fd === 'number' && fd >= 0 ? fd : 'ignore';
+      }
+      default:
+        return 'pipe';
+    }
+  });
+  return { streams, wantsChannel: ipc === true };
+}
+
+// A stream handed to a child is the child's to read: two readers on one
+// descriptor would divide the bytes between them, so this side stops — both
+// the handle, which is what pulls, and the stream, which is what would ask it
+// to pull again.
+function stopReading(slot) {
+  const handle = slot.handle;
+  if (handle !== undefined && handle !== null) {
+    handle.reading = false;
+    if (typeof handle.readStop === 'function') handle.readStop();
   }
-  while (streams.length < 3) streams.push('pipe');
-  return { streams, wantsChannel };
+  const stream = slot._stdio;
+  if (stream === undefined || stream === null || typeof stream.pause !== 'function') return;
+  stream._usedAsStdio = true;
+  stream.pause();
+  stream.readableFlowing = false;
+  if (stream._readableState !== undefined) stream._readableState.reading = false;
 }
 
 function isInternal(message) {
@@ -481,23 +521,25 @@ class ChildProcess extends EventEmitter {
     this.connected = false;
     this.channel = null;
     this._handle = 0;
-    this.stdout = new Readable({ read() {} });
-    this.stderr = new Readable({ read() {} });
-    const self = this;
-    this.stdin = new Writable({
-      write(chunk, encoding, cb) {
-        const payload = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding);
-        native.childStdinWrite(self._handle, payload);
-        cb();
-      },
-      final(cb) {
-        native.childStdinEnd(self._handle);
-        cb();
-      },
-    });
-    this.stdio = [this.stdin, this.stdout, this.stderr];
-    this._piped = [true, true, true];
-    this._streamEnded = [false, false, false];
+    // The streams are the descriptors the child was given; they exist once it
+    // has been started, and a slot the caller asked nothing of is `null`.
+    this.stdin = null;
+    this.stdout = null;
+    this.stderr = null;
+    this.stdio = [null, null, null];
+    // A child is closed when it has gone *and* every stream it wrote to has
+    // reached its end. Its own ending is the first of those; each output
+    // stream adds one more once it exists.
+    this._closesNeeded = 1;
+    this._closesGot = 0;
+  }
+
+  // One of the things this child is waited on for has ended.
+  _maybeClose() {
+    this._closesGot++;
+    if (this._closesGot === this._closesNeeded) {
+      this.emit('close', this.exitCode, this.signalCode);
+    }
   }
   // The low-level entry point Node exposes on the class itself. Its argument
   // checks run before anything is spawned, and its tests assert them verbatim.
@@ -581,7 +623,13 @@ class ChildProcess extends EventEmitter {
     const prepared = prepareSend(message, sendHandle, options);
     const accepted = native.ipcSend(this._handle, prepared.text, prepared.fd);
     if (typeof callback === 'function') {
-      setTimeout(() => callback(accepted ? null : new Error('Channel closed')), 0);
+      // A message the channel would not take says so by name: a caller that
+      // knows a closed channel is one of the ways this can end tells that
+      // ending apart by the code, not by the text.
+      const failure = accepted
+        ? null
+        : coded(new Error('Channel closed'), 'ERR_IPC_CHANNEL_CLOSED');
+      setTimeout(() => callback(failure), 0);
     }
     return accepted;
   }
@@ -598,16 +646,6 @@ class ChildProcess extends EventEmitter {
     // the argument vector, whose first entry is the name the child sees.
     this.spawnfile = command;
     this.spawnargs = [options?.argv0 ?? command, ...args];
-    // A stream the child was not given a pipe for is not a stream this side
-    // can read, and Node reports that as `null` rather than as a stream that
-    // never yields anything.
-    const streams = options?.stdio;
-    if (Array.isArray(streams)) {
-      this._piped = [0, 1, 2].map((slot) => streams[slot] === 'pipe');
-      if (!this._piped[1]) this.stdout = null;
-      if (!this._piped[2]) this.stderr = null;
-      this.stdio = [this.stdin, this.stdout, this.stderr];
-    }
     // The child starts now, so `pid` is readable the moment `spawn` returns;
     // its outcome arrives on a later turn through `__otterChildExit`.
     let started;
@@ -632,55 +670,91 @@ class ChildProcess extends EventEmitter {
     this.pid = started.pid;
     this._handle = started.id;
     children.set(started.id, this);
+    this._openStreams(started.stdio);
     // A child that started is news the caller can act on, and it arrives on
     // the turn after `spawn` returned so the object is theirs first.
     process.nextTick(() => this.emit('spawn'));
   }
 
+  // The ends of the child's pipes this process kept, as the streams a caller
+  // reads and writes. A slot the child was not given a pipe for kept no
+  // descriptor here, and Node reports that as `null` rather than as a stream
+  // that never yields anything.
+  _openStreams(descriptors) {
+    if (!Array.isArray(descriptors)) return;
+    const net = require('net');
+    this.stdio = descriptors.map((fd, slot) => {
+      if (typeof fd !== 'number' || fd < 0) return null;
+      // The first slot is what the child reads, so it is this side's to write;
+      // everything past it is the other way round. A slot of its own beyond
+      // the standard three is whatever the two ends make of it.
+      const socket = new net.Socket({
+        fd,
+        readable: slot !== 0,
+        writable: slot === 0 || slot > 2,
+        // Nothing is pulled off the child's output within the turn that
+        // started it: the reader runs on its own thread, and a caller handing
+        // this very stream to the next child does it before this turn ends.
+        manualStart: slot !== 0,
+      });
+      if (slot !== 0) {
+        socket.on('error', () => {});
+        // The child is not closed until this stream is: output written just
+        // before the child went is still the child's output, and a caller
+        // hears about it before it hears that there is no more.
+        this._closesNeeded++;
+        socket.on('close', () => this._maybeClose());
+        // From the next turn on the stream is read whether or not anyone is
+        // listening, which is what carries it to its end — and the end is what
+        // closes the descriptor.
+        process.nextTick(() => {
+          if (socket._usedAsStdio === true || socket.destroyed) return;
+          socket.read(0);
+        });
+      }
+      return socket;
+    });
+    this.stdin = this.stdio[0] ?? null;
+    this.stdout = this.stdio[1] ?? null;
+    this.stderr = this.stdio[2] ?? null;
+  }
+
+  // Pull through whatever nobody is reading, so every stream reaches its end
+  // and the descriptors behind them are let go of. A stream handed to another
+  // child is not this side's to pull.
+  _flushStreams() {
+    for (const stream of this.stdio) {
+      if (!stream || stream.readable !== true || stream._usedAsStdio === true) continue;
+      stream.resume();
+    }
+  }
+
   _failed(error) {
     this.emit('error', error);
-    this._endStreams();
-    setTimeout(() => this.emit('close', null, null), 0);
+    // A child that never started has no streams to wait for.
+    this._maybeClose();
   }
 
-  _endStreams() {
-    this._endStream(1);
-    this._endStream(2);
-  }
-
-  // End-of-stream is the pipe's news, not the reader's: a stream nobody is
-  // pulling from still has to reach its end, so the read that settles it is
-  // made here rather than waited for.
-  _endStream(which) {
-    const stream = which === 1 ? this.stdout : this.stderr;
-    if (!stream || this._streamEnded[which]) return;
-    this._streamEnded[which] = true;
-    stream.push(null);
-    stream.read(0);
-  }
-
-  // One live chunk from an output pipe; `null` marks that pipe's end.
-  _stdioChunk(which, chunk) {
-    const stream = which === 1 ? this.stdout : this.stderr;
-    if (!stream) return;
-    if (chunk === null) {
-      this._endStream(which);
-      return;
-    }
-    stream.push(Buffer.from(chunk, 'latin1'));
-  }
-
-  // The native half reports the outcome once the child has exited and both
-  // output pipes reached end-of-stream (their chunks were delivered first).
+  // The native half reports the outcome once the child has exited. Its output
+  // pipes end on their own: the descriptor the child held is the last one, and
+  // the reader sees the end of the stream when it goes.
   _exited(status, signal) {
     children.delete(this._handle);
-    this._endStreams();
+    // A child that has gone reads nothing more, so the end this side kept of
+    // its input is let go of here rather than held for a writer with nowhere
+    // to write.
+    if (this.stdin) this.stdin.destroy();
     this.exitCode = status;
     this.signalCode = signal;
     this.connected = false;
     this.channel = null;
     this.emit('exit', status, signal);
-    setTimeout(() => this.emit('close', status, signal), 0);
+    // A stream nobody touched still has to reach its end: pulling it through
+    // is what lets go of the descriptor behind it. It happens a turn later, so
+    // a caller that only reads its child's output once the child is gone still
+    // gets it.
+    process.nextTick(() => this._flushStreams());
+    this._maybeClose();
   }
 
   _channelEvent(kind, payload, handleFdIn) {
@@ -711,12 +785,6 @@ class ChildProcess extends EventEmitter {
 }
 
 // The native half dispatches here, on the isolate thread.
-globalThis.__otterChildStdio = function stdioChunk(handle, which, chunk) {
-  const child = children.get(handle);
-  if (!child) return;
-  child._stdioChunk(which, chunk);
-};
-
 globalThis.__otterChildExit = function exited(handle, status, signal) {
   const child = children.get(handle);
   if (child === undefined) return;
@@ -754,8 +822,8 @@ function describeHandle(sendHandle, options) {
   const inner = dgramHandle ?? sendHandle._handle ?? sendHandle;
   // A connection names itself by the id the host carries it under; a server
   // names itself by its listener's.
-  const id = typeof inner?.fd === 'number' && inner.fd !== -1
-    ? inner.fd
+  const id = typeof inner?._id === 'number' && inner._id !== -1
+    ? inner._id
     : inner?._serverId;
   if (typeof id !== 'number' || id === -1) return null;
   const { UDP } = require('internal/otter/udp_wrap');
@@ -1221,7 +1289,6 @@ module.exports = {
 // Host-dispatch hooks stay off the enumerable global surface: Node's
 // test harness treats any enumerable global it does not know as a leak.
 Object.defineProperty(globalThis, '__otterChildExit', { enumerable: false });
-Object.defineProperty(globalThis, '__otterChildStdio', { enumerable: false });
 Object.defineProperty(globalThis, '__otterChildIpc', { enumerable: false });
 
 // The other end of the same crossing: a descriptor that arrives on this

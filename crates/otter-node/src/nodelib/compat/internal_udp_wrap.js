@@ -51,13 +51,13 @@ class UDP {
   // host; this is the handle that stands for it here.
   static adopt(id) {
     const handle = new UDP();
-    handle.fd = id;
+    handle._id = id;
     handles.set(id, handle);
     return handle;
   }
 
   constructor() {
-    this.fd = -1;
+    this._id = -1;
     this.type = 'udp4';
     this.onmessage = null;
     this.reading = false;
@@ -74,17 +74,17 @@ class UDP {
   // ---- lifetime ----
 
   bind(address, port, flags) {
-    if (this.fd !== -1) return uvCode('EINVAL');
+    if (this._id !== -1) return uvCode('EINVAL');
     let bound;
     try {
       bound = native.bind(this.type, port >>> 0, address ?? '', flags | 0);
     } catch (error) {
       return codeOf(error);
     }
-    this.fd = bound.handle;
+    this._id = bound.handle;
     this._local = { address: bound.address, port: bound.port, family: bound.family };
-    handles.set(this.fd, this);
-    if (!this._refed) native.hold?.(this.fd, false);
+    handles.set(this._id, this);
+    if (!this._refed) native.hold?.(this._id, false);
     return 0;
   }
 
@@ -97,7 +97,7 @@ class UDP {
   }
 
   connect(address, port) {
-    if (this.fd === -1) {
+    if (this._id === -1) {
       const err = this.bind('', 0, 0);
       if (err !== 0) return err;
     }
@@ -124,11 +124,11 @@ class UDP {
   }
 
   close(callback) {
-    if (this.fd !== -1) {
-      handles.delete(this.fd);
-      try { native.close(this.fd); } catch { /* already gone */ }
+    if (this._id !== -1) {
+      handles.delete(this._id);
+      try { native.close(this._id); } catch { /* already gone */ }
     }
-    this.fd = -1;
+    this._id = -1;
     this._closed = true;
     this.reading = false;
     if (typeof callback === 'function') setImmediate(callback);
@@ -143,20 +143,20 @@ class UDP {
 
   ref() {
     this._refed = true;
-    if (this.fd !== -1) native.hold?.(this.fd, true);
+    if (this._id !== -1) native.hold?.(this._id, true);
   }
 
   unref() {
     this._refed = false;
-    if (this.fd !== -1) native.hold?.(this.fd, false);
+    if (this._id !== -1) native.hold?.(this._id, false);
   }
 
   // ---- reading ----
 
   recvStart() {
-    if (this.fd === -1) return uvCode('EBADF');
+    if (this._id === -1) return uvCode('EBADF');
     this.reading = true;
-    native.setReading?.(this.fd, true);
+    native.setReading?.(this._id, true);
     if (this._parked.length > 0) {
       const parked = this._parked;
       this._parked = [];
@@ -167,7 +167,7 @@ class UDP {
 
   recvStop() {
     this.reading = false;
-    native.setReading?.(this.fd, false);
+    native.setReading?.(this._id, false);
     return 0;
   }
 
@@ -189,7 +189,7 @@ class UDP {
   // ---- writing ----
 
   send(req, list, count, port, address, _hasCallback) {
-    if (this.fd === -1) {
+    if (this._id === -1) {
       const err = this.bind('', 0, 0);
       if (err !== 0) return err;
     }
@@ -202,7 +202,7 @@ class UDP {
     const target = this._remote ?? { address: address ?? '', port: port >>> 0 };
     let status = 0;
     try {
-      native.send(this.fd, payload, target.port >>> 0, target.address ?? '');
+      native.send(this._id, payload, target.port >>> 0, target.address ?? '');
     } catch (error) {
       status = codeOf(error);
     }
@@ -226,10 +226,10 @@ class UDP {
   // ---- names ----
 
   getsockname(out) {
-    if (this.fd === -1) return uvCode('EBADF');
+    if (this._id === -1) return uvCode('EBADF');
     let name = this._local;
     try {
-      name = native.address(this.fd) ?? name;
+      name = native.address(this._id) ?? name;
     } catch {
       // The bind result already named the socket; a later query failing
       // does not un-name it.
@@ -248,9 +248,9 @@ class UDP {
   // ---- options ----
 
   _option(name, value, extra) {
-    if (this.fd === -1) return uvCode('EBADF');
+    if (this._id === -1) return uvCode('EBADF');
     try {
-      native.setOption(this.fd, name, value, extra);
+      native.setOption(this._id, name, value, extra);
     } catch (error) {
       return codeOf(error);
     }
@@ -268,7 +268,7 @@ class UDP {
     if (size === 0) {
       // A zero size is a read of the current one.
       try {
-        return native.setOption(this.fd, isSend ? 'getSendBufferSize' : 'getRecvBufferSize', 0);
+        return native.setOption(this._id, isSend ? 'getSendBufferSize' : 'getRecvBufferSize', 0);
       } catch (error) {
         return codeOf(error);
       }
@@ -280,9 +280,9 @@ class UDP {
   _membership(operation, multicast, iface, source) {
     // libuv answers a membership call on an unbound socket with EINVAL:
     // there is a handle, it simply has no address yet.
-    if (this.fd === -1) return uvCode('EINVAL');
+    if (this._id === -1) return uvCode('EINVAL');
     try {
-      native.membership(this.fd, operation, multicast, iface ?? '', source ?? '');
+      native.membership(this._id, operation, multicast, iface ?? '', source ?? '');
     } catch (error) {
       return codeOf(error);
     }

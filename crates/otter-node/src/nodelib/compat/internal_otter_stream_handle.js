@@ -42,6 +42,9 @@ function uvCode(codeName) {
 
 class StreamHandle {
   constructor() {
+    this._id = -1;
+    // The descriptor this handle stands for, when the program named one.
+    // A dialled connection is carried by the host and has none to give.
     this.fd = -1;
     this.reading = false;
     this.onread = null;
@@ -64,9 +67,9 @@ class StreamHandle {
 
   // ---- lifecycle ----
 
-  _adoptFd(fd) {
-    this.fd = fd;
-    connections.set(fd, this);
+  _adoptFd(id) {
+    this._id = id;
+    connections.set(id, this);
     this._updateHold();
   }
 
@@ -74,17 +77,17 @@ class StreamHandle {
   // flight (mirrors libuv's active-handle semantics): a paused, drained
   // socket lets the process exit.
   _updateHold() {
-    if (this.fd === -1) return;
-    native.hold(this.fd, this._refed && (this.reading || this._pendingWriteCount > 0));
+    if (this._id === -1) return;
+    native.hold(this._id, this._refed && (this.reading || this._pendingWriteCount > 0));
   }
 
   close(callback) {
     if (!this._closed) {
       this._closed = true;
-      if (this.fd !== -1) {
-        connections.delete(this.fd);
-        try { native.close(this.fd); } catch { /* already gone */ }
-        this.fd = -1;
+      if (this._id !== -1) {
+        connections.delete(this._id);
+        try { native.close(this._id); } catch { /* already gone */ }
+        this._id = -1;
       }
       if (this._serverId !== -1) {
         servers.delete(this._serverId);
@@ -115,7 +118,7 @@ class StreamHandle {
 
   readStart() {
     this.reading = true;
-    if (this.fd !== -1 && !this._closed) native.setReading(this.fd, true);
+    if (this._id !== -1 && !this._closed) native.setReading(this._id, true);
     this._updateHold();
     if (this._parkedChunks.length > 0 || this._eofPending) {
       queueMicrotask(() => this._drainParked());
@@ -128,7 +131,7 @@ class StreamHandle {
   // an unbounded park queue.
   readStop() {
     this.reading = false;
-    if (this.fd !== -1 && !this._closed) native.setReading(this.fd, false);
+    if (this._id !== -1 && !this._closed) native.setReading(this._id, false);
     this._updateHold();
     return 0;
   }
@@ -223,7 +226,7 @@ class StreamHandle {
   // `onWriteComplete` expects it.
 
   _writeBytes(req, buffer) {
-    if (this.fd === -1 || this._closed) return uvCode('EBADF');
+    if (this._id === -1 || this._closed) return uvCode('EBADF');
     // In-line non-blocking write first, the way libuv's uv_try_write path
     // completes small writes synchronously: an empty writer queue lets the
     // kernel take the bytes now, and only the remainder rides the async
@@ -232,7 +235,7 @@ class StreamHandle {
     if (this._pendingWriteCount === 0) {
       let written = 0;
       try {
-        written = native.tryWrite(this.fd, buffer);
+        written = native.tryWrite(this._id, buffer);
       } catch {
         return uvCode('EPIPE');
       }
@@ -247,7 +250,7 @@ class StreamHandle {
     const token = nextWriteToken++;
     let accepted = false;
     try {
-      accepted = native.write(this.fd, queued, token);
+      accepted = native.write(this._id, queued, token);
     } catch {
       return uvCode('EPIPE');
     }
@@ -282,13 +285,13 @@ class StreamHandle {
   }
 
   shutdown(req) {
-    if (this.fd === -1 || this._closed) return uvCode('ENOTCONN');
+    if (this._id === -1 || this._closed) return uvCode('ENOTCONN');
     // The End marker flushes everything queued ahead of it before the
     // write half closes; completion arrives as a `shutdownDone` event.
     const token = nextWriteToken++;
     pendingShutdowns.set(token, req);
     try {
-      native.end(this.fd, token);
+      native.end(this._id, token);
     } catch {
       pendingShutdowns.delete(token);
       return uvCode('ENOTCONN');
@@ -299,7 +302,7 @@ class StreamHandle {
   // ---- names ----
 
   _fillName(out, which) {
-    const id = this.fd !== -1 ? this.fd : this._serverId;
+    const id = this._id !== -1 ? this._id : this._serverId;
     if (id === -1) {
       if (this._boundAddress !== null) {
         out.address = this._boundAddress;
@@ -323,9 +326,9 @@ class StreamHandle {
   // libuv reports option failures through the return code; a socket that
   // closed under a deferred `setNoDelay` must not throw into the caller.
   setNoDelay(enable) {
-    if (this.fd === -1 || this._closed) return uvCode('EBADF');
+    if (this._id === -1 || this._closed) return uvCode('EBADF');
     try {
-      native.setOption(this.fd, 'setNoDelay', enable !== false);
+      native.setOption(this._id, 'setNoDelay', enable !== false);
     } catch (error) {
       return uvCode(error?.code ?? 'EINVAL');
     }
@@ -347,20 +350,21 @@ class StreamHandle {
     const id = native.openFd(fd);
     if (id < 0) return uvCode('EINVAL');
     this._adoptFd(id);
+    this.fd = fd;
     return 0;
   }
 
   // §net.Socket.resetAndDestroy — SO_LINGER 0 close: the peer reads
   // ECONNRESET instead of a clean EOF.
   reset(callback) {
-    if (this._closed || this.fd === -1) {
+    if (this._closed || this._id === -1) {
       this.close(callback);
       return 0;
     }
     this._closed = true;
-    connections.delete(this.fd);
-    try { native.reset(this.fd); } catch { /* already gone */ }
-    this.fd = -1;
+    connections.delete(this._id);
+    try { native.reset(this._id); } catch { /* already gone */ }
+    this._id = -1;
     if (typeof callback === 'function') setImmediate(callback);
     return 0;
   }

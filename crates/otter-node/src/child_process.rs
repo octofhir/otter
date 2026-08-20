@@ -101,56 +101,6 @@ fn native_value<'scope>(
     )?;
     scope.set(object, "spawnStart", start)?;
 
-    let stdin_table = children.clone();
-    let stdin_write = scope.native_closure(
-        "childStdinWrite",
-        2,
-        &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            let id = handle_arg(args, 0);
-            // A typed-array payload crosses as raw bytes; string payloads
-            // take the latin1 detour, exactly like the net write path.
-            let bytes = if let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap())) {
-                let heap = ctx.heap();
-                let offset = view.byte_offset(heap);
-                let len = view.byte_length(heap);
-                view.buffer(heap)
-                    .with_bytes(heap, |bytes| bytes[offset..offset + len].to_vec())
-            } else {
-                latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()))
-            };
-            let sender = stdin_table
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&id)
-                .and_then(|entry| entry.stdin.clone());
-            let accepted =
-                sender.is_some_and(|sender| sender.send(StdinMessage::Data(bytes)).is_ok());
-            Ok(Value::boolean(accepted))
-        },
-    )?;
-    scope.set(object, "childStdinWrite", stdin_write)?;
-
-    let stdin_end_table = children.clone();
-    let stdin_end = scope.native_closure(
-        "childStdinEnd",
-        1,
-        &[],
-        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            let id = handle_arg(args, 0);
-            let mut table = stdin_end_table
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = table.get_mut(&id)
-                && let Some(sender) = entry.stdin.take()
-            {
-                let _ = sender.send(StdinMessage::End);
-            }
-            Ok(Value::undefined())
-        },
-    )?;
-    scope.set(object, "childStdinEnd", stdin_end)?;
-
     let send_table = children.clone();
     let send = scope.native_closure(
         "ipcSend",
@@ -219,7 +169,6 @@ fn lookup_channel(children: &ChildTable, id: u32) -> Option<Arc<IpcChannel>> {
 /// only the isolate's own thread ever touches it.
 struct ChildEntry {
     channel: Option<Arc<IpcChannel>>,
-    stdin: Option<tokio::sync::mpsc::UnboundedSender<StdinMessage>>,
     /// Whether the child has already been reported as gone. An entry is kept
     /// only while something about the child is still live: its channel can
     /// close after it exits, and it can exit with its channel still open.
@@ -238,12 +187,7 @@ fn retire(children: &ChildTable, id: u32, gone: Ending) {
         return;
     };
     match gone {
-        // A child that has exited reads nothing more, so its stdin pipe is
-        // closed here rather than held for a writer that has nowhere to write.
-        Ending::Child => {
-            entry.exited = true;
-            entry.stdin = None;
-        }
+        Ending::Child => entry.exited = true,
         Ending::Channel => entry.channel = None,
     }
     if entry.exited && entry.channel.is_none() {
@@ -256,12 +200,6 @@ fn retire(children: &ChildTable, id: u32, gone: Ending) {
 enum Ending {
     Child,
     Channel,
-}
-
-/// One instruction for a child's stdin writer task.
-enum StdinMessage {
-    Data(Vec<u8>),
-    End,
 }
 
 type ChildTable = Arc<Mutex<HashMap<u32, ChildEntry>>>;
@@ -309,43 +247,6 @@ impl RuntimeTask for ChildIpcEvent {
                 };
                 let undefined = scope.undefined();
                 let result = scope.call(dispatcher, undefined, &[id, kind, payload, handle])?;
-                Ok(scope.finish(result))
-            })
-        })
-    }
-}
-
-/// A chunk one of the child's output pipes produced, delivered live.
-#[derive(Clone)]
-struct ChildStdio {
-    id: u32,
-    /// 1 = stdout, 2 = stderr.
-    which: u8,
-    /// Latin1-bridged bytes; empty marks end-of-stream.
-    data: Option<String>,
-}
-
-impl RuntimeTask for ChildStdio {
-    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
-        let Some(context) = runtime.realm_execution_context() else {
-            return Ok(());
-        };
-        runtime.run_native_event(&context, |ctx| {
-            ctx.scope(|mut scope| {
-                let globals = scope.global_this();
-                let dispatcher = scope.get(globals, "__otterChildStdio")?;
-                if !scope.is_callable(dispatcher) {
-                    let undefined = scope.undefined();
-                    return Ok(scope.finish(undefined));
-                }
-                let id = scope.number(f64::from(self.id));
-                let which = scope.number(f64::from(self.which));
-                let payload = match &self.data {
-                    Some(text) => scope.string(text)?,
-                    None => scope.null(),
-                };
-                let undefined = scope.undefined();
-                let result = scope.call(dispatcher, undefined, &[id, which, payload])?;
                 Ok(scope.finish(result))
             })
         })
@@ -479,50 +380,34 @@ fn spawn_start(
             cmd.env_remove(otter_runtime::ipc::CHANNEL_VAR);
         }
     }
-    // Each standard stream is named separately, because a caller reading one
-    // and leaving another to this process's own output is an ordinary thing to
-    // ask for. A stream nobody intends to read must not become a pipe nobody
-    // drains.
-    let streams = match opts {
-        Some(options) => {
-            let named = value_of(ctx, options, "stdio");
-            read_string_array(ctx, named)
-        }
-        None => Vec::new(),
+    // Each stream is named separately, because a caller reading one and
+    // leaving another to this process's own output is an ordinary thing to ask
+    // for — and there can be more of them than three, which is what a program
+    // handing a child an extra descriptor is doing.
+    let plans = match stdio_plans(ctx, opts) {
+        Ok(plans) => plans,
+        Err(error) => return spawn_error_result(ctx, &command, &error),
     };
-    let mut piped = [false; 3];
-    for (index, slot) in [0usize, 1, 2].into_iter().enumerate() {
-        let how = streams.get(slot).map(String::as_str).unwrap_or("pipe");
-        let target = match how {
-            "inherit" => Stdio::inherit(),
-            "ignore" => Stdio::null(),
-            _ => {
-                piped[slot] = true;
-                Stdio::piped()
-            }
-        };
-        match index {
-            0 => cmd.stdin(target),
-            1 => cmd.stdout(target),
-            _ => cmd.stderr(target),
-        };
-    }
+    let wired = match wire_stdio(&mut cmd, plans) {
+        Ok(wired) => wired,
+        Err(error) => return spawn_error_result(ctx, &command, &error),
+    };
+    let ours: Vec<std::os::fd::RawFd> = wired.kept.iter().map(fd_number).collect();
 
-    let mut child = match cmd.spawn() {
+    let spawned = cmd.spawn();
+    // The child has its own copies of everything it was given; these ends are
+    // this process's to close whether the launch worked or not.
+    drop(wired.theirs);
+    let child = match spawned {
         Ok(child) => child,
         Err(err) => return spawn_error_result(ctx, &command, &err),
     };
     let pid = child.id();
-
-    // The stdin writer runs on the IO runtime and owns the pipe; End (or the
-    // sender dropping) closes it, which is the EOF the child reads.
-    let stdin_sender = child.stdin.take().map(|pipe| {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<StdinMessage>();
-        if let Some(io) = spawner.io_handle() {
-            io.spawn(stdin_writer(pipe, receiver));
-        }
-        sender
-    });
+    // The ends this process kept are handed to the program, which carries them
+    // as the streams the caller asked for.
+    for fd in wired.kept.into_iter().flatten() {
+        let _ = std::os::fd::IntoRawFd::into_raw_fd(fd);
+    }
 
     children
         .lock()
@@ -531,7 +416,6 @@ fn spawn_start(
             id,
             ChildEntry {
                 channel: channel.map(|(channel, _)| channel),
-                stdin: stdin_sender,
                 exited: false,
             },
         );
@@ -544,8 +428,192 @@ fn spawn_start(
         scope.set(object, "id", id_value)?;
         let pid_value = scope.number(f64::from(pid));
         scope.set(object, "pid", pid_value)?;
+        // One descriptor per stream the caller asked to hold, in the order
+        // they were asked for; a stream this process kept no end of is -1.
+        let list = scope.array(ours.len())?;
+        for (slot, fd) in ours.iter().enumerate() {
+            let value = scope.number(f64::from(*fd));
+            scope.set_index(list, slot, value)?;
+        }
+        scope.set(object, "stdio", list)?;
         Ok(scope.finish(object))
     })
+}
+
+/// The ends of a child's streams once the command has been told what its own
+/// are: `kept` is this process's end of each slot, `theirs` the child's ends,
+/// which have to outlive the spawn and nothing more.
+struct WiredStdio {
+    kept: Vec<Option<std::os::fd::OwnedFd>>,
+    theirs: Vec<std::os::fd::OwnedFd>,
+}
+
+/// The number a kept end answers to, or -1 for a slot this process kept
+/// nothing of.
+fn fd_number(kept: &Option<std::os::fd::OwnedFd>) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    kept.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+}
+
+/// Tell a command what each of its streams is, and answer the ends this
+/// process keeps.
+///
+/// The first three slots are the ones every process has, and the command
+/// carries them itself. A slot past those is put in place by the child between
+/// the fork and the exec, because there is nowhere else to say it.
+fn wire_stdio(cmd: &mut Command, plans: Vec<StdioPlan>) -> Result<WiredStdio, std::io::Error> {
+    use std::os::fd::AsRawFd;
+    let mut wired = WiredStdio {
+        kept: Vec::with_capacity(plans.len()),
+        theirs: Vec::new(),
+    };
+    let mut places: Vec<(std::os::fd::RawFd, std::os::fd::RawFd)> = Vec::new();
+    for (slot, plan) in plans.into_iter().enumerate() {
+        let inherit = matches!(plan, StdioPlan::Inherit) && slot < 3;
+        let (theirs, ours) = match plan {
+            // Past the third slot there is no stream to inherit: a program
+            // that asks for one is asking for nothing.
+            StdioPlan::Inherit | StdioPlan::Ignore => (None, None),
+            StdioPlan::Fd(fd) => (Some(fd), None),
+            StdioPlan::Pipe { parent, child } => (Some(child), Some(parent)),
+        };
+        wired.kept.push(ours);
+        if slot > 2 {
+            if let Some(theirs) = theirs {
+                places.push((theirs.as_raw_fd(), slot as std::os::fd::RawFd));
+                wired.theirs.push(theirs);
+            }
+            continue;
+        }
+        let target = match theirs {
+            Some(fd) => Stdio::from(fd),
+            None if inherit => Stdio::inherit(),
+            None => Stdio::null(),
+        };
+        match slot {
+            0 => cmd.stdin(target),
+            1 => cmd.stdout(target),
+            _ => cmd.stderr(target),
+        };
+    }
+    if !places.is_empty() {
+        // SAFETY: this runs in the forked child before `exec`, where only
+        // async-signal-safe calls are allowed. `dup2` and `fcntl` are both on
+        // that list, and nothing here allocates, locks, or reads shared state.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(cmd, move || {
+                for (source, slot) in &places {
+                    if source == slot {
+                        // Already in place; it only has to survive the exec.
+                        if libc::fcntl(*slot, libc::F_SETFD, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(*source, *slot) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(wired)
+}
+
+/// What one of a child's streams is wired to.
+enum StdioPlan {
+    /// This process's own stream.
+    Inherit,
+    /// Nothing at all.
+    Ignore,
+    /// A pipe: the child gets one end, the program the other.
+    Pipe {
+        parent: std::os::fd::OwnedFd,
+        child: std::os::fd::OwnedFd,
+    },
+    /// A descriptor the caller named. The child gets a copy of it, so closing
+    /// the child's streams never takes the caller's own away.
+    Fd(std::os::fd::OwnedFd),
+}
+
+/// Read what the caller asked each of the child's streams to be.
+///
+/// A slot is named ("pipe", "ignore", "inherit") or is a descriptor the caller
+/// already holds. The channel a forked child speaks over is not a stream and
+/// is arranged separately, so it takes no descriptor here.
+fn stdio_plans(
+    ctx: &mut NativeCtx<'_>,
+    opts: Option<Value>,
+) -> Result<Vec<StdioPlan>, std::io::Error> {
+    let named = opts.map(|options| value_of(ctx, options, "stdio"));
+    let entries: Vec<Value> = match named.and_then(|value| value.as_array()) {
+        Some(array) => {
+            let length = otter_vm::array::len(array, ctx.heap());
+            (0..length)
+                .map(|index| otter_vm::array::get(array, ctx.heap(), index))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let mut plans = Vec::with_capacity(entries.len().max(3));
+    for (slot, entry) in entries.iter().enumerate() {
+        // A slot the child reads from is one this process writes to, and the
+        // other way round for everything past the first.
+        let child_reads = slot == 0;
+        plans.push(match entry {
+            value if value.is_string() => match value.display_string(ctx.heap()).as_str() {
+                "inherit" => StdioPlan::Inherit,
+                "ignore" | "ipc" => StdioPlan::Ignore,
+                _ => open_pipe(child_reads)?,
+            },
+            value => match value.as_f64() {
+                Some(fd) if fd >= 0.0 => StdioPlan::Fd(duplicate(fd as std::os::fd::RawFd)?),
+                _ => open_pipe(child_reads)?,
+            },
+        });
+    }
+    while plans.len() < 3 {
+        plans.push(open_pipe(plans.is_empty())?);
+    }
+    Ok(plans)
+}
+
+/// A fresh pipe, with the ends handed to whichever side reads and writes.
+///
+/// The end this process keeps does not survive into any other child: a
+/// descriptor left open in an unrelated process is a stream whose end never
+/// arrives.
+fn open_pipe(child_reads: bool) -> Result<StdioPlan, std::io::Error> {
+    let (read_end, write_end) = nix::unistd::pipe()?;
+    let (parent, child) = if child_reads {
+        (write_end, read_end)
+    } else {
+        (read_end, write_end)
+    };
+    // Neither end survives an exec under the number it has here. The child's
+    // end is put in its place by the launch and is a stream from then on, and
+    // an end left open under its old number is a stream whose end never
+    // arrives: whoever inherits it holds the pipe open for everyone.
+    for end in [&parent, &child] {
+        nix::fcntl::fcntl(end, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
+    }
+    Ok(StdioPlan::Pipe { parent, child })
+}
+
+/// A copy of a descriptor the caller named, for the child to own.
+///
+/// The copy is a blocking one. Whether reads wait is a property of the open
+/// file description rather than of the descriptor naming it, and a child that
+/// meets "try again" on its own standard input has nowhere to wait — it is not
+/// on this process's loop and cannot be told when to come back.
+fn duplicate(raw: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd, std::io::Error> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    // SAFETY: the descriptor is the caller's and open for this call; it is
+    // only duplicated, and the duplicate is what is owned from here on.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+    let copy = borrowed.try_clone_to_owned()?;
+    let flags = OFlag::from_bits_truncate(fcntl(&copy, FcntlArg::F_GETFL)?);
+    fcntl(&copy, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK))?;
+    Ok(copy)
 }
 
 /// Switch a pipe descriptor to non-blocking mode, which is what tokio's
@@ -590,24 +658,8 @@ fn reap(
     // loop open until its outcome has been reported.
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let exit_spawner = spawner.clone();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
     io.spawn(async move {
-        let out_task = stdout
-            .filter(set_nonblocking)
-            .and_then(|pipe| tokio::process::ChildStdout::from_std(pipe).ok())
-            .map(|pipe| tokio::spawn(stream_pipe(pipe, id, 1, exit_spawner.clone())));
-        let err_task = stderr
-            .filter(set_nonblocking)
-            .and_then(|pipe| tokio::process::ChildStderr::from_std(pipe).ok())
-            .map(|pipe| tokio::spawn(stream_pipe(pipe, id, 2, exit_spawner.clone())));
         let status = tokio::task::spawn_blocking(move || child.wait()).await;
-        if let Some(task) = out_task {
-            let _ = task.await;
-        }
-        if let Some(task) = err_task {
-            let _ = task.await;
-        }
         let exit = match status {
             Ok(Ok(status)) => ChildExit {
                 id,
@@ -630,79 +682,6 @@ fn reap(
             .await;
         drop(keep_alive);
     });
-}
-
-/// Read one output pipe to end-of-stream, delivering each chunk live and a
-/// final `None` marking the end.
-async fn stream_pipe(
-    mut pipe: impl tokio::io::AsyncRead + Unpin,
-    id: u32,
-    which: u8,
-    spawner: RuntimeTaskSpawner,
-) {
-    use tokio::io::AsyncReadExt;
-    let mut chunk = vec![0u8; 65_536];
-    loop {
-        match pipe.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(length) => {
-                if !spawner
-                    .enqueue_ordered(
-                        ChildStdio {
-                            id,
-                            which,
-                            data: Some(bytes_to_latin1(&chunk[..length])),
-                        },
-                        RuntimeLiveness::Unref,
-                    )
-                    .await
-                {
-                    return;
-                }
-            }
-        }
-    }
-    spawner
-        .enqueue_ordered(
-            ChildStdio {
-                id,
-                which,
-                data: None,
-            },
-            RuntimeLiveness::Unref,
-        )
-        .await;
-}
-
-/// Own a child's stdin pipe: write queued bytes in order and close on `End`
-/// (or when the JS side drops the queue), which is the child's EOF.
-async fn stdin_writer(
-    pipe: std::process::ChildStdin,
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<StdinMessage>,
-) {
-    use tokio::io::AsyncWriteExt;
-    if !set_nonblocking(&pipe) {
-        return;
-    }
-    let Ok(mut pipe) = tokio::process::ChildStdin::from_std(pipe) else {
-        return;
-    };
-    while let Some(message) = receiver.recv().await {
-        match message {
-            StdinMessage::Data(bytes) => {
-                if pipe.write_all(&bytes).await.is_err() {
-                    return;
-                }
-                let _ = pipe.flush().await;
-            }
-            StdinMessage::End => break,
-        }
-    }
-    let _ = pipe.shutdown().await;
-}
-
-fn bytes_to_latin1(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| b as char).collect()
 }
 
 fn latin1_to_bytes(s: &str) -> Vec<u8> {
@@ -833,7 +812,6 @@ fn spawn_sync_raw(
     let kill_signal = opt_string(ctx, opts, "killSignal").unwrap_or_else(|| "SIGTERM".to_string());
     let max_buffer = opt_number(ctx, opts, "maxBuffer").unwrap_or(f64::INFINITY);
     let timeout_ms = opt_number(ctx, opts, "timeout").unwrap_or(0.0);
-    let stdio = opt_stdio(ctx, opts);
     let env = opt_env(ctx, opts)?;
     if should_propagate_allow_all(ctx, &command, caps) {
         argv.insert(0, "--allow-all".to_string());
@@ -853,17 +831,26 @@ fn spawn_sync_raw(
         cmd.envs(env);
     }
     // A stream the caller did not ask to see is the child's own: `inherit`
-    // hands it this process's, `ignore` hands it nothing, and only `pipe`
-    // is collected and reported back.
-    cmd.stdin(if input.is_some() {
-        Stdio::piped()
-    } else {
-        stdio[0].to_stdio()
-    });
-    cmd.stdout(stdio[1].to_stdio());
-    cmd.stderr(stdio[2].to_stdio());
+    // hands it this process's, `ignore` hands it nothing, and only a pipe is
+    // collected and reported back. Text to feed the child is a pipe whatever
+    // else was asked for — it has to arrive somewhere.
+    let mut plans = match stdio_plans(ctx, opts) {
+        Ok(plans) => plans,
+        Err(error) => return spawn_error_result(ctx, &command, &error),
+    };
+    if input.is_some() && !matches!(plans.first(), Some(StdioPlan::Pipe { .. })) {
+        match open_pipe(true) {
+            Ok(pipe) => plans[0] = pipe,
+            Err(error) => return spawn_error_result(ctx, &command, &error),
+        }
+    }
+    let wired = match wire_stdio(&mut cmd, plans) {
+        Ok(wired) => wired,
+        Err(error) => return spawn_error_result(ctx, &command, &error),
+    };
 
     let spawn_result = cmd.spawn();
+    drop(wired.theirs);
     let mut child = match spawn_result {
         Ok(child) => child,
         Err(err) => return spawn_error_result(ctx, &command, &err),
@@ -875,7 +862,7 @@ fn spawn_sync_raw(
     } else {
         usize::MAX
     };
-    let mut streams = SyncStreams::adopt(&mut child, input.as_deref());
+    let mut streams = SyncStreams::adopt(wired.kept, input.as_deref());
 
     let deadline = if timeout_ms > 0.0 {
         Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
@@ -976,24 +963,6 @@ fn spawn_sync_raw(
     })
 }
 
-/// What a child's stream is wired to.
-#[derive(Clone, Copy)]
-enum SyncStdio {
-    Pipe,
-    Inherit,
-    Ignore,
-}
-
-impl SyncStdio {
-    fn to_stdio(self) -> Stdio {
-        match self {
-            Self::Pipe => Stdio::piped(),
-            Self::Inherit => Stdio::inherit(),
-            Self::Ignore => Stdio::null(),
-        }
-    }
-}
-
 /// The pipes a synchronous run holds while its child is alive.
 ///
 /// Every byte moves on the thread that made the call: a reader thread would
@@ -1002,9 +971,9 @@ impl SyncStdio {
 struct SyncStreams {
     /// What is left to hand the child, and the pipe to hand it on. The pipe is
     /// let go of once the last byte is in it, which is the end the child reads.
-    input: Option<(std::process::ChildStdin, Vec<u8>, usize)>,
-    out_pipe: Option<std::process::ChildStdout>,
-    err_pipe: Option<std::process::ChildStderr>,
+    input: Option<(std::fs::File, Vec<u8>, usize)>,
+    out_pipe: Option<std::fs::File>,
+    err_pipe: Option<std::fs::File>,
     /// Collected output, `None` for a stream the caller did not ask for.
     out: Option<Vec<u8>>,
     err: Option<Vec<u8>>,
@@ -1013,17 +982,27 @@ struct SyncStreams {
 }
 
 impl SyncStreams {
-    /// Take the child's pipes, and put them in the mode that lets one thread
-    /// tend all three without ever waiting on any single one.
-    fn adopt(child: &mut std::process::Child, input: Option<&str>) -> Self {
-        // A child whose stdin is a pipe nobody writes to reads end-of-file, so
-        // the writing end is kept only while there is something to write.
-        let stdin = child.stdin.take().filter(|pipe| {
-            input.is_some() && set_nonblocking(pipe)
+    /// Take the ends of the child's pipes this process kept, and put them in
+    /// the mode that lets one thread tend all of them without ever waiting on
+    /// any single one.
+    ///
+    /// A slot the caller did not ask for a pipe on kept no end here, and is
+    /// reported back as nothing rather than as empty output.
+    fn adopt(mut kept: Vec<Option<std::os::fd::OwnedFd>>, input: Option<&str>) -> Self {
+        kept.resize_with(3, || None);
+        let mut ends = kept.into_iter().map(|end| {
+            end.filter(set_nonblocking)
+                .map(std::fs::File::from)
         });
-        let input = stdin.map(|pipe| (pipe, latin1_to_bytes(input.unwrap_or_default()), 0));
-        let out_pipe = child.stdout.take().filter(set_nonblocking);
-        let err_pipe = child.stderr.take().filter(set_nonblocking);
+        let stdin = ends.next().flatten();
+        let out_pipe = ends.next().flatten();
+        let err_pipe = ends.next().flatten();
+        // A child whose input nobody writes reads end-of-file, so the writing
+        // end is kept only while there is something to write.
+        let input = match (stdin, input) {
+            (Some(pipe), Some(text)) => Some((pipe, latin1_to_bytes(text), 0)),
+            _ => None,
+        };
         Self {
             out: out_pipe.as_ref().map(|_| Vec::new()),
             err: err_pipe.as_ref().map(|_| Vec::new()),
@@ -1139,31 +1118,6 @@ fn signal_child(pid: u32, signal: &str) {
 
 #[cfg(not(unix))]
 fn signal_child(_pid: u32, _signal: &str) {}
-
-/// How a child's three streams were asked for, defaulting to pipes.
-fn opt_stdio(ctx: &mut NativeCtx<'_>, opts: Option<Value>) -> [SyncStdio; 3] {
-    let mut wired = [SyncStdio::Pipe; 3];
-    let Some(object) = opts.and_then(Value::as_object) else {
-        return wired;
-    };
-    let Some(stdio) = object::get(object, ctx.heap(), "stdio") else {
-        return wired;
-    };
-    let named = |name: &str| match name {
-        "inherit" => SyncStdio::Inherit,
-        "ignore" => SyncStdio::Ignore,
-        _ => SyncStdio::Pipe,
-    };
-    if stdio.is_string() {
-        let all = named(&stdio.display_string(ctx.heap()));
-        return [all; 3];
-    }
-    let entries = read_string_array(ctx, stdio);
-    for (slot, name) in wired.iter_mut().zip(entries.iter()) {
-        *slot = named(name);
-    }
-    wired
-}
 
 fn opt_number(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> Option<f64> {
     let object = opts?.as_object()?;

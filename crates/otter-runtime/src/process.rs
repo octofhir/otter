@@ -50,6 +50,7 @@ pub(crate) fn install_global(
     warning_options: &crate::WarningOptions,
     process_title: Option<&str>,
     runtime_task_spawner: Option<&crate::RuntimeTaskSpawner>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), OtterError> {
     // Claimed before `process.env` is built, so the variable naming the
     // channel is gone from it — a process this one launches must not believe
@@ -229,7 +230,7 @@ pub(crate) fn install_global(
                     define_process_method(&mut scope, process, name, length, call)?;
                 }
                 if let Some(channel) = &channel {
-                    crate::process_ipc::install(&mut scope, process, channel)?;
+                    crate::process_ipc::install(&mut scope, process, channel, cjs)?;
                 }
                 let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
                 scope.set(process, "hrtime", hrtime)?;
@@ -610,6 +611,7 @@ pub(crate) fn reattach_after_restore(
     hooks: &RuntimeHooks,
     working_directory: &crate::process_control::WorkingDirectory,
     runtime_task_spawner: Option<crate::RuntimeTaskSpawner>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), OtterError> {
     // A channel belongs to this launch, not to the donor the snapshot was
     // taken from, so it is claimed here for the same reason `env` is rebuilt.
@@ -668,7 +670,7 @@ pub(crate) fn reattach_after_restore(
                     working_directory,
                 )?;
                 if let Some(channel) = &channel {
-                    crate::process_ipc::install(&mut scope, process, channel)?;
+                    crate::process_ipc::install(&mut scope, process, channel, cjs)?;
                 }
                 Ok(())
             })

@@ -2760,6 +2760,12 @@ impl Runtime {
             &runtime.config.hooks,
             &working_directory,
             runtime.runtime_task_spawner.clone(),
+            &std::sync::Arc::new(crate::commonjs::CjsConfig {
+                capabilities: runtime.config.capabilities.clone(),
+                hosted: runtime.config.hosted_modules.clone(),
+                runtime_task_spawner: runtime.runtime_task_spawner.clone(),
+                addon_loader: runtime.config.commonjs_addon_loader,
+            }),
         )
         .ok()?;
         Some(runtime)
@@ -2923,6 +2929,12 @@ impl Runtime {
                             &config.warning_options,
                             config.process_title.as_deref(),
                             runtime_task_spawner.as_ref(),
+                            &std::sync::Arc::new(crate::commonjs::CjsConfig {
+                                capabilities: config.capabilities.clone(),
+                                hosted: config.hosted_modules.clone(),
+                                runtime_task_spawner: runtime_task_spawner.clone(),
+                                addon_loader: config.commonjs_addon_loader,
+                            }),
                         )?;
                     }
                     if config.expose_gc {

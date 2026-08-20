@@ -20,6 +20,7 @@
 //! # See also
 //! - [`crate::ipc`] — the channel itself.
 
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use otter_vm::{Attr, ErrorKind, Local, NativeCall, NativeError, NativeFn, NativeScope, Value};
@@ -35,8 +36,10 @@ pub(crate) fn install(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
     channel: &Arc<IpcChannel>,
+    cjs: &Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), NativeError> {
     let sender = channel.clone();
+    let cfg = cjs.clone();
     let send: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
         // A channel carries messages, so there is no such thing as sending
         // nothing; Node names the missing argument rather than sending
@@ -48,16 +51,48 @@ pub(crate) fn install(
                 message: "The \"message\" argument must be specified".to_string(),
             });
         };
-        let callback = args.get(1).copied();
+        let rest: Vec<Value> = args.iter().skip(1).copied().collect();
         ctx.scope(|mut scope| {
             let message = scope.value(message);
-            let text = encode(&mut scope, message)?;
-            let accepted = sender.send(&text);
+            // Node's argument shuffle: everything after the message is
+            // optional and a function anywhere in it is the callback. What is
+            // left is the socket to hand over, and its options.
+            let mut callback = None;
+            let mut send_handle = None;
+            let mut options = None;
+            for value in &rest {
+                let value = scope.value(*value);
+                if scope.is_callable(value) {
+                    if callback.is_none() {
+                        callback = Some(value);
+                    }
+                } else if !scope.is_object(value) || scope.is_null(value) {
+                    continue;
+                } else if send_handle.is_none() {
+                    send_handle = Some(value);
+                } else if options.is_none() {
+                    options = Some(value);
+                }
+            }
+            // A message may hand an open socket to the peer. What that socket
+            // is meant to be on arrival is the sockets module's protocol, so
+            // the message is shaped there and the channel only moves it.
+            let (text, handle) = match send_handle {
+                Some(send_handle) => {
+                    let options = options.unwrap_or_else(|| scope.undefined());
+                    prepare_send(&mut scope, &cfg, message, send_handle, options)?
+                }
+                None => (encode(&mut scope, message)?, -1),
+            };
+            let accepted = if handle >= 0 {
+                sender.send_with_handles(&text, vec![handle])
+            } else {
+                sender.send(&text)
+            };
             // Node reports the outcome to a callback when one is given, and
             // answers it either way.
             if let Some(callback) = callback {
-                let callback = scope.value(callback);
-                if scope.is_callable(callback) {
+                {
                     let error = if accepted {
                         scope.null()
                     } else {
@@ -104,6 +139,28 @@ pub(crate) fn install(
         "disconnect",
         0,
         NativeCall::Dynamic(disconnect),
+    )?;
+
+    // A channel is read because the program is listening on it. The listener
+    // machinery reaches this through the slot rather than through the channel,
+    // which it has no other way to name.
+    let reader = channel.clone();
+    let start_reading: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
+        reader.start_reading();
+        Ok(Value::undefined())
+    });
+    let start_reading =
+        scope.native_call("startReading", 0, NativeCall::Dynamic(start_reading))?;
+    scope.define(
+        process,
+        CHANNEL_READ_SLOT,
+        start_reading,
+        Attr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
     )?;
 
     let connected = scope.boolean(true);
@@ -174,13 +231,61 @@ fn event_name(
 /// What marks a message as belonging to a module rather than to the program.
 pub(crate) const INTERNAL_PREFIX: &str = "NODE_";
 
-/// Load the module that turns a received descriptor into a socket, so its
-/// hook is in place before the message that carries one is delivered.
-fn install_handle_adoption(
+/// Where the channel's "start reading" hook sits on `process`.
+pub(crate) const CHANNEL_READ_SLOT: &str = "__otterChannelStartReading";
+
+/// Reach one half of the handle protocol, loading the module that owns it if
+/// the program has not required it yet.
+///
+/// The protocol belongs to the module that owns sockets. A program that never
+/// required it can still be handed a descriptor, or hand one over, so it is
+/// loaded the first time either happens.
+fn install_protocol(
     scope: &mut NativeScope<'_, '_>,
     cfg: &Arc<crate::commonjs::CjsConfig>,
+    name: &str,
 ) -> Result<(), NativeError> {
+    let globals = scope.global_this();
+    let hook = scope.get(globals, name)?;
+    if scope.is_callable(hook) {
+        return Ok(());
+    }
     crate::commonjs::cjs_load_builtin(scope, cfg, "child_process").map(|_| ())
+}
+
+/// The text and descriptor a message carrying an open socket crosses as.
+///
+/// What the peer should see on arrival — a bare handle, a `net.Socket`, a
+/// server — is the sockets module's protocol, so the shaping happens there
+/// and the channel only moves the result.
+fn prepare_send(
+    scope: &mut NativeScope<'_, '_>,
+    cfg: &Arc<crate::commonjs::CjsConfig>,
+    message: Local<'_>,
+    send_handle: Local<'_>,
+    options: Local<'_>,
+) -> Result<(String, RawFd), NativeError> {
+    install_protocol(scope, cfg, "__otterIpcPrepareSend")?;
+    let globals = scope.global_this();
+    let prepare = scope.get(globals, "__otterIpcPrepareSend")?;
+    if !scope.is_callable(prepare) {
+        return Ok((encode(scope, message)?, -1));
+    }
+    let undefined = scope.undefined();
+    let prepared = scope.call(prepare, undefined, &[message, send_handle, options])?;
+    if !scope.is_object(prepared) {
+        return Err(NativeError::Coded {
+            kind: ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: "The \"message\" argument must be one of type string, object, number, \
+                      boolean, or null"
+                .to_string(),
+        });
+    }
+    let text = scope.get(prepared, "text")?;
+    let fd = scope.get(prepared, "fd")?;
+    let fd = scope.number_value(fd)? as RawFd;
+    Ok((scope.display_string(text), fd))
 }
 
 /// Record on `process` that nothing further will cross the channel.
@@ -239,33 +344,41 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                         let text = scope.string(payload)?;
                         let undefined = scope.undefined();
                         let message = scope.call(parse, undefined, &[text])?;
-                        let event = event_name(&mut scope, message)?;
-                        let name = scope.string(event)?;
-                        // A message may carry an open file. Turning it into
-                        // the socket a listener expects is the job of the
-                        // module that owns sockets, so the descriptor goes
-                        // through its hook; without one it is closed rather
-                        // than leaked.
-                        let mut carried = scope.undefined();
-                        for (index, handle) in handles.iter().enumerate() {
-                            let mut adopt = scope.get(globals, "__otterIpcAdoptHandle")?;
-                            if index == 0 && !scope.is_callable(adopt) {
-                                // The hook belongs to the module that owns
-                                // sockets. A program that never required it
-                                // can still be handed one, so it is loaded
-                                // the first time a descriptor arrives.
-                                install_handle_adoption(&mut scope, &cjs_config)?;
-                                adopt = scope.get(globals, "__otterIpcAdoptHandle")?;
-                            }
-                            if index == 0 && scope.is_callable(adopt) {
-                                let fd = scope.number(f64::from(*handle));
-                                let undefined = scope.undefined();
-                                carried = scope.call(adopt, undefined, &[fd])?;
-                            } else {
-                                let _ = nix::unistd::close(*handle);
-                            }
+                        // A message may carry an open file, and what the
+                        // sender meant by it — a bare handle, a connection, a
+                        // server — is the sockets module's protocol. The
+                        // message goes through its hook, which answers the
+                        // event, the message the program sees, and the object
+                        // the descriptor became.
+                        let first = handles.first().copied();
+                        for extra in handles.iter().skip(1) {
+                            let _ = nix::unistd::close(*extra);
                         }
-                        scope.call(emit, process, &[name, message, carried])?;
+                        let Some(first) = first else {
+                            let event = event_name(&mut scope, message)?;
+                            let name = scope.string(event)?;
+                            scope.call(emit, process, &[name, message])?;
+                            let undefined = scope.undefined();
+                            return Ok(scope.finish(undefined));
+                        };
+                        install_protocol(&mut scope, &cjs_config, "__otterIpcDeliver")?;
+                        let globals = scope.global_this();
+                        let deliver = scope.get(globals, "__otterIpcDeliver")?;
+                        if !scope.is_callable(deliver) {
+                            let _ = nix::unistd::close(first);
+                            let event = event_name(&mut scope, message)?;
+                            let name = scope.string(event)?;
+                            scope.call(emit, process, &[name, message])?;
+                            let undefined = scope.undefined();
+                            return Ok(scope.finish(undefined));
+                        }
+                        let fd = scope.number(f64::from(first));
+                        let undefined = scope.undefined();
+                        let delivered = scope.call(deliver, undefined, &[message, fd])?;
+                        let event = scope.get(delivered, "event")?;
+                        let inner = scope.get(delivered, "message")?;
+                        let carried = scope.get(delivered, "handle")?;
+                        scope.call(emit, process, &[event, inner, carried])?;
                     }
                     IpcEvent::Closed => {
                         mark_disconnected(&mut scope, process)?;

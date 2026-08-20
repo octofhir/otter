@@ -263,18 +263,18 @@ class ChildProcess extends EventEmitter {
       if (typeof callback === 'function') { callback(err); return false; }
       throw err;
     }
-    let payload;
+    let prepared;
     try {
-      payload = JSON.stringify(message);
+      prepared = prepareSend(message, sendHandle, options);
     } catch (error) {
       if (typeof callback === 'function') { callback(error); return false; }
       throw error;
     }
-    if (payload === undefined) {
+    if (prepared === undefined) {
       throw invalidArgType(
         'message', 'one of type string, object, number, boolean, or null', message);
     }
-    const accepted = native.ipcSend(this._handle, payload, handleFd(sendHandle));
+    const accepted = native.ipcSend(this._handle, prepared.text, prepared.fd);
     if (typeof callback === 'function') {
       setTimeout(() => callback(accepted ? null : new Error('Channel closed')), 0);
     }
@@ -375,15 +375,15 @@ class ChildProcess extends EventEmitter {
       } catch {
         return;
       }
-      const received = adoptHandle(handleFdIn);
-      if (received !== undefined) {
-        this.emit(isInternal(message) ? 'internalMessage' : 'message', message, received);
-        return;
-      }
       // A module built on the channel coordinates with its peer over the same
       // channel the program uses, so its own traffic is reported separately
       // and a program's `message` listeners only see what the peer sent.
-      this.emit(isInternal(message) ? 'internalMessage' : 'message', message);
+      const { event, message: inner, handle } = unwrap(message, handleFdIn);
+      if (handle === undefined) {
+        this.emit(event, inner);
+        return;
+      }
+      this.emit(event, inner, handle);
       return;
     }
     if (!this.connected) return;
@@ -413,23 +413,161 @@ globalThis.__otterChildIpc = function channelEvent(handle, kind, payload, handle
 };
 
 
-// A socket or server crosses the channel as a duplicate of its descriptor.
-// `undefined` means the message carries nothing but itself.
-function handleFd(sendHandle) {
-  if (sendHandle === undefined || sendHandle === null) return -1;
-  const inner = dgramHandleOf(sendHandle) ?? sendHandle._handle ?? sendHandle;
+// ---- handle passing ----
+//
+// What crosses a channel is a duplicate of a descriptor, so this process
+// keeps its own open and the peer owns what it receives. A descriptor alone
+// does not say what the sender meant by it — the same listening socket is a
+// `net.Server` to one program and a bare handle to `cluster` — so the sender
+// names the kind and the receiver builds that. The name rides in an envelope
+// around the message, which the receiver unwraps before anyone sees it.
+
+const HANDLE_ENVELOPE = 'NODE_HANDLE';
+
+// What the sender is handing over, or `null` when the message carries only
+// itself.
+function describeHandle(sendHandle, options) {
+  if (sendHandle === undefined || sendHandle === null) return null;
+  const dgramHandle = dgramHandleOf(sendHandle);
+  const inner = dgramHandle ?? sendHandle._handle ?? sendHandle;
   // A connection names itself by the id the host carries it under; a server
   // names itself by its listener's.
   const id = typeof inner?.fd === 'number' && inner.fd !== -1
     ? inner.fd
     : inner?._serverId;
-  if (typeof id !== 'number' || id === -1) return -1;
+  if (typeof id !== 'number' || id === -1) return null;
+  const { UDP } = require('internal/otter/udp_wrap');
   // A datagram socket lives in its own table, so it is asked for its own
   // duplicate.
-  const fd = inner instanceof require('internal/otter/udp_wrap').UDP
+  const fd = inner instanceof UDP
     ? require('internal/otter/dgram').dupFd(id)
     : netNative().dupFd(id);
-  return fd;
+  if (typeof fd !== 'number' || fd < 0) return null;
+  return {
+    fd,
+    type: handleType(sendHandle, dgramHandle),
+    dgramType: dgramHandle === undefined || dgramHandle === null
+      ? undefined
+      : sendHandle.type,
+    handle: inner,
+    socket: sendHandle,
+    keepOpen: options?.keepOpen === true,
+  };
+}
+
+function handleType(sendHandle, dgramHandle) {
+  if (dgramHandle !== undefined && dgramHandle !== null) return 'dgram.Socket';
+  const net = require('net');
+  if (sendHandle instanceof net.Server) return 'net.Server';
+  if (sendHandle instanceof net.Socket) return 'net.Socket';
+  return 'net.Native';
+}
+
+function envelope(message, carried) {
+  return {
+    cmd: HANDLE_ENVELOPE,
+    type: carried.type,
+    dgramType: carried.dgramType,
+    msg: message,
+  };
+}
+
+// A sent connection is a connection this side no longer has: the peer owns
+// it now, and two readers on one socket would race for its bytes.
+function detachSent(carried) {
+  if (carried.type !== 'net.Socket' || carried.keepOpen) return;
+  const socket = carried.socket;
+  const handle = carried.handle;
+  // A connection handed to another process is no longer one this server has:
+  // a server waiting to close counts it as gone the moment it leaves.
+  if (socket.server !== undefined && socket.server !== null &&
+      typeof socket.server._connections === 'number') {
+    socket.server._connections--;
+  }
+  socket._handle = null;
+  if (typeof socket.setTimeout === 'function') socket.setTimeout(0);
+  handle.onread = null;
+  try { handle.close(); } catch { /* already gone */ }
+}
+
+// A duplicate made for a crossing that never happened is closed here rather
+// than leaked.
+function closeSent(carried) {
+  try { netNative().closeFd(carried.fd); } catch { /* already gone */ }
+}
+
+// The text and descriptor one message crosses as. A sent connection is
+// detached here rather than on the acknowledgement: the duplicate already
+// holds the socket open, so this side has nothing left to keep.
+function prepareSend(message, sendHandle, options) {
+  const carried = describeHandle(sendHandle, options);
+  let text;
+  try {
+    text = JSON.stringify(carried === null ? message : envelope(message, carried));
+  } catch (error) {
+    if (carried !== null) closeSent(carried);
+    throw error;
+  }
+  if (text === undefined) {
+    if (carried !== null) closeSent(carried);
+    return undefined;
+  }
+  if (carried !== null) detachSent(carried);
+  return { text, fd: carried === null ? -1 : carried.fd };
+}
+
+// The other end: what arrived becomes the kind the sender named.
+function unwrap(message, fd) {
+  const wrapped = message !== null && typeof message === 'object' &&
+    message.cmd === HANDLE_ENVELOPE;
+  if (!wrapped) {
+    if (typeof fd === 'number' && fd >= 0) {
+      try { netNative().closeFd(fd); } catch { /* already gone */ }
+    }
+    return { event: isInternal(message) ? 'internalMessage' : 'message', message };
+  }
+  const inner = message.msg;
+  const event = isInternal(inner) ? 'internalMessage' : 'message';
+  return { event, message: inner, handle: adoptHandle(fd, message.type, message.dgramType) };
+}
+
+function adoptHandle(fd, type, dgramType) {
+  if (typeof fd !== 'number' || fd < 0) return undefined;
+  // The descriptor says what it is; the kernel is the one that knows.
+  const kind = netNative().socketKind(fd);
+  if (kind === 2) return adoptDatagram(fd, type, dgramType);
+  if (kind === 3) return adoptListener(fd, type);
+  const id = netNative().adoptFd(fd);
+  if (id < 0) return undefined;
+  const { TCP } = require('internal/otter/tcp_wrap');
+  const handle = TCP.adopt(id);
+  if (type === 'net.Native') return handle;
+  const net = require('net');
+  return new net.Socket({ handle, readable: true, writable: true });
+}
+
+function adoptDatagram(fd, type, dgramType) {
+  const id = require('internal/otter/dgram').adoptFd(fd);
+  if (id < 0) return undefined;
+  const { UDP } = require('internal/otter/udp_wrap');
+  const handle = UDP.adopt(id);
+  if (type !== 'dgram.Socket') return handle;
+  const dgram = require('dgram');
+  const socket = new dgram.Socket(dgramType ?? 'udp4');
+  socket.bind({ fd: handle });
+  return socket;
+}
+
+function adoptListener(fd, type) {
+  const id = netNative().adoptListenerFd(fd);
+  if (id < 0) return undefined;
+  const { TCP } = require('internal/otter/tcp_wrap');
+  const handle = TCP.adoptListener(id);
+  if (type !== 'net.Server') return handle;
+  const net = require('net');
+  const server = new net.Server();
+  server.listen(handle);
+  return server;
 }
 
 // `dgram` keeps its handle behind a private symbol rather than on `_handle`,
@@ -439,30 +577,8 @@ function dgramHandleOf(value) {
   return value?.[kStateSymbol]?.handle;
 }
 
-// The other end: a descriptor becomes the socket the receiver is handed.
-function adoptHandle(fd) {
-  if (typeof fd !== 'number' || fd < 0) return undefined;
-  // The descriptor says what it is; the kernel is the one that knows.
-  const kind = netNative().socketKind(fd);
-  if (kind === 2) {
-    const id = require('internal/otter/dgram').adoptFd(fd);
-    if (id < 0) return undefined;
-    const { UDP } = require('internal/otter/udp_wrap');
-    return UDP.adopt(id);
-  }
-  const id = netNative().adoptFd(fd);
-  if (id < 0) return undefined;
-  const net = require('net');
-  return new net.Socket({ handle: makeAdoptedHandle(id), readable: true, writable: true });
-}
-
 function netNative() {
   return require('internal/otter/net');
-}
-
-function makeAdoptedHandle(id) {
-  const { TCP } = require('internal/otter/tcp_wrap');
-  return TCP.adopt(id);
 }
 
 function spawn(command, args, options) {
@@ -545,5 +661,12 @@ Object.defineProperty(globalThis, '__otterChildIpc', { enumerable: false });
 
 // The other end of the same crossing: a descriptor that arrives on this
 // process's own channel becomes the socket its `message` listener is handed.
-globalThis.__otterIpcAdoptHandle = adoptHandle;
-Object.defineProperty(globalThis, '__otterIpcAdoptHandle', { enumerable: false });
+// The channel a process is launched with belongs to how it was started, not
+// to this module, so the host owns `process.send`. The two halves of the
+// handle protocol live here, where sockets live, and the host reaches them
+// through these hooks.
+globalThis.__otterIpcPrepareSend = prepareSend;
+globalThis.__otterIpcDeliver = unwrap;
+for (const name of ['__otterIpcPrepareSend', '__otterIpcDeliver']) {
+  Object.defineProperty(globalThis, name, { enumerable: false });
+}

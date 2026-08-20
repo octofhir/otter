@@ -4,6 +4,7 @@
 
 const {
   StreamHandle,
+  adoptServer,
   startConnect,
   startListen,
   handleClassByServer,
@@ -30,6 +31,14 @@ class TCP extends StreamHandle {
     return handle;
   }
 
+  // A listening socket that arrived over a channel accepts here without a
+  // second bind: the kernel already gave it its address.
+  static adoptListener(id) {
+    const handle = new TCP(constants.SERVER);
+    adoptServer(handle, id);
+    return handle;
+  }
+
   bind(address, port) {
     this._boundAddress = address;
     this._boundPort = port >>> 0;
@@ -42,6 +51,7 @@ class TCP extends StreamHandle {
   }
 
   listen(_backlog) {
+    if (this._serverId !== -1) return 0;
     const address = this._boundAddress ?? '0.0.0.0';
     const port = this._boundPort;
     const err = startListen(this, () => native.listen(address, port, this._ipv6Only === true));

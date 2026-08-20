@@ -279,6 +279,19 @@ fn add_listener(
             scope.set_index(events, length, record)?;
         }
         refresh_event_count(&mut scope, process, events)?;
+        // Listening for messages is what opens the channel this process was
+        // launched with: until then what the peer sent waits in the socket
+        // rather than being announced to nobody.
+        if scope.is_string(event) {
+            let name = scope.display_string(event);
+            if name == "message" || name == "internalMessage" {
+                let start = scope.get(process, crate::process_ipc::CHANNEL_READ_SLOT)?;
+                if scope.is_callable(start) {
+                    let undefined = scope.undefined();
+                    scope.call(start, undefined, &[])?;
+                }
+            }
+        }
         Ok(scope.finish(process))
     })
 }

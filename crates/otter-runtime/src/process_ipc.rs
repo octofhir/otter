@@ -122,6 +122,20 @@ pub(crate) fn install(
             let process = scope.get(globals, "process")?;
             let already = scope.get(process, "connected")?;
             if !scope.boolean_value(already)? {
+                // Disconnecting a channel that has already gone is an error
+                // the program hears about, the same way it hears about every
+                // other channel failure.
+                let emit = scope.get(process, "emit")?;
+                if scope.is_callable(emit) {
+                    let name = scope.string("error")?;
+                    let error = scope.error(
+                        otter_vm::ErrorKind::Error,
+                        "IPC channel is already disconnected",
+                    )?;
+                    let code = scope.string("ERR_IPC_DISCONNECTED")?;
+                    scope.set(error, "code", code)?;
+                    scope.call(emit, process, &[name, error])?;
+                }
                 let undefined = scope.undefined();
                 return Ok(scope.finish(undefined));
             }

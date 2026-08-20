@@ -104,11 +104,19 @@ fn native_value<'scope>(
     let send_table = children.clone();
     let send = scope.native_closure(
         "ipcSend",
-        3,
+        4,
         &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
             let id = handle_arg(args, 0);
             let payload = runtime_arg_to_string(args, 1, ctx.heap());
+            // What the caller calls this message. A message that leaves
+            // something behind is named so the module that owns what it
+            // carried can be told once the message has gone.
+            let token = args
+                .get(3)
+                .and_then(|value| value.as_f64())
+                .map(|token| token as u32)
+                .filter(|token| *token != 0);
             // A third argument is an open file to hand over with the message.
             // It is already a duplicate made for the crossing, so the channel
             // closes it once it is sent.
@@ -120,7 +128,7 @@ fn native_value<'scope>(
                 .unwrap_or_default();
             let channel = lookup_channel(&send_table, id);
             let accepted = match channel {
-                Some(channel) => channel.send_with_handles(&payload, handles),
+                Some(channel) => channel.send_with_handles(&payload, handles, token),
                 None => {
                     for handle in handles {
                         let _ = nix::unistd::close(handle);
@@ -228,6 +236,7 @@ impl RuntimeTask for ChildIpcEvent {
         let (kind, payload) = match self.event {
             IpcEvent::Message(payload, _) => ("message", payload),
             IpcEvent::Closed => ("disconnect", String::new()),
+            IpcEvent::Sent(token) => ("sent", token.to_string()),
         };
         runtime.run_native_event(&context, move |ctx| {
             ctx.scope(|mut scope| {

@@ -45,6 +45,10 @@ pub enum IpcEvent {
     Message(String, Vec<RawFd>),
     /// The peer is gone; nothing further will arrive.
     Closed,
+    /// A message the program handed over has left this process, named by the
+    /// token the program gave it. What the message carried is the peer's from
+    /// here on, which is when the sender may let go of its own copy.
+    Sent(u32),
 }
 
 impl IpcEvent {
@@ -55,7 +59,7 @@ impl IpcEvent {
     pub fn take_handles(&mut self) -> Vec<RawFd> {
         match self {
             Self::Message(_, handles) => std::mem::take(handles),
-            Self::Closed => Vec::new(),
+            Self::Closed | Self::Sent(_) => Vec::new(),
         }
     }
 }
@@ -103,6 +107,9 @@ pub struct OutgoingFrame {
     /// with unsent work — the socket takes only a buffer's worth at a time, so
     /// a large message needs turns of the loop that must still happen.
     in_flight: Option<RuntimeKeepAlive>,
+    /// What the program calls this message, when it asked to be told that it
+    /// has gone.
+    sent: Option<u32>,
 }
 
 #[cfg(unix)]
@@ -366,7 +373,7 @@ impl IpcChannel {
     /// Queue one message. Answers whether it was accepted; a disconnected
     /// channel accepts nothing.
     pub fn send(&self, payload: &str) -> bool {
-        self.send_with_handles(payload, Vec::new())
+        self.send_with_handles(payload, Vec::new(), None)
     }
 
     /// Send one message together with the open files it carries.
@@ -375,7 +382,12 @@ impl IpcChannel {
     /// the peer can tell which message they belong to without a protocol of
     /// their own.
     #[must_use]
-    pub fn send_with_handles(&self, payload: &str, handles: Vec<RawFd>) -> bool {
+    pub fn send_with_handles(
+        &self,
+        payload: &str,
+        handles: Vec<RawFd>,
+        sent: Option<u32>,
+    ) -> bool {
         // The descriptors belong to the frame from here on, so every way out
         // of this call closes them exactly once: the writer does it once they
         // have crossed, and dropping the frame does it if they never do.
@@ -383,6 +395,7 @@ impl IpcChannel {
             bytes: Vec::new(),
             handles,
             in_flight: None,
+            sent,
         };
         if !self.connected() {
             return false;
@@ -442,9 +455,13 @@ async fn carry<T, F>(
     T: RuntimeTask,
 {
     let (reader, mut writer) = stream.into_split();
+    // Both halves report what happens on this channel, so the closure that
+    // names those reports is shared rather than owned by the reading side.
+    let deliver = Arc::new(deliver);
     // Dropping the write half is what lets the peer observe the end of the
     // channel, so the writer task owns it and nothing else holds it.
     let writer_spawner = spawner.clone();
+    let writer_deliver = deliver.clone();
     tokio::spawn(async move {
         while let Some(mut frame) = queued.recv().await {
             let outcome = write_frame(&mut writer, &frame.bytes, &frame.handles).await;
@@ -458,12 +475,18 @@ async fn carry<T, F>(
             if let Some(in_flight) = frame.in_flight.take() {
                 let _ = writer_spawner.enqueue(FrameWritten { in_flight }, RuntimeLiveness::Unref);
             }
+            // The message has gone; what it carried belongs to the peer now,
+            // and the sender is told so it can let go of its own copy.
+            if let Some(token) = frame.sent.take() {
+                let _ = writer_spawner
+                    .enqueue(writer_deliver(IpcEvent::Sent(token)), RuntimeLiveness::Unref);
+            }
             if outcome.is_err() {
                 return;
             }
         }
     });
-    read_loop(&reader, &spawner, &reading, &deliver).await;
+    read_loop(&reader, &spawner, &reading, deliver.as_ref()).await;
     connected.store(false, Ordering::SeqCst);
     // The peer is gone, so this end stops holding the run loop open whether or
     // not the program ever calls `disconnect` itself.

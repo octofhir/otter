@@ -77,18 +77,24 @@ pub(crate) fn install(
             let carries = positional.iter().any(|slot| {
                 slot.is_some_and(|value| !scope.is_undefined(value))
             });
-            let (text, handle) = if carries {
+            let (text, handle, token) = if carries {
                 let send_handle = positional[0].unwrap_or_else(|| scope.undefined());
                 let options = positional[1].unwrap_or_else(|| scope.undefined());
                 prepare_send(&mut scope, &cfg, message, send_handle, options)?
             } else {
-                (encode(&mut scope, message)?, -1)
+                (encode(&mut scope, message)?, -1, None)
             };
             let accepted = if handle >= 0 {
-                sender.send_with_handles(&text, vec![handle])
+                sender.send_with_handles(&text, vec![handle], token)
             } else {
                 sender.send(&text)
             };
+            // A message that never left takes what it carried with it; the
+            // module that handed it over hears so at once rather than waiting
+            // for a crossing that will not happen.
+            if !accepted && let Some(token) = token {
+                report_sent(&mut scope, token)?;
+            }
             // Node reports the outcome to a callback when one is given, and
             // answers it either way.
             if let Some(callback) = callback {
@@ -264,12 +270,12 @@ fn prepare_send(
     message: Local<'_>,
     send_handle: Local<'_>,
     options: Local<'_>,
-) -> Result<(String, RawFd), NativeError> {
+) -> Result<(String, RawFd, Option<u32>), NativeError> {
     install_protocol(scope, cfg, "__otterIpcPrepareSend")?;
     let globals = scope.global_this();
     let prepare = scope.get(globals, "__otterIpcPrepareSend")?;
     if !scope.is_callable(prepare) {
-        return Ok((encode(scope, message)?, -1));
+        return Ok((encode(scope, message)?, -1, None));
     }
     let undefined = scope.undefined();
     let prepared = scope.call(prepare, undefined, &[message, send_handle, options])?;
@@ -285,7 +291,40 @@ fn prepare_send(
     let text = scope.get(prepared, "text")?;
     let fd = scope.get(prepared, "fd")?;
     let fd = scope.number_value(fd)? as RawFd;
-    Ok((scope.display_string(text), fd))
+    // A message that leaves something behind names it, so the module that
+    // owns what it carried can be told once the message has gone.
+    let token = scope.get(prepared, "token")?;
+    let token = scope.number_value(token)? as u32;
+    Ok((scope.display_string(text), fd, (token != 0).then_some(token)))
+}
+
+/// Where the module that owns handles hears that a message has gone.
+pub(crate) const SENT_HOOK: &str = "__otterIpcSent";
+
+/// Tell the module that handed a message over that it has left this process.
+fn report_sent(scope: &mut NativeScope<'_, '_>, token: u32) -> Result<(), NativeError> {
+    let globals = scope.global_this();
+    let hook = scope.get(globals, SENT_HOOK)?;
+    if !scope.is_callable(hook) {
+        return Ok(());
+    }
+    let token = scope.number(f64::from(token));
+    let undefined = scope.undefined();
+    scope.call(hook, undefined, &[token])?;
+    Ok(())
+}
+
+/// Let go of everything that was still on its way out when the channel went.
+fn release_pending_sends(scope: &mut NativeScope<'_, '_>) -> Result<(), NativeError> {
+    let globals = scope.global_this();
+    let hook = scope.get(globals, "__otterIpcSentAll")?;
+    if !scope.is_callable(hook) {
+        return Ok(());
+    }
+    let own = scope.number(0.0);
+    let undefined = scope.undefined();
+    scope.call(hook, undefined, &[own])?;
+    Ok(())
 }
 
 /// Record on `process` that nothing further will cross the channel.
@@ -381,7 +420,9 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                         let handle = scope.get(delivered, "handle")?;
                         scope.call(emit, process, &[event, inner, handle])?;
                     }
+                    IpcEvent::Sent(token) => report_sent(&mut scope, *token)?,
                     IpcEvent::Closed => {
+                        release_pending_sends(&mut scope)?;
                         mark_disconnected(&mut scope, process)?;
                         let name = scope.string("disconnect")?;
                         scope.call(emit, process, &[name])?;

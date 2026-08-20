@@ -154,13 +154,30 @@ fn native_value<'scope>(
     let send_table = children.clone();
     let send = scope.native_closure(
         "ipcSend",
-        2,
+        3,
         &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
             let id = handle_arg(args, 0);
             let payload = runtime_arg_to_string(args, 1, ctx.heap());
+            // A third argument is an open file to hand over with the message.
+            // It is already a duplicate made for the crossing, so the channel
+            // closes it once it is sent.
+            let handles: Vec<std::os::fd::RawFd> = args
+                .get(2)
+                .and_then(|value| value.as_f64())
+                .filter(|fd| *fd >= 0.0)
+                .map(|fd| vec![fd as std::os::fd::RawFd])
+                .unwrap_or_default();
             let channel = lookup_channel(&send_table, id);
-            let accepted = channel.is_some_and(|channel| channel.send(&payload));
+            let accepted = match channel {
+                Some(channel) => channel.send_with_handles(&payload, handles),
+                None => {
+                    for handle in handles {
+                        let _ = nix::unistd::close(handle);
+                    }
+                    false
+                }
+            };
             Ok(Value::boolean(accepted))
         },
     )?;
@@ -224,10 +241,18 @@ impl RuntimeTask for ChildIpcEvent {
         let Some(context) = runtime.realm_execution_context() else {
             return Ok(());
         };
-        let (kind, payload) = match &self.event {
-            IpcEvent::Message(payload) => ("message", payload.as_str()),
-            IpcEvent::Closed => ("disconnect", ""),
+        let (kind, payload, handles) = match &self.event {
+            IpcEvent::Message(payload, handles) => {
+                ("message", payload.as_str(), handles.as_slice())
+            }
+            IpcEvent::Closed => ("disconnect", "", [].as_slice()),
         };
+        // The descriptor is handed over as itself; the module that asked for
+        // the message is what turns it into a socket.
+        let handle_fd = handles.first().copied();
+        for extra in handles.iter().skip(1) {
+            let _ = nix::unistd::close(*extra);
+        }
         runtime.run_native_event(&context, |ctx| {
             ctx.scope(|mut scope| {
                 let globals = scope.global_this();
@@ -239,8 +264,12 @@ impl RuntimeTask for ChildIpcEvent {
                 let id = scope.number(f64::from(self.id));
                 let kind = scope.string(kind)?;
                 let payload = scope.string(payload)?;
+                let handle = match handle_fd {
+                    Some(fd) => scope.number(f64::from(fd)),
+                    None => scope.undefined(),
+                };
                 let undefined = scope.undefined();
-                let result = scope.call(dispatcher, undefined, &[id, kind, payload])?;
+                let result = scope.call(dispatcher, undefined, &[id, kind, payload, handle])?;
                 Ok(scope.finish(result))
             })
         })

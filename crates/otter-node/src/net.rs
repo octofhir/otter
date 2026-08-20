@@ -551,6 +551,94 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "reset", reset)?;
+
+    // A connection can cross a channel to another process. What crosses is a
+    // duplicate of the descriptor, so this process keeps its own open and the
+    // peer owns what it receives.
+    let dup_table = table.clone();
+    let dup_fd = scope.native_closure(
+        "dupFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let id = handle_arg(args, 0);
+            let raw = {
+                let table = dup_table
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match table.get(&id) {
+                    Some(Entry {
+                        kind: EntryKind::Connection { socket, .. },
+                        ..
+                    }) => Some(socket.raw_fd()),
+                    _ => None,
+                }
+            };
+            let Some(raw) = raw else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            // SAFETY: `raw` names a descriptor this table owns and keeps open
+            // for the duration of the call; `dup` only reads it.
+            let copy = unsafe { libc::dup(raw) };
+            Ok(RuntimeValue::number_i32(copy))
+        },
+    )?;
+    scope.set(object, "dupFd", dup_fd)?;
+
+    let adopt_table = table.clone();
+    let adopt_ids = next_id.clone();
+    let adopt_spawner = spawner.clone();
+    let adopt_fd = scope.native_closure(
+        "adoptFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            let Some(spawner) = adopt_spawner.as_ref() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let Some(io) = spawner.io_handle() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            if raw < 0 {
+                return Ok(RuntimeValue::number_i32(-1));
+            }
+            // SAFETY: the descriptor arrived from the channel, which handed
+            // ownership over with it; nothing else in this process holds it.
+            let std_stream =
+                unsafe { <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            if std_stream.set_nonblocking(true).is_err() {
+                return Ok(RuntimeValue::number_i32(-1));
+            }
+            let remote = std_stream.peer_addr().ok();
+            // `from_std` registers with the reactor and needs the runtime in
+            // scope.
+            let stream = {
+                let _guard = io.enter();
+                match tokio::net::TcpStream::from_std(std_stream) {
+                    Ok(stream) => stream,
+                    Err(_) => return Ok(RuntimeValue::number_i32(-1)),
+                }
+            };
+            // `adopt` spawns the connection's reader and writer, which need
+            // the host runtime in scope the way `from_std` did.
+            let id = {
+                let _guard = io.enter();
+                adopt(
+                    NetSocket::Tcp(Arc::new(stream)),
+                    remote,
+                    &adopt_table,
+                    &adopt_ids,
+                    spawner,
+                )
+            };
+            Ok(RuntimeValue::number_i32(id as i32))
+        },
+    )?;
+    scope.set(object, "adoptFd", adopt_fd)?;
     Ok(object)
 }
 

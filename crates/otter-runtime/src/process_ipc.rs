@@ -218,7 +218,7 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                     return Ok(scope.finish(undefined));
                 }
                 match &self.event {
-                    IpcEvent::Message(payload) => {
+                    IpcEvent::Message(payload, handles) => {
                         let json = scope.get(globals, "JSON")?;
                         let parse = scope.get(json, "parse")?;
                         let text = scope.string(payload)?;
@@ -226,7 +226,23 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                         let message = scope.call(parse, undefined, &[text])?;
                         let event = event_name(&mut scope, message)?;
                         let name = scope.string(event)?;
-                        scope.call(emit, process, &[name, message])?;
+                        // A message may carry an open file. Turning it into
+                        // the socket a listener expects is the job of the
+                        // module that owns sockets, so the descriptor goes
+                        // through its hook; without one it is closed rather
+                        // than leaked.
+                        let mut carried = scope.undefined();
+                        for (index, handle) in handles.iter().enumerate() {
+                            let adopt = scope.get(globals, "__otterIpcAdoptHandle")?;
+                            if index == 0 && scope.is_callable(adopt) {
+                                let fd = scope.number(f64::from(*handle));
+                                let undefined = scope.undefined();
+                                carried = scope.call(adopt, undefined, &[fd])?;
+                            } else {
+                                let _ = nix::unistd::close(*handle);
+                            }
+                        }
+                        scope.call(emit, process, &[name, message, carried])?;
                     }
                     IpcEvent::Closed => {
                         mark_disconnected(&mut scope, process)?;

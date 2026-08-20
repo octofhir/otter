@@ -22,6 +22,14 @@ class TCP extends StreamHandle {
     this.type = type;
   }
 
+  // A connection that arrived over a channel is already carried by the host;
+  // this is the handle that stands for it here.
+  static adopt(id) {
+    const handle = new TCP(constants.SOCKET);
+    handle._adoptFd(id);
+    return handle;
+  }
+
   bind(address, port) {
     this._boundAddress = address;
     this._boundPort = port >>> 0;

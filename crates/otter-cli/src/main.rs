@@ -162,6 +162,12 @@ struct Cli {
     title: Option<String>,
 
     /// Install a global `gc()` forcing a full collection
+    /// How much stack a call may use, in kilobytes (Node's
+    /// `--stack-size`). The engine counts frames rather than bytes, so this
+    /// is read as the share of the default stack a run is asking for.
+    #[arg(long = "stack-size", alias = "stack_size", value_name = "kilobytes", global = true)]
+    stack_size: Option<u32>,
+
     /// (Node's `--expose-gc`).
     #[arg(long = "expose-gc", alias = "expose_gc", global = true)]
     expose_gc: bool,
@@ -700,6 +706,7 @@ async fn main() -> ExitCode {
     execution.set_process_title(cli.title.clone());
     execution.set_expose_gc(cli.expose_gc);
     execution.set_expose_internals(cli.expose_internals);
+    execution.set_stack_size(cli.stack_size);
     // A node-style switch is accepted in both spellings; `process.execArgv`
     // reports the one the caller actually wrote, which is what a
     // flag-checking harness compares against.
@@ -884,6 +891,26 @@ async fn run_file(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The file a name stands for.
+///
+/// A program may be named without saying what it is written in — a forked
+/// module is named the way `require` would name it — so a name with no file of
+/// its own is answered by the file that would be found for it.
+fn resolved_entry(path: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    for extension in [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".json"] {
+        let mut named = path.as_os_str().to_os_string();
+        named.push(extension);
+        let candidate = PathBuf::from(named);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
 async fn run_file_with_cwd(
     path: &std::path::Path,
     args: &[String],
@@ -896,6 +923,8 @@ async fn run_file_with_cwd(
     cpu_profile: Option<&CpuProfileOptions>,
     max_heap_bytes: Option<u64>,
 ) -> Result<ExitCode, OtterError> {
+    let resolved = resolved_entry(path);
+    let path = resolved.as_path();
     if let Some(mode) = dump_mode {
         if cpu_profile.is_some() {
             return Err(pm_config_error(

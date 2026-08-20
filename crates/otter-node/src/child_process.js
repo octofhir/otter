@@ -941,7 +941,12 @@ function unwrap(message, fd) {
 
 function adoptHandle(fd, type, dgramType) {
   if (typeof fd !== 'number' || fd < 0) return undefined;
-  // The descriptor says what it is; the kernel is the one that knows.
+  // What the sender meant by the descriptor is what the sender said: a
+  // listening socket and a connection are the same kind of thing to the
+  // kernel on some platforms, and asking it turns a server into a socket.
+  if (type === 'net.Server') return adoptListener(fd, type);
+  if (type === 'dgram.Socket') return adoptDatagram(fd, type, dgramType);
+  // A bare handle carries no name, so the kernel answers for it.
   const kind = netNative().socketKind(fd);
   if (kind === 2) return adoptDatagram(fd, type, dgramType);
   if (kind === 3) return adoptListener(fd, type);

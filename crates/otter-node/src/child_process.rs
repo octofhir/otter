@@ -554,38 +554,51 @@ fn stdio_plans(
     };
     let mut plans = Vec::with_capacity(entries.len().max(3));
     for (slot, entry) in entries.iter().enumerate() {
-        // A slot the child reads from is one this process writes to, and the
-        // other way round for everything past the first.
-        let child_reads = slot == 0;
         plans.push(match entry {
             value if value.is_string() => match value.display_string(ctx.heap()).as_str() {
                 "inherit" => StdioPlan::Inherit,
                 "ignore" | "ipc" => StdioPlan::Ignore,
-                _ => open_pipe(child_reads)?,
+                _ => open_pipe(slot)?,
             },
             value => match value.as_f64() {
                 Some(fd) if fd >= 0.0 => StdioPlan::Fd(duplicate(fd as std::os::fd::RawFd)?),
-                _ => open_pipe(child_reads)?,
+                _ => open_pipe(slot)?,
             },
         });
     }
     while plans.len() < 3 {
-        plans.push(open_pipe(plans.is_empty())?);
+        plans.push(open_pipe(plans.len())?);
     }
     Ok(plans)
 }
 
-/// A fresh pipe, with the ends handed to whichever side reads and writes.
+/// A fresh channel for one of a child's streams, with the ends handed to
+/// whichever side reads and writes.
 ///
 /// The end this process keeps does not survive into any other child: a
 /// descriptor left open in an unrelated process is a stream whose end never
 /// arrives.
-fn open_pipe(child_reads: bool) -> Result<StdioPlan, std::io::Error> {
-    let (read_end, write_end) = nix::unistd::pipe()?;
-    let (parent, child) = if child_reads {
-        (write_end, read_end)
+fn open_pipe(slot: usize) -> Result<StdioPlan, std::io::Error> {
+    let (parent, child) = if slot > 2 {
+        // A stream of a child's own is not one of the three every process
+        // has, and nothing says which way it runs: both ends read and write,
+        // which is what a caller writing to the descriptor it handed over
+        // expects of it.
+        nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )?
     } else {
-        (read_end, write_end)
+        let (read_end, write_end) = nix::unistd::pipe()?;
+        // The child reads what it is given on the first stream and writes on
+        // the rest.
+        if slot == 0 {
+            (write_end, read_end)
+        } else {
+            (read_end, write_end)
+        }
     };
     // Neither end survives an exec under the number it has here. The child's
     // end is put in its place by the launch and is a stream from then on, and
@@ -823,7 +836,7 @@ fn spawn_sync_raw(
         Err(error) => return spawn_error_result(ctx, &command, &error),
     };
     if input.is_some() && !matches!(plans.first(), Some(StdioPlan::Pipe { .. })) {
-        match open_pipe(true) {
+        match open_pipe(0) {
             Ok(pipe) => plans[0] = pipe,
             Err(error) => return spawn_error_result(ctx, &command, &error),
         }

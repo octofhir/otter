@@ -79,7 +79,21 @@ pub(crate) fn install(
         ctx.scope(|mut scope| {
             let globals = scope.global_this();
             let process = scope.get(globals, "process")?;
+            let already = scope.get(process, "connected")?;
+            if !scope.boolean_value(already)? {
+                let undefined = scope.undefined();
+                return Ok(scope.finish(undefined));
+            }
             mark_disconnected(&mut scope, process)?;
+            // Closing the channel from this side is a disconnect this side
+            // observes too: a program that asked for it still learns the
+            // channel is gone, exactly as it would had the peer closed
+            // first.
+            let emit = scope.get(process, "emit")?;
+            if scope.is_callable(emit) {
+                let name = scope.string("disconnect")?;
+                scope.call(emit, process, &[name])?;
+            }
             let undefined = scope.undefined();
             Ok(scope.finish(undefined))
         })

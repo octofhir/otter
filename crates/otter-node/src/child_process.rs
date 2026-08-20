@@ -317,7 +317,7 @@ fn spawn_start(
         });
     }
 
-    let mut argv = args
+    let argv = args
         .get(1)
         .copied()
         .map(|value| read_string_array(ctx, value))
@@ -327,9 +327,6 @@ fn spawn_start(
     let argv0 = opt_string(ctx, opts, "argv0");
     let env = opt_env(ctx, opts)?;
     let wants_channel = opt_flag(ctx, opts, "ipc");
-    if should_propagate_allow_all(ctx, &command, caps) {
-        argv.insert(0, "--allow-all".to_string());
-    }
 
     let Some(spawner) = spawner else {
         return Err(crate::type_error(
@@ -370,6 +367,7 @@ fn spawn_start(
         cmd.env_clear();
         cmd.envs(env);
     }
+    grant(&mut cmd, caps);
     match &channel {
         Some((_, address)) => {
             cmd.env(otter_runtime::ipc::CHANNEL_VAR, address);
@@ -756,31 +754,19 @@ fn opt_env(
     })
 }
 
-fn current_exec_path(ctx: &mut NativeCtx<'_>) -> Option<String> {
-    let global = *ctx.interp_mut().global_this();
-    let process = object::get(global, ctx.heap(), "process")?.as_object()?;
-    let exec_path = object::get(process, ctx.heap(), "execPath")?;
-    Some(exec_path.display_string(ctx.heap()))
-}
-
-fn should_propagate_allow_all(
-    ctx: &mut NativeCtx<'_>,
-    command: &str,
-    caps: &CapabilitySet,
-) -> bool {
-    caps.read.is_allow_all()
-        && caps.write.is_allow_all()
-        && caps.net.is_allow_all()
-        && caps.env.is_allow_all()
-        && caps.run.is_allow_all()
-        && caps.ffi.is_allow_all()
-        && {
-            // A symlink to the engine binary is still the engine binary; the
-            // corpus spawns itself through one and expects the same grants.
-            let command = std::fs::canonicalize(command).ok();
-            let exec = current_exec_path(ctx).and_then(|exec| std::fs::canonicalize(exec).ok());
-            command.is_some() && command == exec
-        }
+/// Hand a child what this process was granted.
+///
+/// A process trusted with everything trusts what it starts with the same — it
+/// could do anything the child could anyway — and this is the only way to say
+/// so through a shell, which is how a command line most often reaches a
+/// program. A process that holds less than everything says nothing, and takes
+/// care to say nothing: a name it inherited itself must not outlive the reach
+/// it came with.
+fn grant(cmd: &mut Command, caps: &CapabilitySet) {
+    match caps.inherited_grant() {
+        Some(grant) => cmd.env(otter_runtime::GRANT_VAR, grant),
+        None => cmd.env_remove(otter_runtime::GRANT_VAR),
+    };
 }
 
 fn spawn_sync_raw(
@@ -800,7 +786,7 @@ fn spawn_sync_raw(
         });
     }
 
-    let mut argv = args
+    let argv = args
         .get(1)
         .copied()
         .map(|v| read_string_array(ctx, v))
@@ -813,9 +799,6 @@ fn spawn_sync_raw(
     let max_buffer = opt_number(ctx, opts, "maxBuffer").unwrap_or(f64::INFINITY);
     let timeout_ms = opt_number(ctx, opts, "timeout").unwrap_or(0.0);
     let env = opt_env(ctx, opts)?;
-    if should_propagate_allow_all(ctx, &command, caps) {
-        argv.insert(0, "--allow-all".to_string());
-    }
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
@@ -830,6 +813,7 @@ fn spawn_sync_raw(
         cmd.env_clear();
         cmd.envs(env);
     }
+    grant(&mut cmd, caps);
     // A stream the caller did not ask to see is the child's own: `inherit`
     // hands it this process's, `ignore` hands it nothing, and only a pipe is
     // collected and reported back. Text to feed the child is a pipe whatever

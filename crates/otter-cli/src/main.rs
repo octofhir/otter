@@ -315,6 +315,26 @@ struct PermissionFlags {
 }
 
 impl PermissionFlags {
+    /// Whether the command line said anything about what this run may do.
+    fn names_any_permission(&self) -> bool {
+        [
+            self.allow_read.as_ref(),
+            self.deny_read.as_ref(),
+            self.allow_write.as_ref(),
+            self.deny_write.as_ref(),
+            self.allow_net.as_ref(),
+            self.deny_net.as_ref(),
+            self.allow_env.as_ref(),
+            self.deny_env.as_ref(),
+            self.allow_run.as_ref(),
+            self.deny_run.as_ref(),
+            self.allow_ffi.as_ref(),
+            self.deny_ffi.as_ref(),
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
+
     /// Build a deny-by-default [`CapabilitySet`] and apply CLI overrides on top.
     fn into_capabilities(self) -> CapabilitySet {
         if self.allow_all {
@@ -322,6 +342,14 @@ impl PermissionFlags {
         }
         if self.sandbox {
             return CapabilitySet::sandbox();
+        }
+        // A run that says nothing about what it may do takes what the process
+        // that started it granted. Anything said here is said instead of that,
+        // not on top of it: a command line naming its own reach means it.
+        if !self.names_any_permission()
+            && let Some(inherited) = CapabilitySet::from_inherited_grant()
+        {
+            return inherited;
         }
         let mut caps = CapabilitySet::default();
         apply_path_override(
@@ -633,11 +661,26 @@ struct TestArgs {
 
 // Multi-thread: host IO (HTTP server, fetch, timers) runs on Tokio workers
 // while the VM stays pinned to the isolate thread. Current-thread would stall
+/// Spell out the switches a caller wrote together.
+///
+/// `-pe code` is one word for two switches, and the code that follows belongs
+/// to the last of them. Evaluating and printing is what `-p` already is, so a
+/// cluster of the two is that switch; anything else keeps the word it was
+/// written as, and the argument list is otherwise untouched — everything after
+/// the script is the script's own.
+fn clustered_switches(args: impl Iterator<Item = String>) -> Vec<String> {
+    args.map(|arg| match arg.as_str() {
+        "-pe" | "-ep" => "-p".to_string(),
+        _ => arg,
+    })
+    .collect()
+}
+
 // IO whenever the main thread blocks joining the isolate.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(clustered_switches(std::env::args()));
     startup_timer.mark("parse_args");
     let mut execution = CliExecutionConfig::new(
         cli.timeout_secs,

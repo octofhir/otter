@@ -378,11 +378,23 @@ fn with_file<R>(
     let mut descriptors = table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let file = descriptors
-        .files
-        .get_mut(&fd)
-        .ok_or_else(|| coded_error("EBADF", syscall, Path::new("")))?;
-    body(file).map_err(|error| io_failure(&error, syscall, Path::new("")))
+    if let Some(file) = descriptors.files.get_mut(&fd) {
+        return body(file).map_err(|error| io_failure(&error, syscall, Path::new("")));
+    }
+    // The three descriptors a program starts with were opened by whoever
+    // launched it, so they are never in this table and never this table's to
+    // close: a program reading its own redirected input is reading a file it
+    // did not open.
+    if !(0..3).contains(&fd) {
+        return Err(coded_error("EBADF", syscall, Path::new("")));
+    }
+    // SAFETY: the descriptor is one of the program's own standard streams,
+    // open for as long as the program is; `ManuallyDrop` is what keeps this
+    // borrow from closing it.
+    let mut standard = std::mem::ManuallyDrop::new(unsafe {
+        <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    });
+    body(&mut standard).map_err(|error| io_failure(&error, syscall, Path::new("")))
 }
 
 /// The buffer and byte offset behind any byte view a caller may hand the

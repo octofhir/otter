@@ -234,7 +234,7 @@ pub(crate) fn install_global(
                 }
                 let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
                 scope.set(process, "hrtime", hrtime)?;
-                install_stdio_streams(&mut scope, process)?;
+                install_stdio_streams(&mut scope, process, cjs)?;
                 define_process_method(
                     &mut scope,
                     process,
@@ -445,40 +445,96 @@ fn umask_invalid_value(ctx: &mut NativeCtx<'_>, value: Value) -> NativeError {
     }
 }
 
-/// Install `process.stdout` / `process.stderr` / `process.stdin` as minimal
-/// stream-like objects. Many tests gate on `process.stdout.isTTY` (reading a
-/// property off `undefined` otherwise throws) and write through
-/// `process.stdout.write`; the EventEmitter-style methods are no-ops that
-/// return the stream for chaining.
+/// Install `process.stdout` / `process.stderr` as minimal stream-like objects.
+/// Many tests gate on `process.stdout.isTTY` (reading a property off
+/// `undefined` otherwise throws) and write through `process.stdout.write`; the
+/// EventEmitter-style methods are no-ops that return the stream for chaining.
 fn install_stdio_streams(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), NativeError> {
-    install_one_stdio(
-        scope,
+    install_one_stdio(scope, process, "stdout", 1, NativeCall::Static(stdout_write))?;
+    install_one_stdio(scope, process, "stderr", 2, NativeCall::Static(stderr_write))?;
+    install_stdin(scope, process, cjs)
+}
+
+/// Where the program's standard input lives once it has been opened.
+const STDIN_SLOT: &str = "__otterStdin";
+
+/// Install `process.stdin` as the stream the descriptor deserves.
+///
+/// What standard input is — a terminal, a pipe, a redirected file — decides
+/// which stream stands for it, and the streams themselves belong to the module
+/// that owns them. Opening one costs a handle and a hold on the run loop, so
+/// the first look is what builds it: a program that never reads its input pays
+/// nothing for having one.
+fn install_stdin(
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
+) -> Result<(), NativeError> {
+    let undefined = scope.undefined();
+    scope.define(
         process,
-        "stdout",
-        1,
-        false,
-        NativeCall::Static(stdout_write),
+        STDIN_SLOT,
+        undefined,
+        Attr {
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
     )?;
-    install_one_stdio(
-        scope,
-        process,
-        "stderr",
-        2,
-        false,
-        NativeCall::Static(stderr_write),
-    )?;
-    install_one_stdio(
-        scope,
-        process,
+    let cfg = cjs.clone();
+    let getter = scope.native_closure(
         "stdin",
         0,
-        true,
-        NativeCall::Static(stdio_return_this),
+        &[],
+        move |ctx: &mut NativeCtx<'_>, _args: &[Value], _captures: &[Value]| {
+            let this_value = *ctx.this_value();
+            ctx.scope(|mut scope| {
+                let process = scope.value(this_value);
+                let opened = scope.get(process, STDIN_SLOT)?;
+                if !scope.is_undefined(opened) {
+                    return Ok(scope.finish(opened));
+                }
+                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?;
+                let make = scope.get(stdio, "makeStdin")?;
+                let undefined = scope.undefined();
+                let stream = scope.call(make, undefined, &[])?;
+                scope.set(process, STDIN_SLOT, stream)?;
+                Ok(scope.finish(stream))
+            })
+        },
     )?;
-    Ok(())
+    let setter = scope.native_call("stdin", 1, NativeCall::Static(stdin_setter))?;
+    scope.define_accessor(
+        process,
+        "stdin",
+        getter,
+        setter,
+        otter_vm::object::PropertyFlags::new(true, true, false),
+    )
+}
+
+/// The module that owns the streams a descriptor can become.
+const STDIO_MODULE: &str = "internal/otter/stdio";
+
+/// A program that puts its own stream in place of standard input is answered
+/// with that stream from then on.
+fn stdin_setter(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let stream = args.first().copied().unwrap_or_else(Value::undefined);
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let stream = scope.value(stream);
+        scope.set(process, STDIN_SLOT, stream)?;
+        Ok(Value::undefined())
+    })
 }
 
 fn install_one_stdio(
@@ -486,15 +542,14 @@ fn install_one_stdio(
     process: Local<'_>,
     name: &'static str,
     fd: i32,
-    readable: bool,
     write_call: NativeCall,
 ) -> Result<(), NativeError> {
     let stream = scope.bare_object()?;
     for (key, value) in [
         ("isTTY", scope.boolean(false)),
         ("fd", scope.number(f64::from(fd))),
-        ("writable", scope.boolean(!readable)),
-        ("readable", scope.boolean(readable)),
+        ("writable", scope.boolean(true)),
+        ("readable", scope.boolean(false)),
         ("columns", scope.number(80.0)),
         ("rows", scope.number(24.0)),
     ] {

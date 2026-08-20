@@ -80,6 +80,7 @@ fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
              signal: 'SIGUSR2',\n\
            };\n\
          }\n",
+        include_str!("process_stdio_global.js"),
         include_str!("node_timers_global.js"),
     )))
 }

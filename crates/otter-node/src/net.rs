@@ -121,6 +121,10 @@ impl ReadGate {
 enum NetSocket {
     Tcp(Arc<tokio::net::TcpStream>),
     Unix(Arc<tokio::net::UnixStream>),
+    /// Anything else the kernel will poll: a pipe, a terminal, a descriptor
+    /// that arrived from elsewhere. The bytes move the same way a socket's do,
+    /// so the same reader, writer, and gate drive it.
+    Pollable(Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>),
 }
 
 impl NetSocket {
@@ -128,6 +132,14 @@ impl NetSocket {
         match self {
             Self::Tcp(stream) => stream.readable().await,
             Self::Unix(stream) => stream.readable().await,
+            // Readiness is dropped before the read rather than after it: a
+            // descriptor that says it is ready and then gives nothing must
+            // send the reader back to the poller instead of round the loop.
+            Self::Pollable(fd) => {
+                let mut ready = fd.readable().await?;
+                ready.clear_ready();
+                Ok(())
+            }
         }
     }
 
@@ -135,6 +147,8 @@ impl NetSocket {
         match self {
             Self::Tcp(stream) => stream.try_read(buffer),
             Self::Unix(stream) => stream.try_read(buffer),
+            Self::Pollable(fd) => nix::unistd::read(fd.get_ref(), buffer)
+                .map_err(|error| std::io::Error::from_raw_os_error(error as i32)),
         }
     }
 
@@ -142,6 +156,11 @@ impl NetSocket {
         match self {
             Self::Tcp(stream) => stream.writable().await,
             Self::Unix(stream) => stream.writable().await,
+            Self::Pollable(fd) => {
+                let mut ready = fd.writable().await?;
+                ready.clear_ready();
+                Ok(())
+            }
         }
     }
 
@@ -149,6 +168,8 @@ impl NetSocket {
         match self {
             Self::Tcp(stream) => stream.try_write(bytes),
             Self::Unix(stream) => stream.try_write(bytes),
+            Self::Pollable(fd) => nix::unistd::write(fd.get_ref(), bytes)
+                .map_err(|error| std::io::Error::from_raw_os_error(error as i32)),
         }
     }
 
@@ -156,22 +177,23 @@ impl NetSocket {
         match self {
             Self::Tcp(stream) => stream.local_addr().ok(),
             // Unix sockets have no IP address; `socket.address()` answers
-            // `{}` for them, exactly as Node's does.
-            Self::Unix(_) => None,
+            // `{}` for them, exactly as Node's does. Nor has a pipe or a
+            // terminal.
+            Self::Unix(_) | Self::Pollable(_) => None,
         }
     }
 
     fn set_nodelay(&self, flag: bool) -> std::io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.set_nodelay(flag),
-            Self::Unix(_) => Ok(()),
+            Self::Unix(_) | Self::Pollable(_) => Ok(()),
         }
     }
 
     fn set_ttl(&self, ttl: u32) -> std::io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.set_ttl(ttl),
-            Self::Unix(_) => Ok(()),
+            Self::Unix(_) | Self::Pollable(_) => Ok(()),
         }
     }
 
@@ -205,6 +227,7 @@ impl NetSocket {
         match self {
             Self::Tcp(stream) => stream.as_raw_fd(),
             Self::Unix(stream) => stream.as_raw_fd(),
+            Self::Pollable(fd) => fd.get_ref().as_raw_fd(),
         }
     }
 }
@@ -727,6 +750,71 @@ fn build_native<'scope>(
         },
     )?;
     scope.set(object, "adoptListenerFd", adopt_listener)?;
+
+    // Take over a descriptor the program already has — its own standard
+    // streams, or one it was handed — and carry it the way a connection is
+    // carried. What the kernel will poll can be read and written on the loop;
+    // a regular file cannot, and is read through the file system instead.
+    let open_table = table.clone();
+    let open_ids = next_id.clone();
+    let open_spawner = spawner.clone();
+    let open_fd = scope.native_closure(
+        "openFd",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            let Some(spawner) = open_spawner.as_ref() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let Some(io) = spawner.io_handle() else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let Some(owned) = private_description(raw) else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let registered = {
+                let _guard = io.enter();
+                tokio::io::unix::AsyncFd::new(owned)
+            };
+            let Ok(registered) = registered else {
+                return Ok(RuntimeValue::number_i32(-1));
+            };
+            let id = {
+                let _guard = io.enter();
+                adopt(
+                    NetSocket::Pollable(Arc::new(registered)),
+                    None,
+                    &open_table,
+                    &open_ids,
+                    spawner,
+                )
+            };
+            Ok(RuntimeValue::number_i32(id as i32))
+        },
+    )?;
+    scope.set(object, "openFd", open_fd)?;
+
+    // What a descriptor is. A handle is built from what the kernel says the
+    // descriptor is, so a program reading a redirected file and one reading a
+    // terminal each get the stream that suits it. The answer is the kind's
+    // place in the list the platform layer names them by.
+    let handle_type = scope.native_closure(
+        "guessHandleType",
+        1,
+        &[],
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            let raw = args
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(-1.0) as std::os::fd::RawFd;
+            Ok(RuntimeValue::number_i32(describe_descriptor(raw)))
+        },
+    )?;
+    scope.set(object, "guessHandleType", handle_type)?;
 
     // A descriptor that arrived over a channel says what it is: the kernel
     // knows whether it carries a stream or datagrams, so the receiver does
@@ -1681,6 +1769,124 @@ async fn write_all(stream: &NetSocket, bytes: &[u8]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A descriptor this process can put in non-blocking mode without speaking for
+/// anyone else.
+///
+/// The blocking flag belongs to the open file description, not to the
+/// descriptor, so switching a terminal shared with the shell that started this
+/// program would switch it for the shell too. A terminal is therefore opened
+/// again by name, which is a description of its own; everything else is
+/// already this process's to set.
+fn private_description(raw: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor is open for the duration of this call and only
+    // queried here; ownership is taken below, from a duplicate or from the
+    // caller's own handover.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+    if nix::unistd::isatty(borrowed).unwrap_or(false)
+        && let Some(path) = terminal_name(borrowed.as_raw_fd())
+        && let Ok(reopened) = nix::fcntl::open(
+            path.as_path(),
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )
+    {
+        return Some(reopened);
+    }
+    if !set_nonblocking(borrowed) {
+        return None;
+    }
+    // SAFETY: the caller hands the descriptor over with this call; nothing
+    // else in this process keeps a name for it.
+    Some(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The path a terminal answers to, so it can be opened again as a description
+/// of this process's own.
+fn terminal_name(raw: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
+    let mut name = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: the buffer is this call's own and its true length is passed;
+    // the descriptor is open for the duration of the call.
+    let answered = unsafe { libc::ttyname_r(raw, name.as_mut_ptr().cast(), name.len()) };
+    if answered != 0 {
+        return None;
+    }
+    let end = name.iter().position(|byte| *byte == 0)?;
+    let text = std::str::from_utf8(&name[..end]).ok()?;
+    Some(std::path::PathBuf::from(text))
+}
+
+/// Put a descriptor in non-blocking mode.
+fn set_nonblocking(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) else {
+        return false;
+    };
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).is_ok()
+}
+
+/// What the kernel says a descriptor is, as its place in the list the platform
+/// layer names handle kinds by: TCP, TTY, UDP, FILE, PIPE, UNKNOWN.
+fn describe_descriptor(raw: std::os::fd::RawFd) -> i32 {
+    use nix::sys::socket::SockaddrLike;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    const TCP: i32 = 0;
+    const TTY: i32 = 1;
+    const UDP: i32 = 2;
+    const FILE: i32 = 3;
+    const PIPE: i32 = 4;
+    const UNKNOWN: i32 = 5;
+
+    if raw < 0 {
+        return UNKNOWN;
+    }
+    // SAFETY: the descriptor is open for the duration of this call and is only
+    // asked about — never closed, duplicated, or read.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+    if nix::unistd::isatty(borrowed).unwrap_or(false) {
+        return TTY;
+    }
+    let Ok(stat) = nix::sys::stat::fstat(borrowed) else {
+        return UNKNOWN;
+    };
+    // The kind lives in one field of the mode, not in loose bits: a socket's
+    // mode has a regular file's bits inside it, so the field is masked out
+    // before it is compared.
+    let kind = nix::sys::stat::SFlag::from_bits_truncate(
+        stat.st_mode & nix::sys::stat::SFlag::S_IFMT.bits(),
+    );
+    match kind {
+        nix::sys::stat::SFlag::S_IFIFO => return PIPE,
+        // A character device that is not a terminal — `/dev/null` is the one
+        // every program meets — is read and written like a file.
+        nix::sys::stat::SFlag::S_IFREG
+        | nix::sys::stat::SFlag::S_IFCHR
+        | nix::sys::stat::SFlag::S_IFBLK => return FILE,
+        nix::sys::stat::SFlag::S_IFSOCK => {}
+        _ => return UNKNOWN,
+    }
+    match nix::sys::socket::getsockopt(&borrowed, nix::sys::socket::sockopt::SockType) {
+        // A Unix-domain connection is what Node calls a pipe; only an
+        // internet socket is a TCP handle.
+        Ok(nix::sys::socket::SockType::Stream) => {
+            match nix::sys::socket::getsockname::<nix::sys::socket::SockaddrStorage>(
+                borrowed.as_raw_fd(),
+            ) {
+                Ok(name) if name.family() == Some(nix::sys::socket::AddressFamily::Unix) => PIPE,
+                Ok(_) => TCP,
+                Err(_) => PIPE,
+            }
+        }
+        Ok(nix::sys::socket::SockType::Datagram) => UDP,
+        _ => UNKNOWN,
+    }
 }
 
 fn shutdown_write(stream: &NetSocket) {

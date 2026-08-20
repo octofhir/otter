@@ -193,6 +193,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/otter/zlib_handle", nodelib::internal_zlib_handle),
     HostedModule::cjs_only("internal/otter/fs_binding", nodelib::internal_fs_binding),
     HostedModule::cjs_only("internal/otter/fs_dir", nodelib::internal_fs_dir),
+    HostedModule::cjs_only("internal/otter/stdio", nodelib::internal_otter_stdio),
     HostedModule::cjs_only(
         "internal/otter/fs_event_wrap",
         nodelib::internal_fs_event_wrap,

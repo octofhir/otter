@@ -25,6 +25,7 @@
 pub mod assert;
 pub mod async_hooks;
 mod buffer;
+mod buffer_decode;
 pub mod child_process;
 pub mod crypto;
 pub mod dgram;
@@ -273,6 +274,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("node:child_process", child_process::child_process_cjs_value),
     HostedModule::cjs_only("child_process", child_process::child_process_cjs_value),
     HostedModule::cjs_only("__cpnative", child_process::child_process_native_cjs_value),
+    HostedModule::cjs_only("__bufdecode", buffer_decode::decode_native_cjs_value),
     HostedModule::cjs_only("internal/bootstrap/realm", nodelib::bootstrap_realm),
     HostedModule::cjs_only("internal/util", nodelib::internal_util),
     HostedModule::cjs_only("internal/util/types", nodelib::internal_util_types),

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
@@ -761,6 +761,11 @@ fn spawn_sync_raw(
     let opts = args.get(2).copied();
     let cwd = opt_string(ctx, opts, "cwd");
     let input = opt_string(ctx, opts, "input");
+    let argv0 = opt_string(ctx, opts, "argv0");
+    let kill_signal = opt_string(ctx, opts, "killSignal").unwrap_or_else(|| "SIGTERM".to_string());
+    let max_buffer = opt_number(ctx, opts, "maxBuffer").unwrap_or(f64::INFINITY);
+    let timeout_ms = opt_number(ctx, opts, "timeout").unwrap_or(0.0);
+    let stdio = opt_stdio(ctx, opts);
     let env = opt_env(ctx, opts)?;
     if should_propagate_allow_all(ctx, &command, caps) {
         argv.insert(0, "--allow-all".to_string());
@@ -768,6 +773,10 @@ fn spawn_sync_raw(
 
     let mut cmd = Command::new(&command);
     cmd.args(&argv);
+    #[cfg(unix)]
+    if let Some(argv0) = &argv0 {
+        std::os::unix::process::CommandExt::arg0(&mut cmd, argv0);
+    }
     if let Some(dir) = &cwd {
         cmd.current_dir(dir);
     }
@@ -775,13 +784,16 @@ fn spawn_sync_raw(
         cmd.env_clear();
         cmd.envs(env);
     }
+    // A stream the caller did not ask to see is the child's own: `inherit`
+    // hands it this process's, `ignore` hands it nothing, and only `pipe`
+    // is collected and reported back.
     cmd.stdin(if input.is_some() {
         Stdio::piped()
     } else {
-        Stdio::null()
+        stdio[0].to_stdio()
     });
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stdout(stdio[1].to_stdio());
+    cmd.stderr(stdio[2].to_stdio());
 
     let spawn_result = cmd.spawn();
     let mut child = match spawn_result {
@@ -795,22 +807,67 @@ fn spawn_sync_raw(
         let _ = stdin.write_all(&latin1_to_bytes(input));
     }
 
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
+    let cap = if max_buffer.is_finite() && max_buffer >= 0.0 {
+        max_buffer as usize
+    } else {
+        usize::MAX
+    };
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let out_reader = child
+        .stdout
+        .take()
+        .map(|pipe| drain_capped(pipe, cap, overflowed.clone()));
+    let err_reader = child
+        .stderr
+        .take()
+        .map(|pipe| drain_capped(pipe, cap, overflowed.clone()));
+
+    let deadline = if timeout_ms > 0.0 {
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    };
+    let mut failure: Option<&'static str> = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(err) => break Err(err),
+        }
+        // A child that has already written more than the caller will keep is
+        // stopped rather than left running to fill a buffer nobody reads.
+        if failure.is_none() && overflowed.load(Ordering::SeqCst) {
+            failure = Some("ENOBUFS");
+            signal_child(pid, &kill_signal);
+        }
+        if failure.is_none() && deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            failure = Some("ETIMEDOUT");
+            signal_child(pid, &kill_signal);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let status = match status {
+        Ok(status) => status,
         Err(err) => return spawn_error_result(ctx, &command, &err),
     };
+    let stdout = out_reader.map(|reader| reader.join().unwrap_or_default());
+    let stderr = err_reader.map(|reader| reader.join().unwrap_or_default());
 
-    let status_code = output.status.code();
-    let signal = exit_signal(&output.status);
-    let stdout = bytes_to_latin1(&output.stdout);
-    let stderr = bytes_to_latin1(&output.stderr);
+    let status_code = status.code();
+    let signal = exit_signal(&status);
 
     ctx.scope(|mut scope| {
         let object = scope.object()?;
         set_number(&mut scope, object, "pid", f64::from(pid))?;
-        match status_code {
-            Some(code) => set_number(&mut scope, object, "status", f64::from(code))?,
-            None => set_null(&mut scope, object, "status")?,
+        // A child stopped for running past a limit did not choose its exit,
+        // so it reports no status — only the signal that stopped it.
+        if failure.is_some() {
+            set_null(&mut scope, object, "status")?;
+        } else {
+            match status_code {
+                Some(code) => set_number(&mut scope, object, "status", f64::from(code))?,
+                None => set_null(&mut scope, object, "status")?,
+            }
         }
         match signal {
             Some(signal) => {
@@ -819,13 +876,128 @@ fn spawn_sync_raw(
             }
             None => set_null(&mut scope, object, "signal")?,
         }
-        let stdout = scope.string(&stdout)?;
-        scope.set(object, "stdout", stdout)?;
-        let stderr = scope.string(&stderr)?;
-        scope.set(object, "stderr", stderr)?;
-        set_null(&mut scope, object, "error")?;
+        // Output crosses as bytes rather than as text: a synchronous run can
+        // hand back megabytes, and a character-per-byte detour through a
+        // string would cost several times what the bytes themselves do.
+        for (key, bytes) in [("stdout", stdout), ("stderr", stderr)] {
+            match bytes {
+                Some(bytes) => {
+                    let length = bytes.len();
+                    let buffer = scope.array_buffer_from_bytes(bytes)?;
+                    let view = scope.typed_array_view(
+                        buffer,
+                        otter_vm::binary::TypedArrayKind::Uint8,
+                        0,
+                        length,
+                    )?;
+                    scope.set(object, key, view)?;
+                }
+                None => set_null(&mut scope, object, key)?,
+            }
+        }
+        match failure {
+            Some(code) => {
+                let message = scope.string(code)?;
+                scope.set(object, "error", message)?;
+                let code = scope.string(code)?;
+                scope.set(object, "errorCode", code)?;
+            }
+            None => set_null(&mut scope, object, "error")?,
+        }
         Ok(scope.finish(object))
     })
+}
+
+/// What a child's stream is wired to.
+#[derive(Clone, Copy)]
+enum SyncStdio {
+    Pipe,
+    Inherit,
+    Ignore,
+}
+
+impl SyncStdio {
+    fn to_stdio(self) -> Stdio {
+        match self {
+            Self::Pipe => Stdio::piped(),
+            Self::Inherit => Stdio::inherit(),
+            Self::Ignore => Stdio::null(),
+        }
+    }
+}
+
+/// Read a pipe until it ends or the caller's limit is passed.
+///
+/// A read is kept whole: the limit is what the caller agreed to hold, and it
+/// is noticed after the read that crosses it rather than by cutting that read
+/// in half.
+fn drain_capped(
+    mut pipe: impl std::io::Read + Send + 'static,
+    cap: usize,
+    overflowed: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut kept: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 65_536];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    kept.extend_from_slice(&chunk[..read]);
+                    if kept.len() > cap {
+                        overflowed.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        }
+        kept
+    })
+}
+
+#[cfg(unix)]
+fn signal_child(pid: u32, signal: &str) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    let number = signal_number(signal);
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::try_from(number).ok(),
+    );
+}
+
+#[cfg(not(unix))]
+fn signal_child(_pid: u32, _signal: &str) {}
+
+/// How a child's three streams were asked for, defaulting to pipes.
+fn opt_stdio(ctx: &mut NativeCtx<'_>, opts: Option<Value>) -> [SyncStdio; 3] {
+    let mut wired = [SyncStdio::Pipe; 3];
+    let Some(object) = opts.and_then(Value::as_object) else {
+        return wired;
+    };
+    let Some(stdio) = object::get(object, ctx.heap(), "stdio") else {
+        return wired;
+    };
+    let named = |name: &str| match name {
+        "inherit" => SyncStdio::Inherit,
+        "ignore" => SyncStdio::Ignore,
+        _ => SyncStdio::Pipe,
+    };
+    if stdio.is_string() {
+        let all = named(&stdio.display_string(ctx.heap()));
+        return [all; 3];
+    }
+    let entries = read_string_array(ctx, stdio);
+    for (slot, name) in wired.iter_mut().zip(entries.iter()) {
+        *slot = named(name);
+    }
+    wired
+}
+
+fn opt_number(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> Option<f64> {
+    let object = opts?.as_object()?;
+    object::get(object, ctx.heap(), key)?.as_f64()
 }
 
 fn spawn_error_result(
@@ -864,6 +1036,28 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<String> {
 #[cfg(not(unix))]
 fn exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
     None
+}
+
+/// The number a signal name stands for, defaulting to `SIGTERM` for a name
+/// this platform does not know.
+#[cfg(unix)]
+fn signal_number(name: &str) -> i32 {
+    match name {
+        "SIGHUP" => 1,
+        "SIGINT" => 2,
+        "SIGQUIT" => 3,
+        "SIGILL" => 4,
+        "SIGABRT" => 6,
+        "SIGFPE" => 8,
+        "SIGKILL" => 9,
+        "SIGSEGV" => 11,
+        "SIGPIPE" => 13,
+        "SIGALRM" => 14,
+        "SIGUSR1" => 30,
+        "SIGUSR2" => 31,
+        "SIGSTOP" => 17,
+        _ => 15,
+    }
 }
 
 #[cfg(unix)]

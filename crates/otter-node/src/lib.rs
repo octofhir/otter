@@ -309,6 +309,18 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "internal/webstreams/adapters",
         nodelib::internal_webstreams_adapters,
     ),
+    HostedModule::cjs_only(
+        "internal/webstreams/readablestream",
+        nodelib::internal_webstreams_readablestream,
+    ),
+    HostedModule::cjs_only(
+        "internal/webstreams/writablestream",
+        nodelib::internal_webstreams_writablestream,
+    ),
+    HostedModule::cjs_only(
+        "internal/webstreams/queuingstrategies",
+        nodelib::internal_webstreams_queuingstrategies,
+    ),
     HostedModule::cjs_only("internal/event_target", nodelib::internal_event_target),
     HostedModule::cjs_only(
         "internal/v8/startup_snapshot",

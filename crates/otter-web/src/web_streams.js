@@ -48,6 +48,11 @@
     strategy: Symbol('strategy'),
     readRequests: Symbol('readRequests'),
     started: Symbol('started'),
+    // Set when something asked for more while a pull was already in flight.
+    // A source is asked again because the demand arrived, not because the
+    // last answer came back — asking on every answer never stops when the
+    // source has nothing to give.
+    pullAgain: Symbol('pullAgain'),
   };
 
   class ReadableStreamDefaultController {
@@ -82,6 +87,12 @@
   function closeStream(s) {
     s[R.state] = 'closed';
     for (const req of s[R.readRequests].splice(0)) req.resolve({ value: undefined, done: true });
+    // A reader waiting with a view of its own is answered with that view and
+    // nothing in it: an end reaches everyone waiting for a chunk, whichever
+    // way they asked for one.
+    for (const req of pendingByobReads(s)) {
+      req.resolve({ value: sameView(req.view, 0), done: true });
+    }
     if (s[R.reader] && s[R.reader]._closedDeferred) s[R.reader]._closedDeferred.resolve(undefined);
   }
 
@@ -92,11 +103,29 @@
     s[R.queue].length = 0;
     s[R.queueSize] = 0;
     for (const req of s[R.readRequests].splice(0)) req.reject(e);
+    for (const req of pendingByobReads(s)) req.reject(e);
     if (s[R.reader] && s[R.reader]._closedDeferred) s[R.reader]._closedDeferred.reject(e);
   }
 
+  // Take the reads waiting on a byte stream with views of their own.
+  function pendingByobReads(s) {
+    const c = s[R.controller];
+    if (!c || !c[kByobReads]) return [];
+    c[kByobRequest] = null;
+    return c[kByobReads].splice(0);
+  }
+
+  // Whether something asked for more while the source was answering, and
+  // forget that it did.
+  function takeAgain(s) {
+    const again = s[R.pullAgain] === true;
+    s[R.pullAgain] = false;
+    return again;
+  }
+
   function pullIfNeeded(s) {
-    if (!s[R.started] || s[R.state] !== 'readable' || s[R.pullPromise]) return;
+    if (!s[R.started] || s[R.state] !== 'readable') return;
+    if (s[R.pullPromise]) { s[R.pullAgain] = true; return; }
     const desired = s[R.hwm] - s[R.queueSize];
     if (desired <= 0 && s[R.readRequests].length === 0) return;
     const source = s[R.source];
@@ -104,7 +133,7 @@
     let result;
     try { result = source.pull(s[R.controller]); } catch (err) { errorStream(s, err); return; }
     s[R.pullPromise] = Promise.resolve(result).then(
-      () => { s[R.pullPromise] = null; pullIfNeeded(s); },
+      () => { s[R.pullPromise] = null; if (takeAgain(s)) pullIfNeeded(s); },
       (err) => { s[R.pullPromise] = null; errorStream(s, err); });
   }
 
@@ -186,7 +215,8 @@
     return new Ctor(view.buffer, view.byteOffset, Math.floor(length / elemBytes));
   }
   function pullByte(s) {
-    if (!s[R.started] || s[R.state] !== 'readable' || s[R.pullPromise]) return;
+    if (!s[R.started] || s[R.state] !== 'readable') return;
+    if (s[R.pullPromise]) { s[R.pullAgain] = true; return; }
     const c = s[R.controller];
     const wants = s[R.readRequests].length > 0 || c[kByobReads].length > 0
       || s[R.hwm] - c[kByteQueueSize] > 0;
@@ -196,7 +226,7 @@
     let result;
     try { result = source.pull(c); } catch (err) { errorStream(s, err); return; }
     s[R.pullPromise] = Promise.resolve(result).then(
-      () => { s[R.pullPromise] = null; pullByte(s); },
+      () => { s[R.pullPromise] = null; if (takeAgain(s)) pullByte(s); },
       (err) => { s[R.pullPromise] = null; errorStream(s, err); });
   }
 

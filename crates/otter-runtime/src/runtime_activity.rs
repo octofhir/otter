@@ -50,12 +50,31 @@ pub trait RuntimeTask: Send + 'static {
     fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError>;
 }
 
+/// Why an offered task was not taken.
+pub(crate) enum TaskNotTaken {
+    /// The isolate inbox has no room; the task comes back to be offered again.
+    Full(Box<dyn RuntimeTask>),
+    /// The isolate is gone and will never run the task.
+    Gone,
+}
+
 pub(crate) trait RuntimeTaskQueue: Send + Sync + 'static {
     fn enqueue_boxed(
         &self,
         task: Box<dyn RuntimeTask>,
         liveness: RuntimeLiveness,
     ) -> Result<(), OtterError>;
+
+    /// Offer one task, handing it back when the inbox is full.
+    ///
+    /// A producer that may neither drop nor reorder its events waits for room
+    /// and offers the same task again, keeping ownership of whatever the task
+    /// carries in the meantime.
+    fn offer_boxed(
+        &self,
+        task: Box<dyn RuntimeTask>,
+        liveness: RuntimeLiveness,
+    ) -> Result<(), TaskNotTaken>;
 
     /// Enqueue engine-owned completion work without dropping it under
     /// backpressure. Implementations must retry asynchronously or cancel it
@@ -125,6 +144,30 @@ impl RuntimeTaskSpawner {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
                 Err(_) => return false,
+            }
+        }
+    }
+
+    /// Deliver one task without dropping or reordering it, whatever it holds.
+    ///
+    /// [`Self::enqueue_ordered`] retries by cloning, which a task carrying
+    /// descriptors cannot do — a clone would duplicate ownership of them. This
+    /// one keeps the single task and offers it again once there is room.
+    /// Answers `false` when the isolate is gone and the producer should stop.
+    pub(crate) async fn enqueue_ordered_owned(
+        &self,
+        task: impl RuntimeTask,
+        liveness: RuntimeLiveness,
+    ) -> bool {
+        let mut task: Box<dyn RuntimeTask> = Box::new(task);
+        loop {
+            match self.queue.offer_boxed(task, liveness) {
+                Ok(()) => return true,
+                Err(TaskNotTaken::Gone) => return false,
+                Err(TaskNotTaken::Full(returned)) => {
+                    task = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
             }
         }
     }

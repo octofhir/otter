@@ -6,6 +6,11 @@
 // rest are bookkeeping and formatting expressed in terms of those, so they live
 // here rather than in the intrinsic.
 (function installConsoleExtras(globalThis) {
+  // A console another layer owns answers from an accessor, and reading it
+  // would build it — during bootstrap, before anything asks for one. That
+  // console brings its own bookkeeping, so there is nothing here to add.
+  const owned = Object.getOwnPropertyDescriptor(globalThis, 'console');
+  if (owned === undefined || owned.get !== undefined) return;
   const console = globalThis.console;
   if (!console || typeof console.log !== 'function') return;
 

@@ -60,4 +60,44 @@ function makeStdin() {
   return stdin;
 }
 
-module.exports = { makeStdin };
+// The program's own output, as a stream rather than a bare write.
+//
+// What reaches the descriptor is still the host's write, which returns only
+// once the bytes are gone — a program that exits right after printing must
+// find its output already there, and an asynchronous stream over the same
+// descriptor could not promise that. What the stream adds is the shape
+// everything else expects of `process.stdout`: it is an `EventEmitter`, it
+// can be piped to and written through, and it says whether it is a terminal.
+function makeStdout(fd, write) {
+  const { Writable } = require('stream');
+  const stream = new Writable({
+    decodeStrings: false,
+    write(chunk, encoding, callback) {
+      try {
+        write(typeof chunk === 'string' ? chunk : chunk.toString(encoding === 'buffer' ? undefined : encoding));
+      } catch (error) {
+        callback(error);
+        return;
+      }
+      callback();
+    },
+  });
+  stream.fd = fd;
+  const isTTY = guessHandleType(fd) === 'TTY';
+  stream.isTTY = isTTY;
+  if (isTTY) {
+    const { WriteStream } = require('tty');
+    stream.getColorDepth = WriteStream.prototype.getColorDepth;
+    stream.hasColors = WriteStream.prototype.hasColors;
+    stream.columns = 80;
+    stream.rows = 24;
+  }
+  // Standard output belongs to the process, not to this stream: ending it
+  // would take the program's own output away from anything else writing to
+  // the same descriptor.
+  stream.end = function endStdout() { return this; };
+  stream.destroy = function destroyStdout() { return this; };
+  return stream;
+}
+
+module.exports = { makeStdin, makeStdout };

@@ -445,18 +445,90 @@ fn umask_invalid_value(ctx: &mut NativeCtx<'_>, value: Value) -> NativeError {
     }
 }
 
-/// Install `process.stdout` / `process.stderr` as minimal stream-like objects.
-/// Many tests gate on `process.stdout.isTTY` (reading a property off
-/// `undefined` otherwise throws) and write through `process.stdout.write`; the
-/// EventEmitter-style methods are no-ops that return the stream for chaining.
+/// Install `process.stdout` / `process.stderr` as the streams they are.
+///
+/// Both are built the first time the program looks, so a program that never
+/// prints pays nothing for being able to. What reaches the descriptor is the
+/// host's own write either way; the stream is what everything else expects of
+/// standard output — an `EventEmitter` that can be piped to and asked whether
+/// it is a terminal.
 fn install_stdio_streams(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
     cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), NativeError> {
-    install_one_stdio(scope, process, "stdout", 1, NativeCall::Static(stdout_write))?;
-    install_one_stdio(scope, process, "stderr", 2, NativeCall::Static(stderr_write))?;
+    install_one_stdio(
+        scope,
+        process,
+        "stdout",
+        "__otterStdout",
+        1,
+        stdout_write,
+        cjs,
+    )?;
+    install_one_stdio(
+        scope,
+        process,
+        "stderr",
+        "__otterStderr",
+        2,
+        stderr_write,
+        cjs,
+    )?;
+    install_get_builtin_module(scope, process, cjs)?;
     install_stdin(scope, process, cjs)
+}
+
+/// Install `process.getBuiltinModule`, the way a program asks the runtime for
+/// one of its own modules without a `require` in scope.
+///
+/// It answers the same instance `require` would: the load goes through the
+/// realm's one module cache, so a builtin is never built twice.
+fn install_get_builtin_module(
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
+) -> Result<(), NativeError> {
+    let cfg = cjs.clone();
+    let function = scope.native_closure(
+        "getBuiltinModule",
+        1,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            let id = args.first().copied().unwrap_or_else(Value::undefined);
+            if !id.is_string() {
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::TypeError,
+                    code: "ERR_INVALID_ARG_TYPE",
+                    message: format!(
+                        "The \"id\" argument must be of type string.{}",
+                        crate::process_control::received_suffix(ctx, id)
+                    ),
+                });
+            }
+            let name = id.display_string(ctx.heap());
+            ctx.scope(|mut scope| {
+                // A name the runtime does not own is not an error; it is simply
+                // not a builtin, which is what `undefined` says.
+                let Ok(module) = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, &name) else {
+                    let undefined = scope.undefined();
+                    return Ok(scope.finish(undefined));
+                };
+                Ok(scope.finish(module))
+            })
+        },
+    )?;
+    scope.define(
+        process,
+        "getBuiltinModule",
+        function,
+        Attr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+        .to_flags(),
+    )
 }
 
 /// Where the program's standard input lives once it has been opened.
@@ -537,52 +609,77 @@ fn stdin_setter(
     })
 }
 
+/// One standard output stream, built the first time it is looked at.
+///
+/// A program may put its own stream in place of this one, and is answered with
+/// that stream from then on — which is how a test captures what it prints.
 fn install_one_stdio(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
     name: &'static str,
+    slot: &'static str,
     fd: i32,
-    write_call: NativeCall,
+    write_call: fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), NativeError> {
-    let stream = scope.bare_object()?;
-    for (key, value) in [
-        ("isTTY", scope.boolean(false)),
-        ("fd", scope.number(f64::from(fd))),
-        ("writable", scope.boolean(true)),
-        ("readable", scope.boolean(false)),
-        ("columns", scope.number(80.0)),
-        ("rows", scope.number(24.0)),
-    ] {
-        scope.set(stream, key, value)?;
-    }
-
-    define_method_on(scope, stream, "write", 1, write_call)?;
-    for method in [
-        "end",
-        "cork",
-        "uncork",
-        "destroy",
-        "on",
-        "once",
-        "addListener",
-        "removeListener",
-        "removeAllListeners",
-        "emit",
-        "setEncoding",
-        "pause",
-        "resume",
-        "ref",
-        "unref",
-    ] {
-        define_method_on(
-            scope,
-            stream,
-            method,
-            0,
-            NativeCall::Static(stdio_return_this),
-        )?;
-    }
-    scope.set(process, name, stream)
+    let undefined = scope.undefined();
+    scope.define(
+        process,
+        slot,
+        undefined,
+        Attr {
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
+    )?;
+    let cfg = cjs.clone();
+    let getter = scope.native_closure(
+        name,
+        0,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, _args: &[Value], _captures: &[Value]| {
+            let this_value = *ctx.this_value();
+            ctx.scope(|mut scope| {
+                let process = scope.value(this_value);
+                let opened = scope.get(process, slot)?;
+                if !scope.is_undefined(opened) {
+                    return Ok(scope.finish(opened));
+                }
+                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?;
+                let make = scope.get(stdio, "makeStdout")?;
+                let undefined = scope.undefined();
+                let fd = scope.number(f64::from(fd));
+                let write = scope.native_call(name, 1, NativeCall::Static(write_call))?;
+                let stream = scope.call(make, undefined, &[fd, write])?;
+                scope.set(process, slot, stream)?;
+                Ok(scope.finish(stream))
+            })
+        },
+    )?;
+    let setter = scope.native_closure(
+        name,
+        1,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            let stream = args.first().copied().unwrap_or_else(Value::undefined);
+            let this_value = *ctx.this_value();
+            ctx.scope(|mut scope| {
+                let process = scope.value(this_value);
+                let stream = scope.value(stream);
+                scope.set(process, slot, stream)?;
+                Ok(Value::undefined())
+            })
+        },
+    )?;
+    scope.define_accessor(
+        process,
+        name,
+        getter,
+        setter,
+        otter_vm::object::PropertyFlags::new(true, true, false),
+    )
 }
 
 fn define_method_on(
@@ -620,14 +717,6 @@ fn stderr_write(
     Ok(Value::boolean(true))
 }
 
-/// No-op stream method that returns the receiver, so `stream.on(...).on(...)`
-/// and similar chains do not break.
-fn stdio_return_this(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[otter_vm::Value],
-) -> Result<otter_vm::Value, NativeError> {
-    Ok(*ctx.this_value())
-}
 
 pub(crate) fn define_process_method(
     scope: &mut NativeScope<'_, '_>,

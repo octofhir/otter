@@ -108,9 +108,15 @@ impl ReadGate {
     /// Resolve once reading is allowed. The waiter is registered before the
     /// flag is re-read, so a `set(true)` racing this call cannot be missed.
     ///
+    /// Registering is what `enable` does — building the future does not.
+    /// `notify_waiters` wakes whoever is registered and leaves nothing behind
+    /// for whoever is not, so without it a resume landing between the flag
+    /// read and the wait is lost and the socket never reads again.
     async fn flowing(&self) {
         loop {
             let resumed = self.resumed.notified();
+            tokio::pin!(resumed);
+            resumed.as_mut().enable();
             if self.flowing.load(Ordering::SeqCst) {
                 return;
             }
@@ -127,6 +133,8 @@ impl ReadGate {
     async fn stopped(&self) {
         loop {
             let stopped = self.stopped.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
             if !self.flowing.load(Ordering::SeqCst) {
                 return;
             }

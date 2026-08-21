@@ -107,6 +107,7 @@ impl ReadGate {
 
     /// Resolve once reading is allowed. The waiter is registered before the
     /// flag is re-read, so a `set(true)` racing this call cannot be missed.
+    ///
     async fn flowing(&self) {
         loop {
             let resumed = self.resumed.notified();
@@ -707,17 +708,16 @@ fn build_native<'scope>(
             // the host runtime in scope the way `from_std` did.
             let id = {
                 let _guard = io.enter();
+                // Nothing is pulled off a descriptor that arrived until the
+                // program that asked for it says so, so its gate stays shut.
                 adopt(
                     NetSocket::Tcp(Arc::new(stream)),
                     remote,
                     &adopt_table,
                     &adopt_ids,
                     spawner,
-                    // Nothing is pulled off a descriptor that arrived until
-                    // the program that asked for it has a handle to hear
-                    // about it: bytes read before then are read for nobody.
-                    false,
                 )
+                .0
             };
             Ok(RuntimeValue::number_i32(id as i32))
         },
@@ -815,8 +815,8 @@ fn build_native<'scope>(
                     &open_table,
                     &open_ids,
                     spawner,
-                    false,
                 )
+                .0
             };
             Ok(RuntimeValue::number_i32(id as i32))
         },
@@ -1030,13 +1030,12 @@ fn serve_tcp_listener(
             let Ok((stream, remote)) = accepted else {
                 return;
             };
-            let connection = adopt(
+            let (connection, read_gate) = adopt(
                 NetSocket::Tcp(Arc::new(stream)),
                 Some(remote),
                 &accept_table,
                 &accept_ids,
                 &accept_spawner,
-                true,
             );
             if !enqueue_ordered(
                 &accept_spawner,
@@ -1051,6 +1050,8 @@ fn serve_tcp_listener(
             {
                 return;
             }
+            // The owner has been told; what arrives now has somewhere to go.
+            read_gate.set(true);
         }
     });
     id
@@ -1058,25 +1059,27 @@ fn serve_tcp_listener(
 
 /// Take ownership of a connected stream and start carrying it.
 ///
-/// `reading` says whether bytes may be pulled before the handle asks. A
-/// connection this process dialled or accepted is read at once; a descriptor
-/// the program handed over is not, because only the program knows whether it
-/// is something to read at all.
+/// Nothing is pulled off the stream until the returned gate is opened. Bytes
+/// read before the owner has been told the connection exists are read for
+/// nobody: the handle they belong to is not registered yet, so the `data` and
+/// `end` that carry them arrive addressed to no one and a socket that already
+/// reached its end never reports it. A caller that announces the connection
+/// opens the gate once the announcement has been accepted; a descriptor the
+/// program handed over stays shut until the program asks for it.
 fn adopt(
     stream: NetSocket,
     remote: Option<std::net::SocketAddr>,
     table: &Table,
     next_id: &Arc<AtomicU32>,
     spawner: &RuntimeTaskSpawner,
-    reading: bool,
-) -> u32 {
+) -> (u32, Arc<ReadGate>) {
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let local = stream.local_addr();
     let (outgoing, mut queued) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
     let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let abort = Arc::new(tokio::sync::Notify::new());
     let queued_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let read_gate = Arc::new(ReadGate::new(reading));
+    let read_gate = Arc::new(ReadGate::new(false));
     let shared = Arc::new(AtomicBool::new(false));
     table
         .lock()
@@ -1163,12 +1166,13 @@ fn adopt(
 
     let reader_spawner = spawner.clone();
     let reader_table = table.clone();
+    let reader_gate = read_gate.clone();
     tokio::spawn(async move {
         let mut chunk = vec![0u8; 65_536];
         let mut read_error: Option<&'static str> = None;
         loop {
             tokio::select! {
-                () = read_gate.flowing() => {}
+                () = reader_gate.flowing() => {}
                 () = abort.notified() => return,
             }
             let ready = tokio::select! {
@@ -1176,7 +1180,7 @@ fn adopt(
                 // Stopped from the isolate side while waiting: back to the
                 // gate without reading, so the bytes are still there for
                 // whoever the stream now belongs to.
-                () = read_gate.stopped() => continue,
+                () = reader_gate.stopped() => continue,
                 () = abort.notified() => {
                     // Closed or reset from the isolate side: drop the stream
                     // clone without reporting anything — the JS handle is
@@ -1225,7 +1229,7 @@ fn adopt(
         };
         enqueue_ordered(&reader_spawner, event, RuntimeLiveness::Ref).await;
     });
-    id
+    (id, read_gate)
 }
 
 /// Bind a Unix domain socket and deliver each connection as it arrives.
@@ -1302,27 +1306,28 @@ fn listen_unix(
             let Ok((stream, _remote)) = accepted else {
                 return;
             };
-            let connection = adopt(
+            let (connection, read_gate) = adopt(
                 NetSocket::Unix(Arc::new(stream)),
                 None,
                 &accept_table,
                 &accept_ids,
                 &accept_spawner,
-                true,
             );
-            if accept_spawner
-                .enqueue(
-                    NetEvent::Accepted {
-                        server: id,
-                        connection,
-                        remote: None,
-                    },
-                    RuntimeLiveness::Unref,
-                )
-                .is_err()
+            if !enqueue_ordered(
+                &accept_spawner,
+                NetEvent::Accepted {
+                    server: id,
+                    connection,
+                    remote: None,
+                },
+                RuntimeLiveness::Unref,
+            )
+            .await
             {
                 return;
             }
+            // The owner has been told; what arrives now has somewhere to go.
+            read_gate.set(true);
         }
     });
 
@@ -1370,20 +1375,24 @@ fn connect_unix(
         let _attempt = attempt;
         match tokio::net::UnixStream::connect(&path).await {
             Ok(stream) => {
-                let connection = adopt(
+                let (connection, read_gate) = adopt(
                     NetSocket::Unix(Arc::new(stream)),
                     None,
                     &connect_table,
                     &connect_ids,
                     &connect_spawner,
-                    true,
                 );
-                enqueue_ordered(
+                if enqueue_ordered(
                     &connect_spawner,
                     NetEvent::Connected { token, connection },
                     RuntimeLiveness::Unref,
                 )
-                .await;
+                .await
+                {
+                    // The owner has been told; what arrives now has somewhere
+                    // to go.
+                    read_gate.set(true);
+                }
             }
             Err(error) => {
                 let code = io_code(&error);
@@ -1464,20 +1473,24 @@ fn connect(
         };
         match dial(target, local_address.as_deref(), local_port).await {
             Ok(stream) => {
-                let connection = adopt(
+                let (connection, read_gate) = adopt(
                     NetSocket::Tcp(Arc::new(stream)),
                     Some(target),
                     &connect_table,
                     &connect_ids,
                     &connect_spawner,
-                    true,
                 );
-                enqueue_ordered(
+                if enqueue_ordered(
                     &connect_spawner,
                     NetEvent::Connected { token, connection },
                     RuntimeLiveness::Unref,
                 )
-                .await;
+                .await
+                {
+                    // The owner has been told; what arrives now has somewhere
+                    // to go.
+                    read_gate.set(true);
+                }
             }
             Err(error) => {
                 let code = io_code(&error);

@@ -1408,7 +1408,11 @@ fn connect_unix(
                 if enqueue_ordered(
                     &connect_spawner,
                     NetEvent::Connected { token, connection },
-                    RuntimeLiveness::Unref,
+                    // A connection being made is work the program is waiting
+                    // on, so the hold the attempt took lasts until the answer
+                    // has been delivered — not until it has been queued, or
+                    // the loop can go idle with the answer still in hand.
+                    RuntimeLiveness::Ref,
                 )
                 .await
                 {
@@ -1426,7 +1430,7 @@ fn connect_unix(
                         code,
                         message: format!("connect {code} {path}"),
                     },
-                    RuntimeLiveness::Unref,
+                    RuntimeLiveness::Ref,
                 )
                 .await;
             }
@@ -1489,7 +1493,7 @@ fn connect(
                     code: "ENOTFOUND",
                     message: format!("getaddrinfo ENOTFOUND {host}"),
                 },
-                RuntimeLiveness::Unref,
+                RuntimeLiveness::Ref,
             )
             .await;
             return;
@@ -1506,7 +1510,11 @@ fn connect(
                 if enqueue_ordered(
                     &connect_spawner,
                     NetEvent::Connected { token, connection },
-                    RuntimeLiveness::Unref,
+                    // A connection being made is work the program is waiting
+                    // on, so the hold the attempt took lasts until the answer
+                    // has been delivered — not until it has been queued, or
+                    // the loop can go idle with the answer still in hand.
+                    RuntimeLiveness::Ref,
                 )
                 .await
                 {
@@ -1524,7 +1532,7 @@ fn connect(
                         code,
                         message: format!("connect {code} {target}"),
                     },
-                    RuntimeLiveness::Unref,
+                    RuntimeLiveness::Ref,
                 )
                 .await;
             }

@@ -245,7 +245,9 @@ impl IpcChannel {
             let Ok((stream, _)) = joined else {
                 accept_connected.store(false, Ordering::SeqCst);
                 release(&accept_keep_alive);
-                let _ = accept_spawner.enqueue(deliver(IpcEvent::Closed), RuntimeLiveness::Unref);
+                accept_spawner
+                    .enqueue_ordered_owned(deliver(IpcEvent::Closed), RuntimeLiveness::Unref)
+                    .await;
                 return;
             };
             carry(
@@ -473,13 +475,19 @@ async fn carry<T, F>(
             // the thread that reads it, and a program with nothing left to do
             // would keep waiting to be told so.
             if let Some(in_flight) = frame.in_flight.take() {
-                let _ = writer_spawner.enqueue(FrameWritten { in_flight }, RuntimeLiveness::Unref);
+                writer_spawner
+                    .enqueue_ordered_owned(FrameWritten { in_flight }, RuntimeLiveness::Unref)
+                    .await;
             }
             // The message has gone; what it carried belongs to the peer now,
             // and the sender is told so it can let go of its own copy.
             if let Some(token) = frame.sent.take() {
-                let _ = writer_spawner
-                    .enqueue(writer_deliver(IpcEvent::Sent(token)), RuntimeLiveness::Unref);
+                writer_spawner
+                    .enqueue_ordered_owned(
+                        writer_deliver(IpcEvent::Sent(token)),
+                        RuntimeLiveness::Unref,
+                    )
+                    .await;
             }
             if outcome.is_err() {
                 return;
@@ -491,7 +499,9 @@ async fn carry<T, F>(
     // The peer is gone, so this end stops holding the run loop open whether or
     // not the program ever calls `disconnect` itself.
     release(&keep_alive);
-    let _ = spawner.enqueue(deliver(IpcEvent::Closed), RuntimeLiveness::Unref);
+    spawner
+        .enqueue_ordered_owned(deliver(IpcEvent::Closed), RuntimeLiveness::Unref)
+        .await;
 }
 
 /// A frame has left this process; running this on the loop is what lets go of
@@ -555,14 +565,17 @@ async fn read_loop<T, F>(
             }
             consumed = end;
             // A message that cannot be reported is a message nobody will take
-            // the descriptors off, so they are closed here instead.
+            // the descriptors off, so they are closed here instead. Room in
+            // the inbox is worth waiting for — a peer that sends faster than
+            // the program reads must be made to wait, not go unheard — so only
+            // an isolate that is gone ends the loop.
             let carried = handles.clone();
-            if spawner
-                .enqueue(
+            if !spawner
+                .enqueue_ordered_owned(
                     deliver(IpcEvent::Message(payload, handles)),
                     RuntimeLiveness::Unref,
                 )
-                .is_err()
+                .await
             {
                 close_all(carried);
                 break 'reading;

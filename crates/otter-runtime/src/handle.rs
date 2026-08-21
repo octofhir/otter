@@ -48,6 +48,7 @@ use crate::event_loop::{
 };
 use crate::runtime_activity::{
     RuntimeActivityAccounting, RuntimeKeepAlive, RuntimeTask, RuntimeTaskQueue, RuntimeTaskSpawner,
+    TaskNotTaken,
 };
 use crate::{
     DiagnosticCode, DynamicImportBegin, ExecutionAttempt, ExecutionResult, OtterError, Runtime,
@@ -564,6 +565,37 @@ impl RuntimeTaskQueue for InboxRuntimeTaskQueue {
                     code: DiagnosticCode::RuntimeShutdown.as_str().to_string(),
                     message: "runtime isolate is no longer accepting tasks".to_string(),
                 })
+            }
+        }
+    }
+
+    fn offer_boxed(
+        &self,
+        task: Box<dyn RuntimeTask>,
+        liveness: RuntimeLiveness,
+    ) -> Result<(), TaskNotTaken> {
+        if self.counters.shutdown.load(Ordering::Acquire) {
+            return Err(TaskNotTaken::Gone);
+        }
+        self.counters.retain_host_activity(liveness);
+        match self
+            .tx
+            .try_send(RuntimeMessage::RuntimeTask { task, liveness })
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(message)) => {
+                self.counters.cancel_host_activity(liveness);
+                self.counters
+                    .backpressure_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                match message {
+                    RuntimeMessage::RuntimeTask { task, .. } => Err(TaskNotTaken::Full(task)),
+                    _ => unreachable!("the message just built is a RuntimeTask"),
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.cancel_host_activity(liveness);
+                Err(TaskNotTaken::Gone)
             }
         }
     }

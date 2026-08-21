@@ -1254,6 +1254,17 @@ impl<'rt> NativeCtx<'rt> {
         Ok(())
     }
 
+    /// `Object.freeze` an object a native built, so a host surface that is
+    /// constant to the program reads as constant to it.
+    pub fn freeze_object(&mut self, value: Value) -> Result<(), NativeError> {
+        let object = value.as_object().ok_or_else(|| NativeError::TypeError {
+            name: "freeze",
+            reason: "value is not an object".to_string(),
+        })?;
+        object::freeze(object, self.heap_mut());
+        Ok(())
+    }
+
     /// Insert into a `WeakMap` through the native root contract.
     pub fn weak_map_set(
         &mut self,
@@ -2110,6 +2121,12 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     pub fn make_set_readonly(&mut self, set: Local<'_>) -> Result<(), NativeError> {
         let set = self.raw(set);
         self.ctx.make_set_readonly(set)
+    }
+
+    /// `Object.freeze` a rooted object this scope built.
+    pub fn freeze(&mut self, object: Local<'_>) -> Result<(), NativeError> {
+        let object = self.raw(object);
+        self.ctx.freeze_object(object)
     }
 
     /// Allocate a Proxy over rooted `target` and `handler` values.

@@ -143,6 +143,9 @@ pub fn os_cjs_value<'scope>(
             field_scope.set(signals, name, value)
         })?;
     }
+    // Node freezes the signal table: it names what the platform is, not
+    // something a program may redefine underneath the rest of the process.
+    scope.freeze(signals)?;
     scope.set(constants, "signals", signals)?;
     let errno = scope.object()?;
     for (name, value) in ERRNO {
@@ -613,7 +616,16 @@ fn netmask_prefix_length(addr: *const libc::sockaddr, family: i32) -> Option<u32
     }
 }
 
-fn os_user_info(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_user_info(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Node reads `encoding` off the options before it asks the platform who
+    // the user is, so a getter that throws is the caller's error and reaches
+    // them instead of being swallowed. Anything that is not an object is no
+    // options at all.
+    if let Some(options) = args.first()
+        && options.as_object().is_some()
+    {
+        let _ = ctx.get_value_property(*options, "encoding")?;
+    }
     let info = user_info(ctx);
     ctx.scope(|mut scope| {
         let object = scope.object()?;

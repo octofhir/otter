@@ -2667,7 +2667,12 @@ impl IsolateRunner {
                     // on the original error; the run keeps its code.
                     Err(_) => code,
                 };
-                return (Err(error), Some(final_code));
+                // Only a listener that actually chose a different code
+                // overrides the failure. Reporting the unchanged code as an
+                // override would hide the error itself from the caller, which
+                // is what renders the diagnostic.
+                let override_code = (final_code != code).then_some(final_code);
+                return (Err(error), override_code);
             }
         };
         // From here on the run is over in Node terms: callbacks scheduled by

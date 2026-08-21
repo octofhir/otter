@@ -897,11 +897,18 @@ const pendingSends = new Map();
 let nextSendToken = 1;
 
 // Let go of what a message carried, now that the message has left.
+//
+// Only a `net.Socket` is given up by sending it: the peer owns that
+// connection now. A bare handle, a server, or a datagram socket stays the
+// sender's until the sender itself closes it — `cluster` counts on that, as
+// a connection a worker refuses is offered to the next worker from the very
+// handle it just sent.
 globalThis.__otterIpcSent = function sent(token) {
   const pending = pendingSends.get(token);
   if (pending === undefined) return;
   pendingSends.delete(token);
   if (pending.carried.keepOpen) return;
+  if (pending.carried.type !== 'net.Socket') return;
   const handle = pending.carried.handle;
   if (handle !== undefined && handle !== null) {
     try { handle.close(); } catch { /* already gone */ }

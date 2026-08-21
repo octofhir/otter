@@ -22,13 +22,13 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 //! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::task::JoinHandle;
+use tokio::sync::Notify;
 
 /// Shareable Tokio-backed host services for one application process.
 ///
@@ -147,8 +147,7 @@ pub(crate) struct TokioEventLoop {
     handle: tokio::runtime::Handle,
     owned: Option<Arc<tokio::runtime::Runtime>>,
     http_client: reqwest::Client,
-    next_timer: Arc<AtomicU64>,
-    timers: Arc<Mutex<HashMap<TimerToken, JoinHandle<()>>>>,
+    timers: Arc<TimerDriver>,
 }
 
 impl std::fmt::Debug for TokioEventLoop {
@@ -163,12 +162,12 @@ impl TokioEventLoop {
     /// Wrap an embedder-provided Tokio handle.
     #[must_use]
     pub(crate) fn from_handle(handle: tokio::runtime::Handle) -> Self {
+        let timers = TimerDriver::spawn(&handle);
         Self {
             handle,
             owned: None,
             http_client: reqwest::Client::new(),
-            next_timer: Arc::new(AtomicU64::new(1)),
-            timers: Arc::new(Mutex::new(HashMap::new())),
+            timers,
         }
     }
 
@@ -179,12 +178,13 @@ impl TokioEventLoop {
     /// threads.
     pub(crate) fn owned() -> Result<Self, std::io::Error> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        let handle = runtime.handle().clone();
+        let timers = TimerDriver::spawn(&handle);
         Ok(Self {
-            handle: runtime.handle().clone(),
+            handle,
             owned: Some(runtime),
             http_client: reqwest::Client::new(),
-            next_timer: Arc::new(AtomicU64::new(1)),
-            timers: Arc::new(Mutex::new(HashMap::new())),
+            timers,
         })
     }
 
@@ -229,48 +229,182 @@ impl TokioEventLoop {
         tokio::task::block_in_place(|| self.handle.block_on(future))
     }
 
-    /// Schedule a Tokio timer and notify `wake` from the Tokio
-    /// worker after the delay elapses.
-    ///
-    /// The timer task registry is intentionally Tokio-local. The
-    /// generic [`crate::RuntimeHandle`] only sees owned timer tokens
-    /// and inbox messages; it does not hold executor locks.
-    fn schedule_timer_task(&self, request: TimerRequest, wake: Arc<dyn TimerWake>) -> TimerToken {
-        let token = TimerToken(self.next_timer.fetch_add(1, Ordering::Relaxed));
-        let timers = self.timers.clone();
-        let delay = request.delay;
+}
+
+/// One armed timer as ordered inside [`TimerDriver`].
+///
+/// Ordering is `(deadline, seq)`: earliest deadline first, and among timers
+/// due at the same instant the one armed first. `seq` is what gives
+/// same-millisecond timers their arming order, the way libuv compares
+/// `(timeout, id)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArmedTimer {
+    deadline: Instant,
+    seq: u64,
+    token: TimerToken,
+}
+
+impl Ord for ArmedTimer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deadline
+            .cmp(&other.deadline)
+            .then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+impl PartialOrd for ArmedTimer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// What the driver needs to fire a token, kept out of the heap so a
+/// cancellation is a single map removal.
+struct TimerRecord {
+    wake: Arc<dyn TimerWake>,
+    /// `Some(period)` for `setInterval`; the driver re-arms itself.
+    repeat: Option<Duration>,
+    /// Sequence of the heap entry currently standing for this token. A popped
+    /// entry whose `seq` no longer matches was superseded by a re-arm.
+    seq: u64,
+}
+
+#[derive(Default)]
+struct TimerDriverState {
+    heap: BinaryHeap<Reverse<ArmedTimer>>,
+    records: HashMap<TimerToken, TimerRecord>,
+    next_seq: u64,
+    next_token: u64,
+}
+
+/// Single-task timer wheel behind [`TokioEventLoop`].
+///
+/// Every host timer lives in one deadline-ordered heap drained by one Tokio
+/// task, so the inbox receives `TimerFired` messages in deadline order and, on
+/// a tie, in arming order. Sleeping each timer in its own spawned task cannot
+/// promise that: two `sleep(1ms)` tasks wake on different workers and race to
+/// the inbox.
+struct TimerDriver {
+    state: Mutex<TimerDriverState>,
+    /// Rung whenever the earliest deadline may have moved closer.
+    wakeup: Notify,
+}
+
+impl TimerDriver {
+    /// Build a driver and put its drain loop on `handle`.
+    fn spawn(handle: &tokio::runtime::Handle) -> Arc<Self> {
+        let driver = Arc::new(Self {
+            state: Mutex::new(TimerDriverState {
+                next_token: 1,
+                ..TimerDriverState::default()
+            }),
+            wakeup: Notify::new(),
+        });
+        handle.spawn(Self::drain(Arc::clone(&driver)));
+        driver
+    }
+
+    /// Arm a timer and return the token the VM stores its callback under.
+    fn arm(&self, request: &TimerRequest, wake: Arc<dyn TimerWake>) -> TimerToken {
+        let deadline = Instant::now() + request.delay;
         let repeat = request
             .repeat
             .map(|period| period.max(Duration::from_millis(1)));
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
-        let join = self.handle.spawn(async move {
-            if start_rx.await.is_err() {
-                return;
+        let token = {
+            let mut state = self.state.lock().expect("timer driver poisoned");
+            let token = TimerToken(state.next_token);
+            state.next_token += 1;
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            state.records.insert(token, TimerRecord { wake, repeat, seq });
+            state.heap.push(Reverse(ArmedTimer {
+                deadline,
+                seq,
+                token,
+            }));
+            token
+        };
+        self.wakeup.notify_one();
+        token
+    }
+
+    /// Drop a timer's record. Its heap entry is skipped when it surfaces.
+    fn disarm(&self, token: TimerToken) -> bool {
+        let removed = {
+            let mut state = self.state.lock().expect("timer driver poisoned");
+            state.records.remove(&token).is_some()
+        };
+        if removed {
+            self.wakeup.notify_one();
+        }
+        removed
+    }
+
+    /// Take everything due, in order, and report when the next timer is due.
+    fn take_due(&self) -> (Vec<(Arc<dyn TimerWake>, TimerToken)>, Option<Instant>) {
+        let mut state = self.state.lock().expect("timer driver poisoned");
+        let now = Instant::now();
+        let mut due: Vec<(Arc<dyn TimerWake>, TimerToken)> = Vec::new();
+        while let Some(&Reverse(entry)) = state.heap.peek() {
+            if entry.deadline > now {
+                break;
             }
+            state.heap.pop();
+            let (wake, repeat) = match state.records.get(&entry.token) {
+                Some(record) if record.seq == entry.seq => {
+                    (Arc::clone(&record.wake), record.repeat)
+                }
+                // Cancelled, or superseded by a re-arm.
+                _ => continue,
+            };
             match repeat {
                 Some(period) => {
-                    tokio::time::sleep(delay).await;
-                    loop {
-                        wake.timer_fired(token);
-                        tokio::time::sleep(period).await;
+                    let seq = state.next_seq;
+                    state.next_seq += 1;
+                    if let Some(record) = state.records.get_mut(&entry.token) {
+                        record.seq = seq;
                     }
+                    state.heap.push(Reverse(ArmedTimer {
+                        deadline: now + period,
+                        seq,
+                        token: entry.token,
+                    }));
                 }
                 None => {
-                    tokio::time::sleep(delay).await;
-                    timers
-                        .lock()
-                        .expect("timer registry poisoned")
-                        .remove(&token);
-                    wake.timer_fired(token);
+                    state.records.remove(&entry.token);
                 }
             }
-        });
-        self.timers
-            .lock()
-            .expect("timer registry poisoned")
-            .insert(token, join);
-        let _ = start_tx.send(());
-        token
+            due.push((wake, entry.token));
+        }
+        let next = state.heap.peek().map(|Reverse(entry)| entry.deadline);
+        (due, next)
+    }
+
+    /// Fire due timers forever, sleeping until the earliest deadline.
+    async fn drain(driver: Arc<Self>) {
+        loop {
+            // Registered before the heap is read so an arm racing this pass
+            // still wakes the sleep below.
+            let wakeup = driver.wakeup.notified();
+            tokio::pin!(wakeup);
+
+            let (due, next) = driver.take_due();
+            for (wake, token) in due {
+                wake.timer_fired(token);
+            }
+
+            match next {
+                Some(deadline) => {
+                    let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        () = &mut sleep => {}
+                        () = &mut wakeup => {}
+                    }
+                }
+                None => wakeup.await,
+            }
+        }
     }
 }
 
@@ -333,19 +467,10 @@ impl crate::module_loader::RemoteModuleProvider for TokioRemoteModuleProvider {
 
 impl EventLoop for TokioEventLoop {
     fn schedule_timer(&self, request: TimerRequest, wake: Arc<dyn TimerWake>) -> TimerToken {
-        self.schedule_timer_task(request, wake)
+        self.timers.arm(&request, wake)
     }
 
     fn cancel_timer(&self, token: TimerToken) -> bool {
-        let removed = self
-            .timers
-            .lock()
-            .expect("timer registry poisoned")
-            .remove(&token);
-        let Some(join) = removed else {
-            return false;
-        };
-        join.abort();
-        true
+        self.timers.disarm(token)
     }
 }

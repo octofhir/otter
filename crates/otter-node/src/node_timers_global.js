@@ -1,71 +1,65 @@
 'use strict';
-// Node-shaped timer globals: setTimeout/setInterval hand back a Timeout
-// object carrying ref/unref/refresh, wrapping the runtime's numeric tokens.
-// ref/unref move the token between the host scheduler's liveness classes via
-// the __otterTimerSetRef native, so an unref'd timer stops holding the
-// run-until-idle boundary open.
-(() => {
-  const origSetTimeout = globalThis.setTimeout;
-  const origClearTimeout = globalThis.clearTimeout;
-  const origSetInterval = globalThis.setInterval;
-  const origClearInterval = globalThis.clearInterval;
 
-  class Timeout {
-    constructor(repeat, callback, delay, args) {
-      this._repeat = repeat;
-      this._callback = callback;
-      this._delay = delay;
-      this._args = args;
-      this._destroyed = false;
-      this._refed = true;
-      this._id = repeat
-        ? origSetInterval(callback, delay, ...args)
-        : origSetTimeout(callback, delay, ...args);
+// The program's timers are Node's timers.
+//
+// Node keeps its timer lists in JavaScript and asks the loop for one timer at
+// a time; the engine's own timers are what the loop is here. They are handed
+// to the module that drives them now, while these names still mean them —
+// afterwards the names answer from an accessor that loads that very module.
+//
+// The module itself is loaded the first time a program asks for a timer, so
+// nothing loads it during startup.
+{
+  // Kept in this closure rather than anywhere a program could see: the engine's
+  // timers are not part of the surface a Node program is given.
+  const engine = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    setImmediate: globalThis.setImmediate,
+    clearImmediate: globalThis.clearImmediate,
+    setRef: globalThis.__otterTimerSetRef,
+  };
+
+  const names = [
+    'setTimeout', 'clearTimeout',
+    'setInterval', 'clearInterval',
+    'setImmediate', 'clearImmediate',
+  ];
+
+  // The six arrive together: a program that clears a timer must be clearing
+  // one the same module handed it.
+  const install = () => {
+    const timers = process.getBuiltinModule('timers');
+    for (const name of names) {
+      Object.defineProperty(globalThis, name, {
+        value: timers[name],
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
     }
-    ref() {
-      this._refed = true;
-      if (!this._destroyed) __otterTimerSetRef(this._id, true);
-      return this;
-    }
-    unref() {
-      this._refed = false;
-      if (!this._destroyed) __otterTimerSetRef(this._id, false);
-      return this;
-    }
-    hasRef() { return this._refed; }
-    refresh() {
-      if (this._destroyed) return this;
-      (this._repeat ? origClearInterval : origClearTimeout)(this._id);
-      this._id = this._repeat
-        ? origSetInterval(this._callback, this._delay, ...this._args)
-        : origSetTimeout(this._callback, this._delay, ...this._args);
-      if (!this._refed) __otterTimerSetRef(this._id, false);
-      return this;
-    }
-    close() { clearWrapped(this, this._repeat); return this; }
-    [Symbol.toPrimitive]() { return this._id; }
+    return timers;
+  };
+
+  for (const name of names) {
+    const get = () => install()[name];
+    // Left where the module that drives the timers can find them: it may be
+    // asked for before any of these names is, and reading one then would ask
+    // for it again.
+    get.engineTimers = engine;
+    Object.defineProperty(globalThis, name, {
+      get,
+      set(value) {
+        install();
+        Object.defineProperty(globalThis, name, {
+          value,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      },
+      enumerable: false,
+      configurable: true,
+    });
   }
-
-  function clearWrapped(value, repeat) {
-    if (value == null) return;
-    if (typeof value === 'object') {
-      value._destroyed = true;
-      (repeat ? origClearInterval : origClearTimeout)(value._id);
-      return;
-    }
-    (repeat ? origClearInterval : origClearTimeout)(value);
-  }
-
-  globalThis.setTimeout = function setTimeout(callback, delay, ...args) {
-    return new Timeout(false, callback, delay, args);
-  };
-  globalThis.clearTimeout = function clearTimeout(value) {
-    clearWrapped(value, false);
-  };
-  globalThis.setInterval = function setInterval(callback, delay, ...args) {
-    return new Timeout(true, callback, delay, args);
-  };
-  globalThis.clearInterval = function clearInterval(value) {
-    clearWrapped(value, true);
-  };
-})();
+}

@@ -232,6 +232,15 @@ class AsyncResource {
 
 module.exports = {
   enabledHooksExist,
+  // What a resource created right now would name as the reason it exists:
+  // the trigger the current scope was given, or the scope itself.
+  getDefaultTriggerAsyncId() {
+    const current = executionStack[executionStack.length - 1];
+    return current.triggerAsyncId || current.asyncId;
+  },
+  // Whether anything is listening for a resource being created. Nothing is
+  // emitted when nobody is.
+  initHooksExist: enabledHooksExist,
   defaultTriggerAsyncIdScope(triggerAsyncId, block, ...args) {
     const current = executionStack[executionStack.length - 1];
     executionStack.push({

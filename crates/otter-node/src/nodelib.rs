@@ -154,6 +154,10 @@ nodelib_module!(internal_events_symbols, "internal/events/symbols", vendored "no
 nodelib_module!(node_events, "node:events", vendored "nodelib/events.js");
 nodelib_module!(node_util, "node:util", vendored "nodelib/util.js");
 nodelib_module!(node_path, "node:path", vendored "nodelib/path.js");
+nodelib_module!(node_console, "node:console", vendored "nodelib/console.js");
+nodelib_module!(internal_console_constructor, "internal/console/constructor", vendored "nodelib/internal/console/constructor.js");
+nodelib_module!(internal_console_global, "internal/console/global", vendored "nodelib/internal/console/global.js");
+nodelib_module!(internal_cli_table, "internal/cli_table", vendored "nodelib/internal/cli_table.js");
 nodelib_module!(node_path_posix, "node:path/posix", vendored "nodelib/path/posix.js");
 nodelib_module!(node_path_win32, "node:path/win32", vendored "nodelib/path/win32.js");
 nodelib_module!(internal_http_parser, "internal/http_parser", compat "nodelib/compat/internal_http_parser.js");

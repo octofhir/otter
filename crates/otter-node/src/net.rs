@@ -72,6 +72,11 @@ enum EntryKind {
         /// process speaking for the socket — and once another process holds a
         /// copy, the socket is no longer only this one's to speak for.
         shared: Arc<AtomicBool>,
+        /// Whether this connection has been armed to reset. A reset must
+        /// reach the peer as an RST and nothing else, so the parting shutdown
+        /// of the write half — which would reach it as a clean end first, and
+        /// leave the reset with nothing left to report — is not sent.
+        resetting: Arc<AtomicBool>,
     },
 }
 
@@ -600,10 +605,17 @@ fn build_native<'scope>(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(Entry {
-                    kind: EntryKind::Connection { socket, .. },
+                    kind:
+                        EntryKind::Connection {
+                            socket, resetting, ..
+                        },
                     ..
                 }) = table.get(&id)
                 {
+                    // Said before the entry goes: dropping it is what ends the
+                    // writer task, and the writer must already know not to
+                    // shut the write half down on its way out.
+                    resetting.store(true, Ordering::SeqCst);
                     socket.arm_reset();
                 }
             }
@@ -1089,6 +1101,7 @@ fn adopt(
     let queued_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let read_gate = Arc::new(ReadGate::new(false));
     let shared = Arc::new(AtomicBool::new(false));
+    let resetting = Arc::new(AtomicBool::new(false));
     table
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1102,6 +1115,7 @@ fn adopt(
                     queued: queued_count.clone(),
                     read_gate: read_gate.clone(),
                     shared: shared.clone(),
+                    resetting: resetting.clone(),
                 },
                 keep_alive: Some(keep_alive),
                 local,
@@ -1113,6 +1127,7 @@ fn adopt(
     let writer_spawner = spawner.clone();
     let writer_queued = queued_count;
     let writer_shared = shared;
+    let writer_resetting = resetting;
     tokio::spawn(async move {
         while let Some(message) = queued.recv().await {
             let _decrement = scopeguard_decrement(&writer_queued);
@@ -1167,7 +1182,7 @@ fn adopt(
         // half closes so the peer reads EOF without waiting for every task
         // holding this socket to let go of it. A socket a copy of which left
         // the process is not this process's to close for everyone.
-        if !writer_shared.load(Ordering::SeqCst) {
+        if !writer_shared.load(Ordering::SeqCst) && !writer_resetting.load(Ordering::SeqCst) {
             shutdown_write(&writer_stream);
         }
     });

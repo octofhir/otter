@@ -156,6 +156,29 @@ function derive(name) {
     }
   }
 
+  // `<Namespace><Member>Apply` — the spread-call form of a static:
+  // MathMaxApply(args) = Math.max.apply(Math, args). Node builds these by
+  // binding `Function.prototype.apply`, so they take the argument list as one
+  // array rather than the receiver-plus-list the prototype forms take.
+  m = /^([A-Z][A-Za-z0-9]*?)([A-Z][A-Za-z0-9_]*)Apply$/.exec(name);
+  if (m) {
+    const stem = name.slice(0, -'Apply'.length);
+    for (const [prefix, holder] of [
+      ...Object.entries(namespaces),
+      ...Object.entries(constructors),
+    ]) {
+      if (!holder || !stem.startsWith(prefix)) continue;
+      const rest = stem.slice(prefix.length);
+      if (!/^[A-Z]/.test(rest)) continue;
+      const member = rest === rest.toUpperCase()
+        ? holder[rest]
+        : holder[lowerFirst(rest)] ?? holder[rest];
+      if (typeof member === 'function') {
+        return (args) => ReflectApply(member, holder, args);
+      }
+    }
+  }
+
   // `<Base>Prototype<Method>` — uncurried prototype method.
   m = /^([A-Z][A-Za-z0-9]*?)Prototype([A-Z][A-Za-z0-9]*)$/.exec(name);
   if (m) {

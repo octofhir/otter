@@ -149,6 +149,11 @@ struct RuntimeHandleInner {
     command_capacity: usize,
     counters: Arc<RuntimeCounters>,
     exit: Arc<IsolateExit>,
+    /// Shared fire-order queue every timer wake is handed to. Only the
+    /// host-scheduled test path reaches it from this side; the isolate runner
+    /// owns the producing end.
+    #[cfg(test)]
+    timer_posts: Arc<TimerPostQueue>,
 }
 
 #[derive(Debug, Default)]
@@ -859,6 +864,14 @@ impl RuntimeHandle {
             next_module_job_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
         });
+        let timer_posts = Arc::new(TimerPostQueue {
+            tx: tx.clone(),
+            counters: counters.clone(),
+            io_handle: event_loop.handle(),
+            backlog: Mutex::new(TimerPostBacklog::default()),
+        });
+        #[cfg(test)]
+        let handle_timer_posts = Arc::clone(&timer_posts);
         let runner_counters = counters.clone();
         let scheduler_tx = tx.clone();
         let scheduler_event_loop = event_loop.clone();
@@ -878,6 +891,7 @@ impl RuntimeHandle {
                     interrupt_tx,
                     scheduler_tx,
                     scheduler_event_loop,
+                    timer_posts,
                     runner_module_preparation,
                     runner_module_cancellation,
                 )
@@ -901,6 +915,8 @@ impl RuntimeHandle {
             command_capacity: capacity,
             counters,
             exit,
+            #[cfg(test)]
+            timer_posts: handle_timer_posts,
         });
         Ok(Self { inner })
     }
@@ -1231,9 +1247,8 @@ impl RuntimeHandle {
             &self.inner.counters.pending_unref_timers,
         );
         let wake = Arc::new(RuntimeTimerWake {
-            tx: self.inner.tx.clone(),
+            posts: Arc::clone(&self.inner.timer_posts),
             counters: self.inner.counters.clone(),
-            io_handle: self.inner.event_loop.handle(),
             repeat: request.repeat.is_some(),
             expects_js_callback: false,
         });
@@ -1765,6 +1780,7 @@ fn run_isolate(
     interrupt_tx: SyncSender<otter_vm::InterruptFlag>,
     scheduler_tx: SyncSender<RuntimeMessage>,
     event_loop: TokioEventLoop,
+    timer_posts: Arc<TimerPostQueue>,
     module_preparation: ModulePreparation,
     module_cancellation: crate::module_loader::ModuleLoadCancellation,
 ) {
@@ -1784,7 +1800,7 @@ fn run_isolate(
             Err(_) => return,
         };
     let timer_scheduler = Arc::new(InboxTimerScheduler {
-        tx: scheduler_tx.clone(),
+        posts: timer_posts,
         event_loop,
         counters: counters.clone(),
         next_immediate_token: AtomicU64::new(FIRST_IMMEDIATE_TOKEN),
@@ -1827,6 +1843,120 @@ fn run_isolate(
 /// delay elapses so the runner re-enters the VM and runs the JS
 /// callback.
 ///
+/// One pending timer wake waiting for room in the isolate inbox.
+#[derive(Clone, Copy)]
+struct PendingTimerPost {
+    token: TimerToken,
+    expects_js_callback: bool,
+    accounting: InternalPostAccounting,
+}
+
+#[derive(Default)]
+struct TimerPostBacklog {
+    queue: VecDeque<PendingTimerPost>,
+    /// A flush task is already draining `queue`.
+    draining: bool,
+}
+
+/// Keeps timer wakes in fire order even when the isolate inbox is full.
+///
+/// The generic [`post_internal_message`] answers a full inbox by spawning a
+/// retry task per message, and two such tasks race — past the inbox bound,
+/// `setTimeout(a, 1)` armed before `setTimeout(b, 1)` would run second. Timers
+/// cannot afford that, so once one wake has to wait, every later one waits
+/// behind it here and a single flush task hands them to the inbox in order.
+///
+/// Both producers share one queue: the event-loop timer driver and the
+/// zero-delay path that posts from the isolate thread. Neither may block on a
+/// full inbox — the isolate thread would deadlock draining its own inbox — so
+/// the queue is the backpressure.
+struct TimerPostQueue {
+    tx: SyncSender<RuntimeMessage>,
+    counters: Arc<RuntimeCounters>,
+    io_handle: tokio::runtime::Handle,
+    backlog: Mutex<TimerPostBacklog>,
+}
+
+impl TimerPostQueue {
+    fn post(self: &Arc<Self>, post: PendingTimerPost) {
+        let mut backlog = self.backlog.lock().expect("timer post backlog poisoned");
+        if backlog.queue.is_empty() {
+            match self.tx.try_send(RuntimeMessage::TimerFired {
+                token: post.token,
+                expects_js_callback: post.expects_js_callback,
+            }) {
+                Ok(()) => return,
+                Err(TrySendError::Disconnected(_)) => {
+                    drop(backlog);
+                    cancel_internal_post(&self.counters, post.accounting);
+                    return;
+                }
+                Err(TrySendError::Full(_)) => {}
+            }
+        }
+        // A repeating tick is allowed to coalesce rather than pile up behind a
+        // saturated isolate.
+        if matches!(post.accounting, InternalPostAccounting::DropOnFull) {
+            return;
+        }
+        backlog.queue.push_back(post);
+        if !backlog.draining {
+            backlog.draining = true;
+            let queue = Arc::clone(self);
+            self.io_handle.spawn(async move { queue.flush().await });
+        }
+    }
+
+    async fn flush(self: Arc<Self>) {
+        loop {
+            let next = {
+                let mut backlog = self.backlog.lock().expect("timer post backlog poisoned");
+                match backlog.queue.front().copied() {
+                    Some(next) => next,
+                    None => {
+                        backlog.draining = false;
+                        return;
+                    }
+                }
+            };
+            if self.counters.shutdown.load(Ordering::Acquire) {
+                let drained: Vec<PendingTimerPost> = {
+                    let mut backlog = self.backlog.lock().expect("timer post backlog poisoned");
+                    backlog.draining = false;
+                    backlog.queue.drain(..).collect()
+                };
+                for post in drained {
+                    cancel_internal_post(&self.counters, post.accounting);
+                }
+                return;
+            }
+            match self.tx.try_send(RuntimeMessage::TimerFired {
+                token: next.token,
+                expects_js_callback: next.expects_js_callback,
+            }) {
+                Ok(()) => {
+                    self.backlog
+                        .lock()
+                        .expect("timer post backlog poisoned")
+                        .queue
+                        .pop_front();
+                }
+                Err(TrySendError::Full(_)) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.backlog
+                        .lock()
+                        .expect("timer post backlog poisoned")
+                        .queue
+                        .pop_front();
+                    cancel_internal_post(&self.counters, next.accounting);
+                }
+            }
+        }
+    }
+}
+
 /// The struct is `Send + Sync` because the
 /// [`otter_vm::TimerSchedulerHandle`] alias requires both. The
 /// fields satisfy that: `SyncSender` and `TokioEventLoop` are
@@ -1836,7 +1966,7 @@ fn run_isolate(
 /// is then resolved against the per-isolate
 /// [`otter_vm::TimerCallbacks`] table.
 struct InboxTimerScheduler {
-    tx: SyncSender<RuntimeMessage>,
+    posts: Arc<TimerPostQueue>,
     event_loop: TokioEventLoop,
     counters: Arc<RuntimeCounters>,
     /// Monotonic counter for zero-delay tokens issued on the VM
@@ -1852,9 +1982,8 @@ struct InboxTimerScheduler {
 const FIRST_IMMEDIATE_TOKEN: u64 = 1u64 << 63;
 
 struct RuntimeTimerWake {
-    tx: SyncSender<RuntimeMessage>,
+    posts: Arc<TimerPostQueue>,
     counters: Arc<RuntimeCounters>,
-    io_handle: tokio::runtime::Handle,
     repeat: bool,
     expects_js_callback: bool,
 }
@@ -1869,16 +1998,11 @@ impl TimerWake for RuntimeTimerWake {
         } else {
             InternalPostAccounting::Timer(liveness)
         };
-        post_internal_message(
-            &self.io_handle,
-            &self.tx,
-            &self.counters,
-            RuntimeMessage::TimerFired {
-                token,
-                expects_js_callback: self.expects_js_callback,
-            },
+        self.posts.post(PendingTimerPost {
+            token,
+            expects_js_callback: self.expects_js_callback,
             accounting,
-        );
+        });
     }
 }
 
@@ -1937,16 +2061,11 @@ impl TimerScheduler for InboxTimerScheduler {
         if delay_ms == 0 && repeat_ms.is_none() {
             let token = TimerToken(self.next_immediate_token.fetch_add(1, Ordering::Relaxed));
             self.counters.timer_register(token.0);
-            post_internal_message(
-                &self.event_loop.handle(),
-                &self.tx,
-                &self.counters,
-                RuntimeMessage::TimerFired {
-                    token,
-                    expects_js_callback: true,
-                },
-                InternalPostAccounting::Timer(liveness),
-            );
+            self.posts.post(PendingTimerPost {
+                token,
+                expects_js_callback: true,
+                accounting: InternalPostAccounting::Timer(liveness),
+            });
             return token.0;
         }
         let request = TimerRequest {
@@ -1954,9 +2073,8 @@ impl TimerScheduler for InboxTimerScheduler {
             repeat: repeat_ms.map(Duration::from_millis),
         };
         let wake = Arc::new(RuntimeTimerWake {
-            tx: self.tx.clone(),
+            posts: Arc::clone(&self.posts),
             counters: self.counters.clone(),
-            io_handle: self.event_loop.handle(),
             repeat: repeat_ms.is_some(),
             expects_js_callback: true,
         });

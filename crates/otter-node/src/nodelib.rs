@@ -153,6 +153,9 @@ nodelib_module!(internal_fixed_queue, "internal/fixed_queue", vendored "nodelib/
 nodelib_module!(internal_events_symbols, "internal/events/symbols", vendored "nodelib/internal/events/symbols.js");
 nodelib_module!(node_events, "node:events", vendored "nodelib/events.js");
 nodelib_module!(node_util, "node:util", vendored "nodelib/util.js");
+nodelib_module!(node_path, "node:path", vendored "nodelib/path.js");
+nodelib_module!(node_path_posix, "node:path/posix", vendored "nodelib/path/posix.js");
+nodelib_module!(node_path_win32, "node:path/win32", vendored "nodelib/path/win32.js");
 nodelib_module!(internal_http_parser, "internal/http_parser", compat "nodelib/compat/internal_http_parser.js");
 nodelib_module!(internal_timers, "internal/timers", compat "nodelib/compat/internal_timers.js");
 nodelib_module!(internal_url, "internal/url", compat "nodelib/compat/internal_url.js");

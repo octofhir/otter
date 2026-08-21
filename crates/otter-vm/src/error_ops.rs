@@ -363,6 +363,15 @@ impl Interpreter {
                 dynamic_message = jmsg;
                 (jkind, dynamic_message.as_str())
             }
+            // A blown call stack is a `RangeError` user code can catch, the
+            // way V8 answers one — Node's own stdlib and its tests recurse
+            // until it throws and then carry on. The instance is built by
+            // native allocation alone, so it needs none of the frames the
+            // exhausted stack can no longer hand out.
+            VmError::StackOverflow { .. } => (
+                error_classes::ErrorKind::RangeError,
+                "Maximum call stack size exceeded",
+            ),
             // Hard / structural errors stay as host failures so the
             // caller surfaces them through `RunError` rather than
             // catching them as `try { ... } catch`.

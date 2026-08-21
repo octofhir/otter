@@ -45,7 +45,6 @@ pub mod net;
 pub mod node_test;
 mod nodelib;
 pub mod os;
-pub mod path;
 pub mod querystring;
 pub mod readline;
 pub mod stream;
@@ -92,8 +91,12 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("vm", misc_modules::vm_cjs_value),
     HostedModule::cjs_only("node:process", misc_modules::process_cjs_value),
     HostedModule::cjs_only("process", misc_modules::process_cjs_value),
-    HostedModule::new_with_cjs_value("node:path", path::install_path_module, path::path_cjs_value),
-    HostedModule::new_with_cjs_value("path", path::install_path_module, path::path_cjs_value),
+    HostedModule::cjs_only("node:path", nodelib::node_path),
+    HostedModule::cjs_only("path", nodelib::node_path),
+    HostedModule::cjs_only("node:path/posix", nodelib::node_path_posix),
+    HostedModule::cjs_only("path/posix", nodelib::node_path_posix),
+    HostedModule::cjs_only("node:path/win32", nodelib::node_path_win32),
+    HostedModule::cjs_only("path/win32", nodelib::node_path_win32),
     HostedModule::cjs_only("node:events", nodelib::node_events_with_process_graft),
     HostedModule::cjs_only("events", nodelib::node_events_with_process_graft),
     HostedModule::new_with_cjs_value("node:os", os::install_os_module, os::os_cjs_value),

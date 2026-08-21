@@ -574,6 +574,9 @@ const bindings = {
   os: {
     getOSInformation() { return ['', '', '']; },
   },
+  get timers() {
+    return require('internal/otter/timers_binding');
+  },
   types: {
     isNativeError: (value) => Error.isError(value),
     isPromise: (value) => value instanceof Promise,

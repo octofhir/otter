@@ -161,7 +161,12 @@ nodelib_module!(internal_cli_table, "internal/cli_table", vendored "nodelib/inte
 nodelib_module!(node_path_posix, "node:path/posix", vendored "nodelib/path/posix.js");
 nodelib_module!(node_path_win32, "node:path/win32", vendored "nodelib/path/win32.js");
 nodelib_module!(internal_http_parser, "internal/http_parser", compat "nodelib/compat/internal_http_parser.js");
-nodelib_module!(internal_timers, "internal/timers", compat "nodelib/compat/internal_timers.js");
+nodelib_module!(internal_timers, "internal/timers", vendored "nodelib/internal/timers.js");
+nodelib_module!(internal_priority_queue, "internal/priority_queue", vendored "nodelib/internal/priority_queue.js");
+nodelib_module!(internal_otter_timers, "internal/otter/timers", vendored "nodelib/timers.js");
+nodelib_module!(internal_otter_timers_binding, "internal/otter/timers_binding", compat "nodelib/compat/internal_otter_timers_binding.js");
+nodelib_module!(node_timers, "node:timers", compat "nodelib/compat/node_timers.js");
+nodelib_module!(node_timers_promises, "node:timers/promises", vendored "nodelib/timers/promises.js");
 nodelib_module!(internal_url, "internal/url", compat "nodelib/compat/internal_url.js");
 nodelib_module!(internal_perf_observe, "internal/perf/observe", compat "nodelib/compat/internal_perf_observe.js");
 nodelib_module!(internal_net, "internal/net", vendored "nodelib/internal/net.js");

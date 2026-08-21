@@ -50,7 +50,6 @@ pub mod readline;
 pub mod stream;
 pub mod string_decoder;
 pub mod stubs;
-pub mod timers;
 pub mod tty;
 pub mod url;
 pub mod util;
@@ -114,10 +113,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("stream/web", stream::stream_web_cjs_value),
     HostedModule::cjs_only("node:stream/consumers", stream::stream_consumers_cjs_value),
     HostedModule::cjs_only("stream/consumers", stream::stream_consumers_cjs_value),
-    HostedModule::cjs_only("node:timers", timers::timers_cjs_value),
-    HostedModule::cjs_only("timers", timers::timers_cjs_value),
-    HostedModule::cjs_only("node:timers/promises", timers::timers_promises_cjs_value),
-    HostedModule::cjs_only("timers/promises", timers::timers_promises_cjs_value),
+    HostedModule::cjs_only("node:timers", nodelib::node_timers),
+    HostedModule::cjs_only("timers", nodelib::node_timers),
+    HostedModule::cjs_only("node:timers/promises", nodelib::node_timers_promises),
+    HostedModule::cjs_only("timers/promises", nodelib::node_timers_promises),
+    HostedModule::cjs_only("internal/otter/timers", nodelib::internal_otter_timers),
+    HostedModule::cjs_only(
+        "internal/otter/timers_binding",
+        nodelib::internal_otter_timers_binding,
+    ),
+    HostedModule::cjs_only("internal/priority_queue", nodelib::internal_priority_queue),
     HostedModule::cjs_only("node:readline", readline::readline_cjs_value),
     HostedModule::cjs_only("readline", readline::readline_cjs_value),
     HostedModule::cjs_only("node:readline/promises", readline::readline_cjs_value),

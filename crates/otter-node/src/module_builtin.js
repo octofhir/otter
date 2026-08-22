@@ -81,6 +81,14 @@ Module.setSourceMapsSupport = () => {};
 Module.getSourceMapsSupport = () => ({ enabled: false });
 Module.findSourceMap = () => undefined;
 Module.register = () => {};
+// `-r`/`--require`: each request is loaded before the entry runs, resolved as
+// if required from a file in the working directory.
+Module._preloadModules = (requests) => {
+  if (!requests || requests.length === 0) return;
+  const path = require('path');
+  const preloadRequire = createRequire(path.join(process.cwd(), 'x'));
+  for (const request of requests) preloadRequire(request);
+};
 
 module.exports = Module;
 module.exports.Module = Module;

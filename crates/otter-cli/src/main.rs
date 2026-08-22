@@ -165,7 +165,12 @@ struct Cli {
     /// How much stack a call may use, in kilobytes (Node's
     /// `--stack-size`). The engine counts frames rather than bytes, so this
     /// is read as the share of the default stack a run is asking for.
-    #[arg(long = "stack-size", alias = "stack_size", value_name = "kilobytes", global = true)]
+    #[arg(
+        long = "stack-size",
+        alias = "stack_size",
+        value_name = "kilobytes",
+        global = true
+    )]
     stack_size: Option<u32>,
 
     /// (Node's `--expose-gc`).
@@ -210,9 +215,153 @@ struct Cli {
     )]
     network_family_autoselection_attempt_timeout: Option<u32>,
 
+    /// Node's test-runner switches.
+    #[command(flatten)]
+    test_flags: TestRunnerFlags,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
+}
+
+/// The switches Node's test runner is configured with.
+///
+/// The runner reads them back out of `process.execArgv`, and a run it starts
+/// for one file carries the ones that file needs — so a run accepts all of
+/// them whether or not it is the runner itself.
+#[derive(Debug, Clone, Default, Args)]
+struct TestRunnerFlags {
+    /// Run the test runner over the files named (Node's `--test`).
+    #[arg(long = "test", global = true)]
+    test: bool,
+
+    /// How many test files run at once (Node's `--test-concurrency`).
+    #[arg(long = "test-concurrency", value_name = "count", global = true)]
+    test_concurrency: Option<String>,
+
+    /// Exit once the tests are done, without waiting for the loop to drain
+    /// (Node's `--test-force-exit`).
+    #[arg(long = "test-force-exit", global = true)]
+    test_force_exit: bool,
+
+    /// Module whose `globalSetup`/`globalTeardown` bracket the whole run
+    /// (Node's `--test-global-setup`).
+    #[arg(long = "test-global-setup", value_name = "path", global = true)]
+    test_global_setup: Option<String>,
+
+    /// Whether each test file gets its own process (Node's `--test-isolation`).
+    #[arg(long = "test-isolation", value_name = "mode", global = true)]
+    test_isolation: Option<String>,
+
+    /// Run only the tests whose name matches (Node's `--test-name-pattern`).
+    #[arg(long = "test-name-pattern", value_name = "pattern", global = true)]
+    test_name_pattern: Vec<String>,
+
+    /// Run only the tests marked `only` (Node's `--test-only`).
+    #[arg(long = "test-only", global = true)]
+    test_only: bool,
+
+    /// Seed the order tests are drawn in (Node's `--test-random-seed`).
+    #[arg(long = "test-random-seed", value_name = "seed", global = true)]
+    test_random_seed: Option<String>,
+
+    /// Draw tests in a random order (Node's `--test-randomize`).
+    #[arg(long = "test-randomize", global = true)]
+    test_randomize: bool,
+
+    /// Reporter for the run's events (Node's `--test-reporter`).
+    #[arg(long = "test-reporter", value_name = "name", global = true)]
+    test_reporter: Vec<String>,
+
+    /// Where the matching reporter writes (Node's `--test-reporter-destination`).
+    #[arg(
+        long = "test-reporter-destination",
+        value_name = "destination",
+        global = true
+    )]
+    test_reporter_destination: Vec<String>,
+
+    /// File recording the failures a rerun repeats
+    /// (Node's `--test-rerun-failures`).
+    #[arg(long = "test-rerun-failures", value_name = "path", global = true)]
+    test_rerun_failures: Option<String>,
+
+    /// The share of the files this run takes, as `<index>/<total>`
+    /// (Node's `--test-shard`).
+    #[arg(long = "test-shard", value_name = "index/total", global = true)]
+    test_shard: Option<String>,
+
+    /// Skip the tests whose name matches (Node's `--test-skip-pattern`).
+    #[arg(long = "test-skip-pattern", value_name = "pattern", global = true)]
+    test_skip_pattern: Vec<String>,
+
+    /// How long a test may run, in milliseconds (Node's `--test-timeout`).
+    #[arg(long = "test-timeout", value_name = "ms", global = true)]
+    test_timeout: Option<String>,
+
+    /// Rewrite the snapshots instead of failing where they differ
+    /// (Node's `--test-update-snapshots`).
+    #[arg(long = "test-update-snapshots", global = true)]
+    test_update_snapshots: bool,
+
+    /// Branch coverage a run must reach (Node's `--test-coverage-branches`).
+    #[arg(long = "test-coverage-branches", value_name = "percent", global = true)]
+    test_coverage_branches: Option<String>,
+
+    /// Function coverage a run must reach (Node's `--test-coverage-functions`).
+    #[arg(
+        long = "test-coverage-functions",
+        value_name = "percent",
+        global = true
+    )]
+    test_coverage_functions: Option<String>,
+
+    /// Line coverage a run must reach (Node's `--test-coverage-lines`).
+    #[arg(long = "test-coverage-lines", value_name = "percent", global = true)]
+    test_coverage_lines: Option<String>,
+
+    /// Files coverage leaves out (Node's `--test-coverage-exclude`).
+    #[arg(long = "test-coverage-exclude", value_name = "glob", global = true)]
+    test_coverage_exclude: Vec<String>,
+
+    /// Files coverage takes in (Node's `--test-coverage-include`).
+    #[arg(long = "test-coverage-include", value_name = "glob", global = true)]
+    test_coverage_include: Vec<String>,
+
+    /// Report how much of the code the tests reached
+    /// (Node's `--experimental-test-coverage`).
+    #[arg(long = "experimental-test-coverage", global = true)]
+    experimental_test_coverage: bool,
+
+    /// Let a test replace a module (Node's `--experimental-test-module-mocks`).
+    #[arg(long = "experimental-test-module-mocks", global = true)]
+    experimental_test_module_mocks: bool,
+
+    /// Run only the tests carrying a matching tag
+    /// (Node's `--experimental-test-tag-filter`).
+    #[arg(
+        long = "experimental-test-tag-filter",
+        value_name = "expression",
+        global = true
+    )]
+    experimental_test_tag_filter: Vec<String>,
+
+    /// Map stack frames through the source maps a program carries
+    /// (Node's `--enable-source-maps`).
+    #[arg(long = "enable-source-maps", global = true)]
+    enable_source_maps: bool,
+
+    /// Module imported before the program runs (Node's `--import`).
+    #[arg(long = "import", value_name = "specifier", global = true)]
+    import: Vec<String>,
+
+    /// Module required before the program runs (Node's `--require`).
+    #[arg(long = "require", short = 'r', value_name = "specifier", global = true)]
+    require: Vec<String>,
+
+    /// Rerun whenever a file the run touched changes (Node's `--watch`).
+    #[arg(long = "watch", global = true)]
+    watch: bool,
 }
 
 /// Deno-style permission flags.
@@ -425,11 +574,77 @@ fn build_path_perm(allow: Option<&str>, deny: Option<&str>) -> Permission<PathBu
     }
 }
 
+/// The test-runner switches this run carries, in `process.execArgv` spelling —
+/// the form `internal/options` reads and the form a spawned run is started
+/// with.
+fn test_runner_switches(flags: &TestRunnerFlags, is_test_command: bool) -> Vec<String> {
+    let mut switches = Vec::new();
+    for (on, name) in [
+        (flags.test || is_test_command, "--test"),
+        (flags.test_force_exit, "--test-force-exit"),
+        (flags.test_only, "--test-only"),
+        (flags.test_randomize, "--test-randomize"),
+        (flags.test_update_snapshots, "--test-update-snapshots"),
+        (
+            flags.experimental_test_coverage,
+            "--experimental-test-coverage",
+        ),
+        (
+            flags.experimental_test_module_mocks,
+            "--experimental-test-module-mocks",
+        ),
+        (flags.enable_source_maps, "--enable-source-maps"),
+        (flags.watch, "--watch"),
+    ] {
+        if on {
+            switches.push(name.to_string());
+        }
+    }
+    for (value, name) in [
+        (&flags.test_concurrency, "--test-concurrency"),
+        (&flags.test_global_setup, "--test-global-setup"),
+        (&flags.test_isolation, "--test-isolation"),
+        (&flags.test_random_seed, "--test-random-seed"),
+        (&flags.test_rerun_failures, "--test-rerun-failures"),
+        (&flags.test_shard, "--test-shard"),
+        (&flags.test_timeout, "--test-timeout"),
+        (&flags.test_coverage_branches, "--test-coverage-branches"),
+        (&flags.test_coverage_functions, "--test-coverage-functions"),
+        (&flags.test_coverage_lines, "--test-coverage-lines"),
+    ] {
+        if let Some(value) = value {
+            switches.push(format!("{name}={value}"));
+        }
+    }
+    for (values, name) in [
+        (&flags.test_name_pattern, "--test-name-pattern"),
+        (&flags.test_skip_pattern, "--test-skip-pattern"),
+        (&flags.test_reporter, "--test-reporter"),
+        (
+            &flags.test_reporter_destination,
+            "--test-reporter-destination",
+        ),
+        (&flags.test_coverage_exclude, "--test-coverage-exclude"),
+        (&flags.test_coverage_include, "--test-coverage-include"),
+        (
+            &flags.experimental_test_tag_filter,
+            "--experimental-test-tag-filter",
+        ),
+        (&flags.import, "--import"),
+        (&flags.require, "--require"),
+    ] {
+        for value in values {
+            switches.push(format!("{name}={value}"));
+        }
+    }
+    switches
+}
+
 /// The node-style option switches this run carries, in `process.execArgv`
 /// spelling. `internal/options` reads them back out of `execArgv`, which is
 /// where a vendored module looks for `--max-http-header-size` and friends.
-fn node_option_switches(cli: &Cli) -> Vec<String> {
-    let mut switches = Vec::new();
+fn node_option_switches(cli: &Cli, is_test_command: bool) -> Vec<String> {
+    let mut switches = test_runner_switches(&cli.test_flags, is_test_command);
     if cli.experimental_stream_iter {
         switches.push("--experimental-stream-iter".to_string());
     }
@@ -442,7 +657,9 @@ fn node_option_switches(cli: &Cli) -> Vec<String> {
         switches.push("--network-family-autoselection".to_string());
     }
     if let Some(ms) = cli.network_family_autoselection_attempt_timeout {
-        switches.push(format!("--network-family-autoselection-attempt-timeout={ms}"));
+        switches.push(format!(
+            "--network-family-autoselection-attempt-timeout={ms}"
+        ));
     }
     switches
 }
@@ -711,7 +928,9 @@ async fn main() -> ExitCode {
     // reports the one the caller actually wrote, which is what a
     // flag-checking harness compares against.
     execution.set_flag_spellings(std::env::args().collect());
-    execution.set_node_options(node_option_switches(&cli));
+    let is_test_command = matches!(cli.command, Some(Command::Test(_)));
+    let test_mode = cli.test_flags.test;
+    execution.set_node_options(node_option_switches(&cli, is_test_command));
     let execution = execution;
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
@@ -789,9 +1008,19 @@ async fn main() -> ExitCode {
         }
         (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps, &execution).await,
         (Some(Command::Test(args)), _) => {
-            run_node_tests(args, json, &caps, &execution, &startup_timer).await
+            let globs = args
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            run_test_runner(&globs, &caps, &execution, &startup_timer).await
         }
         (Some(Command::Info), _) => run_info(json, &execution),
+        // `--test` is Node's: the switch turns the run into a test run, and
+        // the positionals name what to test rather than what to execute.
+        (None, _) if test_mode => {
+            run_test_runner(&cli.args, &caps, &execution, &startup_timer).await
+        }
         // Shorthand: `otter <file> [args...]`, routed through
         // the same resolver/session path as `otter run`.
         (None, Some(positional)) => {
@@ -2260,142 +2489,28 @@ async fn run_check(
     Ok(ExitCode::SUCCESS)
 }
 
-async fn run_node_tests(
-    args: TestArgs,
-    json: bool,
+/// Run Node's test runner over the patterns named.
+///
+/// The runner is `internal/main/test_runner`, the module Node's `--test`
+/// starts: it reads its configuration back out of `process.execArgv`, takes
+/// the files to run from `process.argv`, discovering them when none are
+/// named, and reports through the reporters the command line asked for.
+async fn run_test_runner(
+    globs: &[String],
     caps: &CapabilitySet,
     execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
-    let files = discover_node_test_files(&args.paths)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "type": "testPlan",
-                "files": files,
-            })
-        );
-    }
-
-    let mut failed = false;
-    let mut jit_report = None;
-    let mut jit_artifacts = None;
-    for file in files {
-        let otter = cli_otter_builder(caps, execution)
-            .process_argv(process_argv_for_file(&file, &[]))
-            .module_loader(cli_loader_config_for_entry(&file).await)
-            .build()
-            .map_err(|error| {
-                flush_aggregated_jit_debug_on_error(
-                    execution,
-                    &mut jit_report,
-                    &mut jit_artifacts,
-                    error,
-                )
-            })?;
-        startup_timer.mark("runtime_build");
-        let attempt = otter.run_file_with_diagnostics(&file).await;
-        let result = finish_aggregated_jit_debug_attempt(
-            execution,
-            attempt,
-            &mut jit_report,
-            &mut jit_artifacts,
-        )?;
-        startup_timer.mark("runtime_run_file");
-        let exit_code = result.exit_code();
-        if exit_code != 0 {
-            failed = true;
-        }
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "testFile",
-                    "file": file,
-                    "exitCode": exit_code,
-                })
-            );
-        }
-    }
-    let event_write = write_jit_debug_report_if_requested(execution, jit_report);
-    let artifact_write = write_jit_artifacts_if_requested(execution, jit_artifacts);
-    event_write?;
-    artifact_write?;
-
-    Ok(if failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-fn discover_node_test_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, OtterError> {
-    let roots = if paths.is_empty() {
-        vec![PathBuf::from("test")]
-    } else {
-        paths.to_vec()
-    };
-    let mut files = Vec::new();
-    for root in roots {
-        let meta = std::fs::metadata(&root).map_err(|err| pm_io_error(&root, err))?;
-        if meta.is_file() {
-            files.push(root);
-        } else if meta.is_dir() {
-            collect_node_test_files(&root, &mut files)?;
-        }
-    }
-    files.sort();
-    files.dedup();
-    if files.is_empty() {
-        return Err(pm_config_error("no test files found"));
-    }
-    Ok(files)
-}
-
-fn collect_node_test_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), OtterError> {
-    let mut entries = std::fs::read_dir(dir)
-        .map_err(|err| pm_io_error(dir, err))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| pm_io_error(dir, err))?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        let path = entry.path();
-        let meta = entry.metadata().map_err(|err| pm_io_error(&path, err))?;
-        if meta.is_dir() {
-            collect_node_test_files(&path, out)?;
-        } else if meta.is_file() && is_node_test_file(&path) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn is_node_test_file(path: &Path) -> bool {
-    if !has_node_test_extension(path) {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    name.starts_with("test-")
-        || name.starts_with("test_")
-        || name.ends_with(".test.js")
-        || name.ends_with(".test.cjs")
-        || name.ends_with(".test.mjs")
-        || name.ends_with(".test.ts")
-        || name.ends_with(".test.cts")
-        || name.ends_with(".test.mts")
-        || path
-            .components()
-            .any(|part| part.as_os_str() == std::ffi::OsStr::new("test"))
-}
-
-fn has_node_test_extension(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("js" | "cjs" | "mjs" | "ts" | "cts" | "mts")
+    run_eval(
+        "require('internal/main/test_runner');",
+        false,
+        globs,
+        false,
+        caps,
+        execution,
+        startup_timer,
     )
+    .await
 }
 
 async fn run_dump(
@@ -4581,21 +4696,6 @@ export let value = inner;
         }
     }
 
-    #[test]
-    fn node_test_discovery_uses_default_test_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        std::fs::create_dir_all("test/nested").unwrap();
-        std::fs::write("test/app.test.js", "test('a', () => {});\n").unwrap();
-        std::fs::write("test/nested/helper.txt", "nope\n").unwrap();
-
-        let files = discover_node_test_files(&[]).unwrap();
-        std::env::set_current_dir(previous).unwrap();
-
-        assert_eq!(files, vec![PathBuf::from("test/app.test.js")]);
-    }
-
     #[tokio::test]
     async fn fixture_project_covers_development_loop_resolution() {
         let fixture = workspace_root()
@@ -4792,12 +4892,7 @@ export let value = inner;
         let install = run_pm_install(&tmp.path().join("install-failure"), false)
             .await
             .unwrap_err();
-        assert_error_snapshot(
-            &install,
-            "package install failure",
-            "usage",
-            "package.json",
-        );
+        assert_error_snapshot(&install, "package install failure", "usage", "package.json");
     }
 
     fn assert_error_snapshot(

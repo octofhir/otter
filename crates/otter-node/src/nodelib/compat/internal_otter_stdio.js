@@ -74,7 +74,15 @@ function makeStdout(fd, write) {
     decodeStrings: false,
     write(chunk, encoding, callback) {
       try {
-        write(typeof chunk === 'string' ? chunk : chunk.toString(encoding === 'buffer' ? undefined : encoding));
+        // Bytes reach the descriptor as bytes. A string carries the encoding
+        // it was written in, so it becomes bytes here; everything else already
+        // is a buffer source and travels untouched, which is what a program
+        // writing a binary protocol down this stream depends on.
+        write(
+          typeof chunk === 'string' && encoding && encoding !== 'utf8' && encoding !== 'buffer'
+            ? Buffer.from(chunk, encoding)
+            : chunk,
+        );
       } catch (error) {
         callback(error);
         return;

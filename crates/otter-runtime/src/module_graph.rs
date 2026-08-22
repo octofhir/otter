@@ -211,6 +211,9 @@ struct ModuleGraphBuilder<'a> {
     module_sources: BTreeMap<String, String>,
     timings: Option<ModulePhaseTimings>,
     interrupt: Option<otter_vm::InterruptFlag>,
+    /// Whether the entry is the program the caller asked to run, rather than a
+    /// module some other code imported.
+    entry_is_program: bool,
 }
 
 impl<'a> ModuleGraphBuilder<'a> {
@@ -229,7 +232,17 @@ impl<'a> ModuleGraphBuilder<'a> {
             module_sources: BTreeMap::new(),
             timings: None,
             interrupt: None,
+            entry_is_program: true,
         }
+    }
+
+    /// The entry is a module something imported, not the program itself, so
+    /// the exemption that keeps a named program a module does not apply to it:
+    /// a CommonJS file reached this way is presented the way an `import` of
+    /// one is anywhere else in the graph.
+    fn imported(mut self) -> Self {
+        self.entry_is_program = false;
+        self
     }
 
     fn new_profiled(
@@ -386,7 +399,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         // neither does the entry: a caller that asked for a module graph named
         // its entry, and a module with no imports and no exports is still the
         // module it asked for.
-        let is_entry = url == self.entry_url;
+        let is_entry = self.entry_is_program && url == self.entry_url;
         // `package.json#type: module` makes a `.js` file in that scope an ES
         // module regardless of what syntax it happens to use, which is how a
         // module with neither imports nor exports still loads as one.
@@ -1556,7 +1569,23 @@ pub struct LinkedProgram {
 /// - <https://tc39.es/ecma262/#sec-link>
 /// - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedProgram, GraphError> {
-    load_program_inner(loader, entry_path, None, None).map(|(linked, _)| linked)
+    load_program_inner(loader, entry_path, None, None, true).map(|(linked, _)| linked)
+}
+
+/// Load and link the graph rooted at a module an `import()` named.
+///
+/// Same work as [`load_program`], except that the root is a module being
+/// imported: a CommonJS file there gets the interop namespace an `import` of
+/// one gets anywhere else, rather than being read as the module a caller named
+/// on the command line.
+///
+/// # Errors
+/// See [`GraphError`].
+pub fn load_imported_module(
+    loader: &ModuleLoader,
+    entry_path: &Path,
+) -> Result<LinkedProgram, GraphError> {
+    load_program_inner(loader, entry_path, None, None, false).map(|(linked, _)| linked)
 }
 
 pub(crate) fn load_program_interruptible(
@@ -1564,7 +1593,7 @@ pub(crate) fn load_program_interruptible(
     entry_path: &Path,
     interrupt: otter_vm::InterruptFlag,
 ) -> Result<LinkedProgram, GraphError> {
-    load_program_inner(loader, entry_path, None, Some(interrupt)).map(|(linked, _)| linked)
+    load_program_inner(loader, entry_path, None, Some(interrupt), true).map(|(linked, _)| linked)
 }
 
 /// Load and link a module graph from an already-available entry source.
@@ -1628,6 +1657,7 @@ pub fn load_program_profiled(
         entry_path,
         Some(ModulePhaseTimings::default()),
         None,
+        true,
     )?;
     Ok((linked, timings.expect("profiled graph carries timings")))
 }
@@ -1637,6 +1667,7 @@ fn load_program_inner(
     entry_path: &Path,
     mut timings: Option<ModulePhaseTimings>,
     interrupt: Option<otter_vm::InterruptFlag>,
+    entry_is_program: bool,
 ) -> Result<(LinkedProgram, Option<ModulePhaseTimings>), GraphError> {
     // Read the entry directly so the user sees clear errors when
     // the entry path is malformed before any specifier-resolution
@@ -1678,6 +1709,11 @@ fn load_program_inner(
             ModuleGraphBuilder::new_profiled(loader, entry_url, entry_kind, entry_text, timings)
         }
         None => ModuleGraphBuilder::new(loader, entry_url, entry_kind, entry_text),
+    };
+    let builder = if entry_is_program {
+        builder
+    } else {
+        builder.imported()
     };
     let builder = match interrupt {
         Some(interrupt) => builder.with_interrupt(interrupt),

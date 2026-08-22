@@ -122,7 +122,10 @@ pub(crate) fn install_global(
                     // Node's default title is the spawn path (`--title`
                     // overrides it); a plain writable property is enough
                     // until a real setproctitle lands.
-                    ("title", process_title.unwrap_or(snapshot.exec_path.as_str())),
+                    (
+                        "title",
+                        process_title.unwrap_or(snapshot.exec_path.as_str()),
+                    ),
                     ("platform", node_platform()),
                     ("arch", node_arch()),
                     ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
@@ -693,14 +696,46 @@ fn define_method_on(
     scope.define(target, name, value, Attr::builtin_function().to_flags())
 }
 
+/// The bytes a chunk stands for.
+///
+/// A standard stream carries bytes, not text: a `Buffer` — or any other buffer
+/// source — reaches the descriptor exactly as it was written, because what is
+/// on the other end may be a program reading a binary protocol rather than a
+/// terminal. Anything else is the UTF-8 of its string.
+fn write_chunk_bytes(ctx: &mut NativeCtx<'_>, args: &[otter_vm::Value]) -> Vec<u8> {
+    if let Some(value) = args.first().copied() {
+        if let Some(view) = value.as_typed_array(ctx.heap()) {
+            let heap = ctx.heap();
+            let offset = view.byte_offset(heap);
+            let length = view.byte_length(heap);
+            return view
+                .buffer(heap)
+                .with_bytes(heap, |bytes| bytes[offset..offset + length].to_vec());
+        }
+        if let Some(view) = value.as_data_view() {
+            let heap = ctx.heap();
+            let offset = view.byte_offset(heap);
+            let length = view.byte_length(heap);
+            return view
+                .buffer(heap)
+                .with_bytes(heap, |bytes| bytes[offset..offset + length].to_vec());
+        }
+        if let Some(buffer) = value.as_array_buffer() {
+            let heap = ctx.heap();
+            return buffer.with_bytes(heap, <[u8]>::to_vec);
+        }
+    }
+    crate::runtime_arg_to_string(args, 0, ctx.heap()).into_bytes()
+}
+
 fn stdout_write(
     ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     use std::io::Write;
-    let text = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    let bytes = write_chunk_bytes(ctx, args);
     let mut out = std::io::stdout();
-    let _ = out.write_all(text.as_bytes());
+    let _ = out.write_all(&bytes);
     let _ = out.flush();
     Ok(Value::boolean(true))
 }
@@ -710,13 +745,12 @@ fn stderr_write(
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     use std::io::Write;
-    let text = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    let bytes = write_chunk_bytes(ctx, args);
     let mut err = std::io::stderr();
-    let _ = err.write_all(text.as_bytes());
+    let _ = err.write_all(&bytes);
     let _ = err.flush();
     Ok(Value::boolean(true))
 }
-
 
 pub(crate) fn define_process_method(
     scope: &mut NativeScope<'_, '_>,

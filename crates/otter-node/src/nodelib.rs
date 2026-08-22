@@ -162,6 +162,8 @@ nodelib_module!(internal_modules_esm_loader, "internal/modules/esm/loader", comp
 nodelib_module!(internal_modules_cjs_loader, "internal/modules/cjs/loader", compat "nodelib/compat/internal_modules_cjs_loader.js");
 nodelib_module!(internal_modules_customization_hooks, "internal/modules/customization_hooks", compat "nodelib/compat/internal_modules_customization_hooks.js");
 nodelib_module!(node_test_vendored, "node:test", vendored "nodelib/test.js");
+nodelib_module!(node_test_reporters, "node:test/reporters", vendored "nodelib/test_reporters.js");
+nodelib_module!(internal_main_test_runner, "internal/main/test_runner", compat "nodelib/compat/internal_main_test_runner.js");
 nodelib_module!(internal_assert_utils, "internal/assert/utils", vendored "nodelib/internal/assert/utils.js");
 nodelib_module!(internal_assert_assertion_error, "internal/assert/assertion_error", vendored "nodelib/internal/assert/assertion_error.js");
 nodelib_module!(internal_test_runner_assert, "internal/test_runner/assert", vendored "nodelib/internal/test_runner/assert.js");

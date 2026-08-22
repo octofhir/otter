@@ -138,7 +138,6 @@ pub use hooks::{
     RuntimeResolveRequest, default_check_capability, default_compile_source,
 };
 pub use ipc::{CarriedHandles, IpcChannel, IpcEvent};
-pub use process::node_platform;
 pub use otter_compiler::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
     CompiledSourceSpan, LiveBindingSlot,
@@ -159,6 +158,7 @@ pub use otter_vm::{
     JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,
 };
 pub use otter_vm::{NativeCtx, NativeError, Value, marshal};
+pub use process::node_platform;
 pub use realm::{RuntimeExtensionContext, RuntimeGlobalValue, RuntimeRealmContext, RuntimeRealmId};
 // Embedder-driven event loop. `Runtime::install_timer_scheduler`,
 // `install_host_completion_sink`, and `install_dynamic_import_loader`
@@ -1848,6 +1848,17 @@ impl RuntimeModuleGraphState {
         Ok(linked)
     }
 
+    fn load_imported_module(
+        &mut self,
+        loader: &module_loader::ModuleLoader,
+        entry_path: &Path,
+    ) -> Result<module_graph::LinkedProgram, module_graph::GraphError> {
+        let linked = module_graph::load_imported_module(loader, entry_path)?;
+        self.last_entry_url = Some(linked.entry_url.clone());
+        self.last_module_count = linked.module.module_inits.len();
+        Ok(linked)
+    }
+
     fn load_program_profiled(
         &mut self,
         loader: &module_loader::ModuleLoader,
@@ -3508,22 +3519,12 @@ impl Runtime {
     ) -> Result<DynamicImportBegin, OtterError> {
         use std::path::PathBuf;
 
-        let referrer_opt = (!referrer.is_empty()).then_some(referrer);
-        let entry_for_loader = match referrer_opt {
-            Some(url) if module_loader::is_http_url(url) => PathBuf::from("."),
-            Some(url) => url_to_path(url).ok_or_else(|| OtterError::Runtime {
-                diagnostic: Box::new(Diagnostic::new(
-                    DiagnosticKind::Type,
-                    DiagnosticCode::TypeError,
-                    format!("dynamic import: referrer is not a file:// URL: \"{url}\""),
-                )),
-            })?,
-            None => std::env::current_dir().map_err(|error| OtterError::Io {
+        let (entry_for_loader, referrer_opt) =
+            dynamic_import_origin(referrer).map_err(|error| OtterError::Io {
                 path: PathBuf::from("."),
                 kind: IoErrorKind::from_std(error.kind()),
                 message: error.to_string(),
-            })?,
-        };
+            })?;
         let loader = self.module_loader_for_entry(&entry_for_loader);
         let target_url = match loader.resolve(specifier, referrer_opt) {
             Ok(url) => url,
@@ -3562,7 +3563,7 @@ impl Runtime {
         })?;
         let linked = self
             .module_graph
-            .load_program(&loader, &target_path)
+            .load_imported_module(&loader, &target_path)
             .map_err(map_graph_error)?;
         self.complete_dynamic_import_prepared_in_extra_realm(token, &target_url, Ok(linked))?;
         Ok(DynamicImportBegin::Settled)
@@ -3678,22 +3679,9 @@ impl Runtime {
         referrer: &str,
     ) -> Result<DynamicModuleLoad, DynLoadError> {
         use std::path::PathBuf;
-        let referrer_opt = if referrer.is_empty() {
-            None
-        } else {
-            Some(referrer)
-        };
-        let entry_for_loader: PathBuf = match referrer_opt {
-            Some(url) if module_loader::is_http_url(url) => PathBuf::from("."),
-            Some(url) => url_to_path(url).ok_or_else(|| {
-                DynLoadError::type_error(format!(
-                    "dynamic import: referrer is not a file:// URL: \"{url}\""
-                ))
-            })?,
-            None => std::env::current_dir().map_err(|e| {
-                DynLoadError::type_error(format!("dynamic import: cwd lookup failed: {e}"))
-            })?,
-        };
+        let (entry_for_loader, referrer_opt) = dynamic_import_origin(referrer).map_err(|e| {
+            DynLoadError::type_error(format!("dynamic import: cwd lookup failed: {e}"))
+        })?;
         let loader = self.module_loader_for_entry(&entry_for_loader);
         let target_url = loader.resolve(specifier, referrer_opt).map_err(|e| {
             DynLoadError::type_error(format!(
@@ -3749,7 +3737,7 @@ impl Runtime {
         })?;
         let linked = self
             .module_graph
-            .load_program(&loader, &target_path)
+            .load_imported_module(&loader, &target_path)
             .map_err(|e| {
                 DynLoadError::from_graph_error(
                     &e,
@@ -6766,6 +6754,26 @@ pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &
             message: "unknown compiler error variant".to_string(),
         },
     }
+}
+
+/// Where a dynamic `import()` resolves its specifier from: the file the
+/// loader is built for, and the referrer a relative specifier is relative to.
+///
+/// A referrer naming a file — or a document fetched over HTTP — resolves
+/// against itself. Anything else (`<eval>`, a hosted builtin, a synthesized
+/// wrapper) has no file of its own, so a specifier written there resolves the
+/// way Node resolves one written under `--eval`: as though it were written in
+/// a file sitting in the working directory.
+fn dynamic_import_origin(referrer: &str) -> std::io::Result<(std::path::PathBuf, Option<&str>)> {
+    if !referrer.is_empty() {
+        if module_loader::is_http_url(referrer) {
+            return Ok((std::path::PathBuf::from("."), Some(referrer)));
+        }
+        if let Some(path) = url_to_path(referrer) {
+            return Ok((path, Some(referrer)));
+        }
+    }
+    std::env::current_dir().map(|cwd| (cwd.join("[eval]"), None))
 }
 
 /// Convert a `file://` URL back into a filesystem path. Returns

@@ -843,6 +843,22 @@ pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool 
             }
             oxc_ast_visit::walk::walk_await_expression(self, it);
         }
+        fn visit_for_of_statement(&mut self, it: &oxc_ast::ast::ForOfStatement<'a>) {
+            // `for await (… of …)` awaits every step of the iteration, so a
+            // module whose top level writes one is asynchronous for the same
+            // reason a bare `await` makes it one.
+            if self.depth == 0 && it.r#await {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_for_of_statement(self, it);
+        }
+        fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+            // `await using x = …` awaits the disposal it registers.
+            if self.depth == 0 && it.kind == oxc_ast::ast::VariableDeclarationKind::AwaitUsing {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_variable_declaration(self, it);
+        }
     }
     let mut finder = AwaitFinder::default();
     for stmt in stmts {

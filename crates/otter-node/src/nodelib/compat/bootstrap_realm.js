@@ -311,6 +311,21 @@ const privateSymbols = {
 };
 
 const bindings = {
+  // `internalBinding('process_methods')` — where Node hangs the members of
+  // `process` its C++ owns. This runtime builds `process` carrying them, so
+  // the patch has nothing left to install.
+  process_methods: {
+    patchProcessObject() {},
+  },
+  // `internalBinding('performance')` — the milestones bootstrap stamps on the
+  // timeline `perf_hooks` reports. The module is asked for only when a
+  // milestone is reached, so reaching one never drags it into a snapshot.
+  performance: {
+    markBootstrapComplete() {
+      const { performance } = require('perf_hooks');
+      performance.nodeTiming.bootstrapComplete = performance.now();
+    },
+  },
   // `internalBinding('errors')` — the exit codes Node's own C++ names, as
   // the JavaScript that reads them expects to find them.
   errors: {

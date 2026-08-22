@@ -76,14 +76,42 @@ const explicit = {
   IteratorPrototype: Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
   SafeMap, SafeSet, SafeWeakMap, SafeWeakSet, SafeWeakRef,
   SafeFinalizationRegistry, SafeArrayIterator, SafeStringIterator,
-  SafePromiseAll: PromiseAll,
-  SafePromiseAllReturnVoid: async (v) => { await Promise.all(v); },
-  SafePromiseAllReturnArrayLike: PromiseAll,
-  SafePromiseAllSettled: (v) => Promise.allSettled(v),
-  SafePromiseAllSettledReturnVoid: async (v) => { await Promise.allSettled(v); },
+  // Each of these takes an optional mapping function applied to every entry —
+  // the caller passes what to do with each item, not a list of promises it
+  // already built. Ignoring that hands the caller its own input back.
+  SafePromiseAll: (list, mapFn) =>
+    Promise.all(mapFn == null ? list : Array.from(list, (v, i) => mapFn(v, i))),
+  SafePromiseAllReturnVoid: async (list, mapFn) => {
+    await Promise.all(mapFn == null ? list : Array.from(list, (v, i) => mapFn(v, i)));
+  },
+  SafePromiseAllReturnArrayLike: (list, mapFn) =>
+    Promise.all(mapFn == null ? list : Array.from(list, (v, i) => mapFn(v, i))),
+  SafePromiseAllSettled: (list, mapFn) =>
+    Promise.allSettled(mapFn == null ? list : Array.from(list, (v, i) => mapFn(v, i))),
+  SafePromiseAllSettledReturnVoid: async (list, mapFn) => {
+    await Promise.allSettled(mapFn == null ? list : Array.from(list, (v, i) => mapFn(v, i)));
+  },
   SafePromiseRace: (v) => Promise.race(v),
   SafePromisePrototypeFinally: (promise, onFinally) => promise.finally(onFinally),
   PromisePrototypeCatch: (promise, onRejected) => promise.catch(onRejected),
+  // Pin the pattern's own `Symbol.match`/`replace`/`search`/`split` and its
+  // `constructor` to the originals, so a pattern the runtime uses internally
+  // keeps behaving as one however `RegExp.prototype` was meddled with.
+  hardenRegExp: (pattern) => {
+    const proto = RegExp.prototype;
+    for (const well of [Symbol.match, Symbol.matchAll, Symbol.replace, Symbol.search, Symbol.split]) {
+      const original = proto[well];
+      if (typeof original === 'function') {
+        Object.defineProperty(pattern, well, { configurable: true, value: original });
+      }
+    }
+    Object.defineProperty(pattern, 'constructor', { configurable: true, value: RegExp });
+    for (const name of ['dotAll', 'flags', 'global', 'hasIndices', 'ignoreCase', 'multiline',
+      'source', 'sticky', 'unicode']) {
+      Object.defineProperty(pattern, name, { configurable: true, value: pattern[name] });
+    }
+    return pattern;
+  },
   // `queueMicrotask` rides along for files that pull it from primordials.
   queueMicrotask: globalThis.queueMicrotask,
 };
@@ -397,6 +425,19 @@ const bindings = {
     trace: {},
   },
   util: {
+    // Where the caller of the function that asked was written: `[line, column,
+    // file]`. The test runner stamps it on every test and hook so a report can
+    // point at the declaration rather than at the runner.
+    getCallerLocation() {
+      const stack = new Error().stack ?? '';
+      const frames = stack.split('\n').slice(1);
+      // 0 is this function, 1 is whoever called it; 2 is that one's caller,
+      // which is the site being asked about.
+      const frame = frames[2] ?? frames[frames.length - 1] ?? '';
+      const match = /\(?([^()]+):(\d+):(\d+)\)?\s*$/.exec(frame.trim());
+      if (match === null) return [0, 0, ''];
+      return [Number(match[2]), Number(match[3]), match[1]];
+    },
     privateSymbols,
     ...privateSymbols,
     constants: {

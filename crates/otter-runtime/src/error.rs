@@ -36,6 +36,15 @@ pub enum OtterError {
         /// Specific configuration problem.
         reason: ConfigError,
     },
+    /// The command, or the project it ran in, asked for something that does not
+    /// hold — a missing file, an empty selection, two switches that contradict
+    /// each other. It says what is wrong and nothing else: none of the prefixes
+    /// the runtime's own failures carry apply to it.
+    #[error("{message}")]
+    Usage {
+        /// What is wrong, phrased for whoever typed the command.
+        message: String,
+    },
     /// An opaque realm id does not belong to this runtime or is no longer live.
     #[error("invalid runtime realm: {reason}")]
     Realm {
@@ -179,6 +188,7 @@ impl OtterError {
         match self {
             OtterError::Compile { .. } | OtterError::Runtime { .. } => 1,
             OtterError::Config { .. }
+            | OtterError::Usage { .. }
             | OtterError::Realm { .. }
             | OtterError::HostedModule { .. }
             | OtterError::SourceKind { .. }

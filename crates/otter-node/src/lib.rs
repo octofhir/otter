@@ -42,7 +42,6 @@ pub mod internal_test_binding_ext;
 pub mod misc_modules;
 pub mod napi;
 pub mod net;
-pub mod node_test;
 mod nodelib;
 pub mod os;
 pub mod querystring;
@@ -106,8 +105,43 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("events", nodelib::node_events_with_process_graft),
     HostedModule::new_with_cjs_value("node:os", os::install_os_module, os::os_cjs_value),
     HostedModule::new_with_cjs_value("os", os::install_os_module, os::os_cjs_value),
-    HostedModule::cjs_only("node:test", node_test::node_test_cjs_value),
-    HostedModule::cjs_only("test", node_test::node_test_cjs_value),
+    HostedModule::cjs_only("internal/modules/esm/loader", nodelib::internal_modules_esm_loader),
+    HostedModule::cjs_only("internal/modules/cjs/loader", nodelib::internal_modules_cjs_loader),
+    HostedModule::cjs_only(
+        "internal/modules/customization_hooks",
+        nodelib::internal_modules_customization_hooks,
+    ),
+    HostedModule::cjs_only("internal/errors/error_source", nodelib::internal_errors_error_source),
+    HostedModule::cjs_only("internal/error_serdes", nodelib::internal_error_serdes),
+    HostedModule::cjs_only("internal/watch_mode/files_watcher", nodelib::internal_watch_mode_files_watcher),
+    HostedModule::cjs_only("internal/process/pre_execution", nodelib::internal_process_pre_execution),
+    HostedModule::cjs_only("node:test", nodelib::node_test_vendored),
+    HostedModule::cjs_only("test", nodelib::node_test_vendored),
+    HostedModule::cjs_only("internal/assert/utils", nodelib::internal_assert_utils),
+    HostedModule::cjs_only(
+        "internal/assert/assertion_error",
+        nodelib::internal_assert_assertion_error,
+    ),
+    HostedModule::cjs_only("internal/test_runner/assert", nodelib::internal_test_runner_assert),
+    HostedModule::cjs_only("internal/test_runner/coverage", nodelib::internal_test_runner_coverage),
+    HostedModule::cjs_only("internal/test_runner/harness", nodelib::internal_test_runner_harness),
+    HostedModule::cjs_only("internal/test_runner/runner", nodelib::internal_test_runner_runner),
+    HostedModule::cjs_only("internal/test_runner/snapshot", nodelib::internal_test_runner_snapshot),
+    HostedModule::cjs_only("internal/test_runner/tag_filter", nodelib::internal_test_runner_tag_filter),
+    HostedModule::cjs_only("internal/test_runner/test", nodelib::internal_test_runner_test),
+    HostedModule::cjs_only("internal/test_runner/tests_stream", nodelib::internal_test_runner_tests_stream),
+    HostedModule::cjs_only("internal/test_runner/utils", nodelib::internal_test_runner_utils),
+    HostedModule::cjs_only("internal/test_runner/mock/loader", nodelib::internal_test_runner_mock_loader),
+    HostedModule::cjs_only("internal/test_runner/mock/mock", nodelib::internal_test_runner_mock_mock),
+    HostedModule::cjs_only("internal/test_runner/mock/mock_timers", nodelib::internal_test_runner_mock_mock_timers),
+    HostedModule::cjs_only("internal/test_runner/reporter/dot", nodelib::internal_test_runner_reporter_dot),
+    HostedModule::cjs_only("internal/test_runner/reporter/junit", nodelib::internal_test_runner_reporter_junit),
+    HostedModule::cjs_only("internal/test_runner/reporter/lcov", nodelib::internal_test_runner_reporter_lcov),
+    HostedModule::cjs_only("internal/test_runner/reporter/rerun", nodelib::internal_test_runner_reporter_rerun),
+    HostedModule::cjs_only("internal/test_runner/reporter/spec", nodelib::internal_test_runner_reporter_spec),
+    HostedModule::cjs_only("internal/test_runner/reporter/tap", nodelib::internal_test_runner_reporter_tap),
+    HostedModule::cjs_only("internal/test_runner/reporter/utils", nodelib::internal_test_runner_reporter_utils),
+    HostedModule::cjs_only("internal/test_runner/reporter/v8-serializer", nodelib::internal_test_runner_reporter_v8_serializer),
     HostedModule::cjs_only("node:stream", nodelib::node_stream),
     HostedModule::cjs_only("node:stream/web", stream::stream_web_cjs_value),
     HostedModule::cjs_only("stream/web", stream::stream_web_cjs_value),
@@ -262,6 +296,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/http", nodelib::internal_http),
     HostedModule::cjs_only("internal/http_parser", nodelib::internal_http_parser),
     HostedModule::cjs_only("internal/timers", nodelib::internal_timers),
+    HostedModule::cjs_only("internal/otter/timers_lists", nodelib::internal_otter_timers_lists),
     HostedModule::cjs_only("internal/perf/observe", nodelib::internal_perf_observe),
     HostedModule::cjs_only("internal/net", nodelib::internal_net),
     HostedModule::cjs_only(

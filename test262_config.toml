@@ -2,7 +2,7 @@
 # This file configures the test262 conformance test runner.
 
 # Path to the test262 directory (relative to project root)
-# test262_path = "tests/test262"
+# test262_path = "vendor/test262"
 
 # Pin test262 to a specific commit (optional)
 # test262_commit = "abc123..."

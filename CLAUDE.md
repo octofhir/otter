@@ -32,11 +32,12 @@ just test262-filter "Array/prototype/map"
 ```
 
 Current fast-path CLI surface:
-- enabled: `run`, direct file execution, `-e`, `-p`, package-management commands
+- enabled: `run`, direct file execution, `-e`, `-p`, `test` (the hosted
+  `node:test` runner), package-management commands
 - also enabled: `watch` (restart on change), `x` / `dlx` and the `otterx`
   binary (run a package binary), `doctor` (stale tree + undeclared imports),
   `approve-builds` (dependency install-script approvals)
-- disabled: `repl`, `test`, `build`
+- disabled: `repl`, `build`
 
 Install security is deny-by-default and configured in
 `package.json#otter.install`: dependency lifecycle scripts run only for

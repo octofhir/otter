@@ -16,9 +16,58 @@ const defaults = new Map([
   ['--experimental-stream-iter', false],
   ['--network-family-autoselection', true],
   ['--network-family-autoselection-attempt-timeout', 500],
+  // The test runner's switches, with the values Node gives them when the
+  // switch is absent. A list-valued switch answers an empty list, never
+  // nothing: the runner counts them without checking first.
+  ['--test', false],
+  ['--test-concurrency', 0],
+  ['--test-force-exit', false],
+  ['--test-global-setup', undefined],
+  ['--test-isolation', 'process'],
+  ['--test-name-pattern', []],
+  ['--test-only', false],
+  ['--test-random-seed', 0],
+  ['--test-randomize', false],
+  ['--test-reporter', []],
+  ['--test-reporter-destination', []],
+  ['--test-rerun-failures', undefined],
+  ['--test-shard', undefined],
+  ['--test-skip-pattern', []],
+  ['--test-timeout', 0],
+  ['--test-update-snapshots', false],
+  ['--test-coverage-branches', 0],
+  ['--test-coverage-exclude', []],
+  ['--test-coverage-functions', 0],
+  ['--test-coverage-include', []],
+  ['--test-coverage-lines', 0],
+  ['--experimental-test-coverage', false],
+  ['--experimental-test-module-mocks', false],
+  ['--experimental-test-tag-filter', []],
+  ['--enable-source-maps', false],
+  ['--import', []],
+  ['--strip-types', false],
+  ['--watch', false],
 ]);
 
-const values = new Map(defaults);
+// Switches whose value is a list: repeating one adds to it.
+const listValued = new Set([
+  '--test-name-pattern',
+  '--test-skip-pattern',
+  '--test-reporter',
+  '--test-reporter-destination',
+  '--test-coverage-exclude',
+  '--test-coverage-include',
+  '--experimental-test-tag-filter',
+  '--import',
+]);
+
+// A fresh list per switch, so appending to one never shows up in another run's.
+const values = new Map();
+for (const [name, value] of defaults) {
+  values.set(name, Array.isArray(value) ? [] : value);
+}
+// Whether a seed was given at all, which the runner asks about separately.
+values.set('[has_test_random_seed]', false);
 
 for (const argument of (typeof process === 'object' && process?.execArgv) || []) {
   const equals = argument.indexOf('=');
@@ -34,11 +83,25 @@ for (const argument of (typeof process === 'object' && process?.execArgv) || [])
   }
   if (!defaults.has(name)) continue;
   const text = argument.slice(equals + 1);
-  values.set(name, typeof defaults.get(name) === 'number' ? Number(text) : text);
+  if (listValued.has(name)) {
+    values.get(name).push(text);
+  } else {
+    values.set(name, typeof defaults.get(name) === 'number' ? Number(text) : text);
+  }
+  if (name === '--test-random-seed') values.set('[has_test_random_seed]', true);
 }
 
 module.exports = {
   getOptionValue(name) { return values.get(name); },
+  // The switches this process was started with, as a list — what a child
+  // process has to be started with to run the same way. That list is
+  // `process.execArgv`.
+  getOptionsAsFlagsFromBinding() {
+    return [...((typeof process === 'object' && process?.execArgv) || [])];
+  },
+  getEmbedderOptions() {
+    return { shouldNotRegisterESMLoader: false, noGlobalSearchPaths: false, hasEmbedderPreload: false };
+  },
   options: new Map(),
   aliases: new Map(),
 };

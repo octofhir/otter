@@ -3329,11 +3329,12 @@ fn pm_io_error(path: &Path, err: std::io::Error) -> OtterError {
     pm_config_error(format!("I/O failed for `{}`: {err}", path.display()))
 }
 
+/// The command, or the project it ran in, asked for something that does not
+/// hold. Nothing about it is a runtime configuration problem, so it carries
+/// none of that wording.
 pub(crate) fn pm_config_error(message: impl Into<String>) -> OtterError {
-    OtterError::Config {
-        reason: otter_runtime::ConfigError::ConflictingCapabilities {
-            message: message.into(),
-        },
+    OtterError::Usage {
+        message: message.into(),
     }
 }
 
@@ -4794,7 +4795,7 @@ export let value = inner;
         assert_error_snapshot(
             &install,
             "package install failure",
-            "config",
+            "usage",
             "package.json",
         );
     }

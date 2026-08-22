@@ -1742,6 +1742,18 @@ impl Interpreter {
         recv_value: Value,
         name: &str,
     ) -> Result<bool, VmError> {
+        // A class keeps its statics on a side object, not on the constructor
+        // it wraps, so a static named like a `Function.prototype` method is
+        // only found by looking there. Missing it hands `C.bind(…)` to
+        // `Function.prototype.bind`, which then calls the class without `new`.
+        if let Some(class) = recv_value.as_class_constructor() {
+            let statics = class.statics(&self.gc_heap);
+            if crate::object::get_own_descriptor(statics, &self.gc_heap, name).is_some() {
+                return Ok(true);
+            }
+            let ctor = class.ctor(&self.gc_heap);
+            return self.callable_has_own_function_method_shadow(context, ctor, name);
+        }
         if let Some(function_id) = recv_value.as_function().or_else(|| {
             recv_value
                 .as_closure(&self.gc_heap)

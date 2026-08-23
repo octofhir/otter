@@ -191,17 +191,14 @@ pub enum RegExpError {
         /// Matcher diagnostic.
         message: String,
     },
-    /// Flag string contained a character outside `"dgimsuvy"`.
-    #[error("invalid regular expression flag `{flag}`")]
-    InvalidFlag {
-        /// The offending character.
-        flag: char,
-    },
-    /// Same flag was specified twice.
-    #[error("duplicate regular expression flag `{flag}`")]
-    DuplicateFlag {
-        /// The repeated flag.
-        flag: char,
+    /// Flag string held a character outside `"dgimsuvy"`, repeated a
+    /// flag, or combined the mutually exclusive `u` and `v`. All three
+    /// are one message in JS engines, which name the whole flag string
+    /// rather than the offending character.
+    #[error("Invalid flags supplied to RegExp constructor '{flags}'")]
+    InvalidFlags {
+        /// The flag string as written.
+        flags: String,
     },
     /// The GC heap refused the regex body allocation.
     #[error("regular expression allocation failed")]
@@ -248,7 +245,7 @@ pub struct RegExpFlags {
 
 impl RegExpFlags {
     /// Parse the canonical ASCII flag string. Order does not matter;
-    /// duplicate flags raise [`RegExpError::DuplicateFlag`].
+    /// duplicate flags raise [`RegExpError::InvalidFlags`].
     ///
     /// Supported flags: `d g i m s u v y`. Per §22.2.4
     /// [`RegExp Pattern Flags`](https://tc39.es/ecma262/#sec-patterns-static-semantics-early-errors)
@@ -266,15 +263,23 @@ impl RegExpFlags {
                 'u' => &mut out.unicode,
                 'v' => &mut out.unicode_sets,
                 'y' => &mut out.sticky,
-                other => return Err(RegExpError::InvalidFlag { flag: other }),
+                _ => {
+                    return Err(RegExpError::InvalidFlags {
+                        flags: flags.to_string(),
+                    });
+                }
             };
             if *slot {
-                return Err(RegExpError::DuplicateFlag { flag: c });
+                return Err(RegExpError::InvalidFlags {
+                    flags: flags.to_string(),
+                });
             }
             *slot = true;
         }
         if out.unicode && out.unicode_sets {
-            return Err(RegExpError::InvalidFlag { flag: 'v' });
+            return Err(RegExpError::InvalidFlags {
+                flags: flags.to_string(),
+            });
         }
         Ok(out)
     }
@@ -743,7 +748,7 @@ mod tests {
     fn flags_reject_duplicate() {
         assert!(matches!(
             RegExpFlags::parse("gg"),
-            Err(RegExpError::DuplicateFlag { flag: 'g' })
+            Err(RegExpError::InvalidFlags { ref flags }) if flags == "gg"
         ));
     }
 
@@ -751,7 +756,7 @@ mod tests {
     fn flags_reject_unknown() {
         assert!(matches!(
             RegExpFlags::parse("z"),
-            Err(RegExpError::InvalidFlag { flag: 'z' })
+            Err(RegExpError::InvalidFlags { ref flags }) if flags == "z"
         ));
     }
 

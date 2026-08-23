@@ -667,10 +667,7 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                     &flags_text,
                 )
             })
-            .map_err(|error| NativeError::SyntaxError {
-                name: "RegExp",
-                reason: format!("{error}"),
-            })?;
+            .map_err(regexp_error_to_syntax_error)?;
         let re = scope.value(Value::regexp(re));
 
         // `GetPrototypeFromConstructor(newTarget, ...)` is observable for a
@@ -881,20 +878,22 @@ fn compile_flags_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<Str
     )
 }
 
+/// Render a compile failure the way the language quotes it: both the
+/// pattern and the flag diagnostics are messages JS engines emit
+/// verbatim, so neither carries a native-name prefix.
 fn regexp_error_to_syntax_error(err: crate::regexp::RegExpError) -> NativeError {
-    NativeError::SyntaxError {
-        name: "RegExp.prototype.compile",
-        reason: match err {
-            crate::regexp::RegExpError::InvalidPattern { message } => {
-                format!("invalid regular expression: {message}")
-            }
-            crate::regexp::RegExpError::InvalidFlag { flag } => {
-                format!("invalid regular expression flag `{flag}`")
-            }
-            crate::regexp::RegExpError::DuplicateFlag { flag } => {
-                format!("duplicate regular expression flag `{flag}`")
-            }
-            crate::regexp::RegExpError::OutOfMemory => "out of memory".to_string(),
+    match err {
+        crate::regexp::RegExpError::OutOfMemory => NativeError::SyntaxError {
+            name: "RegExp",
+            reason: "out of memory".to_string(),
+        },
+        crate::regexp::RegExpError::InvalidPattern { message } => NativeError::SpecError {
+            kind: crate::error_classes::ErrorKind::SyntaxError,
+            message: format!("Invalid regular expression: {message}"),
+        },
+        crate::regexp::RegExpError::InvalidFlags { flags } => NativeError::SpecError {
+            kind: crate::error_classes::ErrorKind::SyntaxError,
+            message: format!("Invalid flags supplied to RegExp constructor '{flags}'"),
         },
     }
 }

@@ -908,12 +908,21 @@ fn process_exit(
     ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let this_value = *ctx.this_value();
+    // `process.exit()` with no argument leaves with whatever
+    // `process.exitCode` holds; only an argument overrides it. Node reads
+    // the call's arity for this, so `exit(undefined)` still means zero.
+    let value = match args.first() {
+        Some(value) => *value,
+        None => this_value
+            .as_object()
+            .and_then(|process| otter_vm::object::get(process, ctx.heap(), EXIT_CODE_SLOT))
+            .unwrap_or_else(Value::undefined),
+    };
     let code = normalize_exit_code(&value, ctx.heap()).ok_or_else(|| NativeError::TypeError {
         name: "process.exit",
         reason: "exit code must be a finite number between 0 and 255".to_string(),
     })?;
-    let this_value = *ctx.this_value();
     ctx.scope(|mut scope| {
         let process = scope.value(this_value);
         let code_value = scope.number(f64::from(code));

@@ -3434,7 +3434,9 @@ impl Runtime {
                 // completion; their settlement reactions settle the
                 // import token, and the same drain delivers the
                 // import promise's own reactions.
-                if let Err(err) = self.interp.drain_microtasks_with_default(Some(context)) {
+                if let Err(err) = self.interp.drain_microtasks_with_default(Some(context))
+                    && !self.absorb_termination(&err)
+                {
                     return Err(enrich_runtime_diagnostic_with_cause(
                         &mut self.interp,
                         map_vm_error(err),
@@ -3642,7 +3644,9 @@ impl Runtime {
     ) -> Result<bool, OtterError> {
         let settled_context = self.interp.settle_dynamic_import(token, reaction_outcome);
         if let Some(context) = settled_context {
-            if let Err(err) = self.interp.drain_microtasks_with_default(Some(context)) {
+            if let Err(err) = self.interp.drain_microtasks_with_default(Some(context))
+                && !self.absorb_termination(&err)
+            {
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
                     map_vm_error(err),
@@ -4136,6 +4140,20 @@ impl Runtime {
         }
         drain?;
         Ok(())
+    }
+
+    /// Record a termination raised by a drained microtask, if that is what
+    /// this error is.
+    ///
+    /// Every host boundary that drains has to ask: a termination is not a
+    /// diagnostic, and mapping one into an `OtterError` loses the exit —
+    /// the loop then runs on until its remaining work drains.
+    fn absorb_termination(&mut self, error: &otter_vm::RunError) -> bool {
+        if let otter_vm::VmError::Exit { code } = error.error {
+            self.pending_exit_code = Some(code);
+            return true;
+        }
+        false
     }
 
     /// Take an exit code requested by JavaScript during a host-driven
@@ -4987,6 +5005,7 @@ impl Runtime {
             if let Err(err) = self
                 .interp
                 .drain_microtasks_with_default(Some(context.clone()))
+                && !self.absorb_termination(&err)
             {
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
@@ -5721,6 +5740,12 @@ impl Runtime {
         loop {
             match self.interp.drain_microtasks(context) {
                 Ok(()) => return Ok(()),
+                // A termination is not an exception: it is never offered to
+                // `uncaughtException`. A listener claiming it would resume
+                // the drain and the run would continue past the point that
+                // asked to stop — which is what an installed handler did to
+                // every `process.exit()` raised from a microtask.
+                Err(error) if error.error.is_termination() => return Err(error),
                 Err(error) => {
                     // The failing task's context is still installed, which is
                     // where an active domain lives.

@@ -1917,6 +1917,12 @@ fn static_try_generic(
         let mut cap = cap_handles.current(interp, Some(exec.clone()));
         match call_result {
             Ok(value) => call_capability_resolve(interp, stack, &mut cap, value)?,
+            // A termination is not a value the capability can carry: it ends
+            // the run wherever it was raised.
+            Err(crate::VmError::Exit { code }) => {
+                return Err(crate::NativeError::Exit { code });
+            }
+            Err(crate::VmError::Interrupted) => return Err(crate::NativeError::Interrupted),
             Err(crate::VmError::Uncaught) => {
                 let reason = rejection_value_for(interp, &crate::VmError::Uncaught);
                 call_capability_reject(interp, stack, &mut cap, reason)?;

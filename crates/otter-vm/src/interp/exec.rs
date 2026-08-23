@@ -459,7 +459,7 @@ impl Interpreter {
                         Ok(())
                     }
                     Err(vm_err) => {
-                        if result_capability.is_some() {
+                        if result_capability.is_some() && !vm_err.is_termination() {
                             let reason =
                                 crate::promise_dispatch::rejection_value_for(self, &vm_err);
                             self.settle_microtask_capability(
@@ -498,7 +498,7 @@ impl Interpreter {
                     Ok(())
                 }
                 Err(vm_err) => {
-                    if result_capability.is_some() {
+                    if result_capability.is_some() && !vm_err.is_termination() {
                         // Reaction-mode: route the error into the
                         // downstream promise as a rejection rather
                         // than aborting the drain. If a sub-dispatch
@@ -544,7 +544,7 @@ impl Interpreter {
                     Ok(())
                 }
                 Err(vm_err) => {
-                    if result_capability.is_some() {
+                    if result_capability.is_some() && !vm_err.is_termination() {
                         let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
                             crate::promise_dispatch::rejection_value_for(self, &vm_err)
                         });
@@ -697,7 +697,7 @@ impl Interpreter {
                 Ok(())
             }
             Err(error) => {
-                if result_capability.is_some() {
+                if result_capability.is_some() && !error.is_termination() {
                     // Reaction-mode unwind: route the abrupt
                     // completion's [[Value]] into the downstream
                     // promise as a rejection per ECMA-262

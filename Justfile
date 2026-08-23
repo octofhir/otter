@@ -164,16 +164,21 @@ check-project project:
 
 # Run Test262 tests (all). Pass extra args: just test262 --filter foo
 # Uses otter-runtime (new VM). Writes JSON + Markdown reports under test262_results/.
+#
+# Optimized: an unoptimized engine is slow enough that the regular-expression
+# suites outrun the per-test budget and deep enough on the stack to abort, so
+# the whole `property-escapes` family reads as timeouts and crashes that say
+# nothing about conformance. The run is also five times shorter.
 test262 *args:
-    cargo run -p otter-test262 --bin otter-test262 -- run --output test262_results/run.json {{args}}
+    cargo run --release -p otter-test262 --bin otter-test262 -- run --output test262_results/run.json {{args}}
 
 # Run Test262 tests with filter (e.g., "literals")
 test262-filter filter:
-    cargo run -p otter-test262 --bin otter-test262 -- run --filter {{filter}} --output test262_results/run.json
+    cargo run --release -p otter-test262 --bin otter-test262 -- run --filter {{filter}} --output test262_results/run.json
 
 # Run Test262 for specific directory (e.g., "built-ins/Math")
 test262-dir dir:
-    cargo run -p otter-test262 --bin otter-test262 -- run --filter {{dir}} --output test262_results/run.json
+    cargo run --release -p otter-test262 --bin otter-test262 -- run --filter {{dir}} --output test262_results/run.json
 
 # Run full test262 in crash-safe batches, merge results, generate conformance doc
 test262-full *args:

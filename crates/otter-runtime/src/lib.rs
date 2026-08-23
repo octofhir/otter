@@ -545,8 +545,10 @@ impl GlobalClass {
 /// Default heap cap (2 GiB) when none is configured.
 pub const DEFAULT_MAX_HEAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Default per-`run_*` timeout (30 s) when none is configured.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-`run_*` timeout: none. A program runs until it is done,
+/// the way every other JavaScript runtime lets it; a caller that wants a
+/// wall clock asks for one with [`RuntimeBuilder::timeout`].
+pub const DEFAULT_TIMEOUT: Duration = Duration::ZERO;
 
 /// Default JS call-stack limit.
 pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
@@ -6009,8 +6011,8 @@ pub struct Otter {
 }
 
 impl Otter {
-    /// Construct with defaults: deny-all capabilities,
-    /// 256 MiB heap cap, 30 s timeout.
+    /// Construct with defaults: deny-all capabilities, a 256 MiB heap
+    /// cap, and no wall-clock limit.
     #[must_use]
     pub fn new() -> Self {
         Self::builder()

@@ -88,7 +88,8 @@ struct Cli {
     json: bool,
 
     /// Per-run wall-clock timeout in seconds. `0` disables the
-    /// timeout. Defaults to the runtime's 30-second limit.
+    /// timeout, which is also the default: a program runs until it
+    /// is done.
     #[arg(long = "timeout", value_name = "secs", global = true)]
     timeout_secs: Option<u64>,
 

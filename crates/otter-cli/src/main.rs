@@ -215,6 +215,11 @@ struct Cli {
     )]
     network_family_autoselection_attempt_timeout: Option<u32>,
 
+    /// How `--eval` source is read: `module` makes it an ES module, so it may
+    /// use `import` and top-level `await` (Node's `--input-type`).
+    #[arg(long = "input-type", value_name = "type", global = true)]
+    input_type: Option<String>,
+
     /// Node's test-runner switches.
     #[command(flatten)]
     test_flags: TestRunnerFlags,
@@ -928,6 +933,7 @@ async fn main() -> ExitCode {
     // reports the one the caller actually wrote, which is what a
     // flag-checking harness compares against.
     execution.set_flag_spellings(std::env::args().collect());
+    let input_type_is_module = cli.input_type.as_deref() == Some("module");
     let is_test_command = matches!(cli.command, Some(Command::Test(_)));
     let test_mode = cli.test_flags.test;
     execution.set_node_options(node_option_switches(&cli, is_test_command));
@@ -961,6 +967,7 @@ async fn main() -> ExitCode {
             print,
             &cli.args,
             json,
+            input_type_is_module,
             &caps,
             &execution,
             &startup_timer,
@@ -1000,6 +1007,7 @@ async fn main() -> ExitCode {
                 args.print,
                 &[],
                 json,
+                false,
                 &caps,
                 &execution,
                 &startup_timer,
@@ -2245,6 +2253,7 @@ async fn run_eval(
     print: bool,
     extra_args: &[String],
     json: bool,
+    module: bool,
     caps: &CapabilitySet,
     execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
@@ -2261,9 +2270,23 @@ async fn run_eval(
         .process_argv(argv)
         .build()?;
     startup_timer.mark("runtime_build");
-    // `-e`/`-p` is Node's `[eval]` module: the snippet runs in the working
-    // directory's CommonJS scope.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // `--input-type=module` reads the snippet as an ES module, so it may
+    // `import` and `await` at its top level. It has no file, and resolves
+    // against the working directory as though it sat in one.
+    if module {
+        let url = format!("file://{}/[eval]", cwd.display());
+        let result = otter
+            .run_module_source(SourceInput::from_javascript(source), url)
+            .await?;
+        startup_timer.mark("runtime_eval");
+        if print {
+            println!("{}", result.completion_string());
+        }
+        return Ok(ExitCode::from(result.exit_code()));
+    }
+    // `-e`/`-p` is otherwise Node's `[eval]` script: the snippet runs in the
+    // working directory's CommonJS scope.
     let attempt = otter
         .eval_in_commonjs_scope_with_diagnostics(source, cwd)
         .await;
@@ -2505,6 +2528,7 @@ async fn run_test_runner(
         "require('internal/main/test_runner');",
         false,
         globs,
+        false,
         false,
         caps,
         execution,

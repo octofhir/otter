@@ -2221,11 +2221,11 @@ pub fn call(
                     }));
                 }
                 keys
-            } else if first.is_some_and(|v| {
-                v.as_weak_ref().is_some() || v.as_finalization_registry().is_some()
-            }) {
-                // WeakRef / FinalizationRegistry are ordinary objects with
-                // internal slots and no own string-keyed properties.
+            } else if first.is_some_and(|v| v.is_object_type()) {
+                // Every remaining object kind — a buffer, a promise, a weak
+                // collection, a `WeakRef`, a `FinalizationRegistry` — keeps
+                // its state in internal slots and owns no string key. Only
+                // `null` and `undefined` have no answer at all.
                 Vec::new()
             } else {
                 return Err(VmError::TypeMismatch);
@@ -2238,10 +2238,15 @@ pub fn call(
         // table inside JsObject.
         // <https://tc39.es/ecma262/#sec-object.getownpropertysymbols>
         M::GetOwnPropertySymbols => {
-            // WeakRef / FinalizationRegistry carry no own symbol keys.
-            if args.first().is_some_and(|v| {
-                v.as_weak_ref().is_some() || v.as_finalization_registry().is_some()
-            }) {
+            // §20.1.2.13 step 1 ToObject — a primitive boxes to a fresh
+            // wrapper, and an object kind that keeps its state in internal
+            // slots (a buffer, a promise, a weak collection, a `WeakRef`)
+            // carries no property bag: both own no symbol key. Only `null`
+            // and `undefined` have no answer at all.
+            if args.first().is_none_or(|v| v.as_object().is_none()) {
+                if args.first().is_none_or(|v| v.is_nullish()) {
+                    return Err(VmError::TypeMismatch);
+                }
                 return Ok(Value::array(rooted_array_from_elements(
                     gc_heap,
                     Vec::new(),

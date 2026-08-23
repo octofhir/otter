@@ -10,6 +10,8 @@ target
 
 # Build output
 dist/
+# Vendored Node `deps/` sources keep node's own layout, `dist/` included.
+!crates/otter-node/src/nodelib/internal/deps/**/dist/
 docs/book/book/
 
 # Environment files

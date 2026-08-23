@@ -1,8 +1,9 @@
 #!/bin/bash
 # Fetch official Node.js test files via sparse checkout.
 # Downloads the parallel and sequential suites, their common harness, the
-# official fixtures they load, and the CLI documentation consumed by process
-# flag conformance.
+# official fixtures they load, the CLI documentation consumed by process flag
+# conformance, the `lib/` sources the runtime vendors from, and the bundled
+# acorn `deps/` those sources tokenize with.
 #
 # Tracks nodejs/node `main` so conformance is measured against the same moving
 # target Node itself develops against.
@@ -16,7 +17,7 @@ set -euo pipefail
 BRANCH="${1:-main}"
 TARGET="tests/node-compat/node"
 REPO="https://github.com/nodejs/node.git"
-PATHS=(test/parallel test/sequential test/common test/fixtures doc/api/cli.md)
+PATHS=(test/parallel test/sequential test/common test/fixtures doc/api/cli.md lib deps/acorn)
 
 if [ -d "$TARGET/.git" ]; then
     echo "Updating existing Node.js test checkout (branch: $BRANCH)..."

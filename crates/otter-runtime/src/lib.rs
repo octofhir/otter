@@ -4843,7 +4843,22 @@ impl Runtime {
         specifier: &str,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let start = std::time::Instant::now();
-        let compiled = self.compile_source(&source, specifier)?;
+        let mut compiled = self.compile_source(&source, specifier)?;
+        // A classic script is its own single "module" as far as frames go.
+        // The module linker stamps each function with the URL it came from;
+        // a script has no linker, and a frame with no URL of its own reads
+        // as belonging to whichever module happens to be executing when the
+        // stack is captured. Stamp the specifier, and register the source
+        // under it so those frames resolve to a line and column at all.
+        for function in &mut compiled.bytecode.functions {
+            if function.module_url.is_empty() {
+                function.module_url = specifier.to_string();
+            }
+        }
+        self.interp.register_module_source(
+            specifier.to_string(),
+            std::sync::Arc::from(source.text.as_str()),
+        );
         self.run_compiled_script_with_context_since(compiled.bytecode, start)
     }
 

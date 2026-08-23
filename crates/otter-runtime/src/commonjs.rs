@@ -14,6 +14,8 @@
 //! - `resolve_module` - canonical hosted/file resolution and cache keys.
 //! - `cjs_load` - load hosted modules, files, and native addons through the
 //!   shared module-record cache.
+//! - [`SCHEME_ONLY_BUILTINS`] - builtins a user module reaches only as
+//!   `node:<name>`.
 //!
 //! # Invariants
 //! - The require cache is one null-prototype JS object exposed as
@@ -33,6 +35,9 @@
 //! - Filesystem capabilities are checked before any module or package manifest
 //!   is read; native addons additionally pass through the configured loader's
 //!   FFI capability check.
+//! - A bare specifier names a builtin only when the requester is allowed to
+//!   spell it that way: builtins require each other bare, while a user module
+//!   naming a [`SCHEME_ONLY_BUILTINS`] entry gets `node_modules` resolution.
 //! - Re-entry uses [`otter_vm::Interpreter::run_callable_sync`] and the
 //!   code-space-linked wrapper from `create_commonjs_wrapper`; the unsafe
 //!   `Interpreter::run` (which swaps `code_space`) is never called nested.
@@ -110,10 +115,29 @@ pub fn require_commonjs_dependency<'scope>(
     scope.call(require, this_value, &[specifier])
 }
 
+/// Builtins reachable only through the `node:` scheme. A user module
+/// naming one of these bare gets ordinary `node_modules` resolution, so a
+/// package called `test` shadows nothing. Builtins requiring each other
+/// still use the bare spelling, which is why the caller says whether the
+/// request came from one of them.
+pub const SCHEME_ONLY_BUILTINS: &[&str] = &[
+    "dtls",
+    "ffi",
+    "sea",
+    "sqlite",
+    "quic",
+    "test",
+    "test/reporters",
+    "vfs",
+];
+
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier
 /// directly (`fs`) or the `node:`-prefixed form (`node:fs`).
-fn resolve_builtin(cfg: &CjsConfig, spec: &str) -> Option<HostedModule> {
+fn resolve_builtin(cfg: &CjsConfig, spec: &str, from_builtin: bool) -> Option<HostedModule> {
     if !spec.starts_with("node:") && !spec.starts_with('.') && !Path::new(spec).is_absolute() {
+        if !from_builtin && SCHEME_ONLY_BUILTINS.contains(&spec) {
+            return None;
+        }
         let prefixed = format!("node:{spec}");
         if let Some(hm) = cfg.hosted.iter().find(|h| h.specifier() == prefixed) {
             return Some(*hm);
@@ -213,8 +237,13 @@ fn resolve_file(dir: &Path, spec: &str, capabilities: &CapabilitySet) -> Option<
 /// The selected hosted row is authoritative for aliases, so both
 /// `fs/promises` and `node:fs/promises` use `node:fs/promises` when that is the
 /// registered specifier. Files use their canonical absolute path.
-fn resolve_module(cfg: &CjsConfig, dir: &Path, spec: &str) -> Result<CjsResolution, NativeError> {
-    if let Some(hosted) = resolve_builtin(cfg, spec) {
+fn resolve_module(
+    cfg: &CjsConfig,
+    dir: &Path,
+    spec: &str,
+    from_builtin: bool,
+) -> Result<CjsResolution, NativeError> {
+    if let Some(hosted) = resolve_builtin(cfg, spec, from_builtin) {
         let key = hosted.specifier().to_string();
         return Ok(CjsResolution {
             filename: key.clone(),
@@ -223,8 +252,15 @@ fn resolve_module(cfg: &CjsConfig, dir: &Path, spec: &str) -> Result<CjsResoluti
             target: CjsTarget::Hosted(hosted),
         });
     }
-    let path = resolve_file(dir, spec, &cfg.capabilities)
-        .ok_or_else(|| runtime_type_error("require", format!("Cannot find module '{spec}'")))?;
+    let path = resolve_file(dir, spec, &cfg.capabilities).ok_or_else(|| {
+        // Node reports an unresolvable specifier as a plain `Error`
+        // carrying `MODULE_NOT_FOUND`; callers branch on the code.
+        NativeError::Coded {
+            kind: otter_vm::error_classes::ErrorKind::Error,
+            code: "MODULE_NOT_FOUND",
+            message: format!("Cannot find module '{spec}'"),
+        }
+    })?;
     Ok(CjsResolution::file(path))
 }
 
@@ -236,7 +272,10 @@ fn make_require<'scope>(
     cfg: Arc<CjsConfig>,
     cache: Local<'_>,
     dir: PathBuf,
+    from_builtin: bool,
 ) -> Result<Local<'scope>, NativeError> {
+    let cfg_for_resolve = Arc::clone(&cfg);
+    let dir_for_resolve = dir.clone();
     let closure = move |ctx: &mut NativeCtx<'_>,
                         args: &[Value],
                         captures: &[Value]|
@@ -252,11 +291,66 @@ fn make_require<'scope>(
                 "module specifier is required",
             ));
         }
-        cjs_load(ctx, &cfg, cache, &dir, &spec)
+        cjs_load(ctx, &cfg, cache, &dir, &spec, from_builtin)
     };
     let require = scope.native_closure("require", 1, &[cache], closure)?;
     scope.define(require, "cache", cache, Attr::data().to_flags())?;
+    let resolve = make_require_resolve(scope, cfg_for_resolve, dir_for_resolve, from_builtin)?;
+    scope.define(require, "resolve", resolve, Attr::data().to_flags())?;
     Ok(require)
+}
+
+/// Build `require.resolve` for one module directory.
+///
+/// It answers with the same resolution `require` itself would take — a
+/// builtin reports its registered specifier, a file its canonical path —
+/// and reports an unresolvable specifier the way `require` does, with a
+/// `MODULE_NOT_FOUND` error.
+fn make_require_resolve<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cfg: Arc<CjsConfig>,
+    dir: PathBuf,
+    from_builtin: bool,
+) -> Result<Local<'scope>, NativeError> {
+    let paths_dir = dir.clone();
+    let resolve = scope.native_closure("resolve", 1, &[], move |ctx, args, _captures| {
+        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+        if spec.is_empty() {
+            return Err(runtime_type_error(
+                "require.resolve",
+                "module specifier is required",
+            ));
+        }
+        let resolution = resolve_module(&cfg, &dir, &spec, from_builtin)?;
+        ctx.scope(|mut scope| {
+            let filename = scope.string(&resolution.filename)?;
+            Ok(scope.finish(filename))
+        })
+    })?;
+    // §`require.resolve.paths` — the `node_modules` chain a bare
+    // specifier would walk. A builtin has no chain and answers `null`.
+    let paths = scope.native_closure("paths", 1, &[], move |ctx, args, _captures| {
+        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+        let is_relative = spec.starts_with('.') || Path::new(&spec).is_absolute();
+        ctx.scope(|mut scope| {
+            if !is_relative && paths_dir.as_os_str().is_empty() {
+                let null = scope.null();
+                return Ok(scope.finish(null));
+            }
+            let entries: Vec<String> = paths_dir
+                .ancestors()
+                .map(|ancestor| ancestor.join("node_modules").to_string_lossy().into_owned())
+                .collect();
+            let array = scope.array(entries.len())?;
+            for (index, entry) in entries.iter().enumerate() {
+                let value = scope.string(entry)?;
+                scope.set_index(array, index, value)?;
+            }
+            Ok(scope.finish(array))
+        })
+    })?;
+    scope.define(resolve, "paths", paths, Attr::data().to_flags())?;
+    Ok(resolve)
 }
 
 fn cached_exports<'scope>(
@@ -325,7 +419,13 @@ fn load_resolved_scoped<'scope>(
 
     let record = begin_module_record(scope, cache, resolution)?;
     let result = (|| {
-        let require = make_require(scope, cfg.clone(), cache, resolution.dir.clone())?;
+        let require = make_require(
+            scope,
+            cfg.clone(),
+            cache,
+            resolution.dir.clone(),
+            matches!(resolution.target, CjsTarget::Hosted(_)),
+        )?;
         match &resolution.target {
             CjsTarget::Hosted(hosted) => {
                 let mut publish_namespace = false;
@@ -472,8 +572,9 @@ pub(crate) fn cjs_load(
     cache: object::JsObject,
     dir: &Path,
     spec: &str,
+    from_builtin: bool,
 ) -> Result<Value, NativeError> {
-    let resolution = resolve_module(cfg, dir, spec)?;
+    let resolution = resolve_module(cfg, dir, spec, from_builtin)?;
     ctx.scope(|mut scope| {
         let cache = scope.value(Value::object(cache));
         let exports = load_resolved_scoped(&mut scope, cfg, cache, &resolution, None)?;
@@ -498,7 +599,7 @@ pub(crate) fn cjs_load_builtin<'scope>(
     cfg: &Arc<CjsConfig>,
     specifier: &str,
 ) -> Result<Local<'scope>, NativeError> {
-    let hosted = resolve_builtin(cfg, specifier).ok_or_else(|| {
+    let hosted = resolve_builtin(cfg, specifier, false).ok_or_else(|| {
         runtime_type_error("import", format!("no builtin module named '{specifier}'"))
     })?;
     let key = hosted.specifier().to_string();

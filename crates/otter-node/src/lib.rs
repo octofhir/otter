@@ -129,9 +129,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         nodelib::internal_process_pre_execution,
     ),
     HostedModule::cjs_only("node:test", nodelib::node_test_vendored),
-    HostedModule::cjs_only("test", nodelib::node_test_vendored),
     HostedModule::cjs_only("node:test/reporters", nodelib::node_test_reporters),
-    HostedModule::cjs_only("test/reporters", nodelib::node_test_reporters),
     HostedModule::cjs_only(
         "internal/main/test_runner",
         nodelib::internal_main_test_runner,

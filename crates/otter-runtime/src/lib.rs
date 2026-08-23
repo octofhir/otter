@@ -60,7 +60,7 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 mod commonjs;
-pub use commonjs::{require_commonjs_dependency, run_builtin_cjs_shim};
+pub use commonjs::{SCHEME_ONLY_BUILTINS, require_commonjs_dependency, run_builtin_cjs_shim};
 pub mod compile_cache;
 pub mod compiled_program;
 pub mod data_modules;

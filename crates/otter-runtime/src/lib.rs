@@ -2818,6 +2818,7 @@ impl Runtime {
                 hosted: runtime.config.hosted_modules.clone(),
                 runtime_task_spawner: runtime.runtime_task_spawner.clone(),
                 addon_loader: runtime.config.commonjs_addon_loader,
+                report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
             }),
         )
         .ok()?;
@@ -2987,6 +2988,8 @@ impl Runtime {
                                 hosted: config.hosted_modules.clone(),
                                 runtime_task_spawner: runtime_task_spawner.clone(),
                                 addon_loader: config.commonjs_addon_loader,
+                                report_watch_dependencies:
+                                    crate::commonjs::watch_reporting_requested(),
                             }),
                         )?;
                     }
@@ -5884,6 +5887,7 @@ impl Runtime {
             hosted: self.config.hosted_modules.clone(),
             runtime_task_spawner: self.runtime_task_spawner.clone(),
             addon_loader: self.config.commonjs_addon_loader,
+            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
         });
         // Entry execution context, linked into the interpreter code space so the
         // wrapper closures resolve from any frame.

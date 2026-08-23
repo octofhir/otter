@@ -81,6 +81,39 @@ pub fn watch_reporting_requested() -> bool {
     std::env::var_os("WATCH_REPORT_DEPENDENCIES").is_some_and(|value| !value.is_empty())
 }
 
+/// Post one imported module URL to the watching parent.
+///
+/// The ESM side reports what it linked, not what it resolved: the graph is
+/// built before any of it evaluates, so the whole batch is known at once.
+pub(crate) fn report_watch_imports<'a>(
+    ctx: &mut NativeCtx<'_>,
+    urls: impl Iterator<Item = &'a str> + Clone,
+) {
+    let _ = ctx.scope(|mut scope| -> Result<Value, NativeError> {
+        let nothing = scope.undefined();
+        let Some(process) = scope.global("process") else {
+            return Ok(scope.finish(nothing));
+        };
+        let send = scope.get(process, "send")?;
+        if !scope.is_callable(send) {
+            return Ok(scope.finish(nothing));
+        }
+        let count = urls.clone().count();
+        if count == 0 {
+            return Ok(scope.finish(nothing));
+        }
+        let message = scope.object()?;
+        let files = scope.array(count)?;
+        for (index, url) in urls.enumerate() {
+            let value = scope.string(url)?;
+            scope.set_index(files, index, value)?;
+        }
+        scope.set(message, "watch:import", files)?;
+        scope.call(send, process, &[message])?;
+        Ok(scope.finish(nothing))
+    });
+}
+
 /// Post one required file to the watching parent over the IPC channel.
 ///
 /// Node does this from its loaders; loading here is native, so the report

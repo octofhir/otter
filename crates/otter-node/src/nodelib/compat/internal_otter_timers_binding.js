@@ -115,6 +115,25 @@ function setupTimers(immediateCallback, timersCallback) {
   processTimers = timersCallback;
 }
 
+// What is keeping the loop alive, once this layer owns the timers.
+//
+// Until now the engine's timers were the program's, and the engine's account
+// of them was the answer. From here they are stand-ins — one armed timer and
+// one armed immediate however many the lists hold — so counting them would
+// count the stand-ins rather than what they stand for. The lists keep their
+// own counts of what holds the loop open, and those are the answer.
+Object.defineProperty(process, 'getActiveResourcesInfo', {
+  value: function getActiveResourcesInfo() {
+    const info = [];
+    for (let i = 0; i < immediateInfo[1]; i++) info.push('Immediate');
+    for (let i = 0; i < timeoutInfo[0]; i++) info.push('Timeout');
+    return info;
+  },
+  writable: true,
+  enumerable: false,
+  configurable: true,
+});
+
 module.exports = {
   immediateInfo,
   timeoutInfo,

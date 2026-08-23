@@ -1836,6 +1836,24 @@ pub struct EvalCompileOptions {
     pub super_property_allowed: bool,
 }
 
+/// Where an error's captured stack points, resolved against the source the
+/// isolate still holds for that script.
+///
+/// # See also
+/// - [`runtime_cx::NativeCtx::error_source_position`]
+#[derive(Debug, Clone)]
+pub struct ErrorSourcePosition {
+    /// Module URL / file path the top frame was compiled from.
+    pub script_name: String,
+    /// 1-based source line of the top frame.
+    pub line_number: u32,
+    /// 0-based column within that line, the offset callers index the
+    /// source line by.
+    pub start_column: u32,
+    /// Text of the source line, without its terminator.
+    pub source_line: String,
+}
+
 /// One call-site record for `util.getCallSites`, serialized to JSON and
 /// reconstituted as a plain object on the JS side. Field names match
 /// Node's `CallSite` property shape.

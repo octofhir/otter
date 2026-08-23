@@ -585,6 +585,23 @@ fn system_error_code(message: &str) -> &str {
 /// multi-module bytecode produces frames pointing at the original
 /// source URL rather than the bytecode module's synthesized name
 /// (`<entry>`).
+/// How many frames, counting from the innermost, sit at or above the
+/// topmost frame executing `callee`.
+///
+/// `Error.captureStackTrace(target, constructorOpt)` hides that function
+/// and everything it called. The match is on the exact function object the
+/// frame is running, because a bytecode function id means nothing outside
+/// the program it was numbered in — an entry script and the modules it
+/// requires are numbered separately, so comparing ids across them both
+/// misses the real frame and matches unrelated ones.
+pub(crate) fn frames_above_callee(stack: &ActivationStack, callee: Value) -> Option<usize> {
+    stack
+        .iter()
+        .rev()
+        .position(|frame| frame.self_value == callee)
+        .map(|index| index + 1)
+}
+
 pub(crate) fn snapshot_frames(
     context: &ExecutionContext,
     stack: &ActivationStack,
@@ -592,14 +609,25 @@ pub(crate) fn snapshot_frames(
     stack
         .iter()
         .rev()
-        .map(|f| {
+        .enumerate()
+        .map(|(depth, f)| {
             let function = context.function(f.function_id);
             let exec_function = context.exec_function(f.function_id);
             let function_name = function
                 .map(|fun| fun.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string());
+            // A frame with a callee above it advanced its `pc` past the
+            // call before pushing that callee, so its current instruction
+            // is one step ahead of the call site the frame is reported at.
+            // The innermost frame has no callee and is at its own current
+            // instruction.
+            let instruction = if depth == 0 {
+                f.pc as usize
+            } else {
+                (f.pc as usize).saturating_sub(1)
+            };
             let byte_pc = exec_function
-                .and_then(|fun| fun.instruction_byte_pc(f.pc as usize))
+                .and_then(|fun| fun.instruction_byte_pc(instruction))
                 .unwrap_or(0);
             // `byte_spans` is sorted by `pc`. `partition_point` finds
             // the predecessor entry (largest `pc <= byte_pc`), so

@@ -409,7 +409,11 @@ impl<'a> ModuleGraphBuilder<'a> {
                 Some(crate::module_loader::LoaderPackageType::Module)
             )
         });
-        let text = if url.ends_with(".mjs") || is_entry || in_module_package {
+        // A `data:` module is an ES module whatever its body looks like:
+        // there is no file for a package scope to speak for, and no
+        // CommonJS resolution that could reach it.
+        let is_data = crate::module_loader::is_data_url(&url);
+        let text = if url.ends_with(".mjs") || is_entry || in_module_package || is_data {
             text
         } else {
             let shim = with_program(text.as_str(), kind, |program| {

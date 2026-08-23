@@ -3732,6 +3732,23 @@ impl Runtime {
             };
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
         }
+        // A `data:` module has no file to walk either: its source is the
+        // specifier, so it is linked straight from the decoded text.
+        if module_loader::is_data_url(&target_url) {
+            let entry = loader.load_resolved(target_url.clone()).map_err(|e| {
+                DynLoadError::from_graph_error(
+                    &module_graph::GraphError::from(e),
+                    format!("dynamic import: load failed for \"{target_url}\""),
+                )
+            })?;
+            let linked = module_graph::load_program_source(&loader, entry).map_err(|e| {
+                DynLoadError::from_graph_error(
+                    &e,
+                    format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
+                )
+            })?;
+            return self.evaluate_dynamic_linked_module(&target_url, linked);
+        }
         let target_path: PathBuf = url_to_path(&target_url).ok_or_else(|| {
             DynLoadError::type_error(format!(
                 "dynamic import: target is not a file:// URL: \"{target_url}\""
@@ -5345,6 +5362,35 @@ impl Runtime {
             self.interp
                 .register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
         }
+        self.report_watch_imports(sources);
+    }
+
+    /// Tell a watching parent which files this module batch pulled in.
+    ///
+    /// The graph is linked before any of it evaluates, so one message
+    /// carries the whole batch. Only real files are of interest: a builtin
+    /// cannot change on disk.
+    fn report_watch_imports(&mut self, sources: &std::collections::BTreeMap<String, String>) {
+        if !commonjs::watch_reporting_requested() {
+            return;
+        }
+        let files: Vec<&str> = sources
+            .keys()
+            .filter(|url| url.starts_with("file://"))
+            .map(String::as_str)
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        let Some(context) = self.realm_execution_context() else {
+            return;
+        };
+        otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::default_call(),
+            Some(&context),
+            |ctx| commonjs::report_watch_imports(ctx, files.iter().copied()),
+        );
     }
 
     pub(crate) fn run_module_with_context(

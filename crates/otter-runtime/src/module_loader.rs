@@ -192,6 +192,120 @@ pub fn is_http_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
+/// Whether `url` is a `data:` URL — a module whose source is the
+/// specifier itself (§16.2.1.6, `data:` imports).
+#[must_use]
+pub fn is_data_url(url: &str) -> bool {
+    url.starts_with("data:")
+}
+
+/// Decode a `data:` module into its source text and language.
+///
+/// `data:[<mediatype>][;base64],<data>`. JavaScript and JSON media types
+/// are modules; anything else is not something this loader can evaluate,
+/// which is a resolution failure rather than a parse failure.
+fn decode_data_url(url: &str) -> Result<ResolvedSource, LoaderError> {
+    let body = url.strip_prefix("data:").unwrap_or_default();
+    let (meta, payload) = body.split_once(',').ok_or_else(|| LoaderError::Load {
+        url: url.to_string(),
+        message: "data URL has no comma separating the media type from the data".to_string(),
+    })?;
+    let (media_type, base64) = match meta.strip_suffix(";base64") {
+        Some(head) => (head, true),
+        None => (meta, false),
+    };
+    let media_type = media_type.split(';').next().unwrap_or("").trim();
+    let bytes = if base64 {
+        base64_decode(payload).ok_or_else(|| LoaderError::Load {
+            url: url.to_string(),
+            message: "data URL payload is not valid base64".to_string(),
+        })?
+    } else {
+        percent_decode(payload)
+    };
+    let text = String::from_utf8(bytes).map_err(|error| LoaderError::Load {
+        url: url.to_string(),
+        message: format!("data URL payload is not valid UTF-8: {error}"),
+    })?;
+    // An empty media type defaults to `text/plain`, but every engine reads
+    // a bare `data:,...` module as JavaScript, and so does the corpus.
+    let kind = match media_type {
+        "" | "text/javascript" | "application/javascript" | "text/plain" => SourceKind::JavaScript,
+        "application/json" => {
+            return Ok(ResolvedSource {
+                url: url.to_string(),
+                kind: SourceKind::JavaScript,
+                jsx: None,
+                text: format!("export default {text};"),
+            });
+        }
+        other => {
+            return Err(LoaderError::Load {
+                url: url.to_string(),
+                message: format!("data URL media type '{other}' is not a module"),
+            });
+        }
+    };
+    Ok(ResolvedSource {
+        url: url.to_string(),
+        kind,
+        jsx: None,
+        text,
+    })
+}
+
+/// Percent-decode a `data:` payload, leaving anything that is not a valid
+/// escape as written.
+fn percent_decode(payload: &str) -> Vec<u8> {
+    let bytes = payload.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(high) = (bytes[index + 1] as char).to_digit(16)
+            && let Some(low) = (bytes[index + 2] as char).to_digit(16)
+        {
+            out.push((high * 16 + low) as u8);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Decode standard base64, ignoring ASCII whitespace.
+fn base64_decode(payload: &str) -> Option<Vec<u8>> {
+    const fn value_of(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(payload.len() / 4 * 3);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0u32;
+    for byte in payload.bytes() {
+        if byte.is_ascii_whitespace() || byte == b'=' {
+            continue;
+        }
+        let value = value_of(byte)?;
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Which resolver flavour to use when consulting
 /// [`oxc_resolver`] for a bare specifier. ESM is the default;
 /// the CJS variant is wired for symmetry with `package.json`'s
@@ -749,6 +863,11 @@ impl ModuleLoader {
                 specifier: specifier.to_string(),
             });
         }
+        // A `data:` module carries its own source, so it is already
+        // canonical and needs no filesystem or network reach.
+        if is_data_url(specifier) {
+            return Ok(specifier.to_string());
+        }
         // §16.2.1.5 HostLoadImportedModule — the host owns the
         // gating decision for privileged specifier shapes.
         // `http:` / `https:` modules require `Net`; the loader surfaces a
@@ -959,6 +1078,9 @@ impl ModuleLoader {
     /// dependency is not resolved twice and benchmark timing can distinguish
     /// resolver time from source-loading time.
     pub(crate) fn load_resolved(&self, url: String) -> Result<ResolvedSource, LoaderError> {
+        if is_data_url(&url) {
+            return decode_data_url(&url);
+        }
         if self.is_hosted_url(&url) {
             return Ok(ResolvedSource {
                 url,

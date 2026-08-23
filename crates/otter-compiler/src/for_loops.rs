@@ -67,6 +67,13 @@ pub(crate) fn compile_for_of_statement(
         );
     }
 
+    // §7.4.11 AsyncIteratorClose — a throw out of the loop body closes the
+    // async iterator, and closing it is an `await`, which the synchronous
+    // unwind close cannot perform. The body therefore runs inside a handler
+    // whose landing closes the iterator and re-throws what was in flight. The
+    // head is outside it: §7.4.8 leaves an iterator whose `next` threw alone.
+    let close_exc_reg = is_for_await.then(|| cx.alloc_scratch());
+
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
 
@@ -150,6 +157,11 @@ pub(crate) fn compile_for_of_statement(
     // the function-scope binding pre-hoisted at function entry.
     // AssignmentTarget heads reassign without a fresh scope per
     // step (no per-iteration binding to materialize).
+    let close_handler = close_exc_reg.map(|exc_reg| {
+        let handler = cx.emit_enter_try(0, otter_bytecode::NO_HANDLER_OFFSET, exc_reg, span);
+        cx.active_handlers += 1;
+        handler
+    });
     cx.enter_scope();
     bind_for_in_of_head(cx, &s.left, bind_source, span)?;
     if let Some(body_reg) = compile_statement(cx, &s.body)? {
@@ -159,9 +171,32 @@ pub(crate) fn compile_for_of_statement(
         cx.store_completion(completion_reg, body_reg, span);
     }
     cx.exit_scope();
+    if close_handler.is_some() {
+        cx.emit(Op::LeaveTry, vec![], span);
+        cx.active_handlers -= 1;
+    }
 
     let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
     cx.patch_branch(back_jmp, loop_top);
+
+    // The landing, reached only by the unwinder — the jump above never falls
+    // into it. §7.4.11 step 6 answers with the original throw completion
+    // before anything the close itself produced is looked at, so a `return`
+    // that throws, or an awaited result that is not an Object, leaves the
+    // in-flight throw untouched.
+    if let (Some(handler), Some(exc_reg)) = (close_handler, close_exc_reg) {
+        cx.patch_enter_try_offset(handler, /* catch */ true);
+        let swallow_exc = cx.alloc_scratch();
+        let swallow = cx.emit_enter_try(0, otter_bytecode::NO_HANDLER_OFFSET, swallow_exc, span);
+        cx.active_handlers += 1;
+        emit_async_iterator_close(cx, iter_reg, false, span);
+        cx.emit(Op::LeaveTry, vec![], span);
+        cx.active_handlers -= 1;
+        let closed = cx.emit_branch_placeholder(Op::Jump, None, span);
+        cx.patch_enter_try_offset(swallow, /* catch */ true);
+        cx.patch_branch_to_here(closed);
+        cx.emit(Op::Throw, [Operand::Register(exc_reg)], span);
+    }
 
     let frame = cx.loops.pop().expect("for-of loop frame");
     // `continue` re-iterates without closing the iterator (§14.7.5.6 —
@@ -182,37 +217,9 @@ pub(crate) fn compile_for_of_statement(
         cx.patch_branch_to_here(pc);
     }
     if is_for_await && had_breaks {
-        // §7.4.11 AsyncIteratorClose — call the iterator's `return`,
-        // await its result, and only then require that result to be an
-        // Object. The synchronous close cannot await, so an async
-        // `return` (a promise) would fail its object check.
-        let result_reg = cx.alloc_scratch();
-        let called_reg = cx.alloc_scratch();
-        let awaited_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::AsyncIteratorReturn,
-            vec![
-                Operand::Register(result_reg),
-                Operand::Register(called_reg),
-                Operand::Register(iter_reg),
-            ],
-            span,
-        );
-        let skip = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(called_reg), span);
-        cx.emit(
-            Op::Await,
-            [
-                Operand::Register(awaited_reg),
-                Operand::Register(result_reg),
-            ],
-            span,
-        );
-        cx.emit(
-            Op::CheckIteratorResult,
-            [Operand::Register(awaited_reg)],
-            span,
-        );
-        cx.patch_branch_to_here(skip);
+        // A break completion: the awaited result must be an Object
+        // (§7.4.11 step 8), because nothing else is in flight to keep.
+        emit_async_iterator_close(cx, iter_reg, true, span);
     }
     cx.patch_branch_to_here(exit_jmp);
     // Close the throw-unwind region: both the exhausted-iterator exit
@@ -229,6 +236,46 @@ pub(crate) fn compile_for_of_statement(
         cx.exit_scope();
     }
     Ok(completion_reg)
+}
+
+/// §7.4.11 AsyncIteratorClose — call the iterator's `return` and await its
+/// result. `check_result` requires that result to be an Object, which the spec
+/// asks for only when there is no throw completion already in flight.
+fn emit_async_iterator_close(
+    cx: &mut Compiler,
+    iter_reg: u16,
+    check_result: bool,
+    span: (u32, u32),
+) {
+    let result_reg = cx.alloc_scratch();
+    let called_reg = cx.alloc_scratch();
+    let awaited_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::AsyncIteratorReturn,
+        vec![
+            Operand::Register(result_reg),
+            Operand::Register(called_reg),
+            Operand::Register(iter_reg),
+        ],
+        span,
+    );
+    let skip = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(called_reg), span);
+    cx.emit(
+        Op::Await,
+        [
+            Operand::Register(awaited_reg),
+            Operand::Register(result_reg),
+        ],
+        span,
+    );
+    if check_result {
+        cx.emit(
+            Op::CheckIteratorResult,
+            [Operand::Register(awaited_reg)],
+            span,
+        );
+    }
+    cx.patch_branch_to_here(skip);
 }
 
 /// If `head` is a `for (let x of …)` / `for (const x of …)` single

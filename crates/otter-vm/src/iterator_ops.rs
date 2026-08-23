@@ -2879,6 +2879,16 @@ impl Interpreter {
                     .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
                 if !has_finally {
                     handle.mark_done(&mut self.gc_heap);
+                    // An async generator answers through the request its caller
+                    // queued, not through this return value — the caller was
+                    // handed that request's promise and has already gone. The
+                    // whole queue completes the way a finished body completes
+                    // it: the front request with the value `return` carried,
+                    // and every request behind it as done.
+                    if handle.is_async(&self.gc_heap) {
+                        self.async_generator_drain_done(context, handle)?;
+                        return Ok(Value::undefined());
+                    }
                     return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
                 }
                 return_value = Some(*arg);

@@ -220,6 +220,12 @@ struct Cli {
     #[arg(long = "input-type", value_name = "type", global = true)]
     input_type: Option<String>,
 
+    /// What becomes of a promise rejection nobody handled — `throw` (the
+    /// default), `strict`, `warn`, `warn-with-error-code`, or `none`
+    /// (Node's `--unhandled-rejections`).
+    #[arg(long = "unhandled-rejections", value_name = "mode", global = true)]
+    unhandled_rejections: Option<String>,
+
     /// Node's test-runner switches.
     #[command(flatten)]
     test_flags: TestRunnerFlags,
@@ -650,6 +656,9 @@ fn test_runner_switches(flags: &TestRunnerFlags, is_test_command: bool) -> Vec<S
 /// where a vendored module looks for `--max-http-header-size` and friends.
 fn node_option_switches(cli: &Cli, is_test_command: bool) -> Vec<String> {
     let mut switches = test_runner_switches(&cli.test_flags, is_test_command);
+    if let Some(mode) = &cli.unhandled_rejections {
+        switches.push(format!("--unhandled-rejections={mode}"));
+    }
     if cli.experimental_stream_iter {
         switches.push("--experimental-stream-iter".to_string());
     }

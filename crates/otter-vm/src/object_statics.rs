@@ -1883,11 +1883,17 @@ pub fn call(
                     )?)),
                     None => Ok(Value::undefined()),
                 }
-            } else if first
-                .is_some_and(|v| v.is_boolean() || v.is_number() || v.is_symbol() || v.is_big_int())
-            {
-                // §20.1.2.7 Object.getOwnPropertyDescriptor — primitive
-                // wrappers carry no own data props for arbitrary keys.
+            } else if first.is_some_and(|v| {
+                v.is_boolean()
+                    || v.is_number()
+                    || v.is_symbol()
+                    || v.is_big_int()
+                    || v.is_object_type()
+            }) {
+                // §20.1.2.7 Object.getOwnPropertyDescriptor — a primitive
+                // wrapper carries no own data property for an arbitrary key,
+                // and neither does an object kind whose state is internal
+                // slots: both answer that there is none.
                 Ok(Value::undefined())
             } else if first.is_none_or(|v| v.is_null() || v.is_undefined()) {
                 Err(interp.err_type(

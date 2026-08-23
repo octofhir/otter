@@ -83,5 +83,6 @@ fn install(runtime: &mut RuntimeRealmContext<'_>) -> Result<(), OtterError> {
         include_str!("node_console_global.js"),
         include_str!("process_stdio_global.js"),
         include_str!("node_timers_global.js"),
+        include_str!("node_promise_rejection_global.js"),
     )))
 }

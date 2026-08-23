@@ -1057,7 +1057,12 @@ impl Interpreter {
                     || target.is_number()
                     || target.is_symbol()
                     || target.is_big_int()
+                    || target.is_object_type()
                 {
+                    // A primitive boxes to a fresh wrapper, and an object kind
+                    // keeping its state in internal slots — a promise, a weak
+                    // collection — owns no property under any key: both answer
+                    // that there is no descriptor rather than refusing.
                     None
                 } else {
                     return Err(self.err_type(

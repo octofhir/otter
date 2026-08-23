@@ -289,6 +289,7 @@ impl Interpreter {
             eval_hook: None,
             pending_generator_throw: None,
             pending_uncaught_throw: None,
+            uncaught_from_promise_rejection: false,
             async_context: Value::undefined(),
             iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,

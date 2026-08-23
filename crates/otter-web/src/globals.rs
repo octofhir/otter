@@ -95,25 +95,34 @@ fn install_promise_rejection_handling(
           replaceable('onunhandledrejection');\n\
           replaceable('onrejectionhandled');\n\
           replaceable('onerror');\n\
-          Object.defineProperty(g, '__otterFirePromiseRejection', {\n\
-            value: function (promise, reason, handled) {\n\
-              var type = handled ? 'rejectionhandled' : 'unhandledrejection';\n\
-              var event;\n\
-              try {\n\
-                event = new g.PromiseRejectionEvent(type, {\n\
-                  promise: promise, reason: reason, cancelable: !handled,\n\
-                });\n\
-              } catch (_) { return; }\n\
+          // A reporter already here belongs to a layer with its own answer for\n\
+          // a rejection nobody claimed — Node's `process` has one. The event is\n\
+          // dispatched first either way, because a handler may claim the\n\
+          // rejection by preventing it; what is left goes to that layer, and\n\
+          // where there is none it is reported here.\n\
+          var previous = typeof g.__otterFirePromiseRejection === 'function' ?\n\
+            g.__otterFirePromiseRejection : null;\n\
+          var fire = function (promise, reason, handled) {\n\
+            var type = handled ? 'rejectionhandled' : 'unhandledrejection';\n\
+            var event;\n\
+            try {\n\
+              event = new g.PromiseRejectionEvent(type, {\n\
+                promise: promise, reason: reason, cancelable: !handled,\n\
+              });\n\
+            } catch (_) { event = null; }\n\
+            if (event !== null) {\n\
               var handler = g['on' + type];\n\
               if (typeof handler === 'function') {\n\
                 try { handler.call(g, event); }\n\
                 catch (e) { try { g.reportError(e); } catch (_) {} }\n\
               }\n\
-              if (!handled && !event.defaultPrevented) {\n\
-                try { g.reportError(reason); } catch (_) {}\n\
-              }\n\
-            },\n\
-            writable: true, enumerable: false, configurable: true,\n\
+            }\n\
+            if (!handled && event !== null && event.defaultPrevented) return;\n\
+            if (previous !== null) { previous(promise, reason, handled); return; }\n\
+            if (!handled) { try { g.reportError(reason); } catch (_) {} }\n\
+          };\n\
+          Object.defineProperty(g, '__otterFirePromiseRejection', {\n\
+            value: fire, writable: true, enumerable: false, configurable: true,\n\
           });\n\
         })(globalThis);";
     runtime

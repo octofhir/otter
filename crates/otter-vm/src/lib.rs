@@ -1316,6 +1316,12 @@ pub struct Interpreter {
     /// original thrown value is preserved here until the outer
     /// dispatch loop re-throws it on the still-live caller stack.
     pending_uncaught_throw: Option<Value>,
+    /// Whether the throw now escaping came from reporting a rejected promise
+    /// nobody handled. Node names that origin `'unhandledRejection'` when it
+    /// offers the throw to `process`, and the host reads this to tell the two
+    /// apart. Set as the throw leaves the rejection checkpoint and taken by
+    /// whoever surfaces it.
+    uncaught_from_promise_rejection: bool,
     /// The async context every job queued from here inherits. Host code reads
     /// and writes it through [`Interpreter::async_context`] /
     /// [`Interpreter::set_async_context`]; a microtask or timer captures it at

@@ -37,6 +37,7 @@ mod fs_cp;
 mod fs_watch;
 pub mod globals;
 pub mod internal_errors_ext;
+pub mod error_source_ext;
 pub mod internal_test_binding_ext;
 pub mod misc_modules;
 pub mod napi;
@@ -391,6 +392,14 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only(
         "internal/deps/minimatch/index",
         nodelib::internal_deps_minimatch,
+    ),
+    HostedModule::cjs_only(
+        "internal/deps/acorn/acorn/dist/acorn",
+        nodelib::internal_deps_acorn,
+    ),
+    HostedModule::cjs_only(
+        "internal/otter/error_source",
+        error_source_ext::error_source_cjs_value,
     ),
     HostedModule::cjs_only("internal/util/diff", nodelib::internal_util_diff),
     HostedModule::cjs_only("internal/assert/myers_diff", nodelib::internal_myers_diff),

@@ -329,6 +329,12 @@ const bindings = {
   // `internalBinding('errors')` — the exit codes Node's own C++ names, as
   // the JavaScript that reads them expects to find them.
   errors: {
+    // The source location an error's captured stack points at. Lives on a
+    // native module because it reads the structured frame snapshot: the
+    // caller builds this message before anything has touched `stack`.
+    getErrorSourcePositions(error) {
+      return require('internal/otter/error_source').getErrorSourcePositions(error);
+    },
     exitCodes: {
       kNoFailure: 0,
       kUncaughtException: 1,

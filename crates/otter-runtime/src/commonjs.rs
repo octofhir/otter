@@ -64,6 +64,49 @@ pub(crate) struct CjsConfig {
     pub(crate) hosted: Vec<HostedModule>,
     pub(crate) runtime_task_spawner: Option<RuntimeTaskSpawner>,
     pub(crate) addon_loader: Option<CommonJsAddonLoader>,
+    /// Whether this run reports each file it requires to a watching
+    /// parent. Set once per run, from the environment the parent spawned
+    /// it with; see [`watch_reporting_requested`].
+    pub(crate) report_watch_dependencies: bool,
+}
+
+/// Whether the parent that spawned this process asked to be told what it
+/// requires.
+///
+/// Watch mode learns a test file's dependencies from the child that loads
+/// them, and asks for that by setting `WATCH_REPORT_DEPENDENCIES` in the
+/// child's environment.
+#[must_use]
+pub fn watch_reporting_requested() -> bool {
+    std::env::var_os("WATCH_REPORT_DEPENDENCIES").is_some_and(|value| !value.is_empty())
+}
+
+/// Post one required file to the watching parent over the IPC channel.
+///
+/// Node does this from its loaders; loading here is native, so the report
+/// is made here instead. A run with no channel — or none of this asked for
+/// — has nothing to post, and a failed post is not the requiring module's
+/// problem, so nothing propagates.
+fn report_watch_dependency(ctx: &mut NativeCtx<'_>, filename: &str) {
+    let _ = ctx.scope(|mut scope| -> Result<Value, NativeError> {
+        let Some(process) = scope.global("process") else {
+            let nothing = scope.undefined();
+            return Ok(scope.finish(nothing));
+        };
+        let send = scope.get(process, "send")?;
+        if !scope.is_callable(send) {
+            let nothing = scope.undefined();
+            return Ok(scope.finish(nothing));
+        }
+        let message = scope.object()?;
+        let files = scope.array(1)?;
+        let path = scope.string(filename)?;
+        scope.set_index(files, 0, path)?;
+        scope.set(message, "watch:require", files)?;
+        scope.call(send, process, &[message])?;
+        let nothing = scope.undefined();
+        Ok(scope.finish(nothing))
+    });
 }
 
 /// Run an embedded JavaScript shim as a CommonJS module and return its
@@ -575,6 +618,12 @@ pub(crate) fn cjs_load(
     from_builtin: bool,
 ) -> Result<Value, NativeError> {
     let resolution = resolve_module(cfg, dir, spec, from_builtin)?;
+    if cfg.report_watch_dependencies
+        && let CjsTarget::File(path) = &resolution.target
+    {
+        let path = path.to_string_lossy().into_owned();
+        report_watch_dependency(ctx, &path);
+    }
     ctx.scope(|mut scope| {
         let cache = scope.value(Value::object(cache));
         let exports = load_resolved_scoped(&mut scope, cfg, cache, &resolution, None)?;
@@ -650,6 +699,12 @@ pub(crate) fn cjs_instantiate_file(
     source: &str,
 ) -> Result<Value, NativeError> {
     let resolution = CjsResolution::file(abs.to_path_buf());
+    // The entry counts too: a watching parent maps a file to the tests that
+    // depend on it, and a test file is its own first dependency.
+    if cfg.report_watch_dependencies {
+        let path = resolution.filename.clone();
+        report_watch_dependency(ctx, &path);
+    }
     ctx.scope(|mut scope| {
         let cache = canonical_cache(&mut scope)?;
         let exports = load_resolved_scoped(&mut scope, cfg, cache, &resolution, Some(source))?;

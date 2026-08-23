@@ -380,6 +380,7 @@ impl crate::RuntimeTask for ProcessIpcEvent {
             hosted: runtime.config.hosted_modules.clone(),
             runtime_task_spawner: runtime.runtime_task_spawner.clone(),
             addon_loader: runtime.config.commonjs_addon_loader,
+            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
         });
         runtime.run_native_event(&context, move |ctx| {
             ctx.scope(|mut scope| {

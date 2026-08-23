@@ -311,6 +311,7 @@ fn synthesize_commonjs_namespace<'scope>(
         hosted: hosted_modules.to_vec(),
         runtime_task_spawner,
         addon_loader: None,
+        report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
     });
     let hosted_error = |error: otter_vm::NativeError| OtterError::HostedModule {
         specifier: specifier.to_string(),

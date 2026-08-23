@@ -251,6 +251,20 @@ pub enum VmError {
     },
 }
 
+impl VmError {
+    /// Whether this ends the run wherever it is raised.
+    ///
+    /// A termination is not a JS exception: it carries no value a promise
+    /// could settle with, and turning one into a rejection would let the
+    /// run continue past the point that asked to stop. `process.exit()`
+    /// called from a microtask or an `async` body reaches every one of
+    /// those conversion sites.
+    #[must_use]
+    pub const fn is_termination(&self) -> bool {
+        matches!(self, Self::Exit { .. } | Self::Interrupted)
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<VmError>() <= 24);
 // `VmError` must stay `Copy` so the hot `Result<_, VmError>` chain carries no
 // drop glue. This fails to compile if any future variant gains an owned field.

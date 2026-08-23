@@ -186,7 +186,7 @@ impl Interpreter {
             // Retain in `notified` (a GC root) before firing so the handle
             // survives any collection the reporter triggers.
             self.rejection_tracker.notified.push(promise);
-            self.fire_promise_rejection(context, promise, false);
+            self.fire_promise_rejection(context, promise, false)?;
         }
 
         // Notified → handled. A late `.then`/`.catch` flips the live flag.
@@ -195,7 +195,7 @@ impl Interpreter {
             let promise = self.rejection_tracker.notified[jdx];
             if promise.is_handled(&self.gc_heap) {
                 self.rejection_tracker.notified.swap_remove(jdx);
-                self.fire_promise_rejection(context, promise, true);
+                self.fire_promise_rejection(context, promise, true)?;
                 continue;
             }
             jdx += 1;
@@ -204,19 +204,23 @@ impl Interpreter {
     }
 
     /// Invoke the JS reporter for one promise. `handled` selects the event type
-    /// (`rejectionhandled` vs `unhandledrejection`). Reporter errors are
-    /// swallowed — a rejection notification must never abort the drain.
+    /// (`rejectionhandled` vs `unhandledrejection`).
+    ///
+    /// A reporter that throws is reporting that nothing took the rejection and
+    /// the run is over — Node's default for a rejection nobody handled — so the
+    /// throw escapes the drain rather than being swallowed. It is marked as
+    /// coming from a rejection so the host can name that origin.
     fn fire_promise_rejection(
         &mut self,
         context: &ExecutionContext,
         promise: crate::promise::JsPromiseHandle,
         handled: bool,
-    ) {
+    ) -> Result<(), RunError> {
         let reason = match promise.state(&self.gc_heap) {
             crate::promise::PromiseState::Rejected(reason) => reason,
             // Only rejected promises are tracked; a settled-elsewhere handle is
             // stale bookkeeping, skip it.
-            _ => return,
+            _ => return Ok(()),
         };
         let promise_value = Value::promise(promise);
         if let Some(hook) = self.promise_rejection_hook() {
@@ -226,21 +230,39 @@ impl Interpreter {
                 Some(context),
                 |ctx| hook.notify(ctx, promise_value, reason, handled),
             );
-            return;
+            return Ok(());
         }
 
         // Re-fetch per call: the reporter Value is not rooted across the
         // reentrant dispatch a previous fire may have moved it through.
         let Some(reporter) = crate::object::get(self.global_this, &self.gc_heap, REPORTER_GLOBAL)
         else {
-            return;
+            return Ok(());
         };
         if !reporter.is_callable() {
-            return;
+            return Ok(());
         }
         let this = Value::object(self.global_this);
         let args: smallvec::SmallVec<[Value; 8]> =
             smallvec::smallvec![promise_value, reason, Value::boolean(handled)];
-        let _ = self.run_callable_sync(context, &reporter, this, args);
+        match self.run_callable_sync(context, &reporter, this, args) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.uncaught_from_promise_rejection = true;
+                let detail = self.take_error_detail();
+                Err(RunError {
+                    error,
+                    frames: Vec::new(),
+                    detail,
+                })
+            }
+        }
+    }
+
+    /// Whether the throw now surfacing came out of the rejection checkpoint,
+    /// clearing the mark. Read once, where the host names the origin.
+    #[must_use]
+    pub fn take_uncaught_from_promise_rejection(&mut self) -> bool {
+        std::mem::take(&mut self.uncaught_from_promise_rejection)
     }
 }

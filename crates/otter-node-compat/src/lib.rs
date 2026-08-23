@@ -436,6 +436,8 @@ fn supported_test_flags(file_path: &Path) -> Vec<String> {
         "--disable-warning=",
         "--max-http-header-size=",
         "--network-family-autoselection-attempt-timeout=",
+        "--unhandled-rejections=",
+        "--input-type=",
     ];
     const SUPPORTED_EXACT: &[&str] = &[
         "--expose-gc",

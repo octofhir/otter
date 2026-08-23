@@ -3698,23 +3698,18 @@ impl Runtime {
         if target_url.starts_with("http://") || target_url.starts_with("https://") {
             return Ok(DynamicModuleLoad::FetchHttps { target_url });
         }
-        // A hosted builtin (`node:fs`, `process`, ...) has no file to walk:
-        // synthesize the same CommonJS bridge a static `import` of a CJS file
-        // gets, whose default export is the module's `require` value.
+        // A hosted builtin (`node:fs`, `process`, ...) has no file to walk. A
+        // module that imports it does, so the graph is rooted at one: linking
+        // builds the builtin's own namespace — `default` and every named
+        // export — which is exactly what a static `import` of it answers, and
+        // that namespace is what the import resolves to.
         if loader.is_hosted_url(&target_url) {
             let synthetic_url = format!("otter-hosted-dynamic:{target_url}");
-            if let Some(env) = self.interp.module_env(&synthetic_url) {
-                return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
-            }
             let specifier_literal =
                 serde_json::to_string(&target_url).unwrap_or_else(|_| "\"\"".to_string());
-            let requirer = entry_for_loader.join("__otter_dynamic_import__.js");
-            let requirer_literal = serde_json::to_string(&requirer.to_string_lossy())
-                .unwrap_or_else(|_| "\"\"".to_string());
             let text = format!(
-                "import __otterModule from \"node:module\";\n\
-                 const __otterCommonJs = __otterModule.createRequire({requirer_literal})({specifier_literal});\n\
-                 export default __otterCommonJs;\n"
+                "import * as __otterHosted from {specifier_literal};\n\
+                 export default __otterHosted;\n"
             );
             let entry = module_loader::ResolvedSource {
                 url: synthetic_url.clone(),
@@ -3728,7 +3723,11 @@ impl Runtime {
                     format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
                 )
             })?;
-            return self.evaluate_dynamic_linked_module(&synthetic_url, linked);
+            let loaded = self.evaluate_dynamic_linked_module(&synthetic_url, linked)?;
+            let Some(env) = self.interp.module_env(&target_url) else {
+                return Ok(loaded);
+            };
+            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
         }
         let target_path: PathBuf = url_to_path(&target_url).ok_or_else(|| {
             DynLoadError::type_error(format!(
@@ -5691,6 +5690,13 @@ impl Runtime {
         let Some(thrown) = self.interp.take_pending_uncaught_throw() else {
             return Ok(false);
         };
+        // Node names the origin of a throw that came out of reporting a
+        // rejected promise nobody handled, and a handler is given it.
+        let origin_name = if self.interp.take_uncaught_from_promise_rejection() {
+            "unhandledRejection"
+        } else {
+            "uncaughtException"
+        };
         let handled = otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::default_call(),
@@ -5764,7 +5770,7 @@ impl Runtime {
                         let emit = scope.get(process, "emit")?;
                         if scope.is_callable(emit) {
                             let event = scope.string("uncaughtExceptionMonitor")?;
-                            let origin = scope.string("uncaughtException")?;
+                            let origin = scope.string(origin_name)?;
                             scope.call(emit, process, &[event, thrown, origin])?;
                         }
                     }
@@ -5789,7 +5795,7 @@ impl Runtime {
                         return Ok(false);
                     }
                     let event = scope.string("uncaughtException")?;
-                    let origin = scope.string("uncaughtException")?;
+                    let origin = scope.string(origin_name)?;
                     scope.call(emit, process, &[event, thrown, origin])?;
                     Ok(true)
                 })

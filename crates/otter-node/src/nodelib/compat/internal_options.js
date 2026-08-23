@@ -48,6 +48,7 @@ const defaults = new Map([
   ['--require', []],
   ['--strip-types', false],
   ['--watch', false],
+  ['--unhandled-rejections', 'throw'],
 ]);
 
 // Switches whose value is a list: repeating one adds to it.

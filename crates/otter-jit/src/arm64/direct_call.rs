@@ -143,7 +143,10 @@ fn emit_generated_receiver_allocation(
         ; cmp w11, JS_CLOSURE_BODY_TYPE_TAG as u32
         ; b.ne =>guard_miss
         ; ldr w11, [x14, view.closure_call_layout.function_id_byte]
-        ; cmp w11, plan.new_target_function_id
+    );
+    emit_compare_function_id(ops, plan.new_target_function_id);
+    dynasm!(ops
+        ; .arch aarch64
         ; b.ne =>guard_miss
         ; =>target_ready
         ; ldr w11, [x2, view.class_constructor_layout.prototype_byte]
@@ -417,6 +420,25 @@ impl StackLayout {
 #[must_use]
 pub(crate) fn target_is_supported(target: &JitDirectCallee) -> bool {
     StackLayout::for_target(target).is_some()
+}
+
+/// Compare `w11` against a baked function id.
+///
+/// AArch64's `cmp` carries a 12-bit unsigned immediate, and a function id is
+/// counted per program rather than drawn from a small fixed set: past 4095 the
+/// assembler refuses the instruction outright. A wider id is materialised into
+/// `w15` first, so the guard is emitted whatever the id is.
+fn emit_compare_function_id(ops: &mut Assembler, function_id: u32) {
+    if function_id <= 0xfff {
+        dynasm!(ops ; .arch aarch64 ; cmp w11, function_id);
+        return;
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz w15, function_id & 0xffff
+        ; movk w15, function_id >> 16, lsl 16
+        ; cmp w11, w15
+    );
 }
 
 fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {

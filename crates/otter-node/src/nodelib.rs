@@ -188,7 +188,7 @@ nodelib_module!(internal_test_runner_reporter_utils, "internal/test_runner/repor
 nodelib_module!(internal_test_runner_reporter_v8_serializer, "internal/test_runner/reporter/v8-serializer", vendored "nodelib/internal/test_runner/reporter/v8-serializer.js");
 nodelib_module!(node_console, "node:console", vendored "nodelib/console.js");
 nodelib_module!(internal_console_constructor, "internal/console/constructor", vendored "nodelib/internal/console/constructor.js");
-nodelib_module!(internal_console_global, "internal/console/global", vendored "nodelib/internal/console/global.js");
+nodelib_module!(internal_console_global_unbound, "internal/console/global", vendored "nodelib/internal/console/global.js");
 nodelib_module!(internal_cli_table, "internal/cli_table", vendored "nodelib/internal/cli_table.js");
 nodelib_module!(node_path_posix, "node:path/posix", vendored "nodelib/path/posix.js");
 nodelib_module!(node_path_win32, "node:path/win32", vendored "nodelib/path/win32.js");
@@ -283,6 +283,34 @@ nodelib_module!(node_cluster, "node:cluster", compat "nodelib/compat/node_cluste
 ///
 /// # Errors
 /// Returns a native error when the shim fails to allocate or evaluate.
+/// `internal/console/global`, answering a console that can already write.
+///
+/// Node binds the global console to the process's streams during bootstrap,
+/// before any module can reach for it. This runtime builds the console the
+/// first time it is looked at, and that first look can be a `require` of this
+/// module rather than a read of the global — the test runner's is — so the
+/// binding happens where the console is built.
+///
+/// # Errors
+/// Returns a native error when the module fails to evaluate or the binding
+/// call throws.
+pub fn internal_console_global<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    let exports =
+        internal_console_global_unbound(scope, caps, runtime_task_spawner, module, require)?;
+    let constructor =
+        otter_runtime::require_commonjs_dependency(scope, require, "internal/console/constructor")?;
+    let initialize = scope.get(constructor, "initializeGlobalConsole")?;
+    let undefined = scope.undefined();
+    scope.call(initialize, undefined, &[exports])?;
+    Ok(exports)
+}
+
 pub fn node_events_with_process_graft<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,

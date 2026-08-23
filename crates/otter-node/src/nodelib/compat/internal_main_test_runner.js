@@ -15,6 +15,9 @@
 const { getOptionValue } = require('internal/options');
 const { run } = require('internal/test_runner/runner');
 const { parseCommandLine } = require('internal/test_runner/utils');
+let debug = require('internal/util/debuglog').debuglog('test_runner', (fn) => {
+  debug = fn;
+});
 
 const options = parseCommandLine();
 
@@ -27,6 +30,7 @@ if (options.isolation !== 'none') {
 // the runner to discover the files itself.
 options.globPatterns = process.argv.slice(1);
 
+debug('test runner configuration:', options);
 run(options).on('test:summary', (data) => {
   if (!data.success) {
     process.exitCode = 1;

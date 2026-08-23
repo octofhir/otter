@@ -8,10 +8,19 @@ fn hosted_node_module_specs_are_static_and_ordered() {
     assert_eq!(specs[0].specifier(), "node:fs");
     assert_eq!(specs[1].specifier(), "fs");
 
-    // Every `node:`-prefixed builtin has a matching bare specifier.
+    // Every `node:`-prefixed builtin has a matching bare specifier, except
+    // the ones only the scheme reaches — a bare row for those would shadow a
+    // `node_modules` package of the same name.
     let names: Vec<&str> = specs.iter().map(|m| m.specifier()).collect();
     for name in &names {
         if let Some(bare) = name.strip_prefix("node:") {
+            if otter_runtime::SCHEME_ONLY_BUILTINS.contains(&bare) {
+                assert!(
+                    !names.contains(&bare),
+                    "{name} must not be reachable without the scheme"
+                );
+                continue;
+            }
             assert!(names.contains(&bare), "missing bare specifier for {name}");
         }
     }

@@ -1593,6 +1593,17 @@ pub enum NativeError {
         /// Human-readable error message.
         message: String,
     },
+    /// A spec-mandated error whose message is already exactly what the
+    /// language prescribes. The class-named variants below prefix the
+    /// throwing native's name, which reads well for engine diagnostics
+    /// but corrupts a message the specification quotes verbatim.
+    #[error("{message}")]
+    SpecError {
+        /// JS error class for the thrown instance.
+        kind: crate::error_classes::ErrorKind,
+        /// The complete message, used unchanged.
+        message: String,
+    },
     /// A JS error carrying a Node-style `.code` (`ERR_*`). `kind` selects the
     /// error class; `code` becomes an own property on the thrown instance.
     /// Native modules use this for structured `error.code` (no string munging).

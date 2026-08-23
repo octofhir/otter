@@ -1312,6 +1312,17 @@ impl ErrorClassRegistry {
         // `constructorOpt` is a function, every frame at or above the
         // topmost frame named like that function is omitted (skip-until-
         // function), so a subclass constructor can hide its own frame.
+        /// How many innermost frames `constructorOpt` hides, when it names
+        /// a live frame. Identity against the function object the frame is
+        /// running, not its bytecode id: ids are numbered per program, so an
+        /// entry script and a module it requires reuse the same numbers.
+        fn ctor_frames_to_skip(ctx: &NativeCtx<'_>, ctor: Value) -> Option<usize> {
+            if ctor.as_function().is_none() && ctor.as_closure(ctx.heap()).is_none() {
+                return None;
+            }
+            ctx.frames_above_callee(ctor)
+        }
+
         fn error_capture_stack_trace(
             ctx: &mut NativeCtx<'_>,
             args: &[Value],
@@ -1340,15 +1351,10 @@ impl ErrorClassRegistry {
             // drop every frame at or above the topmost frame belonging to
             // it (matched by function identity, the V8 semantics). This
             // lets a subclass constructor hide its own and inner frames.
-            if let Some(ctor) = args.get(1).copied() {
-                let skip_fid = ctor
-                    .as_function()
-                    .or_else(|| ctor.as_closure(ctx.heap()).map(|c| c.function_id()));
-                if let Some(fid) = skip_fid
-                    && let Some(pos) = frames.iter().position(|f| f.function_id == fid)
-                {
-                    frames.drain(0..=pos);
-                }
+            if let Some(ctor) = args.get(1).copied()
+                && let Some(skip) = ctor_frames_to_skip(ctx, ctor)
+            {
+                frames.drain(0..skip.min(frames.len()));
             }
             if frames.len() > limit {
                 frames.truncate(limit);
@@ -1369,12 +1375,28 @@ impl ErrorClassRegistry {
                         reason: err.to_string(),
                     }
                 })?;
+                // The string allocation may have moved the target; the
+                // rooted argument slot is the live handle.
+                let target_obj = args
+                    .first()
+                    .and_then(|value| value.as_object())
+                    .unwrap_or(target_obj);
                 let _ = object::define_own_property(
                     target_obj,
                     ctx.heap_mut(),
                     "stack",
                     PropertyDescriptor::data(Value::string(s), true, false, true),
                 );
+                // Keep the structured frames as well. A plain object is a
+                // capture target precisely because it is cheap, and callers
+                // that want the position rather than the rendered text ask
+                // for the frames — the rendering above must not be the only
+                // record of where the capture happened.
+                let target_obj = args
+                    .first()
+                    .and_then(|value| value.as_object())
+                    .unwrap_or(target_obj);
+                crate::object::set_error_stack_frames(target_obj, ctx.heap_mut(), frames);
             }
             Ok(Value::undefined())
         }

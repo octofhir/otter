@@ -48,8 +48,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ActivationStack, ExecutionContext, Interpreter, IteratorHandle, IteratorState, Local,
-    NativeError, Value, VmError, array,
+    ActivationStack, ErrorSourcePosition, ExecutionContext, Interpreter, IteratorHandle,
+    IteratorState, Local, NativeError, Value, VmError, array,
     binary::array_buffer::JsArrayBuffer,
     collections,
     handles::HandleScope,
@@ -384,6 +384,14 @@ impl<'rt> NativeCtx<'rt> {
         crate::error_ops::snapshot_frames(context, self.cx.activations())
     }
 
+    /// How many innermost frames belong to `callee` and its callees.
+    ///
+    /// `None` when no live frame is running that function.
+    #[must_use]
+    pub fn frames_above_callee(&self, callee: Value) -> Option<usize> {
+        crate::error_ops::frames_above_callee(self.cx.activations(), callee)
+    }
+
     /// Capture the current JavaScript stack as Node-compatible call-site JSON.
     ///
     /// `skip` drops frames from the top and `count` caps the result. Source
@@ -445,6 +453,31 @@ impl<'rt> NativeCtx<'rt> {
             })
             .collect();
         serde_json::to_string(&sites).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Where the top frame of an error's captured stack points.
+    ///
+    /// Answers the script name, the 1-based line, the 0-based column, and
+    /// the text of that source line. `None` when the value carries no
+    /// captured stack, or the script it names has no source on hand.
+    ///
+    /// Reads the structured snapshot rather than the rendered `stack`
+    /// string, so the answer does not depend on whether anything has
+    /// looked at `stack` yet.
+    #[must_use]
+    pub fn error_source_position(&self, error: &Value) -> Option<ErrorSourcePosition> {
+        let object = error.as_object()?;
+        let frames = crate::object::error_stack_frames(object, self.heap())?;
+        let frame = frames.first()?;
+        let interp = self.cx.interp();
+        let (line, column) = interp.source_line_col(&frame.module, frame.span.0)?;
+        let source_line = interp.source_line_text(&frame.module, line)?.to_owned();
+        Some(ErrorSourcePosition {
+            script_name: frame.module.clone(),
+            line_number: line,
+            start_column: column.saturating_sub(1),
+            source_line,
+        })
     }
 
     /// Borrow the owning interpreter together with the current

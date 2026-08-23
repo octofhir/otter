@@ -1671,40 +1671,23 @@ pub(crate) fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool
     is_property_bearing_object(target)
 }
 
+/// Whether `[[OwnPropertyKeys]]` answers for this value.
+///
+/// Every Object does, whatever kind it is: one that keeps its state in
+/// internal slots — a buffer, a promise, a weak collection — owns no key and
+/// answers with none, which is not the same as having no answer. Only a
+/// primitive is asked through `ToObject` first.
 fn own_property_names_uses_internal_methods(target: &Value) -> bool {
-    target.is_object()
-        || target.is_array()
-        || target.is_proxy()
-        || target.is_function()
-        || target.is_closure()
-        || target.is_native_function()
-        || target.is_bound_function()
-        || target.is_class_constructor()
-        || target.is_regexp()
-        || target.is_data_view()
-        || target.is_typed_array()
-        || target.is_map()
-        || target.is_set()
-        || target.is_temporal()
-        || target.is_generator()
-        || target.is_intl()
-        || target.is_iterator()
-        || target.as_weak_ref().is_some()
-        || target.as_finalization_registry().is_some()
+    target.is_object_type() || target.is_proxy()
 }
 
+/// Whether every own property of this value can be described.
+///
+/// The descriptors are read through `[[OwnPropertyKeys]]`, so the same answer
+/// holds: every Object has one, and a kind holding its state in internal slots
+/// describes an empty set rather than refusing.
 fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
-    target.is_object()
-        || target.is_array()
-        || target.is_proxy()
-        || target.is_function()
-        || target.is_closure()
-        || target.is_native_function()
-        || target.is_bound_function()
-        || target.is_class_constructor()
-        || target.is_regexp()
-        || target.is_data_view()
-        || target.is_temporal()
+    own_property_names_uses_internal_methods(target)
 }
 
 pub(crate) fn enumerable_own_string_entries(

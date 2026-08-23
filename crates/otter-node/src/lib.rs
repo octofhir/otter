@@ -22,7 +22,6 @@
 //! # See also
 //! - [`otter_runtime::CommonJsAddonLoader`]
 
-pub mod assert;
 pub mod async_hooks;
 mod buffer;
 mod buffer_decode;
@@ -63,11 +62,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("__fsnative", fs::fs_native_cjs_value),
     HostedModule::cjs_only("node:fs/promises", fs::fs_promises_cjs_value),
     HostedModule::cjs_only("fs/promises", fs::fs_promises_cjs_value),
-    HostedModule::cjs_only("node:assert", assert::assert_cjs_value),
-    HostedModule::cjs_only("assert", assert::assert_cjs_value),
-    HostedModule::cjs_only("node:assert/strict", assert::assert_strict_cjs_value),
-    HostedModule::cjs_only("assert/strict", assert::assert_strict_cjs_value),
-    HostedModule::cjs_only("internal/assert/calltracker", assert::calltracker_cjs_value),
+    HostedModule::cjs_only("node:assert", nodelib::node_assert_vendored),
+    HostedModule::cjs_only("assert", nodelib::node_assert_vendored),
+    HostedModule::cjs_only("node:assert/strict", nodelib::node_assert_strict_vendored),
+    HostedModule::cjs_only("assert/strict", nodelib::node_assert_strict_vendored),
     HostedModule::cjs_only("internal/url", nodelib::internal_url),
     HostedModule::cjs_only(
         "internal/test/binding",

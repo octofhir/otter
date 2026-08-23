@@ -1816,12 +1816,27 @@ pub fn vm_to_native_error(
         // boundary so a host (e.g. the CommonJS loader) can surface a clean
         // process termination instead of an uncatchable-looking TypeError.
         crate::VmError::Exit { code } => NativeError::Exit { code },
-        // URIError / BudgetExceeded / UnknownIntrinsic / InvalidRegExp carry a
-        // message/name detail; the rest render their static `Display` text via
-        // `message()`'s fallback.
-        _ => NativeError::TypeError {
+        // URIError / BudgetExceeded / UnknownIntrinsic / InvalidRegExp are
+        // raised with a message or name detail of their own.
+        crate::VmError::URIError => NativeError::URIError {
             name,
             reason: message(),
+        },
+        crate::VmError::BudgetExceeded
+        | crate::VmError::UnknownIntrinsic
+        | crate::VmError::InvalidRegExp => NativeError::TypeError {
+            name,
+            reason: message(),
+        },
+        // Everything else raises no detail. The isolate's slot holds one
+        // error's detail at a time and is only emptied where an error
+        // surfaces, so reading it here would pin whatever was raised last
+        // onto this error — and, since the result is raised in turn, the next
+        // detail-less error would inherit that, and the one after it both.
+        // Each renders its own text instead.
+        _ => NativeError::TypeError {
+            name,
+            reason: err.to_string(),
         },
     }
 }

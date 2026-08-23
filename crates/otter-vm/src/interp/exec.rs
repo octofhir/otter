@@ -528,6 +528,42 @@ impl Interpreter {
                 }
             };
         }
+        // A callable Proxy reaches [[Call]] only through the `apply`
+        // trap (§10.5.12); it has neither a bytecode target nor a
+        // native call slot, so the frame-pushing path below cannot
+        // reach it. Run it on the synchronous call path, which owns
+        // the trap dispatch, and settle the reaction capability from
+        // its completion exactly as the native arm does.
+        if current.as_proxy().is_some() {
+            let callee = *current;
+            let this_value = *effective_this;
+            let args = std::mem::take(effective_args);
+            return match self.run_callable_sync_rooted(stack, context, &callee, this_value, args) {
+                Ok(value) => {
+                    self.settle_microtask_capability(context, result_capability.take(), Ok(value));
+                    Ok(())
+                }
+                Err(vm_err) => {
+                    if result_capability.is_some() {
+                        let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
+                            crate::promise_dispatch::rejection_value_for(self, &vm_err)
+                        });
+                        self.settle_microtask_capability(
+                            context,
+                            result_capability.take(),
+                            Err(reason),
+                        );
+                        Ok(())
+                    } else {
+                        Err(RunError {
+                            error: vm_err,
+                            frames: Vec::new(),
+                            detail: self.take_error_detail(),
+                        })
+                    }
+                }
+            };
+        }
         let (
             function_id,
             parent_upvalues,

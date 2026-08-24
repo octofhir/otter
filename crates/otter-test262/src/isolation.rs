@@ -87,7 +87,6 @@ pub fn snapshot_runtime(
             max_heap_bytes,
             allow_blocking_atomics_wait,
             jit_selection,
-            ..SnapshotRuntimeOptions::default()
         },
     )
 }

@@ -516,3 +516,117 @@ fn annex_b_class_control_letter_admits_digits_and_underscore() {
     // Outside a class the extension does not apply.
     assert!(matched_text(r"\c0", "", "\u{0f}\u{10}\u{11}").is_none());
 }
+
+/// All matches of `pattern` in `subject`, as `(start, end)` pairs.
+fn all_matches(pattern: &str, flag_str: &str, subject: &str) -> Vec<(usize, usize)> {
+    let flags = Flags::from_str_lossy(flag_str);
+    let re = Regex::compile_str(pattern, flags).expect("compile");
+    let units: Vec<u16> = subject.encode_utf16().collect();
+    re.find_utf16(&units, 0, ExecConfig::default())
+        .map(|m| {
+            let m = m.expect("match");
+            (m.range.start, m.range.end)
+        })
+        .collect()
+}
+
+/// A non-multiline `^` pins every match to offset 0, and a resumed search past
+/// that offset finds nothing — including when every alternative is anchored.
+#[test]
+fn start_anchored_matches_only_at_offset_zero() {
+    assert_eq!(all_matches("^ab", "", "abab"), vec![(0, 2)]);
+    assert_eq!(all_matches("^foo|^bar", "", "bazfoobar"), Vec::new());
+    assert_eq!(all_matches("^foo|^bar", "", "barfoo"), vec![(0, 3)]);
+    // A capture group and a word boundary before the anchor keep it anchored.
+    assert_eq!(all_matches("(^a)", "", "ba"), Vec::new());
+    assert_eq!(all_matches("\\B^a", "", "ba"), Vec::new());
+    // One unanchored alternative is enough to keep the whole pattern scanning.
+    assert_eq!(all_matches("^foo|bar", "", "bazbar"), vec![(3, 6)]);
+    // Under `m` the anchor holds after every line terminator.
+    assert_eq!(all_matches("^ab", "m", "xx\nabab"), vec![(3, 5)]);
+
+    let flags = Flags::from_str_lossy("");
+    let re = Regex::compile_str("^ab", flags).expect("compile");
+    let units: Vec<u16> = "abab".encode_utf16().collect();
+    assert!(
+        re.find_utf16(&units, 2, ExecConfig::default())
+            .next()
+            .is_none(),
+        "a search resumed past offset 0 cannot satisfy `^`"
+    );
+}
+
+/// The literal-prefix scan must land on every occurrence, including overlapping
+/// candidates and alternatives that share only part of a head.
+#[test]
+fn literal_prefix_scan_finds_every_match() {
+    assert_eq!(all_matches("abab", "", "abababab"), vec![(0, 4), (4, 8)]);
+    assert_eq!(all_matches("aaa", "", "aaaaa"), vec![(0, 3)]);
+    assert_eq!(
+        all_matches("quick|quiet", "", "quiet quick quilt"),
+        vec![(0, 5), (6, 11)]
+    );
+    // Only the shared head is required, so a partial head still matches.
+    assert_eq!(all_matches("abc|abd", "", "zzabd"), vec![(2, 5)]);
+    // A case-insensitive literal is not a verbatim unit sequence.
+    assert_eq!(all_matches("abc", "i", "xxABCxx"), vec![(2, 5)]);
+    // The scan must not fire on a literal that only appears past the subject end.
+    assert_eq!(all_matches("abcd", "", "abc"), Vec::new());
+    // A non-BMP literal is two units and still scans correctly.
+    assert_eq!(all_matches("\u{1F600}x", "u", "y\u{1F600}x"), vec![(1, 4)]);
+}
+
+/// A fused repeat under `u`/`v` counts *code points*: give-back must step whole
+/// surrogate pairs, and `min` must be a repetition count, not a unit count.
+#[test]
+fn fused_repeat_is_code_point_wise_under_unicode() {
+    assert_eq!(
+        matched_text(".+", "u", "\u{1F600}\u{1F601}").as_deref(),
+        Some("\u{1F600}\u{1F601}")
+    );
+    // Two astral repetitions satisfy `{2,}`; one does not.
+    assert_eq!(
+        matched_text(".{2,}", "u", "\u{1F600}\u{1F601}").as_deref(),
+        Some("\u{1F600}\u{1F601}")
+    );
+    assert_eq!(matched_text(".{2,}", "u", "\u{1F600}"), None);
+    // Give-back over astral repetitions: the trailing atom must reclaim exactly
+    // one code point, not one code unit.
+    assert_eq!(
+        matched_text(
+            "[\u{1F600}-\u{1F64F}]+\u{1F64F}",
+            "u",
+            "\u{1F600}\u{1F601}\u{1F64F}"
+        )
+        .as_deref(),
+        Some("\u{1F600}\u{1F601}\u{1F64F}")
+    );
+    // Lazy repeats give forward by whole code points too.
+    assert_eq!(
+        matched_text(".+?\u{1F64F}", "u", "\u{1F600}\u{1F601}\u{1F64F}").as_deref(),
+        Some("\u{1F600}\u{1F601}\u{1F64F}")
+    );
+    // Without `u` the same subject is matched per code unit.
+    assert_eq!(
+        matched_text(".{4}", "", "\u{1F600}\u{1F601}").as_deref(),
+        Some("\u{1F600}\u{1F601}")
+    );
+    // A lookbehind runs the fused repeat backwards over code points.
+    assert_eq!(
+        matched_text("(?<=[\u{1F600}-\u{1F64F}]+)x", "u", "\u{1F600}\u{1F601}x").as_deref(),
+        Some("x")
+    );
+}
+
+/// An unmatchable alternative contributes no path, and an unmatchable element
+/// makes its whole sequence unmatchable.
+#[test]
+fn unmatchable_alternatives_are_dropped() {
+    assert_eq!(all_matches("[]|foo", "", "zzfoo"), vec![(2, 5)]);
+    assert_eq!(all_matches("[]", "", "abc"), Vec::new());
+    assert_eq!(all_matches("a[]b", "", "ab"), Vec::new());
+    // `[^]` is the complement of the empty set and matches anything.
+    assert_eq!(all_matches("[^]", "", "a"), vec![(0, 1)]);
+    // A negative lookahead over an unmatchable body always succeeds.
+    assert_eq!(all_matches("(?![])a", "", "a"), vec![(0, 1)]);
+}

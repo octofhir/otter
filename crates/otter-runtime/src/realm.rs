@@ -168,11 +168,17 @@ impl<'a> RuntimeRealmContext<'a> {
     /// [`crate::Runtime::run_script_in_realm`] or the corresponding handle API.
     pub fn install_script(&mut self, source: SourceInput) -> Result<(), OtterError> {
         let context = if let Some(hook) = self.hooks.compile_hook() {
+            let text = crate::module_loader::admit_source(
+                &self.interp.source_account(),
+                "<realm-installer>",
+                source.text,
+            )
+            .map_err(crate::module_loader::LoaderError::into_otter_error)?;
             let resolved = crate::module_loader::ResolvedSource {
                 url: "<realm-installer>".to_string(),
                 kind: source.kind,
                 jsx: None,
-                text: source.text,
+                text,
             };
             let bytecode = hook
                 .compile(crate::RuntimeCompileRequest { source: &resolved })?
@@ -535,11 +541,20 @@ impl crate::Runtime {
             .module_graph
             .load_program_source_interruptible(
                 &loader,
-                crate::module_loader::ResolvedSource {
-                    url,
-                    kind: source.kind,
-                    jsx: None,
-                    text: source.text,
+                {
+                    let text = crate::module_loader::admit_source(
+                        loader.resource_account(),
+                        &url,
+                        source.text,
+                    )
+                    .map_err(crate::module_graph::GraphError::Loader)
+                    .map_err(crate::map_graph_error)?;
+                    crate::module_loader::ResolvedSource {
+                        url,
+                        kind: source.kind,
+                        jsx: None,
+                        text,
+                    }
                 },
                 interrupt,
             )
@@ -637,7 +652,7 @@ fn execute_linked_module_in_active_realm(
         );
     }
     for (url, text) in &linked.module_sources {
-        interp.register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
+        interp.register_module_source(url.clone(), text.clone());
     }
     records.for_each_record(realm_id, |url, _| {
         for referrer in [&entry_url, ""] {

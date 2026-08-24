@@ -381,9 +381,33 @@ impl Interpreter {
     pub fn register_module_source(
         &mut self,
         module_url: impl Into<String>,
-        text: std::sync::Arc<str>,
+        text: otter_resource::SharedSource,
     ) {
         self.module_sources.register(module_url, text);
+    }
+
+    /// Admit a host- or VM-synthesized source against the registry's
+    /// account and register it.
+    ///
+    /// # Errors
+    /// Returns the admission failure without retaining anything.
+    pub fn register_module_source_owned(
+        &mut self,
+        module_url: impl Into<String>,
+        text: String,
+    ) -> Result<(), otter_resource::SharedSourceError> {
+        self.module_sources.register_owned(module_url, text)
+    }
+
+    /// Install the ledger charged for VM-synthesized retained sources.
+    pub fn set_source_account(&mut self, account: otter_resource::ResourceAccount) {
+        self.module_sources.set_account(account);
+    }
+
+    /// The ledger charged for VM-synthesized retained sources.
+    #[must_use]
+    pub fn source_account(&self) -> otter_resource::ResourceAccount {
+        self.module_sources.account().clone()
     }
 
     /// Resolve a `(module_url, byte_offset)` to a 1-based `(line, column)`

@@ -167,13 +167,26 @@ configuration and telemetry surface.
 
 ### R2. Close unbounded stores and queues
 
-Apply R1 to:
+Landed: retained module source text is accounted end to end. `SharedSource`
+carries one exact `SourceModuleBytes` charge per physical allocation through
+the module loader, data/`data:` synthesis, the remote provider contract
+(`RemoteModuleRequest.account`, streamed chunk admission in the built-in
+Tokio provider), the redirect alias cache (aliases share one charge), the
+module graph, `LinkedProgram`, and the VM source registry, which admits
+VM-synthesized wrappers against the runtime account. Local file reads stream
+through the charged builder; script/eval registration admits before
+retention; charges die with the isolate and rejections are typed and
+observable. Worker count and message queues/bytes are bounded by H2.
 
-- JIT `CodeSpace`, code objects, metadata, safepoints, and deopt maps;
-- module source text, redirect bodies, compiled modules, and cache entries;
-- Web/Node response bodies, stream buffers, timers, tasks, and messages;
-- worker count, OS threads, Tokio tasks, and cross-worker payloads;
-- GC external allocations and host-owned backing stores.
+Still open, in R1 terms:
+
+- JIT `CodeSpace`, code objects, metadata, safepoints, and deopt maps
+  (`GeneratedCodeBytes` is still uncharged; CodeSpace is append-only and the
+  registry has no byte budget or size-driven retirement);
+- per-function `FunctionRecord.source_text` duplicates module source inside
+  retained bytecode (uncharged second copy);
+- Web/Node response bodies, stream buffers, and host-owned backing stores;
+- GC external allocations.
 
 Use streaming or bounded reads where whole-body collection is not semantically
 required. Eviction must be deterministic and must not invalidate live code or

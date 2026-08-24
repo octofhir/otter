@@ -188,6 +188,8 @@ struct ModulePreparation {
     capability_evaluator: crate::RuntimeCapabilityEvaluator,
     remote_provider: Arc<dyn crate::module_loader::RemoteModuleProvider>,
     remote_cache: Arc<RemoteModuleCache>,
+    /// Ledger remote providers charge while streaming module bodies.
+    resource_account: ResourceAccount,
 }
 
 #[derive(Debug, Default)]
@@ -244,6 +246,7 @@ impl ModulePreparation {
             ),
             remote_provider,
             remote_cache: Arc::new(RemoteModuleCache::default()),
+            resource_account: config.resource_account.clone(),
         }
     }
 
@@ -255,6 +258,7 @@ impl ModulePreparation {
                 &self.package_manager,
                 &self.capabilities,
                 &self.hooks,
+                &self.resource_account,
             )
             .with_remote_fetch(self.remote_cache.clone())
     }
@@ -266,11 +270,13 @@ impl ModulePreparation {
         cancellation: crate::module_loader::ModuleLoadCancellation,
     ) -> Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError> {
         let loader = self.loader_for_entry(std::path::Path::new("."));
+        let text = crate::module_loader::admit_source(loader.resource_account(), &url, source.text)
+            .map_err(crate::module_graph::GraphError::Loader)?;
         let entry = crate::module_loader::ResolvedSource {
             url,
             kind: source.kind,
             jsx: None,
-            text: source.text,
+            text,
         };
         self.prepare_entry(loader, entry, cancellation).await
     }
@@ -475,6 +481,7 @@ impl ModulePreparation {
                 .remote_provider
                 .fetch(crate::module_loader::RemoteModuleRequest {
                     url: current_url.clone(),
+                    account: self.resource_account.clone(),
                     cancellation: cancellation.clone(),
                 })
                 .await;

@@ -17,19 +17,22 @@
 //! - `line_starts` is computed once at registration; the VM never holds
 //!   a mutable borrow of a registered source, so no interior mutability
 //!   is needed.
+//! - Every retained source carries its exact `SourceModuleBytes` charge:
+//!   loader-produced text arrives as an already-admitted
+//!   [`SharedSource`], and VM-synthesized text (eval/CommonJS wrappers)
+//!   is admitted against the registry's account before retention.
 //!
 //! # See also
 //! - [`crate::error_ops::snapshot_frames`] — produces the
 //!   `(function, module, span)` frames this registry maps to positions.
 
-use std::sync::Arc;
-
+use otter_resource::{ResourceAccount, SharedSource, SharedSourceError};
 use rustc_hash::FxHashMap;
 
 /// One module's source text with a precomputed line-start index.
 #[derive(Debug, Clone)]
 pub struct ModuleSource {
-    text: Arc<str>,
+    text: SharedSource,
     /// Byte offset of the first character of each line. `line_starts[0]`
     /// is always `0`; entry `n` is the byte offset just past the `n`th
     /// `\n`. Sorted ascending, so a byte offset maps to a line by
@@ -39,7 +42,7 @@ pub struct ModuleSource {
 
 impl ModuleSource {
     /// Build a source entry, scanning once for line starts.
-    pub fn new(text: Arc<str>) -> Self {
+    pub fn new(text: SharedSource) -> Self {
         let mut line_starts = Vec::with_capacity(64);
         line_starts.push(0);
         for (idx, byte) in text.bytes().enumerate() {
@@ -90,15 +93,45 @@ impl ModuleSource {
 /// `module_url → ModuleSource` registry owned by the interpreter.
 #[derive(Debug, Default)]
 pub struct SourceRegistry {
+    /// Ledger charged for VM-synthesized retained sources. The runtime
+    /// installs its shared account at construction; the default is a
+    /// private unlimited account, matching `ResourceLimits::unlimited`.
+    account: ResourceAccount,
     sources: FxHashMap<String, ModuleSource>,
 }
 
 impl SourceRegistry {
-    /// Register (or replace) a module's source text. Idempotent re-loads
-    /// simply rebuild the line index.
-    pub fn register(&mut self, module_url: impl Into<String>, text: Arc<str>) {
+    /// Install the ledger charged for VM-synthesized retained sources.
+    pub fn set_account(&mut self, account: ResourceAccount) {
+        self.account = account;
+    }
+
+    /// The ledger charged for VM-synthesized retained sources.
+    #[must_use]
+    pub fn account(&self) -> &ResourceAccount {
+        &self.account
+    }
+
+    /// Register (or replace) a module's already-admitted source text.
+    /// Idempotent re-loads simply rebuild the line index.
+    pub fn register(&mut self, module_url: impl Into<String>, text: SharedSource) {
         self.sources
             .insert(module_url.into(), ModuleSource::new(text));
+    }
+
+    /// Admit a VM-synthesized source against the registry's account and
+    /// register it.
+    ///
+    /// # Errors
+    /// Returns the admission failure without retaining anything.
+    pub fn register_owned(
+        &mut self,
+        module_url: impl Into<String>,
+        text: String,
+    ) -> Result<(), SharedSourceError> {
+        let text = SharedSource::admit(&self.account, text)?;
+        self.register(module_url, text);
+        Ok(())
     }
 
     /// Look up a registered module's source.
@@ -126,9 +159,13 @@ impl SourceRegistry {
 mod tests {
     use super::*;
 
+    fn source(text: &str) -> SharedSource {
+        SharedSource::admit(&ResourceAccount::default(), text.to_string()).unwrap()
+    }
+
     #[test]
     fn line_col_basic() {
-        let src = ModuleSource::new(Arc::from("ab\ncde\nf"));
+        let src = ModuleSource::new(source("ab\ncde\nf"));
         // offset 0 -> line 1 col 1
         assert_eq!(src.line_col(0), (1, 1));
         // offset 1 -> line 1 col 2
@@ -144,21 +181,21 @@ mod tests {
     #[test]
     fn line_col_utf16_columns() {
         // 'é' is 2 bytes UTF-8, 1 UTF-16 unit. Column after it is 2.
-        let src = ModuleSource::new(Arc::from("é x"));
+        let src = ModuleSource::new(source("é x"));
         // byte offset 2 is the space (after the 2-byte 'é')
         assert_eq!(src.line_col(2), (1, 2));
     }
 
     #[test]
     fn clamps_past_end() {
-        let src = ModuleSource::new(Arc::from("abc"));
+        let src = ModuleSource::new(source("abc"));
         assert_eq!(src.line_col(999), (1, 4));
     }
 
     #[test]
     fn registry_roundtrip() {
         let mut reg = SourceRegistry::default();
-        reg.register("file:///a.js", Arc::from("x\ny"));
+        reg.register("file:///a.js", source("x\ny"));
         assert_eq!(reg.line_col("file:///a.js", 2), Some((2, 1)));
         assert_eq!(reg.line_col("file:///missing.js", 0), None);
     }

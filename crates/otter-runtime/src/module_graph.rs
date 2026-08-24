@@ -165,7 +165,7 @@ struct ModuleGraph {
     /// `module_url → verbatim source text` for every real compiled
     /// module, forwarded to the interpreter so `Error.prototype.stack`
     /// and `util.getCallSites` can resolve frame spans to `(line, col)`.
-    module_sources: BTreeMap<String, String>,
+    module_sources: BTreeMap<String, otter_resource::SharedSource>,
 }
 
 impl ModuleGraph {
@@ -206,9 +206,9 @@ struct ModuleGraphBuilder<'a> {
     loader: &'a ModuleLoader,
     entry_url: String,
     nodes: BTreeMap<String, ModuleNode>,
-    queue: Vec<(String, SourceKind, String, bool)>,
+    queue: Vec<(String, SourceKind, otter_resource::SharedSource, bool)>,
     load_count: usize,
-    module_sources: BTreeMap<String, String>,
+    module_sources: BTreeMap<String, otter_resource::SharedSource>,
     timings: Option<ModulePhaseTimings>,
     interrupt: Option<otter_vm::InterruptFlag>,
     /// Whether the entry is the program the caller asked to run, rather than a
@@ -221,7 +221,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         loader: &'a ModuleLoader,
         entry_url: String,
         entry_kind: SourceKind,
-        entry_text: String,
+        entry_text: otter_resource::SharedSource,
     ) -> Self {
         Self {
             loader,
@@ -249,7 +249,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         loader: &'a ModuleLoader,
         entry_url: String,
         entry_kind: SourceKind,
-        entry_text: String,
+        entry_text: otter_resource::SharedSource,
         timings: ModulePhaseTimings,
     ) -> Self {
         let mut builder = Self::new(loader, entry_url, entry_kind, entry_text);
@@ -328,7 +328,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             return self
                 .loader
                 .load_resolved(url.to_string())
-                .map(|source| source.text.into_bytes());
+                .map(|source| source.text.as_bytes().to_vec());
         }
         let path = url.strip_prefix("file://").unwrap_or(url);
         let started = Instant::now();
@@ -370,7 +370,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         &mut self,
         url: String,
         kind: SourceKind,
-        text: String,
+        text: otter_resource::SharedSource,
         optional_dynamic: bool,
     ) -> Result<(), GraphError> {
         if self.nodes.contains_key(&url) {
@@ -416,7 +416,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         let text = if url.ends_with(".mjs") || is_entry || in_module_package || is_data {
             text
         } else {
-            let shim = with_program(text.as_str(), kind, |program| {
+            let shim = with_program(&text, kind, |program| {
                 Ok::<Option<String>, GraphError>(if crate::program_looks_like_module(program) {
                     None
                 } else {
@@ -427,7 +427,15 @@ impl<'a> ModuleGraphBuilder<'a> {
                 url: url.clone(),
                 error,
             })??;
-            shim.unwrap_or(text)
+            match shim {
+                // The CommonJS wrapper is a synthesized retained source:
+                // admit it, releasing the original file's charge with `text`.
+                Some(shim) => {
+                    crate::module_loader::admit_source(self.loader.resource_account(), &url, shim)
+                        .map_err(GraphError::Loader)?
+                }
+                None => text,
+            }
         };
 
         // Retain the verbatim source so the interpreter can map this
@@ -441,7 +449,8 @@ impl<'a> ModuleGraphBuilder<'a> {
             let requests = collect_module_requests(program);
             let mut resolved_imports: HashMap<ImportRequest, String> = HashMap::new();
             let mut deps: Vec<ModuleEdge> = Vec::with_capacity(requests.len());
-            let mut queued: Vec<(String, SourceKind, String, bool)> = Vec::new();
+            let mut queued: Vec<(String, SourceKind, otter_resource::SharedSource, bool)> =
+                Vec::new();
             let mut eager_static_specs: HashSet<String> = HashSet::new();
             let mut dynamic_specs: HashSet<String> = HashSet::new();
             for request in &requests {
@@ -496,6 +505,12 @@ impl<'a> ModuleGraphBuilder<'a> {
                                 })
                             },
                         )?;
+                        let shim = crate::module_loader::admit_source(
+                            self.loader.resource_account(),
+                            &target,
+                            shim,
+                        )
+                        .map_err(GraphError::Loader)?;
                         queued.push((
                             target,
                             SourceKind::JavaScript,
@@ -704,7 +719,7 @@ pub(crate) struct PrefetchRequest {
 /// Parse one module off the async executor and return its literal dependency
 /// requests. Resolution and host I/O remain separate phases.
 pub(crate) fn scan_module_requests(
-    text: String,
+    text: otter_resource::SharedSource,
     kind: SourceKind,
 ) -> Result<Vec<PrefetchRequest>, GraphError> {
     with_program(&text, kind, |program| {
@@ -1546,7 +1561,7 @@ pub struct LinkedProgram {
     /// `module_url → verbatim source text` for every real compiled
     /// module. The runtime registers these with the interpreter before
     /// evaluation so frame spans resolve to `(line, column)`.
-    pub module_sources: BTreeMap<String, String>,
+    pub module_sources: BTreeMap<String, otter_resource::SharedSource>,
 }
 
 /// Top-level entry: load the dependency graph rooted at `entry_path`,
@@ -1700,10 +1715,18 @@ fn load_program_inner(
         timings.resolve_time_ns = duration_ns(started.elapsed());
     }
     let load_started = timings.is_some().then(Instant::now);
-    let entry_text = std::fs::read_to_string(entry_path).map_err(|e| LoaderError::Load {
-        url: entry_url.clone(),
-        message: e.to_string(),
-    })?;
+    let entry_text = {
+        let mut file = std::fs::File::open(entry_path).map_err(|e| LoaderError::Load {
+            url: entry_url.clone(),
+            message: e.to_string(),
+        })?;
+        otter_resource::SharedSource::read_utf8(loader.resource_account(), &mut file).map_err(
+            |error| LoaderError::Load {
+                url: entry_url.clone(),
+                message: format!("bounded source read failed: {error}"),
+            },
+        )?
+    };
     if let (Some(timings), Some(started)) = (&mut timings, load_started) {
         timings.load_time_ns = duration_ns(started.elapsed());
     }
@@ -2150,7 +2173,12 @@ mod tests {
             "file://{}",
             std::fs::canonicalize(&entry_path).unwrap().display()
         );
-        let entry_text = std::fs::read_to_string(&entry_path).unwrap();
+        let entry_text = crate::module_loader::admit_source(
+            loader.resource_account(),
+            &entry_url,
+            std::fs::read_to_string(&entry_path).unwrap(),
+        )
+        .unwrap();
 
         let (graph, timings) = ModuleGraphBuilder::new(
             &loader,

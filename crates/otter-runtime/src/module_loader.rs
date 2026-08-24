@@ -46,8 +46,8 @@ use crate::{CapabilityRequest, CapabilitySet, RuntimeCapability, RuntimeHooks};
 /// One remote module fetched over http/https.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteModuleSource {
-    /// UTF-8 source text.
-    pub source: String,
+    /// Accounted UTF-8 source text; alias cache entries share one charge.
+    pub source: otter_resource::SharedSource,
     /// Response `Content-Type` header, used to classify the source kind
     /// (Deno-style: the server's declared media type is authoritative for a
     /// specifier that carries no meaningful path extension).
@@ -144,6 +144,10 @@ impl Default for ModuleLoadCancellation {
 pub struct RemoteModuleRequest {
     /// Canonical pre-fetch URL authorized by the runtime capability hook.
     pub url: String,
+    /// Ledger the provider charges while streaming the body. The returned
+    /// [`RemoteModuleResponse::Source`] carries the admitted source as its
+    /// proof of accounting.
+    pub account: otter_resource::ResourceAccount,
     /// Cancellation triggered by command timeout, waiter cancellation, or
     /// runtime disposal.
     pub cancellation: ModuleLoadCancellation,
@@ -159,8 +163,9 @@ pub struct RemoteModuleRequest {
 pub enum RemoteModuleResponse {
     /// Source body returned for the requested URL.
     Source {
-        /// UTF-8 module source.
-        source: String,
+        /// Admitted UTF-8 module source, charged against the request's
+        /// account while it was read.
+        source: otter_resource::SharedSource,
         /// Response `Content-Type`, when known.
         content_type: Option<String>,
     },
@@ -240,7 +245,10 @@ pub fn is_data_url(url: &str) -> bool {
 /// `data:[<mediatype>][;base64],<data>`. JavaScript and JSON media types
 /// are modules; anything else is not something this loader can evaluate,
 /// which is a resolution failure rather than a parse failure.
-fn decode_data_url(url: &str) -> Result<ResolvedSource, LoaderError> {
+fn decode_data_url(
+    url: &str,
+    account: &otter_resource::ResourceAccount,
+) -> Result<ResolvedSource, LoaderError> {
     let body = url.strip_prefix("data:").unwrap_or_default();
     let (meta, payload) = body.split_once(',').ok_or_else(|| LoaderError::Load {
         url: url.to_string(),
@@ -268,11 +276,12 @@ fn decode_data_url(url: &str) -> Result<ResolvedSource, LoaderError> {
     let kind = match media_type {
         "" | "text/javascript" | "application/javascript" | "text/plain" => SourceKind::JavaScript,
         "application/json" => {
+            let text = admit_source(account, url, format!("export default {text};"))?;
             return Ok(ResolvedSource {
                 url: url.to_string(),
                 kind: SourceKind::JavaScript,
                 jsx: None,
-                text: format!("export default {text};"),
+                text,
             });
         }
         other => {
@@ -282,11 +291,53 @@ fn decode_data_url(url: &str) -> Result<ResolvedSource, LoaderError> {
             });
         }
     };
+    let text = admit_source(account, url, text)?;
     Ok(ResolvedSource {
         url: url.to_string(),
         kind,
         jsx: None,
         text,
+    })
+}
+
+/// Read a file's raw bytes through the shared streaming builder so the
+/// payload is charged before it is retained.
+pub(crate) fn read_file_bytes_accounted(
+    account: &otter_resource::ResourceAccount,
+    url: &str,
+    path: &str,
+) -> Result<otter_resource::AccountedBytes, LoaderError> {
+    let mut file = std::fs::File::open(path).map_err(|error| LoaderError::Load {
+        url: url.to_string(),
+        message: error.to_string(),
+    })?;
+    let mut builder = otter_resource::SharedSourceBuilder::new(account);
+    builder
+        .read_from(&mut file)
+        .map_err(|error| LoaderError::Load {
+            url: url.to_string(),
+            message: format!("bounded read failed: {error}"),
+        })?;
+    Ok(builder.finish_bytes())
+}
+
+impl LoaderError {
+    /// Map into the public runtime error through the shared graph-error
+    /// diagnostics path.
+    pub(crate) fn into_otter_error(self) -> crate::OtterError {
+        crate::map_graph_error(crate::module_graph::GraphError::Loader(self))
+    }
+}
+
+/// Charge one retained source to the loader's ledger.
+pub(crate) fn admit_source(
+    account: &otter_resource::ResourceAccount,
+    url: &str,
+    text: String,
+) -> Result<otter_resource::SharedSource, LoaderError> {
+    otter_resource::SharedSource::admit(account, text).map_err(|error| LoaderError::Load {
+        url: url.to_string(),
+        message: format!("source admission failed: {error}"),
     })
 }
 
@@ -409,8 +460,9 @@ pub struct ResolvedSource {
     /// including `extends`, so compile-time callers do not need a second
     /// tsconfig loader.
     pub jsx: Option<String>,
-    /// Source text (UTF-8).
-    pub text: String,
+    /// Accounted source text (UTF-8). Clones share one
+    /// `SourceModuleBytes` charge.
+    pub text: otter_resource::SharedSource,
 }
 
 /// Runtime-local read-only package graph used by [`ModuleLoader`].
@@ -685,6 +737,10 @@ pub struct LoaderConfig {
     pub hosted_specifiers: Vec<String>,
     /// Optional read-only installed package graph.
     pub package_graph: Option<LoaderPackageGraph>,
+    /// Ledger charged for every retained module source byte this loader
+    /// reads or synthesizes. Defaults to a private unlimited account;
+    /// runtime construction installs the shared runtime account.
+    pub resource_account: otter_resource::ResourceAccount,
     /// Capability state used to gate privileged specifier shapes
     /// at resolve time. `http:` / `https:` specifiers consult
     /// `capabilities.net`; future remote-package work will
@@ -727,6 +783,7 @@ impl LoaderConfig {
             enable_node_modules: true,
             hosted_specifiers: Vec::new(),
             package_graph: None,
+            resource_account: otter_resource::ResourceAccount::default(),
             capabilities: CapabilitySet::sandbox(),
             capability_hooks: RuntimeHooks::default(),
         }
@@ -784,6 +841,12 @@ impl ModuleLoader {
     #[must_use]
     pub fn new(base_dir: PathBuf) -> Self {
         Self::with_config(LoaderConfig::new(base_dir))
+    }
+
+    /// Ledger charged for retained module source bytes.
+    #[must_use]
+    pub(crate) fn resource_account(&self) -> &otter_resource::ResourceAccount {
+        &self.config.resource_account
     }
 
     /// Construct a loader with explicit configuration.
@@ -1110,15 +1173,17 @@ impl ModuleLoader {
     /// dependency is not resolved twice and benchmark timing can distinguish
     /// resolver time from source-loading time.
     pub(crate) fn load_resolved(&self, url: String) -> Result<ResolvedSource, LoaderError> {
+        let account = self.config.resource_account.clone();
         if is_data_url(&url) {
-            return decode_data_url(&url);
+            return decode_data_url(&url, &account);
         }
         if self.is_hosted_url(&url) {
+            let text = admit_source(&account, &url, String::new())?;
             return Ok(ResolvedSource {
                 url,
                 kind: SourceKind::JavaScript,
                 jsx: None,
-                text: String::new(),
+                text,
             });
         }
         // Remote (http/https) module: fetch through the wired hook, following
@@ -1157,16 +1222,17 @@ impl ModuleLoader {
         // formats are the same shape, parsed by the host so the module body
         // is a JSON literal either way.
         if let Some(format) = crate::data_modules::DataFormat::from_extension(extension) {
-            let raw = std::fs::read(path).map_err(|e| LoaderError::Load {
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+            // The raw payload stays charged while the host transform derives
+            // the retained module source from it.
+            let raw = read_file_bytes_accounted(&account, &url, path)?;
             let text = crate::data_modules::data_module_source(format, &raw).map_err(|err| {
                 LoaderError::Load {
                     url: url.clone(),
                     message: err.message,
                 }
             })?;
+            drop(raw);
+            let text = admit_source(&account, &url, text)?;
             return Ok(ResolvedSource {
                 url,
                 kind: SourceKind::JavaScript,
@@ -1181,10 +1247,17 @@ impl ModuleLoader {
                 extension: extension.to_string(),
             }
         })?;
-        let text = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {
+        let mut file = std::fs::File::open(path).map_err(|e| LoaderError::Load {
             url: url.clone(),
             message: e.to_string(),
         })?;
+        let text =
+            otter_resource::SharedSource::read_utf8(&account, &mut file).map_err(|error| {
+                LoaderError::Load {
+                    url: url.clone(),
+                    message: format!("bounded source read failed: {error}"),
+                }
+            })?;
         Ok(ResolvedSource {
             url,
             kind,

@@ -20,6 +20,13 @@ impl RemoteModuleProvider for CachedModules {
                 url: request.url.clone(),
                 message: "cache miss".to_string(),
             })?;
+            let source =
+                otter_runtime::SharedSource::admit(&request.account, source).map_err(|error| {
+                    RemoteModuleError::Fetch {
+                        url: request.url.clone(),
+                        message: format!("source admission failed: {error}"),
+                    }
+                })?;
             Ok(RemoteModuleResponse::Source {
                 source,
                 content_type: Some("text/javascript".to_string()),

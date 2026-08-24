@@ -30,6 +30,7 @@ unnecessary_lazy_evaluations = "allow"
 [dependencies]
 otter-bytecode = { workspace = true }
 otter-gc = { workspace = true }
+otter-resource = { workspace = true }
 otter-regex = { workspace = true }
 otter-macros = { workspace = true }
 serde = { workspace = true }

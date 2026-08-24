@@ -194,7 +194,7 @@ impl Matcher<'_, '_> {
                     if frame.pos != low {
                         stack.push(Frame {
                             pc: frame.pc,
-                            pos: step(frame.pos, 1, !backward),
+                            pos: self.retreat_rep(frame.pos, backward),
                             log_mark: frame.log_mark,
                             resume: Resume::RepeatGreedy { low },
                         });
@@ -204,7 +204,7 @@ impl Matcher<'_, '_> {
                     if frame.pos != high {
                         stack.push(Frame {
                             pc: frame.pc,
-                            pos: step(frame.pos, 1, backward),
+                            pos: self.advance_rep(frame.pos, backward),
                             log_mark: frame.log_mark,
                             resume: Resume::RepeatLazy { high },
                         });
@@ -241,7 +241,7 @@ impl Matcher<'_, '_> {
                         } else {
                             (pos, pos + seq.len())
                         };
-                        if hi <= units.len() && units[lo..hi] == **seq {
+                        if hi <= units.len() && seq_eq(&units[lo..hi], seq) {
                             pc += 1;
                             pos = if backward { lo } else { hi };
                         } else {
@@ -261,13 +261,51 @@ impl Matcher<'_, '_> {
                         greedy,
                         possessive,
                     } => {
-                        // Tight one-code-unit scan (non-Unicode), then a single
-                        // chained give-back frame rather than a split per char.
-                        // The atom kind is matched once, outside the per-unit
-                        // loop, so each loop is a single specialized test.
-                        // `unit_at` reads the unit the next repetition would
-                        // consume, which is the one before `end` when the region
-                        // runs backwards.
+                        // Tight scan of the whole run, then a single chained
+                        // give-back frame rather than a split per character.
+                        //
+                        // Code-point mode (`u`/`v`) decodes each repetition, so
+                        // an atom of any width fuses; the scan reports both the
+                        // maximal end and the position after exactly `min`
+                        // repetitions, since a repetition is no longer a fixed
+                        // number of code units.
+                        if prog.unicode {
+                            let Some((end, low)) =
+                                self.scan_repeat_cp(atom, &prog.classes, pos, *min, backward)
+                            else {
+                                break None;
+                            };
+                            if *greedy {
+                                if !*possessive && end != low {
+                                    stack.push(Frame {
+                                        pc: pc + 1,
+                                        pos: self.retreat_rep(end, backward),
+                                        log_mark: log.len(),
+                                        resume: Resume::RepeatGreedy { low },
+                                    });
+                                }
+                                pos = end;
+                            } else {
+                                if end != low {
+                                    stack.push(Frame {
+                                        pc: pc + 1,
+                                        pos: self.advance_rep(low, backward),
+                                        log_mark: log.len(),
+                                        resume: Resume::RepeatLazy { high: end },
+                                    });
+                                }
+                                pos = low;
+                            }
+                            pc += 1;
+                            continue;
+                        }
+                        // Code-unit mode: every repetition is exactly one unit,
+                        // so the scan is a tight loop with no decode and `min`
+                        // repetitions are `min` units. The atom kind is matched
+                        // once, outside the per-unit loop, so each loop is a
+                        // single specialized test. `unit_at` reads the unit the
+                        // next repetition would consume, which is the one before
+                        // `end` when the region runs backwards.
                         let units = self.units();
                         let len = units.len();
                         let more = |end: usize| {
@@ -347,7 +385,7 @@ impl Matcher<'_, '_> {
                             if !*possessive && end != low {
                                 stack.push(Frame {
                                     pc: pc + 1,
-                                    pos: step(end, 1, !backward),
+                                    pos: self.retreat_rep(end, backward),
                                     log_mark: log.len(),
                                     resume: Resume::RepeatGreedy { low },
                                 });
@@ -357,7 +395,7 @@ impl Matcher<'_, '_> {
                             if end != low {
                                 stack.push(Frame {
                                     pc: pc + 1,
-                                    pos: step(low, 1, backward),
+                                    pos: self.advance_rep(low, backward),
                                     log_mark: log.len(),
                                     resume: Resume::RepeatLazy { high: end },
                                 });
@@ -536,6 +574,81 @@ impl Matcher<'_, '_> {
         self.input.units()
     }
 
+    /// Scan a fused repeat in code-point mode.
+    ///
+    /// Consumes the atom as many times as it matches, returning the maximal end
+    /// position together with the position reached after exactly `min`
+    /// repetitions — the shortest length the repeat may give back to. Returns
+    /// `None` when the atom cannot repeat `min` times, which fails the path.
+    ///
+    /// Under `u`/`v` a repetition is one *code point*, which may be one or two
+    /// code units, so neither the repetition count nor the give-back floor can
+    /// be derived from the consumed width; both are tracked here.
+    fn scan_repeat_cp(
+        &self,
+        atom: &RepeatAtom,
+        classes: &[ClassSet],
+        pos: usize,
+        min: u32,
+        backward: bool,
+    ) -> Option<(usize, usize)> {
+        let mut end = pos;
+        let mut low = pos;
+        let mut count: u64 = 0;
+        let min = u64::from(min);
+        while let Some((cp, w)) = self.decode_dir(end, backward) {
+            let matched = match atom {
+                RepeatAtom::Char {
+                    cp: target,
+                    ignore_case,
+                } => self.char_eq(*target, cp, *ignore_case),
+                RepeatAtom::Any { dot_all } => *dot_all || !is_line_terminator(cp),
+                RepeatAtom::Class {
+                    class,
+                    negate,
+                    ignore_case,
+                } => self.class_member(&classes[*class as usize], *negate, cp, *ignore_case),
+            };
+            if !matched {
+                break;
+            }
+            end = step(end, w, backward);
+            count += 1;
+            if count == min {
+                low = end;
+            }
+        }
+        (count >= min).then_some((end, low))
+    }
+
+    /// Move `p` one repetition back toward the start of a fused repeat's run —
+    /// the give-back step. One code unit outside code-point mode, otherwise the
+    /// width of the repetition that ended there.
+    #[inline]
+    fn retreat_rep(&self, p: usize, backward: bool) -> usize {
+        if !self.input.is_code_point_mode() {
+            return step(p, 1, !backward);
+        }
+        if backward {
+            let w = self.decode(p).map_or(1, |(_, w)| w);
+            p + w
+        } else {
+            let w = self.decode_back(p).map_or(1, |(_, w)| w);
+            p - w
+        }
+    }
+
+    /// Move `p` one repetition forward along a fused repeat's run — the
+    /// give-forward step of a lazy repeat.
+    #[inline]
+    fn advance_rep(&self, p: usize, backward: bool) -> usize {
+        if !self.input.is_code_point_mode() {
+            return step(p, 1, backward);
+        }
+        let w = self.decode_dir(p, backward).map_or(1, |(_, w)| w);
+        step(p, w, backward)
+    }
+
     /// Decode the code point the next atom consumes at `pos`: the one starting
     /// there when running forwards, the one ending there when running backwards.
     fn decode_dir(&self, pos: usize, backward: bool) -> Option<(u32, usize)> {
@@ -691,6 +804,24 @@ impl Matcher<'_, '_> {
             }
         }
         Some(if backward { at } else { at + len })
+    }
+}
+
+/// Compare a subject window against a fused literal run of the same length.
+///
+/// Short runs — nearly all of them — compare unit by unit so the check stays
+/// inline instead of paying a call into the slice comparison; longer runs are
+/// worth that call.
+#[inline]
+fn seq_eq(window: &[u16], seq: &[u16]) -> bool {
+    debug_assert_eq!(window.len(), seq.len());
+    match seq.len() {
+        2 => window[0] == seq[0] && window[1] == seq[1],
+        3 => window[0] == seq[0] && window[1] == seq[1] && window[2] == seq[2],
+        4 => {
+            window[0] == seq[0] && window[1] == seq[1] && window[2] == seq[2] && window[3] == seq[3]
+        }
+        _ => window == seq,
     }
 }
 

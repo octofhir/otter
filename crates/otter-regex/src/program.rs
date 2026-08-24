@@ -7,13 +7,21 @@
 //! [`Insn::Look`] sub-search.
 //!
 //! # Contents
-//! - [`Program`] — the instruction vector plus capture/loop metadata and the
-//!   engine-relevant flag bits.
+//! - [`Program`] — the instruction vector plus capture/loop metadata, the
+//!   engine-relevant flag bits, and the scan strategy chosen for the pattern.
 //! - [`Insn`] — a single matcher instruction.
+//! - [`Prefilter`] — the set of code points that can begin a match.
+//! - [`LiteralPrefix`] — the literal run every match must begin with, when the
+//!   pattern has one.
 //!
 //! # Invariants
 //! - Operands that reference other instructions are indices into the same
 //!   [`Program::insns`] vector.
+//! - Every scan aid ([`Program::prefilter`], [`Program::literal_prefix`],
+//!   [`Program::start_anchored`]) is a *necessary* condition on a match's start
+//!   position, never a sufficient one: skipping a position it rejects can never
+//!   discard a match, and every position it accepts is still run through the
+//!   matcher.
 //! - Capture slots number `2 * (group_count + 1)`: slots `2*g` / `2*g+1` hold
 //!   the start / end of group `g`, with group `0` the overall match.
 //! - A lookaround body is a contiguous region beginning at [`Insn::Look`]'s
@@ -187,6 +195,18 @@ pub(crate) struct Program {
     /// exactly the maximal span of [`Prefilter`] members, so the skip reuses the
     /// prefilter membership test.
     pub(crate) lead_possessive_run: bool,
+    /// The literal code units every match must begin with, when there are at
+    /// least two of them. Strictly stronger than [`Self::prefilter`] (which
+    /// characterizes only the first code point), so the leftmost search prefers
+    /// it: a whole literal run is confirmed by the scan before the matcher is
+    /// entered at all.
+    pub(crate) literal_prefix: Option<LiteralPrefix>,
+    /// `true` when every path from entry asserts start-of-input (`^` outside
+    /// multiline) before consuming anything. Such a pattern can only match at
+    /// offset `0`, so the leftmost search tries that one position and stops
+    /// instead of retrying — and rejects a resumed search (`lastIndex > 0`)
+    /// outright.
+    pub(crate) start_anchored: bool,
 }
 
 /// A scan prefilter: the set of code points that can begin a match, in a form
@@ -289,11 +309,282 @@ impl Prefilter {
     }
 }
 
+/// A literal code-unit sequence every match must begin with, plus the offset of
+/// its rarest unit.
+///
+/// The scan searches for that one unit rather than the first, then confirms the
+/// whole literal. Searching a single unit keeps the inner loop a plain equality
+/// scan the compiler vectorizes, while picking the *rarest* unit is what makes
+/// the candidate rate low: in ordinary text the leading unit of a word is a
+/// common letter, so a first-unit scan stops constantly, whereas the `q` of
+/// `unquestionable` almost never fires.
+#[derive(Debug, Clone)]
+pub(crate) struct LiteralPrefix {
+    /// The required units, in subject order.
+    units: Box<[u16]>,
+    /// Index into `units` of the unit the scan searches for.
+    rare: usize,
+}
+
+impl LiteralPrefix {
+    /// Longest literal this scan will hold. A longer required prefix is
+    /// truncated, which only weakens the filter, never its soundness.
+    const MAX_UNITS: usize = 4096;
+
+    /// Build the scan for a required literal of two or more units.
+    pub(crate) fn new(mut units: Vec<u16>) -> Self {
+        units.truncate(Self::MAX_UNITS);
+        debug_assert!(units.len() >= 2);
+        let rare = units
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, u)| unit_commonness(**u))
+            .map_or(0, |(i, _)| i);
+        Self {
+            units: units.into_boxed_slice(),
+            rare,
+        }
+    }
+
+    /// The first offset at or after `from` where the literal occurs, or `None`
+    /// when the subject holds no further occurrence.
+    #[must_use]
+    pub(crate) fn find(&self, text: &[u16], from: usize) -> Option<usize> {
+        let n = self.units.len();
+        let target = self.units[self.rare];
+        let mut i = from;
+        loop {
+            if i + n > text.len() {
+                return None;
+            }
+            // The searched unit sits `rare` units into the window, so a hit at
+            // `i + rare + off` corresponds to a window starting at `i + off`.
+            let off = text[i + self.rare..].iter().position(|&u| u == target)?;
+            let start = i + off;
+            if start + n > text.len() {
+                return None;
+            }
+            if text[start..start + n] == *self.units {
+                return Some(start);
+            }
+            i = start + 1;
+        }
+    }
+}
+
+/// A rough relative frequency for a code unit in ordinary text, used only to
+/// pick which unit of a literal the scan searches for. Lower is rarer.
+///
+/// The exact numbers matter little — what matters is that letters and spaces
+/// rank far above punctuation, digits, and everything outside ASCII, so a
+/// literal containing an unusual unit searches on that one.
+fn unit_commonness(u: u16) -> u8 {
+    const TABLE: [u8; 128] = {
+        let mut t = [8u8; 128];
+        // Punctuation and control units are rarer than letters but not rare
+        // enough to beat a genuinely unusual unit.
+        let mut i = 0;
+        while i < 128 {
+            t[i] = if i >= b'a' as usize && i <= b'z' as usize {
+                40
+            } else if i >= b'A' as usize && i <= b'Z' as usize {
+                20
+            } else if i >= b'0' as usize && i <= b'9' as usize {
+                16
+            } else {
+                6
+            };
+            i += 1;
+        }
+        // The most common English letters, plus the separators that dominate
+        // any real subject.
+        t[b' ' as usize] = 100;
+        t[b'\n' as usize] = 60;
+        t[b'e' as usize] = 90;
+        t[b't' as usize] = 85;
+        t[b'a' as usize] = 82;
+        t[b'o' as usize] = 80;
+        t[b'i' as usize] = 78;
+        t[b'n' as usize] = 76;
+        t[b's' as usize] = 74;
+        t[b'r' as usize] = 72;
+        t[b'h' as usize] = 70;
+        t[b'l' as usize] = 65;
+        t[b'd' as usize] = 62;
+        t[b'u' as usize] = 58;
+        t[b'c' as usize] = 55;
+        t[b'm' as usize] = 52;
+        t
+    };
+    let i = usize::from(u);
+    // Outside ASCII a unit is rare enough that searching it is always the best
+    // choice available.
+    if i < TABLE.len() { TABLE[i] } else { 1 }
+}
+
 impl Program {
     /// Number of slots: capture slots `2 * (group_count + 1)` plus one per
     /// unbounded-quantifier progress mark.
     #[must_use]
     pub(crate) fn slot_count(&self) -> usize {
         2 * (self.group_count as usize + 1) + self.loop_marks
+    }
+}
+
+impl Program {
+    /// Render the lowered program as a human-readable listing: one line per
+    /// instruction, preceded by the scan strategy chosen for it.
+    ///
+    /// This is a diagnostic surface for the measurement harness, not part of
+    /// the matching contract; the exact text is free to change.
+    pub(crate) fn describe(&self) -> String {
+        use core::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "groups   {}\nunicode  {}\nmarks    {}",
+            self.group_count, self.unicode, self.loop_marks
+        );
+        let _ = writeln!(out, "scan     {}", self.scan_strategy());
+        for (i, class) in self.classes.iter().enumerate() {
+            let _ = writeln!(out, "class#{i}  {}", describe_class(class));
+        }
+        let _ = writeln!(out, "insns");
+        for (pc, insn) in self.insns.iter().enumerate() {
+            let _ = writeln!(out, "  {pc:>4}  {}", describe_insn(insn));
+        }
+        out
+    }
+
+    /// A one-line summary of how the leftmost search skips positions.
+    fn scan_strategy(&self) -> String {
+        match (&self.prefilter, self.lead_possessive_run) {
+            (None, _) => "unfiltered".to_string(),
+            (Some(pf), run) => {
+                let base = match pf.single() {
+                    Some(u) => format!("literal U+{u:04X}"),
+                    None => "first-set".to_string(),
+                };
+                if run {
+                    format!("{base} + possessive-run skip")
+                } else {
+                    base
+                }
+            }
+        }
+    }
+}
+
+/// Render a class set compactly: its first few ranges plus any string
+/// alternatives.
+fn describe_class(set: &ClassSet) -> String {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    for (i, r) in set.code_points.ranges().iter().enumerate() {
+        if i == 6 {
+            let _ = write!(s, " …{} more", set.code_points.ranges().len() - 6);
+            break;
+        }
+        if r.start() == r.end() {
+            let _ = write!(s, " {:04X}", r.start());
+        } else {
+            let _ = write!(s, " {:04X}-{:04X}", r.start(), r.end());
+        }
+    }
+    if !set.strings.is_empty() {
+        let _ = write!(s, " +{} string(s)", set.strings.len());
+    }
+    s.trim_start().to_string()
+}
+
+/// Render one instruction.
+fn describe_insn(insn: &Insn) -> String {
+    match insn {
+        Insn::Char { cp, ignore_case } => {
+            format!("char U+{cp:04X}{}", if *ignore_case { " /i" } else { "" })
+        }
+        Insn::CharSeq(seq) => {
+            let text: String = char::decode_utf16(seq.iter().copied())
+                .map(|c| c.unwrap_or('\u{FFFD}'))
+                .collect();
+            format!("charseq {} {text:?}", seq.len())
+        }
+        Insn::Class {
+            class,
+            negate,
+            ignore_case,
+        } => format!(
+            "class#{class}{}{}",
+            if *negate { " negated" } else { "" },
+            if *ignore_case { " /i" } else { "" }
+        ),
+        Insn::AnyChar { dot_all } => {
+            format!("any{}", if *dot_all { " dotall" } else { "" })
+        }
+        Insn::Repeat {
+            atom,
+            min,
+            greedy,
+            possessive,
+        } => format!(
+            "repeat {} min={min}{}{}",
+            match atom {
+                RepeatAtom::Char { cp, ignore_case } =>
+                    format!("char U+{cp:04X}{}", if *ignore_case { " /i" } else { "" }),
+                RepeatAtom::Class {
+                    class,
+                    negate,
+                    ignore_case,
+                } => format!(
+                    "class#{class}{}{}",
+                    if *negate { " negated" } else { "" },
+                    if *ignore_case { " /i" } else { "" }
+                ),
+                RepeatAtom::Any { dot_all } => {
+                    format!("any{}", if *dot_all { " dotall" } else { "" })
+                }
+            },
+            if *greedy { " greedy" } else { " lazy" },
+            if *possessive { " possessive" } else { "" }
+        ),
+        Insn::Fail => "fail".to_string(),
+        Insn::Jump(t) => format!("jump {t}"),
+        Insn::Split(a, b) => format!("split {a} {b}"),
+        Insn::Save(slot) => format!("save {slot}"),
+        Insn::ClearCapture(g) => format!("clearcap {g}"),
+        Insn::SetMark(m) => format!("setmark {m}"),
+        Insn::CheckProgress(m) => format!("checkprogress {m}"),
+        Insn::BackRef {
+            indices,
+            ignore_case,
+        } => format!(
+            "backref {indices:?}{}",
+            if *ignore_case { " /i" } else { "" }
+        ),
+        Insn::AssertStart { multiline } => {
+            format!("assertstart{}", if *multiline { " /m" } else { "" })
+        }
+        Insn::AssertEnd { multiline } => {
+            format!("assertend{}", if *multiline { " /m" } else { "" })
+        }
+        Insn::WordBoundary {
+            invert,
+            ignore_case,
+        } => format!(
+            "wordboundary{}{}",
+            if *invert { " inverted" } else { "" },
+            if *ignore_case { " /i" } else { "" }
+        ),
+        Insn::Look {
+            negate,
+            behind,
+            entry,
+        } => format!(
+            "look{}{} entry={entry}",
+            if *behind { " behind" } else { " ahead" },
+            if *negate { " negative" } else { "" }
+        ),
+        Insn::LookMatch => "lookmatch".to_string(),
+        Insn::Match => "match".to_string(),
     }
 }

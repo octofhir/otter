@@ -7,6 +7,10 @@ license = "MIT"
 description = "Standalone, VM-agnostic ECMAScript RegExp engine for Otter (clean-room)."
 build = "build.rs"
 
+[[bin]]
+name = "otter-regex-bench"
+path = "src/bin/bench.rs"
+
 # Dependency allowlist — ZERO Otter crates. The dependency edge is one-way:
 # the VM consumes this engine; this engine never reaches back into the VM/GC.
 # Only well-maintained third-party crates are permitted here.

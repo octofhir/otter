@@ -32,7 +32,6 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         insns: Vec::new(),
         classes: Vec::new(),
         next_mark: mark_base,
-        unicode: flags.is_unicode_mode(),
         backward: false,
     };
     // The overall-match bounds (slots 0/1) are not emitted as `Save`
@@ -114,6 +113,11 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     // Auto-possessify greedy fused repeats whose give-back is provably futile.
     mark_possessive(&mut e.insns, &e.classes, flags.is_unicode_mode());
     let lead_possessive_run = lead_possessive_run(&e.insns);
+    let start_anchored = start_anchored(&e.insns);
+    let literal_prefix = (!start_anchored)
+        .then(|| compute_literal_prefix(&e.insns))
+        .flatten()
+        .map(crate::program::LiteralPrefix::new);
 
     let loop_marks = e.next_mark - mark_base;
     let unicode = flags.is_unicode_mode();
@@ -139,7 +143,119 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         loop_marks,
         prefilter,
         lead_possessive_run,
+        start_anchored,
+        literal_prefix,
     }
+}
+
+/// Instructions the literal-prefix walk may visit before giving up, so a `Jump`
+/// cycle or a wide alternation cannot make the analysis quadratic.
+const LITERAL_WALK_BUDGET: u32 = 512;
+
+/// How deep alternation nesting may go before the literal-prefix walk stops
+/// descending.
+const LITERAL_MAX_DEPTH: u32 = 24;
+
+/// The literal code units every match must begin with, when there are at least
+/// two — see [`Program::literal_prefix`].
+///
+/// Walks the paths leaving entry and returns their longest common literal
+/// prefix, so an alternation of literals that share a head (`ab|ac`) still
+/// yields `ab`'s and `ac`'s shared `a`… and a plain literal pattern yields all
+/// of it. Case-insensitive atoms contribute nothing: the scan compares units
+/// verbatim, and folding belongs to the first-set prefilter instead.
+fn compute_literal_prefix(insns: &[Insn]) -> Option<Vec<u16>> {
+    let mut budget = LITERAL_WALK_BUDGET;
+    let units = path_literal(insns, 0, &mut budget, 0);
+    (units.len() >= 2).then_some(units)
+}
+
+/// The literal units a single path from `pc` must consume before it reaches
+/// something the scan cannot characterize. An alternation contributes the
+/// common prefix of its two arms.
+fn path_literal(insns: &[Insn], mut pc: usize, budget: &mut u32, depth: u32) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    loop {
+        if *budget == 0 {
+            return out;
+        }
+        *budget -= 1;
+        match insns.get(pc) {
+            // Zero-width bookkeeping and assertions move nothing, so whatever
+            // literal follows still sits at the match's start position.
+            Some(
+                Insn::Save(_)
+                | Insn::ClearCapture(_)
+                | Insn::SetMark(_)
+                | Insn::CheckProgress(_)
+                | Insn::AssertStart { .. }
+                | Insn::AssertEnd { .. }
+                | Insn::WordBoundary { .. },
+            ) => pc += 1,
+            Some(Insn::Jump(t)) => pc = *t,
+            Some(Insn::Char {
+                cp,
+                ignore_case: false,
+            }) if *cp < 0x1_0000 && !(0xD800..=0xDFFF).contains(cp) => {
+                out.push(*cp as u16);
+                pc += 1;
+            }
+            Some(Insn::CharSeq(seq)) => {
+                out.extend_from_slice(seq);
+                pc += 1;
+            }
+            Some(Insn::Split(a, b)) if depth < LITERAL_MAX_DEPTH => {
+                let left = path_literal(insns, *a, budget, depth + 1);
+                let right = path_literal(insns, *b, budget, depth + 1);
+                let shared = left
+                    .iter()
+                    .zip(right.iter())
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                out.extend_from_slice(&left[..shared]);
+                return out;
+            }
+            // Anything else consumes unpredictably (a class, `.`, a repeat, a
+            // backreference) or leaves the straight-line prefix (a lookaround,
+            // the pattern end).
+            _ => return out,
+        }
+    }
+}
+
+/// Whether every path from entry asserts start-of-input before consuming
+/// anything — see [`Program::start_anchored`].
+///
+/// Walks the zero-width prefix of every path. A path is anchored once it
+/// reaches a non-multiline `^`, since nothing before that point moved the
+/// position; reaching anything that consumes, branches into a lookaround, or
+/// asserts `^` *with* multiline (where `^` also holds after a line terminator)
+/// leaves the pattern unanchored. Other zero-width assertions are passed
+/// through: they neither move the position nor pin it.
+fn start_anchored(insns: &[Insn]) -> bool {
+    let mut visited = vec![false; insns.len()];
+    let mut work = vec![0usize];
+    let mut anchored_any = false;
+    while let Some(pc) = work.pop() {
+        if pc >= insns.len() || visited[pc] {
+            continue;
+        }
+        visited[pc] = true;
+        match &insns[pc] {
+            Insn::AssertStart { multiline: false } => anchored_any = true,
+            Insn::Save(_) | Insn::ClearCapture(_) | Insn::SetMark(_) | Insn::CheckProgress(_) => {
+                work.push(pc + 1);
+            }
+            Insn::AssertEnd { .. } | Insn::WordBoundary { .. } => work.push(pc + 1),
+            Insn::Jump(t) => work.push(*t),
+            Insn::Split(a, b) => {
+                work.push(*a);
+                work.push(*b);
+            }
+            _ => return false,
+        }
+    }
+    anchored_any
 }
 
 /// Whether the unique first consuming instruction — reached from entry through
@@ -509,9 +625,6 @@ struct Emitter {
     classes: Vec<ClassSet>,
     /// Next free loop-mark slot.
     next_mark: usize,
-    /// `u`/`v` mode — disables the fused single-unit repeat (atoms are
-    /// variable-width under surrogate-pair traversal).
-    unicode: bool,
     /// `true` while lowering the body of a lookbehind. §22.2.2.4 evaluates such
     /// a body with direction -1: concatenations run right to left and every
     /// atom consumes the input *before* the current position. Emission mirrors
@@ -655,6 +768,13 @@ impl Emitter {
                 });
             }
             Node::Concat(nodes) => {
+                // A concatenation containing a node that can never match can
+                // never match either, so the whole sequence lowers to one
+                // `Fail` rather than instructions no subject can reach.
+                if nodes.iter().any(never_matches) {
+                    self.emit(Insn::Fail);
+                    return;
+                }
                 // Fuse a run of consecutive case-sensitive BMP literals into one
                 // `CharSeq` so the matcher confirms them in a single slice
                 // comparison rather than one dispatch per character. A
@@ -689,8 +809,19 @@ impl Emitter {
     }
 
     fn compile_alternation(&mut self, alts: &[Node]) {
+        // Alternatives that can never match contribute no reachable path, so
+        // dropping them removes both their instructions and their influence on
+        // the start-set analyses. Group numbering is fixed by the parser and is
+        // unaffected: a dropped alternative's groups simply stay unset, exactly
+        // as they would have.
+        let live: Vec<&Node> = alts.iter().filter(|n| !never_matches(n)).collect();
+        let alts: &[&Node] = &live;
+        if alts.is_empty() {
+            self.emit(Insn::Fail);
+            return;
+        }
         if alts.len() == 1 {
-            self.compile(&alts[0]);
+            self.compile(alts[0]);
             return;
         }
         let mut exit_jumps = Vec::new();
@@ -725,11 +856,11 @@ impl Emitter {
             return;
         }
         let min = min.min(crate::parser::MAX_REPEAT);
-        // Fuse an unbounded repeat of a single one-code-unit atom into one
-        // instruction so the matcher consumes it in a tight loop. Only in
-        // non-Unicode mode, where every atom is exactly one code unit.
+        // Fuse an unbounded repeat of a single atom into one instruction so the
+        // matcher consumes it in a tight loop instead of dispatching a split per
+        // repetition. The executor scans code units directly outside `u`/`v` and
+        // decodes code points under it, so both modes fuse.
         if max.is_none()
-            && !self.unicode
             && let Some(atom) = self.fuseable_atom(node)
         {
             self.emit(Insn::Repeat {
@@ -751,8 +882,8 @@ impl Emitter {
         }
     }
 
-    /// The fused-repeat atom for `node`, when it is a single one-code-unit atom
-    /// (a literal, `.`, or a string-free class). Interns the class set if any.
+    /// The fused-repeat atom for `node`, when it is a single atom (a literal,
+    /// `.`, or a string-free class). Interns the class set if any.
     fn fuseable_atom(&mut self, node: &Node) -> Option<crate::program::RepeatAtom> {
         use crate::program::RepeatAtom;
         match node {
@@ -936,6 +1067,36 @@ fn capture_indices(node: &Node) -> Vec<u32> {
     let mut out = Vec::new();
     visit(node, &mut out);
     out
+}
+
+/// Whether `node` can never match any subject.
+///
+/// Two shapes qualify: an empty non-negated class (`[]`, which §22.2.2 gives no
+/// members), and a counted quantifier whose minimum exceeds what any subject
+/// could supply — §22.2.1 puts no ceiling on the digits, so such a pattern is
+/// writable. Conservative: anything unproven answers `false`.
+fn never_matches(node: &Node) -> bool {
+    match node {
+        Node::Class { set, negate, .. } => {
+            !*negate && set.code_points.is_empty() && set.strings.is_empty()
+        }
+        Node::Repeat { node, quant } => {
+            (quant.min > crate::parser::MAX_REPEAT && consumes_input(node))
+                || (quant.min >= 1 && never_matches(node))
+        }
+        Node::Concat(nodes) => nodes.iter().any(never_matches),
+        Node::Alternate(nodes) => !nodes.is_empty() && nodes.iter().all(never_matches),
+        Node::Group { kind, body } => match kind {
+            GroupKind::Capturing { .. } | GroupKind::NonCapturing => never_matches(body),
+            // A *negative* assertion around an unmatchable body always holds, so
+            // only the positive forms inherit the failure.
+            GroupKind::Lookahead { negate } | GroupKind::Lookbehind { negate } => {
+                !*negate && never_matches(body)
+            }
+        },
+        Node::Empty | Node::Char { .. } | Node::AnyChar { .. } | Node::Assert(_) => false,
+        Node::BackRef { .. } => false,
+    }
 }
 
 /// Whether `node` provably consumes at least one code point on every successful

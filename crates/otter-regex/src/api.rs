@@ -100,6 +100,16 @@ impl Regex {
         }
     }
 
+    /// Render the lowered program as a human-readable listing.
+    ///
+    /// A diagnostic surface for tooling (the measurement harness dumps it to
+    /// explain which scan strategy a pattern chose); the exact text carries no
+    /// stability promise.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.program.describe()
+    }
+
     /// Drop-in alias for [`Regex::find_utf16`] matching the migrated host's
     /// existing call site.
     #[must_use]
@@ -111,6 +121,21 @@ impl Regex {
     ) -> Matches<'r, 't> {
         self.find_utf16(text, start, config)
     }
+}
+
+/// How the leftmost search advances between candidate start positions.
+///
+/// Resolved once from the compiled program, so the per-candidate path is a
+/// single dispatch rather than a chain of option tests.
+enum Scan<'p> {
+    /// Every position is a candidate; the matcher decides.
+    Unfiltered,
+    /// Only offset 0 can match.
+    Anchored,
+    /// Candidates are the occurrences of a required literal prefix.
+    Literal(&'p crate::program::LiteralPrefix),
+    /// Candidates are the positions whose code point can begin a match.
+    FirstSet(&'p crate::program::Prefilter),
 }
 
 /// Iterator over successive matches of a [`Regex`] in a UTF-16 subject.
@@ -139,38 +164,70 @@ impl Iterator for Matches<'_, '_> {
         let unicode = program.unicode;
         let input = Input::new(self.text, unicode);
         let mut pos = self.next_start;
+        // Resolve the scan strategy once per call rather than re-testing it at
+        // every candidate position.
+        let scan = if program.start_anchored {
+            Scan::Anchored
+        } else if let Some(lit) = &program.literal_prefix {
+            Scan::Literal(lit)
+        } else if let Some(pf) = &program.prefilter {
+            Scan::FirstSet(pf)
+        } else {
+            Scan::Unfiltered
+        };
         loop {
-            // First-set prefilter: skip positions that cannot start a match.
-            if let Some(pf) = &program.prefilter {
-                if let Some(unit) = pf.single() {
-                    // Single-literal fast path: a vectorizable equality scan for
-                    // the one code unit that can begin a match.
-                    match self
-                        .text
-                        .get(pos..)
-                        .and_then(|t| t.iter().position(|&u| u == unit))
-                    {
-                        Some(off) => pos += off,
-                        // No further occurrence: a single-literal prefilter means
-                        // every match must consume that unit, so no match remains.
-                        // Step past the end so the terminator below fires (rather
-                        // than clamping to `len`, which would oscillate with
-                        // `advance_scan`).
-                        None => pos = self.text.len() + 1,
+            match scan {
+                Scan::Unfiltered => {}
+                // A start-anchored pattern (`^` outside multiline) can only
+                // match at offset 0: every later position fails the assertion
+                // identically, so the whole search ends rather than retrying
+                // each one.
+                Scan::Anchored => {
+                    if pos > 0 {
+                        self.done = true;
+                        return None;
                     }
-                } else if unicode {
-                    while pos < self.text.len() {
-                        let (cp, _) = decode_at(self.text, pos, unicode);
-                        if pf.cp_may_start(cp) {
-                            break;
+                }
+                // Jump straight to the next position whose units match the
+                // literal every match must begin with.
+                Scan::Literal(lit) => match lit.find(self.text, pos) {
+                    Some(at) => pos = at,
+                    // No further occurrence, so no further match. Step past the
+                    // end so the terminator below fires.
+                    None => pos = self.text.len() + 1,
+                },
+                // First-set prefilter: skip positions that cannot start a match.
+                Scan::FirstSet(pf) => {
+                    if let Some(unit) = pf.single() {
+                        // Single-literal fast path: a vectorizable equality scan for
+                        // the one code unit that can begin a match.
+                        match self
+                            .text
+                            .get(pos..)
+                            .and_then(|t| t.iter().position(|&u| u == unit))
+                        {
+                            Some(off) => pos += off,
+                            // No further occurrence: a single-literal prefilter means
+                            // every match must consume that unit, so no match remains.
+                            // Step past the end so the terminator below fires (rather
+                            // than clamping to `len`, which would oscillate with
+                            // `advance_scan`).
+                            None => pos = self.text.len() + 1,
                         }
-                        pos = advance_scan(self.text, pos, unicode);
-                    }
-                } else {
-                    // Non-Unicode: a code unit is a code point, so the scan is a
-                    // tight single-step loop with no surrogate decode.
-                    while pos < self.text.len() && !pf.cp_may_start(u32::from(self.text[pos])) {
-                        pos += 1;
+                    } else if unicode {
+                        while pos < self.text.len() {
+                            let (cp, _) = decode_at(self.text, pos, unicode);
+                            if pf.cp_may_start(cp) {
+                                break;
+                            }
+                            pos = advance_scan(self.text, pos, unicode);
+                        }
+                    } else {
+                        // Non-Unicode: a code unit is a code point, so the scan is a
+                        // tight single-step loop with no surrogate decode.
+                        while pos < self.text.len() && !pf.cp_may_start(u32::from(self.text[pos])) {
+                            pos += 1;
+                        }
                     }
                 }
             }

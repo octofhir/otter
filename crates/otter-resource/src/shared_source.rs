@@ -236,6 +236,17 @@ impl SharedSourceBuilder {
         }
     }
 
+    /// Publish the raw byte stream with its charge intact. For transient
+    /// non-UTF-8 inputs (data-module payloads) that stay accounted while a
+    /// host transform derives the retained source from them.
+    pub fn finish_bytes(self) -> AccountedBytes {
+        let Self { bytes, lease } = self;
+        AccountedBytes {
+            bytes,
+            _lease: lease,
+        }
+    }
+
     /// Return the number of bytes currently retained by this builder.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -254,6 +265,54 @@ impl fmt::Debug for SharedSourceBuilder {
         formatter
             .debug_struct("SharedSourceBuilder")
             .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for SharedSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for SharedSource {}
+
+impl std::hash::Hash for SharedSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+/// Owned bytes whose exact `SourceModuleBytes` charge lives with them.
+///
+/// Dropping the value releases the charge with the bytes.
+#[must_use = "dropping releases the byte charge"]
+pub struct AccountedBytes {
+    bytes: Vec<u8>,
+    _lease: ResourceLease,
+}
+
+impl AccountedBytes {
+    /// The accounted byte payload.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::Deref for AccountedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for AccountedBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountedBytes")
+            .field("len", &self.bytes.len())
             .finish_non_exhaustive()
     }
 }

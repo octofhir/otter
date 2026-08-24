@@ -61,7 +61,11 @@ impl RemoteModuleProvider for TestProvider {
                         } else {
                             match sources.get(&request.url).cloned() {
                             Some(source) => Ok(RemoteModuleResponse::Source {
-                                source,
+                                source: otter_runtime::SharedSource::admit(
+                                    &request.account,
+                                    source,
+                                )
+                                .expect("test source admission"),
                                 content_type: Some("text/javascript".to_string()),
                             }),
                             None => Err(RemoteModuleError::Fetch {
@@ -99,7 +103,11 @@ impl RemoteModuleProvider for CancellationDefyingProvider {
                 request.cancellation.cancelled().await;
                 state.returned_after_cancel.store(true, Ordering::Release);
                 return Ok(RemoteModuleResponse::Source {
-                    source: "export const late = 1;".to_string(),
+                    source: otter_runtime::SharedSource::admit(
+                        &request.account,
+                        "export const late = 1;".to_string(),
+                    )
+                    .expect("test source admission"),
                     content_type: Some("text/javascript".to_string()),
                 });
             }

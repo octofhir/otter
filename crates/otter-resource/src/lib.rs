@@ -56,7 +56,7 @@ pub use account::{ResourceAccount, ResourceLease, ResourceLeaseSet, ResourceRese
 pub use class::ResourceClass;
 pub use error::ResourceError;
 pub use limits::{ResourceLimits, ResourceLimitsBuilder};
-pub use shared_source::{SharedSource, SharedSourceBuilder, SharedSourceError};
+pub use shared_source::{AccountedBytes, SharedSource, SharedSourceBuilder, SharedSourceError};
 pub use snapshot::{ResourceSnapshot, ResourceSnapshotEntry};
 
 #[cfg(test)]

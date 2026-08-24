@@ -539,6 +539,7 @@ async fn fetch_remote_module_hop(
     request: crate::module_loader::RemoteModuleRequest,
 ) -> Result<crate::module_loader::RemoteModuleResponse, crate::module_loader::RemoteModuleError> {
     let requested_url = request.url.clone();
+    let request_account = request.account.clone();
     let current = reqwest::Url::parse(&requested_url).map_err(|error| {
         crate::module_loader::RemoteModuleError::Fetch {
             url: requested_url.clone(),
@@ -581,13 +582,32 @@ async fn fetch_remote_module_hop(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let source =
-        response
-            .text()
-            .await
-            .map_err(|error| crate::module_loader::RemoteModuleError::Fetch {
+    // Stream the body in chunks, charging each chunk to the request's
+    // ledger before it is retained. A rejected byte budget aborts the
+    // download instead of collecting an unbounded body first.
+    let mut response = response;
+    let mut builder = otter_resource::SharedSourceBuilder::new(&request_account);
+    loop {
+        let chunk = response.chunk().await.map_err(|error| {
+            crate::module_loader::RemoteModuleError::Fetch {
                 url: current.to_string(),
                 message: format!("HTTP body read failed: {error}"),
+            }
+        })?;
+        let Some(chunk) = chunk else { break };
+        builder.push_bytes(&chunk).map_err(|error| {
+            crate::module_loader::RemoteModuleError::Fetch {
+                url: current.to_string(),
+                message: format!("bounded body read failed: {error}"),
+            }
+        })?;
+    }
+    let source =
+        builder
+            .finish_utf8()
+            .map_err(|error| crate::module_loader::RemoteModuleError::Fetch {
+                url: current.to_string(),
+                message: format!("HTTP body is not valid UTF-8 source: {error}"),
             })?;
     Ok(crate::module_loader::RemoteModuleResponse::Source {
         source,

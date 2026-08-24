@@ -503,3 +503,73 @@ fn public_resource_diagnostics_are_send_sync() {
     assert_send_sync::<otter_runtime::ResourceSnapshot>();
     assert_send_sync::<otter_runtime::RuntimeHandle>();
 }
+
+#[test]
+fn module_source_bytes_are_charged_while_retained_and_released_on_drop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dep = dir.path().join("dep.js");
+    std::fs::write(&dep, "export const value = 41;").expect("write dep");
+    let entry = dir.path().join("entry.js");
+    std::fs::write(
+        &entry,
+        "import { value } from './dep.js'; globalThis.out = value + 1;",
+    )
+    .expect("write entry");
+
+    let account = ResourceAccount::default();
+    let mut runtime = Runtime::builder()
+        .resource_account(account.clone())
+        .capabilities(otter_runtime::CapabilitySet::allow_all())
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .expect("runtime");
+    runtime.run_file(&entry).expect("entry runs");
+
+    let retained = resource_entry(&account, ResourceClass::SourceModuleBytes);
+    let source_bytes =
+        (std::fs::metadata(&entry).unwrap().len() + std::fs::metadata(&dep).unwrap().len()) as u64;
+    assert!(
+        retained.current() >= source_bytes,
+        "retained {} < loaded source bytes {}",
+        retained.current(),
+        source_bytes
+    );
+    assert_eq!(retained.rejections(), 0);
+
+    drop(runtime);
+    let after = resource_entry(&account, ResourceClass::SourceModuleBytes);
+    assert_eq!(
+        after.current(),
+        0,
+        "source charge must die with the isolate"
+    );
+}
+
+#[test]
+fn source_byte_limit_rejects_an_oversized_module_before_retention() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("entry.js");
+    std::fs::write(&entry, "globalThis.out = 'x'.repeat(10);").expect("write entry");
+
+    let account = ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::SourceModuleBytes, 8)
+            .build(),
+    );
+    let mut runtime = Runtime::builder()
+        .resource_account(account.clone())
+        .capabilities(otter_runtime::CapabilitySet::allow_all())
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .expect("runtime");
+    runtime
+        .run_file(&entry)
+        .expect_err("an 8-byte source budget cannot admit the module");
+    let entry_stats = resource_entry(&account, ResourceClass::SourceModuleBytes);
+    assert!(entry_stats.rejections() >= 1);
+    assert_eq!(
+        entry_stats.current(),
+        0,
+        "a rejected source must not stay charged"
+    );
+}

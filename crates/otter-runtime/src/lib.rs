@@ -158,6 +158,7 @@ pub use otter_compiler::{
 pub use otter_resource::{
     ResourceAccount, ResourceClass, ResourceError, ResourceLease, ResourceLimits,
     ResourceLimitsBuilder, ResourceReservation, ResourceSnapshot, ResourceSnapshotEntry,
+    SharedSource, SharedSourceBuilder, SharedSourceError,
 };
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
@@ -1844,6 +1845,7 @@ impl RuntimeModuleLoaderState {
         package_manager: &RuntimePackageManagerHandle,
         capabilities: &CapabilitySet,
         hooks: &RuntimeHooks,
+        resource_account: &ResourceAccount,
     ) -> module_loader::ModuleLoader {
         let mut cfg = match &self.configured {
             Some(cfg) => cfg.clone(),
@@ -1868,6 +1870,7 @@ impl RuntimeModuleLoaderState {
         // the default policy remains the configured host allowlist.
         cfg.capabilities = capabilities.clone();
         cfg.capability_hooks = hooks.clone();
+        cfg.resource_account = resource_account.clone();
         module_loader::ModuleLoader::with_config(cfg)
     }
 }
@@ -2796,6 +2799,7 @@ impl Runtime {
             })?;
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
+        interp.set_source_account(config.resource_account.clone());
         interp.set_console_sink(config.console_sink.clone());
         // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
         // heap state, so a restored isolate wires it fresh.
@@ -2891,6 +2895,7 @@ impl Runtime {
         interp.gc_heap_mut().set_tenure_all(true);
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
+        interp.set_source_account(config.resource_account.clone());
         interp.set_console_sink(config.console_sink.clone());
         if let Some(hook) = config.promise_rejection_hook.clone() {
             interp.set_promise_rejection_hook(hook);
@@ -3851,6 +3856,9 @@ impl Runtime {
                 "import * as __otterHosted from {specifier_literal};\n\
                  export default __otterHosted;\n"
             );
+            let text = module_loader::admit_source(loader.resource_account(), &synthetic_url, text)
+                .map_err(module_graph::GraphError::Loader)
+                .map_err(|e| DynLoadError::from_graph_error(&e, &synthetic_url))?;
             let entry = module_loader::ResolvedSource {
                 url: synthetic_url.clone(),
                 kind: SourceKind::JavaScript,
@@ -4927,10 +4935,16 @@ impl Runtime {
                 function.module_url = specifier.to_string();
             }
         }
-        self.interp.register_module_source(
-            specifier.to_string(),
-            std::sync::Arc::from(source.text.as_str()),
-        );
+        if let Err(error) = self
+            .interp
+            .register_module_source_owned(specifier.to_string(), source.text.clone())
+        {
+            return Err(module_loader::LoaderError::Load {
+                url: specifier.to_string(),
+                message: format!("source admission failed: {error}"),
+            }
+            .into_otter_error());
+        }
         self.run_compiled_script_with_context_since(compiled.bytecode, start)
     }
 
@@ -5327,11 +5341,17 @@ impl Runtime {
         specifier: &str,
     ) -> Result<CompiledModule, OtterError> {
         let compiled = if let Some(hook) = self.config.hooks.compile_hook() {
+            let text = module_loader::admit_source(
+                &self.config.resource_account,
+                specifier,
+                source.text.clone(),
+            )
+            .map_err(module_loader::LoaderError::into_otter_error)?;
             let resolved = module_loader::ResolvedSource {
                 url: specifier.to_string(),
                 kind: source.kind,
                 jsx: None,
-                text: source.text.clone(),
+                text,
             };
             hook.compile(RuntimeCompileRequest { source: &resolved })?
         } else if source.allow_top_level_await {
@@ -5416,11 +5436,17 @@ impl Runtime {
             .module_graph
             .load_program_source_interruptible(
                 &loader,
-                module_loader::ResolvedSource {
-                    url,
-                    kind: source.kind,
-                    jsx: None,
-                    text: source.text,
+                {
+                    let text =
+                        module_loader::admit_source(loader.resource_account(), &url, source.text)
+                            .map_err(module_graph::GraphError::Loader)
+                            .map_err(map_graph_error)?;
+                    module_loader::ResolvedSource {
+                        url,
+                        kind: source.kind,
+                        jsx: None,
+                        text,
+                    }
                 },
                 interrupt,
             )
@@ -5514,10 +5540,13 @@ impl Runtime {
     /// so `Error.prototype.stack` and `util.getCallSites` can resolve a
     /// frame's byte span to a `(line, column)` position. Called once per
     /// graph load, before evaluation begins.
-    fn register_module_sources(&mut self, sources: &std::collections::BTreeMap<String, String>) {
+    fn register_module_sources(
+        &mut self,
+        sources: &std::collections::BTreeMap<String, otter_resource::SharedSource>,
+    ) {
         for (url, text) in sources {
             self.interp
-                .register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
+                .register_module_source(url.clone(), text.clone());
         }
         self.report_watch_imports(sources);
     }
@@ -5527,7 +5556,10 @@ impl Runtime {
     /// The graph is linked before any of it evaluates, so one message
     /// carries the whole batch. Only real files are of interest: a builtin
     /// cannot change on disk.
-    fn report_watch_imports(&mut self, sources: &std::collections::BTreeMap<String, String>) {
+    fn report_watch_imports(
+        &mut self,
+        sources: &std::collections::BTreeMap<String, otter_resource::SharedSource>,
+    ) {
         if !commonjs::watch_reporting_requested() {
             return;
         }
@@ -5712,6 +5744,7 @@ impl Runtime {
             &self.package_manager,
             &self.config.capabilities,
             &self.config.hooks,
+            &self.config.resource_account,
         )
     }
 
@@ -5857,7 +5890,22 @@ impl Runtime {
                     .map_err(|err| map_compile_error(err, &specifier))
             })
             .map_err(|err| map_syntax_error(err, &specifier))??;
-            if let Some(module) = module {
+            if let Some(mut module) = module {
+                for function in &mut module.functions {
+                    if function.module_url.is_empty() {
+                        function.module_url = specifier.clone();
+                    }
+                }
+                if let Err(error) = self
+                    .interp
+                    .register_module_source_owned(specifier.clone(), source.text.clone())
+                {
+                    return Err(module_loader::LoaderError::Load {
+                        url: specifier.clone(),
+                        message: format!("source admission failed: {error}"),
+                    }
+                    .into_otter_error());
+                }
                 return self.run_compiled_script_with_context_since(module, start);
             }
             return self.run_module_with_context(path);
@@ -7157,7 +7205,7 @@ fn evaluate_dynamic_linked_module_on(
         );
     }
     for (url, text) in &linked.module_sources {
-        interp.register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
+        interp.register_module_source(url.clone(), text.clone());
     }
     let context = interp.link_module(linked.module).map_err(|error| {
         DynLoadError::type_error(format!(
@@ -7600,9 +7648,7 @@ mod tests {
                 calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 format!("globalThis.__otterCompileHookCacheMarker = {marker};")
             });
-            let text = replacement
-                .as_deref()
-                .unwrap_or(request.source.text.as_str());
+            let text = replacement.as_deref().unwrap_or(&request.source.text);
             compile_script_source_to_module(text, request.source.kind, &request.source.url)
                 .map_err(|error| map_compile_error(error, &request.source.url))
         }

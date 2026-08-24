@@ -637,11 +637,10 @@ impl Interpreter {
             function.module_url = module_url.to_string();
         }
         // Register the wrapped source so frame spans resolve to
-        // `(line, column)` against it.
-        self.register_module_source(
-            module_url.to_string(),
-            std::sync::Arc::from(source.as_str()),
-        );
+        // `(line, column)` against it. The wrapper is VM-synthesized, so it
+        // is admitted against the registry's source budget here.
+        self.register_module_source_owned(module_url.to_string(), source)
+            .map_err(|_| VmError::InvalidOperand)?;
         let context = self
             .link_module(module)
             .map_err(|_| VmError::InvalidOperand)?;

@@ -3230,29 +3230,45 @@ impl Interpreter {
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        let start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
-        let final_index =
-            self.array_relative_index(stack, context, args.get(1), len as f64, len)?;
-        let count = final_index.saturating_sub(start);
-        let a = self.array_species_create(stack, context, o, count, roots)?;
-        if count <= MAX_ARRAY_LIKE_PROBE_LEN {
-            for n in 0..count {
-                self.slice_copy_index(stack, context, o, a, start + n, n)?;
+        // Length/index coercion, species construction, and every copy
+        // iteration can allocate and move the receiver and the result
+        // array; park both in the handle arena and re-read from the
+        // rooted slots before each use.
+        self.with_handle_scope(|interp, scope| {
+            let o_handle = interp.scoped_value(scope, o);
+            let o_now = interp.escape_scoped(o_handle);
+            let len = length_of_array_like(interp, stack, context, &o_now)?;
+            let start = interp.array_relative_index(stack, context, args.first(), 0.0, len)?;
+            let final_index =
+                interp.array_relative_index(stack, context, args.get(1), len as f64, len)?;
+            let count = final_index.saturating_sub(start);
+            let o_now = interp.escape_scoped(o_handle);
+            let a = interp.array_species_create(stack, context, o_now, count, roots)?;
+            let a_handle = interp.scoped_value(scope, a);
+            if count <= MAX_ARRAY_LIKE_PROBE_LEN {
+                for n in 0..count {
+                    let o_now = interp.escape_scoped(o_handle);
+                    let a_now = interp.escape_scoped(a_handle);
+                    interp.slice_copy_index(stack, context, o_now, a_now, start + n, n)?;
+                }
+            } else {
+                let o_now = interp.escape_scoped(o_handle);
+                for n in interp.slice_sparse_offsets(o_now, len, start, count)? {
+                    let o_now = interp.escape_scoped(o_handle);
+                    let a_now = interp.escape_scoped(a_handle);
+                    interp.slice_copy_index(stack, context, o_now, a_now, start + n, n)?;
+                }
             }
-        } else {
-            for n in self.slice_sparse_offsets(o, len, start, count)? {
-                self.slice_copy_index(stack, context, o, a, start + n, n)?;
-            }
-        }
-        self.array_set_property_throwing(
-            stack,
-            context,
-            a,
-            "length",
-            Value::number(NumberValue::from_f64(count as f64)),
-        )?;
-        Ok(a)
+            let a_now = interp.escape_scoped(a_handle);
+            interp.array_set_property_throwing(
+                stack,
+                context,
+                a_now,
+                "length",
+                Value::number(NumberValue::from_f64(count as f64)),
+            )?;
+            Ok(interp.escape_scoped(a_handle))
+        })
     }
 
     fn slice_copy_index(
@@ -3264,13 +3280,26 @@ impl Interpreter {
         from_index: usize,
         to_index: usize,
     ) -> Result<(), VmError> {
-        let from = format_index_key(from_index as f64);
-        if !self.array_method_has_property(stack, context, from_object, &from)? {
-            return Ok(());
-        }
-        let value = self.array_method_get_property(stack, context, from_object, &from)?;
-        let to = format_index_key(to_index as f64);
-        self.create_data_property_or_throw(stack, context, to_object, &to, value)
+        // The has/get probes can run proxy traps and getters, and the
+        // final define can grow the target — all allocating. Re-read
+        // both objects (and the fetched value) from rooted slots
+        // across those boundaries.
+        self.with_handle_scope(|interp, scope| {
+            let from_handle = interp.scoped_value(scope, from_object);
+            let to_handle = interp.scoped_value(scope, to_object);
+            let from = format_index_key(from_index as f64);
+            let from_now = interp.escape_scoped(from_handle);
+            if !interp.array_method_has_property(stack, context, from_now, &from)? {
+                return Ok(());
+            }
+            let from_now = interp.escape_scoped(from_handle);
+            let value = interp.array_method_get_property(stack, context, from_now, &from)?;
+            let value_handle = interp.scoped_value(scope, value);
+            let to = format_index_key(to_index as f64);
+            let to_now = interp.escape_scoped(to_handle);
+            let value_now = interp.escape_scoped(value_handle);
+            interp.create_data_property_or_throw(stack, context, to_now, &to, value_now)
+        })
     }
 
     fn array_species_create(
@@ -3593,13 +3622,26 @@ impl Interpreter {
         from_index: usize,
         to_index: usize,
     ) -> Result<(), VmError> {
-        let from = format_index_key(from_index as f64);
-        if !self.array_method_has_property(stack, context, from_object, &from)? {
-            return Ok(());
-        }
-        let value = self.array_method_get_property(stack, context, from_object, &from)?;
-        let to = format_index_key(to_index as f64);
-        self.create_data_property_or_throw(stack, context, to_object, &to, value)
+        // The has/get probes can run proxy traps and getters, and the
+        // final define can grow the target — all allocating. Re-read
+        // both objects (and the fetched value) from rooted slots
+        // across those boundaries.
+        self.with_handle_scope(|interp, scope| {
+            let from_handle = interp.scoped_value(scope, from_object);
+            let to_handle = interp.scoped_value(scope, to_object);
+            let from = format_index_key(from_index as f64);
+            let from_now = interp.escape_scoped(from_handle);
+            if !interp.array_method_has_property(stack, context, from_now, &from)? {
+                return Ok(());
+            }
+            let from_now = interp.escape_scoped(from_handle);
+            let value = interp.array_method_get_property(stack, context, from_now, &from)?;
+            let value_handle = interp.scoped_value(scope, value);
+            let to = format_index_key(to_index as f64);
+            let to_now = interp.escape_scoped(to_handle);
+            let value_now = interp.escape_scoped(value_handle);
+            interp.create_data_property_or_throw(stack, context, to_now, &to, value_now)
+        })
     }
 
     fn splice_shift_left(

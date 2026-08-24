@@ -331,10 +331,9 @@ pub(crate) fn callable_to_string(ctx: &mut FunctionMetadataContext<'_>, callee: 
         resolved
             .as_closure(ctx.heap())
             .map(|c| c.cached_function_id)
-    }) && let Some(function) = ctx.context.function(fid)
-        && let Some(source) = &function.source_text
+    }) && let Some(source) = ctx.context.function_source_text(fid)
     {
-        return source.clone();
+        return source.to_string();
     }
     let display = callable_name(ctx, callee).unwrap_or_default();
     if is_identifier_name(&display) {

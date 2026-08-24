@@ -533,6 +533,7 @@ mod tests {
                 url: "test:mod".to_string(),
                 function_id: 1,
             }],
+            function_source: None,
         }
     }
 

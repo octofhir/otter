@@ -88,6 +88,7 @@ fn new_object_named_store_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -164,6 +165,7 @@ fn new_object_two_named_stores_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo"), string_constant("bar")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -246,6 +248,7 @@ fn inherited_writable_data_store_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -358,6 +361,7 @@ fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -429,6 +433,7 @@ fn direct_prototype_missing_store_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -494,6 +499,7 @@ fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }

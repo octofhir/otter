@@ -105,6 +105,7 @@ mod tests {
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         };
         let text = disassemble(&module);
         assert!(text.contains("; otter bytecode dump —"));
@@ -147,6 +148,7 @@ mod tests {
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         };
 
         let actual = mnemonic_snapshot(&disassemble(&module));

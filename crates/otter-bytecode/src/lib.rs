@@ -2062,13 +2062,15 @@ pub struct Function {
     /// be empty (a synthesized constructor with no own bindings).
     #[serde(default)]
     pub contains_direct_eval: bool,
-    /// Verbatim source text of the function / class definition
-    /// (§20.2.3.5 [[SourceText]]). Populated for user code by slicing
-    /// the original source over `source_text_span` (or `span` when
-    /// unset); `None` for synthesized functions with no backing
-    /// source, which `toString` renders in the `NativeFunction` form.
+    /// Byte range into [`BytecodeModule::function_source`] for the
+    /// function / class definition (§20.2.3.5 [[SourceText]]). Validated
+    /// at compile time by slicing the source over `source_text_span` (or
+    /// `span` when unset); `None` for synthesized functions with no
+    /// backing source, which `toString` renders in the `NativeFunction`
+    /// form. A range instead of an owned copy: every function shares the
+    /// module-level source snapshot rather than retaining its own slice.
     #[serde(default)]
-    pub source_text: Option<String>,
+    pub source_text_range: Option<(u32, u32)>,
     /// Byte range to slice for [[SourceText]] when it differs from the
     /// executable `span`: a class constructor reports the whole
     /// `class … {}` definition, and a method / accessor reports its
@@ -2266,6 +2268,12 @@ pub struct BytecodeModule {
     pub source_kind: SourceKind,
     /// Function table; index 0 is `<main>`.
     pub functions: Vec<Function>,
+    /// One shared source snapshot each function's
+    /// [`Function::source_text_range`] slices for [[SourceText]].
+    /// `None` when no function retains source (fixtures, synthesized
+    /// modules).
+    #[serde(default)]
+    pub function_source: Option<String>,
     /// Module-wide constant pool.
     #[serde(default)]
     pub constants: Vec<Constant>,

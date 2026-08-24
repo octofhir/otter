@@ -96,10 +96,8 @@ pub(crate) fn decode_module(module: &mut BytecodeModule) {
             Constant::Number { .. } | Constant::FunctionId { .. } | Constant::BigInt { .. } => {}
         }
     }
-    for function in &mut module.functions {
-        if let Some(source_text) = function.source_text.as_mut() {
-            decode_source_text(source_text);
-        }
+    if let Some(function_source) = module.function_source.as_mut() {
+        decode_source_text(function_source);
     }
 }
 

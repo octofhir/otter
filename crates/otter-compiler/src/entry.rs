@@ -478,14 +478,16 @@ impl<'a, 'b> ProgramParts<'a, 'b> {
     }
 }
 
-/// Attach §20.2.3.5 [[SourceText]] to every compiled function by
-/// slicing the original source over the function's byte span. The
+/// Attach §20.2.3.5 [[SourceText]] to every compiled function as a
+/// validated range into one shared module-level source snapshot. The
 /// `<main>` script/eval/module entry (function 0) is skipped — it is
 /// never observable through `Function.prototype.toString`. Spans that
 /// fall outside the source or on a non-char boundary (synthesized
-/// functions) leave `source_text` as `None`, so `toString` keeps the
-/// `NativeFunction` form for them.
+/// functions) leave the range `None`, so `toString` keeps the
+/// `NativeFunction` form for them. The snapshot is retained once per
+/// module instead of one owned slice per function.
 pub(crate) fn attach_source_text(module: &mut BytecodeModule, source: &str) {
+    let mut any_range = false;
     for function in module.functions.iter_mut().skip(1) {
         // A method / accessor reports its `MethodDefinition` source,
         // whose range is wider than the function body `span` (it
@@ -502,9 +504,13 @@ pub(crate) fn attach_source_text(module: &mut BytecodeModule, source: &str) {
         if start >= end {
             continue;
         }
-        if let Some(text) = source.get(start as usize..end as usize) {
-            function.source_text = Some(text.to_string());
+        if source.get(start as usize..end as usize).is_some() {
+            function.source_text_range = Some((start, end));
+            any_range = true;
         }
+    }
+    if any_range {
+        module.function_source = Some(source.to_string());
     }
 }
 
@@ -999,6 +1005,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
         constants,
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     };
     attach_source_text(&mut bytecode, source_text);
     Ok(bytecode)
@@ -1695,6 +1702,7 @@ pub fn compile_module_program(
         constants,
         module_resolutions,
         module_inits: Vec::new(),
+        function_source: None,
     };
     attach_source_text(&mut bytecode, program.source_text);
     Ok(bytecode)

@@ -45,6 +45,7 @@ fn bench_dispatch(c: &mut Criterion) {
         constants: vec![],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     };
     let mut interp = Interpreter::new();
     let context = otter_vm::ExecutionContext::from_module(module).expect("valid bytecode fixture");

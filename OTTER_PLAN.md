@@ -50,7 +50,7 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-08-24.
-- Observed commit: `4a7fbf53` (clean tree at snapshot time).
+- Observed commit: `708c7bc5` (clean tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: compile-cache unit/Unix tests
@@ -72,7 +72,7 @@ claim.
 | H2 | Isolation | P0 | complete | R1 | bounded, capability-aware Workers with deterministic shutdown |
 | B1 | Bytecode | P0 | active | none | mandatory panic-free verifier before any bytecode executes |
 | R1 | Resources | P0 | active | none | one aggregate runtime budget and typed exhaustion errors |
-| R2 | Resources | P1 | queued | R1 | bound code, source, module, queue, worker, and external memory |
+| R2 | Resources | P1 | active | R1 | bound code, source, module, queue, worker, and external memory |
 | E1 | Embedding | P1 | started by H1 | none | one reusable capability evaluator for all host surfaces |
 | J1 | JIT | P1 | active lane | B1, R1 | one typed target-neutral compiled pipeline |
 | J2 | Portability | P1 | queued | J1 | x86-64 parity over the same Machine IR |

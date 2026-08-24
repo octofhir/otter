@@ -296,67 +296,40 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             });
 
-            let dispatch: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-                let worker = ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.dispatchEvent", "invalid receiver".to_string())
-                })?;
-                let event = args.first().copied().unwrap_or(Value::undefined());
-                let event_obj = event.as_object().ok_or_else(|| {
-                    type_err(
-                        "Worker.dispatchEvent",
-                        "event must be an object".to_string(),
-                    )
-                })?;
-                dispatch_event_object(ctx, worker, event_obj)?;
-                Ok(Value::boolean(true))
-            });
-
-            let add: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-                let worker = ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.addEventListener", "invalid receiver".to_string())
-                })?;
-                let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-                if let Some(listener) = args.get(1)
-                    && listener.is_callable()
-                {
-                    add_worker_event_listener(ctx, worker, &ty, *listener)?;
-                }
-                Ok(Value::undefined())
-            });
-
-            let remove: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-                let worker = ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.removeEventListener", "invalid receiver".to_string())
-                })?;
-                let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-                if let Some(listener) = args.get(1) {
-                    remove_worker_event_listener(ctx, worker, &ty, *listener)?;
-                }
-                Ok(Value::undefined())
-            });
-
             let worker = ctx.scope(|mut scope| {
                 let worker = scope.object()?;
                 let null = scope.null();
                 scope.set(worker, "onmessage", null)?;
                 scope.set(worker, "onerror", null)?;
                 scope.set(worker, "onmessageerror", null)?;
-                let listeners = scope.object()?;
-                scope.set(worker, "__otterListeners", listeners)?;
 
                 for (name, length, call) in [
                     ("postMessage", 1, NativeCall::Dynamic(post)),
                     ("terminate", 0, NativeCall::Dynamic(terminate)),
-                    ("dispatchEvent", 1, NativeCall::Dynamic(dispatch)),
-                    ("addEventListener", 2, NativeCall::Dynamic(add)),
-                    ("removeEventListener", 2, NativeCall::Dynamic(remove)),
                 ] {
                     let function = scope.native_call(name, length, call)?;
                     scope.set(worker, name, function)?;
                 }
                 Ok::<Value, NativeError>(scope.finish(worker))
             })?;
-            install_worker_poll_timer(ctx, host.clone(), id, worker)
+            let worker_root = ctx.persistent_root_insert(worker);
+            let result = (|| {
+                let listeners = ctx.scope(|mut scope| {
+                    let listeners = scope.object()?;
+                    Ok::<Value, NativeError>(scope.finish(listeners))
+                })?;
+                let listeners_root = ctx.persistent_root_insert(listeners);
+                let result = (|| {
+                    install_worker_event_methods(ctx, worker_root, listeners_root)?;
+                    let worker = worker_persistent_value(ctx, worker_root)?;
+                    let listeners = worker_persistent_value(ctx, listeners_root)?;
+                    install_worker_poll_timer(ctx, host.clone(), id, worker, listeners)
+                })();
+                ctx.persistent_root_remove(listeners_root);
+                result
+            })();
+            ctx.persistent_root_remove(worker_root);
+            result
         })();
         if result.is_err()
             && let Some(record) = host.remove(id)
@@ -409,11 +382,111 @@ fn spawn_worker_record(host: &Arc<WorkerHostState>, specifier: String) -> Result
     Ok(id.get())
 }
 
+fn worker_persistent_value(
+    ctx: &NativeCtx<'_>,
+    root: otter_vm::PersistentRootId,
+) -> Result<Value, NativeError> {
+    ctx.persistent_root_get(root)
+        .ok_or_else(|| type_err("Worker", "worker root was lost".to_string()))
+}
+
+/// Installs `dispatchEvent`/`addEventListener`/`removeEventListener` on the
+/// worker object. The listener store rides each function's traced capture
+/// vector; it is deliberately not an own property of the worker, so script
+/// cannot observe or replace the routing state.
+fn install_worker_event_methods(
+    ctx: &mut NativeCtx<'_>,
+    worker_root: otter_vm::PersistentRootId,
+    listeners_root: otter_vm::PersistentRootId,
+) -> Result<(), NativeError> {
+    let listeners = worker_persistent_value(ctx, listeners_root)?;
+    let dispatch = ctx.native_value_with_length(
+        "dispatchEvent",
+        1,
+        smallvec![listeners],
+        |ctx, args, captures| {
+            let worker = ctx
+                .this_value()
+                .as_object()
+                .ok_or_else(|| type_err("Worker.dispatchEvent", "invalid receiver".to_string()))?;
+            let event = args.first().copied().unwrap_or(Value::undefined());
+            let event_obj = event.as_object().ok_or_else(|| {
+                type_err(
+                    "Worker.dispatchEvent",
+                    "event must be an object".to_string(),
+                )
+            })?;
+            let listeners = captures.first().and_then(|value| value.as_object());
+            dispatch_event_object(ctx, worker, listeners, event_obj)?;
+            Ok(Value::boolean(true))
+        },
+    )?;
+    set_worker_method(ctx, worker_root, "dispatchEvent", dispatch)?;
+
+    let listeners = worker_persistent_value(ctx, listeners_root)?;
+    let add = ctx.native_value_with_length(
+        "addEventListener",
+        2,
+        smallvec![listeners],
+        |ctx, args, captures| {
+            ctx.this_value().as_object().ok_or_else(|| {
+                type_err("Worker.addEventListener", "invalid receiver".to_string())
+            })?;
+            let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+            // The capture slab is old-space and rewritten in place by a moving
+            // collection, so this read is fresh even after `value_to_string`
+            // allocated.
+            let store = captures.first().copied().unwrap_or(Value::undefined());
+            if let Some(listener) = args.get(1)
+                && listener.is_callable()
+            {
+                add_worker_event_listener(ctx, store, &ty, *listener)?;
+            }
+            Ok(Value::undefined())
+        },
+    )?;
+    set_worker_method(ctx, worker_root, "addEventListener", add)?;
+
+    let listeners = worker_persistent_value(ctx, listeners_root)?;
+    let remove = ctx.native_value_with_length(
+        "removeEventListener",
+        2,
+        smallvec![listeners],
+        |ctx, args, captures| {
+            ctx.this_value().as_object().ok_or_else(|| {
+                type_err("Worker.removeEventListener", "invalid receiver".to_string())
+            })?;
+            let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+            let store = captures.first().copied().unwrap_or(Value::undefined());
+            if let Some(listener) = args.get(1) {
+                remove_worker_event_listener(ctx, store, &ty, *listener)?;
+            }
+            Ok(Value::undefined())
+        },
+    )?;
+    set_worker_method(ctx, worker_root, "removeEventListener", remove)
+}
+
+fn set_worker_method(
+    ctx: &mut NativeCtx<'_>,
+    worker_root: otter_vm::PersistentRootId,
+    name: &'static str,
+    function: Value,
+) -> Result<(), NativeError> {
+    let worker = worker_persistent_value(ctx, worker_root)?;
+    ctx.scope(|mut scope| {
+        let worker = scope.value(worker);
+        let function = scope.value(function);
+        scope.set(worker, name, function)
+    })
+}
+
 fn install_worker_poll_timer(
     ctx: &mut NativeCtx<'_>,
     host: Arc<WorkerHostState>,
     id: u64,
     worker_value: Value,
+    listeners_value: Value,
 ) -> Result<Value, NativeError> {
     let poll_host = host.clone();
     // `native_value` may collect while allocating the function's display
@@ -424,7 +497,7 @@ fn install_worker_poll_timer(
     let result = (|| {
         let poll = ctx.native_value(
             "__otter_worker_poll",
-            smallvec![worker_value],
+            smallvec![worker_value, listeners_value],
             move |ctx, _args, captures| {
                 let Some(worker_value) = captures.first().copied() else {
                     return Ok(Value::undefined());
@@ -475,7 +548,10 @@ fn install_worker_poll_timer(
                             }
                             return Ok(Value::undefined());
                         }
-                        dispatch_event_object(ctx, worker, event_obj)?;
+                        // Capture slab reads stay fresh across the allocations
+                        // above; slot 1 is the hidden listener store.
+                        let listeners = captures.get(1).and_then(|value| value.as_object());
+                        dispatch_event_object(ctx, worker, listeners, event_obj)?;
                     }
                     Ok(Value::undefined())
                 })();
@@ -505,6 +581,7 @@ fn install_worker_poll_timer(
 fn dispatch_event_object(
     ctx: &mut NativeCtx<'_>,
     worker: object::JsObject,
+    listeners_store: Option<object::JsObject>,
     event: object::JsObject,
 ) -> Result<(), NativeError> {
     let ty = object::get(event, ctx.heap(), "type")
@@ -513,7 +590,9 @@ fn dispatch_event_object(
         .unwrap_or_default();
     let handler_key = format!("on{ty}");
     let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
-    let listeners = worker_event_listeners(ctx, worker, &ty);
+    let listeners = listeners_store
+        .map(|store| worker_event_listeners(ctx, store, &ty))
+        .unwrap_or_default();
     ctx.scope(|mut scope| {
         let worker = scope.value(Value::object(worker));
         let event = scope.value(Value::object(event));
@@ -536,21 +615,16 @@ fn dispatch_event_object(
 
 fn add_worker_event_listener(
     ctx: &mut NativeCtx<'_>,
-    worker: object::JsObject,
+    store_value: Value,
     ty: &str,
     listener: Value,
 ) -> Result<(), NativeError> {
     ctx.scope(|mut scope| {
-        let worker = scope.value(Value::object(worker));
+        let store = scope.value(store_value);
         let listener = scope.value(listener);
-        let existing_store = scope.get(worker, "__otterListeners")?;
-        let store = if scope.is_object(existing_store) {
-            existing_store
-        } else {
-            let store = scope.object()?;
-            scope.set(worker, "__otterListeners", store)?;
-            store
-        };
+        if !scope.is_object(store) {
+            return Ok(());
+        }
         let existing_list = scope.get(store, ty)?;
         let list = if scope.is_array(existing_list)? {
             existing_list
@@ -572,14 +646,13 @@ fn add_worker_event_listener(
 
 fn remove_worker_event_listener(
     ctx: &mut NativeCtx<'_>,
-    worker: object::JsObject,
+    store_value: Value,
     ty: &str,
     listener: Value,
 ) -> Result<(), NativeError> {
     ctx.scope(|mut scope| {
-        let worker = scope.value(Value::object(worker));
+        let store = scope.value(store_value);
         let listener = scope.value(listener);
-        let store = scope.get(worker, "__otterListeners")?;
         if !scope.is_object(store) {
             return Ok(());
         }
@@ -603,12 +676,7 @@ fn remove_worker_event_listener(
     })
 }
 
-fn worker_event_listeners(ctx: &NativeCtx<'_>, worker: object::JsObject, ty: &str) -> Vec<Value> {
-    let Some(store) =
-        object::get(worker, ctx.heap(), "__otterListeners").and_then(|value| value.as_object())
-    else {
-        return Vec::new();
-    };
+fn worker_event_listeners(ctx: &NativeCtx<'_>, store: object::JsObject, ty: &str) -> Vec<Value> {
     let Some(list) = object::get(store, ctx.heap(), ty).and_then(|value| value.as_array()) else {
         return Vec::new();
     };

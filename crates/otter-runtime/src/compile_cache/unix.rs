@@ -417,7 +417,11 @@ fn scan_and_prune(
 
 fn bounded_modified_time(metadata: &std::fs::Metadata, now: SystemTime) -> SystemTime {
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    (modified <= now).then_some(modified).unwrap_or(UNIX_EPOCH)
+    if modified <= now {
+        modified
+    } else {
+        UNIX_EPOCH
+    }
 }
 
 fn unlink_candidate(root: &OwnedFd, candidate: &CacheEntryCandidate) -> bool {

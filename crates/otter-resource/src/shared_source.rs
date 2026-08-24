@@ -155,7 +155,6 @@ pub struct SharedSourceBuilder {
 
 impl SharedSourceBuilder {
     /// Create an empty builder charged to `account`.
-    #[must_use]
     pub fn new(account: &ResourceAccount) -> Self {
         let lease = account
             .reserve_exact(ResourceClass::SourceModuleBytes, 0)

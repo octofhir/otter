@@ -2483,7 +2483,7 @@ fn run_isolate(
 /// loop, and posts back a [`RuntimeMessage::TimerFired`] when the
 /// delay elapses so the runner re-enters the VM and runs the JS
 /// callback.
-
+///
 /// The struct is `Send + Sync` because the
 /// [`otter_vm::TimerSchedulerHandle`] alias requires both. The
 /// fields satisfy that: [`InboxSender`] and `TokioEventLoop` are
@@ -4203,14 +4203,15 @@ mod inbox_tests {
         );
         assert_eq!(counters.pending_unref_host_ops.load(Ordering::Relaxed), 0);
         assert_eq!(counters.cancelled_host_ops.load(Ordering::Relaxed), 2);
-        let pending = inbox
-            .shared
-            .pending
-            .lock()
-            .expect("runtime inbox pending queue");
-        assert!(!pending.draining);
-        assert!(pending.fifo.is_empty());
-        drop(pending);
+        {
+            let pending = inbox
+                .shared
+                .pending
+                .lock()
+                .expect("runtime inbox pending queue");
+            assert!(!pending.draining);
+            assert!(pending.fifo.is_empty());
+        }
         assert!(matches!(rx.recv().await, Some(RuntimeMessage::Interrupt)));
     }
 
@@ -4745,9 +4746,10 @@ mod shutdown_tests {
     }
 
     fn config_with_account(account: ResourceAccount) -> RuntimeConfig {
-        let mut config = RuntimeConfig::default();
-        config.resource_account = account;
-        config
+        RuntimeConfig {
+            resource_account: account,
+            ..RuntimeConfig::default()
+        }
     }
 
     fn queued_tasks(account: &ResourceAccount) -> crate::ResourceSnapshotEntry {

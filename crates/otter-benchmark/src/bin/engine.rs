@@ -1593,7 +1593,15 @@ fn run_jit_compile(
     };
     let validation_module = module.clone();
     let mut feedback_interpreter = Interpreter::new();
-    let context = feedback_interpreter.link_module(module);
+    let context = match feedback_interpreter.link_module(module) {
+        Ok(context) => context,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Compile,
+                format!("bytecode link failed: {error}"),
+            );
+        }
+    };
     let compiler = Arc::new(match compile_tier {
         CompileTier::Template => OtterJitCompiler::template_only(),
         CompileTier::Optimizing => OtterJitCompiler::production_tiered(),
@@ -1759,7 +1767,15 @@ fn run_jit_compile(
     let validation = validation_code.into_validation();
     let mut validation_interpreter = Interpreter::new();
     validation.install(&mut validation_interpreter);
-    let validation_context = validation_interpreter.link_module(validation_module);
+    let validation_context = match validation_interpreter.link_module(validation_module) {
+        Ok(context) => context,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Compile,
+                format!("validation bytecode link failed: {error}"),
+            );
+        }
+    };
     for attempt in 0..COMPILE_VALIDATION_CALL_LIMIT {
         let value = match invoke_numeric_target(
             &mut validation_interpreter,

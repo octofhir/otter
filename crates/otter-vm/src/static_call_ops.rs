@@ -460,36 +460,51 @@ impl Interpreter {
             // accessor-aware path so user-defined `valueOf` /
             // `toString` / accessor getters fire per §6.2.5.5
             // ToPropertyDescriptor.
+            // Each iteration can allocate (getters, descriptor
+            // evaluation, the define), moving both the fresh object
+            // and the props source. Park them in the handle arena and
+            // re-read from the rooted slots before each use.
             let props_owned = *props_arg;
-            let keys = own_enumerable_keys_for_define(self, stack, context, &props_owned)?;
-            for key in keys {
-                let outcome =
-                    self.ordinary_get_value(stack, context, props_owned, props_owned, &key, 0)?;
-                let desc_value = match outcome {
-                    crate::VmGetOutcome::Value(v) => v,
-                    crate::VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, props_owned, args)?
+            return self.with_handle_scope(|interp, scope| {
+                let obj_handle = interp.scoped_value(scope, Value::object(obj));
+                let props_handle = interp.scoped_value(scope, props_owned);
+                let props_now = interp.escape_scoped(props_handle);
+                let keys = own_enumerable_keys_for_define(interp, stack, context, &props_now)?;
+                for key in keys {
+                    let props_now = interp.escape_scoped(props_handle);
+                    let outcome =
+                        interp.ordinary_get_value(stack, context, props_now, props_now, &key, 0)?;
+                    let desc_value = match outcome {
+                        crate::VmGetOutcome::Value(v) => v,
+                        crate::VmGetOutcome::InvokeGetter { getter } => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            let props_now = interp.escape_scoped(props_handle);
+                            interp.run_callable_sync_rooted(
+                                stack, context, &getter, props_now, args,
+                            )?
+                        }
+                    };
+                    let descriptor =
+                        interp.evaluate_to_property_descriptor(stack, context, &desc_value)?;
+                    let target_now = interp.escape_scoped(obj_handle);
+                    if !interp.define_own_property_value(
+                        stack,
+                        context,
+                        &target_now,
+                        &key,
+                        descriptor,
+                    )? {
+                        return Err(interp.err_type(
+                            (format!(
+                                "Cannot define property '{}'",
+                                property_key_label(&key, &interp.gc_heap)
+                            ))
+                            .into(),
+                        ));
                     }
-                };
-                let descriptor =
-                    self.evaluate_to_property_descriptor(stack, context, &desc_value)?;
-                if !self.define_own_property_value(
-                    stack,
-                    context,
-                    &Value::object(obj),
-                    &key,
-                    descriptor,
-                )? {
-                    return Err(self.err_type(
-                        (format!(
-                            "Cannot define property '{}'",
-                            property_key_label(&key, &self.gc_heap)
-                        ))
-                        .into(),
-                    ));
                 }
-            }
+                Ok(interp.escape_scoped(obj_handle))
+            });
         }
         Ok(Value::object(obj))
     }
@@ -535,36 +550,55 @@ impl Interpreter {
                 ("Object.defineProperties properties must be an object".to_string()).into(),
             ));
         }
-        let keys = own_enumerable_keys_for_define(self, stack, context, &props_value)?;
-        for key in keys {
-            // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
-            // and step 5 — `ToPropertyDescriptor(descObj)` reads the
-            // accessor / data fields off the resolved value. Thread
-            // both through the interpreter so user getters fire and
-            // any abrupt completion propagates.
-            let outcome =
-                self.ordinary_get_value(stack, context, props_value, props_value, &key, 0)?;
-            let desc_value = match outcome {
-                crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    self.run_callable_sync_rooted(stack, context, &getter, props_value, args)?
+        // Every loop iteration below can allocate (accessor getters,
+        // descriptor evaluation, the define itself), so a raw `Value`
+        // local goes stale on the first collecting allocation. Park the
+        // target and the props source in the handle arena and re-read
+        // them from their rooted slots before each use.
+        self.with_handle_scope(|interp, scope| {
+            let target_handle = interp.scoped_value(scope, target_value);
+            let props_handle = interp.scoped_value(scope, props_value);
+            let props_now = interp.escape_scoped(props_handle);
+            let keys = own_enumerable_keys_for_define(interp, stack, context, &props_now)?;
+            for key in keys {
+                // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
+                // and step 5 — `ToPropertyDescriptor(descObj)` reads the
+                // accessor / data fields off the resolved value. Thread
+                // both through the interpreter so user getters fire and
+                // any abrupt completion propagates.
+                let props_now = interp.escape_scoped(props_handle);
+                let outcome =
+                    interp.ordinary_get_value(stack, context, props_now, props_now, &key, 0)?;
+                let desc_value = match outcome {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        let props_now = interp.escape_scoped(props_handle);
+                        interp.run_callable_sync_rooted(stack, context, &getter, props_now, args)?
+                    }
+                };
+                let descriptor =
+                    interp.evaluate_to_property_descriptor(stack, context, &desc_value)?;
+                let target_now = interp.escape_scoped(target_handle);
+                let ok = interp.define_own_property_value(
+                    stack,
+                    context,
+                    &target_now,
+                    &key,
+                    descriptor,
+                )?;
+                if !ok {
+                    return Err(interp.err_type(
+                        (format!(
+                            "Object.defineProperties: cannot define '{}'",
+                            property_key_label(&key, &interp.gc_heap)
+                        ))
+                        .into(),
+                    ));
                 }
-            };
-            let descriptor = self.evaluate_to_property_descriptor(stack, context, &desc_value)?;
-            let ok =
-                self.define_own_property_value(stack, context, &target_value, &key, descriptor)?;
-            if !ok {
-                return Err(self.err_type(
-                    (format!(
-                        "Object.defineProperties: cannot define '{}'",
-                        property_key_label(&key, &self.gc_heap)
-                    ))
-                    .into(),
-                ));
             }
-        }
-        Ok(target_value)
+            Ok(interp.escape_scoped(target_handle))
+        })
     }
 
     /// §20.1.2.1 Object.assign(target, ...sources).
@@ -1576,17 +1610,35 @@ fn own_enumerable_keys_for_define(
         || props.is_regexp()
         || props.is_proxy()
     {
-        let keys = interp.own_property_keys_value(stack, context, props)?;
-        let mut out = Vec::new();
-        for key in keys {
-            let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())?;
-            let desc =
-                interp.get_own_property_descriptor_for_value(stack, context, *props, Some(&key))?;
-            if desc.is_some_and(|desc| desc.enumerable()) {
-                out.push(vm_key);
+        // The per-key descriptor probe can allocate (proxy traps,
+        // exotic own-property paths), moving the props source and the
+        // key values still queued in `keys`. Park them all in the
+        // handle arena and re-read from the rooted slots per use.
+        return interp.with_handle_scope(|interp, scope| {
+            let props_handle = interp.scoped_value(scope, *props);
+            let keys = interp.own_property_keys_value(stack, context, props)?;
+            let key_handles: Vec<_> = keys
+                .into_iter()
+                .map(|key| interp.scoped_value(scope, key))
+                .collect();
+            let mut out = Vec::new();
+            for key_handle in key_handles {
+                let key = interp.escape_scoped(key_handle);
+                let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())?;
+                let props_now = interp.escape_scoped(props_handle);
+                let key = interp.escape_scoped(key_handle);
+                let desc = interp.get_own_property_descriptor_for_value(
+                    stack,
+                    context,
+                    props_now,
+                    Some(&key),
+                )?;
+                if desc.is_some_and(|desc| desc.enumerable()) {
+                    out.push(vm_key);
+                }
             }
-        }
-        return Ok(out);
+            Ok(out)
+        });
     }
     if let Some(arr) = props.as_array() {
         // §22.1.3.3 EnumerableOwnPropertyNames for Array.

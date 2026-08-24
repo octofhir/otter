@@ -690,20 +690,14 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otter_bytecode::{BytecodeModule, Function, SourceKind};
+    use otter_bytecode::Function;
 
     use crate::frame_state::{AsyncFrameState, ParkedFrameState, TryHandler};
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "async-ops-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "async-ops-test.js",
+        ))
         .expect("valid bytecode fixture")
     }
 

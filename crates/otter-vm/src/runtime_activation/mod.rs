@@ -345,15 +345,9 @@ mod tests {
     fn identity_is_decoded_once_and_slot_access_is_checked() {
         let mut vm = Interpreter::new();
         let mut stack = ActivationStack::new();
-        let context = ExecutionContext::from_module(crate::BytecodeModule {
-            module: "runtime-call-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::TypeScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "runtime-call-test.js",
+        ))
         .expect("valid bytecode fixture");
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [Value::number_i32(3), Value::undefined()];
@@ -387,15 +381,9 @@ mod tests {
     fn materialized_identity_must_resolve_the_published_stack_slot() {
         let mut vm = Interpreter::new();
         let mut stack = ActivationStack::new();
-        let context = ExecutionContext::from_module(crate::BytecodeModule {
-            module: "runtime-call-materialized-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::TypeScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "runtime-call-materialized-test.js",
+        ))
         .expect("valid bytecode fixture");
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
@@ -490,15 +478,9 @@ mod tests {
         let _ = vm.err_uncaught("stale committed detail".into());
 
         let mut stack = ActivationStack::new();
-        let context = ExecutionContext::from_module(crate::BytecodeModule {
-            module: "runtime-call-throw-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::TypeScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "runtime-call-throw-test.js",
+        ))
         .expect("valid bytecode fixture");
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [Value::undefined()];
@@ -558,15 +540,9 @@ mod tests {
         let mut vm = Interpreter::new();
         let before = vm.jit_runtime_stats();
         let mut stack = ActivationStack::new();
-        let context = ExecutionContext::from_module(crate::BytecodeModule {
-            module: "runtime-call-wrong-site-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::TypeScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "runtime-call-wrong-site-test.js",
+        ))
         .expect("valid bytecode fixture");
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [Value::undefined()];

@@ -3939,22 +3939,15 @@ mod tests {
     use super::*;
     use crate::NumberValue;
     use crate::runtime_cx::NativeCallInfo;
-    use otter_bytecode::{BytecodeModule, SourceKind};
 
     /// Minimal execution context for paths that invoke a capability's
     /// native resolve/reject closure — `call_capability_function` runs
     /// it through `run_callable_sync`, which requires a `Some(context)`
     /// even when the body needs no module functions.
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "promise-dispatch-test".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "promise-dispatch-test",
+        ))
         .expect("valid bytecode fixture")
     }
 

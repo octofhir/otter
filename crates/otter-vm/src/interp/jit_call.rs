@@ -1496,15 +1496,9 @@ mod tests {
     }
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(otter_bytecode::BytecodeModule {
-            module: "compiled-entry-transaction-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::JavaScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "compiled-entry-transaction-test.js",
+        ))
         .expect("valid bytecode fixture")
     }
 

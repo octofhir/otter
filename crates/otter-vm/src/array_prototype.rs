@@ -5079,7 +5079,7 @@ mod tests {
     }
 
     fn for_each_add_bitand_upvalue_function(op: Op) -> Function {
-        callback_function(
+        let mut function = callback_function(
             "<for-each-callback>",
             1,
             11,
@@ -5161,7 +5161,11 @@ mod tests {
                 ),
                 instr(11, Op::ReturnUndefined, vec![]),
             ],
-        )
+        );
+        // The body loads and stores upvalue 0; the verifier checks the
+        // declared frame upvalue window.
+        function.inherited_upvalue_count = 1;
+        function
     }
 
     fn instr(pc: u32, op: Op, operands: Vec<Operand>) -> Instruction {
@@ -5174,7 +5178,11 @@ mod tests {
             template_sites: Vec::new(),
             source_kind: BcSourceKind::JavaScript,
             functions: vec![function],
-            constants: Vec::new(),
+            // The synthetic bodies reference `ConstIndex(0)` as a coercion
+            // hint; the verifier requires a String slot there.
+            constants: vec![otter_bytecode::Constant::String {
+                utf16: "number".encode_utf16().collect(),
+            }],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })

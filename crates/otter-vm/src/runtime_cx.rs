@@ -2767,6 +2767,21 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         key: &str,
         value: Local<'_>,
     ) -> Result<(), NativeError> {
+        // A captured native function stores host-written own properties in
+        // its ordinary property bag, mirroring the native-function branch of
+        // [`Self::get`]. Plain objects and arrays keep the direct scoped
+        // store.
+        if let Some(native) = self.raw(object).as_native_function() {
+            let stored = self.raw(value);
+            let descriptor = object::PropertyDescriptor::data(stored, true, true, true);
+            if native.define_own_property(self.ctx.heap_mut(), key, descriptor) {
+                return Ok(());
+            }
+            return Err(NativeError::TypeError {
+                name: "NativeScope::set",
+                reason: format!("cannot define own property '{key}' on this native function"),
+            });
+        }
         let result = self
             .ctx
             .cx
@@ -3679,42 +3694,55 @@ mod tests {
         }
 
         let mut interp = Interpreter::new();
-        with_default_ctx(&mut interp, |ctx| {
-            ctx.scope(|mut scope| {
-                let captured = scope.object().expect("young capture");
-                let marker = scope.string("capture-identity").expect("marker");
-                scope.set(captured, "marker", marker).expect("mark capture");
-                let function = scope
-                    .native_closure(
-                        "captureIdentityAfterNameAllocation",
-                        0,
-                        &[captured],
-                        |_ctx, _args, captures| Ok(captures[0]),
-                    )
-                    .expect("captured native function");
-                let function_name = scope.get(function, "name").expect("native name");
-                assert_eq!(
-                    scope.string_value(function_name).unwrap(),
-                    "captureIdentityAfterNameAllocation"
-                );
-                let own_marker = scope.string("own-property").expect("own marker");
-                scope
-                    .set(function, "probe", own_marker)
-                    .expect("write native own property");
-                let stored_marker = scope.get(function, "probe").expect("read own property");
-                assert_eq!(scope.string_value(stored_marker).unwrap(), "own-property");
-                let this_value = scope.undefined();
-                let returned = scope
-                    .call(function, this_value, &[])
-                    .expect("invoke captured native function");
-                assert!(scope.strict_equals(returned, captured));
-                let returned_marker = scope.get(returned, "marker").expect("read marker");
-                assert_eq!(
-                    scope.string_value(returned_marker).unwrap(),
-                    "capture-identity"
-                );
-            });
-        });
+        // Invoking the captured function needs a dispatch context; a minimal
+        // verified module provides one without changing what the test
+        // exercises.
+        let context = interp
+            .link_module(crate::test_support::minimal_bytecode_module(
+                "native-capture-test.js",
+            ))
+            .expect("minimal fixture module");
+        NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(Value::undefined()),
+            Some(&context),
+            |ctx| {
+                ctx.scope(|mut scope| {
+                    let captured = scope.object().expect("young capture");
+                    let marker = scope.string("capture-identity").expect("marker");
+                    scope.set(captured, "marker", marker).expect("mark capture");
+                    let function = scope
+                        .native_closure(
+                            "captureIdentityAfterNameAllocation",
+                            0,
+                            &[captured],
+                            |_ctx, _args, captures| Ok(captures[0]),
+                        )
+                        .expect("captured native function");
+                    let function_name = scope.get(function, "name").expect("native name");
+                    assert_eq!(
+                        scope.string_value(function_name).unwrap(),
+                        "captureIdentityAfterNameAllocation"
+                    );
+                    let own_marker = scope.string("own-property").expect("own marker");
+                    scope
+                        .set(function, "probe", own_marker)
+                        .expect("write native own property");
+                    let stored_marker = scope.get(function, "probe").expect("read own property");
+                    assert_eq!(scope.string_value(stored_marker).unwrap(), "own-property");
+                    let this_value = scope.undefined();
+                    let returned = scope
+                        .call(function, this_value, &[])
+                        .expect("invoke captured native function");
+                    assert!(scope.strict_equals(returned, captured));
+                    let returned_marker = scope.get(returned, "marker").expect("read marker");
+                    assert_eq!(
+                        scope.string_value(returned_marker).unwrap(),
+                        "capture-identity"
+                    );
+                });
+            },
+        );
     }
 
     #[test]

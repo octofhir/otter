@@ -1112,7 +1112,6 @@ fn record_reaction_barriers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otter_bytecode::{BytecodeModule, SourceKind};
 
     fn n(v: i32) -> Value {
         Value::number_i32(v)
@@ -1129,16 +1128,8 @@ mod tests {
     }
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "promise-test".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
-        .expect("valid bytecode fixture")
+        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module("promise-test"))
+            .expect("valid bytecode fixture")
     }
 
     #[test]

@@ -686,8 +686,16 @@ mod tests {
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
                 contains_direct_eval: false,
-                code: Vec::<Instruction>::new().into(),
-                spans: Vec::<SpanEntry>::new(),
+                code: vec![Instruction {
+                    pc: 0,
+                    op: otter_bytecode::Op::ReturnUndefined,
+                    operands: vec![],
+                }]
+                .into(),
+                spans: vec![SpanEntry {
+                    pc: 0,
+                    span: (0, 0),
+                }],
                 number_hint_sites: Vec::new(),
                 class_hint_sites: Vec::new(),
             }],

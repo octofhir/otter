@@ -15,7 +15,7 @@ use crate::weak_refs::{
     process_weak_refs_and_finalizers, weak_ref_deref,
 };
 use crate::{ExecutionContext, Interpreter, Value};
-use otter_bytecode::{BytecodeModule, SourceKind};
+use otter_bytecode::BytecodeModule;
 use otter_gc::raw::RawGc;
 
 fn full_gc_with_roots(
@@ -35,15 +35,7 @@ fn full_gc_with_roots(
 }
 
 fn empty_module() -> BytecodeModule {
-    BytecodeModule {
-        module: "weakref-finalization-test".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: Vec::new(),
-        constants: Vec::new(),
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-    }
+    crate::test_support::minimal_bytecode_module("weakref-finalization-test")
 }
 
 fn empty_context() -> ExecutionContext {

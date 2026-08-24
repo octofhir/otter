@@ -3656,40 +3656,57 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let shift = actual_delete_count - insert_count;
         let tail_count = len.saturating_sub(actual_start + actual_delete_count);
-        if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
-            for k in actual_start..len.saturating_sub(actual_delete_count) {
-                self.splice_move_or_delete(
+        // Every move/delete step is reentrant and allocating; park the
+        // receiver in the handle arena and re-read it before each step so a
+        // moving collection mid-loop cannot leave a stale carrier.
+        self.with_handle_scope(|interp, scope| {
+            let o_handle = interp.scoped_value(scope, o);
+            if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
+                for k in actual_start..len.saturating_sub(actual_delete_count) {
+                    let o_now = interp.escape_scoped(o_handle);
+                    interp.splice_move_or_delete(
+                        stack,
+                        context,
+                        o_now,
+                        k + actual_delete_count,
+                        k + insert_count,
+                    )?;
+                }
+                for k in (len - shift)..len {
+                    let key = format_index_key(k as f64);
+                    let o_now = interp.escape_scoped(o_handle);
+                    interp.array_delete_property_throwing(stack, context, o_now, &key)?;
+                }
+                return Ok(());
+            }
+
+            let o_now = interp.escape_scoped(o_handle);
+            let candidates = interp.splice_shift_candidates(
+                o_now,
+                len,
+                actual_start,
+                actual_delete_count,
+                insert_count,
+            )?;
+            for k in candidates {
+                let o_now = interp.escape_scoped(o_handle);
+                interp.splice_move_or_delete(
                     stack,
                     context,
-                    o,
+                    o_now,
                     k + actual_delete_count,
                     k + insert_count,
                 )?;
             }
-            for k in (len - shift)..len {
-                let key = format_index_key(k as f64);
-                self.array_delete_property_throwing(stack, context, o, &key)?;
+            let o_now = interp.escape_scoped(o_handle);
+            let own_indices = interp.splice_own_indices(o_now, len)?;
+            for k in own_indices.range((len - shift)..len) {
+                let key = format_index_key(*k as f64);
+                let o_now = interp.escape_scoped(o_handle);
+                interp.array_delete_property_throwing(stack, context, o_now, &key)?;
             }
-            return Ok(());
-        }
-
-        let candidates =
-            self.splice_shift_candidates(o, len, actual_start, actual_delete_count, insert_count)?;
-        for k in candidates {
-            self.splice_move_or_delete(
-                stack,
-                context,
-                o,
-                k + actual_delete_count,
-                k + insert_count,
-            )?;
-        }
-        let own_indices = self.splice_own_indices(o, len)?;
-        for k in own_indices.range((len - shift)..len) {
-            let key = format_index_key(*k as f64);
-            self.array_delete_property_throwing(stack, context, o, &key)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn splice_shift_right(
@@ -3703,31 +3720,44 @@ impl Interpreter {
         insert_count: usize,
     ) -> Result<(), VmError> {
         let tail_count = len.saturating_sub(actual_start + actual_delete_count);
-        if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
-            for k in (actual_start..len.saturating_sub(actual_delete_count)).rev() {
-                self.splice_move_or_delete(
+        // Same rooting contract as `splice_shift_left`: each step allocates,
+        // so the receiver is re-read from the arena before every use.
+        self.with_handle_scope(|interp, scope| {
+            let o_handle = interp.scoped_value(scope, o);
+            if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
+                for k in (actual_start..len.saturating_sub(actual_delete_count)).rev() {
+                    let o_now = interp.escape_scoped(o_handle);
+                    interp.splice_move_or_delete(
+                        stack,
+                        context,
+                        o_now,
+                        k + actual_delete_count,
+                        k + insert_count,
+                    )?;
+                }
+                return Ok(());
+            }
+
+            let o_now = interp.escape_scoped(o_handle);
+            let candidates = interp.splice_shift_candidates(
+                o_now,
+                len,
+                actual_start,
+                actual_delete_count,
+                insert_count,
+            )?;
+            for k in candidates.into_iter().rev() {
+                let o_now = interp.escape_scoped(o_handle);
+                interp.splice_move_or_delete(
                     stack,
                     context,
-                    o,
+                    o_now,
                     k + actual_delete_count,
                     k + insert_count,
                 )?;
             }
-            return Ok(());
-        }
-
-        let candidates =
-            self.splice_shift_candidates(o, len, actual_start, actual_delete_count, insert_count)?;
-        for k in candidates.into_iter().rev() {
-            self.splice_move_or_delete(
-                stack,
-                context,
-                o,
-                k + actual_delete_count,
-                k + insert_count,
-            )?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn splice_move_or_delete(
@@ -3740,12 +3770,21 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key(to_index as f64);
-        if self.array_method_has_property(stack, context, o, &from)? {
-            let value = self.array_method_get_property(stack, context, o, &from)?;
-            self.array_set_property_throwing(stack, context, o, &to, value)
-        } else {
-            self.array_delete_property_throwing(stack, context, o, &to)
-        }
+        // The has/get/set triple is reentrant and allocating; the receiver
+        // is re-read from the arena between the observable steps.
+        self.with_handle_scope(|interp, scope| {
+            let o_handle = interp.scoped_value(scope, o);
+            let o_now = interp.escape_scoped(o_handle);
+            if interp.array_method_has_property(stack, context, o_now, &from)? {
+                let o_now = interp.escape_scoped(o_handle);
+                let value = interp.array_method_get_property(stack, context, o_now, &from)?;
+                let o_now = interp.escape_scoped(o_handle);
+                interp.array_set_property_throwing(stack, context, o_now, &to, value)
+            } else {
+                let o_now = interp.escape_scoped(o_handle);
+                interp.array_delete_property_throwing(stack, context, o_now, &to)
+            }
+        })
     }
 
     fn splice_sparse_offsets(

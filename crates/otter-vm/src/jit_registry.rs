@@ -56,6 +56,10 @@ struct RegisteredCode {
     code: Arc<dyn JitFunctionCode>,
     dependencies: Box<[CodeDependency]>,
     state: CodeLifetimeState,
+    /// Exact `GeneratedCodeBytes` charge for the executable mapping and its
+    /// owned metadata. Released when the retired object is physically
+    /// dropped from the registry.
+    _generated_code_lease: otter_resource::ResourceLease,
 }
 
 /// New generated-call observations since the previous cold reconciliation.
@@ -93,6 +97,10 @@ struct GeneratedFeedbackSeen {
 pub struct JitCodeRegistry {
     /// Published C-layout lookup surface; `context` names this registry.
     view: CodeRegistryView,
+    /// Ledger charged for every installed code object's retained bytes.
+    /// Defaults to a private unlimited account; the runtime installs its
+    /// shared account at construction.
+    account: otter_resource::ResourceAccount,
     /// Installed code objects by unique code-object id.
     codes: rustc_hash::FxHashMap<u64, RegisteredCode>,
     /// Address-stable entry cells by code generation. Cells are tombstoned on
@@ -118,6 +126,7 @@ impl JitCodeRegistry {
                 context: 0,
                 resolve_safepoint: resolve_jit_registry_safepoint as *const () as u64,
             },
+            account: otter_resource::ResourceAccount::default(),
             codes: rustc_hash::FxHashMap::default(),
             entry_cells: rustc_hash::FxHashMap::default(),
             function_entry_cells: rustc_hash::FxHashMap::default(),
@@ -126,6 +135,11 @@ impl JitCodeRegistry {
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
         registry
+    }
+
+    /// Install the ledger charged for installed code objects' retained bytes.
+    pub(crate) fn set_account(&mut self, account: otter_resource::ResourceAccount) {
+        self.account = account;
     }
 
     /// Register one current code object under its unique id.
@@ -232,12 +246,22 @@ impl JitCodeRegistry {
             debug_assert!(false, "code-object ids are never reused");
             return false;
         }
+        // Generated-code admission: a rejected budget declines the install
+        // and the function stays on its previous tier. The rejection is
+        // visible on the ledger.
+        let Ok(generated_code_lease) = self.account.reserve_exact(
+            otter_resource::ResourceClass::GeneratedCodeBytes,
+            code.retained_bytes(),
+        ) else {
+            return false;
+        };
         let replaced = self.codes.insert(
             code_object_id,
             RegisteredCode {
                 code,
                 dependencies,
                 state: CodeLifetimeState::Installed,
+                _generated_code_lease: generated_code_lease,
             },
         );
         debug_assert!(replaced.is_none(), "code-object ids are never reused");
@@ -981,6 +1005,58 @@ mod tests {
             records: Vec::new(),
             dependencies: dependencies.into_boxed_slice(),
         })
+    }
+
+    #[test]
+    fn generated_code_bytes_are_charged_limited_and_released() {
+        let mut interp = crate::Interpreter::new();
+        let code = fake_code(61, Vec::new());
+        let per_object = code.retained_bytes();
+        let account = otter_resource::ResourceAccount::new(
+            otter_resource::ResourceLimits::builder()
+                .limit(
+                    otter_resource::ResourceClass::GeneratedCodeBytes,
+                    per_object,
+                )
+                .build(),
+        );
+        interp.set_resource_account(account.clone());
+
+        assert!(interp.jit_code_registry.register(61, code));
+        let entry = *account
+            .snapshot()
+            .get(otter_resource::ResourceClass::GeneratedCodeBytes);
+        assert_eq!(entry.current(), per_object);
+
+        // The budget is exhausted: the next install declines without side
+        // effects and the rejection is visible on the ledger.
+        assert!(
+            !interp
+                .jit_code_registry
+                .register(62, fake_code(62, Vec::new()))
+        );
+        assert!(!interp.jit_code_registry.codes.contains_key(&62));
+        let entry = *account
+            .snapshot()
+            .get(otter_resource::ResourceClass::GeneratedCodeBytes);
+        assert_eq!(entry.current(), per_object);
+        assert_eq!(entry.rejections(), 1);
+
+        // Physical retirement releases the charge with the object.
+        interp.jit_code_registry.invalidate_code_object(61);
+        interp.jit_code_registry.retire_unreferenced();
+        assert!(!interp.jit_code_registry.codes.contains_key(&61));
+        let entry = *account
+            .snapshot()
+            .get(otter_resource::ResourceClass::GeneratedCodeBytes);
+        assert_eq!(entry.current(), 0);
+
+        // With the charge released the registry admits new code again.
+        assert!(
+            interp
+                .jit_code_registry
+                .register(63, fake_code(63, Vec::new()))
+        );
     }
 
     #[test]

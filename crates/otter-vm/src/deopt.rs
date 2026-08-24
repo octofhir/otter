@@ -442,6 +442,28 @@ pub struct DeoptRuntime {
     pub gpr_budget: u16,
 }
 
+impl DeoptRuntime {
+    /// Bytes this deopt metadata retains for the code object's lifetime:
+    /// the exit descriptors, every frame state, its frame chain, and each
+    /// frame's slot table. Saturating: a saturated total still exceeds any
+    /// real budget and fails generated-code admission closed.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        let mut total = std::mem::size_of::<Self>() as u64;
+        total = total
+            .saturating_add(std::mem::size_of_val::<[DeoptExitDescriptor]>(&self.exits) as u64);
+        for state in self.table.entries() {
+            total =
+                total.saturating_add(std::mem::size_of_val::<[DeoptFrame]>(&state.frames) as u64);
+            for frame in &state.frames {
+                total =
+                    total.saturating_add(std::mem::size_of_val::<[DeoptSlot]>(&frame.slots) as u64);
+            }
+        }
+        total
+    }
+}
+
 /// A compact bitset over a safepoint's compiled slots: bit `i` set means slot
 /// `i` holds a tagged pointer the moving collector must find and relocate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

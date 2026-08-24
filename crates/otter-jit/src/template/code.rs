@@ -137,6 +137,21 @@ impl JitFunctionCode for TemplateCode {
         self.code.len()
     }
 
+    fn retained_bytes(&self) -> u64 {
+        retained_bytes_sum(
+            self.code.len(),
+            &[
+                std::mem::size_of_val::<[u16]>(&self.register_operands),
+                std::mem::size_of_val::<[u32]>(&self.index_operands),
+                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self.load_ic_cells),
+                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self.store_ic_cells),
+                std::mem::size_of_val::<[SafepointRecord]>(&self.safepoint_records),
+                std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
+                self.osr_entries.len() * std::mem::size_of::<(u32, usize)>(),
+            ],
+        )
+    }
+
     fn generated_stack_frame_bytes(&self) -> Option<u32> {
         #[cfg(target_arch = "aarch64")]
         {
@@ -215,4 +230,15 @@ impl JitFunctionCode for TemplateCode {
             )
         }
     }
+}
+
+/// Saturating sum of the executable mapping and its owned side tables.
+/// Saturation is acceptable here: a saturated total still exceeds any real
+/// budget and fails admission closed.
+pub(crate) fn retained_bytes_sum(code_len: usize, parts: &[usize]) -> u64 {
+    let mut total = code_len as u64;
+    for part in parts {
+        total = total.saturating_add(*part as u64);
+    }
+    total
 }

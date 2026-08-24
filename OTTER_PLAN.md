@@ -178,11 +178,17 @@ through the charged builder; script/eval registration admits before
 retention; charges die with the isolate and rejections are typed and
 observable. Worker count and message queues/bytes are bounded by H2.
 
+Also landed: every installed JIT code object charges its exact retained
+bytes — executable mapping, operand/IC/safepoint tables, dependencies, OSR
+map, and the full deopt-frame metadata — to `GeneratedCodeBytes` through the
+isolate registry, sharing the runtime account with source admission. A
+rejected budget declines the install (the function stays on its previous
+tier) with a visible rejection; physical retirement releases the charge.
+
 Still open, in R1 terms:
 
-- JIT `CodeSpace`, code objects, metadata, safepoints, and deopt maps
-  (`GeneratedCodeBytes` is still uncharged; CodeSpace is append-only and the
-  registry has no byte budget or size-driven retirement);
+- `CodeSpace` chunk retention (append-only bytecode + executable modules,
+  uncharged) and size-driven code eviction policy;
 - per-function `FunctionRecord.source_text` duplicates module source inside
   retained bytecode (uncharged second copy);
 - Web/Node response bodies, stream buffers, and host-owned backing stores;

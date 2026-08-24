@@ -177,6 +177,20 @@ impl JitFunctionCode for OptimizedCode {
         self.code_metadata
     }
 
+    fn retained_bytes(&self) -> u64 {
+        crate::template::code::retained_bytes_sum(
+            self.code.len(),
+            &[
+                std::mem::size_of_val::<[SafepointRecord]>(&self.safepoint_records),
+                std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
+                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self._load_ic_cells),
+                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self._store_ic_cells),
+                self.osr_entries.len() * std::mem::size_of::<(u32, usize)>(),
+            ],
+        )
+        .saturating_add(self.deopt.retained_bytes())
+    }
+
     fn native_frame_kind(&self) -> otter_vm::native_abi::NativeFrameKind {
         otter_vm::native_abi::NativeFrameKind::Optimizing
     }

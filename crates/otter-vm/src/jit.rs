@@ -1871,6 +1871,16 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;
 
+    /// Total bytes this installed code object retains: the executable
+    /// mapping plus owned metadata, safepoint records, IC cells, operand
+    /// tables, and deopt maps. The isolate registry charges this amount to
+    /// `GeneratedCodeBytes` at installation and releases it at retirement.
+    /// The default covers the executable mapping only; tiers with owned
+    /// side tables override it with their exact retained sum.
+    fn retained_bytes(&self) -> u64 {
+        self.code_len() as u64
+    }
+
     /// `true` when this code was compiled with unsupported opcodes emitted as
     /// bail-to-interpreter, making it sound to enter only at a supported loop
     /// header via OSR (not at function entry). The function-entry tier-up path

@@ -399,9 +399,11 @@ impl Interpreter {
         self.module_sources.register_owned(module_url, text)
     }
 
-    /// Install the ledger charged for VM-synthesized retained sources.
-    pub fn set_source_account(&mut self, account: otter_resource::ResourceAccount) {
-        self.module_sources.set_account(account);
+    /// Install the shared ledger charged for VM-retained allocations:
+    /// synthesized sources and installed generated code.
+    pub fn set_resource_account(&mut self, account: otter_resource::ResourceAccount) {
+        self.module_sources.set_account(account.clone());
+        self.jit_code_registry.set_account(account);
     }
 
     /// The ledger charged for VM-synthesized retained sources.

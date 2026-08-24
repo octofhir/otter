@@ -151,6 +151,7 @@ struct RuntimeHandleInner {
     module_preparation: ModulePreparation,
     module_cancellation: crate::module_loader::ModuleLoadCancellation,
     interrupt: otter_vm::InterruptFlag,
+    atomics_wait_agent: otter_vm::atomics_wait::WaitAgentHandle,
     command_timeout: Duration,
     command_capacity: usize,
     counters: Arc<RuntimeCounters>,
@@ -1541,8 +1542,8 @@ impl RuntimeHandle {
                 code: DiagnosticCode::IsolateSpawn.as_str().to_string(),
                 message: e.to_string(),
             })?;
-        let interrupt = match interrupt_rx.recv() {
-            Ok(interrupt) => interrupt,
+        let (interrupt, atomics_wait_agent) = match interrupt_rx.recv() {
+            Ok(handles) => handles,
             Err(_) => {
                 // Bootstrap failed before publishing the interrupt handle.
                 // Join the finished runner so a failed construction never
@@ -1564,6 +1565,7 @@ impl RuntimeHandle {
             module_preparation,
             module_cancellation,
             interrupt,
+            atomics_wait_agent,
             command_timeout,
             command_capacity: capacity,
             counters,
@@ -1947,6 +1949,29 @@ impl RuntimeHandle {
         liveness: RuntimeLiveness,
     ) -> Result<(), OtterError> {
         self.task_spawner().enqueue(task, liveness)
+    }
+
+    /// Cross-thread canceller for this isolate's blocking `Atomics.wait`
+    /// agent. `Worker.terminate` uses it to wake a worker parked in a
+    /// blocking wait before the cooperative interrupt can land.
+    #[must_use]
+    pub(crate) fn atomics_wait_agent(&self) -> otter_vm::atomics_wait::WaitAgentHandle {
+        self.inner.atomics_wait_agent.clone()
+    }
+
+    /// Join the isolate runner thread. Deterministic teardown for
+    /// `Worker.terminate`: callers must have already requested shutdown and
+    /// cancelled blocking waits, so the runner exits promptly.
+    pub(crate) fn join_runner_blocking(&self) {
+        let runner = self
+            .inner
+            .runner
+            .lock()
+            .expect("isolate runner mutex poisoned")
+            .take();
+        if let Some(runner) = runner {
+            let _ = runner.join();
+        }
     }
 
     /// Clone a sender for scheduling typed runtime tasks.
@@ -2417,7 +2442,10 @@ fn run_isolate(
     admitted: AdmittedRuntimeConfig,
     rx: mpsc::Receiver<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
-    interrupt_tx: SyncSender<otter_vm::InterruptFlag>,
+    interrupt_tx: SyncSender<(
+        otter_vm::InterruptFlag,
+        otter_vm::atomics_wait::WaitAgentHandle,
+    )>,
     inbox: InboxSender,
     event_loop: TokioEventLoop,
     module_preparation: ModulePreparation,
@@ -2459,7 +2487,10 @@ fn run_isolate(
         completion_pool: completion_pool.clone(),
     });
     runtime.install_dynamic_import_loader(dynamic_import_loader);
-    let _ = interrupt_tx.send(runtime.interrupt_handle().raw_flag());
+    let _ = interrupt_tx.send((
+        runtime.interrupt_handle().raw_flag(),
+        runtime.atomics_wait_agent_handle(),
+    ));
     let mut runner = IsolateRunner {
         runtime,
         rx,
@@ -4904,7 +4935,9 @@ mod shutdown_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deferred_command_retains_one_lease_until_shutdown_teardown() {
-        let account = queued_task_account(1);
+        // Budget: one lease for the 60s one-shot timer admission that keeps
+        // the first command draining, one for the deferred command.
+        let account = queued_task_account(2);
         let handle = RuntimeHandle::spawn_with_capacity(config_with_account(account.clone()), 1)
             .expect("runtime handle");
         let (first, second) = defer_second_command(&handle);
@@ -4912,7 +4945,7 @@ mod shutdown_tests {
         let entry = queued_tasks(&account);
         assert_eq!(
             (entry.current(), entry.peak(), entry.rejections()),
-            (1, 1, 0)
+            (2, 2, 0)
         );
         assert!(handle.activity_stats().running_command);
         assert_eq!(handle.activity_stats().queued_commands, 1);
@@ -4925,11 +4958,13 @@ mod shutdown_tests {
 
     #[test]
     fn dropping_last_handle_during_referenced_work_does_not_deadlock() {
-        let account = queued_task_account(1);
+        // One lease for the pending one-shot timer, one for the deferred
+        // command.
+        let account = queued_task_account(2);
         let handle = RuntimeHandle::spawn_with_capacity(config_with_account(account.clone()), 1)
             .expect("runtime handle");
         let (first, second) = defer_second_command(&handle);
-        assert_eq!(queued_tasks(&account).current(), 1);
+        assert_eq!(queued_tasks(&account).current(), 2);
         drop(first);
         drop(second);
 

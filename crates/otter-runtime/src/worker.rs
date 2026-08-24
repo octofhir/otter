@@ -1,22 +1,33 @@
 //! Worker isolates, JavaScript `Worker`, and isolate-pool routing.
 //!
 //! The runtime worker model is isolate-per-worker: each worker owns a
-//! separate runtime runner and therefore a separate VM, runtime state,
-//! and GC heap. This module owns both the sendable host handle and the
-//! JavaScript-visible message/event surface.
+//! separate managed runtime runner ([`RuntimeHandle`]) and therefore a
+//! separate VM, runtime state, GC heap, bounded inbox, timers, host
+//! completions, and dynamic-import pump. This module owns both the sendable
+//! host handle and the JavaScript-visible message/event surface.
 //!
 //! # Contents
 //!
 //! - [`Worker`] — sendable handle to one worker isolate.
 //! - [`WorkerBuilder`] — configuration for one worker.
 //! - [`OtterPool`] — small round-robin isolate pool prototype.
-//! - JavaScript worker construction, owned message payloads, event dispatch,
-//!   transfer commit, and deterministic termination.
+//! - JavaScript worker construction, phased message admission, typed
+//!   [`RuntimeTask`] delivery in both directions, transfer commit, and
+//!   deterministic termination.
 //!
 //! # Invariants
 //!
-//! - Every worker owns a separate admitted runtime; no ordinary VM value or
-//!   moving GC handle crosses isolates.
+//! - Every worker owns a separate admitted runtime; no ordinary VM value,
+//!   moving GC handle, or [`ExecutionContext`] crosses a `Send` boundary.
+//!   Parent- and child-side dispatch state lives inside the owning isolate
+//!   and is reacquired from `&mut Runtime` or persistent roots.
+//! - Delivery is wake-driven: parent and child exchange typed tasks through
+//!   their bounded inboxes. There is no polling channel and no poll timer.
+//! - Every message passes validate/measure → admission → fallible clone →
+//!   enqueue → detach, charging the finite [`WorkerFamily`] ledger and the
+//!   shared main ledger atomically per account with checked arithmetic.
+//! - The worker's terminal Error/Closed outcome rides a guaranteed credit
+//!   reserved at construction and is delivered exactly once.
 //! - Worker methods accept only owned public inputs and return
 //!   [`crate::ExecutionResult`] / [`crate::OtterError`].
 //! - Owned JavaScript message payloads materialize entirely inside one traced
@@ -30,26 +41,28 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use otter_gc::raw::RawGc;
+use otter_resource::{ResourceClass, ResourceLease, ResourceLeaseSet};
 use otter_vm::binary::JsArrayBuffer;
 use otter_vm::binary::array_buffer::SharedBody;
+use otter_vm::host_completion::{HostCompletionAdmission, HostCompletionOutcome};
 use otter_vm::{
-    Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope, Value, array, collections,
-    object,
+    ExecutionContext, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope,
+    PersistentRootId, Value, array, collections, object,
 };
 use smallvec::smallvec;
 
-use crate::admission::{AdmittedRuntimeConfig, RUNTIME_THREAD_STACK_BYTES, RuntimeAdmissionKind};
+use crate::event_loop::RuntimeLiveness;
 use crate::module_loader;
+use crate::runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 use crate::{
     CapabilitySet, ExecutionResult, OtterError, ResourceAccount, ResourceLimits, ResourceSnapshot,
     Runtime, RuntimeActivityStats, RuntimeBuilder, RuntimeConfig, RuntimeHandle, SourceInput,
-    StructuredCloneNumber, StructuredCloneTransferList, StructuredCloneValue,
+    StructuredCloneNumber, StructuredCloneTransferList, StructuredCloneValue, TokioRuntimeHost,
 };
 
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
@@ -102,95 +115,145 @@ struct WorkerTransferList {
     set: HashSet<JsArrayBuffer>,
 }
 
-enum WorkerCommand {
-    Message(WorkerPayload),
-    Shutdown,
-}
-
 enum WorkerEvent {
     Message(WorkerPayload),
     Error(String),
     MessageError(String),
-    Closed,
 }
 
-const WORKER_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Hard limits shared by every JavaScript worker reachable from one root
+/// runtime, including nested workers. The family ledger is a second, always
+/// finite [`ResourceAccount`]: an unlimited main ledger cannot lift these
+/// caps because every worker and message reserves on both.
+pub(crate) struct WorkerFamily {
+    account: ResourceAccount,
+}
+
+impl std::fmt::Debug for WorkerFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerFamily").finish_non_exhaustive()
+    }
+}
+
+const WORKER_FAMILY_MAX_WORKERS: u64 = 128;
+const WORKER_FAMILY_MAX_QUEUED_MESSAGES: u64 = 4096;
+const WORKER_FAMILY_MAX_QUEUED_MESSAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound for one measured message graph.
+const WORKER_MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// Flat accounted overhead of one payload node (enum tag, vec headers).
+const WORKER_MESSAGE_NODE_BYTES: u64 = 32;
+/// Flat accounted overhead of one transfer-list entry.
+const WORKER_MESSAGE_TRANSFER_ENTRY_BYTES: u64 = 32;
+
+impl WorkerFamily {
+    pub(crate) fn standard() -> Arc<Self> {
+        Self::with_limits(
+            WORKER_FAMILY_MAX_WORKERS,
+            WORKER_FAMILY_MAX_QUEUED_MESSAGES,
+            WORKER_FAMILY_MAX_QUEUED_MESSAGE_BYTES,
+        )
+    }
+
+    pub(crate) fn with_limits(
+        workers: u64,
+        queued_messages: u64,
+        queued_message_bytes: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            account: ResourceAccount::new(
+                ResourceLimits::builder()
+                    .limit(ResourceClass::Workers, workers)
+                    .limit(ResourceClass::QueuedMessages, queued_messages)
+                    .limit(ResourceClass::QueuedMessageBytes, queued_message_bytes)
+                    .build(),
+            ),
+        })
+    }
+}
+
+/// Parent-isolate dispatch state for one worker: the rooted worker object,
+/// the rooted hidden listener store, and the execution context that
+/// constructed the worker. Persistent root ids are only dereferenced on the
+/// parent isolate thread.
+#[derive(Clone)]
+struct WorkerParentBinding {
+    worker_root: PersistentRootId,
+    listeners_root: PersistentRootId,
+    context: ExecutionContext,
+}
 
 struct WorkerRecord {
     id: WorkerId,
-    tx: mpsc::Sender<WorkerCommand>,
-    events: Mutex<mpsc::Receiver<WorkerEvent>>,
-    interrupt: crate::InterruptHandle,
-    atomics_wait_agent: otter_vm::atomics_wait::WaitAgentHandle,
-    poll_timer: Mutex<Option<u64>>,
-    join: Mutex<Option<thread::JoinHandle<()>>>,
-    terminated: std::sync::atomic::AtomicBool,
+    child: RuntimeHandle,
+    child_spawner: RuntimeTaskSpawner,
+    child_shared: Arc<WorkerChildShared>,
+    wait_agent: otter_vm::atomics_wait::WaitAgentHandle,
+    binding: Mutex<Option<WorkerParentBinding>>,
+    keep_alive: Mutex<Option<RuntimeKeepAlive>>,
+    /// Family worker slot. Released when the record drops.
+    _family_worker_lease: ResourceLease,
+    terminated: AtomicBool,
 }
 
 impl WorkerRecord {
-    fn terminate(&self) {
-        if self
-            .terminated
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
+    /// Idempotent termination request: cancel a blocking `Atomics.wait`,
+    /// then interrupt and shut the child isolate down. Returns `true` for
+    /// the call that performed the transition.
+    fn request_terminate(&self) -> bool {
+        if self.terminated.swap(true, Ordering::SeqCst) {
+            return false;
         }
-        let _ = self.tx.send(WorkerCommand::Shutdown);
-        self.atomics_wait_agent.cancel();
-        self.interrupt.interrupt();
+        self.wait_agent.cancel();
+        self.child.shutdown();
+        true
     }
 
+    /// Deterministically join the child isolate runner thread.
     fn join(&self) {
-        if let Some(join) = self.join.lock().expect("worker join mutex poisoned").take() {
-            let _ = join.join();
+        self.child.join_runner_blocking();
+    }
+
+    fn release_keep_alive(&self) {
+        if let Some(keep_alive) = self
+            .keep_alive
+            .lock()
+            .expect("worker keep-alive mutex poisoned")
+            .take()
+        {
+            keep_alive.close();
         }
     }
 
-    fn install_poll_timer(&self, token: u64) {
-        let previous = self
-            .poll_timer
+    fn take_binding(&self) -> Option<WorkerParentBinding> {
+        self.binding
             .lock()
-            .expect("worker poll-timer mutex poisoned")
-            .replace(token);
-        debug_assert!(previous.is_none(), "worker poll timer installed twice");
+            .expect("worker binding mutex poisoned")
+            .take()
     }
 
-    fn take_poll_timer(&self) -> Option<u64> {
-        self.poll_timer
+    fn binding_view(&self) -> Option<WorkerParentBinding> {
+        self.binding
             .lock()
-            .expect("worker poll-timer mutex poisoned")
-            .take()
+            .expect("worker binding mutex poisoned")
+            .clone()
     }
 }
 
 impl Drop for WorkerRecord {
     fn drop(&mut self) {
-        self.terminate();
-        if let Some(join) = self
-            .join
-            .get_mut()
-            .expect("worker join mutex poisoned")
-            .take()
-        {
-            let _ = join.join();
-        }
+        self.request_terminate();
+        self.join();
+        self.release_keep_alive();
     }
 }
 
-#[derive(Default)]
 pub(crate) struct WorkerHostState {
     config: RuntimeConfig,
+    family: Arc<WorkerFamily>,
     workers: Mutex<HashMap<u64, Arc<WorkerRecord>>>,
 }
 
 impl WorkerHostState {
-    pub(crate) fn new(config: RuntimeConfig) -> Self {
-        Self {
-            config,
-            workers: Mutex::new(HashMap::new()),
-        }
-    }
-
     fn insert(&self, record: Arc<WorkerRecord>) {
         self.workers
             .lock()
@@ -224,162 +287,566 @@ impl Drop for WorkerHostState {
             .map(|(_, worker)| worker)
             .collect();
         for worker in &workers {
-            worker.terminate();
+            worker.request_terminate();
         }
         for worker in workers {
             worker.join();
+            worker.release_keep_alive();
         }
     }
 }
 
+/// Sendable child-side worker state. Lives in the child natives, the entry
+/// task, and the parent record; never carries VM values or GC handles.
+struct WorkerChildShared {
+    id: u64,
+    /// Parent isolate inbox for typed delivery tasks.
+    parent: RuntimeTaskSpawner,
+    /// Parent host registry; `Weak` breaks the
+    /// host -> record -> shared -> host cycle.
+    host: Weak<WorkerHostState>,
+    family: Arc<WorkerFamily>,
+    /// Shared main ledger inherited from the parent runtime.
+    account: ResourceAccount,
+    closed: AtomicBool,
+    /// Pre-reserved terminal credit. Taking it is the once-only gate for the
+    /// worker's terminal Error/Closed delivery.
+    terminal: Mutex<Option<HostCompletionAdmission>>,
+}
+
 pub(crate) fn install_main_worker_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
-    let host = Arc::new(WorkerHostState::new(runtime.config.clone()));
-    runtime.install_native_constructor_global_call("Worker", 2, worker_constructor_call(host))?;
+    let family = runtime
+        .config
+        .worker_family
+        .clone()
+        .unwrap_or_else(WorkerFamily::standard);
+    runtime.config.worker_family = Some(family.clone());
+    let parent_spawner = runtime.runtime_task_spawner();
+    let host = Arc::new(WorkerHostState {
+        config: runtime.config.clone(),
+        family,
+        workers: Mutex::new(HashMap::new()),
+    });
+    runtime.install_native_constructor_global_call(
+        "Worker",
+        2,
+        worker_constructor_call(host, parent_spawner),
+    )?;
     Ok(())
 }
 
-fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
+fn worker_constructor_call(
+    host: Arc<WorkerHostState>,
+    parent_spawner: Option<RuntimeTaskSpawner>,
+) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        // A direct runtime has no managed inbox: fail synchronously before
+        // any resource effect.
+        let Some(parent_spawner) = parent_spawner.clone() else {
+            return Err(type_err(
+                "Worker",
+                "Worker requires a managed RuntimeHandle/Otter runtime".to_string(),
+            ));
+        };
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-        let id = spawn_worker_record(&host, specifier)?;
-        let result = (|| {
-            let post_host = host.clone();
-            let post_id = id;
-            let post: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-                ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.postMessage", "invalid receiver".to_string())
-                })?;
-                let Some(record) = post_host.get(post_id) else {
-                    return Err(type_err(
-                        "Worker.postMessage",
-                        "worker is not running".to_string(),
-                    ));
-                };
-                if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(type_err(
-                        "Worker.postMessage",
-                        "worker has been terminated".to_string(),
-                    ));
-                }
-                let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
-                let payload = clone_worker_value(
-                    args.first().unwrap_or(&Value::undefined()),
-                    ctx.heap(),
-                    &transfers,
-                )?;
-                record
-                    .tx
-                    .send(WorkerCommand::Message(payload))
-                    .map_err(|_| {
-                        type_err("Worker.postMessage", "worker channel is closed".to_string())
-                    })?;
-                // Detachment commits the transfer only after the destination
-                // queue accepts the payload. A closed worker must not turn a
-                // synchronous `postMessage` failure into silent buffer loss.
-                detach_worker_transfers(&transfers, ctx.heap_mut());
-                Ok(Value::undefined())
-            });
-
-            let terminate_host = host.clone();
-            let terminate_id = id;
-            let terminate: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
-                ctx.this_value()
-                    .as_object()
-                    .ok_or_else(|| type_err("Worker.terminate", "invalid receiver".to_string()))?;
-                if let Some(record) = terminate_host.remove(terminate_id) {
-                    record.terminate();
-                    if let Some(token) = record.take_poll_timer() {
-                        let _ = ctx.cancel_timer(token);
-                    }
-                    record.join();
-                }
-                Ok(Value::undefined())
-            });
-
-            let worker = ctx.scope(|mut scope| {
-                let worker = scope.object()?;
-                let null = scope.null();
-                scope.set(worker, "onmessage", null)?;
-                scope.set(worker, "onerror", null)?;
-                scope.set(worker, "onmessageerror", null)?;
-
-                for (name, length, call) in [
-                    ("postMessage", 1, NativeCall::Dynamic(post)),
-                    ("terminate", 0, NativeCall::Dynamic(terminate)),
-                ] {
-                    let function = scope.native_call(name, length, call)?;
-                    scope.set(worker, name, function)?;
-                }
-                Ok::<Value, NativeError>(scope.finish(worker))
-            })?;
-            let worker_root = ctx.persistent_root_insert(worker);
-            let result = (|| {
-                let listeners = ctx.scope(|mut scope| {
-                    let listeners = scope.object()?;
-                    Ok::<Value, NativeError>(scope.finish(listeners))
-                })?;
-                let listeners_root = ctx.persistent_root_insert(listeners);
-                let result = (|| {
-                    install_worker_event_methods(ctx, worker_root, listeners_root)?;
-                    let worker = worker_persistent_value(ctx, worker_root)?;
-                    let listeners = worker_persistent_value(ctx, listeners_root)?;
-                    install_worker_poll_timer(ctx, host.clone(), id, worker, listeners)
-                })();
-                ctx.persistent_root_remove(listeners_root);
-                result
-            })();
-            ctx.persistent_root_remove(worker_root);
-            result
-        })();
+        let parent_context = ctx.execution_context().cloned().ok_or_else(|| {
+            type_err(
+                "Worker",
+                "Worker construction requires an execution context".to_string(),
+            )
+        })?;
+        let record = spawn_managed_worker(&host, &parent_spawner, specifier)?;
+        let result = build_worker_object(ctx, &host, &record, parent_context);
         if result.is_err()
-            && let Some(record) = host.remove(id)
+            && let Some(record) = host.remove(record.id.get())
         {
-            record.terminate();
+            record.request_terminate();
             record.join();
+            record.release_keep_alive();
         }
         result
     });
     NativeCall::Dynamic(call)
 }
 
-fn spawn_worker_record(host: &Arc<WorkerHostState>, specifier: String) -> Result<u64, NativeError> {
-    let admitted = Runtime::admit_config(host.config.clone(), RuntimeAdmissionKind::WorkerThread)
-        .map_err(|err| type_err("Worker", err.to_string()))?;
+fn spawn_managed_worker(
+    host: &Arc<WorkerHostState>,
+    parent_spawner: &RuntimeTaskSpawner,
+    specifier: String,
+) -> Result<Arc<WorkerRecord>, NativeError> {
     let id = next_worker_id()
         .ok_or_else(|| type_err("Worker", "worker id space is exhausted".to_string()))?;
-    let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (event_tx, event_rx) = mpsc::channel();
-    let (interrupt_tx, interrupt_rx) = mpsc::sync_channel(1);
-    let thread_name = format!("otter-worker-{}", id.get());
-    let join = thread::Builder::new()
-        .name(thread_name)
-        .stack_size(RUNTIME_THREAD_STACK_BYTES)
-        .spawn(move || {
-            run_js_worker(id, specifier, admitted, cmd_rx, event_tx, interrupt_tx);
-        })
-        .map_err(|err| type_err("Worker", format!("worker spawn failed: {err}")))?;
-    let (interrupt, atomics_wait_agent) = match interrupt_rx.recv() {
-        Ok(handles) => handles,
-        Err(_) => {
-            let _ = join.join();
-            return Err(type_err(
-                "Worker",
-                "worker runtime stopped before exposing interrupt handle".to_string(),
-            ));
-        }
-    };
+    // Family admission precedes every spawn effect. The main ledger charges
+    // its own worker tuple inside the managed spawn below.
+    let family_worker_lease = host
+        .family
+        .account
+        .reserve_exact(ResourceClass::Workers, 1)
+        .map_err(|err| type_err("Worker", format!("worker family limit: {err}")))?;
+    // Terminal credit: reserved before the spawn so the worker's Error/Closed
+    // outcome can always be delivered, even through a full parent inbox.
+    let terminal = parent_spawner
+        .admit_guaranteed(RuntimeLiveness::Unref)
+        .map_err(|err| type_err("Worker", err.to_string()))?;
+    let child_config = configure_worker_child(host.config.clone(), parent_spawner);
+    let child = RuntimeHandle::spawn_worker(child_config)
+        .map_err(|err| type_err("Worker", err.to_string()))?;
+    let child_spawner = child.task_spawner();
+    let wait_agent = child.atomics_wait_agent();
+    let keep_alive = parent_spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let shared = Arc::new(WorkerChildShared {
+        id: id.get(),
+        parent: parent_spawner.clone(),
+        host: Arc::downgrade(host),
+        family: host.family.clone(),
+        account: host.config.resource_account.clone(),
+        closed: AtomicBool::new(false),
+        terminal: Mutex::new(Some(terminal)),
+    });
     let record = Arc::new(WorkerRecord {
         id,
-        tx: cmd_tx,
-        events: Mutex::new(event_rx),
-        interrupt,
-        atomics_wait_agent,
-        poll_timer: Mutex::new(None),
-        join: Mutex::new(Some(join)),
-        terminated: std::sync::atomic::AtomicBool::new(false),
+        child,
+        child_spawner: child_spawner.clone(),
+        child_shared: shared.clone(),
+        wait_agent,
+        binding: Mutex::new(None),
+        keep_alive: Mutex::new(Some(keep_alive)),
+        _family_worker_lease: family_worker_lease,
+        terminated: AtomicBool::new(false),
     });
-    host.insert(record);
-    Ok(id.get())
+    host.insert(record.clone());
+    if child_spawner
+        .enqueue(WorkerEntryTask { shared, specifier }, RuntimeLiveness::Ref)
+        .is_err()
+    {
+        host.remove(id.get());
+        record.request_terminate();
+        record.join();
+        record.release_keep_alive();
+        return Err(type_err(
+            "Worker",
+            "worker entry could not be scheduled".to_string(),
+        ));
+    }
+    Ok(record)
+}
+
+/// Prepare the child isolate's configuration: workers may block in
+/// `Atomics.wait`, share the parent's Tokio executor, and inherit the
+/// parent's capabilities, hooks, module host, resource account, and worker
+/// family verbatim through the cloned config.
+fn configure_worker_child(
+    mut config: RuntimeConfig,
+    parent_spawner: &RuntimeTaskSpawner,
+) -> RuntimeConfig {
+    config.allow_blocking_atomics_wait = true;
+    if config.runtime_host.is_none()
+        && let Some(io_handle) = parent_spawner.io_handle()
+    {
+        config.runtime_host = Some(TokioRuntimeHost::from_handle(io_handle));
+    }
+    config
+}
+
+fn build_worker_object(
+    ctx: &mut NativeCtx<'_>,
+    host: &Arc<WorkerHostState>,
+    record: &Arc<WorkerRecord>,
+    parent_context: ExecutionContext,
+) -> Result<Value, NativeError> {
+    let id = record.id.get();
+    let post_host = host.clone();
+    let post: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        ctx.this_value()
+            .as_object()
+            .ok_or_else(|| type_err("Worker.postMessage", "invalid receiver".to_string()))?;
+        let Some(record) = post_host.get(id) else {
+            return Err(type_err(
+                "Worker.postMessage",
+                "worker is not running".to_string(),
+            ));
+        };
+        if record.terminated.load(Ordering::SeqCst) {
+            return Err(type_err(
+                "Worker.postMessage",
+                "worker has been terminated".to_string(),
+            ));
+        }
+        let value = args.first().copied().unwrap_or_else(Value::undefined);
+        let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
+        // Validate/measure, admit, clone, enqueue, then detach: a rejected or
+        // failed message never detaches the sender's transferables.
+        let measured = measure_worker_message(&value, ctx.heap(), &transfers)?;
+        let leases = admit_worker_message(
+            &post_host.family,
+            &post_host.config.resource_account,
+            measured,
+            "Worker.postMessage",
+        )?;
+        let payload = clone_worker_value(&value, ctx.heap(), &transfers)?;
+        record
+            .child_spawner
+            .enqueue(
+                WorkerChildMessageTask {
+                    shared: record.child_shared.clone(),
+                    payload,
+                    leases,
+                },
+                RuntimeLiveness::Ref,
+            )
+            .map_err(|err| type_err("Worker.postMessage", err.to_string()))?;
+        detach_worker_transfers(&transfers, ctx.heap_mut());
+        Ok(Value::undefined())
+    });
+
+    let terminate_host = host.clone();
+    let terminate: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
+        ctx.this_value()
+            .as_object()
+            .ok_or_else(|| type_err("Worker.terminate", "invalid receiver".to_string()))?;
+        if let Some(record) = terminate_host.remove(id) {
+            record.request_terminate();
+            record.join();
+            record.release_keep_alive();
+            if let Some(binding) = record.take_binding() {
+                ctx.persistent_root_remove(binding.worker_root);
+                ctx.persistent_root_remove(binding.listeners_root);
+            }
+        }
+        Ok(Value::undefined())
+    });
+
+    let worker = ctx.scope(|mut scope| {
+        let worker = scope.object()?;
+        let null = scope.null();
+        scope.set(worker, "onmessage", null)?;
+        scope.set(worker, "onerror", null)?;
+        scope.set(worker, "onmessageerror", null)?;
+
+        for (name, length, call) in [
+            ("postMessage", 1, NativeCall::Dynamic(post)),
+            ("terminate", 0, NativeCall::Dynamic(terminate)),
+        ] {
+            let function = scope.native_call(name, length, call)?;
+            scope.set(worker, name, function)?;
+        }
+        Ok::<Value, NativeError>(scope.finish(worker))
+    })?;
+    let worker_root = ctx.persistent_root_insert(worker);
+    let listeners = match ctx.scope(|mut scope| {
+        let listeners = scope.object()?;
+        Ok::<Value, NativeError>(scope.finish(listeners))
+    }) {
+        Ok(listeners) => listeners,
+        Err(err) => {
+            ctx.persistent_root_remove(worker_root);
+            return Err(err);
+        }
+    };
+    let listeners_root = ctx.persistent_root_insert(listeners);
+    let result = (|| {
+        install_worker_event_methods(ctx, worker_root, listeners_root)?;
+        worker_persistent_value(ctx, worker_root)
+    })();
+    match result {
+        Ok(worker_value) => {
+            // The binding owns both persistent roots from here on; terminate
+            // or the terminal task releases them.
+            record
+                .binding
+                .lock()
+                .expect("worker binding mutex poisoned")
+                .replace(WorkerParentBinding {
+                    worker_root,
+                    listeners_root,
+                    context: parent_context,
+                });
+            Ok(worker_value)
+        }
+        Err(err) => {
+            ctx.persistent_root_remove(worker_root);
+            ctx.persistent_root_remove(listeners_root);
+            Err(err)
+        }
+    }
+}
+
+/// Leases held while one message occupies the parent or child queue.
+/// Dropping them — on dispatch, cancellation, or enqueue failure — returns
+/// the family and main-ledger charges atomically per account.
+struct WorkerMessageLeases {
+    _family: ResourceLeaseSet,
+    _main: ResourceLeaseSet,
+}
+
+fn admit_worker_message(
+    family: &WorkerFamily,
+    account: &ResourceAccount,
+    bytes: u64,
+    api: &'static str,
+) -> Result<WorkerMessageLeases, NativeError> {
+    if bytes > WORKER_MAX_MESSAGE_BYTES {
+        return Err(type_err(
+            api,
+            format!("message of {bytes} bytes exceeds the {WORKER_MAX_MESSAGE_BYTES}-byte limit"),
+        ));
+    }
+    let family_leases = family
+        .account
+        .reserve_exact_many(&[
+            (ResourceClass::QueuedMessages, 1),
+            (ResourceClass::QueuedMessageBytes, bytes),
+        ])
+        .map_err(|err| type_err(api, format!("worker message queue limit: {err}")))?;
+    let main_leases = account
+        .reserve_exact_many(&[
+            (ResourceClass::QueuedTasks, 1),
+            (ResourceClass::QueuedMessages, 1),
+            (ResourceClass::QueuedMessageBytes, bytes),
+        ])
+        .map_err(|err| type_err(api, format!("runtime message budget: {err}")))?;
+    Ok(WorkerMessageLeases {
+        _family: family_leases,
+        _main: main_leases,
+    })
+}
+
+/// Deliver the worker's terminal outcome exactly once through the
+/// pre-reserved guaranteed credit. Later calls find the credit consumed and
+/// do nothing.
+fn post_worker_terminal(shared: &WorkerChildShared, error: Option<String>) {
+    let Some(admission) = shared
+        .terminal
+        .lock()
+        .expect("worker terminal mutex poisoned")
+        .take()
+    else {
+        return;
+    };
+    let Some(host) = shared.host.upgrade() else {
+        return;
+    };
+    let task = WorkerTerminalTask {
+        host,
+        id: shared.id,
+        error,
+    };
+    let _ = shared
+        .parent
+        .enqueue_guaranteed(admission, task, HostCompletionOutcome::Completed);
+}
+
+/// Post one non-terminal child event (an uncaught handler error or a payload
+/// materialization failure) to the parent through ordinary admission. A full
+/// queue drops the event; the rejection stays visible on both ledgers.
+fn post_worker_event(shared: &WorkerChildShared, event: WorkerEvent) {
+    let bytes = match &event {
+        WorkerEvent::Error(message) | WorkerEvent::MessageError(message) => {
+            let Some(bytes) = (message.len() as u64)
+                .checked_mul(2)
+                .and_then(|b| b.checked_add(WORKER_MESSAGE_NODE_BYTES))
+            else {
+                return;
+            };
+            bytes
+        }
+        WorkerEvent::Message(_) => return,
+    };
+    let Ok(leases) = admit_worker_message(&shared.family, &shared.account, bytes, "Worker") else {
+        return;
+    };
+    let Some(host) = shared.host.upgrade() else {
+        return;
+    };
+    let _ = shared.parent.enqueue(
+        WorkerParentDeliverTask {
+            host,
+            id: shared.id,
+            event,
+            leases,
+        },
+        RuntimeLiveness::Ref,
+    );
+}
+
+fn dispatch_worker_event_on_parent(
+    runtime: &mut Runtime,
+    binding: &WorkerParentBinding,
+    event: WorkerEvent,
+) -> Result<(), OtterError> {
+    let worker_root = binding.worker_root;
+    let listeners_root = binding.listeners_root;
+    runtime.run_native_event(&binding.context, move |ctx| {
+        // Materialize first; the root re-reads below stay fresh because no
+        // allocation happens between them and the dispatch call.
+        let event_value = worker_event_to_value(ctx, event)?;
+        let Some(event_obj) = event_value.as_object() else {
+            return Ok(Value::undefined());
+        };
+        let Some(worker) = ctx
+            .persistent_root_get(worker_root)
+            .and_then(|value| value.as_object())
+        else {
+            return Ok(Value::undefined());
+        };
+        let listeners = ctx
+            .persistent_root_get(listeners_root)
+            .and_then(|value| value.as_object());
+        dispatch_event_object(ctx, worker, listeners, event_obj)?;
+        Ok(Value::undefined())
+    })
+}
+
+/// First task on a fresh worker isolate: installs the worker globals, runs
+/// the entry, and retains the entry context for later message dispatch. The
+/// bounded child inbox is FIFO, so a `postMessage` issued right after the
+/// constructor is dispatched only after the entry completed.
+struct WorkerEntryTask {
+    shared: Arc<WorkerChildShared>,
+    specifier: String,
+}
+
+impl RuntimeTask for WorkerEntryTask {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Self { shared, specifier } = *self;
+        if let Err(err) = install_worker_scope_natives(runtime, shared.clone()) {
+            post_worker_terminal(&shared, Some(err.to_string()));
+            return Ok(());
+        }
+        match run_worker_entry(runtime, &specifier) {
+            Ok((_result, context)) => {
+                runtime.worker_child_context = Some(context);
+            }
+            Err(err) => {
+                post_worker_terminal(&shared, Some(err.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel(self: Box<Self>, _runtime: &mut Runtime) {
+        post_worker_terminal(&self.shared, None);
+    }
+}
+
+/// Parent-to-child message. Runs on the child isolate; leases drop when the
+/// message leaves the queue on every dispatch, cancel, and drop path.
+struct WorkerChildMessageTask {
+    shared: Arc<WorkerChildShared>,
+    payload: WorkerPayload,
+    leases: WorkerMessageLeases,
+}
+
+impl RuntimeTask for WorkerChildMessageTask {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Self {
+            shared,
+            payload,
+            leases,
+        } = *self;
+        drop(leases);
+        if shared.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some(context) = runtime.worker_child_context.clone() else {
+            return Ok(());
+        };
+        if let Err(err) = runtime.dispatch_worker_message_event(&context, |ctx| {
+            materialize_worker_payload(ctx, &payload)
+        }) {
+            let event = match err {
+                crate::MessageEventDispatchError::Materialize(err) => {
+                    WorkerEvent::MessageError(err.to_string())
+                }
+                crate::MessageEventDispatchError::Handler(err) => {
+                    WorkerEvent::Error(err.to_string())
+                }
+            };
+            post_worker_event(&shared, event);
+        }
+        Ok(())
+    }
+}
+
+/// Child-to-parent delivery. Runs on the parent isolate and dispatches the
+/// event on the rooted worker object.
+struct WorkerParentDeliverTask {
+    host: Arc<WorkerHostState>,
+    id: u64,
+    event: WorkerEvent,
+    leases: WorkerMessageLeases,
+}
+
+impl RuntimeTask for WorkerParentDeliverTask {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Self {
+            host,
+            id,
+            event,
+            leases,
+        } = *self;
+        drop(leases);
+        let Some(record) = host.get(id) else {
+            return Ok(());
+        };
+        if record.terminated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some(binding) = record.binding_view() else {
+            return Ok(());
+        };
+        // A throwing event handler must not take the parent runner down; the
+        // dispatch error is already routed through diagnostics mapping.
+        let _ = dispatch_worker_event_on_parent(runtime, &binding, event);
+        Ok(())
+    }
+}
+
+/// The worker's terminal outcome on the parent isolate: dispatch a fatal
+/// error event when one exists, then release the binding roots and tear the
+/// child isolate down. Reached exactly once through the terminal credit.
+struct WorkerTerminalTask {
+    host: Arc<WorkerHostState>,
+    id: u64,
+    error: Option<String>,
+}
+
+impl WorkerTerminalTask {
+    fn cleanup(record: &WorkerRecord, runtime: &mut Runtime) {
+        if let Some(binding) = record.take_binding() {
+            runtime.interp.persistent_root_remove(binding.worker_root);
+            runtime
+                .interp
+                .persistent_root_remove(binding.listeners_root);
+        }
+        record.request_terminate();
+        record.join();
+        record.release_keep_alive();
+    }
+}
+
+impl RuntimeTask for WorkerTerminalTask {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let Self { host, id, error } = *self;
+        let Some(record) = host.remove(id) else {
+            return Ok(());
+        };
+        if let Some(error) = error
+            && !record.terminated.load(Ordering::SeqCst)
+            && let Some(binding) = record.binding_view()
+        {
+            let _ = dispatch_worker_event_on_parent(runtime, &binding, WorkerEvent::Error(error));
+        }
+        Self::cleanup(&record, runtime);
+        Ok(())
+    }
+
+    fn cancel(self: Box<Self>, runtime: &mut Runtime) {
+        let Self { host, id, .. } = *self;
+        if let Some(record) = host.remove(id) {
+            Self::cleanup(&record, runtime);
+        }
+    }
 }
 
 fn worker_persistent_value(
@@ -479,103 +946,6 @@ fn set_worker_method(
         let function = scope.value(function);
         scope.set(worker, name, function)
     })
-}
-
-fn install_worker_poll_timer(
-    ctx: &mut NativeCtx<'_>,
-    host: Arc<WorkerHostState>,
-    id: u64,
-    worker_value: Value,
-    listeners_value: Value,
-) -> Result<Value, NativeError> {
-    let poll_host = host.clone();
-    // `native_value` may collect while allocating the function's display
-    // name. Keep the caller's local Worker handle in the persistent arena and
-    // re-read it after allocation; the function's own capture vector is
-    // traced independently by `NativeFunction::allocate_with_roots`.
-    let worker_root = ctx.persistent_root_insert(worker_value);
-    let result = (|| {
-        let poll = ctx.native_value(
-            "__otter_worker_poll",
-            smallvec![worker_value, listeners_value],
-            move |ctx, _args, captures| {
-                let Some(worker_value) = captures.first().copied() else {
-                    return Ok(Value::undefined());
-                };
-                if worker_value.as_object().is_none() {
-                    return Ok(Value::undefined());
-                }
-                let Some(record) = poll_host.get(id) else {
-                    return Ok(Value::undefined());
-                };
-                let worker_root = ctx.persistent_root_insert(worker_value);
-                let result = (|| {
-                    let mut events = Vec::new();
-                    {
-                        let rx = record
-                            .events
-                            .lock()
-                            .expect("worker event receiver poisoned");
-                        while let Ok(event) = rx.try_recv() {
-                            events.push(event);
-                        }
-                    }
-                    for event in events {
-                        let event_obj = match worker_event_to_value(ctx, event) {
-                            Ok(value) => value.as_object().expect("event materializes to object"),
-                            Err(err) => worker_event_to_value(
-                                ctx,
-                                WorkerEvent::MessageError(err.to_string()),
-                            )?
-                            .as_object()
-                            .expect("messageerror materializes to object"),
-                        };
-                        let ty = object::get(event_obj, ctx.heap(), "type")
-                            .and_then(|value| value.as_string(ctx.heap()))
-                            .map(|s| s.to_lossy_string(ctx.heap()))
-                            .unwrap_or_default();
-                        let worker = ctx
-                            .persistent_root_get(worker_root)
-                            .and_then(|value| value.as_object())
-                            .expect("fresh worker persistent root");
-                        if ty == "close" {
-                            let closed_record = poll_host.remove(id);
-                            if let Some(closed_record) = closed_record {
-                                if let Some(token) = closed_record.take_poll_timer() {
-                                    let _ = ctx.cancel_timer(token);
-                                }
-                                closed_record.join();
-                            }
-                            return Ok(Value::undefined());
-                        }
-                        // Capture slab reads stay fresh across the allocations
-                        // above; slot 1 is the hidden listener store.
-                        let listeners = captures.get(1).and_then(|value| value.as_object());
-                        dispatch_event_object(ctx, worker, listeners, event_obj)?;
-                    }
-                    Ok(Value::undefined())
-                })();
-                ctx.persistent_root_remove(worker_root);
-                result
-            },
-        )?;
-        let worker_value = ctx
-            .persistent_root_get(worker_root)
-            .ok_or_else(|| type_err("Worker", "worker root was lost".to_string()))?;
-        let (worker, timer_token) = ctx.scope(|mut scope| {
-            let worker = scope.value(worker_value);
-            let poll = scope.value(poll);
-            let timer_token = scope.schedule_interval(poll, 1)?;
-            Ok::<(Value, u64), NativeError>((scope.finish(worker), timer_token))
-        })?;
-        let record = host
-            .get(id)
-            .ok_or_else(|| type_err("Worker", "worker stopped during construction".to_string()))?;
-        record.install_poll_timer(timer_token);
-        Ok(worker)
-    })();
-    ctx.persistent_root_remove(worker_root);
-    result
 }
 
 fn dispatch_event_object(
@@ -686,106 +1056,72 @@ fn worker_event_listeners(ctx: &NativeCtx<'_>, store: object::JsObject, ty: &str
         .collect()
 }
 
-fn run_js_worker(
-    _id: WorkerId,
-    specifier: String,
-    admitted: AdmittedRuntimeConfig,
-    rx: mpsc::Receiver<WorkerCommand>,
-    tx: mpsc::Sender<WorkerEvent>,
-    interrupt_tx: mpsc::SyncSender<(
-        crate::InterruptHandle,
-        otter_vm::atomics_wait::WaitAgentHandle,
-    )>,
-) {
-    let mut runtime = match Runtime::from_config_with_task_spawner(admitted, None) {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            let _ = tx.send(WorkerEvent::Error(err.to_string()));
-            return;
-        }
-    };
-    runtime.set_allow_blocking_atomics_wait(true);
-    let interrupt = runtime.interrupt_handle();
-    let atomics_wait_agent = runtime.atomics_wait_agent_handle();
-    let _ = interrupt_tx.send((interrupt.clone(), atomics_wait_agent));
-    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Err(err) = install_worker_scope_natives(&mut runtime, tx.clone(), closed.clone()) {
-        let _ = tx.send(WorkerEvent::Error(err.to_string()));
-        let _ = tx.send(WorkerEvent::Closed);
-        return;
-    }
-    let context = match run_worker_entry(&mut runtime, &specifier) {
-        Ok((_result, context)) => context,
-        Err(err) => {
-            let _ = tx.send(WorkerEvent::Error(err.to_string()));
-            let _ = tx.send(WorkerEvent::Closed);
-            return;
-        }
-    };
-    while !closed.load(std::sync::atomic::Ordering::SeqCst) {
-        match rx.recv_timeout(WORKER_COMMAND_POLL_INTERVAL) {
-            Ok(WorkerCommand::Message(payload)) => {
-                if let Err(err) = runtime.dispatch_worker_message_event(&context, |ctx| {
-                    materialize_worker_payload(ctx, &payload)
-                }) {
-                    match err {
-                        crate::MessageEventDispatchError::Materialize(err) => {
-                            let _ = tx.send(WorkerEvent::MessageError(err.to_string()));
-                        }
-                        crate::MessageEventDispatchError::Handler(err) => {
-                            let _ = tx.send(WorkerEvent::Error(err.to_string()));
-                        }
-                    }
-                }
-            }
-            Ok(WorkerCommand::Shutdown) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) if interrupt.is_interrupted() => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    let _ = tx.send(WorkerEvent::Closed);
-}
-
 fn run_worker_entry(
     runtime: &mut Runtime,
     specifier: &str,
-) -> Result<(ExecutionResult, otter_vm::ExecutionContext), OtterError> {
-    let path = PathBuf::from(specifier);
-    if path.exists() {
-        runtime.run_file_with_context(path)
+) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
+    // Path-shaped specifiers run as files; everything else resolves as a
+    // module. The choice is syntactic: probing the filesystem before the
+    // capability boundary would leak existence information and race the
+    // actual open.
+    let path = Path::new(specifier);
+    if path.is_absolute() || specifier.starts_with("./") || specifier.starts_with("../") {
+        runtime.run_file_with_context(PathBuf::from(specifier))
     } else {
-        runtime.run_module_with_context(path)
+        runtime.run_module_with_context(PathBuf::from(specifier))
     }
 }
 
 fn install_worker_scope_natives(
     runtime: &mut Runtime,
-    tx: mpsc::Sender<WorkerEvent>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+    shared: Arc<WorkerChildShared>,
 ) -> Result<(), OtterError> {
-    let post_tx = tx.clone();
+    let post_shared = shared.clone();
     let post: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+        if post_shared.closed.load(Ordering::SeqCst) {
+            return Err(type_err("postMessage", "worker is closed".to_string()));
+        }
+        let value = args.first().copied().unwrap_or_else(Value::undefined);
         let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
-        let payload = clone_worker_value(
-            args.first().unwrap_or(&Value::undefined()),
-            ctx.heap(),
-            &transfers,
+        let measured = measure_worker_message(&value, ctx.heap(), &transfers)?;
+        let leases = admit_worker_message(
+            &post_shared.family,
+            &post_shared.account,
+            measured,
+            "postMessage",
         )?;
-        post_tx
-            .send(WorkerEvent::Message(payload))
-            .map_err(|_| type_err("postMessage", "parent channel is closed".to_string()))?;
+        let payload = clone_worker_value(&value, ctx.heap(), &transfers)?;
+        let Some(host) = post_shared.host.upgrade() else {
+            return Err(type_err(
+                "postMessage",
+                "parent runtime is gone".to_string(),
+            ));
+        };
+        post_shared
+            .parent
+            .enqueue(
+                WorkerParentDeliverTask {
+                    host,
+                    id: post_shared.id,
+                    event: WorkerEvent::Message(payload),
+                    leases,
+                },
+                RuntimeLiveness::Ref,
+            )
+            .map_err(|err| type_err("postMessage", err.to_string()))?;
         // Preserve the transferable on enqueue failure. Detaching before the
-        // channel accepts ownership would turn a reported failure into silent
-        // data loss in the worker.
+        // parent queue accepts ownership would turn a reported failure into
+        // silent data loss in the worker.
         detach_worker_transfers(&transfers, ctx.heap_mut());
         Ok(Value::undefined())
     });
     runtime.install_native_global_call("postMessage", 2, NativeCall::Dynamic(post))?;
 
-    let close_flag = closed;
+    let close_shared = shared;
     let close: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
-        close_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !close_shared.closed.swap(true, Ordering::SeqCst) {
+            post_worker_terminal(&close_shared, None);
+        }
         Ok(Value::undefined())
     });
     runtime.install_native_global_call("close", 0, NativeCall::Dynamic(close))?;
@@ -793,6 +1129,175 @@ fn install_worker_scope_natives(
     runtime.set_global("onmessage", Value::null());
     runtime.set_global("onerror", Value::null());
     Ok(())
+}
+
+/// Measure the accounted size of one message graph before any admission or
+/// clone. Mirrors [`clone_worker_value`]'s structure: an unsupported value or
+/// a cycle fails here, before any resource effect. All arithmetic is checked.
+fn measure_worker_message(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    transfers: &WorkerTransferList,
+) -> Result<u64, NativeError> {
+    let mut active = HashSet::new();
+    let body = measure_worker_value(value, heap, "$".to_string(), 0, &mut active)?;
+    let transfer_entries =
+        u64::try_from(transfers.buffers.len()).map_err(|_| measure_overflow())?;
+    let transfer_cost = transfer_entries
+        .checked_mul(WORKER_MESSAGE_TRANSFER_ENTRY_BYTES)
+        .ok_or_else(measure_overflow)?;
+    body.checked_add(transfer_cost).ok_or_else(measure_overflow)
+}
+
+fn measure_overflow() -> NativeError {
+    type_err(
+        "structuredClone",
+        "message size overflows the accounting range".to_string(),
+    )
+}
+
+fn measure_checked_sum(total: u64, add: u64) -> Result<u64, NativeError> {
+    total.checked_add(add).ok_or_else(measure_overflow)
+}
+
+fn measure_worker_value(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    path: String,
+    depth: usize,
+    active: &mut HashSet<RawGc>,
+) -> Result<u64, NativeError> {
+    if depth > crate::structured_clone::DEFAULT_STRUCTURED_CLONE_MAX_DEPTH {
+        return Err(type_err(
+            "structuredClone",
+            format!("depth limit exceeded at {path}"),
+        ));
+    }
+    if value.is_undefined()
+        || value.is_null()
+        || value.as_boolean().is_some()
+        || value.as_number().is_some()
+    {
+        return Ok(WORKER_MESSAGE_NODE_BYTES);
+    }
+    if let Some(b) = value.as_big_int() {
+        let digits =
+            u64::try_from(b.to_decimal_string(heap).len()).map_err(|_| measure_overflow())?;
+        return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, digits);
+    }
+    if let Some(s) = value.as_string(heap) {
+        let bytes = u64::from(s.len())
+            .checked_mul(2)
+            .ok_or_else(measure_overflow)?;
+        return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, bytes);
+    }
+    if let Some(buf) = value.as_array_buffer() {
+        if buf.as_shared_arc(heap).is_some() {
+            return Ok(WORKER_MESSAGE_NODE_BYTES);
+        }
+        let bytes = buf.with_bytes(heap, |bytes| bytes.len());
+        let bytes = u64::try_from(bytes).map_err(|_| measure_overflow())?;
+        return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, bytes);
+    }
+    if let Some(arr) = value.as_array() {
+        if !active.insert(arr.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let len = array::len(arr, heap);
+        let mut total = WORKER_MESSAGE_NODE_BYTES;
+        for idx in 0..len {
+            let element = array::get(arr, heap, idx);
+            let child =
+                measure_worker_value(&element, heap, format!("{path}[{idx}]"), depth + 1, active)?;
+            total = measure_checked_sum(total, child)?;
+        }
+        active.remove(&arr.raw());
+        return Ok(total);
+    }
+    if let Some(map) = value.as_map() {
+        if !active.insert(map.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let entries = collections::map_entries(map, heap);
+        let mut total = WORKER_MESSAGE_NODE_BYTES;
+        for (idx, (key, entry)) in entries.iter().enumerate() {
+            let key_bytes = measure_worker_value(
+                key,
+                heap,
+                format!("{path}<map-key:{idx}>"),
+                depth + 1,
+                active,
+            )?;
+            total = measure_checked_sum(total, key_bytes)?;
+            let value_bytes = measure_worker_value(
+                entry,
+                heap,
+                format!("{path}<map-value:{idx}>"),
+                depth + 1,
+                active,
+            )?;
+            total = measure_checked_sum(total, value_bytes)?;
+        }
+        active.remove(&map.raw());
+        return Ok(total);
+    }
+    if let Some(set) = value.as_set() {
+        if !active.insert(set.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let values = collections::set_values(set, heap);
+        let mut total = WORKER_MESSAGE_NODE_BYTES;
+        for (idx, element) in values.iter().enumerate() {
+            let child = measure_worker_value(
+                element,
+                heap,
+                format!("{path}<set-value:{idx}>"),
+                depth + 1,
+                active,
+            )?;
+            total = measure_checked_sum(total, child)?;
+        }
+        active.remove(&set.raw());
+        return Ok(total);
+    }
+    if let Some(obj) = value.as_object() {
+        if !active.insert(obj.raw()) {
+            return Err(type_err(
+                "structuredClone",
+                format!("cycle detected at {path}"),
+            ));
+        }
+        let properties: Vec<(String, Value)> = object::with_properties(obj, heap, |properties| {
+            properties
+                .enumerable_data_iter()
+                .map(|(key, entry)| (key.to_string(), entry))
+                .collect()
+        });
+        let mut total = WORKER_MESSAGE_NODE_BYTES;
+        for (key, entry) in properties {
+            let key_bytes = u64::try_from(key.len()).map_err(|_| measure_overflow())?;
+            total = measure_checked_sum(total, key_bytes)?;
+            total = measure_checked_sum(total, WORKER_MESSAGE_NODE_BYTES)?;
+            let child =
+                measure_worker_value(&entry, heap, format!("{path}.{key}"), depth + 1, active)?;
+            total = measure_checked_sum(total, child)?;
+        }
+        active.remove(&obj.raw());
+        return Ok(total);
+    }
+    Err(type_err(
+        "structuredClone",
+        format!("unsupported value at {path}: {:?}", value.kind()),
+    ))
 }
 
 fn worker_event_to_value(
@@ -828,10 +1333,6 @@ fn materialize_worker_event_in_scope<'scope, 'rt>(
             let message = scope.string(&message)?;
             scope.set(object, "type", ty)?;
             scope.set(object, "message", message)?;
-        }
-        WorkerEvent::Closed => {
-            let ty = scope.string("close")?;
-            scope.set(object, "type", ty)?;
         }
     }
     Ok(object)
@@ -2260,5 +2761,451 @@ mod tests {
             .build()
             .unwrap();
         otter.run_file(&entry).await.unwrap();
+    }
+    fn family_otter(family: Arc<WorkerFamily>) -> Otter {
+        let mut builder = Otter::builder().capabilities(CapabilitySet::allow_all());
+        builder.runtime = builder.runtime.worker_family(family);
+        builder.build().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_worker_runs_timers_microtasks_and_dynamic_import() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("dep.js"), "export const tag = 'dep';").unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            const order = [];
+            queueMicrotask(() => order.push("microtask"));
+            setTimeout(async () => {
+              order.push("timer");
+              const dep = await import("./dep.js");
+              order.push(dep.tag);
+              postMessage(order.join(","));
+            }, 0);
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                w.onerror = (event) => {{ throw "worker error: " + event.message; }};
+                w.onmessage = (event) => {{
+                  if (event.data !== "microtask,timer,dep") throw "bad order: " + event.data;
+                  w.terminate();
+                }};
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlimited_main_ledger_does_not_bypass_family_worker_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "globalThis.onmessage = () => {};").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const first = new Worker({0:?});
+                let rejected = "";
+                try {{
+                  new Worker({0:?});
+                }} catch (error) {{
+                  rejected = String(error);
+                }}
+                first.terminate();
+                if (!rejected.includes("worker family limit")) {{
+                  throw "second worker was not rejected: " + rejected;
+                }}
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        // The main ledger is the unlimited default; only the family is finite.
+        let otter = family_otter(WorkerFamily::with_limits(
+            1,
+            WORKER_FAMILY_MAX_QUEUED_MESSAGES,
+            WORKER_FAMILY_MAX_QUEUED_MESSAGE_BYTES,
+        ));
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_workers_share_the_family_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_path = dir.path().join("inner.js");
+        fs::write(&inner_path, "globalThis.onmessage = () => {};").unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            format!(
+                r#"
+                let outcome = "spawned";
+                try {{
+                  new Worker({:?});
+                }} catch (error) {{
+                  outcome = String(error);
+                }}
+                postMessage(outcome);
+                "#,
+                inner_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                w.onerror = (event) => {{ throw "worker error: " + event.message; }};
+                w.onmessage = (event) => {{
+                  if (!String(event.data).includes("worker family limit")) {{
+                    throw "nested worker escaped the family limit: " + event.data;
+                  }}
+                  w.terminate();
+                }};
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = family_otter(WorkerFamily::with_limits(
+            1,
+            WORKER_FAMILY_MAX_QUEUED_MESSAGES,
+            WORKER_FAMILY_MAX_QUEUED_MESSAGE_BYTES,
+        ));
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn family_rejected_message_does_not_detach_the_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "globalThis.onmessage = () => {};").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                const buffer = new ArrayBuffer(64);
+                let threw = "";
+                try {{
+                  w.postMessage(buffer, [buffer]);
+                }} catch (error) {{
+                  threw = String(error);
+                }}
+                w.terminate();
+                if (!threw.includes("worker message queue limit")) {{
+                  throw "message was not rejected: " + threw;
+                }}
+                if (buffer.byteLength !== 64) {{
+                  throw "rejected transfer detached the sender buffer";
+                }}
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = family_otter(WorkerFamily::with_limits(WORKER_FAMILY_MAX_WORKERS, 0, 0));
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_message_graph_is_a_typed_error_before_any_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            "globalThis.onmessage = (event) => postMessage(event.data);",
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                const giant = "x".repeat(9 * 1024 * 1024);
+                let threw = "";
+                try {{
+                  w.postMessage(giant);
+                }} catch (error) {{
+                  threw = String(error);
+                }}
+                if (!threw.includes("exceeds")) {{
+                  throw "giant graph was not rejected: " + threw;
+                }}
+                // The worker remains usable after the rejection.
+                w.onmessage = (event) => {{
+                  if (event.data !== "ok") throw "bad echo: " + event.data;
+                  w.terminate();
+                }};
+                w.postMessage("ok");
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_error_close_race_yields_one_terminal_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "postMessage('ready'); close();").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                globalThis.errors = 0;
+                w.onerror = () => {{ globalThis.errors += 1; }};
+                w.onmessage = () => {{
+                  // Race the terminal Closed delivery against terminate().
+                  w.terminate();
+                  w.terminate();
+                }};
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let account = ResourceAccount::default();
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .resource_account(account.clone())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+        let errors = otter.eval("globalThis.errors").await.unwrap();
+        assert_eq!(errors.completion_string(), "0");
+        // Census returns to baseline: the parent handle is the only isolate
+        // and every queued-message charge was released.
+        let snapshot = account.snapshot();
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::Workers)
+                .current(),
+            0
+        );
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::QueuedMessages)
+                .current(),
+            0
+        );
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::QueuedMessageBytes)
+                .current(),
+            0
+        );
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::Isolates)
+                .current(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_lifecycle_returns_resource_census_to_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            globalThis.onmessage = (event) => {
+              for (let i = 0; i < 32; i += 1) postMessage(event.data + i);
+              close();
+            };
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                globalThis.received = 0;
+                w.onmessage = () => {{ globalThis.received += 1; }};
+                w.postMessage(100);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let account = ResourceAccount::default();
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .resource_account(account.clone())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+        let received = otter.eval("globalThis.received").await.unwrap();
+        assert_eq!(received.completion_string(), "32");
+        let snapshot = account.snapshot();
+        for class in [
+            otter_resource::ResourceClass::Workers,
+            otter_resource::ResourceClass::QueuedMessages,
+            otter_resource::ResourceClass::QueuedMessageBytes,
+        ] {
+            assert_eq!(
+                snapshot.get(class).current(),
+                0,
+                "class {class:?} did not return to baseline"
+            );
+        }
+        // The worker's 16 MiB stack charge is gone; what remains is the
+        // parent handle's own runner stack.
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::WorkerStackBytes)
+                .current(),
+            crate::admission::RUNTIME_THREAD_STACK_BYTES as u64
+        );
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::Isolates)
+                .current(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_terminal_survives_a_busy_parent_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        // A burst larger than the parent's bounded inbox: excess ordinary
+        // messages may be rejected with a typed error, but the terminal
+        // Closed always lands through its pre-reserved guaranteed credit.
+        fs::write(
+            &worker_path,
+            r#"
+            for (let i = 0; i < 256; i += 1) {
+              try { postMessage(i); } catch (error) { /* backpressure */ }
+            }
+            close();
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                globalThis.received = 0;
+                w.onmessage = () => {{ globalThis.received += 1; }};
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let account = ResourceAccount::default();
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .resource_account(account.clone())
+            .build()
+            .unwrap();
+        // run_file returning proves the worker's keep-alive was released by
+        // the terminal task; a lost terminal would hang the parent drain.
+        otter.run_file(&entry).await.unwrap();
+        let snapshot = account.snapshot();
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::Workers)
+                .current(),
+            0
+        );
+        assert_eq!(
+            snapshot
+                .get(otter_resource::ResourceClass::QueuedMessages)
+                .current(),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_worker_holds_no_timer_wakeups() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "globalThis.onmessage = () => {};").unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const w = new Worker({:?});
+                setTimeout(() => {{ w.terminate(); }}, 30);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+        // The only timer in this program is the parent's one-shot terminate
+        // timer. An idle worker adds no repeating wakeup: after the run the
+        // parent's timer census is empty.
+        let stats = otter.handle().activity_stats();
+        assert_eq!(stats.pending_ref_timers, 0);
+        assert_eq!(stats.pending_unref_timers, 0);
+    }
+
+    /// Static source gate: the managed worker path must not regress to
+    /// thread-channel polling. The needles are split so this test does not
+    /// match itself.
+    #[test]
+    fn worker_source_gate_forbids_polling_primitives() {
+        let source = include_str!("worker.rs");
+        for needle in [
+            concat!("std::sync::", "mpsc"),
+            concat!("recv_", "timeout"),
+            concat!("WORKER_COMMAND_", "POLL_INTERVAL"),
+            concat!("schedule_", "interval"),
+            concat!("std::thread::", "spawn"),
+        ] {
+            assert!(
+                !source.contains(needle),
+                "worker.rs regressed to polling primitive {needle:?}"
+            );
+        }
     }
 }

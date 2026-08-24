@@ -15,7 +15,7 @@
 //! - `otter_resource::ResourceAccount`
 
 use otter_runtime::{
-    JitSelection, OtterError, OtterPool, RUNTIME_THREAD_STACK_BYTES, ResourceAccount,
+    JitSelection, Otter, OtterError, OtterPool, RUNTIME_THREAD_STACK_BYTES, ResourceAccount,
     ResourceClass, ResourceError, ResourceLimits, ResourceSnapshotEntry, Runtime, RuntimeBuilder,
     RuntimeGlobalInstaller, SnapshotRuntimeOptions, SourceInput, Worker,
 };
@@ -337,7 +337,7 @@ fn additional_realms_do_not_count_as_isolates() {
 }
 
 #[test]
-fn javascript_worker_is_rejected_before_child_channels_or_thread() {
+fn javascript_worker_requires_a_managed_runtime() {
     let account = isolate_account(1);
     let mut parent = Runtime::builder()
         .resource_account(account.clone())
@@ -346,17 +346,30 @@ fn javascript_worker_is_rejected_before_child_channels_or_thread() {
         .build()
         .expect("parent isolate");
 
-    parent
+    let error = parent
         .eval(SourceInput::from_javascript(
             "new Worker('resource-limit-worker.js')",
         ))
-        .expect_err("the parent occupies the only isolate slot");
+        .expect_err("a direct runtime has no managed task spawner");
+    assert!(
+        error
+            .to_string()
+            .contains("Worker requires a managed RuntimeHandle/Otter runtime"),
+        "unexpected error: {error}"
+    );
+    // The refusal is synchronous and produces no resource effect: nothing was
+    // reserved and no rejection was published on any class.
     let entry = isolate_entry(&account);
     assert_eq!(
         (entry.current(), entry.peak(), entry.rejections()),
-        (1, 1, 1)
+        (1, 1, 0)
     );
-    for class in [ResourceClass::Workers, ResourceClass::WorkerStackBytes] {
+    for class in [
+        ResourceClass::Workers,
+        ResourceClass::WorkerStackBytes,
+        ResourceClass::QueuedMessages,
+        ResourceClass::QueuedMessageBytes,
+    ] {
         let entry = resource_entry(&account, class);
         assert_eq!(
             (entry.current(), entry.peak(), entry.rejections()),
@@ -368,29 +381,27 @@ fn javascript_worker_is_rejected_before_child_channels_or_thread() {
     assert_eq!(isolate_entry(&account).current(), 0);
 }
 
-#[test]
-fn javascript_worker_role_rejection_does_not_publish_isolate_or_stack_peaks() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn javascript_worker_role_rejection_precedes_child_thread_and_channels() {
     let account = ResourceAccount::new(
         ResourceLimits::builder()
             .limit(ResourceClass::Isolates, 2)
             .limit(ResourceClass::Workers, 0)
             .limit(
                 ResourceClass::WorkerStackBytes,
-                RUNTIME_THREAD_STACK_BYTES as u64,
+                2 * RUNTIME_THREAD_STACK_BYTES as u64,
             )
             .build(),
     );
-    let mut parent = Runtime::builder()
+    let otter = Otter::builder()
         .resource_account(account.clone())
-        .process_global(false)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
-        .expect("parent isolate");
+        .expect("managed parent");
 
-    parent
-        .eval(SourceInput::from_javascript(
-            "new Worker('worker-role-limit.js')",
-        ))
+    otter
+        .eval("new Worker('worker-role-limit.js')")
+        .await
         .expect_err("worker slot limit must reject before child setup");
 
     let isolates = isolate_entry(&account);
@@ -403,13 +414,19 @@ fn javascript_worker_role_rejection_does_not_publish_isolate_or_stack_peaks() {
         (workers.current(), workers.peak(), workers.rejections()),
         (0, 0, 1)
     );
+    // The rejected worker never spawned a thread: only the parent handle's
+    // stack charge is visible.
     let stacks = resource_entry(&account, ResourceClass::WorkerStackBytes);
     assert_eq!(
         (stacks.current(), stacks.peak(), stacks.rejections()),
-        (0, 0, 0)
+        (
+            RUNTIME_THREAD_STACK_BYTES as u64,
+            RUNTIME_THREAD_STACK_BYTES as u64,
+            0
+        )
     );
 
-    drop(parent);
+    otter.handle().shutdown_and_wait().await;
     assert_eq!(isolate_entry(&account).current(), 0);
 }
 

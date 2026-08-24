@@ -50,13 +50,16 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-08-24.
-- Observed commit: `be5fad199485b1acfa9328b294fa8685051c4ee8`.
-- The checkout is intentionally dirty and changing in parallel. Re-snapshot
-  touched files immediately before each edit and merge with concurrent work;
-  never reset or overwrite it.
-- Recent focused core runs passed for `otter-bytecode`, `otter-gc`,
-  `otter-jit`, `otter-runtime`, and `otter-vm`. These are local
-  observations, not a publishable clean-tree baseline.
+- Observed commit: `4a7fbf53` (clean tree at snapshot time).
+- The checkout may change in parallel. Re-snapshot touched files immediately
+  before each edit and merge with concurrent work; never reset or overwrite it.
+- Checkpoint gates passed on this commit: compile-cache unit/Unix tests
+  (incl. root-symlink and hardlinked-lock regressions), worker suite under
+  `OTTER_GC_STRESS` 1/13, `resource_accounting`, `otter-resource`,
+  release `otter-bytecode` verifier/mutation tests, workspace
+  `cargo check --all-targets`, and `clippy --all-targets --all-features
+  -D warnings`. These are local observations, not a publishable clean-tree
+  baseline.
 - The published `ES_CONFORMANCE.md` snapshot is historical. A fresh full run
   is required before claiming a new conformance number.
 - No performance result from this dirty snapshot is eligible for publication.
@@ -66,7 +69,7 @@ claim.
 | ID | Lane | Priority | Status | Depends on | Active outcome |
 |---|---|---:|---|---|---|
 | H1 | Security | P0 | complete | none | every HTTP redirect hop and cached final alias is authorized |
-| H2 | Isolation | P0 | queued | R1 | bounded, capability-aware Workers with deterministic shutdown |
+| H2 | Isolation | P0 | complete | R1 | bounded, capability-aware Workers with deterministic shutdown |
 | B1 | Bytecode | P0 | active | none | mandatory panic-free verifier before any bytecode executes |
 | R1 | Resources | P0 | active | none | one aggregate runtime budget and typed exhaustion errors |
 | R2 | Resources | P1 | queued | R1 | bound code, source, module, queue, worker, and external memory |
@@ -98,15 +101,25 @@ explicit future slices rather than implicit H1 scope.
 
 ### H2. Worker isolation
 
-Workers must inherit a narrowed, explicit capability evaluator; they may never
-silently regain host defaults. Introduce per-runtime and aggregate worker
-counts, bounded message bytes/items, wake-driven scheduling, deterministic
-cancellation, and join-on-shutdown. Reject before spawning or enqueueing when a
-limit is exhausted. No detached OS-thread or Tokio-task leak is acceptable.
+Complete. JavaScript workers are managed isolates: each `new Worker` spawns a
+`RuntimeHandle` runner with the full wake-driven inbox, timers, host
+completions, and dynamic imports; the raw thread/mpsc/poll-timer path is
+deleted and a static source gate keeps it out. Parent↔child messages travel as
+typed `RuntimeTask`s through the bounded inboxes after a fixed
+validate/measure → admission → fallible clone → enqueue → detach pipeline with
+checked arithmetic. Workers and messages charge the shared main ledger and a
+finite per-family hard-limit ledger (workers, queued messages, queued message
+bytes, single-message bytes) atomically per account; nested workers inherit
+the same family, account, and capabilities, and an unlimited main ledger
+cannot bypass the family. Each worker pre-reserves a guaranteed terminal
+credit so its Error/Closed outcome lands exactly once even through a full
+parent inbox; `terminate()` cancels the blocking `Atomics.wait` agent,
+interrupts, shuts down, and joins deterministically. A direct `Runtime`
+rejects `Worker` synchronously without resource effect. Census-to-baseline,
+family-limit, nested-worker, transfer-preservation, oversized-graph,
+terminal-race, busy-inbox, idle-wakeup, and GC-stress tests pass.
 
-Acceptance includes adversarial spawn storms, queue floods, parent shutdown,
-worker exceptions, and capability-denial tests. Thread/task counts and queued
-bytes must return to baseline after every case.
+Future narrowing options (worker-scoped capability subsets) remain E1 scope.
 
 ### H3. Remaining effect surfaces
 

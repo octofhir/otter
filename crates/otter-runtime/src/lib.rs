@@ -1786,6 +1786,11 @@ pub(crate) struct RuntimeConfig {
     allow_blocking_atomics_wait: bool,
     install_process_global: bool,
     install_worker_global: bool,
+    /// Shared hard-limit family every JavaScript `Worker` spawned from this
+    /// runtime (and its nested workers) charges. `None` until the root
+    /// runtime installs its `Worker` global; child configs inherit the
+    /// parent's family so nesting cannot mint fresh limits.
+    pub(crate) worker_family: Option<Arc<worker::WorkerFamily>>,
     console_sink: ConsoleSinkHandle,
     promise_rejection_hook: Option<PromiseRejectionHookHandle>,
     hooks: RuntimeHooks,
@@ -2084,6 +2089,7 @@ impl Default for RuntimeConfig {
             allow_blocking_atomics_wait: false,
             install_process_global: true,
             install_worker_global: true,
+            worker_family: None,
             console_sink: otter_vm::console::default_console_sink(),
             promise_rejection_hook: None,
             hooks: RuntimeHooks::default(),
@@ -2191,6 +2197,16 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn resource_account(mut self, account: ResourceAccount) -> Self {
         self.config.resource_account = account;
+        self
+    }
+
+    /// Override the hard-limit family charged by every JavaScript `Worker`
+    /// spawned from this runtime and its nested workers. Test-only: the
+    /// production family is process-fixed.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn worker_family(mut self, family: Arc<worker::WorkerFamily>) -> Self {
+        self.config.worker_family = Some(family);
         self
     }
 
@@ -2833,6 +2849,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             runtime_task_spawner,
             pending_exit_code: None,
+            worker_child_context: None,
             admission_leases: None,
         })
     }
@@ -3073,6 +3090,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             runtime_task_spawner,
             pending_exit_code: None,
+            worker_child_context: None,
             restored_from_snapshot: false,
             admission_leases: None,
         };
@@ -3187,6 +3205,12 @@ pub struct Runtime {
     /// in-flight run with the code, exactly as an exit during entry
     /// evaluation does.
     pending_exit_code: Option<u8>,
+    /// Dispatch context of a JavaScript worker isolate's entry module,
+    /// retained after entry evaluation so later message tasks can run the
+    /// global `onmessage` handler. Isolate-local: it never crosses a `Send`
+    /// boundary — worker tasks reacquire it from `&mut Runtime` on the
+    /// isolate thread.
+    pub(crate) worker_child_context: Option<ExecutionContext>,
     /// Exact role charge. This field is last so every VM and host-owned
     /// resource is destroyed before the shared ledger releases the isolate,
     /// worker slot, and native stack bytes together.
@@ -3417,10 +3441,6 @@ impl Runtime {
     #[must_use]
     pub fn runtime_task_spawner(&self) -> Option<RuntimeTaskSpawner> {
         self.runtime_task_spawner.clone()
-    }
-
-    pub(crate) fn set_allow_blocking_atomics_wait(&mut self, allow: bool) {
-        self.interp.set_allow_blocking_atomics_wait(allow);
     }
 
     /// Configured per-`run_*` timeout. Direct runtimes interrupt executing

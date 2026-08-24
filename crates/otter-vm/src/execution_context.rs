@@ -93,9 +93,27 @@ impl ExecutionContext {
     /// modules on one interpreter must use
     /// [`crate::Interpreter::link_module`] instead so all chunks share
     /// one function-id space.
-    #[must_use]
-    pub fn from_module(module: BytecodeModule) -> Self {
+    ///
+    /// # Errors
+    /// Returns [`crate::BytecodeLinkError`] before constructing a context when
+    /// the module is malformed.
+    pub fn from_module(module: BytecodeModule) -> Result<Self, crate::BytecodeLinkError> {
         Arc::new(CodeSpace::default()).link_module(module)
+    }
+
+    /// Build a standalone context from decoded/cache bytecode while retaining
+    /// its mandatory verification proof through executable construction.
+    /// Embedders that execute several modules on one interpreter should use
+    /// [`crate::Interpreter::link_verified_module`] so their function ids share
+    /// one code space.
+    ///
+    /// # Errors
+    /// Returns [`crate::BytecodeLinkError`] before constructing a context when
+    /// the retained proof cannot fit the fresh code space.
+    pub fn from_verified_module(
+        module: otter_bytecode::VerifiedBytecodeModule,
+    ) -> Result<Self, crate::BytecodeLinkError> {
+        Arc::new(CodeSpace::default()).link_verified_module(module)
     }
 
     /// Wrap one linked chunk's tables. Only [`CodeSpace::link_module`] and
@@ -756,7 +774,7 @@ mod tests {
     }
 
     fn run_module_with_interpreter(module: BytecodeModule) -> (Value, Interpreter) {
-        let context = ExecutionContext::from_module(module);
+        let context = ExecutionContext::from_module(module).expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
         let value = interp.run(&context).expect("test bytecode runs");
         (value, interp)
@@ -765,11 +783,13 @@ mod tests {
     #[test]
     fn string_constants_have_stable_property_atoms() {
         let mut interp = Interpreter::new();
-        let context = interp.link_module(module_with(
-            vec![instr(0, Op::ReturnUndefined, [])],
-            vec![string_constant("foo")],
-            1,
-        ));
+        let context = interp
+            .link_module(module_with(
+                vec![instr(0, Op::ReturnUndefined, [])],
+                vec![string_constant("foo")],
+                1,
+            ))
+            .expect("valid bytecode fixture");
 
         let key = context
             .property_atom(0)
@@ -800,10 +820,12 @@ mod tests {
                         Operand::ConstIndex(1),
                     ],
                 ),
+                instr(2, Op::ReturnUndefined, []),
             ],
             vec![string_constant("length"), string_constant("value")],
             3,
-        ));
+        ))
+        .expect("valid bytecode fixture");
 
         let view = context.jit_compile_snapshot(0).expect("function exists");
 
@@ -836,6 +858,7 @@ mod tests {
                         Operand::ConstIndex(0),
                     ],
                 ),
+                instr(2, Op::ReturnUndefined, []),
             ],
             vec![
                 string_constant("charCodeAt"),
@@ -843,7 +866,8 @@ mod tests {
                 string_constant("value"),
             ],
             4,
-        ));
+        ))
+        .expect("valid bytecode fixture");
 
         let view = context.jit_compile_snapshot(0).expect("function exists");
 
@@ -860,28 +884,32 @@ mod tests {
     #[test]
     fn sibling_jit_snapshot_resolves_load_number_from_its_own_chunk() {
         let mut interp = Interpreter::new();
-        let owner = interp.link_module(module_with(
-            vec![
-                instr(
-                    0,
-                    Op::LoadNumber,
-                    [Operand::Register(0), Operand::ConstIndex(0)],
-                ),
-                instr(1, Op::ReturnValue, [Operand::Register(0)]),
-            ],
-            vec![Constant::Number {
-                bits: 17.25_f64.to_bits(),
-            }],
-            1,
-        ));
+        let owner = interp
+            .link_module(module_with(
+                vec![
+                    instr(
+                        0,
+                        Op::LoadNumber,
+                        [Operand::Register(0), Operand::ConstIndex(0)],
+                    ),
+                    instr(1, Op::ReturnValue, [Operand::Register(0)]),
+                ],
+                vec![Constant::Number {
+                    bits: 17.25_f64.to_bits(),
+                }],
+                1,
+            ))
+            .expect("valid bytecode fixture");
         let owner_function = owner.function_base();
-        let ambient = interp.link_module(module_with(
-            vec![instr(0, Op::ReturnUndefined, [])],
-            vec![Constant::Number {
-                bits: (-99.0_f64).to_bits(),
-            }],
-            0,
-        ));
+        let ambient = interp
+            .link_module(module_with(
+                vec![instr(0, Op::ReturnUndefined, [])],
+                vec![Constant::Number {
+                    bits: (-99.0_f64).to_bits(),
+                }],
+                0,
+            ))
+            .expect("valid bytecode fixture");
 
         let snapshot = ambient
             .jit_compile_snapshot(owner_function)
@@ -1026,7 +1054,8 @@ mod tests {
             ],
             vec![string_constant("foo")],
             4,
-        ));
+        ))
+        .expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
 
         assert_eq!(
@@ -1079,7 +1108,8 @@ mod tests {
             ],
             vec![string_constant("foo")],
             5,
-        ));
+        ))
+        .expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
 
         assert_eq!(
@@ -1128,7 +1158,7 @@ mod tests {
             5,
         );
 
-        let context = ExecutionContext::from_module(module);
+        let context = ExecutionContext::from_module(module).expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
 
         assert_eq!(
@@ -1193,7 +1223,8 @@ mod tests {
             ],
             vec![string_constant("foo")],
             5,
-        ));
+        ))
+        .expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
 
         assert_eq!(
@@ -1258,7 +1289,8 @@ mod tests {
             ],
             vec![string_constant("foo"), string_constant("bar")],
             5,
-        ));
+        ))
+        .expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
 
         assert_eq!(

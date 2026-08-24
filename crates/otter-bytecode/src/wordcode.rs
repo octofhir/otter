@@ -15,6 +15,8 @@
 //! - Operand kinds come only from the opcode schema.
 //! - Up to four words are instruction-local; longer forms use one function-wide
 //!   dense overflow table and never allocate per instruction.
+//! - Frozen bodies use one canonical storage form: inline padding is zero and
+//!   overflow ranges are dense, ordered, and wholly in bounds.
 //! - Instruction position is the only logical PC; records carry no PC field.
 //! - A frozen [`FunctionCode`] is the canonical compiler, wire, and debug
 //!   representation, not a required interpreter memory layout.
@@ -23,7 +25,7 @@
 //! - [`crate::opcode_schema`]
 //! - [`crate::encoding`]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{Op, Operand, opcode_schema};
 
@@ -89,17 +91,37 @@ impl Instruction {
         if self.operands_are_inline() {
             return self.inline_operand_words.get(index).copied();
         }
-        overflow
-            .get(self.overflow_operand_offset as usize + index)
-            .copied()
+        let offset = usize::try_from(self.overflow_operand_offset).ok()?;
+        overflow.get(offset.checked_add(index)?).copied()
     }
 }
 
 /// Frozen authoritative compiler/wire wordcode for one function.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FunctionCode {
     instructions: Box<[Instruction]>,
     overflow_operand_words: Box<[u32]>,
+}
+
+impl<'de> Deserialize<'de> for FunctionCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedFunctionCode {
+            instructions: Box<[Instruction]>,
+            overflow_operand_words: Box<[u32]>,
+        }
+
+        let serialized = SerializedFunctionCode::deserialize(deserializer)?;
+        let code = Self {
+            instructions: serialized.instructions,
+            overflow_operand_words: serialized.overflow_operand_words,
+        };
+        crate::encoding::verify_wordcode_function(&code).map_err(serde::de::Error::custom)?;
+        Ok(code)
+    }
 }
 
 impl FunctionCode {
@@ -453,5 +475,22 @@ mod tests {
         assert!(builder.set_operand(0, 0, Operand::Imm32(-7)));
         assert!(!builder.set_operand(0, 0, Operand::Register(1)));
         assert_eq!(builder.operand(0, 0), Some(Operand::Imm32(-7)));
+    }
+
+    #[test]
+    fn serde_rejects_noncanonical_function_code() {
+        let mut builder = FunctionCodeBuilder::new();
+        builder.push(Op::LoadUndefined, &[Operand::Register(0)]);
+        builder.push(Op::ReturnUndefined, &[]);
+        let code = builder.finish();
+
+        let encoded = serde_json::to_value(&code).expect("serialize canonical wordcode");
+        let round_trip: FunctionCode =
+            serde_json::from_value(encoded.clone()).expect("deserialize canonical wordcode");
+        assert_eq!(round_trip, code);
+
+        let mut invalid = encoded;
+        invalid["instructions"][0]["operand_count"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<FunctionCode>(invalid).is_err());
     }
 }

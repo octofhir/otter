@@ -278,7 +278,9 @@ impl Interpreter {
             .map(|binding| binding.name.clone())
             .collect();
         let module = self.compile_escaped_source(&source, options)?;
-        let context = self.link_module(module);
+        let context = self
+            .link_module(module)
+            .map_err(|_| VmError::InvalidOperand)?;
         let main = context.exec_main();
         // A strict direct eval owns a private current record whose parent is
         // the caller record. Root that unpublished handle while the fresh
@@ -489,7 +491,9 @@ impl Interpreter {
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.
-        let context = self.link_module(module);
+        let context = self
+            .link_module(module)
+            .map_err(|_| VmError::InvalidOperand)?;
         let main = context.exec_main();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
@@ -638,7 +642,9 @@ impl Interpreter {
             module_url.to_string(),
             std::sync::Arc::from(source.as_str()),
         );
-        let context = self.link_module(module);
+        let context = self
+            .link_module(module)
+            .map_err(|_| VmError::InvalidOperand)?;
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
         // completion).
@@ -682,7 +688,9 @@ impl Interpreter {
         let prefix = kind.source_prefix();
         let source = format!("({prefix} anonymous({params_joined}\n) {{\n{body}\n}})");
         let module = self.compile_escaped_source(&source, EvalCompileOptions::default())?;
-        let context = self.link_module(module);
+        let context = self
+            .link_module(module)
+            .map_err(|_| VmError::InvalidOperand)?;
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion).

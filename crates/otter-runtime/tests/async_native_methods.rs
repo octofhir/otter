@@ -11,15 +11,17 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use otter_macros::{HostClass, js_class};
 use otter_runtime::{
-    ConsoleLevel, ConsoleSink, GlobalClass, HostCompletionJob, HostCompletionSink, HostKeepAlive,
-    Otter, OtterError, Runtime, SourceInput,
+    ConsoleLevel, ConsoleSink, GlobalClass, HostCompletionAdmission, HostCompletionJob,
+    HostCompletionOutcome, HostCompletionSink, NativeCtx, NativeError, Otter, OtterError, Runtime,
+    SourceInput, Value,
 };
-use otter_vm::marshal::JsError;
+use otter_vm::marshal::{JsError, MarshalCx};
 
 #[derive(Debug, Default)]
 struct LogCapture {
@@ -84,6 +86,43 @@ impl Sleeper {
     }
 }
 
+static ADMISSION_PROBE_POLLED: AtomicBool = AtomicBool::new(false);
+static HOSTLESS_FACTORY_CALLED: AtomicBool = AtomicBool::new(false);
+
+fn hostless_factory_probe(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    ctx.scope(|scope| {
+        let mut cx = MarshalCx::new(scope);
+        let promise = cx
+            .promise_from_future(|| {
+                HOSTLESS_FACTORY_CALLED.store(true, Ordering::Release);
+                std::future::pending::<Result<f64, JsError>>()
+            })
+            .map_err(|error| error.into_native("hostlessFactoryProbe"))?;
+        Ok(cx.escape(promise))
+    })
+}
+
+/// Host class whose async body records whether completion admission happened first.
+#[derive(Debug, Clone, HostClass)]
+pub struct AdmissionProbe {
+    _marker: (),
+}
+
+#[js_class(name = "AdmissionProbe", feature = WEB)]
+impl AdmissionProbe {
+    #[constructor]
+    fn js_new() -> AdmissionProbe {
+        AdmissionProbe { _marker: () }
+    }
+
+    #[method(name = "start")]
+    async fn js_start(self) -> f64 {
+        ADMISSION_PROBE_POLLED.store(true, Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        1.0
+    }
+}
+
 fn build_otter(capture: Arc<LogCapture>) -> Otter {
     Otter::builder()
         .console_sink(capture)
@@ -94,7 +133,11 @@ fn build_otter(capture: Arc<LogCapture>) -> Otter {
 
 struct ChannelCompletionSink {
     handle: tokio::runtime::Handle,
-    tx: Sender<HostCompletionJob>,
+    tx: Sender<(
+        HostCompletionAdmission,
+        HostCompletionJob,
+        HostCompletionOutcome,
+    )>,
 }
 
 impl HostCompletionSink for ChannelCompletionSink {
@@ -102,14 +145,28 @@ impl HostCompletionSink for ChannelCompletionSink {
         self.handle.spawn(future);
     }
 
-    fn complete(&self, job: HostCompletionJob) {
+    fn complete(
+        &self,
+        admission: HostCompletionAdmission,
+        job: HostCompletionJob,
+        outcome: HostCompletionOutcome,
+    ) -> Result<(), String> {
         self.tx
-            .send(job)
-            .expect("Layer A completion receiver lives");
+            .send((admission, job, outcome))
+            .map_err(|_| "Layer A completion receiver closed".to_string())
     }
 
-    fn keep_alive(&self) -> HostKeepAlive {
-        HostKeepAlive::noop()
+    fn finish_inline(
+        &self,
+        admission: HostCompletionAdmission,
+        _outcome: HostCompletionOutcome,
+    ) -> Result<(), String> {
+        drop(admission);
+        Ok(())
+    }
+
+    fn admit(&self) -> Result<HostCompletionAdmission, String> {
+        Ok(HostCompletionAdmission::new(Box::new(())))
     }
 
     fn with_executor_context(&self, f: &mut dyn FnMut()) {
@@ -121,7 +178,14 @@ impl HostCompletionSink for ChannelCompletionSink {
 fn build_layer_a(
     capture: Arc<LogCapture>,
     handle: tokio::runtime::Handle,
-) -> (Runtime, Receiver<HostCompletionJob>) {
+) -> (
+    Runtime,
+    Receiver<(
+        HostCompletionAdmission,
+        HostCompletionJob,
+        HostCompletionOutcome,
+    )>,
+) {
     let mut runtime = Runtime::builder()
         .console_sink(capture)
         .global_classes([GlobalClass::from_intrinsic::<SleeperIntrinsic>()])
@@ -160,6 +224,67 @@ async fn async_method_settles_after_real_await() -> Result<(), OtterError> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_host_capacity_rejects_before_the_future_is_polled() -> Result<(), OtterError> {
+    ADMISSION_PROBE_POLLED.store(false, Ordering::Release);
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .completion_capacities(0, 0, 1)
+        .console_sink(capture.clone())
+        .global_classes([GlobalClass::from_intrinsic::<AdmissionProbeIntrinsic>()])
+        .build()
+        .expect("zero completion capacity is a valid fail-closed runtime");
+
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                try {
+                    new AdmissionProbe().start();
+                    console.log("unexpected-success");
+                } catch (error) {
+                    console.log(error.name + ":" + /capacity/.test(error.message));
+                }
+                "#,
+            ),
+            "<async-admission-exhausted>",
+        )
+        .await?;
+
+    assert!(!ADMISSION_PROBE_POLLED.load(Ordering::Acquire));
+    assert_eq!(capture.snapshot(), vec!["TypeError:true".to_string()]);
+    assert_eq!(otter.activity_stats().pending_ref_host_ops, 0);
+    Ok(())
+}
+
+#[test]
+fn hostless_embedding_rejects_before_constructing_the_future() {
+    HOSTLESS_FACTORY_CALLED.store(false, Ordering::Release);
+    let mut runtime = Runtime::builder().build().expect("hostless runtime");
+    runtime
+        .install_native_global("hostlessFactoryProbe", 0, hostless_factory_probe)
+        .expect("probe installs");
+
+    let result = runtime
+        .eval(SourceInput::from_javascript(
+            r#"
+            let outcome;
+            try {
+                hostlessFactoryProbe();
+                outcome = "unexpected-success";
+            } catch (error) {
+                outcome = error.name + ":" + /not available/.test(error.message);
+            }
+            outcome;
+            "#,
+        ))
+        .expect("hostless admission failure is catchable");
+
+    assert_eq!(result.completion_string(), "TypeError:true");
+    assert!(!HOSTLESS_FACTORY_CALLED.load(Ordering::Acquire));
+}
+
 /// Immediately-ready future: settles through the pre-settled promise
 /// path (works even without the executor round-trip) and reactions
 /// run on the ordinary microtask drain.
@@ -179,6 +304,9 @@ async fn async_method_fast_path_settles_ready_future() -> Result<(), OtterError>
         )
         .await?;
     assert_eq!(capture.snapshot(), vec!["quick:4".to_string()]);
+    let activity = otter.activity_stats();
+    assert_eq!(activity.completed_host_ops, 1);
+    assert_eq!(activity.cancelled_host_ops, 0);
     Ok(())
 }
 
@@ -254,10 +382,12 @@ fn layer_a_embedder_delivers_async_completion_on_its_own_thread() {
         )
         .expect("script starts async work");
 
-    let job = completions
+    let (admission, job, outcome) = completions
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("executor posts the completion to the embedder queue");
+    assert_eq!(outcome, HostCompletionOutcome::Completed);
     runtime.run_host_completion(job);
+    drop(admission);
 
     assert_eq!(capture.snapshot(), vec!["browser+1".to_string()]);
 }

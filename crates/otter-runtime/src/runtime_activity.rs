@@ -48,14 +48,11 @@ pub(crate) trait RuntimeActivityAccounting: Send + Sync + 'static {
 pub trait RuntimeTask: Send + 'static {
     /// Execute this task during a runtime event-loop turn.
     fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError>;
-}
 
-/// Why an offered task was not taken.
-pub(crate) enum TaskNotTaken {
-    /// The isolate inbox has no room; the task comes back to be offered again.
-    Full(Box<dyn RuntimeTask>),
-    /// The isolate is gone and will never run the task.
-    Gone,
+    /// Release isolate-local state if process exit suppresses this task.
+    /// Ordinary owned-data tasks need no cleanup; tasks carrying persistent
+    /// roots override this hook.
+    fn cancel(self: Box<Self>, _runtime: &mut Runtime) {}
 }
 
 pub(crate) trait RuntimeTaskQueue: Send + Sync + 'static {
@@ -65,21 +62,38 @@ pub(crate) trait RuntimeTaskQueue: Send + Sync + 'static {
         liveness: RuntimeLiveness,
     ) -> Result<(), OtterError>;
 
-    /// Offer one task, handing it back when the inbox is full.
+    /// Wait for bounded inbox capacity and enqueue one owned task.
     ///
-    /// A producer that may neither drop nor reorder its events waits for room
-    /// and offers the same task again, keeping ownership of whatever the task
-    /// carries in the meantime.
-    fn offer_boxed(
+    /// The future retains the only copy of the task until the inbox accepts it
+    /// or closes. Implementations must use a capacity wake, never timer-based
+    /// retry polling.
+    fn enqueue_boxed_ordered(
         &self,
         task: Box<dyn RuntimeTask>,
         liveness: RuntimeLiveness,
-    ) -> Result<(), TaskNotTaken>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>;
 
-    /// Enqueue engine-owned completion work without dropping it under
-    /// backpressure. Implementations must retry asynchronously or cancel it
-    /// during shutdown; they must not block the caller.
-    fn enqueue_boxed_guaranteed(&self, task: Box<dyn RuntimeTask>, liveness: RuntimeLiveness);
+    /// Reserve physically bounded terminal-completion capacity before an
+    /// async native creates its Promise or starts its future.
+    fn admit_boxed_guaranteed(
+        &self,
+        liveness: RuntimeLiveness,
+    ) -> Result<otter_vm::host_completion::HostCompletionAdmission, OtterError>;
+
+    /// Move the unique pre-effect admission into the shared wake-driven FIFO.
+    fn enqueue_boxed_guaranteed(
+        &self,
+        admission: otter_vm::host_completion::HostCompletionAdmission,
+        task: Box<dyn RuntimeTask>,
+        outcome: otter_vm::host_completion::HostCompletionOutcome,
+    ) -> Result<(), OtterError>;
+
+    /// Consume a completion that finished synchronously on the isolate.
+    fn finish_boxed_guaranteed(
+        &self,
+        admission: otter_vm::host_completion::HostCompletionAdmission,
+        outcome: otter_vm::host_completion::HostCompletionOutcome,
+    ) -> Result<(), OtterError>;
 }
 
 /// Cloneable sender for scheduling typed tasks onto the runtime event loop.
@@ -128,53 +142,39 @@ impl RuntimeTaskSpawner {
     /// Deliver one task without dropping or reordering it.
     ///
     /// The isolate inbox is bounded; a burst of I/O completions can outrun
-    /// the dispatch loop. Backpressure is retried in place — the calling
-    /// producer task does not advance to its next event until this one is
-    /// accepted — so per-producer ordering survives. Answers `false` when
-    /// the isolate is shutting down and the producer should stop.
-    pub async fn enqueue_ordered(
-        &self,
-        task: impl RuntimeTask + Clone,
-        liveness: RuntimeLiveness,
-    ) -> bool {
-        loop {
-            match self.enqueue(task.clone(), liveness) {
-                Ok(()) => return true,
-                Err(err) if err.is_backpressure() => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                Err(_) => return false,
-            }
-        }
-    }
-
-    /// Deliver one task without dropping or reordering it, whatever it holds.
-    ///
-    /// [`Self::enqueue_ordered`] retries by cloning, which a task carrying
-    /// descriptors cannot do — a clone would duplicate ownership of them. This
-    /// one keeps the single task and offers it again once there is room.
-    /// Answers `false` when the isolate is gone and the producer should stop.
-    pub(crate) async fn enqueue_ordered_owned(
-        &self,
-        task: impl RuntimeTask,
-        liveness: RuntimeLiveness,
-    ) -> bool {
-        let mut task: Box<dyn RuntimeTask> = Box::new(task);
-        loop {
-            match self.queue.offer_boxed(task, liveness) {
-                Ok(()) => return true,
-                Err(TaskNotTaken::Gone) => return false,
-                Err(TaskNotTaken::Full(returned)) => {
-                    task = returned;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            }
-        }
-    }
-
-    pub(crate) fn enqueue_guaranteed(&self, task: impl RuntimeTask, liveness: RuntimeLiveness) {
+    /// the dispatch loop. The calling producer awaits one wake-driven capacity
+    /// reservation and does not advance to its next event until this one is
+    /// accepted, so per-producer ordering survives. Answers `false` when the
+    /// isolate is shutting down and the producer should stop.
+    pub async fn enqueue_ordered(&self, task: impl RuntimeTask, liveness: RuntimeLiveness) -> bool {
         self.queue
-            .enqueue_boxed_guaranteed(Box::new(task), liveness);
+            .enqueue_boxed_ordered(Box::new(task), liveness)
+            .await
+    }
+
+    fn admit_guaranteed(
+        &self,
+        liveness: RuntimeLiveness,
+    ) -> Result<otter_vm::host_completion::HostCompletionAdmission, OtterError> {
+        self.queue.admit_boxed_guaranteed(liveness)
+    }
+
+    fn enqueue_guaranteed(
+        &self,
+        admission: otter_vm::host_completion::HostCompletionAdmission,
+        task: impl RuntimeTask,
+        outcome: otter_vm::host_completion::HostCompletionOutcome,
+    ) -> Result<(), OtterError> {
+        self.queue
+            .enqueue_boxed_guaranteed(admission, Box::new(task), outcome)
+    }
+
+    fn finish_guaranteed(
+        &self,
+        admission: otter_vm::host_completion::HostCompletionAdmission,
+        outcome: otter_vm::host_completion::HostCompletionOutcome,
+    ) -> Result<(), OtterError> {
+        self.queue.finish_boxed_guaranteed(admission, outcome)
     }
 
     /// Retain one long-lived host resource in the runtime liveness counters.
@@ -315,6 +315,10 @@ impl RuntimeTask for HostCompletionTask {
         runtime.run_host_completion(self.job);
         Ok(())
     }
+
+    fn cancel(self: Box<Self>, runtime: &mut crate::Runtime) {
+        runtime.cancel_host_completion(self.job);
+    }
 }
 
 impl otter_vm::host_completion::HostCompletionSink for SpawnerCompletionSink {
@@ -328,15 +332,31 @@ impl otter_vm::host_completion::HostCompletionSink for SpawnerCompletionSink {
         // loop-less embeddings.
     }
 
-    fn complete(&self, job: otter_vm::host_completion::HostCompletionJob) {
+    fn complete(
+        &self,
+        admission: otter_vm::host_completion::HostCompletionAdmission,
+        job: otter_vm::host_completion::HostCompletionJob,
+        outcome: otter_vm::host_completion::HostCompletionOutcome,
+    ) -> Result<(), String> {
         self.spawner
-            .enqueue_guaranteed(HostCompletionTask { job }, RuntimeLiveness::Ref);
+            .enqueue_guaranteed(admission, HostCompletionTask { job }, outcome)
+            .map_err(|error| error.to_string())
     }
 
-    fn keep_alive(&self) -> otter_vm::host_completion::HostKeepAlive {
-        otter_vm::host_completion::HostKeepAlive::new(Box::new(
-            self.spawner.retain_keep_alive(RuntimeLiveness::Ref),
-        ))
+    fn finish_inline(
+        &self,
+        admission: otter_vm::host_completion::HostCompletionAdmission,
+        outcome: otter_vm::host_completion::HostCompletionOutcome,
+    ) -> Result<(), String> {
+        self.spawner
+            .finish_guaranteed(admission, outcome)
+            .map_err(|error| error.to_string())
+    }
+
+    fn admit(&self) -> Result<otter_vm::host_completion::HostCompletionAdmission, String> {
+        self.spawner
+            .admit_guaranteed(RuntimeLiveness::Ref)
+            .map_err(|error| error.to_string())
     }
 
     fn with_executor_context(&self, f: &mut dyn FnMut()) {

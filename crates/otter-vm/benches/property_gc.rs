@@ -89,6 +89,7 @@ fn new_object_named_store_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn new_object_two_named_stores_loop(iterations: i32) -> ExecutionContext {
@@ -164,6 +165,7 @@ fn new_object_two_named_stores_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn inherited_writable_data_store_loop(iterations: i32) -> ExecutionContext {
@@ -245,6 +247,7 @@ fn inherited_writable_data_store_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
@@ -356,6 +359,7 @@ fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn direct_prototype_missing_store_loop(iterations: i32) -> ExecutionContext {
@@ -426,6 +430,7 @@ fn direct_prototype_missing_store_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
@@ -490,6 +495,7 @@ fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn run_gc_measured_iters(context: &ExecutionContext, iters: u64) -> std::time::Duration {

@@ -10,7 +10,7 @@
 //! - Direct thread-pinned and sendable isolate/runtime entry points.
 //! - Opaque realm lifecycle and realm-targeted script/module execution types.
 //! - Shared Tokio host, owned task delivery, capabilities, hooks, diagnostics,
-//!   and canonical in-memory module loading.
+//!   resource accounting, snapshots, and canonical in-memory module loading.
 //!
 //! # Invariants
 //! - Every type crossing a runtime thread boundary is owned and `Send`.
@@ -25,15 +25,18 @@
 
 pub use crate::module_loader::{
     ModuleLoadCancellation, RemoteModuleError, RemoteModuleFuture, RemoteModuleProvider,
-    RemoteModuleRequest, RemoteModuleSource,
+    RemoteModuleRequest, RemoteModuleResponse,
 };
 pub use crate::{
     CapabilityRequest, CapabilitySet, ConfigError, ConsoleLevel, ConsoleSink, ConsoleSinkHandle,
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, ExecutionAttempt,
     ExecutionResult, HostAtomInterner, InterruptHandle, IoErrorKind, Otter, OtterBuilder,
-    OtterError, Permission, RealmError, Runtime, RuntimeActivityStats, RuntimeBuilder,
-    RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook, RuntimeDiagnosticHook,
-    RuntimeGlobalInstaller, RuntimeGlobalValue, RuntimeHandle, RuntimeHooks, RuntimeHostAtom,
-    RuntimeHostAtomId, RuntimeJobHook, RuntimeLoadHook, RuntimeRealmContext, RuntimeRealmId,
-    RuntimeResolveHook, RuntimeTask, RuntimeTaskSpawner, SourceInput, StackFrame, TokioRuntimeHost,
+    OtterError, Permission, RealmError, ResourceAccount, ResourceClass, ResourceError,
+    ResourceLease, ResourceLimits, ResourceLimitsBuilder, ResourceReservation, ResourceSnapshot,
+    ResourceSnapshotEntry, Runtime, RuntimeActivityStats, RuntimeBuilder, RuntimeCapability,
+    RuntimeCapabilityHook, RuntimeCompileHook, RuntimeDiagnosticHook, RuntimeGlobalInstaller,
+    RuntimeGlobalValue, RuntimeHandle, RuntimeHooks, RuntimeHostAtom, RuntimeHostAtomId,
+    RuntimeJobHook, RuntimeLoadHook, RuntimeRealmContext, RuntimeRealmId, RuntimeResolveHook,
+    RuntimeSnapshot, RuntimeSnapshotDiagnostics, RuntimeTask, RuntimeTaskSpawner,
+    SnapshotRuntimeOptions, SourceInput, StackFrame, TokioRuntimeHost,
 };

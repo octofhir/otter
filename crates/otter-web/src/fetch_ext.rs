@@ -24,10 +24,12 @@
 use std::sync::Arc;
 
 use otter_runtime::marshal::{IntoJs, JsError, MarshalCx};
-use otter_runtime::web_fetch_host::{FetchRequest, FetchResponseHead, ResponseBody, prepare_fetch};
+use otter_runtime::web_fetch_host::{
+    FetchRequest, FetchResponseHead, FetchTransport, ResponseBody, prepare_fetch,
+};
 use otter_runtime::{
-    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value,
+    RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeValue as Value,
 };
 
 /// One streamed body chunk: `Some` bytes become a `Uint8Array`, end-of-stream
@@ -79,14 +81,15 @@ impl IntoJs for StreamingHead {
                 "fetch.pull",
                 Default::default(),
                 move |ctx, _args, _captures| {
-                    let body = body.clone();
                     ctx.scope(|scope| {
                         let mut cx = MarshalCx::new(scope);
-                        let future = async move {
-                            body.pull().await.map(ChunkResult).map_err(JsError::Type)
-                        };
                         let promise = cx
-                            .promise_from_future(future)
+                            .promise_from_future(|| {
+                                let body = body.clone();
+                                async move {
+                                    body.pull().await.map(ChunkResult).map_err(JsError::Type)
+                                }
+                            })
                             .map_err(|err| err.into_native("fetch"))?;
                         Ok(cx.escape(promise))
                     })
@@ -108,11 +111,9 @@ impl IntoJs for StreamingHead {
 pub fn native_fetch(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
-    caps: &CapabilitySet,
+    transport: &FetchTransport,
 ) -> Result<Value, NativeError> {
     let arg = |index: usize| args.get(index).copied().unwrap_or_else(Value::undefined);
-    let net = caps.net.clone();
-    let user_agent = format!("Otter/{}", env!("CARGO_PKG_VERSION"));
 
     ctx.scope(|scope| {
         let mut cx = MarshalCx::new(scope);
@@ -149,18 +150,20 @@ pub fn native_fetch(
             body,
             redirect,
         };
-        let (abort, transport) = prepare_fetch(request, user_agent, net);
-        let future = async move {
-            transport
-                .await
-                .map(|(head, body)| StreamingHead {
-                    head,
-                    body: Arc::new(body),
-                })
-                .map_err(JsError::Type)
-        };
-        let promise = cx
-            .promise_from_future(future)
+        let (promise, abort) = cx
+            .promise_from_future_with(|| {
+                let (abort, transport) = prepare_fetch(request, transport.clone());
+                let future = async move {
+                    transport
+                        .await
+                        .map(|(head, body)| StreamingHead {
+                            head,
+                            body: Arc::new(body),
+                        })
+                        .map_err(JsError::Type)
+                };
+                (abort, future)
+            })
             .map_err(|err| err.into_native("fetch"))?;
 
         // `abort()` cancels the in-flight request; idempotent, so the shim can

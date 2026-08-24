@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use otter_runtime::{Runtime, SourceInput, TimerFireOutcome, TimerScheduler};
+use otter_runtime::{Runtime, SourceInput, TimerAdmission, TimerFireOutcome, TimerScheduler};
 
 /// Records what the VM asked for instead of owning a real clock. A GUI
 /// embedder would arm a timer wheel here and call `fire_timer` from its
@@ -31,7 +31,17 @@ impl RecordingScheduler {
 }
 
 impl TimerScheduler for RecordingScheduler {
-    fn schedule(&self, delay_ms: u64, repeat_ms: Option<u64>) -> u64 {
+    fn admit(&self, _repeat: bool) -> Result<TimerAdmission, String> {
+        Ok(TimerAdmission::new(Box::new(())))
+    }
+
+    fn schedule(
+        &self,
+        admission: TimerAdmission,
+        delay_ms: u64,
+        repeat_ms: Option<u64>,
+    ) -> Result<u64, String> {
+        drop(admission);
         let mut next = self.next_token.lock().expect("next_token");
         *next += 1;
         let token = *next;
@@ -39,7 +49,7 @@ impl TimerScheduler for RecordingScheduler {
             .lock()
             .expect("scheduled")
             .push((token, delay_ms, repeat_ms));
-        token
+        Ok(token)
     }
 
     fn cancel(&self, token: u64) -> bool {
@@ -253,4 +263,31 @@ fn disposing_a_realm_cancels_every_timer_owned_by_that_realm() {
             TimerFireOutcome::Missing
         );
     }
+}
+
+#[test]
+fn bulk_timer_teardown_detaches_callbacks_and_cancels_host_deadlines() {
+    let scheduler = Arc::new(RecordingScheduler::default());
+    let mut runtime = runtime_with(&scheduler);
+
+    eval(
+        &mut runtime,
+        "setTimeout(() => { globalThis.mustNotRun = true; }, 60000);\
+         setInterval(() => { globalThis.mustNotRun = true; }, 60000);",
+    );
+    let mut tokens = scheduler.tokens();
+    assert_eq!(runtime.cancel_all_timers(), 2);
+    assert!(!runtime.has_pending_timer_callbacks());
+
+    let mut cancelled = scheduler.cancelled.lock().expect("cancelled").clone();
+    tokens.sort_unstable();
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, tokens);
+    for token in tokens {
+        assert_eq!(
+            runtime.fire_timer(token).expect("late fire is harmless"),
+            TimerFireOutcome::Missing
+        );
+    }
+    assert_eq!(eval(&mut runtime, "globalThis.mustNotRun"), "undefined");
 }

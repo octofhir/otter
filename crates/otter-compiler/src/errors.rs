@@ -44,6 +44,22 @@ pub enum CompileError {
         /// Source span of the offending node.
         span: (u32, u32),
     },
+    /// Compiler-owned runtime metadata exceeded its hard materialization
+    /// budget. The bytecode itself may be valid, but duplicating its
+    /// diagnostics payload would exceed the bounded compiler/runtime DTO.
+    #[error("compiled metadata requires {requested_bytes} bytes, limit is {limit_bytes} bytes")]
+    MetadataLimit {
+        /// Complete checked materialization size required by the metadata.
+        requested_bytes: usize,
+        /// Hard metadata materialization budget.
+        limit_bytes: usize,
+    },
+    /// A fallible metadata allocation failed below the hard budget.
+    #[error("failed to reserve {requested_bytes} bytes for compiled metadata")]
+    MetadataAllocation {
+        /// Complete checked materialization size being reserved.
+        requested_bytes: usize,
+    },
 }
 
 impl From<SyntaxError> for CompileError {

@@ -124,10 +124,10 @@ impl NativeFunctionMetadata {
 /// dispatch.
 pub type NativeFastFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
 
-/// Plain function pointer for a static native that reads traced
-/// captures. Same dump-safe identity as [`NativeFastFn`] — the entry
-/// address goes through the external-reference table — with the
-/// capture-slab slice the dynamic ABI passes.
+/// Plain function pointer for a static native that reads traced captures.
+/// Same process-local snapshot identity as [`NativeFastFn`] — the entry has a
+/// dense external-reference id — with the capture-slab slice the dynamic ABI
+/// passes.
 pub type NativeCapturesFn =
     for<'rt> fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
 
@@ -180,10 +180,10 @@ enum NativeCallStorage {
 /// A dynamic closure's `Arc` never sits in the body: the body names it
 /// by index into the isolate's [`otter_gc::host_refs::HostRefTable`],
 /// which owns the payload, and the sweep releases the slot when the
-/// body dies (see the `ReleaseHostRefs` impl below). That leaves the
-/// body free of anything `Drop` — a page image carries it whole. The
-/// static function pointer stays: it is rebuilt from `native_ref`
-/// through the external-ref table at restore.
+/// body dies (see the `ReleaseHostRefs` impl below). That leaves the body free
+/// of anything `Drop` — an opaque page image carries it whole. Static function
+/// pointers remain valid because restore is strictly in-process; `native_ref`
+/// rebuilds the parallel guard table at the same dense index.
 #[derive(Clone, Copy)]
 enum NativeCallSlot {
     Static(NativeFastFn),
@@ -226,15 +226,14 @@ pub struct NativeFunctionBody {
     /// [`otter_gc::NO_EXTERNAL_REF`] means the callable is not backed by
     /// [`NativeCallStorage::Static`]. Static builtins store their index in
     /// the isolate's [`otter_gc::ExternalRefTable`], so generated code can
-    /// validate prototype method slots without decoding the Rust enum —
-    /// and so the body holds no raw entry address, which differs per
-    /// build and per process and could not survive a page dump.
+    /// validate prototype method slots without decoding the Rust enum. Opaque
+    /// snapshot restore is same-process, so the call slot's static entry point
+    /// remains valid without serializing or translating it.
     #[pelt(skip)]
     native_ref: u32,
     /// Display name (used in stack traces and `Function.prototype.
     /// toString` once that lands). A heap-owned string, not a
-    /// `&'static str`: rodata addresses differ per build and per
-    /// process, so a dumped page could not carry one.
+    /// `&'static str`, so ownership and tracing remain explicit.
     name: JsString,
     /// ECMAScript `.length` metadata.
     #[pelt(skip)]
@@ -282,31 +281,6 @@ pub(crate) const NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET: usize =
 const _: () = assert!(NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET == 0);
 
 impl NativeFunctionBody {
-    /// Rewrite the entry-point address by the loader's image slide.
-    /// A page restore in another process copies the captured function
-    /// pointer verbatim; the whole binary image moved as one unit, so
-    /// adding the slide yields this process's address for the same
-    /// function. Dynamic variants hold host-ref indices, not
-    /// addresses, and stay untouched.
-    pub(crate) fn slide_entry_points(&mut self, slide: isize) {
-        match &mut self.call {
-            NativeCallSlot::Static(f) => {
-                let addr = (*f as usize).wrapping_add_signed(slide);
-                // SAFETY: `addr` is the captured entry point of this
-                // exact function in the current process image.
-                *f = unsafe { std::mem::transmute::<usize, NativeFastFn>(addr) };
-            }
-            NativeCallSlot::StaticWithCaptures(f) => {
-                let addr = (*f as usize).wrapping_add_signed(slide);
-                // SAFETY: as above, for the captures ABI.
-                *f = unsafe { std::mem::transmute::<usize, NativeCapturesFn>(addr) };
-            }
-            NativeCallSlot::VmIntrinsic(_)
-            | NativeCallSlot::Dynamic(_)
-            | NativeCallSlot::LocalDynamic(_) => {}
-        }
-    }
-
     /// Describe this body's non-GC payload for
     /// [`crate::native_census`]. Lives here because the storage enum
     /// and the raw entry address are module-private; the census
@@ -339,45 +313,17 @@ impl NativeFunctionBody {
 /// Clone every dynamic-native closure entry of `source`'s host-ref
 /// table into `target`, at identical indices.
 ///
-/// In-process restore only: the restored bodies carry the capture
+/// The restored bodies carry the capture
 /// isolate's `u32` indices, and the two payload types this table holds
-/// are both `Arc`s that clone by reference count. A cross-process
-/// restore replaces this wholesale with the re-install-by-name list.
-pub fn clone_host_refs_for_restore(source: &otter_gc::GcHeap, target: &mut otter_gc::GcHeap) {
+/// are both `Arc`s that clone by reference count.
+#[cfg(test)]
+pub(crate) fn clone_host_refs_for_restore(
+    source: &otter_gc::GcHeap,
+    target: &mut otter_gc::GcHeap,
+) {
     for (index, payload) in snapshot_dynamic_natives(source) {
         install_dynamic_native(target, index, &payload);
     }
-}
-
-/// Display names of every dynamic-native body, keyed by host-ref
-/// index — the serializable half of the closure list. A blob restore
-/// re-creates each payload by name through the host's resolver.
-pub fn dynamic_native_names(heap: &otter_gc::GcHeap) -> Vec<(u32, String)> {
-    let mut out: Vec<(u32, String)> = Vec::new();
-    heap.for_each_live_payload::<NativeFunctionBody, _>(|_space, body| {
-        if let NativeCallSlot::Dynamic(index) | NativeCallSlot::LocalDynamic(index) = body.call {
-            out.push((index, body.name.to_lossy_string(heap)));
-        }
-    });
-    out.sort_by_key(|entry| entry.0);
-    out.dedup_by(|a, b| a.0 == b.0);
-    out
-}
-
-/// Dynamic-native payloads keyed by display name — the in-process
-/// resolver for a blob decode: the same process that captured the
-/// closures can hand them back by name, Arc-cloned.
-pub fn dynamic_natives_by_name(
-    heap: &otter_gc::GcHeap,
-) -> Vec<(String, crate::snapshot::DynamicNativePayload)> {
-    let names = dynamic_native_names(heap);
-    let payloads = snapshot_dynamic_natives(heap);
-    let by_index: std::collections::HashMap<u32, crate::snapshot::DynamicNativePayload> =
-        payloads.into_iter().collect();
-    names
-        .into_iter()
-        .filter_map(|(index, name)| Some((name, by_index.get(&index)?.clone())))
-        .collect()
 }
 
 /// Collect the dynamic-native closures of `heap`'s host-ref table for
@@ -463,10 +409,21 @@ impl NativeFunction {
         metadata: NativeFunctionMetadata,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        // The display name becomes a heap string first: nothing local
-        // is live yet, so only the caller's roots need to survive the
-        // allocation.
-        let name_string = JsString::from_str_with_roots(name, heap, external_visit)?;
+        // The display name is allocated before the capture slab exists. Trace
+        // the exact mutable vector that will later move into that slab during
+        // this first allocation; tracing a clone would rewrite only the clone
+        // and leave the published vector holding stale young-generation
+        // handles after a moving collection.
+        let mut captures = captures;
+        let name_string = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external_visit(visitor);
+                for value in &captures {
+                    value.trace_value_slots(visitor);
+                }
+            };
+            JsString::from_str_with_roots(name, heap, &mut visit)?
+        };
         let name_root = Value::string(name_string);
         // Interning before the body is built keeps this the one place a
         // static native's entry address enters the isolate: every
@@ -494,7 +451,6 @@ impl NativeFunction {
                 NativeCallSlot::LocalDynamic(heap.intern_host_ref(Box::new(arc)))
             }
         };
-        let mut captures = captures;
         let own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
@@ -527,6 +483,18 @@ impl NativeFunction {
             own_properties_root.trace_value_slots(visitor);
             visitor(captures_slot.cast::<RawGc>());
         };
+        // The object and capture-slab allocations above may have moved both
+        // roots. Rebuild the typed wrappers from the rewritten root slots
+        // before constructing the pending body. Reusing the original locals
+        // here would publish stale from-space handles whenever one of those
+        // intermediate allocations collected without the final body
+        // allocation collecting again.
+        let name_string = name_root
+            .as_string(heap)
+            .expect("native display-name root remains a string");
+        let own_properties = own_properties_root
+            .as_object()
+            .expect("native own-properties root remains an object");
         Ok(Self {
             inner: heap.alloc_with_roots(
                 NativeFunctionBody {
@@ -789,8 +757,8 @@ impl NativeFunction {
     }
 
     /// Build a static native function with explicit `.length` and
-    /// explicit traced JS captures. The entry point is a plain `fn`,
-    /// so the callable is dump-safe: the address rides the
+    /// explicit traced JS captures. The entry point is a plain `fn`, so the
+    /// callable needs no closure allocation: its identity rides the
     /// external-reference table and the captures ride the slab.
     pub fn with_length_and_captures(
         heap: &mut otter_gc::GcHeap,
@@ -813,8 +781,9 @@ impl NativeFunction {
 
     /// Build a genuinely dynamic native function from a Rust closure,
     /// with explicit `.length` and traced JS captures. Prefer the
-    /// `fn`-pointer constructors: a closure's `Arc` cannot ride a page
-    /// dump and must be re-installed by name on restore.
+    /// `fn`-pointer constructors when captured Rust state is unnecessary. A
+    /// closure's `Arc` lives in the host-ref table and is Arc-cloned at its
+    /// exact index by an in-process snapshot.
     fn with_length_and_closure<F>(
         heap: &mut otter_gc::GcHeap,
         name: &'static str,

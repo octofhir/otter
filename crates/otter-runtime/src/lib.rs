@@ -23,6 +23,10 @@
 //! - [`ExecutionResult`] — successful run output.
 //! - [`ExecutionAttempt`] — diagnostic-aware success/error envelope.
 //! - [`OtterError`], [`ConfigError`], [`IoErrorKind`] — error model.
+//! - [`ResourceAccount`], [`ResourceLimits`], [`ResourceSnapshot`] — shared
+//!   resource admission and diagnostics.
+//! - [`RuntimeSnapshot`] — in-process isolate image tied to its donor runtime
+//!   configuration and resource account.
 //! - [`InterruptHandle`] — cooperative cancellation.
 //! - [`embedding`] — preferred owned orchestration API.
 //!
@@ -54,14 +58,21 @@
 //!   is used by the active runtime path.
 //! - JIT diagnostics cross the async boundary as owned report data, including
 //!   partial reports from abrupt completion; they contain no VM/GC handles.
+//! - Every live runtime retains one atomic role-specific lease set from its
+//!   config's shared [`ResourceAccount`]. Direct runtimes charge an isolate;
+//!   handle and worker runtimes additionally charge their native stack, and
+//!   workers charge their worker slot. Construction reserves the complete set
+//!   before effects and every error path rolls it back.
 //!
 //! # See also
 //! - [Engine architecture](../../../docs/book/src/engine/architecture.md)
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+mod admission;
 mod commonjs;
+mod completion_admission;
 pub use commonjs::{SCHEME_ONLY_BUILTINS, require_commonjs_dependency, run_builtin_cjs_shim};
-pub mod compile_cache;
+mod compile_cache;
 pub mod compiled_program;
 pub mod data_modules;
 pub mod diagnostics;
@@ -83,10 +94,9 @@ mod process_events;
 mod process_execve;
 mod process_flags;
 mod process_ipc;
-pub mod promise_registry;
 mod realm;
 mod runtime_activity;
-pub mod snapshot_cache;
+mod runtime_snapshot;
 pub mod structured_clone;
 pub mod surface;
 pub mod web_fetch_host;
@@ -123,6 +133,9 @@ use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind
 use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag, NativeCallInfo};
 use serde::{Deserialize, Serialize};
 
+use admission::{AdmittedRuntimeConfig, RuntimeAdmissionKind};
+
+pub use admission::RUNTIME_THREAD_STACK_BYTES;
 pub use compiled_program::CompiledProgram;
 pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
 pub use error::{ConfigError, IoErrorKind, OtterError, RealmError};
@@ -132,15 +145,19 @@ pub use heap_config::{
     MANAGED_HEAP_PAGE_BYTES, configured_managed_heap_bytes, initialize_managed_heap,
 };
 pub use hooks::{
-    CapabilityRequest, RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook,
-    RuntimeCompileRequest, RuntimeDiagnosticHook, RuntimeHooks, RuntimeJobHook, RuntimeJobKind,
-    RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
+    CapabilityRequest, RuntimeCapability, RuntimeCapabilityEvaluator, RuntimeCapabilityHook,
+    RuntimeCompileHook, RuntimeCompileRequest, RuntimeDiagnosticHook, RuntimeHooks, RuntimeJobHook,
+    RuntimeJobKind, RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
     RuntimeResolveRequest, default_check_capability, default_compile_source,
 };
 pub use ipc::{CarriedHandles, IpcChannel, IpcEvent};
 pub use otter_compiler::{
-    CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
-    CompiledSourceSpan, LiveBindingSlot,
+    CompiledExport, CompiledFunctionSpans, CompiledImport, CompiledImportKind, CompiledModule,
+    CompiledModuleMetadata, LiveBindingSlot,
+};
+pub use otter_resource::{
+    ResourceAccount, ResourceClass, ResourceError, ResourceLease, ResourceLimits,
+    ResourceLimitsBuilder, ResourceReservation, ResourceSnapshot, ResourceSnapshotEntry,
 };
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
@@ -160,17 +177,19 @@ pub use otter_vm::{
 pub use otter_vm::{NativeCtx, NativeError, Value, marshal};
 pub use process::node_platform;
 pub use realm::{RuntimeExtensionContext, RuntimeGlobalValue, RuntimeRealmContext, RuntimeRealmId};
+pub use runtime_snapshot::{RuntimeSnapshot, RuntimeSnapshotDiagnostics, SnapshotRuntimeOptions};
 // Embedder-driven event loop. `Runtime::install_timer_scheduler`,
 // `install_host_completion_sink`, and `install_dynamic_import_loader`
 // are public, so the types naming their arguments must be reachable
 // without a direct `otter-vm` dependency.
-pub use otter_vm::host_completion::{HostCompletionJob, HostCompletionSink, HostKeepAlive};
+pub use otter_vm::host_completion::{
+    HostCompletionAdmission, HostCompletionJob, HostCompletionOutcome, HostCompletionSink,
+};
 pub use otter_vm::promise_rejection::{PromiseRejectionHook, PromiseRejectionHookHandle};
 pub use otter_vm::{
-    DynamicImportLoader, DynamicImportLoaderHandle, TimerEntry, TimerScheduler,
-    TimerSchedulerHandle,
+    DynamicImportAdmission, DynamicImportLoader, DynamicImportLoaderHandle, TimerAdmission,
+    TimerEntry, TimerScheduler, TimerSchedulerHandle,
 };
-pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
@@ -180,18 +199,18 @@ pub use structured_clone::{
 };
 pub use surface::{
     HostAtomInterner, RuntimeAccessorSpec, RuntimeAttr, RuntimeClassSpec, RuntimeConstSpec,
-    RuntimeConstValue, RuntimeConstructorSpec, RuntimeDynamicNativePayload, RuntimeHostAtom,
-    RuntimeHostAtomId, RuntimeHostDataTracer, RuntimeHostObjectData, RuntimeHostObjectError,
-    RuntimeHostValueSlot, RuntimeJsObject, RuntimeJsString, RuntimeLocal, RuntimeMethodSpec,
-    RuntimeNamespaceSpec, RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError,
-    RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNativeScope, RuntimeNumberValue,
-    RuntimeObjectLayout, RuntimePendingValue, RuntimePendingValues, RuntimePropertySpec,
-    RuntimeSurfaceError, RuntimeTracedHostObjectData, RuntimeValue, runtime_accessor,
-    runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements, runtime_class,
-    runtime_constant, runtime_constructor, runtime_getter, runtime_method,
-    runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
-    runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
-    runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeConstValue, RuntimeConstructorSpec, RuntimeHostAtom, RuntimeHostAtomId,
+    RuntimeHostDataTracer, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeHostValueSlot,
+    RuntimeJsObject, RuntimeJsString, RuntimeLocal, RuntimeMethodSpec, RuntimeNamespaceSpec,
+    RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn,
+    RuntimeNativeScope, RuntimeNumberValue, RuntimeObjectLayout, RuntimePendingValue,
+    RuntimePendingValues, RuntimePropertySpec, RuntimeSurfaceError, RuntimeTracedHostObjectData,
+    RuntimeValue, runtime_accessor, runtime_alloc_object, runtime_arg_to_string,
+    runtime_array_from_elements, runtime_class, runtime_constant, runtime_constructor,
+    runtime_getter, runtime_method, runtime_method_with_attrs, runtime_namespace,
+    runtime_native_dynamic, runtime_native_static, runtime_optional_arg_to_string,
+    runtime_property, runtime_set_property, runtime_string_value, runtime_this_object,
+    runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
 };
 pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
@@ -655,6 +674,8 @@ pub struct ExecutionResult {
     jit_debug_report: Option<Box<JitDebugReport>>,
     /// Owned, opt-in successful compile artifacts for this top-level run.
     jit_artifacts: Option<Box<JitArtifactBatch>>,
+    /// Owned, opt-in VM stack samples collected during this run.
+    cpu_profile: Option<Box<otter_vm::CpuProfile>>,
 }
 
 impl ExecutionResult {
@@ -673,6 +694,7 @@ impl ExecutionResult {
             stats: Box::default(),
             jit_debug_report: None,
             jit_artifacts: None,
+            cpu_profile: None,
         }
     }
 
@@ -687,6 +709,7 @@ impl ExecutionResult {
             stats: Box::default(),
             jit_debug_report: None,
             jit_artifacts: None,
+            cpu_profile: None,
         }
     }
 
@@ -703,6 +726,25 @@ impl ExecutionResult {
         };
         self.jit_debug_report = Some(report);
         self
+    }
+
+    fn with_cpu_profile(mut self, profile: otter_vm::CpuProfile) -> Self {
+        match self.cpu_profile.take() {
+            Some(mut existing) => {
+                existing.samples.extend(profile.samples);
+                existing.time_deltas_us.extend(profile.time_deltas_us);
+                self.cpu_profile = Some(existing);
+            }
+            None => self.cpu_profile = Some(Box::new(profile)),
+        }
+        self
+    }
+
+    /// Owned VM stack samples, when the run asked for a CPU profile through
+    /// [`RuntimeBuilder::cpu_profile_interval`].
+    #[must_use]
+    pub fn cpu_profile(&self) -> Option<&otter_vm::CpuProfile> {
+        self.cpu_profile.as_deref()
     }
 
     fn with_jit_artifacts(mut self, artifacts: JitArtifactBatch) -> Self {
@@ -1338,6 +1380,36 @@ impl Permission<String> {
             }
         }
     }
+
+    /// Test alternate spellings of one resource as a single permission
+    /// decision.
+    ///
+    /// Every deny pattern is checked against every spelling before any allow
+    /// pattern is accepted. This is required for resources such as network
+    /// endpoints, where `example.com` and `example.com:443` describe the same
+    /// connection and evaluating them as independent `matches` calls would
+    /// let one spelling bypass a deny on the other.
+    #[must_use]
+    pub fn matches_any(&self, values: &[&str]) -> bool {
+        match self {
+            Self::Deny => false,
+            Self::AllowAll => !values.is_empty(),
+            Self::Scoped {
+                allow_list,
+                deny_list,
+            } => {
+                if deny_list
+                    .iter()
+                    .any(|pattern| values.iter().any(|value| glob_match_string(pattern, value)))
+                {
+                    return false;
+                }
+                allow_list
+                    .iter()
+                    .any(|pattern| values.iter().any(|value| glob_match_string(pattern, value)))
+            }
+        }
+    }
 }
 
 impl Permission<PathBuf> {
@@ -1477,6 +1549,19 @@ mod permission_tests {
     fn deny_matches_nothing() {
         let perm = Permission::<String>::Deny;
         assert!(!perm.matches("anything"));
+    }
+
+    #[test]
+    fn alternate_resource_spellings_preserve_deny_wins() {
+        let bare_denied =
+            Permission::<String>::allow_except(["*".to_string()], ["127.0.0.1".to_string()]);
+        assert!(!bare_denied.matches_any(&["127.0.0.1", "127.0.0.1:8080"]));
+
+        let port_denied = Permission::<String>::allow_except(
+            ["example.test".to_string()],
+            ["example.test:443".to_string()],
+        );
+        assert!(!port_denied.matches_any(&["example.test", "example.test:443"]));
     }
 
     #[test]
@@ -1656,20 +1741,6 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
     })
 }
 
-/// The per-isolate knobs [`Runtime::from_isolate_snapshot_with`]
-/// honors; everything else about the realm rides the image.
-#[derive(Debug, Clone, Default)]
-pub struct SnapshotRuntimeOptions {
-    /// Per-run wall-clock timeout; `Duration::ZERO` disables it.
-    pub timeout: Duration,
-    /// Heap cap in bytes; `0` disables the cap.
-    pub max_heap_bytes: u64,
-    /// Whether `Atomics.wait` may block this isolate's thread.
-    pub allow_blocking_atomics_wait: bool,
-    /// JIT tier selection.
-    pub jit_selection: JitSelection,
-}
-
 /// Runtime configuration.
 /// Warning-channel switches carried from the CLI (`--no-warnings`,
 /// `--no-deprecation`, `--trace-warnings`, `--throw-deprecation`,
@@ -1692,6 +1763,10 @@ pub struct WarningOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
+    /// Shared ledger inherited by config clones and child isolates.
+    pub(crate) resource_account: ResourceAccount,
+    /// Finite per-isolate credits for terminal work and its live origins.
+    pub(crate) completion_capacities: completion_admission::CompletionCapacities,
     max_heap_bytes: u64,
     timeout: Duration,
     max_stack_depth: u32,
@@ -1722,52 +1797,12 @@ pub(crate) struct RuntimeConfig {
     process_title: Option<String>,
     expose_gc: bool,
     tracer_factory: Option<TracerFactory>,
+    /// Dispatch-tick interval for VM stack sampling; `None` leaves the
+    /// profiler uninstalled.
+    cpu_profile_interval: Option<u64>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
     jit_debug: JitDebugRequest,
-    /// Named factories re-creating dynamic-native closures on a
-    /// snapshot restore. Populated by extension builder methods.
-    dynamic_native_factories: DynamicNativeFactories,
-    /// Serve builds from the per-user snapshot cache and store fresh
-    /// builds back into it.
-    snapshot_cache: bool,
-    /// Cache directory override; `None` uses the per-user default.
-    snapshot_cache_root: Option<PathBuf>,
-}
-
-/// What a [`DynamicNativeFactory`] sees at restore time.
-pub struct DynamicNativeReattachCtx<'a> {
-    /// The restoring runtime's capability set.
-    pub capabilities: &'a CapabilitySet,
-    /// Event-loop task spawner, when the host runs one.
-    pub task_spawner: Option<RuntimeTaskSpawner>,
-}
-
-/// Factory re-creating one named dynamic-native closure on restore.
-pub type DynamicNativeFactory = Arc<
-    dyn Fn(&DynamicNativeReattachCtx<'_>) -> otter_vm::snapshot::DynamicNativePayload + Send + Sync,
->;
-
-/// Name-keyed [`DynamicNativeFactory`] set carried by the config.
-#[derive(Clone, Default)]
-pub(crate) struct DynamicNativeFactories {
-    by_name: std::collections::HashMap<String, DynamicNativeFactory>,
-}
-
-impl std::fmt::Debug for DynamicNativeFactories {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DynamicNativeFactories({})", self.by_name.len())
-    }
-}
-
-impl DynamicNativeFactories {
-    fn insert(&mut self, name: String, factory: DynamicNativeFactory) {
-        self.by_name.insert(name, factory);
-    }
-
-    fn get(&self, name: &str) -> Option<&DynamicNativeFactory> {
-        self.by_name.get(name)
-    }
 }
 
 /// Which execution tiers a runtime installs at construction.
@@ -1905,17 +1940,17 @@ impl RuntimeModuleGraphState {
 
 /// Per-runtime source-map table.
 ///
-/// Built incrementally by [`Self::record_compiled_metadata`] every
-/// time the runtime compiles a module / script — each
-/// [`CompiledSourceSpan`] is keyed by `(module_url, function_id)`
+/// Replaced per source by [`Self::record_compiled_metadata`] every time the
+/// runtime compiles a module / script. Each [`CompiledFunctionSpans`] group is
+/// keyed by `(module_url, function_id)`
 /// because PC namespaces are per-function (two functions in the
 /// same source file both start at `pc = 0`).
 ///
 /// The PC vectors are kept sorted by ascending `pc` so
 /// [`Self::resolve_frame_span`] can binary-search for the
-/// predecessor entry matching a live frame's PC. The compiler
-/// already emits spans in PC order, so the push path keeps the
-/// invariant for free.
+/// predecessor entry matching a live frame's PC. Recompilation replaces the
+/// complete record for each affected URL; appending a second generation would
+/// both retain stale functions and break the sorted-PC invariant.
 ///
 /// # See also
 /// - [`otter_vm::snapshot_frames`] — the in-VM counterpart that
@@ -1927,17 +1962,32 @@ struct RuntimeSourceMapTable {
 
 impl RuntimeSourceMapTable {
     fn record_compiled_metadata(&self, metadata: &CompiledModuleMetadata) {
+        let mut replacements: BTreeMap<String, BTreeMap<u32, Vec<SpanEntry>>> = BTreeMap::new();
+        if !metadata.source_url.is_empty() {
+            // Even metadata with no spans is authoritative: recompiling an
+            // empty source must clear functions retained from its predecessor.
+            replacements.entry(metadata.source_url.clone()).or_default();
+        }
+        for function in &metadata.function_spans {
+            replacements
+                .entry(function.module_url.clone())
+                .or_default()
+                .entry(function.function_id)
+                .or_default()
+                .extend_from_slice(&function.spans);
+        }
+        for functions in replacements.values_mut() {
+            for spans in functions.values_mut() {
+                spans.sort_unstable_by_key(|entry| entry.pc);
+                // One PC has one current source range. Defensive replacement
+                // keeps malformed/duplicated metadata deterministic.
+                spans.dedup_by_key(|entry| entry.pc);
+            }
+        }
+
         let mut by_module_url = self.by_module_url.borrow_mut();
-        for span in &metadata.spans {
-            by_module_url
-                .entry(span.module_url.clone())
-                .or_default()
-                .entry(span.function_id)
-                .or_default()
-                .push(SpanEntry {
-                    pc: span.pc,
-                    span: span.span,
-                });
+        for (module_url, functions) in replacements {
+            by_module_url.insert(module_url, functions);
         }
     }
 
@@ -2012,6 +2062,12 @@ impl RuntimePackageManagerHandle {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            resource_account: ResourceAccount::default(),
+            completion_capacities: completion_admission::CompletionCapacities {
+                guaranteed: completion_admission::DEFAULT_GUARANTEED_COMPLETION_CAPACITY,
+                host_operations: completion_admission::DEFAULT_HOST_OPERATION_CAPACITY,
+                timers: completion_admission::DEFAULT_TIMER_CAPACITY,
+            },
             max_heap_bytes: DEFAULT_MAX_HEAP_BYTES,
             timeout: DEFAULT_TIMEOUT,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
@@ -2039,12 +2095,10 @@ impl Default for RuntimeConfig {
             expose_gc: false,
             process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
+            cpu_profile_interval: None,
             jit_selection: JitSelection::default(),
             jit_osr_threshold: None,
             jit_debug: JitDebugRequest::default(),
-            dynamic_native_factories: DynamicNativeFactories::default(),
-            snapshot_cache: false,
-            snapshot_cache_root: None,
         }
     }
 }
@@ -2058,38 +2112,8 @@ impl RuntimeConfig {
         self.runtime_host.clone()
     }
 
-    /// The cache this build reads and writes, honoring the root
-    /// override.
-    pub(crate) fn snapshot_cache_handle(&self) -> Option<snapshot_cache::SnapshotCache> {
-        match &self.snapshot_cache_root {
-            Some(root) => Some(snapshot_cache::SnapshotCache::new(root.clone())),
-            None => snapshot_cache::SnapshotCache::user_default(),
-        }
-    }
-
-    /// Everything about this build that shapes the bootstrap image and
-    /// is not per-run data — the snapshot cache key's discriminator.
-    /// Per-run values (argv, cwd, env, capabilities) are deliberately
-    /// absent: the restore path re-supplies them.
-    pub(crate) fn snapshot_surface_tag(&self) -> String {
-        use std::fmt::Write as _;
-        let mut tag = String::new();
-        for extension in &self.extensions {
-            let _ = write!(tag, "ext:{};", extension.name);
-        }
-        for hosted in &self.hosted_modules {
-            let _ = write!(tag, "mod:{};", hosted.specifier);
-        }
-        let _ = write!(
-            tag,
-            "classes:{};installers:{};commonjs:{};process:{};worker:{}",
-            self.global_classes.len(),
-            self.realm_installers.len(),
-            self.commonjs_enabled,
-            self.install_process_global,
-            self.install_worker_global,
-        );
-        tag
+    pub(crate) const fn completion_capacities(&self) -> completion_admission::CompletionCapacities {
+        self.completion_capacities
     }
 }
 
@@ -2097,13 +2121,6 @@ fn string_oom_to_error(err: otter_gc::OutOfMemory) -> OtterError {
     OtterError::OutOfMemory {
         requested_bytes: err.requested_bytes(),
         heap_limit_bytes: err.heap_limit_bytes(),
-    }
-}
-
-fn promise_settle_string_to_error(err: otter_vm::NativeError) -> OtterError {
-    OtterError::Internal {
-        code: DiagnosticCode::StringAlloc.as_str().to_string(),
-        message: err.to_string(),
     }
 }
 
@@ -2159,6 +2176,42 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    /// Replace the shared resource ledger with a fresh account using `limits`.
+    ///
+    /// Cloning this builder after the call shares the newly created account.
+    /// Runtime construction charges its complete role tuple against this
+    /// account before creating an interpreter, channel, or native thread.
+    #[must_use]
+    pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.config.resource_account = ResourceAccount::new(limits);
+        self
+    }
+
+    /// Use an existing account shared with sibling runtime builders.
+    #[must_use]
+    pub fn resource_account(mut self, account: ResourceAccount) -> Self {
+        self.config.resource_account = account;
+        self
+    }
+
+    /// Set the finite per-isolate capacities for guaranteed terminal work,
+    /// in-flight host operations, and live timers. A zero value intentionally
+    /// disables admission for that class (fail closed).
+    #[must_use]
+    pub fn completion_capacities(
+        mut self,
+        guaranteed: usize,
+        host_operations: usize,
+        timers: usize,
+    ) -> Self {
+        self.config.completion_capacities = completion_admission::CompletionCapacities {
+            guaranteed,
+            host_operations,
+            timers,
+        };
+        self
+    }
+
     /// Replace the capability set.
     #[must_use]
     pub fn capabilities(mut self, caps: CapabilitySet) -> Self {
@@ -2501,46 +2554,23 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sample the VM stack every `interval` bytecode dispatch ticks for the
+    /// whole run, so a program that only finishes when its event loop drains
+    /// — a server, say — still produces a profile. The samples reach the
+    /// caller on [`ExecutionResult::cpu_profile`]. `None` (the default)
+    /// leaves the profiler uninstalled.
+    #[must_use]
+    pub fn cpu_profile_interval(mut self, interval: Option<u64>) -> Self {
+        self.config.cpu_profile_interval = interval;
+        self
+    }
+
     /// Select which execution tiers the runtime installs. Differential
     /// harnesses build one runtime per [`JitSelection`] and compare
     /// observable behavior; production embedders keep the default.
     #[must_use]
     pub fn jit_selection(mut self, selection: JitSelection) -> Self {
         self.config.jit_selection = selection;
-        self
-    }
-
-    /// Register a factory that re-creates the named dynamic-native
-    /// closure when this build restores from a snapshot blob.
-    /// Extension builder methods call this for every closure they
-    /// install; a name the restore cannot resolve is a cache miss.
-    #[must_use]
-    pub fn dynamic_native_factory(
-        mut self,
-        name: impl Into<String>,
-        factory: DynamicNativeFactory,
-    ) -> Self {
-        self.config
-            .dynamic_native_factories
-            .insert(name.into(), factory);
-        self
-    }
-
-    /// Serve this build from the per-user snapshot cache: a hit
-    /// restores the bootstrap image instead of rebuilding it, a miss
-    /// bootstraps and stores the blob for the next launch.
-    #[must_use]
-    pub fn snapshot_cache(mut self, enabled: bool) -> Self {
-        self.config.snapshot_cache = enabled;
-        self
-    }
-
-    /// Root directory for the snapshot cache, overriding the per-user
-    /// default. Implies [`Self::snapshot_cache`]`(true)`.
-    #[must_use]
-    pub fn snapshot_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.config.snapshot_cache = true;
-        self.config.snapshot_cache_root = Some(root.into());
         self
     }
 
@@ -2578,19 +2608,29 @@ impl RuntimeBuilder {
         RuntimeHandle::spawn(self.config)
     }
 
+    /// Construct a sendable runtime whose admission includes a worker slot.
+    ///
+    /// Kept private to the worker surface so ordinary handles cannot
+    /// accidentally consume worker capacity and workers cannot bypass it.
+    pub(crate) fn build_worker_handle(self) -> Result<RuntimeHandle, OtterError> {
+        RuntimeHandle::spawn_worker(self.config)
+    }
+
     /// Construct a sendable runtime handle without blocking the async caller
     /// during isolate bootstrap.
     ///
-    /// Browser page creation should prefer this method. Validation, thread
-    /// startup and the interrupt-handle handshake run on the configured shared
-    /// Tokio host's blocking pool; UI/core async workers remain free to drive
+    /// Browser page creation should prefer this method. Validation and isolate
+    /// admission happen before any blocking task is scheduled; thread startup
+    /// and the interrupt-handle handshake then run on the configured shared
+    /// Tokio host's blocking pool. UI/core async workers remain free to drive
     /// input, rendering and I/O.
     ///
     /// # Errors
     /// Returns [`OtterError`] when no Tokio host/current runtime is available,
     /// configuration is invalid, or isolate startup fails.
     pub async fn build_handle_async(self) -> Result<RuntimeHandle, OtterError> {
-        let host_handle = match self.config.runtime_host() {
+        let admitted = Runtime::admit_config(self.config, RuntimeAdmissionKind::HandleThread)?;
+        let host_handle = match admitted.config.runtime_host() {
             Some(host) => host.handle(),
             None => {
                 tokio::runtime::Handle::try_current().map_err(|error| OtterError::Internal {
@@ -2600,7 +2640,7 @@ impl RuntimeBuilder {
             }
         };
         host_handle
-            .spawn_blocking(move || RuntimeHandle::spawn(self.config))
+            .spawn_blocking(move || RuntimeHandle::spawn_admitted(admitted))
             .await
             .map_err(|error| OtterError::Internal {
                 code: DiagnosticCode::IsolateStart.as_str().to_string(),
@@ -2618,6 +2658,28 @@ impl Runtime {
                 },
             });
         }
+        for (name, capacity) in [
+            (
+                "guaranteed completions",
+                config.completion_capacities.guaranteed,
+            ),
+            (
+                "host operations",
+                config.completion_capacities.host_operations,
+            ),
+            ("timers", config.completion_capacities.timers),
+        ] {
+            if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(OtterError::Config {
+                    reason: ConfigError::InvalidCompletionCapacity {
+                        message: format!(
+                            "{name} capacity {capacity} exceeds the maximum {}",
+                            tokio::sync::Semaphore::MAX_PERMITS
+                        ),
+                    },
+                });
+            }
+        }
         // Hosted-module lookups take the first specifier match, so a
         // duplicate registration would silently shadow the later installer.
         // Surface the conflict at build time instead.
@@ -2634,7 +2696,17 @@ impl Runtime {
     }
 
     pub(crate) fn from_config(config: RuntimeConfig) -> Result<Self, OtterError> {
-        Self::from_config_with_task_spawner(config, None)
+        let admitted = Self::admit_config(config, RuntimeAdmissionKind::Direct)?;
+        Self::from_config_with_task_spawner(admitted, None)
+    }
+
+    /// Validate `config`, then atomically reserve the complete role tuple
+    /// before interpreter, event-loop, channel, or thread construction.
+    pub(crate) fn admit_config(
+        config: RuntimeConfig,
+        kind: RuntimeAdmissionKind,
+    ) -> Result<AdmittedRuntimeConfig, OtterError> {
+        AdmittedRuntimeConfig::admit(config, kind)
     }
 
     /// Assemble a runtime around an isolate restored from `snapshot`,
@@ -2647,52 +2719,40 @@ impl Runtime {
     ///
     /// # Errors
     /// Propagates config validation and image-restore failures.
-    pub fn from_isolate_snapshot(
-        snapshot: &otter_vm::snapshot::IsolateSnapshot,
-    ) -> Result<Self, OtterError> {
+    pub fn from_isolate_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, OtterError> {
         Self::from_isolate_snapshot_with(snapshot, SnapshotRuntimeOptions::default())
     }
 
-    /// Restore from a serialized snapshot blob. `resolve` supplies
-    /// each dynamic-native closure by its captured display name.
-    ///
-    /// # Errors
-    /// A blob this binary did not write (or a name the resolver cannot
-    /// supply) surfaces as [`OtterError::Internal`]; callers treat it
-    /// as a cache miss and bootstrap instead.
-    pub fn from_snapshot_blob_with(
-        bytes: &[u8],
-        options: SnapshotRuntimeOptions,
-        resolve: &mut dyn FnMut(&str) -> Option<otter_vm::snapshot::DynamicNativePayload>,
-    ) -> Result<Self, OtterError> {
-        let snapshot =
-            otter_vm::snapshot::IsolateSnapshot::from_bytes(bytes, resolve).ok_or_else(|| {
-                OtterError::Internal {
-                    code: DiagnosticCode::IsolateStart.as_str().to_string(),
-                    message: "snapshot blob decode failed".to_string(),
-                }
-            })?;
-        Self::from_isolate_snapshot_with(&snapshot, options)
-    }
-
     /// [`Self::from_isolate_snapshot`] with the per-isolate knobs a
-    /// host actually varies per run — everything else about the realm
-    /// is already inside the image.
+    /// host actually varies per run. Everything else comes from the snapshot's
+    /// donor configuration so captured native closures and runtime policy keep
+    /// one authority. The snapshot donor account is mandatory.
     ///
     /// # Errors
     /// Propagates config validation and image-restore failures.
     pub fn from_isolate_snapshot_with(
-        snapshot: &otter_vm::snapshot::IsolateSnapshot,
+        snapshot: &RuntimeSnapshot,
         options: SnapshotRuntimeOptions,
     ) -> Result<Self, OtterError> {
-        let config = RuntimeConfig {
-            timeout: options.timeout,
-            max_heap_bytes: options.max_heap_bytes,
-            allow_blocking_atomics_wait: options.allow_blocking_atomics_wait,
-            jit_selection: options.jit_selection,
-            ..RuntimeConfig::default()
-        };
-        Self::assemble_restored(snapshot, config, None)
+        let config = Self::snapshot_runtime_config(options, snapshot.donor_config.clone());
+        let AdmittedRuntimeConfig {
+            config,
+            resource_leases,
+            kind,
+        } = Self::admit_config(config, RuntimeAdmissionKind::Direct)?;
+        let runtime = Self::assemble_restored(&snapshot.isolate, config, None)?;
+        Ok(runtime.with_admission(resource_leases, kind))
+    }
+
+    fn snapshot_runtime_config(
+        options: SnapshotRuntimeOptions,
+        mut donor_config: RuntimeConfig,
+    ) -> RuntimeConfig {
+        donor_config.timeout = options.timeout;
+        donor_config.max_heap_bytes = options.max_heap_bytes;
+        donor_config.allow_blocking_atomics_wait = options.allow_blocking_atomics_wait;
+        donor_config.jit_selection = options.jit_selection;
+        donor_config
     }
 
     /// Build a full runtime around a restored interpreter: the same
@@ -2703,14 +2763,20 @@ impl Runtime {
         config: RuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<Self, OtterError> {
-        Self::validate_config(&config)?;
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
+        let completion_pool = completion_admission::CompletionAdmissionPool::new(
+            config.resource_account.clone(),
+            config.completion_capacities,
+        );
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
         let mut interp = Interpreter::from_isolate_snapshot_capped(snapshot, config.max_heap_bytes)
-            .map_err(|err| OtterError::Internal {
-                code: DiagnosticCode::IsolateStart.as_str().to_string(),
-                message: format!("snapshot restore failed: {err}"),
+            .map_err(|err| match err {
+                otter_gc::ImageError::OutOfMemory(oom) => string_oom_to_error(oom),
+                other => OtterError::Internal {
+                    code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                    message: format!("snapshot restore failed: {other}"),
+                },
             })?;
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
@@ -2722,10 +2788,9 @@ impl Runtime {
             interp.set_promise_rejection_hook(hook);
         }
         let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
-        // Diagnostics are host machinery too: the image carries heap state, so
-        // the caller's tracing and JIT-diagnostics requests reach a restored
-        // isolate only from here. Skipping them makes `--trace`, `--jit-events`,
-        // and `--jit-artifacts` silently observe nothing on the cached path.
+        // Diagnostics are host machinery too: the image carries heap state,
+        // while the donor configuration carries tracing and JIT-diagnostics
+        // requests. Reinstall them without re-running any realm installer.
         interp.set_jit_debug_request(config.jit_debug);
         if let Some(threshold) = config.jit_osr_threshold {
             interp.set_jit_osr_threshold(threshold);
@@ -2746,8 +2811,12 @@ impl Runtime {
         if let Some(factory) = &config.tracer_factory {
             interp.set_tracer(Some(factory.build()));
         }
+        if let Some(interval) = config.cpu_profile_interval {
+            interp.enable_cpu_profiler(interval);
+        }
         interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
             queue: layer_a_dynamic_imports.clone(),
+            completion_pool,
         }));
         Ok(Runtime {
             interp,
@@ -2762,82 +2831,36 @@ impl Runtime {
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
             layer_a_dynamic_imports,
-            promise_registry: promise_registry::PromiseRegistry::new(),
             runtime_task_spawner,
             pending_exit_code: None,
+            admission_leases: None,
         })
     }
 
-    /// Try to serve `config` from the snapshot cache. Any miss —
-    /// absent entry, undecodable blob, unresolvable dynamic native —
-    /// returns `None` and the caller bootstraps.
-    fn try_snapshot_restore(
-        config: &RuntimeConfig,
+    pub(crate) fn from_config_with_task_spawner(
+        admitted: AdmittedRuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    ) -> Option<Self> {
-        let cache = config.snapshot_cache_handle()?;
-        let key = snapshot_cache::snapshot_cache_key(&config.snapshot_surface_tag());
-        let bytes = cache.load(&key)?;
-        let worker_host = config
-            .install_worker_global
-            .then(|| Arc::new(worker::WorkerHostState::new(config.clone())));
-        // One cell for this restore: the resolved `cwd` closure and the
-        // freshly installed `chdir` must observe the same directory.
-        let working_directory = process_control::WorkingDirectory::new(config.process_cwd.clone());
-        let reattach_ctx = DynamicNativeReattachCtx {
-            capabilities: &config.capabilities,
-            task_spawner: runtime_task_spawner.clone(),
-        };
-        let mut resolve = |name: &str| {
-            if let Some(host) = &worker_host
-                && let Some(payload) = worker::dynamic_native_payload(name, host)
-            {
-                return Some(payload);
-            }
-            if config.install_process_global
-                && let Some(payload) = process::dynamic_native_payload(name, &working_directory)
-            {
-                return Some(payload);
-            }
-            config
-                .dynamic_native_factories
-                .get(name)
-                .map(|factory| factory(&reattach_ctx))
-        };
-        let snapshot = otter_vm::snapshot::IsolateSnapshot::from_bytes(&bytes, &mut resolve)?;
-        let mut runtime =
-            Self::assemble_restored(&snapshot, config.clone(), runtime_task_spawner).ok()?;
-        process::reattach_after_restore(
-            &mut runtime.interp,
-            &runtime.config.process_argv,
-            &runtime.config.process_env_overlay,
-            &runtime.config.capabilities,
-            &runtime.config.hooks,
-            &working_directory,
-            runtime.runtime_task_spawner.clone(),
-            &std::sync::Arc::new(crate::commonjs::CjsConfig {
-                capabilities: runtime.config.capabilities.clone(),
-                hosted: runtime.config.hosted_modules.clone(),
-                runtime_task_spawner: runtime.runtime_task_spawner.clone(),
-                addon_loader: runtime.config.commonjs_addon_loader,
-                report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
-            }),
-        )
-        .ok()?;
-        Some(runtime)
+    ) -> Result<Self, OtterError> {
+        let AdmittedRuntimeConfig {
+            config,
+            resource_leases,
+            kind,
+        } = admitted;
+        let runtime = Self::build_from_config(config, runtime_task_spawner)?;
+        Ok(runtime.with_admission(resource_leases, kind))
     }
 
-    pub(crate) fn from_config_with_task_spawner(
+    /// Build an isolate while its already-charged admission lease remains in
+    /// the caller, so every bootstrap failure releases the slot exactly once.
+    fn build_from_config(
         config: RuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<Self, OtterError> {
-        if config.snapshot_cache
-            && let Some(runtime) = Self::try_snapshot_restore(&config, runtime_task_spawner.clone())
-        {
-            return Ok(runtime);
-        }
-        Self::validate_config(&config)?;
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
+        let completion_pool = completion_admission::CompletionAdmissionPool::new(
+            config.resource_account.clone(),
+            config.completion_capacities,
+        );
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
         // The interpreter owns both per-isolate heaps; the string and GC
@@ -3023,9 +3046,13 @@ impl Runtime {
                     if let Some(factory) = &config.tracer_factory {
                         interp.set_tracer(Some(factory.build()));
                     }
+                    if let Some(interval) = config.cpu_profile_interval {
+                        interp.enable_cpu_profiler(interval);
+                    }
                     interp.set_dynamic_import_loader(std::sync::Arc::new(
                         LayerADynamicImportLoader {
                             queue: layer_a_dynamic_imports.clone(),
+                            completion_pool: completion_pool.clone(),
                         },
                     ));
                     Ok((pending_class_js, pending_extension_js))
@@ -3044,10 +3071,10 @@ impl Runtime {
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
             layer_a_dynamic_imports,
-            promise_registry: promise_registry::PromiseRegistry::new(),
             runtime_task_spawner,
             pending_exit_code: None,
             restored_from_snapshot: false,
+            admission_leases: None,
         };
         if runtime.config.install_worker_global {
             worker::install_main_worker_globals(&mut runtime)?;
@@ -3091,20 +3118,37 @@ impl Runtime {
                     message: format!("class `{name}` attached JS glue failed: {err}"),
                 })?;
         }
-        // The build is complete and still fully tenured — exactly the
-        // state a snapshot wants. Store the blob so the next launch of
-        // this binary restores instead of rebuilding.
-        if runtime.config.snapshot_cache
-            && let Some(cache) = runtime.config.snapshot_cache_handle()
-            && let Ok(blob) = runtime.snapshot_blob()
-        {
-            let key = snapshot_cache::snapshot_cache_key(&runtime.config.snapshot_surface_tag());
-            cache.store(&key, &blob);
-        }
         // Bootstrap is over; user allocations go back through the nursery,
         // where most of them die.
         runtime.interp.gc_heap_mut().set_tenure_all(false);
         Ok(runtime)
+    }
+
+    fn with_admission(
+        mut self,
+        resource_leases: otter_resource::ResourceLeaseSet,
+        kind: RuntimeAdmissionKind,
+    ) -> Self {
+        debug_assert!(self.admission_leases.is_none());
+        debug_assert_eq!(resource_leases.amount(ResourceClass::Isolates), 1);
+        debug_assert_eq!(
+            resource_leases.amount(ResourceClass::Workers),
+            if kind == RuntimeAdmissionKind::WorkerThread {
+                1
+            } else {
+                0
+            }
+        );
+        debug_assert_eq!(
+            resource_leases.amount(ResourceClass::WorkerStackBytes),
+            if kind == RuntimeAdmissionKind::Direct {
+                0
+            } else {
+                admission::RUNTIME_THREAD_STACK_BYTES as u64
+            }
+        );
+        self.admission_leases = Some(resource_leases);
+        self
     }
 }
 
@@ -3134,16 +3178,6 @@ pub struct Runtime {
     /// between microtask drains. The isolate runner replaces the
     /// loader at spawn, so this queue stays empty under Layer B.
     layer_a_dynamic_imports: LayerADynamicImportQueue,
-    /// Per-isolate map from runtime-issued `PromiseId` to the
-    /// persistent root of the pending Promise a host async op is
-    /// expected to settle. Embedders register a fresh promise inside
-    /// a native function (VM thread), then post the matching settle
-    /// outcome through
-    /// [`crate::RuntimeHandle::settle_promise`] (host thread).
-    /// The isolate runner pops the entry on the inbox hop and
-    /// resolves / rejects it through the standard promise
-    /// dispatch path so reactions land on the microtask queue.
-    promise_registry: promise_registry::PromiseRegistry,
     /// Sender for owned tasks that must run on the isolate event loop.
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
     /// Exit requested by JavaScript from a host-driven callback — a timer
@@ -3153,6 +3187,12 @@ pub struct Runtime {
     /// in-flight run with the code, exactly as an exit during entry
     /// evaluation does.
     pending_exit_code: Option<u8>,
+    /// Exact role charge. This field is last so every VM and host-owned
+    /// resource is destroyed before the shared ledger releases the isolate,
+    /// worker slot, and native stack bytes together.
+    /// Construction keeps it `None` only behind a private admission wrapper;
+    /// every publicly reachable runtime owns `Some`.
+    admission_leases: Option<otter_resource::ResourceLeaseSet>,
 }
 
 pub(crate) enum MessageEventDispatchError {
@@ -3194,24 +3234,61 @@ pub(crate) enum DynamicImportBegin {
     FetchHttps { target_url: String },
 }
 
-/// Shared FIFO of `(token, specifier, referrer)` dynamic-import
-/// requests awaiting the Layer A pump.
+/// One direct-mode dynamic import and the unique bounded completion carrier
+/// acquired before its pending Promise was created.
+#[derive(Debug)]
+struct LayerADynamicImportRequest {
+    admission: completion_admission::CompletionAdmission,
+    token: u64,
+    specifier: String,
+    referrer: String,
+}
+
+/// Shared physically bounded FIFO of dynamic-import requests awaiting the
+/// Layer A pump.
 type LayerADynamicImportQueue =
-    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, String, String)>>>;
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<LayerADynamicImportRequest>>>;
 
 /// Default [`otter_vm::DynamicImportLoader`] for direct-mode runtimes:
 /// queues the request for [`Runtime::pump_layer_a_dynamic_imports`].
 /// Replaced by the isolate runner's inbox-backed loader under Layer B.
 struct LayerADynamicImportLoader {
     queue: LayerADynamicImportQueue,
+    completion_pool: completion_admission::CompletionAdmissionPool,
 }
 
 impl otter_vm::DynamicImportLoader for LayerADynamicImportLoader {
-    fn schedule(&self, token: u64, specifier: String, referrer: String) {
+    fn admit(&self) -> Result<otter_vm::DynamicImportAdmission, String> {
+        let admission = self
+            .completion_pool
+            .admit(completion_admission::CompletionOrigin::HostOperation)
+            .map_err(|error| error.to_string())?;
+        Ok(otter_vm::DynamicImportAdmission::new(Box::new(admission)))
+    }
+
+    fn schedule(
+        &self,
+        admission: otter_vm::DynamicImportAdmission,
+        token: u64,
+        specifier: String,
+        referrer: String,
+    ) -> Result<(), String> {
+        let admission = admission
+            .try_into_inner::<completion_admission::CompletionAdmission>()
+            .map_err(|_| "foreign Layer A dynamic-import admission carrier".to_string())?;
+        if !admission.belongs_to(&self.completion_pool) {
+            return Err("Layer A dynamic-import admission belongs to another runtime".to_string());
+        }
         self.queue
             .lock()
-            .expect("layer-a dynamic import queue poisoned")
-            .push_back((token, specifier, referrer));
+            .map_err(|_| "Layer A dynamic-import queue is poisoned".to_string())?
+            .push_back(LayerADynamicImportRequest {
+                admission: *admission,
+                token,
+                specifier,
+                referrer,
+            });
+        Ok(())
     }
 }
 
@@ -3300,10 +3377,28 @@ impl Runtime {
         RuntimeBuilder::default()
     }
 
+    /// Clone the shared resource account used by this isolate and its children.
+    #[must_use]
+    pub fn resource_account(&self) -> ResourceAccount {
+        self.config.resource_account.clone()
+    }
+
+    /// Capture deterministic current, peak, rejection, and limit counters.
+    #[must_use]
+    pub fn resource_snapshot(&self) -> ResourceSnapshot {
+        self.config.resource_account.snapshot()
+    }
+
     /// Cooperative cancellation handle.
     #[must_use]
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle(self.interp.interrupt_handle())
+    }
+
+    /// Clone a lifecycle handle that cancels only this isolate's Atomics waits.
+    #[must_use]
+    pub(crate) fn atomics_wait_agent_handle(&self) -> otter_vm::atomics_wait::WaitAgentHandle {
+        self.interp.atomics_wait_agent_handle()
     }
 
     pub(crate) fn with_direct_timeout<T>(
@@ -3380,6 +3475,22 @@ impl Runtime {
     /// and settle JavaScript promises in this isolate.
     pub fn run_host_completion(&mut self, job: otter_vm::host_completion::HostCompletionJob) {
         job.run(&mut self.interp);
+    }
+
+    /// Suppress a host completion after process exit while releasing any
+    /// persistent roots owned by its job.
+    pub(crate) fn cancel_host_completion(
+        &mut self,
+        job: otter_vm::host_completion::HostCompletionJob,
+    ) {
+        job.cancel(&mut self.interp);
+    }
+
+    /// Cancel one pending dynamic import when its admitted host completion can
+    /// no longer be delivered. This removes the registry's GC root without
+    /// running JavaScript in an already-finalized process.
+    pub(crate) fn cancel_dynamic_import(&mut self, token: u64) -> bool {
+        self.interp.cancel_dynamic_import(token)
     }
 
     /// Install the host-side dynamic-import scheduler. Wired by
@@ -3782,7 +3893,11 @@ impl Runtime {
         }
         self.register_resolved_exports(&linked.metadata);
         self.register_module_sources(&linked.module_sources);
-        let context = self.interp.link_module(linked.module);
+        let context = self.interp.link_module(linked.module).map_err(|error| {
+            DynLoadError::type_error(format!(
+                "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
+            ))
+        })?;
         // Hosted builtins in this batch get their real namespaces (running
         // their installers when needed); plain modules get fresh
         // environments — the same records pipeline the static loader uses.
@@ -3848,10 +3963,9 @@ impl Runtime {
     /// Standard descriptor attributes (`{ writable: true,
     /// enumerable: false, configurable: true }` per §17 + §19) are
     /// applied so the binding behaves like every other default
-    /// global. Embedders that need to expose a host-bound JS value
-    /// (e.g. a [`otter_vm::Value::Promise`] returned by
-    /// [`Self::register_pending_promise`]) call this from the
-    /// runner thread before re-entering script execution.
+    /// global. Embedders call this from the runner thread before re-entering
+    /// script execution; async native results instead materialize through the
+    /// typed host-completion protocol.
     pub fn set_global(&mut self, name: &str, value: otter_vm::Value) {
         self.interp.set_global(name, value);
     }
@@ -4180,125 +4294,39 @@ impl Runtime {
         !self.interp.timer_callbacks().is_empty()
     }
 
-    /// Number of host-settlement promises still retained by this runtime.
+    /// Cancel every JavaScript timer currently owned by this runtime.
     ///
-    /// This is a cheap diagnostic snapshot for shutdown and idle-state
-    /// validation. It does not inspect ordinary JavaScript promises, whose
-    /// reactions are drained by the normal microtask queue boundary.
-    #[must_use]
-    pub fn pending_host_promise_count(&self) -> usize {
-        self.promise_registry.len()
+    /// Callback roots are detached before the host scheduler is asked to
+    /// cancel its deadlines, so a wake that loses the cancellation race is a
+    /// harmless miss. Runtime-handle process finalization uses this boundary
+    /// after exit listeners return; direct embedders may use it when ending
+    /// their own hosted process lifecycle.
+    ///
+    /// Returns the number of callback entries detached from the VM.
+    pub fn cancel_all_timers(&mut self) -> usize {
+        self.interp.cancel_all_timers()
     }
 
-    /// `true` when the isolate still owes observable work: queued
-    /// microtasks, live timer entries, or unsettled host promises.
+    /// Cancel one JavaScript timer after a fatal handle-runner callback.
+    pub(crate) fn cancel_timer_callback(&mut self, token: u64) -> bool {
+        self.interp.cancel_timer(token)
+    }
+
+    /// `true` when the isolate still owes observable local work: queued
+    /// microtasks or live timer entries.
     ///
     /// This is the idle predicate for an embedder that drives the
     /// isolate from its own event loop. A `false` result means the
-    /// caller may block on its own wake sources without stranding JS
-    /// work; it does not mean the runtime may be dropped, since a host
-    /// operation in flight can still enqueue a settlement later.
+    /// caller may block on its own wake sources without stranding JS work.
+    /// Async native operations carry their own completion admission and
+    /// liveness through the installed host sink rather than a raw Promise-id
+    /// registry.
     ///
-    /// Cheap: three counter reads, no heap walk. Safe to call every
+    /// Cheap: two counter reads, no heap walk. Safe to call every
     /// loop turn.
     #[must_use]
     pub fn has_pending_work(&self) -> bool {
-        self.microtask_stats().pending
-            || self.has_pending_timer_callbacks()
-            || self.pending_host_promise_count() > 0
-    }
-
-    /// Register a fresh pending JS promise and return the
-    /// `(PromiseId, Value::Promise)` pair. The caller — typically
-    /// a native function exposed to JS — returns the
-    /// [`otter_vm::Value`] to the script and ships the
-    /// [`promise_registry::PromiseId`] over to a host async op.
-    /// Settlement happens later through
-    /// [`Self::settle_pending_promise`] (runner-side) or
-    /// [`crate::RuntimeHandle::settle_promise`] (host-side, posts
-    /// the inbox message).
-    ///
-    /// # Errors
-    /// Returns [`OtterError::OutOfMemory`] when the GC heap cap
-    /// blocks the fresh pure-promise allocation.
-    pub fn register_pending_promise(
-        &mut self,
-    ) -> Result<(promise_registry::PromiseId, otter_vm::Value), OtterError> {
-        let handle = otter_vm::promise_dispatch::pending_runtime_rooted(&mut self.interp, &[], &[])
-            .map_err(|oom| OtterError::OutOfMemory {
-                requested_bytes: oom.requested_bytes(),
-                heap_limit_bytes: oom.heap_limit_bytes(),
-            })?;
-        let promise = otter_vm::Value::promise(handle);
-        let root = self.interp.persistent_root_insert(promise);
-        let id = self
-            .promise_registry
-            .register(root, self.interp.active_host_realm_id());
-        Ok((id, promise))
-    }
-
-    /// Settle the promise registered under `id` with `outcome` and
-    /// drain any reactions the settlement enqueued onto the
-    /// per-isolate microtask queue. A late or duplicate settle
-    /// (entry already taken) is a silent no-op so the host can
-    /// race-cancel without observable damage.
-    ///
-    /// # Errors
-    /// Returns the wrapped [`otter_vm::VmError`] when the reaction
-    /// drain reports an unhandled error.
-    pub fn settle_pending_promise(
-        &mut self,
-        id: promise_registry::PromiseId,
-        outcome: promise_registry::HostSettleOutcome,
-    ) -> Result<bool, OtterError> {
-        let entry = match self.promise_registry.take(id) {
-            Some(entry) => entry,
-            None => return Ok(false),
-        };
-        // Take the persistent root directly into a handle scope before
-        // materializing the host payload. String allocation may trigger a
-        // moving collection, so both the Promise and payload stay `Local`
-        // through settlement.
-        self.interp
-            .with_host_realm_id(entry.realm_id, move |interp| {
-                Ok(settle_host_promise_on(interp, entry.root, outcome))
-            })
-            .map_err(realm::map_realm_vm_error)?
-    }
-
-    /// Resolve a registered host promise with a JavaScript value materialized
-    /// on this isolate's mutator turn.
-    ///
-    /// The host side carries only [`PromiseId`] plus owned Rust data. After an
-    /// inbox or browser-event hop, `materialize` runs inside a handle scope and
-    /// can build a `Response`, DOM wrapper, array, or any other GC-managed
-    /// value without sending a [`Value`] across threads or isolates.
-    ///
-    /// A late or duplicate id returns `Ok(false)` without calling
-    /// `materialize`. The registry entry is consumed before materialization,
-    /// including when the closure fails, so settlement remains one-shot.
-    ///
-    /// # Errors
-    /// Returns an embedder materialization error or a reaction-drain error.
-    pub fn settle_pending_promise_with<F>(
-        &mut self,
-        id: promise_registry::PromiseId,
-        materialize: F,
-    ) -> Result<bool, OtterError>
-    where
-        F: for<'scope, 'rt> FnOnce(
-            &mut RuntimeNativeScope<'scope, 'rt>,
-        ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>,
-    {
-        let entry = match self.promise_registry.take(id) {
-            Some(entry) => entry,
-            None => return Ok(false),
-        };
-        self.interp
-            .with_host_realm_id(entry.realm_id, move |interp| {
-                Ok(settle_host_promise_with_on(interp, entry.root, materialize))
-            })
-            .map_err(realm::map_realm_vm_error)?
+        self.microtask_stats().pending || self.has_pending_timer_callbacks()
     }
 
     /// Fire the timer identified by `token`. Routes through
@@ -4563,7 +4591,19 @@ impl Runtime {
 
     fn attach_execution_stats(&mut self, result: ExecutionResult) -> ExecutionResult {
         let stats = self.execution_stats();
-        result.with_stats(stats)
+        self.attach_cpu_profile(result.with_stats(stats))
+    }
+
+    /// Hand the samples taken so far to `result`, leaving the profiler running.
+    ///
+    /// A run that only ends when its event loop drains keeps sampling long
+    /// after entry evaluation returned, so the loop driver attaches again on
+    /// the way out.
+    pub(crate) fn attach_cpu_profile(&mut self, result: ExecutionResult) -> ExecutionResult {
+        match self.interp.drain_cpu_profile() {
+            Some(profile) => result.with_cpu_profile(profile),
+            None => result,
+        }
     }
 
     pub(crate) fn attach_jit_debug_report(&mut self, result: ExecutionResult) -> ExecutionResult {
@@ -4671,9 +4711,9 @@ impl Runtime {
         self.interp.heap_census()
     }
 
-    /// Census of every live native callable by dispatch storage —
-    /// static function pointers, VM intrinsics, and the closure-backed
-    /// natives a snapshot restore would have to re-install by name.
+    /// Census of every live native callable by dispatch storage — static
+    /// function pointers, VM intrinsics, and closure-backed natives retained by
+    /// an in-process snapshot.
     #[must_use]
     pub fn native_census(&self) -> otter_vm::native_census::NativeCensus {
         self.interp.native_census()
@@ -4693,51 +4733,23 @@ impl Runtime {
         self.interp.root_census()
     }
 
-    /// Capture this runtime's old generation as a relocatable image.
-    ///
-    /// # Errors
-    /// Propagates [`otter_gc::ImageError`].
-    pub fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
-        self.interp.capture_heap_image()
-    }
-
-    /// Whether this runtime restored from a snapshot blob instead of
+    /// Whether this runtime restored from an in-process snapshot instead of
     /// bootstrapping.
     #[must_use]
     pub fn restored_from_snapshot(&self) -> bool {
         self.restored_from_snapshot
     }
 
-    /// Serialize this isolate to the flat snapshot blob a later
-    /// process of the same binary restores with
-    /// [`Self::from_snapshot_blob_with`].
-    ///
-    /// # Errors
-    /// Propagates [`otter_gc::ImageError`] from the capture.
-    pub fn snapshot_blob(&self) -> Result<Vec<u8>, otter_gc::ImageError> {
-        let snapshot = self.capture_isolate_snapshot()?;
-        let names = otter_vm::native_function::dynamic_native_names(self.interp.gc_heap());
-        Ok(snapshot.to_bytes(&names))
-    }
-
-    /// Dynamic-native payloads of this live isolate keyed by display
-    /// name — the resolver a same-process blob decode uses.
-    #[must_use]
-    pub fn dynamic_natives_by_name(
-        &self,
-    ) -> Vec<(String, otter_vm::snapshot::DynamicNativePayload)> {
-        otter_vm::native_function::dynamic_natives_by_name(self.interp.gc_heap())
-    }
-
-    /// Capture everything a restore needs from this isolate. See
-    /// [`otter_vm::snapshot::IsolateSnapshot`].
+    /// Capture an in-process runtime image tied to this isolate's complete
+    /// runtime configuration and resource account.
     ///
     /// # Errors
     /// Propagates [`otter_gc::ImageError`].
-    pub fn capture_isolate_snapshot(
-        &self,
-    ) -> Result<otter_vm::snapshot::IsolateSnapshot, otter_gc::ImageError> {
-        self.interp.capture_isolate_snapshot()
+    pub fn capture_isolate_snapshot(&self) -> Result<RuntimeSnapshot, otter_gc::ImageError> {
+        Ok(RuntimeSnapshot {
+            isolate: self.interp.capture_isolate_snapshot()?,
+            donor_config: self.config.clone(),
+        })
     }
 
     /// This realm's `globalThis` as a GC handle, for callers that need
@@ -4907,7 +4919,24 @@ impl Runtime {
         module: BytecodeModule,
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let context = self.interp.link_module(module);
+        let context = self.interp.link_module(module)?;
+        self.run_linked_script_with_context_since(context, start)
+    }
+
+    fn run_verified_script_with_context_since(
+        &mut self,
+        module: otter_bytecode::VerifiedBytecodeModule,
+        start: std::time::Instant,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
+        let context = self.interp.link_verified_module(module)?;
+        self.run_linked_script_with_context_since(context, start)
+    }
+
+    fn run_linked_script_with_context_since(
+        &mut self,
+        context: ExecutionContext,
+        start: std::time::Instant,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script
@@ -4965,53 +4994,97 @@ impl Runtime {
         context: &ExecutionContext,
     ) -> Result<(), OtterError> {
         loop {
-            let batch: Vec<(u64, String, String)> = {
+            let request = {
                 let mut queue = self
                     .layer_a_dynamic_imports
                     .lock()
                     .expect("layer-a dynamic import queue poisoned");
-                queue.drain(..).collect()
+                queue.pop_front()
             };
-            if batch.is_empty() {
-                return Ok(());
-            }
-            for (token, specifier, referrer) in batch {
-                match self.begin_dynamic_import(token, &specifier, &referrer)? {
-                    DynamicImportBegin::Settled => {}
-                    DynamicImportBegin::FetchHttps { target_url } => {
-                        let message = format!(
-                            "dynamic import: remote module \"{target_url}\" requires the isolate runner"
-                        );
-                        if self
-                            .interp
-                            .dynamic_import_realm_id(token)
-                            .is_some_and(|realm_id| realm_id != 0)
-                        {
-                            self.settle_extra_realm_dynamic_error(
-                                token,
-                                otter_vm::ErrorKind::TypeError,
-                                message,
-                            )?;
-                        } else {
-                            let reason = self.alloc_dynamic_import_error(
-                                otter_vm::ErrorKind::TypeError,
-                                message,
-                            )?;
-                            self.settle_dynamic_import_result(token, Err(reason))?;
+            if let Some(request) = request {
+                let LayerADynamicImportRequest {
+                    admission,
+                    token,
+                    specifier,
+                    referrer,
+                } = request;
+                let active = admission.begin_dispatch();
+                let result = (|| -> Result<(), OtterError> {
+                    match self.begin_dynamic_import(token, &specifier, &referrer)? {
+                        DynamicImportBegin::Settled => {}
+                        DynamicImportBegin::FetchHttps { target_url } => {
+                            let message = format!(
+                                "dynamic import: remote module \"{target_url}\" requires the isolate runner"
+                            );
+                            if self
+                                .interp
+                                .dynamic_import_realm_id(token)
+                                .is_some_and(|realm_id| realm_id != 0)
+                            {
+                                self.settle_extra_realm_dynamic_error(
+                                    token,
+                                    otter_vm::ErrorKind::TypeError,
+                                    message,
+                                )?;
+                            } else {
+                                let reason = self.alloc_dynamic_import_error(
+                                    otter_vm::ErrorKind::TypeError,
+                                    message,
+                                )?;
+                                self.settle_dynamic_import_result(token, Err(reason))?;
+                            }
                         }
                     }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    drop(active);
+                    self.cancel_layer_a_dynamic_imports_after_failure(token);
+                    return Err(error);
                 }
+                drop(active);
+                continue;
             }
+
             if let Err(err) = self
                 .interp
                 .drain_microtasks_with_default(Some(context.clone()))
                 && !self.absorb_termination(&err)
             {
+                self.cancel_layer_a_dynamic_imports_after_failure(0);
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
                     map_vm_error(err),
                 ));
             }
+            if self
+                .layer_a_dynamic_imports
+                .lock()
+                .expect("layer-a dynamic import queue poisoned")
+                .is_empty()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Fatal Layer A pumping errors cannot leave a registry root after the
+    /// unique admission that protected it is dropped. Cancel the current token
+    /// (when non-zero), then consume and cancel every still-admitted FIFO item
+    /// one at a time so cleanup itself allocates no batch vector.
+    fn cancel_layer_a_dynamic_imports_after_failure(&mut self, current_token: u64) {
+        if current_token != 0 {
+            let _ = self.cancel_dynamic_import(current_token);
+        }
+        loop {
+            let request = self
+                .layer_a_dynamic_imports
+                .lock()
+                .expect("layer-a dynamic import queue poisoned")
+                .pop_front();
+            let Some(request) = request else { return };
+            let _ = self.cancel_dynamic_import(request.token);
+            drop(request);
         }
     }
 
@@ -5087,7 +5160,7 @@ impl Runtime {
         with_value: impl FnOnce(&mut otter_vm::NativeCtx<'_>, otter_vm::Value) -> R,
     ) -> Result<R, OtterError> {
         let compiled = self.compile_source(&source, specifier)?;
-        let context = self.interp.link_module(compiled.bytecode);
+        let context = self.interp.link_module(compiled.bytecode)?;
         let value = match self.interp.run(&context) {
             Ok(value) => value,
             Err(err) => {
@@ -5159,29 +5232,71 @@ impl Runtime {
         name: &str,
         source: impl Into<String>,
     ) -> Result<ExecutionResult, OtterError> {
+        let cache = if self.config.hooks.compile_hook().is_none() {
+            compile_cache::CompileCache::user_default()
+        } else {
+            None
+        };
+        self.run_bootstrap_script_with_cache(name, source, cache)
+    }
+
+    fn run_bootstrap_script_with_cache(
+        &mut self,
+        name: &str,
+        source: impl Into<String>,
+        cache: Option<compile_cache::CompileCache>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.run_bootstrap_script_with_cache_and_metadata_budget(
+            name,
+            source.into(),
+            cache,
+            otter_compiler::MAX_COMPILED_METADATA_BYTES,
+        )
+    }
+
+    fn run_bootstrap_script_with_cache_and_metadata_budget(
+        &mut self,
+        name: &str,
+        source: String,
+        cache: Option<compile_cache::CompileCache>,
+        metadata_budget: usize,
+    ) -> Result<ExecutionResult, OtterError> {
         let specifier = format!("<bootstrap:{name}>");
-        let source = SourceInput::from_javascript(source.into());
+        let source = SourceInput::from_javascript(source);
         let start = std::time::Instant::now();
         // Bootstrap sources are byte-identical on every launch, which is what
         // makes them worth caching. Ordinary script evaluation is deliberately
         // left alone: its sources are one-offs, and an entry per snippet is a
         // directory that grows without ever being read again.
-        let cache = compile_cache::CompileCache::user_default();
+        // A compile hook defines a different compiler contract whose identity
+        // is not the embedded default-compiler fingerprint. It must neither
+        // consume a shared default entry nor publish hook-produced bytecode
+        // under that key.
+        let cache = if self.config.hooks.compile_hook().is_none() {
+            cache
+        } else {
+            None
+        };
         let key = cache
             .as_ref()
             .map(|_| compile_cache::cache_key(&source.text, source.kind, &specifier));
-        let bytecode = match (&cache, &key) {
-            (Some(cache), Some(key)) if let Some(bytecode) = cache.load(key) => bytecode,
-            _ => {
-                let compiled = self.compile_source(&source, &specifier)?;
-                self.source_maps
-                    .record_compiled_metadata(&compiled.metadata);
-                if let (Some(cache), Some(key)) = (&cache, &key) {
-                    cache.store(key, &compiled.bytecode);
-                }
-                compiled.bytecode
-            }
-        };
+        if let (Some(cache), Some(key)) = (&cache, &key)
+            && let Some(bytecode) = cache.load(key)
+            && let Ok(metadata) = CompiledModuleMetadata::span_only_from_bytecode_with_budget(
+                bytecode.module(),
+                metadata_budget,
+            )
+        {
+            self.source_maps.record_compiled_metadata(&metadata);
+            return self
+                .run_verified_script_with_context_since(bytecode, start)
+                .map(|(result, _context)| result);
+        }
+        let compiled = self.compile_source(&source, &specifier)?;
+        if let (Some(cache), Some(key)) = (&cache, &key) {
+            cache.store(key, &compiled.bytecode);
+        }
+        let bytecode = compiled.bytecode;
         self.run_compiled_script_with_context_since(bytecode, start)
             .map(|(result, _context)| result)
     }
@@ -5206,6 +5321,7 @@ impl Runtime {
                 compile_script_source_with_top_level_await(&source.text, source.kind, specifier)
                     .map_err(|err| map_compile_error(err, specifier))?;
             CompiledModule::from_bytecode(bytecode)
+                .map_err(|err| map_compile_error(err, specifier))?
         } else {
             compile_script_source_to_module(&source.text, source.kind, specifier)
                 .map_err(|err| map_compile_error(err, specifier))?
@@ -5502,14 +5618,14 @@ impl Runtime {
                     });
             });
 
-        self.module_records.mark_evaluating(realm_id);
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), runtime_link_started) {
             timings.link_time_ns = timings
                 .link_time_ns
                 .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         }
         let codeblock_started = timings.is_some().then(std::time::Instant::now);
-        let context = self.interp.link_module(module);
+        let context = self.interp.link_module(module)?;
+        self.module_records.mark_evaluating(realm_id);
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), codeblock_started) {
             timings.compile_time_ns = timings
                 .compile_time_ns
@@ -5966,7 +6082,7 @@ impl Runtime {
         // wrapper closures resolve from any frame.
         let empty = compile_script_source("", SourceKind::JavaScript, "<commonjs-root>")
             .map_err(|err| map_compile_error(err, "<commonjs-root>"))?;
-        let context = self.interp.link_module(empty);
+        let context = self.interp.link_module(empty)?;
         let load = otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::default_call(),
@@ -6316,6 +6432,18 @@ impl Otter {
         self.handle.activity_stats()
     }
 
+    /// Clone the shared resource account used by this isolate and its children.
+    #[must_use]
+    pub fn resource_account(&self) -> ResourceAccount {
+        self.handle.resource_account()
+    }
+
+    /// Capture deterministic current, peak, rejection, and limit counters.
+    #[must_use]
+    pub fn resource_snapshot(&self) -> ResourceSnapshot {
+        self.handle.resource_snapshot()
+    }
+
     /// Drop down to Layer B.
     #[must_use]
     pub fn handle(&self) -> &RuntimeHandle {
@@ -6330,6 +6458,36 @@ pub struct OtterBuilder {
 }
 
 impl OtterBuilder {
+    /// Replace the shared resource ledger with a fresh account using `limits`.
+    #[must_use]
+    pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.runtime = self.runtime.resource_limits(limits);
+        self
+    }
+
+    /// Use an existing account shared with sibling runtime builders.
+    #[must_use]
+    pub fn resource_account(mut self, account: ResourceAccount) -> Self {
+        self.runtime = self.runtime.resource_account(account);
+        self
+    }
+
+    /// Set finite per-isolate capacities for guaranteed terminal work,
+    /// in-flight host operations, and live timers. Zero disables admission for
+    /// that class.
+    #[must_use]
+    pub fn completion_capacities(
+        mut self,
+        guaranteed: usize,
+        host_operations: usize,
+        timers: usize,
+    ) -> Self {
+        self.runtime = self
+            .runtime
+            .completion_capacities(guaranteed, host_operations, timers);
+        self
+    }
+
     /// Replace the capability set.
     #[must_use]
     pub fn capabilities(mut self, caps: CapabilitySet) -> Self {
@@ -6554,6 +6712,14 @@ impl OtterBuilder {
         self
     }
 
+    /// Sample the VM stack for the whole run. See
+    /// [`RuntimeBuilder::cpu_profile_interval`].
+    #[must_use]
+    pub fn cpu_profile_interval(mut self, interval: Option<u64>) -> Self {
+        self.runtime = self.runtime.cpu_profile_interval(interval);
+        self
+    }
+
     /// [`RuntimeBuilder::jit_selection`].
     #[must_use]
     pub fn jit_selection(mut self, selection: JitSelection) -> Self {
@@ -6572,26 +6738,6 @@ impl OtterBuilder {
     #[must_use]
     pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
         self.runtime = self.runtime.jit_debug(request);
-        self
-    }
-
-    /// Serve this build from the per-user snapshot cache. See
-    /// [`RuntimeBuilder::snapshot_cache`].
-    #[must_use]
-    pub fn snapshot_cache(mut self, enabled: bool) -> Self {
-        self.runtime = self.runtime.snapshot_cache(enabled);
-        self
-    }
-
-    /// Register a snapshot-restore factory for a named dynamic native.
-    /// See [`RuntimeBuilder::dynamic_native_factory`].
-    #[must_use]
-    pub fn dynamic_native_factory(
-        mut self,
-        name: impl Into<String>,
-        factory: DynamicNativeFactory,
-    ) -> Self {
-        self.runtime = self.runtime.dynamic_native_factory(name, factory);
         self
     }
 
@@ -6847,6 +6993,18 @@ pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &
                 .with_source_url(source_url),
             ],
         },
+        CompileError::MetadataLimit {
+            requested_bytes,
+            limit_bytes,
+        } => OtterError::OutOfMemory {
+            requested_bytes: u64::try_from(requested_bytes).unwrap_or(u64::MAX),
+            heap_limit_bytes: u64::try_from(limit_bytes).unwrap_or(u64::MAX),
+        },
+        CompileError::MetadataAllocation { requested_bytes } => OtterError::OutOfMemory {
+            requested_bytes: u64::try_from(requested_bytes).unwrap_or(u64::MAX),
+            heap_limit_bytes: u64::try_from(otter_compiler::MAX_COMPILED_METADATA_BYTES)
+                .unwrap_or(u64::MAX),
+        },
         _ => OtterError::Internal {
             code: DiagnosticCode::CompileUnknown.as_str().to_string(),
             message: "unknown compiler error variant".to_string(),
@@ -6900,103 +7058,6 @@ pub(crate) fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
 ///   `<module-init>` threw a JS value. The settler uses that
 ///   value directly as the promise's rejection reason per
 ///   §16.2.1.7 step 7.b.i + §27.2.1.7.
-fn settle_host_promise_on(
-    interp: &mut Interpreter,
-    root: RuntimePersistentRootId,
-    outcome: HostSettleOutcome,
-) -> Result<bool, OtterError> {
-    let settled = otter_vm::NativeCtx::with_host_context(
-        interp,
-        otter_vm::NativeCallInfo::default_call(),
-        None,
-        |ctx| {
-            ctx.scope(|mut scope| -> Result<bool, OtterError> {
-                let Some(promise) = scope.take_persistent_root(root) else {
-                    return Ok(false);
-                };
-                let (payload, reject) = match outcome {
-                    HostSettleOutcome::ResolveUndefined => {
-                        (scope.value(otter_vm::Value::undefined()), false)
-                    }
-                    HostSettleOutcome::ResolveNull => (scope.value(otter_vm::Value::null()), false),
-                    HostSettleOutcome::ResolveBoolean(value) => {
-                        (scope.value(otter_vm::Value::boolean(value)), false)
-                    }
-                    HostSettleOutcome::ResolveNumber(value) => (
-                        scope.value(otter_vm::Value::number(otter_vm::NumberValue::from_f64(
-                            value,
-                        ))),
-                        false,
-                    ),
-                    HostSettleOutcome::ResolveString(value) => (
-                        scope
-                            .string(&value)
-                            .map_err(promise_settle_string_to_error)?,
-                        false,
-                    ),
-                    HostSettleOutcome::RejectString(reason) => (
-                        scope
-                            .string(&reason)
-                            .map_err(promise_settle_string_to_error)?,
-                        true,
-                    ),
-                };
-                if reject {
-                    scope
-                        .reject_promise(promise, payload)
-                        .map_err(map_native_error)?;
-                } else {
-                    scope
-                        .fulfill_promise(promise, payload)
-                        .map_err(map_native_error)?;
-                }
-                Ok(true)
-            })
-        },
-    )?;
-    if settled {
-        interp
-            .drain_microtasks_with_default(None)
-            .map_err(|error| enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error)))?;
-    }
-    Ok(settled)
-}
-
-fn settle_host_promise_with_on<F>(
-    interp: &mut Interpreter,
-    root: RuntimePersistentRootId,
-    materialize: F,
-) -> Result<bool, OtterError>
-where
-    F: for<'scope, 'rt> FnOnce(
-        &mut RuntimeNativeScope<'scope, 'rt>,
-    ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>,
-{
-    let settled = otter_vm::NativeCtx::with_host_context(
-        interp,
-        otter_vm::NativeCallInfo::default_call(),
-        None,
-        |ctx| {
-            ctx.scope(|mut scope| -> Result<bool, OtterError> {
-                let Some(promise) = scope.take_persistent_root(root) else {
-                    return Ok(false);
-                };
-                let payload = materialize(&mut scope).map_err(map_native_error)?;
-                scope
-                    .fulfill_promise(promise, payload)
-                    .map_err(map_native_error)?;
-                Ok(true)
-            })
-        },
-    )?;
-    if settled {
-        interp
-            .drain_microtasks_with_default(None)
-            .map_err(|error| enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error)))?;
-    }
-    Ok(settled)
-}
-
 fn evaluate_and_settle_dynamic_linked_module_on(
     interp: &mut Interpreter,
     token: u64,
@@ -7078,7 +7139,11 @@ fn evaluate_dynamic_linked_module_on(
     for (url, text) in &linked.module_sources {
         interp.register_module_source(url.clone(), std::sync::Arc::from(text.as_str()));
     }
-    let context = interp.link_module(linked.module);
+    let context = interp.link_module(linked.module).map_err(|error| {
+        DynLoadError::type_error(format!(
+            "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
+        ))
+    })?;
     for init in context.module_inits() {
         if interp.module_env(&init.url).is_some() {
             continue;
@@ -7501,7 +7566,54 @@ mod tests {
     use super::*;
     use crate::event_loop::{TimerRequest, TimerToken};
 
+    const COMPILE_HOOK_CACHE_TEST_NAME: &str = "compile-hook-cache-regression";
+
     fn assert_send_sync<T: Send + Sync>() {}
+
+    fn marker_compile_hook(
+        marker: u32,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl RuntimeCompileHook {
+        move |request: RuntimeCompileRequest<'_>| {
+            let target = format!("<bootstrap:{COMPILE_HOOK_CACHE_TEST_NAME}>");
+            let replacement = (request.source.url == target).then(|| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("globalThis.__otterCompileHookCacheMarker = {marker};")
+            });
+            let text = replacement
+                .as_deref()
+                .unwrap_or(request.source.text.as_str());
+            compile_script_source_to_module(text, request.source.kind, &request.source.url)
+                .map_err(|error| map_compile_error(error, &request.source.url))
+        }
+    }
+
+    fn source_map_metadata(
+        source_url: &str,
+        spans: &[(u32, u32, (u32, u32))],
+    ) -> CompiledModuleMetadata {
+        let mut metadata = compile_script_source_to_module("", SourceKind::JavaScript, source_url)
+            .expect("empty source compiles")
+            .metadata;
+        metadata.source_url = source_url.to_string();
+        let mut by_function = BTreeMap::<u32, Vec<SpanEntry>>::new();
+        for &(function_id, pc, span) in spans {
+            by_function
+                .entry(function_id)
+                .or_default()
+                .push(SpanEntry { pc, span });
+        }
+        metadata.function_spans = by_function
+            .into_iter()
+            .map(|(function_id, spans)| CompiledFunctionSpans {
+                function_id,
+                function_name: format!("f{function_id}"),
+                module_url: source_url.to_string(),
+                spans,
+            })
+            .collect();
+        metadata
+    }
 
     #[test]
     fn default_jit_selection_is_production_tiered() {
@@ -7604,6 +7716,179 @@ mod tests {
         assert_eq!(runtime.module_graph.last_module_count, 2);
         assert!(runtime.source_maps.contains_module(&entry_url));
         assert!(runtime.source_maps.contains_module(&dep_url));
+    }
+
+    #[test]
+    fn source_map_recompilation_replaces_stale_functions_and_spans() {
+        let table = RuntimeSourceMapTable::default();
+        let url = "file:///source-map-reload.js";
+        let first =
+            source_map_metadata(url, &[(0, 0, (0, 1)), (0, 10, (10, 11)), (1, 0, (20, 21))]);
+        table.record_compiled_metadata(&first);
+        table.record_compiled_metadata(&first);
+
+        {
+            let sources = table.by_module_url.borrow();
+            let functions = sources.get(url).expect("source recorded");
+            assert_eq!(functions.len(), 2);
+            assert_eq!(functions.get(&0).expect("function zero").len(), 2);
+        }
+
+        let replacement = source_map_metadata(url, &[(0, 5, (100, 110)), (0, 0, (90, 95))]);
+        table.record_compiled_metadata(&replacement);
+        assert_eq!(table.resolve_frame_span(url, 0, 0), Some((90, 95)));
+        assert_eq!(table.resolve_frame_span(url, 0, 9), Some((100, 110)));
+        assert_eq!(table.resolve_frame_span(url, 1, 0), None);
+
+        let empty = source_map_metadata(url, &[]);
+        table.record_compiled_metadata(&empty);
+        assert!(table.contains_module(url));
+        assert_eq!(table.resolve_frame_span(url, 0, 0), None);
+        assert!(
+            table
+                .by_module_url
+                .borrow()
+                .get(url)
+                .expect("empty replacement remains authoritative")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compile_hooks_bypass_and_never_publish_to_the_shared_bootstrap_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = compile_cache::CompileCache::new(directory.path().join("cache"));
+        let source = "globalThis.__otterCompileHookCacheMarker = 0;";
+        let specifier = format!("<bootstrap:{COMPILE_HOOK_CACHE_TEST_NAME}>");
+        let key = compile_cache::cache_key(source, SourceKind::JavaScript, &specifier);
+        let seed = compile_script_source_to_module(source, SourceKind::JavaScript, &specifier)
+            .expect("default compiler seed");
+        cache.store(&key, &seed.bytecode);
+        assert!(cache.load(&key).is_some());
+
+        for marker in [1_u32, 2] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut runtime = Runtime::builder()
+                .compile_hook(marker_compile_hook(marker, calls.clone()))
+                .build()
+                .expect("runtime with compile hook");
+            runtime
+                .run_bootstrap_script_with_cache(
+                    COMPILE_HOOK_CACHE_TEST_NAME,
+                    source,
+                    Some(cache.clone()),
+                )
+                .expect("hook-produced bootstrap executes");
+            let observed = runtime
+                .eval(SourceInput::from_javascript(
+                    "globalThis.__otterCompileHookCacheMarker;",
+                ))
+                .expect("read hook marker");
+
+            assert_eq!(observed.completion_string(), marker.to_string());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+
+        let retained = cache.load(&key).expect("default cache entry remains");
+        assert_eq!(
+            otter_bytecode::binary::encode_module(retained.module()),
+            otter_bytecode::binary::encode_module(&seed.bytecode)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_cache_hit_restores_cold_compile_frame_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = compile_cache::CompileCache::new(directory.path().join("cache"));
+        let name = "source-map-cache-parity";
+        let source = "function add(a, b) { return a + b; }\nglobalThis.__cacheSpan = add(20, 22);";
+        let specifier = format!("<bootstrap:{name}>");
+        let key = compile_cache::cache_key(source, SourceKind::JavaScript, &specifier);
+
+        let mut cold = Runtime::builder().build().expect("cold runtime");
+        cold.run_bootstrap_script_with_cache(name, source, Some(cache.clone()))
+            .expect("cold bootstrap");
+        assert!(cache.load(&key).is_some());
+        let cold_maps = cold.source_maps.by_module_url.borrow().clone();
+        let functions = cold_maps.get(&specifier).expect("cold source map");
+        let (&function_id, spans) = functions
+            .iter()
+            .find(|(_, spans)| !spans.is_empty())
+            .expect("compiled bootstrap has spans");
+        let pc = spans[0].pc;
+        let cold_span = cold
+            .resolve_frame_span(&specifier, function_id, pc)
+            .expect("cold frame span");
+
+        let mut hit = Runtime::builder().build().expect("cache-hit runtime");
+        hit.run_bootstrap_script_with_cache(name, source, Some(cache))
+            .expect("cached bootstrap");
+
+        assert_eq!(
+            hit.source_maps
+                .by_module_url
+                .borrow()
+                .get(&specifier)
+                .cloned(),
+            Some(functions.clone())
+        );
+        assert_eq!(
+            hit.resolve_frame_span(&specifier, function_id, pc),
+            Some(cold_span)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn over_budget_cache_metadata_falls_back_without_partial_source_map_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = compile_cache::CompileCache::new(directory.path().join("cache"));
+        let name = "source-map-cache-budget-fallback";
+        let source = "globalThis.__cacheMetadataFallback = 1;";
+        let specifier = format!("<bootstrap:{name}>");
+        let key = compile_cache::cache_key(source, SourceKind::JavaScript, &specifier);
+
+        let mut hostile = compile_script_source_to_module(
+            "globalThis.__cacheMetadataFallback = 99;",
+            SourceKind::JavaScript,
+            &specifier,
+        )
+        .expect("hostile cache seed compiles");
+        hostile.bytecode.functions[0].name = "cached".repeat(1_024);
+        cache.store(&key, &hostile.bytecode);
+        assert!(cache.load(&key).is_some());
+
+        let mut expected = Runtime::builder().build().expect("reference runtime");
+        expected
+            .run_bootstrap_script_with_cache(name, source, None)
+            .expect("reference cold bootstrap");
+        let expected_maps = expected.source_maps.by_module_url.borrow().clone();
+
+        let mut fallback = Runtime::builder().build().expect("fallback runtime");
+        let stale = source_map_metadata(&specifier, &[(77, 0, (900, 901))]);
+        fallback.source_maps.record_compiled_metadata(&stale);
+        fallback
+            .run_bootstrap_script_with_cache_and_metadata_budget(
+                name,
+                source.to_string(),
+                Some(cache),
+                128,
+            )
+            .expect("over-budget hit falls back to cold compilation");
+        assert_eq!(
+            fallback.source_maps.by_module_url.borrow().clone(),
+            expected_maps,
+            "failed cached reconstruction must install neither cached nor stale partial spans"
+        );
+        let observed = fallback
+            .eval(SourceInput::from_javascript(
+                "globalThis.__cacheMetadataFallback;",
+            ))
+            .expect("read fallback marker");
+
+        assert_eq!(observed.completion_string(), "1");
     }
 
     #[test]
@@ -8360,6 +8645,200 @@ mod tests {
 
         let mut runtime = Runtime::builder().build().unwrap();
         runtime.run_module(dir.path().join("entry.mjs")).unwrap();
+    }
+
+    #[test]
+    fn layer_a_dynamic_import_capacity_rejects_before_registering_pending_work() {
+        let mut runtime = Runtime::builder()
+            .completion_capacities(0, 1, 1)
+            .build()
+            .expect("zero guaranteed capacity is a valid fail-closed runtime");
+        runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+                    globalThis.dynamicAdmission = "pending";
+                    const target = "./never-loaded.js";
+                    import(target).then(
+                        () => { globalThis.dynamicAdmission = "unexpected-success"; },
+                        (error) => {
+                            globalThis.dynamicAdmission =
+                                error.name + ":" + /capacity/.test(error.message);
+                        },
+                    );
+                    "#,
+                ),
+                "<dynamic-admission-exhausted>",
+            )
+            .expect("dynamic import admission rejection is delivered as a Promise rejection");
+        let result = runtime
+            .eval(SourceInput::from_javascript("globalThis.dynamicAdmission;"))
+            .expect("read rejection outcome");
+
+        assert_eq!(result.completion_string(), "TypeError:true");
+        assert!(!runtime.has_pending_work());
+        let snapshot = runtime.resource_snapshot();
+        assert_eq!(snapshot.get(ResourceClass::QueuedTasks).current(), 0);
+        assert_eq!(snapshot.get(ResourceClass::HostOperations).current(), 0);
+    }
+
+    #[test]
+    fn excessive_completion_capacities_return_config_errors_without_panicking_or_admission() {
+        let excessive = tokio::sync::Semaphore::MAX_PERMITS
+            .checked_add(1)
+            .expect("Tokio semaphore maximum leaves one invalid usize value");
+
+        for capacities in [(excessive, 1, 1), (1, excessive, 1), (1, 1, excessive)] {
+            let account = ResourceAccount::default();
+            let build = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+                let account = account.clone();
+                move || {
+                    Runtime::builder()
+                        .resource_account(account)
+                        .completion_capacities(capacities.0, capacities.1, capacities.2)
+                        .build()
+                }
+            }));
+
+            let error = build
+                .expect("invalid public capacity must not panic")
+                .expect_err("invalid public capacity must be rejected");
+            assert!(matches!(
+                error,
+                OtterError::Config {
+                    reason: ConfigError::InvalidCompletionCapacity { .. }
+                }
+            ));
+            assert_eq!(
+                account.snapshot().get(ResourceClass::Isolates).current(),
+                0,
+                "validation precedes runtime-role admission"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_a_rejects_foreign_admission_carriers_without_retention() {
+        let capacities = completion_admission::CompletionCapacities {
+            guaranteed: 1,
+            host_operations: 1,
+            timers: 1,
+        };
+        let account_a = ResourceAccount::default();
+        let account_b = ResourceAccount::default();
+        let queue_a = LayerADynamicImportQueue::default();
+        let queue_b = LayerADynamicImportQueue::default();
+        let loader_a = LayerADynamicImportLoader {
+            queue: queue_a.clone(),
+            completion_pool: completion_admission::CompletionAdmissionPool::new(
+                account_a.clone(),
+                capacities,
+            ),
+        };
+        let loader_b = LayerADynamicImportLoader {
+            queue: queue_b.clone(),
+            completion_pool: completion_admission::CompletionAdmissionPool::new(
+                account_b.clone(),
+                capacities,
+            ),
+        };
+
+        let admission =
+            otter_vm::DynamicImportLoader::admit(&loader_a).expect("first-runtime admission");
+        assert!(
+            otter_vm::DynamicImportLoader::schedule(
+                &loader_b,
+                admission,
+                1,
+                "x".to_string(),
+                String::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            otter_vm::DynamicImportLoader::schedule(
+                &loader_b,
+                otter_vm::DynamicImportAdmission::new(Box::new(())),
+                2,
+                "x".to_string(),
+                String::new(),
+            )
+            .is_err()
+        );
+
+        assert!(queue_a.lock().expect("first queue").is_empty());
+        assert!(queue_b.lock().expect("second queue").is_empty());
+        for account in [account_a, account_b] {
+            let snapshot = account.snapshot();
+            assert_eq!(snapshot.get(ResourceClass::QueuedTasks).current(), 0);
+            assert_eq!(snapshot.get(ResourceClass::HostOperations).current(), 0);
+        }
+    }
+
+    #[test]
+    fn layer_a_fatal_cleanup_removes_current_and_queued_import_roots() {
+        let mut runtime = Runtime::builder().build().expect("runtime");
+        let (_, context) = runtime
+            .run_script_with_context(SourceInput::from_javascript("0"), "<dynamic-cleanup>")
+            .expect("establish execution context");
+        let current_promise =
+            otter_vm::promise_dispatch::pending_runtime_rooted(&mut runtime.interp, &[], &[])
+                .expect("current pending promise");
+        let current_token = runtime.interp.dynamic_import_registry_mut().insert(
+            current_promise,
+            context.clone(),
+            0,
+        );
+        let queued_promise =
+            otter_vm::promise_dispatch::pending_runtime_rooted(&mut runtime.interp, &[], &[])
+                .expect("queued pending promise");
+        let queued_token =
+            runtime
+                .interp
+                .dynamic_import_registry_mut()
+                .insert(queued_promise, context, 0);
+
+        let account = ResourceAccount::default();
+        let pool = completion_admission::CompletionAdmissionPool::new(
+            account.clone(),
+            completion_admission::CompletionCapacities {
+                guaranteed: 2,
+                host_operations: 2,
+                timers: 1,
+            },
+        );
+        let current = pool
+            .admit(completion_admission::CompletionOrigin::HostOperation)
+            .expect("current admission")
+            .begin_dispatch();
+        let queued = pool
+            .admit(completion_admission::CompletionOrigin::HostOperation)
+            .expect("queued admission");
+        runtime
+            .layer_a_dynamic_imports
+            .lock()
+            .expect("Layer A queue")
+            .push_back(LayerADynamicImportRequest {
+                admission: queued,
+                token: queued_token,
+                specifier: "unused".to_string(),
+                referrer: String::new(),
+            });
+
+        runtime.cancel_layer_a_dynamic_imports_after_failure(current_token);
+        drop(current);
+
+        assert!(runtime.interp.dynamic_import_registry().is_empty());
+        assert!(
+            runtime
+                .layer_a_dynamic_imports
+                .lock()
+                .expect("Layer A queue")
+                .is_empty()
+        );
+        let snapshot = account.snapshot();
+        assert_eq!(snapshot.get(ResourceClass::QueuedTasks).current(), 0);
+        assert_eq!(snapshot.get(ResourceClass::HostOperations).current(), 0);
     }
 
     #[test]

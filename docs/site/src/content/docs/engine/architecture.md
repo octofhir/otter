@@ -90,6 +90,10 @@ Module loading, hosted modules, Web APIs, and Node-style surfaces must
 enforce capabilities at the Rust boundary. Type declarations and JS shims
 are useful ergonomics, not security boundaries. Capability checks should
 happen before host work is started and before native resources are opened.
+An authorization belongs to the exact resource it checked: redirects, retries,
+aliases, and delegated operations must re-enter the same runtime evaluator
+before they can target a different host resource. Remote-module providers
+therefore return one hop and never own redirect policy.
 
 ## Bootstrap
 

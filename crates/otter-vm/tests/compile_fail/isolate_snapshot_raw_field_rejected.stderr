@@ -1,0 +1,5 @@
+error[E0616]: field `image` of struct `IsolateSnapshot` is private
+ --> tests/compile_fail/isolate_snapshot_raw_field_rejected.rs:5:14
+  |
+5 |     snapshot.image = image;
+  |              ^^^^^ private field

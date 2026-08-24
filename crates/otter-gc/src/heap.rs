@@ -814,8 +814,8 @@ impl GcHeap {
         &self.external_refs
     }
 
-    /// Rebuild the external-reference table from a serialized address
-    /// list, preserving indices. See
+    /// Rebuild the external-reference table from a same-process captured
+    /// address list, preserving indices. See
     /// [`ExternalRefTable::restore_from_addrs`].
     pub fn restore_external_refs(&mut self, addrs: impl IntoIterator<Item = usize>) {
         self.external_refs.restore_from_addrs(addrs);

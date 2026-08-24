@@ -15,19 +15,24 @@
 //!
 //! # Contents
 //! - [`encode_module`] — a module as flat bytes.
-//! - [`decode_module`] — flat bytes back into a module.
+//! - [`encode_module_bounded`] — the same encoding with a hard output budget.
+//! - [`decode_module`] — flat bytes into an immutable verified carrier.
 //!
 //! # Invariants
-//! - Encoding is total and decoding is fallible: any byte string that is not
-//!   something [`encode_module`] produced fails to decode rather than
-//!   producing a wrong module.
-//! - Reads are bounds-checked. A truncated or corrupt buffer ends as `None`.
+//! - Encoding validates every wire-length conversion. The bounded entry point
+//!   stops before an append would exceed its caller's byte budget; it never
+//!   constructs an oversized buffer and rejects it afterwards.
+//! - Any byte string that is not something [`encode_module`] produced fails
+//!   to decode rather than producing a wrong module.
+//! - Reads are bounds-checked. A truncated or corrupt buffer returns a typed
+//!   error and never creates a [`VerifiedBytecodeModule`] or reaches a VM
+//!   consumer.
 //! - The format carries no version. A reader that cannot make sense of a
 //!   buffer rejects it, and the caller — which keys entries by the build that
 //!   wrote them — simply produces the module again.
-//! - Sequences are pre-sized from their length prefix, and the prefix is
-//!   bounded by the remaining buffer, so a corrupt count cannot ask for a
-//!   large allocation.
+//! - Every decoded `String` and `Vec` shares one allocation budget. The budget
+//!   has both an input-linear quota and a fixed hard ceiling, so a corrupt
+//!   count cannot amplify a small cache blob into a large allocation.
 //!
 //! # See also
 //! - [`crate::BytecodeModule`], the value this encodes.
@@ -38,16 +43,47 @@ use crate::{
     DirectEvalBinding, Function, MappedArgumentBinding, ModuleInit, ModuleResolution, SourceKind,
     SpanEntry, TemplateSite,
     encoding::{op_from_byte, op_to_byte},
+    verifier::{BytecodeVerifyError, VerifiedBytecodeModule},
 };
 
 /// Marks a buffer as this encoding. A buffer that does not start with it is
 /// not something this module wrote.
 const MAGIC: &[u8; 8] = b"otterbc\0";
 
+/// Small modules need enough headroom for owned Rust collection headers, while
+/// larger modules should remain proportional to their flat representation.
+const DECODE_ALLOCATION_FLOOR_BYTES: usize = 64 * 1024;
+const DECODE_ALLOCATION_BYTES_PER_INPUT_BYTE: usize = 16;
+const DECODE_ALLOCATION_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Encode `module` as flat bytes.
+///
+/// Callers accepting modules from a bounded or otherwise untrusted source
+/// should use [`encode_module_bounded`]. This convenience entry point preserves
+/// the historical infallible API for already-admitted in-memory modules.
 #[must_use]
 pub fn encode_module(module: &BytecodeModule) -> Vec<u8> {
-    let mut out = Writer::new();
+    encode_module_with_limit(module, usize::MAX)
+        .unwrap_or_else(|error| panic!("failed to encode admitted bytecode module: {error}"))
+}
+
+/// Encode `module` without ever growing the output beyond `max_bytes`.
+///
+/// # Errors
+/// Returns [`ModuleEncodeError`] when the wire representation cannot fit its
+/// fixed-width length fields, would exceed `max_bytes`, or allocation fails.
+pub fn encode_module_bounded(
+    module: &BytecodeModule,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ModuleEncodeError> {
+    encode_module_with_limit(module, max_bytes)
+}
+
+fn encode_module_with_limit(
+    module: &BytecodeModule,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ModuleEncodeError> {
+    let mut out = Writer::new(max_bytes);
     out.bytes(MAGIC);
     out.string(&module.module);
     out.u8(source_kind_tag(module.source_kind));
@@ -59,10 +95,70 @@ pub fn encode_module(module: &BytecodeModule) -> Vec<u8> {
     out.finish()
 }
 
-/// Decode flat bytes back into a module, or `None` when the bytes are not a
-/// module this encoding produced.
-#[must_use]
-pub fn decode_module(bytes: &[u8]) -> Option<BytecodeModule> {
+/// Typed reason a module could not be represented as bounded flat bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModuleEncodeError {
+    /// A string or sequence length does not fit the format's `u32` field.
+    LengthOverflow,
+    /// The next complete field would exceed the caller's output budget.
+    SizeLimitExceeded,
+    /// Reserving the required output storage failed.
+    AllocationFailed,
+}
+
+impl std::fmt::Display for ModuleEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthOverflow => write!(f, "bytecode field length exceeds u32"),
+            Self::SizeLimitExceeded => write!(f, "encoded bytecode exceeds output limit"),
+            Self::AllocationFailed => write!(f, "encoded bytecode allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for ModuleEncodeError {}
+
+/// Typed reason a flat bytecode blob was rejected.
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModuleDecodeError {
+    /// The buffer is truncated, malformed, or has trailing data.
+    MalformedEncoding,
+    /// The flat shape decoded, but the module violates VM admission
+    /// invariants.
+    Verify(BytecodeVerifyError),
+}
+
+impl std::fmt::Display for ModuleDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedEncoding => write!(f, "malformed flat bytecode encoding"),
+            Self::Verify(error) => write!(f, "invalid bytecode module: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ModuleDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MalformedEncoding => None,
+            Self::Verify(error) => Some(error),
+        }
+    }
+}
+
+/// Decode and verify a normal base-zero module.
+///
+/// # Errors
+/// Returns [`ModuleDecodeError`] for malformed bytes or a structurally invalid
+/// module.
+pub fn decode_module(bytes: &[u8]) -> Result<VerifiedBytecodeModule, ModuleDecodeError> {
+    let module = decode_unverified_module(bytes).ok_or(ModuleDecodeError::MalformedEncoding)?;
+    VerifiedBytecodeModule::new(module).map_err(ModuleDecodeError::Verify)
+}
+
+fn decode_unverified_module(bytes: &[u8]) -> Option<BytecodeModule> {
     let mut input = Reader::new(bytes);
     if input.bytes(MAGIC.len())? != MAGIC {
         return None;
@@ -90,41 +186,100 @@ pub fn decode_module(bytes: &[u8]) -> Option<BytecodeModule> {
 
 struct Writer {
     out: Vec<u8>,
+    max_bytes: usize,
+    error: Option<ModuleEncodeError>,
 }
 
 impl Writer {
-    fn new() -> Self {
+    fn new(max_bytes: usize) -> Self {
+        let initial_capacity = max_bytes.min(64 * 1024);
+        let mut out = Vec::new();
+        let error = out
+            .try_reserve_exact(initial_capacity)
+            .err()
+            .map(|_| ModuleEncodeError::AllocationFailed);
         Self {
-            out: Vec::with_capacity(64 * 1024),
+            out,
+            max_bytes,
+            error,
         }
     }
 
-    fn finish(self) -> Vec<u8> {
-        self.out
+    fn finish(self) -> Result<Vec<u8>, ModuleEncodeError> {
+        self.error.map_or(Ok(self.out), Err)
     }
 
-    fn bytes(&mut self, bytes: &[u8]) {
+    fn has_failed(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn set_error(&mut self, error: ModuleEncodeError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if self.has_failed() {
+            return;
+        }
+        let Some(new_len) = self.out.len().checked_add(bytes.len()) else {
+            self.set_error(ModuleEncodeError::SizeLimitExceeded);
+            return;
+        };
+        if new_len > self.max_bytes {
+            self.set_error(ModuleEncodeError::SizeLimitExceeded);
+            return;
+        }
+        let spare = self.out.capacity().saturating_sub(self.out.len());
+        if spare < bytes.len() {
+            let target_capacity = self
+                .out
+                .capacity()
+                .saturating_mul(2)
+                .max(new_len)
+                .min(self.max_bytes);
+            let additional = target_capacity.saturating_sub(self.out.len());
+            if self.out.try_reserve_exact(additional).is_err() {
+                self.set_error(ModuleEncodeError::AllocationFailed);
+                return;
+            }
+        }
         self.out.extend_from_slice(bytes);
     }
 
+    fn wire_len(&mut self, len: usize) -> Option<u32> {
+        match u32::try_from(len) {
+            Ok(len) => Some(len),
+            Err(_) => {
+                self.set_error(ModuleEncodeError::LengthOverflow);
+                None
+            }
+        }
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.append(bytes);
+    }
+
     fn u8(&mut self, value: u8) {
-        self.out.push(value);
+        self.append(&[value]);
     }
 
     fn bool(&mut self, value: bool) {
-        self.out.push(u8::from(value));
+        self.u8(u8::from(value));
     }
 
     fn u16(&mut self, value: u16) {
-        self.out.extend_from_slice(&value.to_le_bytes());
+        self.append(&value.to_le_bytes());
     }
 
     fn u32(&mut self, value: u32) {
-        self.out.extend_from_slice(&value.to_le_bytes());
+        self.append(&value.to_le_bytes());
     }
 
     fn u64(&mut self, value: u64) {
-        self.out.extend_from_slice(&value.to_le_bytes());
+        self.append(&value.to_le_bytes());
     }
 
     fn span(&mut self, span: (u32, u32)) {
@@ -133,7 +288,10 @@ impl Writer {
     }
 
     fn string(&mut self, value: &str) {
-        self.u32(value.len() as u32);
+        let Some(len) = self.wire_len(value.len()) else {
+            return;
+        };
+        self.u32(len);
         self.bytes(value.as_bytes());
     }
 
@@ -148,29 +306,53 @@ impl Writer {
     }
 
     fn utf16(&mut self, units: &[u16]) {
-        self.u32(units.len() as u32);
+        let Some(len) = self.wire_len(units.len()) else {
+            return;
+        };
+        self.u32(len);
         for unit in units {
+            if self.has_failed() {
+                break;
+            }
             self.u16(*unit);
         }
     }
 
     fn seq<T>(&mut self, items: &[T], mut write: impl FnMut(&mut Self, &T)) {
-        self.u32(items.len() as u32);
+        let Some(len) = self.wire_len(items.len()) else {
+            return;
+        };
+        self.u32(len);
         for item in items {
+            if self.has_failed() {
+                break;
+            }
             write(self, item);
         }
     }
 
     fn u32_seq(&mut self, items: &[u32]) {
-        self.u32(items.len() as u32);
+        let Some(len) = self.wire_len(items.len()) else {
+            return;
+        };
+        self.u32(len);
         for item in items {
+            if self.has_failed() {
+                break;
+            }
             self.u32(*item);
         }
     }
 
     fn template_site(&mut self, site: &TemplateSite) {
-        self.u32(site.cooked.len() as u32);
+        let Some(len) = self.wire_len(site.cooked.len()) else {
+            return;
+        };
+        self.u32(len);
         for cooked in &site.cooked {
+            if self.has_failed() {
+                break;
+            }
             self.optional_string(cooked.as_ref());
         }
         self.seq(&site.raw, |writer, raw| writer.string(raw));
@@ -256,8 +438,14 @@ impl Writer {
 
     fn function_code(&mut self, code: &FunctionCode) {
         let (instructions, overflow) = code.raw_parts();
-        self.u32(instructions.len() as u32);
+        let Some(len) = self.wire_len(instructions.len()) else {
+            return;
+        };
+        self.u32(len);
         for instruction in instructions {
+            if self.has_failed() {
+                break;
+            }
             let (op, operand_count, inline, overflow_offset) = instruction.raw_parts();
             // The wire byte, not the Rust discriminant: the two orders differ,
             // and reading one as the other lands on a different opcode whose
@@ -326,11 +514,22 @@ impl Writer {
 struct Reader<'a> {
     input: &'a [u8],
     at: usize,
+    allocation_budget: usize,
 }
 
 impl<'a> Reader<'a> {
     fn new(input: &'a [u8]) -> Self {
-        Self { input, at: 0 }
+        let allocation_budget = input
+            .len()
+            .checked_mul(DECODE_ALLOCATION_BYTES_PER_INPUT_BYTE)
+            .and_then(|bytes| bytes.checked_add(DECODE_ALLOCATION_FLOOR_BYTES))
+            .unwrap_or(DECODE_ALLOCATION_HARD_LIMIT_BYTES)
+            .min(DECODE_ALLOCATION_HARD_LIMIT_BYTES);
+        Self {
+            input,
+            at: 0,
+            allocation_budget,
+        }
     }
 
     fn is_at_end(&self) -> bool {
@@ -388,10 +587,27 @@ impl<'a> Reader<'a> {
         Some(count)
     }
 
+    fn charge_allocation(&mut self, bytes: usize) -> Option<()> {
+        self.allocation_budget = self.allocation_budget.checked_sub(bytes)?;
+        Some(())
+    }
+
+    fn vec_with_exact_capacity<T>(&mut self, count: usize) -> Option<Vec<T>> {
+        let bytes = count.checked_mul(std::mem::size_of::<T>())?;
+        self.charge_allocation(bytes)?;
+        let mut items = Vec::new();
+        items.try_reserve_exact(count).ok()?;
+        Some(items)
+    }
+
     fn string(&mut self) -> Option<String> {
         let len = self.u32()? as usize;
-        let bytes = self.bytes(len)?;
-        String::from_utf8(bytes.to_vec()).ok()
+        let value = std::str::from_utf8(self.bytes(len)?).ok()?;
+        self.charge_allocation(len)?;
+        let mut decoded = String::new();
+        decoded.try_reserve_exact(len).ok()?;
+        decoded.push_str(value);
+        Some(decoded)
     }
 
     fn optional_string(&mut self) -> Option<Option<String>> {
@@ -404,7 +620,7 @@ impl<'a> Reader<'a> {
 
     fn utf16(&mut self) -> Option<Vec<u16>> {
         let count = self.count(2)?;
-        let mut units = Vec::with_capacity(count);
+        let mut units = self.vec_with_exact_capacity(count)?;
         for _ in 0..count {
             units.push(self.u16()?);
         }
@@ -413,7 +629,7 @@ impl<'a> Reader<'a> {
 
     fn seq<T>(&mut self, mut read: impl FnMut(&mut Self) -> Option<T>) -> Option<Vec<T>> {
         let count = self.count(1)?;
-        let mut items = Vec::with_capacity(count);
+        let mut items = self.vec_with_exact_capacity(count)?;
         for _ in 0..count {
             items.push(read(self)?);
         }
@@ -422,7 +638,7 @@ impl<'a> Reader<'a> {
 
     fn u32_seq(&mut self) -> Option<Vec<u32>> {
         let count = self.count(4)?;
-        let mut items = Vec::with_capacity(count);
+        let mut items = self.vec_with_exact_capacity(count)?;
         for _ in 0..count {
             items.push(self.u32()?);
         }
@@ -431,7 +647,7 @@ impl<'a> Reader<'a> {
 
     fn template_site(&mut self) -> Option<TemplateSite> {
         let cooked_count = self.count(1)?;
-        let mut cooked = Vec::with_capacity(cooked_count);
+        let mut cooked = self.vec_with_exact_capacity(cooked_count)?;
         for _ in 0..cooked_count {
             cooked.push(self.optional_string()?);
         }
@@ -520,7 +736,7 @@ impl<'a> Reader<'a> {
         // One instruction occupies opcode + operand count + four inline words
         // + one overflow offset.
         let count = self.count(2 + INLINE_OPERAND_WORDS * 4 + 4)?;
-        let mut instructions = Vec::with_capacity(count);
+        let mut instructions = self.vec_with_exact_capacity(count)?;
         for _ in 0..count {
             let op = op_from_byte(self.u8()?)?;
             let operand_count = self.u8()?;
@@ -672,7 +888,7 @@ mod tests {
                 mapped_argument_bindings: vec![MappedArgumentBinding {
                     argument_index: 0,
                     formal_name: "x".to_string(),
-                    storage: ArgumentBindingStorage::Upvalue { idx: 3 },
+                    storage: ArgumentBindingStorage::Upvalue { idx: 0 },
                 }],
                 module_url: "file:///entry.ts".to_string(),
                 direct_eval_bindings: vec![DirectEvalBinding {
@@ -691,7 +907,7 @@ mod tests {
                     pc: 0,
                     span: (0, 4),
                 }],
-                number_hint_sites: vec![0, 7],
+                number_hint_sites: vec![0, 1],
                 class_hint_sites: vec![ClassHintSite {
                     pc: 1,
                     class_function_id: 0,
@@ -735,7 +951,7 @@ mod tests {
         let bytes = encode_module(&module);
         let restored = decode_module(&bytes).expect("round trip");
         assert_eq!(
-            crate::dump::to_json_pretty(&restored).unwrap(),
+            crate::dump::to_json_pretty(restored.module()).unwrap(),
             crate::dump::to_json_pretty(&module).unwrap()
         );
     }
@@ -747,12 +963,39 @@ mod tests {
     }
 
     #[test]
+    fn bounded_encoding_never_constructs_an_oversized_result() {
+        let module = sample_module();
+        let expected = encode_module(&module);
+        assert_eq!(
+            encode_module_bounded(&module, expected.len()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            encode_module_bounded(&module, expected.len() - 1).unwrap_err(),
+            ModuleEncodeError::SizeLimitExceeded
+        );
+        assert_eq!(
+            encode_module_bounded(&module, 0).unwrap_err(),
+            ModuleEncodeError::SizeLimitExceeded
+        );
+    }
+
+    #[test]
     fn bytes_this_encoding_did_not_write_are_rejected() {
-        assert!(decode_module(b"").is_none());
-        assert!(decode_module(b"not a module at all").is_none());
+        assert_eq!(
+            decode_module(b"").unwrap_err(),
+            ModuleDecodeError::MalformedEncoding
+        );
+        assert_eq!(
+            decode_module(b"not a module at all").unwrap_err(),
+            ModuleDecodeError::MalformedEncoding
+        );
         let mut bytes = encode_module(&sample_module());
         bytes[0] = b'X';
-        assert!(decode_module(&bytes).is_none());
+        assert_eq!(
+            decode_module(&bytes).unwrap_err(),
+            ModuleDecodeError::MalformedEncoding
+        );
     }
 
     #[test]
@@ -760,7 +1003,10 @@ mod tests {
         let bytes = encode_module(&sample_module());
         for end in 0..bytes.len() {
             assert!(
-                decode_module(&bytes[..end]).is_none(),
+                matches!(
+                    decode_module(&bytes[..end]),
+                    Err(ModuleDecodeError::MalformedEncoding)
+                ),
                 "prefix of {end} bytes decoded as a module"
             );
         }
@@ -770,7 +1016,10 @@ mod tests {
     fn trailing_bytes_are_rejected() {
         let mut bytes = encode_module(&sample_module());
         bytes.push(0);
-        assert!(decode_module(&bytes).is_none());
+        assert_eq!(
+            decode_module(&bytes).unwrap_err(),
+            ModuleDecodeError::MalformedEncoding
+        );
     }
 
     #[test]
@@ -781,6 +1030,55 @@ mod tests {
         // site count; a hostile value must be rejected against the buffer.
         let at = MAGIC.len() + 4 + module.module.len() + 1;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode_module(&bytes).is_none());
+        assert_eq!(
+            decode_module(&bytes).unwrap_err(),
+            ModuleDecodeError::MalformedEncoding
+        );
+    }
+
+    #[test]
+    fn a_padded_sequence_cannot_amplify_into_a_large_allocation() {
+        const PADDED_COUNT: u32 = 64 * 1024;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // Empty module name.
+        bytes.push(source_kind_tag(SourceKind::JavaScript));
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // No template sites.
+        bytes.extend_from_slice(&PADDED_COUNT.to_le_bytes());
+        bytes.resize(bytes.len() + PADDED_COUNT as usize, 0);
+
+        let decoded = std::panic::catch_unwind(|| decode_module(&bytes))
+            .expect("decoder panicked while rejecting an amplified sequence");
+        assert_eq!(decoded.unwrap_err(), ModuleDecodeError::MalformedEncoding);
+    }
+
+    #[test]
+    fn structurally_invalid_module_is_a_typed_decode_error() {
+        let mut module = sample_module();
+        module.functions[0].id = 1;
+        let bytes = encode_module(&module);
+        assert!(matches!(
+            decode_module(&bytes),
+            Err(ModuleDecodeError::Verify(
+                BytecodeVerifyError::FunctionId { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn single_byte_mutations_never_panic_or_escape_verification() {
+        let encoded = encode_module(&sample_module());
+        for index in 0..encoded.len() {
+            let mut mutated = encoded.clone();
+            mutated[index] ^= 0xa5;
+            let decoded = std::panic::catch_unwind(|| decode_module(&mutated));
+            let decoded =
+                decoded.unwrap_or_else(|_| panic!("decoder panicked after mutating byte {index}"));
+            if let Ok(module) = decoded {
+                crate::verify_module_at_base(module.module(), module.function_base())
+                    .unwrap_or_else(|error| panic!("decoder admitted byte {index}: {error}"));
+            }
+        }
     }
 }

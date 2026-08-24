@@ -10,10 +10,13 @@
 //! - [`FunctionKindPrototypes`] — cached constructor/prototype pairs.
 //! - Post-bootstrap allocation of the prototype objects.
 //! - Lookup helpers keyed by bytecode function metadata.
+//! - Allocation-free snapshot capture and restore of the cached roots.
 //!
 //! # Invariants
 //! - Cached objects are allocated after `%Function.prototype%` exists.
 //! - All cached object handles are traced as interpreter roots.
+//! - Snapshot restore only accepts handles relocated from its captured image;
+//!   it never rebuilds this graph under the restoring heap cap.
 //! - The default ordinary function kind is represented by `None`;
 //!   callers should then fall back to `%Function.prototype%`.
 //!
@@ -44,6 +47,47 @@ pub(crate) struct FunctionKindPrototypes {
 }
 
 impl FunctionKindPrototypes {
+    pub(crate) const SNAPSHOT_ROOT_COUNT: usize = 8;
+
+    pub(crate) fn snapshot_roots(&self) -> [RawGc; Self::SNAPSHOT_ROOT_COUNT] {
+        [
+            self.generator_constructor,
+            self.generator_prototype,
+            self.async_constructor,
+            self.async_prototype,
+            self.async_generator_constructor,
+            self.async_generator_prototype,
+            self.generator_object_prototype,
+            self.async_generator_object_prototype,
+        ]
+        .map(|object| object.map_or(RawGc::NULL, JsObject::raw))
+    }
+
+    pub(crate) fn from_snapshot_roots(
+        roots: [Option<JsObject>; Self::SNAPSHOT_ROOT_COUNT],
+    ) -> Self {
+        let [
+            generator_constructor,
+            generator_prototype,
+            async_constructor,
+            async_prototype,
+            async_generator_constructor,
+            async_generator_prototype,
+            generator_object_prototype,
+            async_generator_object_prototype,
+        ] = roots;
+        Self {
+            generator_constructor,
+            generator_prototype,
+            async_constructor,
+            async_prototype,
+            async_generator_constructor,
+            async_generator_prototype,
+            generator_object_prototype,
+            async_generator_object_prototype,
+        }
+    }
+
     pub(crate) fn build_post_bootstrap(
         heap: &mut otter_gc::GcHeap,
         mut shape_root: object::ShapeHandle,

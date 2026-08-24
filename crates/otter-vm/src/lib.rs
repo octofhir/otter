@@ -234,6 +234,7 @@ mod test_support;
 
 pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef, ActiveFrameStorage};
 pub use arithmetic_dispatch::NumericRuntimeOp;
+pub use code_space::BytecodeLinkError;
 pub use cpu_profile::CpuProfile;
 pub use execution_context::{CallFeedbackStats, ExecutionContext};
 pub use frame_state::{
@@ -276,7 +277,9 @@ pub use closure::{
 };
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
-pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
+pub use dynamic_import::{
+    DynamicImportAdmission, DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry,
+};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use handles::{HandleArena, Local, ObjectLayout, PendingValue, PendingValues};
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
@@ -325,7 +328,9 @@ pub use register_stack::RegisterWindow;
 pub use string::{JsString, MAX_ROPE_DEPTH};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
-pub use timers::{TimerCallbacks, TimerEntry, TimerKind, TimerScheduler, TimerSchedulerHandle};
+pub use timers::{
+    TimerAdmission, TimerCallbacks, TimerEntry, TimerKind, TimerScheduler, TimerSchedulerHandle,
+};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
 // Eight-byte tagged value. Canonical `Value` export.
@@ -911,6 +916,10 @@ pub struct Interpreter {
     /// once, on the latch's sole `false -> true` transition.
     array_index_accessor_protector_epoch: u64,
     interrupt: InterruptFlag,
+    /// Non-reused ECMA agent identity for `Atomics.wait` lifecycle control.
+    /// Host shutdown holds a cloneable handle while this owner token ensures
+    /// interpreter drop cannot leave a parked waiter in the process registry.
+    atomics_wait_agent: atomics_wait::WaitAgent,
     /// Countdown of remaining compiled back-edges before the next cooperative
     /// budget checkpoint. Compiled code decrements this inline at every
     /// back-edge and re-enters [`Self::jit_backedge_poll`] only when it reaches
@@ -993,6 +1002,7 @@ pub struct Interpreter {
     /// count from the canonical native-activation scan so a deoptimized frame
     /// is never counted twice.
     jit_materialized_generated_call_depth: u32,
+    /// Whether synchronous `Atomics.wait` may block this isolate's host thread.
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads
@@ -1169,10 +1179,24 @@ pub struct Interpreter {
     /// [`Self::JIT_OSR_THRESHOLD`]; embedders can override it explicitly through
     /// [`Self::set_jit_osr_threshold`].
     jit_osr_threshold: u32,
-    /// Compiled-code cache keyed by global function id. `Some(code)` is an
-    /// installed baseline body; `None` records a function the emitter could not
-    /// compile (outside the supported subset), so it is never retried.
+    /// Canonical Template code cache keyed by global function id and shared by
+    /// ordinary entry and every loop-OSR header. `Some(code)` is the sole
+    /// installed Template body for the function; `None` records a permanent
+    /// unsupported/pinned verdict. Transient failures never enter this map.
     jit_code: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    /// Entry-resolution calls remaining before a transient Template compile
+    /// failure is retried. OSR uses its independent per-header back-edge
+    /// threshold as the retry clock and never consumes this countdown.
+    jit_template_entry_retry_remaining: rustc_hash::FxHashMap<u32, u32>,
+    /// Function ids whose canonical Template body has been selected for loop
+    /// OSR. This owns no executable code; it keeps residency category counts
+    /// exact now that entry and OSR share the same `Arc`.
+    jit_template_osr_fids: rustc_hash::FxHashSet<u32>,
+    /// Template compilations currently building a snapshot/emission. The
+    /// bounded eager direct-call walk can encounter a cycle before the outer
+    /// body is installed; this guard declines that nested request instead of
+    /// publishing a second generation for the same function.
+    jit_template_compiling: rustc_hash::FxHashSet<u32>,
     /// Separately installed optimizing-tier bodies keyed by function id.
     /// `None` records a hot function outside the deliberately narrow subset.
     jit_optimized_code:
@@ -1197,12 +1221,6 @@ pub struct Interpreter {
     /// advanced, so a structurally-ineligible body is not recompiled on every hot
     /// loop iteration.
     jit_optimized_declined_epoch: rustc_hash::FxHashMap<u32, Option<u32>>,
-    /// OSR-target compiled-code cache keyed by `(function_id, loop_header_pc)`.
-    /// A target compile is not interchangeable with another header in the same
-    /// function: its synthetic entry edge and captured OSR reload set are rooted
-    /// at one loop header.
-    jit_osr_code:
-        rustc_hash::FxHashMap<(u32, u32), Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry monomorphic cache over [`Self::jit_code`] for repeated
     /// synchronous function entries. Records the last function id whose
     /// installed body is a non-OSR baseline body, so repeated resolution skips

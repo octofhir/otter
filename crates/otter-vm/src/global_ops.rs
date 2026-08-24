@@ -501,7 +501,15 @@ impl Interpreter {
         let frame = &stack[top_idx];
         let function_id = frame.function_id;
         let eval_env = (!frame.eval_env.is_null()).then_some(frame.eval_env);
-        self.store_dynamic_value(context, stack, function_id, eval_env, value, name_idx, false)?;
+        self.store_dynamic_value(
+            context,
+            stack,
+            function_id,
+            eval_env,
+            value,
+            name_idx,
+            false,
+        )?;
         stack[top_idx].advance_pc()?;
         Ok(())
     }

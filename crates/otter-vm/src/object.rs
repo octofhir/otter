@@ -884,12 +884,10 @@ pub struct ExoticSlots {
 }
 
 impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
-    /// Sever foreign ownership on a snapshot restore: the host payload
-    /// box aliases the capture isolate's allocation — its vtable is
-    /// dead in another process, so even this body's own trace impl
-    /// must never see it. The bootstrap graph carries no live host
-    /// payloads; anything that did would re-create its payload through
-    /// its own serializer contract.
+    /// Sever foreign ownership on a snapshot restore: the copied host payload
+    /// box aliases the source isolate's allocation and would become a second
+    /// owner, so even this body's own trace impl must never see it. Capturable
+    /// graphs carry no live host payloads.
     fn sever_restored_payload(&mut self) {
         // SAFETY: overwriting without dropping (or reading) severs the
         // alias; the capture isolate remains the owner.

@@ -253,7 +253,9 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntim
         }
         JitSelection::InterpreterOnly => {}
     }
-    let context = interp.link_module(fixture_module());
+    let context = interp
+        .link_module(fixture_module())
+        .expect("valid bytecode fixture");
     for _ in 0..4010 {
         assert_eq!(
             call_add(
@@ -366,7 +368,9 @@ fn optimized_float_function_matches_interpreter_bits() {
         if !matches!(selection, JitSelection::InterpreterOnly) {
             interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
         }
-        let context = interp.link_module(fixture_module());
+        let context = interp
+            .link_module(fixture_module())
+            .expect("valid bytecode fixture");
         for _ in 0..4010 {
             assert_eq!(
                 call_float_add(&mut interp, &context, 1.25, 2.5).to_bits(),
@@ -391,7 +395,9 @@ fn optimized_float_function_matches_interpreter_bits() {
 fn optimized_long_loop_interrupts_through_leaf_poll_without_reentry() {
     let mut interp = Interpreter::new();
     interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
-    let context = interp.link_module(fixture_module());
+    let context = interp
+        .link_module(fixture_module())
+        .expect("valid bytecode fixture");
     for _ in 0..4010 {
         assert_eq!(
             call_int(&mut interp, &context, 4, 10)

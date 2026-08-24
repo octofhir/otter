@@ -170,14 +170,14 @@ pub fn remote_source_kind(content_type: Option<&str>, url: &str) -> SourceKind {
 /// Parse `source` once and pass the AST to `f`.
 ///
 /// Use this on compile and analysis paths that need to inspect AST state. The
-/// callback form keeps the OXC allocator and source text alive for the exact
-/// lifetime of the borrowed [`Program`] without exposing a reparse-capable
-/// wrapper.
+/// callback form borrows the caller's source directly and keeps the OXC
+/// allocator alive for the exact lifetime of the borrowed [`Program`] without
+/// exposing a reparse-capable wrapper or cloning the source text.
 ///
 /// # Errors
 /// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
 pub fn with_program<R>(
-    source: impl Into<String>,
+    source: &str,
     kind: SourceKind,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<R, SyntaxError> {
@@ -187,14 +187,14 @@ pub fn with_program<R>(
 /// Parse `source` once and return both the callback result and parser time.
 ///
 /// This opt-in surface exists for phase-level benchmark evidence. The duration
-/// covers allocator/source setup and OXC parsing, ending before the callback
-/// performs AST analysis or bytecode lowering. Ordinary compilation continues
-/// to use [`with_program`] and does not read the clock.
+/// covers allocator setup and OXC parsing, ending before the callback performs
+/// AST analysis or bytecode lowering. Ordinary compilation continues to use
+/// [`with_program`] and does not read the clock.
 ///
 /// # Errors
 /// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
 pub fn with_program_timing<R>(
-    source: impl Into<String>,
+    source: &str,
     kind: SourceKind,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<(R, Duration), SyntaxError> {
@@ -214,7 +214,7 @@ pub fn with_program_timing<R>(
 /// # Errors
 /// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
 pub fn with_program_goal<R>(
-    source: impl Into<String>,
+    source: &str,
     kind: SourceKind,
     goal: SourceGoal,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
@@ -223,16 +223,15 @@ pub fn with_program_goal<R>(
 }
 
 fn with_program_goal_after_parse<R, T>(
-    source: impl Into<String>,
+    source: &str,
     kind: SourceKind,
     goal: SourceGoal,
     after_parse: impl FnOnce() -> T,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<(R, T), SyntaxError> {
     let allocator = Allocator::default();
-    let source = source.into();
     let parser =
-        Parser::new(&allocator, &source, kind.to_oxc_with_goal(goal)).with_options(ParseOptions {
+        Parser::new(&allocator, source, kind.to_oxc_with_goal(goal)).with_options(ParseOptions {
             parse_regular_expression: true,
             ..Default::default()
         });
@@ -361,7 +360,8 @@ mod tests {
 
     #[test]
     fn with_program_parses_once_for_callback_consumers() {
-        let len = with_program("undefined;", SourceKind::TypeScript, |program| {
+        let source = String::from("undefined;");
+        let len = with_program(source.as_str(), SourceKind::TypeScript, |program| {
             program.body.len()
         })
         .unwrap();

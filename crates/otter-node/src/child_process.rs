@@ -233,8 +233,8 @@ impl RuntimeTask for ChildIpcEvent {
             return Ok(());
         };
         let id = self.id;
-        let (kind, payload) = match self.event {
-            IpcEvent::Message(payload, _) => ("message", payload),
+        let (kind, payload) = match &mut self.event {
+            IpcEvent::Message(payload, _) => ("message", std::mem::take(payload)),
             IpcEvent::Closed => ("disconnect", String::new()),
             IpcEvent::Sent(token) => ("sent", token.to_string()),
         };
@@ -352,13 +352,12 @@ fn spawn_start(
     // to join is already listening when it gets there.
     let channel = if wants_channel {
         let events = children.clone();
-        let (channel, address) =
-            IpcChannel::listen(spawner, move |event| ChildIpcEvent {
-                id,
-                event,
-                children: events.clone(),
-            })
-                .map_err(|error| crate::type_error("child_process", error.to_string()))?;
+        let (channel, address) = IpcChannel::listen(spawner, move |event| ChildIpcEvent {
+            id,
+            event,
+            children: events.clone(),
+        })
+        .map_err(|error| crate::type_error("child_process", error.to_string()))?;
         Some((channel, address))
     } else {
         None
@@ -655,7 +654,10 @@ fn open_pipe(slot: usize) -> Result<StdioPlan, std::io::Error> {
     // an end left open under its old number is a stream whose end never
     // arrives: whoever inherits it holds the pipe open for everyone.
     for end in [&parent, &child] {
-        nix::fcntl::fcntl(end, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
+        nix::fcntl::fcntl(
+            end,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )?;
     }
     Ok(StdioPlan::Pipe { parent, child })
 }
@@ -1041,10 +1043,9 @@ impl SyncStreams {
     /// reported back as nothing rather than as empty output.
     fn adopt(mut kept: Vec<Option<std::os::fd::OwnedFd>>, input: Option<&str>) -> Self {
         kept.resize_with(3, || None);
-        let mut ends = kept.into_iter().map(|end| {
-            end.filter(set_nonblocking)
-                .map(std::fs::File::from)
-        });
+        let mut ends = kept
+            .into_iter()
+            .map(|end| end.filter(set_nonblocking).map(std::fs::File::from));
         let stdin = ends.next().flatten();
         let out_pipe = ends.next().flatten();
         let err_pipe = ends.next().flatten();

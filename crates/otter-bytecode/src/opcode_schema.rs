@@ -309,8 +309,26 @@ pub enum ExceptionSuccessorSpec {
     },
     /// Unwind to the current frame handler or continue in the caller.
     DynamicFrameHandlerOrCaller,
+    /// The current activation has already completed: route a catchable failure
+    /// through the caller's handler or let it escape the dispatch stack.
+    ///
+    /// The return family owns this terminal intra-function edge because
+    /// derived-constructor validation and async completion settlement happen
+    /// after the returning frame is removed. `TailCall` deliberately retains
+    /// [`Self::DynamicFrameHandlerOrCaller`]: an activation that cannot be
+    /// discarded falls back to an ordinary call while its handlers remain
+    /// active; a discarded activation is proven to own no handlers.
+    CallerHandlerOrUncaught,
     /// Resume a parked throw/return/break/continue completion.
     ResumeParkedAbruptCompletion,
+    /// Resume a suspended frame with a `return` completion: discard catch-only
+    /// handlers, run every pending `finally`, then complete the frame.
+    ///
+    /// Ordinary `yield` owns this dynamic edge because
+    /// `Generator.prototype.return` resumes after the suspension without
+    /// executing another bytecode opcode first. Delegating `yield*` instead
+    /// receives the resume kind as ordinary data.
+    RunFinallyHandlersToFrameReturn,
     /// Run pending finally handlers down to an encoded handler-stack floor.
     RunFinallyHandlersToFloor {
         /// Operand position containing the non-negative floor.
@@ -1424,6 +1442,12 @@ const ENTER_TRY_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] = &[
 ];
 const THROW_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
     &[ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller];
+const RETURN_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
+    &[ExceptionSuccessorSpec::CallerHandlerOrUncaught];
+const YIELD_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] = &[
+    ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller,
+    ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn,
+];
 const END_FINALLY_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
     &[ExceptionSuccessorSpec::ResumeParkedAbruptCompletion];
 const JUMP_VIA_FINALLY_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
@@ -1436,6 +1460,10 @@ const fn exception_successor_shape(op: Op) -> ExceptionSuccessorShape {
     match op {
         Op::EnterTry => ExceptionSuccessorShape::new(ENTER_TRY_EXCEPTION_SUCCESSORS),
         Op::Throw => ExceptionSuccessorShape::new(THROW_EXCEPTION_SUCCESSORS),
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined => {
+            ExceptionSuccessorShape::new(RETURN_EXCEPTION_SUCCESSORS)
+        }
+        Op::Yield => ExceptionSuccessorShape::new(YIELD_EXCEPTION_SUCCESSORS),
         Op::EndFinally => ExceptionSuccessorShape::new(END_FINALLY_EXCEPTION_SUCCESSORS),
         Op::JumpViaFinally => ExceptionSuccessorShape::new(JUMP_VIA_FINALLY_EXCEPTION_SUCCESSORS),
         Op::PopParkedFinally => ExceptionSuccessorShape::new(NO_EXCEPTION_SUCCESSORS),
@@ -1640,7 +1668,14 @@ const fn effects(op: Op) -> OpcodeEffects {
             | Op::ReturnUndefined
     );
     OpcodeEffects {
-        may_throw: !leaf,
+        // These remain allocation-free, non-reentrant leaf operations while
+        // owning typed exception exits: `LoadThis` can hit the derived-`this`
+        // TDZ, while return completion can fail only after leaving this frame.
+        may_throw: !leaf
+            || matches!(
+                op,
+                Op::LoadThis | Op::Return | Op::ReturnValue | Op::ReturnUndefined
+            ),
         may_allocate: !leaf,
         may_trigger_gc: !leaf,
         may_reenter_javascript: !leaf,

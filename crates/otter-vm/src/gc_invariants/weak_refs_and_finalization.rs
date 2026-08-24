@@ -47,7 +47,7 @@ fn empty_module() -> BytecodeModule {
 }
 
 fn empty_context() -> ExecutionContext {
-    ExecutionContext::from_module(empty_module())
+    ExecutionContext::from_module(empty_module()).expect("valid bytecode fixture")
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn finalization_cleanup_job_carries_registry_context() {
     let registry = alloc_finalization_registry_with_context(
         interp.gc_heap_mut(),
         callback,
-        Some(ExecutionContext::from_module(empty_module())),
+        Some(ExecutionContext::from_module(empty_module()).expect("valid bytecode fixture")),
     )
     .expect("registry");
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");

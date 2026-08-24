@@ -22,62 +22,82 @@ fn capture_is_structurally_deterministic() {
     let b = full_surface_runtime();
     let snap_a = a.capture_isolate_snapshot().expect("capture a");
     let snap_b = b.capture_isolate_snapshot().expect("capture b");
+    let diagnostics_a = snap_a.diagnostics();
+    let diagnostics_b = snap_b.diagnostics();
 
     assert!(
-        !snap_a.atom_names.is_empty(),
+        !diagnostics_a.atom_names().is_empty(),
         "a built isolate interned property names"
     );
     assert_eq!(
-        snap_a.atom_names, snap_b.atom_names,
+        diagnostics_a.atom_names(),
+        diagnostics_b.atom_names(),
         "atom table must be a function of the build, not of the run"
     );
     assert_eq!(
-        snap_a.fixed_roots.len(),
-        snap_b.fixed_roots.len(),
+        diagnostics_a.fixed_root_count(),
+        diagnostics_b.fixed_root_count(),
         "fixed root walk must have identical shape"
     );
-    let keys_a: Vec<&str> = snap_a
-        .global_lexicals
-        .iter()
-        .map(|(name, _, _)| name.as_ref())
-        .collect();
-    let keys_b: Vec<&str> = snap_b
-        .global_lexicals
-        .iter()
-        .map(|(name, _, _)| name.as_ref())
-        .collect();
-    assert_eq!(keys_a, keys_b, "global lexical key set must match");
+    assert_eq!(
+        diagnostics_a.global_lexical_names(),
+        diagnostics_b.global_lexical_names(),
+        "global lexical key set must match"
+    );
     assert!(
-        snap_a.image.object_count() > 1000,
+        diagnostics_a.object_count() > 1000,
         "the image holds the bootstrap graph, saw {}",
-        snap_a.image.object_count()
+        diagnostics_a.object_count()
     );
 }
 
 #[test]
 fn restore_round_trips_in_process() {
-    let source = full_surface_runtime();
-    let snapshot = source.capture_isolate_snapshot().expect("capture");
-    let mut restored = otter_vm::Interpreter::from_isolate_snapshot(&snapshot).expect("restore");
+    let snapshot = {
+        let source = full_surface_runtime();
+        source.capture_isolate_snapshot().expect("capture")
+    };
+    let mut restored =
+        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
 
-    // The restored global graph resolves the same intrinsics.
-    let global = *restored.global_this();
-    let object_ctor = otter_vm::object::get(global, restored.gc_heap(), "Object")
-        .expect("restored global has Object");
-    assert!(
-        object_ctor.is_object_type(),
-        "Object constructor survived the round trip"
+    let before = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "`${typeof Object},${typeof JSON},${typeof process.cwd},${typeof process.cwd()}`",
+        ))
+        .expect("restored globals and captured dynamic native");
+    assert_eq!(
+        before.completion_string(),
+        "function,object,function,string"
     );
-    let json = otter_vm::object::get(global, restored.gc_heap(), "JSON")
-        .expect("restored global has JSON");
-    assert!(json.is_object_type());
 
     // A full collection over the restored heap must find a consistent
     // graph: every reachable slot relocated, nothing double-owned.
     restored.force_gc().expect("full GC over restored heap");
-    let after = otter_vm::object::get(global, restored.gc_heap(), "Object")
-        .expect("Object survives a full GC");
-    assert!(after.is_object_type());
+    let after = restored
+        .eval(otter_runtime::SourceInput::from_javascript(
+            "`${typeof Object},${typeof JSON},${typeof process.cwd()}`",
+        ))
+        .expect("restored globals after full GC");
+    assert_eq!(after.completion_string(), "function,object,string");
+}
+
+#[test]
+fn restore_preserves_donor_authority_and_non_overridden_config() {
+    let snapshot = {
+        let donor = otter_runtime::Runtime::builder()
+            .capabilities(otter_runtime::CapabilitySet::allow_all())
+            .max_stack_depth(777)
+            .process_global(false)
+            .worker_global(false)
+            .build()
+            .expect("configured donor");
+        donor.capture_isolate_snapshot().expect("capture")
+    };
+
+    let restored =
+        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    assert!(restored.capabilities().is_allow_all());
+    assert_eq!(restored.max_stack_depth(), 777);
 }
 
 #[test]
@@ -182,114 +202,6 @@ fn restored_runtime_evaluates_javascript() {
 }
 
 #[test]
-fn snapshot_blob_round_trips_in_process() {
-    let source = full_surface_runtime();
-    let bytes = source.snapshot_blob().expect("blob capture");
-    assert!(
-        bytes.len() > 100_000,
-        "the blob holds pages + bytecode, saw {} bytes",
-        bytes.len()
-    );
-
-    // Same-process resolver: hand back the live isolate's closures by
-    // their captured names.
-    let dynamics = source.dynamic_natives_by_name();
-    let mut restored = otter_runtime::Runtime::from_snapshot_blob_with(
-        &bytes,
-        otter_runtime::SnapshotRuntimeOptions::default(),
-        &mut |name| {
-            dynamics
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, payload)| payload.clone())
-        },
-    )
-    .expect("blob restore");
-
-    let result = restored
-        .eval(otter_runtime::SourceInput::from_javascript(
-            "JSON.stringify([1 + 1, /b+/.test('abbc'), new Map([[1, 2]]).get(1), eval('40 + 2')])",
-        ))
-        .expect("eval on blob-restored runtime");
-    assert_eq!(result.completion_string(), "[2,true,2,42]");
-}
-
-#[test]
-fn snapshot_cache_serves_the_second_build() {
-    let cache_dir = tempfile::tempdir().expect("tempdir");
-
-    let build = |dir: &std::path::Path| {
-        otter_runtime::Runtime::builder()
-            .with_node_apis()
-            .with_otter_modules()
-            .with_web_apis()
-            .snapshot_cache_root(dir)
-            .build()
-            .expect("cached build")
-    };
-
-    let first = build(cache_dir.path());
-    assert!(
-        !first.restored_from_snapshot(),
-        "an empty cache must bootstrap"
-    );
-    drop(first);
-
-    let mut second = build(cache_dir.path());
-    assert!(
-        second.restored_from_snapshot(),
-        "the second build must restore from the stored blob"
-    );
-    let probe = second
-        .eval(otter_runtime::SourceInput::from_javascript(
-            "JSON.stringify([1 + 1, typeof fetch, typeof Worker, typeof process.cwd(), \
-             process.argv.length >= 0, eval('7 * 6')])",
-        ))
-        .expect("eval on cache-restored runtime");
-    assert_eq!(
-        probe.completion_string(),
-        r#"[2,"function","function","string",true,42]"#
-    );
-}
-
-#[test]
-fn a_cache_restored_runtime_still_observes_its_diagnostics() {
-    let cache_dir = tempfile::tempdir().expect("tempdir");
-
-    let build = |dir: &std::path::Path| {
-        otter_runtime::Runtime::builder()
-            .with_node_apis()
-            .with_otter_modules()
-            .with_web_apis()
-            .snapshot_cache_root(dir)
-            .jit_debug(otter_vm::jit_debug::JitDebugRequest::events())
-            .build()
-            .expect("cached build")
-    };
-
-    drop(build(cache_dir.path()));
-    let mut restored = build(cache_dir.path());
-    assert!(
-        restored.restored_from_snapshot(),
-        "the second build must restore from the stored blob"
-    );
-
-    // Diagnostics are host machinery, not heap state: a restored isolate owes
-    // the same capture the caller asked the builder for. A disabled sink
-    // reports `None` here no matter how much it ran.
-    let result = restored
-        .eval(otter_runtime::SourceInput::from_javascript(
-            "function f(n){var s=0;for(var i=0;i<n;i++)s+=i;return s} \
-             for(var k=0;k<20000;k++)f(8); f(3)",
-        ))
-        .expect("eval on cache-restored runtime");
-    assert!(
-        result.jit_debug_report().is_some(),
-        "a restored isolate must carry the requested JIT diagnostics capture"
-    );
-}
-
-#[test]
 fn a_full_collection_on_a_restored_isolate_loses_nothing() {
     let mut source = full_surface_runtime();
     let snapshot = source.capture_isolate_snapshot().expect("capture");
@@ -333,72 +245,20 @@ fn a_full_collection_on_a_restored_isolate_loses_nothing() {
 }
 
 #[test]
-fn a_full_collection_on_a_blob_restored_isolate_loses_nothing() {
-    let mut source = full_surface_runtime();
-    let bytes = source.snapshot_blob().expect("blob capture");
-    let dynamics = source.dynamic_natives_by_name();
-    source.force_gc().expect("donor full GC");
-    let donor = source.heap_census();
-    let donor_rows: Vec<(u8, u64)> = donor
-        .old
-        .rows
-        .iter()
-        .map(|row| (row.type_tag, row.object_count))
-        .collect();
-
-    let mut restored = otter_runtime::Runtime::from_snapshot_blob_with(
-        &bytes,
-        otter_runtime::SnapshotRuntimeOptions::default(),
-        &mut |name| {
-            dynamics
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, payload)| payload.clone())
-        },
-    )
-    .expect("blob restore");
-    restored.force_gc().expect("restored full GC");
-    let after = restored.heap_census();
-    let after_by_tag: std::collections::HashMap<u8, u64> = after
-        .old
-        .rows
-        .iter()
-        .map(|row| (row.type_tag, row.object_count))
-        .collect();
-    for (tag, donor_count) in &donor_rows {
-        let after_count = after_by_tag.get(tag).copied().unwrap_or(0);
-        assert!(
-            after_count > 0,
-            "type {tag:#x} vanished after a blob-restored GC ({donor_count} at donor)"
-        );
-        assert!(
-            after_count * 2 >= *donor_count,
-            "type {tag:#x} lost most bodies through the blob: donor {donor_count}, restored {after_count}"
-        );
-    }
-}
-
-#[test]
-fn cache_restored_isolate_survives_allocation_pressure() {
-    let cache_dir = tempfile::tempdir().expect("tempdir");
-    let build = || {
-        otter_runtime::Runtime::builder()
-            .with_node_apis()
-            .with_otter_modules()
-            .with_web_apis()
-            .snapshot_cache_root(cache_dir.path())
-            .build()
-            .expect("cached build")
+fn in_process_restored_isolate_survives_allocation_pressure() {
+    let snapshot = {
+        let source = full_surface_runtime();
+        source.capture_isolate_snapshot().expect("capture")
     };
-    drop(build());
-    let mut restored = build();
+    let mut restored =
+        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
     assert!(restored.restored_from_snapshot());
 
     let probe = restored
         .eval(otter_runtime::SourceInput::from_javascript(
             "var junk; for (var i = 0; i < 400000; i++) { junk = {a: i, b: [i, i + 1]}; }             JSON.stringify(['abc'.match(/b/)[0], new Map([[1, 2]]).get(1),              typeof RegExp.prototype[Symbol.match], new Set([3]).has(3)])",
         ))
-        .expect("pressure loop on cache-restored runtime");
+        .expect("pressure loop on restored runtime");
     assert_eq!(probe.completion_string(), r#"["b",2,"function",true]"#);
 
     restored.force_gc().expect("full GC");
@@ -415,33 +275,25 @@ fn a_donor_finalization_registry_severs_on_restore() {
     // Seed the registry inside the bootstrap, the way an extension's
     // install script would: the donor captures under tenure-all, so
     // registry cells land in old space and ride the image.
-    let source = otter_runtime::Runtime::builder()
-        .with_node_apis()
-        .with_otter_modules()
-        .with_web_apis()
-        .extension_installer(otter_runtime::RuntimeExtensionInstaller::new(|ctx| {
-            ctx.install_script(otter_runtime::SourceInput::from_javascript(
-                "globalThis.__fr = new FinalizationRegistry(function(){}); \
-                 globalThis.__wr = new WeakRef(globalThis); \
-                 for (var i = 0; i < 64; i++) { __fr.register({t: i}, i, {u: i}); }",
-            ))
-        }))
-        .build()
-        .expect("seeded runtime");
-    let bytes = source.snapshot_blob().expect("blob capture");
-    let dynamics = source.dynamic_natives_by_name();
+    let snapshot = {
+        let source = otter_runtime::Runtime::builder()
+            .with_node_apis()
+            .with_otter_modules()
+            .with_web_apis()
+            .extension_installer(otter_runtime::RuntimeExtensionInstaller::new(|ctx| {
+                ctx.install_script(otter_runtime::SourceInput::from_javascript(
+                    "globalThis.__fr = new FinalizationRegistry(function(){}); \
+                     globalThis.__wr = new WeakRef(globalThis); \
+                     for (var i = 0; i < 64; i++) { __fr.register({t: i}, i, {u: i}); }",
+                ))
+            }))
+            .build()
+            .expect("seeded runtime");
+        source.capture_isolate_snapshot().expect("capture")
+    };
 
-    let mut restored = otter_runtime::Runtime::from_snapshot_blob_with(
-        &bytes,
-        otter_runtime::SnapshotRuntimeOptions::default(),
-        &mut |name| {
-            dynamics
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, payload)| payload.clone())
-        },
-    )
-    .expect("blob restore");
+    let mut restored =
+        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
     restored.force_gc().expect("full GC over severed registry");
     let probe = restored
         .eval(otter_runtime::SourceInput::from_javascript(

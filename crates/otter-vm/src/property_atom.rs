@@ -25,6 +25,8 @@
 //!   property name resolve to the same id, and different names never share one.
 //! - The interner is append-only and never evicts. Ids are permanent for the
 //!   isolate's life, which is what lets shapes and caches store bare ids.
+//! - Each interned spelling has one backing allocation shared by the name-to-id
+//!   map and the id-to-name table.
 //! - A chunk's atom table starts unresolved and is resolved by the interpreter
 //!   that links or adopts it. Resolution is idempotent, so a code space adopted
 //!   by a different interpreter re-keys to that interpreter's interner instead
@@ -37,8 +39,8 @@
 //! - [`crate::execution_context`]
 //! - [`crate::property_dispatch`]
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use otter_bytecode::Constant;
 use rustc_hash::FxHashMap;
@@ -86,9 +88,9 @@ pub(crate) struct NameInterner {
 
 #[derive(Debug, Default)]
 struct InternedNames {
-    ids: FxHashMap<Box<str>, u32>,
+    ids: FxHashMap<Arc<str>, u32>,
     /// Id → name, for diagnostics. Append-only: index equals the atom's id.
-    names: Vec<Box<str>>,
+    names: Vec<Arc<str>>,
 }
 
 impl NameInterner {
@@ -105,8 +107,9 @@ impl NameInterner {
             AtomId::UNRESOLVED,
             "isolate exhausted the atom id range"
         );
-        inner.names.push(name.into());
-        inner.ids.insert(name.into(), id);
+        let spelling: Arc<str> = Arc::from(name);
+        inner.names.push(Arc::clone(&spelling));
+        inner.ids.insert(spelling, id);
         AtomId(id)
     }
 
@@ -115,7 +118,13 @@ impl NameInterner {
     /// on a fresh isolate re-mints identical ids.
     #[must_use]
     pub(crate) fn snapshot_names(&self) -> Vec<Box<str>> {
-        self.inner.lock().expect("name interner").names.clone()
+        self.inner
+            .lock()
+            .expect("name interner")
+            .names
+            .iter()
+            .map(|name| Box::<str>::from(name.as_ref()))
+            .collect()
     }
 
     /// Spelling of an interned atom, for diagnostics. Copies out because the
@@ -124,7 +133,10 @@ impl NameInterner {
     #[must_use]
     pub(crate) fn name(&self, atom: AtomId) -> Option<Box<str>> {
         let inner = self.inner.lock().expect("name interner");
-        inner.names.get(atom.raw() as usize).cloned()
+        inner
+            .names
+            .get(atom.raw() as usize)
+            .map(|name| Box::<str>::from(name.as_ref()))
     }
 
     /// Number of distinct property names this isolate has interned.
@@ -297,6 +309,8 @@ impl AtomTable {
 mod tests {
     use super::*;
 
+    static_assertions::assert_impl_all!(NameInterner: Send, Sync);
+
     fn utf16(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
     }
@@ -399,5 +413,17 @@ mod tests {
         let atom = names.intern("length");
         assert_eq!(names.name(atom).as_deref(), Some("length"));
         assert_eq!(names.name(AtomId::from_global(99)), None);
+    }
+
+    #[test]
+    fn interner_indexes_share_one_spelling_allocation() {
+        let names = NameInterner::default();
+        let atom = names.intern("length");
+        let inner = names.inner.lock().expect("name interner");
+        let indexed = &inner.names[atom.raw() as usize];
+        let (mapped, _) = inner.ids.get_key_value("length").expect("interned name");
+
+        assert!(Arc::ptr_eq(indexed, mapped));
+        assert_eq!(Arc::strong_count(indexed), 2);
     }
 }

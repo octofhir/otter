@@ -44,7 +44,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use crate::host_completion::{HostCompletionJob, HostCompletionSink, HostKeepAlive};
+use crate::host_completion::{
+    HostCompletionAdmission, HostCompletionJob, HostCompletionOutcome, HostCompletionSink,
+};
 use crate::persistent_roots::PersistentRootId;
 use crate::promise::JsPromise;
 use crate::{ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, Value};
@@ -61,7 +63,7 @@ pub struct PromiseCompleter {
     sink: Arc<dyn HostCompletionSink>,
     context: Option<ExecutionContext>,
     realm_id: u32,
-    keep_alive: Option<HostKeepAlive>,
+    admission: Option<HostCompletionAdmission>,
 }
 
 impl std::fmt::Debug for PromiseCompleter {
@@ -86,14 +88,26 @@ impl PromiseCompleter {
 
     fn finish<R: IntoJs + Send + 'static>(mut self, result: Result<R, JsError>) {
         let Some(root) = self.root.take() else { return };
+        let admission = self
+            .admission
+            .take()
+            .expect("a pending promise owns one completion admission");
         let context = self.context.clone();
         let realm_id = self.realm_id;
-        self.sink.complete(HostCompletionJob::new(move |interp| {
-            settle_from_root(interp, root, realm_id, context, result);
-        }));
-        // The keep-alive is released only after the completion job is
-        // posted, so the event loop cannot go idle in between.
-        self.keep_alive.take();
+        if let Err(error) = self.sink.complete(
+            admission,
+            HostCompletionJob::new_with_cancel(
+                move |interp| {
+                    settle_from_root(interp, root, realm_id, context, result);
+                },
+                move |interp| {
+                    interp.persistent_root_remove(root);
+                },
+            ),
+            HostCompletionOutcome::Completed,
+        ) {
+            report_delivery_failure(&error);
+        }
     }
 }
 
@@ -103,11 +117,37 @@ impl Drop for PromiseCompleter {
         // root on the isolate so it can be collected. The promise
         // never settles — the correct terminal state for dropped work.
         if let Some(root) = self.root.take() {
-            self.sink.complete(HostCompletionJob::new(move |interp| {
-                interp.persistent_root_remove(root);
-            }));
+            let admission = self
+                .admission
+                .take()
+                .expect("a pending promise owns one completion admission");
+            if let Err(error) = self.sink.complete(
+                admission,
+                HostCompletionJob::new_with_cancel(
+                    move |interp| {
+                        interp.persistent_root_remove(root);
+                    },
+                    move |interp| {
+                        interp.persistent_root_remove(root);
+                    },
+                ),
+                HostCompletionOutcome::Cancelled,
+            ) {
+                report_delivery_failure(&error);
+            }
         }
     }
+}
+
+/// A host contract violation has no safe VM re-entry path left. Report it
+/// without panicking (including while unwinding an aborted future).
+fn report_delivery_failure(error: &str) {
+    use std::io::Write as _;
+
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "otter: host completion delivery failed: {error}"
+    );
 }
 
 /// Settle the promise parked at `root` with `result`, converting on
@@ -225,6 +265,15 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                 "async host completions are not available in this embedding".to_string(),
             ));
         };
+        let admission = sink.admit().map_err(JsError::Type)?;
+        self.promise_pending_admitted(sink, admission)
+    }
+
+    fn promise_pending_admitted(
+        &mut self,
+        sink: Arc<dyn HostCompletionSink>,
+        admission: HostCompletionAdmission,
+    ) -> Result<(Local<'s>, PromiseCompleter), JsError> {
         let context = self.ctx().context_ref().cloned();
         let interp = self.ctx().interp_mut();
         let realm_id = interp.active_host_realm_id();
@@ -233,7 +282,6 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let promise_value = Value::promise(handle);
         let root = interp.persistent_root_insert(promise_value);
         let parked = self.park(promise_value);
-        let keep_alive = sink.keep_alive();
         Ok((
             parked,
             PromiseCompleter {
@@ -241,22 +289,55 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                 sink,
                 context,
                 realm_id,
-                keep_alive: Some(keep_alive),
+                admission: Some(admission),
             },
         ))
     }
 
-    /// The full async-method protocol: poll `future` once on the spot
-    /// — an already-ready result settles through the ordinary
-    /// pre-settled promise path with no executor round-trip — and
-    /// otherwise spawn it on the host executor with a completer.
-    pub fn promise_from_future<R, F>(&mut self, future: F) -> Result<Local<'s>, JsError>
+    /// The full async-method protocol: admit and construct `future`, then poll
+    /// it once on the spot. An already-ready result settles through the
+    /// ordinary pre-settled promise path with no executor round-trip; otherwise
+    /// the future is spawned on the host executor with a completer.
+    pub fn promise_from_future<R, F, Make>(
+        &mut self,
+        make_future: Make,
+    ) -> Result<Local<'s>, JsError>
     where
         R: IntoJs + Send + 'static,
         F: Future<Output = Result<R, JsError>> + Send + 'static,
+        Make: FnOnce() -> F,
     {
+        self.promise_from_future_with(|| ((), make_future()))
+            .map(|(promise, ())| promise)
+    }
+
+    /// Variant of [`Self::promise_from_future`] whose admitted factory also
+    /// returns an isolate-local sidecar, such as a cancellation handle.
+    /// Admission still precedes both values' construction. An embedding with
+    /// no completion sink fails before the factory is invoked.
+    pub fn promise_from_future_with<R, F, Sidecar, Make>(
+        &mut self,
+        make: Make,
+    ) -> Result<(Local<'s>, Sidecar), JsError>
+    where
+        R: IntoJs + Send + 'static,
+        F: Future<Output = Result<R, JsError>> + Send + 'static,
+        Make: FnOnce() -> (Sidecar, F),
+    {
+        let sink = self
+            .ctx()
+            .interp_mut()
+            .host_completion_sink()
+            .ok_or_else(|| {
+                JsError::Type(
+                    "async host completions are not available in this embedding".to_string(),
+                )
+            })?;
+        // Constructing or polling a future may start I/O or register reactor
+        // state. Reserve its terminal completion before either operation.
+        let admission = sink.admit().map_err(JsError::Type)?;
+        let (sidecar, future) = make();
         let mut pinned: Pin<Box<dyn Future<Output = Result<R, JsError>> + Send>> = Box::pin(future);
-        let sink = self.ctx().interp_mut().host_completion_sink();
         // Eager first poll: an immediately-ready future (a data-only
         // method) settles with no executor round-trip. Reactor-backed
         // futures need the executor's context to register wakers, so
@@ -270,27 +351,30 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                     ready = Some(result);
                 }
             };
-            match &sink {
-                Some(sink) => sink.with_executor_context(&mut poll_once),
-                None => poll_once(),
-            }
+            sink.with_executor_context(&mut poll_once);
         }
         if let Some(result) = ready {
-            return match result {
-                Ok(value) => {
-                    let out = value.into_js(self)?;
-                    self.promise_fulfilled(out)
-                }
+            let promise = match result {
+                Ok(value) => value
+                    .into_js(self)
+                    .and_then(|out| self.promise_fulfilled(out)),
                 Err(error) => {
-                    let reason = reject_reason(self, &error)?;
-                    self.promise_rejected(reason)
+                    reject_reason(self, &error).and_then(|reason| self.promise_rejected(reason))
                 }
             };
+            let outcome = if promise.is_ok() {
+                HostCompletionOutcome::Completed
+            } else {
+                HostCompletionOutcome::Failed
+            };
+            if let Err(error) = sink.finish_inline(admission, outcome) {
+                report_delivery_failure(&error);
+            }
+            return promise.map(|promise| (promise, sidecar));
         }
-        let (promise, completer) = self.promise_pending()?;
-        let sink = sink.expect("promise_pending succeeded, so the completion sink is installed");
+        let (promise, completer) = self.promise_pending_admitted(sink.clone(), admission)?;
         sink.spawn(Box::pin(drive(pinned, completer)));
-        Ok(promise)
+        Ok((promise, sidecar))
     }
 }
 

@@ -881,11 +881,9 @@ fn build_native<'scope>(
             // and only queried, never closed or duplicated here.
             let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
             let kind = nix::sys::socket::getsockopt(&borrowed, nix::sys::socket::sockopt::SockType);
-            let listening = nix::sys::socket::getsockopt(
-                &borrowed,
-                nix::sys::socket::sockopt::AcceptConn,
-            )
-            .unwrap_or(false);
+            let listening =
+                nix::sys::socket::getsockopt(&borrowed, nix::sys::socket::sockopt::AcceptConn)
+                    .unwrap_or(false);
             let _ = borrowed.as_raw_fd();
             let answer = match kind {
                 Ok(nix::sys::socket::SockType::Stream) if listening => 3,
@@ -1221,7 +1219,7 @@ fn adopt(
                         &reader_spawner,
                         NetEvent::Data {
                             connection: id,
-                            payload: bytes_to_latin1(&chunk[..length]),
+                            payload: chunk[..length].to_vec(),
                         },
                         RuntimeLiveness::Unref,
                     )
@@ -1617,7 +1615,7 @@ enum NetEvent {
     },
     Data {
         connection: u32,
-        payload: String,
+        payload: Vec<u8>,
     },
     Ended {
         connection: u32,
@@ -1651,8 +1649,16 @@ impl RuntimeTask for NetEvent {
 fn deliver(
     runtime: &mut Runtime,
     context: &RuntimeExecutionContext,
-    event: NetEvent,
+    mut event: NetEvent,
 ) -> Result<(), OtterError> {
+    // A read chunk reaches JS as the `ArrayBuffer` that owns its bytes, so the
+    // payload leaves the event before the borrowing match below: no encode to
+    // a latin1 string here and no decode back to a Buffer there, and the
+    // buffer costs one move rather than three passes over every byte.
+    let mut chunk = match &mut event {
+        NetEvent::Data { payload, .. } => Some(std::mem::take(payload)),
+        _ => None,
+    };
     runtime.run_native_event(context, |ctx| {
         ctx.scope(|mut scope| {
             let globals = scope.global_this();
@@ -1694,13 +1700,11 @@ fn deliver(
                     let message = scope.string(message)?;
                     (name, token, code, message)
                 }
-                NetEvent::Data {
-                    connection,
-                    payload,
-                } => {
+                NetEvent::Data { connection, .. } => {
                     let name = scope.string("data")?;
                     let connection = scope.number(f64::from(*connection));
-                    let payload = scope.string(payload)?;
+                    let payload =
+                        scope.array_buffer_from_bytes(chunk.take().unwrap_or_default())?;
                     let undefined = scope.undefined();
                     (name, connection, payload, undefined)
                 }
@@ -2052,10 +2056,6 @@ fn system_error_code(code: &'static str, syscall: &'static str) -> RuntimeNative
         dest: None,
         errno: 0,
     }
-}
-
-fn bytes_to_latin1(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| *byte as char).collect()
 }
 
 fn latin1_to_bytes(text: &str) -> Vec<u8> {

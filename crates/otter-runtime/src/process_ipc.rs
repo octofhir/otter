@@ -74,9 +74,9 @@ pub(crate) fn install(
             // protocol — as is what counts as a socket at all. Anything given
             // past the message goes there to be shaped and refused; the
             // channel only moves the result.
-            let carries = positional.iter().any(|slot| {
-                slot.is_some_and(|value| !scope.is_undefined(value))
-            });
+            let carries = positional
+                .iter()
+                .any(|slot| slot.is_some_and(|value| !scope.is_undefined(value)));
             let (text, handle, token) = if carries {
                 let send_handle = positional[0].unwrap_or_else(|| scope.undefined());
                 let options = positional[1].unwrap_or_else(|| scope.undefined());
@@ -169,8 +169,7 @@ pub(crate) fn install(
         reader.start_reading();
         Ok(Value::undefined())
     });
-    let start_reading =
-        scope.native_call("startReading", 0, NativeCall::Dynamic(start_reading))?;
+    let start_reading = scope.native_call("startReading", 0, NativeCall::Dynamic(start_reading))?;
     scope.define(
         process,
         CHANNEL_READ_SLOT,
@@ -309,7 +308,11 @@ fn prepare_send(
     // owns what it carried can be told once the message has gone.
     let token = scope.get(prepared, "token")?;
     let token = scope.number_value(token)? as u32;
-    Ok((scope.display_string(text), fd, (token != 0).then_some(token)))
+    Ok((
+        scope.display_string(text),
+        fd,
+        (token != 0).then_some(token),
+    ))
 }
 
 /// Where the module that owns handles hears that a message has gone.

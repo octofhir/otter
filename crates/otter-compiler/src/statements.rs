@@ -114,11 +114,11 @@ pub(crate) fn compile_tail_return(
 /// an `ExpressionStatement` whose value should propagate as the
 /// program's completion value; `None` otherwise.
 /// Emit the jump for a `break`/`continue` targeting `cx.loops[target_idx]`.
-/// When one or more `finally` blocks sit between the jump site and the
-/// target, emit [`Op::JumpViaFinally`] (which runs those blocks before
-/// jumping, popping the frame's try-handlers down to the target's
-/// `handler_floor`); otherwise a plain [`Op::Jump`]. Returns the
-/// instruction pc so the caller can register it for back-patching.
+/// When one or more handlers sit between the jump site and the target, emit
+/// [`Op::JumpViaFinally`]. It runs crossed `finally` blocks and also removes
+/// crossed catch-only handlers before jumping down to the target's exact
+/// `handler_floor`; otherwise emit a plain [`Op::Jump`]. Returns the instruction
+/// pc so the caller can register it for back-patching.
 fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -> u32 {
     // §14.15.3 — exiting a finally BODY abandons the completion that
     // finally parked; discard one entry per crossed body before the
@@ -133,10 +133,14 @@ fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -
             span,
         );
     }
+    let crossed_handlers = cx
+        .active_handlers
+        .saturating_sub(cx.loops[target_idx].handler_floor);
     let crossed_finally = cx
         .active_finally
         .saturating_sub(cx.loops[target_idx].finally_floor);
-    if crossed_finally > 0 {
+    debug_assert!(crossed_finally <= crossed_handlers);
+    if crossed_handlers > 0 {
         let floor = cx.loops[target_idx].handler_floor as i32;
         let pc = cx.next_pc();
         cx.emit(

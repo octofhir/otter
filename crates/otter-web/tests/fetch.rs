@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use otter_runtime::{
-    CapabilitySet, ConsoleLevel, ConsoleSink, Otter, OtterError, Permission, SourceInput,
+    CapabilityRequest, CapabilitySet, ConsoleLevel, ConsoleSink, Otter, OtterError, Permission,
+    RuntimeCapability, SourceInput, default_check_capability,
 };
 use otter_web::WebApiBuilderExt;
 
@@ -337,6 +338,141 @@ async fn fetch_redirect_manual_returns_response() -> Result<(), OtterError> {
     assert_eq!(
         capture.snapshot(),
         vec!["manual:302:http://127.0.0.1:9/next".to_string()]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_redirect_is_authorized_before_the_next_connection() -> Result<(), OtterError> {
+    let denied_listener = TcpListener::bind("127.0.0.1:0").expect("bind denied endpoint");
+    denied_listener
+        .set_nonblocking(true)
+        .expect("nonblocking denied endpoint");
+    let denied_url = format!(
+        "http://{}/denied",
+        denied_listener.local_addr().expect("denied addr")
+    );
+    let redirect_target = denied_url.clone();
+    let (initial_url, server) = spawn_one_shot(move |_request| {
+        format!("HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\n\r\n")
+    });
+    let parsed_initial = url::Url::parse(&initial_url).expect("initial URL");
+    let initial_authority = format!(
+        "{}:{}",
+        parsed_initial.host_str().expect("initial host"),
+        parsed_initial.port().expect("initial port")
+    );
+    let mut capabilities = CapabilitySet::sandbox();
+    capabilities.net = Permission::allow([initial_authority]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let hook_calls = calls.clone();
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(capabilities)
+        .capability_hook(
+            move |capabilities: &CapabilitySet,
+                  capability: RuntimeCapability,
+                  request: &CapabilityRequest<'_>| {
+                if let CapabilityRequest::Network { url, initiator } = request {
+                    hook_calls
+                        .lock()
+                        .expect("hook calls")
+                        .push((url.to_string(), initiator.map(url::Url::to_string)));
+                }
+                default_check_capability(capabilities, capability, request)
+            },
+        )
+        .console_sink(capture.clone())
+        .build()?;
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(format!(
+                r#"
+                fetch("{initial_url}")
+                  .then(() => console.log("resolved"))
+                  .catch((error) => console.log("rejected:" + (error instanceof TypeError)));
+                "#
+            )),
+            "<fetch-redirect-capability>",
+        )
+        .await?;
+    server.join().expect("redirect server thread");
+    assert_eq!(capture.snapshot(), vec!["rejected:true".to_string()]);
+    assert_eq!(
+        calls.lock().expect("hook calls").as_slice(),
+        &[
+            (initial_url.clone(), None),
+            (denied_url.clone(), Some(initial_url)),
+        ]
+    );
+    match denied_listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("denied redirect endpoint observed a connection"),
+        Err(error) => panic!("denied endpoint accept failed: {error}"),
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_follows_allowed_redirect_and_reports_final_url() -> Result<(), OtterError> {
+    let (final_url, final_server) = spawn_one_shot(|_request| {
+        let body = "redirected fetch";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    });
+    let redirect_target = final_url.clone();
+    let (initial_url, redirect_server) = spawn_one_shot(move |_request| {
+        format!("HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\n\r\n")
+    });
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let hook_calls = calls.clone();
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(allow_net())
+        .capability_hook(
+            move |capabilities: &CapabilitySet,
+                  capability: RuntimeCapability,
+                  request: &CapabilityRequest<'_>| {
+                if let CapabilityRequest::Network { url, initiator } = request {
+                    hook_calls
+                        .lock()
+                        .expect("hook calls")
+                        .push((url.to_string(), initiator.map(url::Url::to_string)));
+                }
+                default_check_capability(capabilities, capability, request)
+            },
+        )
+        .console_sink(capture.clone())
+        .build()?;
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(format!(
+                r#"
+                fetch("{initial_url}")
+                  .then((response) => response.text().then((text) =>
+                    console.log("followed:" + response.url + ":" + text)
+                  ))
+                  .catch((error) => console.log("err:" + error));
+                "#
+            )),
+            "<fetch-redirect-follow>",
+        )
+        .await?;
+    redirect_server.join().expect("redirect server thread");
+    final_server.join().expect("final server thread");
+    assert_eq!(
+        capture.snapshot(),
+        vec![format!("followed:{final_url}:redirected fetch")]
+    );
+    assert_eq!(
+        calls.lock().expect("hook calls").as_slice(),
+        &[(initial_url.clone(), None), (final_url, Some(initial_url)),]
     );
     Ok(())
 }

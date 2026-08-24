@@ -171,13 +171,12 @@ pub trait ReleaseHostRefs: SafeTraceable {
 }
 
 /// Restore-time hook for bodies that own storage outside the heap.
-/// A restored page carries the capture isolate's malloc pointers and
-/// vtables verbatim; dereferencing any of them in another process is
-/// unsound — including from the body's own trace impl during the
-/// restore's relocation walk. The restore invokes this on every such
-/// body BEFORE its first trace; the implementation must overwrite the
-/// foreign fields (`std::ptr::write` — no drop, no read through the
-/// old values) with owned, process-local state.
+/// A restored page carries the source isolate's malloc pointers and vtables
+/// verbatim. Even in the same process, the copied body would become a second
+/// owner, so dereferencing or dropping those fields is unsound. The restore
+/// invokes this on every such body BEFORE its first trace; the implementation
+/// must overwrite the foreign fields (`std::ptr::write` — no drop, no read
+/// through the old values) with independently owned state.
 pub trait SeverRestoredPayload: SafeTraceable {
     /// Replace every foreign-owned field with process-local state.
     fn sever_restored_payload(&mut self);
@@ -406,8 +405,8 @@ impl TraceTable {
     /// A GC body needs dropping exactly when it owns something the heap
     /// does not — a `Vec`, a `Box`, an `Arc`, a hash table. That makes
     /// this the completeness check the slot walk cannot do: a field with
-    /// no GC handles in it still holds a buffer a page image cannot
-    /// carry, and a restored copy would be its second owner.
+    /// no GC handles in it still holds a buffer an opaque page image cannot
+    /// duplicate without a sever/rebuild contract.
     #[inline]
     #[must_use]
     pub fn owns_outside_storage(&self, tag: u8) -> bool {

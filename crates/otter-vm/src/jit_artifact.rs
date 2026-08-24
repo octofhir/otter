@@ -123,7 +123,7 @@ pub struct JitArtifactMetadata {
     pub module: String,
     /// Isolate-assigned code-object identity.
     pub code_object_id: u64,
-    /// Entry or loop-OSR compile target.
+    /// Entry request or loop header that triggered this whole-body compile.
     pub entry: JitDebugTarget,
     /// Encoded bytecode size.
     pub bytecode_bytes: u64,

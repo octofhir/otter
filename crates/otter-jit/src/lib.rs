@@ -137,8 +137,8 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         entry::runtime_stub_bindings()
     }
 
-    // The baseline tier serves OSR requests too: it builds a loop-header
-    // OSR trampoline per back-edge target, so a hot loop with an opcode
+    // The baseline tier serves OSR requests too: every whole-function body
+    // contains one OSR trampoline per verified back-edge target, so a hot loop with an opcode
     // outside the compiled subset still tiers up to a native loop body
     // instead of interpreting.
     fn compile_function(
@@ -186,6 +186,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 artifact: output.artifact,
                 diagnostics: output.diagnostics,
             }),
+            Err(Unsupported::Backend(_)) => Ok(otter_vm::JitCompileStatus::Unavailable),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in template subset: {reason:?}"),
             }),

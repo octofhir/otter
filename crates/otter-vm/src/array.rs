@@ -461,15 +461,9 @@ fn trace_array_symbol_accessors(
 }
 
 impl ArrayExoticSlots {
-    /// Sever foreign ownership after a snapshot restore: every
-    /// container is re-read out of the aliased storage into a fresh
-    /// allocation and written back without dropping the alias.
-    /// Whether every container is absent — the state a snapshot can
-    /// carry. The capture refuses an image whose array sidecars hold
-    /// content, because [`Self::sever_restored_payload`] drops it.
-    /// The serializable slice of this sidecar: per-key descriptor
-    /// flags as `(key, writable, enumerable, configurable)`. Every
-    /// other container must be empty for a snapshot
+    /// Capture the sidecar's rebuildable per-key descriptor flags as
+    /// `(key, writable, enumerable, configurable)`. Every other container must
+    /// be empty for an opaque snapshot
     /// ([`Self::is_empty_for_snapshot`] modulo this one).
     pub(crate) fn snapshot_property_flags(&self) -> Vec<(String, bool, bool, bool)> {
         self.property_flags
@@ -532,11 +526,10 @@ impl ArrayExoticSlots {
 }
 
 impl otter_gc::trace::SeverRestoredPayload for ArrayExoticSlots {
-    /// Sever foreign ownership on a snapshot restore. The containers
-    /// alias the capture isolate's mallocs — unreadable in another
-    /// process, so they are overwritten with `None` without being read
-    /// or dropped. The capture side guarantees they were empty
-    /// ([`Self::is_empty_for_snapshot`]).
+    /// Sever foreign ownership on a snapshot restore. The copied containers
+    /// alias the source isolate's mallocs and would be second owners, so they
+    /// are overwritten with `None` without being read or dropped. The capture
+    /// side guarantees they were empty ([`Self::is_empty_for_snapshot`]).
     fn sever_restored_payload(&mut self) {
         // SAFETY: overwriting without dropping (or reading) severs the
         // alias; the capture isolate remains the owner.
@@ -556,9 +549,8 @@ impl otter_gc::SafeTraceable for ArrayExoticSlots {
     const TYPE_TAG: u8 = ARRAY_EXOTIC_SLOTS_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
-        // Mutable visits throughout: the mutable value trace normalizes
-        // a restored value's cage prefix in place, so a cross-process
-        // snapshot restore re-homes every slot on its relocation walk.
+        // Mutable visits throughout so moving collections and page-image
+        // relocation can rewrite every slot in place.
         if let Some(sparse) = &mut self.sparse_elements {
             for value in sparse.values_mut() {
                 value.trace_value_slot_mut(visitor);

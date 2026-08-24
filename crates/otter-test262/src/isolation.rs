@@ -30,9 +30,8 @@ use std::time::{Duration, Instant};
 
 use otter_runtime::{
     ExecutionResult, InterruptHandle, JitSelection, OtterError, Runtime, RuntimeExtensionInstaller,
-    SnapshotRuntimeOptions, SourceInput,
+    RuntimeSnapshot, SnapshotRuntimeOptions, SourceInput,
 };
-use otter_vm::snapshot::IsolateSnapshot;
 
 /// Build a fresh runtime with the configured per-test caps.
 ///
@@ -62,7 +61,7 @@ pub fn fresh_runtime(
 /// freeze its heap. Every restored isolate shares the image
 /// read-only, so the per-test cost drops from a full bootstrap to a
 /// page restore.
-pub fn capture_snapshot_donor(jit_selection: JitSelection) -> Result<IsolateSnapshot, OtterError> {
+pub fn capture_snapshot_donor(jit_selection: JitSelection) -> Result<RuntimeSnapshot, OtterError> {
     let donor = fresh_runtime(Duration::ZERO, 0, false, jit_selection)?;
     donor
         .capture_isolate_snapshot()
@@ -75,7 +74,7 @@ pub fn capture_snapshot_donor(jit_selection: JitSelection) -> Result<IsolateSnap
 /// Restore a per-test runtime from `snapshot` with the same knobs
 /// [`fresh_runtime`] applies to a bootstrapped one.
 pub fn snapshot_runtime(
-    snapshot: &IsolateSnapshot,
+    snapshot: &RuntimeSnapshot,
     timeout: Duration,
     max_heap_bytes: u64,
     allow_blocking_atomics_wait: bool,
@@ -88,6 +87,7 @@ pub fn snapshot_runtime(
             max_heap_bytes,
             allow_blocking_atomics_wait,
             jit_selection,
+            ..SnapshotRuntimeOptions::default()
         },
     )
 }

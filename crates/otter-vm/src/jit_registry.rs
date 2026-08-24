@@ -1131,7 +1131,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         let target_value = crate::Value::object(target);
         let prototype_value = crate::Value::object(prototype);
         let mut stack = crate::activation_stack::ActivationStack::new();

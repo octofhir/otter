@@ -72,7 +72,6 @@ fn proxy_details(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     })
 }
 
-
 /// `ownNonIndexKeys(value)` — the own string keys of a byte view that are
 /// not element indices, or `undefined` when the value is not one.
 ///

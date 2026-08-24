@@ -136,7 +136,7 @@ impl RuntimeModuleRecords {
                 specifier: "<hosted-namespace-root>".to_string(),
                 message: format!("{error:?}"),
             })?;
-            Some(interp.link_module(empty))
+            Some(interp.link_module(empty)?)
         } else {
             None
         };

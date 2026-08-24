@@ -192,7 +192,7 @@ pub struct TestResult {
 /// because the worker loop is single-threaded and clones per
 /// [`ExecConfig`]; the image itself is immutable after capture.
 #[derive(Clone)]
-pub struct SharedSnapshot(pub std::rc::Rc<otter_vm::snapshot::IsolateSnapshot>);
+pub struct SharedSnapshot(pub std::rc::Rc<otter_runtime::RuntimeSnapshot>);
 
 impl std::fmt::Debug for SharedSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

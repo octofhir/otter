@@ -2,9 +2,9 @@
 //!
 //! [`crate::snapshot::HeapSnapshot`] answers "what is reachable and
 //! what does it retain"; this module answers the cheaper, flatter
-//! question a snapshot writer needs first: **which pages hold which
-//! objects, and how many bytes of each type sit in old space once a
-//! runtime has finished building its API surface**. It is a linear
+//! question used by diagnostics and in-process image sizing: **which pages
+//! hold which objects, and how many bytes of each type sit in old space once
+//! a runtime has finished building its API surface**. It is a linear
 //! walk of the page payloads with no graph construction, so it can
 //! run on a fully-built runtime without perturbing it.
 //!
@@ -25,8 +25,7 @@
 //! - Free-space fillers ([`crate::header::FREE_TAG`]) are counted as
 //!   `filler_bytes`, never as live objects; swept and forwarded
 //!   headers are skipped entirely. A census therefore reports the
-//!   set a snapshot writer would have to dump, not the raw page
-//!   extent.
+//!   set an opaque image would retain, not the raw page extent.
 //! - `object_count` and `live_bytes` equal the sums over `rows`.
 //! - Rows are sorted by descending `bytes`, ties broken by ascending
 //!   tag, so the rendered table is stable across runs.
@@ -82,19 +81,10 @@ pub struct SpaceCensus {
     pub rows: Vec<TagRow>,
 }
 
-impl SpaceCensus {
-    /// Bytes the space would have to dump into a snapshot blob:
-    /// live bodies only.
-    #[must_use]
-    pub fn dumpable_bytes(&self) -> u64 {
-        self.live_bytes
-    }
-}
-
 /// Whole-heap census, one entry per space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeapCensus {
-    /// Old generation — the set a bootstrap snapshot dumps.
+    /// Old generation — the set an opaque in-process image captures.
     pub old: SpaceCensus,
     /// Young generation from-space.
     pub young: SpaceCensus,

@@ -1144,6 +1144,7 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+        .expect("valid bytecode fixture")
     }
 
     #[test]
@@ -1232,7 +1233,8 @@ mod tests {
                 constants: Vec::new(),
                 module_resolutions: Vec::new(),
                 module_inits: Vec::new(),
-            });
+            })
+            .expect("valid bytecode fixture");
         let result = interp
             .add_value(&mut stack, &context, lhs, Value::number_i32(7))
             .expect("string addition");

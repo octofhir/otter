@@ -8,17 +8,17 @@
 //! is neither pages nor roots nor keyed state is a cache, and caches
 //! start empty: the shape runtime's side tables refill on use (only
 //! its id registry is re-populated from the restored shape bodies),
-//! and the realm's typed intrinsic slots are re-primed from the
-//! restored global graph by the same `prime_realm_caches` the ordinary
-//! constructor runs.
+//! while realm intrinsics, iterator prototypes, and function-kind
+//! prototypes are installed from captured, relocated roots without
+//! allocating against the restored heap.
 //!
 //! # Invariants
 //!
-//! - In-process only for now: static native bodies carry entry
+//! - In-process only: static native bodies carry entry
 //!   addresses verbatim (valid within the process), the code space is
 //!   shared by `Arc`, and dynamic closures are Arc-clones at their
-//!   captured host-ref indices. The cross-build path adds external-ref
-//!   resolution and the re-install-by-name list on top of this.
+//!   captured host-ref indices. No byte decoder or cross-process restore
+//!   path exists.
 //! - The fixed root walk must consume exactly the captured sequence;
 //!   a length mismatch is a layout drift between capture and restore
 //!   builds and panics rather than mis-rooting.
@@ -26,11 +26,31 @@
 //! # See also
 //!
 //! - `crate::snapshot` — the capture half.
-//! - `scratchpad/PLAN_BOOTSTRAP_SNAPSHOT.md` — S3/S4.
+//! - `otter-gc/src/heap_image.rs` — the unsafe low-level page operation whose
+//!   capture provenance this safe wrapper establishes.
 
 use crate::snapshot::IsolateSnapshot;
 use crate::{Interpreter, object, symbol::SymbolRegistry};
 use otter_gc::raw::RawGc;
+
+fn relocate_object_roots<const N: usize>(
+    relocation: &otter_gc::Relocation,
+    captured_roots: &[RawGc; N],
+) -> Result<[Option<object::JsObject>; N], otter_gc::ImageError> {
+    let mut restored = [None; N];
+    for (slot, captured) in restored.iter_mut().zip(captured_roots.iter().copied()) {
+        if captured.is_null() {
+            continue;
+        }
+        let relocated = relocation
+            .relocate_raw(captured)
+            .ok_or(otter_gc::ImageError::DanglingSlot { offset: captured.0 })?;
+        // SAFETY: the opaque snapshot arrays are populated only from
+        // `JsObject` fields, and relocation preserves each body type.
+        *slot = Some(unsafe { object::JsObject::from_offset(relocated.0) });
+    }
+    Ok(restored)
+}
 
 impl Interpreter {
     /// Build an interpreter from `snapshot` without running the
@@ -55,20 +75,25 @@ impl Interpreter {
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)
             .expect("GcHeap construction never fails on the default cage");
         object::register_gc_traceables(&mut gc_heap);
-        // Before anything can mint a shape id in this process: freshly
-        // minted ids must never collide with the ids the image's shapes
-        // and dictionary objects already carry.
+        // SAFETY: `IsolateSnapshot` has no public constructor or mutable raw
+        // fields and is produced only by this VM's same-process capture path.
+        // The trace/sever registrations above are the same registrations used
+        // by the source interpreter.
+        let relocation = unsafe { gc_heap.restore_old_space(&snapshot.image) }?;
+        let iterator_prototype_roots =
+            relocate_object_roots(&relocation, &snapshot.iterator_prototype_roots)?;
+        let function_kind_prototypes =
+            crate::function_kind::FunctionKindPrototypes::from_snapshot_roots(
+                relocate_object_roots(&relocation, &snapshot.function_kind_prototype_roots)?,
+            );
+        // No shell construction above mints object shapes. Publish the donor's
+        // id floor only after page admission succeeds so a failed restore has
+        // no process-global side effect, and before any later code can mint a
+        // shape that would collide with restored bodies.
         object::bump_next_shape_id_to(snapshot.next_shape_id);
-        let relocation = gc_heap.restore_old_space(&snapshot.image)?;
-        // Same indices, current addresses: every captured entry slides
-        // by however far the loader moved the binary image (zero for an
-        // in-process restore).
-        gc_heap.restore_external_refs(
-            snapshot
-                .external_ref_addrs
-                .iter()
-                .map(|&addr| relocation.slide_image_pointer(addr)),
-        );
+        // Static entry points are process-local addresses. Rebuild the table at
+        // identical indices without translating them.
+        gc_heap.restore_external_refs(snapshot.external_ref_addrs.iter().copied());
 
         // Keyed side state that other shells depend on.
         let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
@@ -99,6 +124,7 @@ impl Interpreter {
             array_index_accessor_protector: false,
             array_index_accessor_protector_epoch: 0,
             interrupt: crate::InterruptFlag::new(),
+            atomics_wait_agent: crate::atomics_wait::WaitAgent::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space: std::sync::Arc::clone(&snapshot.code_space),
@@ -148,13 +174,15 @@ impl Interpreter {
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: Self::JIT_OSR_THRESHOLD,
             jit_code: rustc_hash::FxHashMap::default(),
+            jit_template_entry_retry_remaining: rustc_hash::FxHashMap::default(),
+            jit_template_osr_fids: rustc_hash::FxHashSet::default(),
+            jit_template_compiling: rustc_hash::FxHashSet::default(),
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
             jit_optimized_bail_pcs: std::collections::BTreeMap::new(),
             jit_optimized_bail_counts: rustc_hash::FxHashMap::default(),
             jit_optimized_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
-            jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_runtime_stats: crate::JitRuntimeStats::default(),
@@ -206,17 +234,21 @@ impl Interpreter {
             timer_callbacks: crate::timers::TimerCallbacks::new(),
             dynamic_import_loader: None,
             dynamic_import_registry: crate::dynamic_import::DynamicImportRegistry::new(),
-            array_iterator_prototype: crate::gc_trace::RootCell::new(None),
-            map_iterator_prototype: crate::gc_trace::RootCell::new(None),
-            set_iterator_prototype: crate::gc_trace::RootCell::new(None),
-            string_iterator_prototype: crate::gc_trace::RootCell::new(None),
-            regexp_string_iterator_prototype: crate::gc_trace::RootCell::new(None),
-            iterator_helper_prototype: crate::gc_trace::RootCell::new(None),
-            wrap_for_valid_iterator_prototype: crate::gc_trace::RootCell::new(None),
-            default_realm_iterator_prototypes: std::array::from_fn(|_| {
-                crate::gc_trace::RootCell::new(None)
+            array_iterator_prototype: crate::gc_trace::RootCell::new(iterator_prototype_roots[0]),
+            map_iterator_prototype: crate::gc_trace::RootCell::new(iterator_prototype_roots[1]),
+            set_iterator_prototype: crate::gc_trace::RootCell::new(iterator_prototype_roots[2]),
+            string_iterator_prototype: crate::gc_trace::RootCell::new(iterator_prototype_roots[3]),
+            regexp_string_iterator_prototype: crate::gc_trace::RootCell::new(
+                iterator_prototype_roots[4],
+            ),
+            iterator_helper_prototype: crate::gc_trace::RootCell::new(iterator_prototype_roots[5]),
+            wrap_for_valid_iterator_prototype: crate::gc_trace::RootCell::new(
+                iterator_prototype_roots[6],
+            ),
+            default_realm_iterator_prototypes: std::array::from_fn(|index| {
+                crate::gc_trace::RootCell::new(iterator_prototype_roots[7 + index])
             }),
-            function_kind_prototypes: crate::function_kind::FunctionKindPrototypes::default(),
+            function_kind_prototypes,
             cold_frames: crate::cold_frame::ColdFramePool::new(),
             realm_intrinsics: crate::realm_intrinsics::RealmIntrinsics::default(),
             regex_compile_cache: crate::regexp::RegexCompileCache::default(),
@@ -313,28 +345,6 @@ impl Interpreter {
             }
         }
 
-        // Native entry points are binary-image addresses; slide each one
-        // by the loader's image move. In-process the slide is zero and
-        // the pass rewrites nothing.
-        let slide = relocation.image_pointer_slide();
-        if slide != 0 {
-            let mut natives: Vec<*mut crate::native_function::NativeFunctionBody> = Vec::new();
-            interp
-                .gc_heap
-                .for_each_live_payload::<crate::native_function::NativeFunctionBody, _>(
-                    |_space, body| {
-                        natives.push(body as *const _ as *mut _);
-                    },
-                );
-            // SAFETY: single mutator, no allocation between collect and
-            // write; each pointer names a live payload of its type.
-            unsafe {
-                for body in natives {
-                    (*body).slide_entry_points(slide);
-                }
-            }
-        }
-
         // Re-register every restored shape body under its id; the other
         // shape-runtime tables are lookup caches that refill on use.
         let mut restored_shapes: Vec<(crate::object::ShapeId, object::ShapeHandle)> = Vec::new();
@@ -354,9 +364,37 @@ impl Interpreter {
             interp.shape_runtime.register_restored_shape(id, handle);
         }
 
-        // Prime the realm's typed caches from the restored global graph.
-        interp.prime_realm_caches();
         interp.gc_heap.set_tenure_all(false);
         Ok(interp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Interpreter;
+
+    #[test]
+    fn exact_image_cap_restore_does_not_allocate_or_panic() {
+        let source = Interpreter::new();
+        let snapshot = source
+            .capture_isolate_snapshot()
+            .expect("fresh isolate must be capturable");
+        let exact_cap = snapshot.image.live_bytes();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Interpreter::from_isolate_snapshot_capped(&snapshot, exact_cap)
+        }));
+        let restored = result
+            .expect("restore at the exact image cap must not panic")
+            .expect("the image itself fits the exact cap");
+
+        assert!(restored.array_iterator_prototype.get().is_some());
+        assert!(
+            restored
+                .function_kind_prototypes
+                .snapshot_roots()
+                .iter()
+                .all(|root| !root.is_null())
+        );
     }
 }

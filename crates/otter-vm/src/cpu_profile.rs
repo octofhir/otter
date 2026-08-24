@@ -91,6 +91,20 @@ impl CpuProfiler {
         self.time_deltas_us.push(delta);
     }
 
+    /// Hand back everything sampled so far and keep sampling.
+    ///
+    /// A long run reports through several [`crate::ExecutionResult`]s (module
+    /// evaluation, then the drained event loop); draining lets each of them
+    /// carry its share without uninstalling the sampler mid-run.
+    #[must_use]
+    pub(crate) fn drain(&mut self) -> CpuProfile {
+        CpuProfile {
+            interval: self.interval,
+            samples: std::mem::take(&mut self.samples),
+            time_deltas_us: std::mem::take(&mut self.time_deltas_us),
+        }
+    }
+
     /// Consume the sampler and return the owned profile.
     #[must_use]
     pub(crate) fn finish(self) -> CpuProfile {

@@ -1,10 +1,9 @@
 //! Isolate-local table of external (non-GC) references held by heap bodies.
 //!
-//! Some bodies point at things the collector does not own and cannot
-//! move: Rust function entry addresses, most of all. Those addresses
-//! differ per build and per process (ASLR), so a body that stores one
-//! raw cannot be written to a page dump and read back in another
-//! process.
+//! Some bodies point at things the collector does not own and cannot move:
+//! Rust function entry addresses, most of all. An opaque in-process heap image
+//! stores only their dense indices and shares the exact address list; no raw
+//! address is serialized or accepted from bytes.
 //!
 //! This table gives every such address a small, dense, isolate-local
 //! index. A body stores the index; the address is looked up here when
@@ -96,18 +95,9 @@ impl ExternalRefTable {
         self.addrs.get(index as usize - 1).copied()
     }
 
-    /// Every interned address in index order (index `i + 1` holds
-    /// `addrs()[i]`). This is the list a snapshot serializes; a
-    /// restore feeds it back through [`Self::restore_from_addrs`]
-    /// after sliding each address by the loader's image move.
-    #[must_use]
-    pub fn addrs(&self) -> &[usize] {
-        &self.addrs
-    }
-
-    /// Rebuild the table from a serialized address list, preserving
-    /// indices. The table must be empty — restore precedes any
-    /// interning in a restored isolate.
+    /// Rebuild the table from a same-process captured address list, preserving
+    /// indices. The table must be empty — restore precedes any interning in a
+    /// restored isolate.
     ///
     /// # Panics
     /// When the table already holds entries; that is a caller

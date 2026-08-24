@@ -1415,17 +1415,43 @@ impl Interpreter {
                         }
                     }
                 } else if let Some(loader) = self.dynamic_import_loader.clone() {
-                    let pending =
-                        promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                            .pending_stack_rooted(self, stack, &[], &[])?;
-                    let token = self.dynamic_import_registry.insert(
-                        pending,
-                        import_context.clone(),
-                        self.active_realm_id,
-                    );
-                    self.record_runtime_host_op_enqueued();
-                    loader.schedule(token, specifier, referrer.clone());
-                    pending
+                    match loader.admit() {
+                        Err(error) => {
+                            let reason = self.make_type_error_with_stack_roots(
+                                stack,
+                                &format!("dynamic import: {error}"),
+                            )?;
+                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
+                                .rejected_stack_rooted(self, stack, reason, &[], &[])?
+                        }
+                        Ok(admission) => {
+                            let pending = promise_dispatch::PromiseBuilder::with_context(
+                                import_context.clone(),
+                            )
+                            .pending_stack_rooted(
+                                self,
+                                stack,
+                                &[],
+                                &[],
+                            )?;
+                            let token = self.dynamic_import_registry.insert(
+                                pending,
+                                import_context.clone(),
+                                self.active_realm_id,
+                            );
+                            match loader.schedule(admission, token, specifier, referrer.clone()) {
+                                Ok(()) => self.record_runtime_host_op_enqueued(),
+                                Err(error) => {
+                                    let reason = self.make_type_error_with_stack_roots(
+                                        stack,
+                                        &format!("dynamic import: {error}"),
+                                    )?;
+                                    let _ = self.settle_dynamic_import_inner(token, Err(reason));
+                                }
+                            }
+                            pending
+                        }
+                    }
                 } else {
                     let reason = self.make_type_error_with_stack_roots(
                         stack,

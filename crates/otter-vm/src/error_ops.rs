@@ -713,9 +713,7 @@ pub(crate) fn native_to_vm_error_with_stack(
         NativeError::Error { message } => {
             native_spec_error(interp, stack, ErrorKind::Error, message)
         }
-        NativeError::SpecError { kind, message } => {
-            native_spec_error(interp, stack, kind, message)
-        }
+        NativeError::SpecError { kind, message } => native_spec_error(interp, stack, kind, message),
         NativeError::Coded {
             kind,
             code,

@@ -1934,28 +1934,11 @@ impl Value {
             debug_assert_eq!(
                 self.0 >> 32,
                 (otter_gc::cage_base() as u64) >> 32,
-                "trace_value_slots: cell bits {:#x} have a non-cage high word — a foreign 8-byte pointer (Arc/Box) is being traced as a Value, or a restored value bypassed the mutable trace path",
+                "trace_value_slots: cell bits {:#x} have a non-cage high word — a foreign 8-byte pointer (Arc/Box) is being traced as a Value",
                 self.0,
             );
             let slot = &self.0 as *const u64 as *mut otter_gc::raw::RawGc;
             visitor(slot);
-        }
-    }
-
-    /// Rewrite this cell value's high word to the current cage prefix.
-    ///
-    /// A heap-cell `Value` stores `cage_base + offset`; the prefix is a
-    /// per-process constant, so a snapshot restored in another process
-    /// carries the capture process's prefix in every 8-byte value slot.
-    /// The relocation walk (and every later trace) funnels body slots
-    /// through the mutable visitor, so normalizing here re-homes each
-    /// restored value exactly once — the branch never fires outside a
-    /// restore.
-    #[inline]
-    fn normalize_cage_prefix(&mut self) {
-        let current = (otter_gc::cage_base() as u64) >> 32;
-        if self.0 >> 32 != current {
-            self.0 = (current << 32) | (self.0 & 0xffff_ffff);
         }
     }
 
@@ -1987,7 +1970,12 @@ impl Value {
     /// Visit this value as an explicitly mutable root slot.
     pub(crate) fn trace_value_slot_mut(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if is_cell_bits(self.0) {
-            self.normalize_cage_prefix();
+            debug_assert_eq!(
+                self.0 >> 32,
+                (otter_gc::cage_base() as u64) >> 32,
+                "trace_value_slot_mut: cell bits {:#x} have a non-cage high word",
+                self.0,
+            );
             let slot = &mut self.0 as *mut u64 as *mut otter_gc::raw::RawGc;
             visitor(slot);
         }

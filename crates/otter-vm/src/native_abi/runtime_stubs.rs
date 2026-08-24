@@ -958,7 +958,6 @@ pub const STUB_JIT_BIND_FUNCTION: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
-
 /// Complete the exact published object property-protocol operation from two
 /// boxed values. Function/PC identity selects `instanceof`, `in`,
 /// `[[GetPrototypeOf]]`, or `[[SetPrototypeOf]]`; Proxy traps and
@@ -1109,7 +1108,6 @@ pub const STUB_JIT_STATIC_CALL_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
     NativeResultDomain::None,
 );
-
 
 /// Completes spread calls/constructions, explicit-receiver calls, generic
 /// method-call misses, and `CollectArguments` through the VM's synchronous
@@ -1383,7 +1381,6 @@ pub const STUB_JIT_CLASS_SUPER_CONSTRUCTOR: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::ValueWord,
     NativeResultDomain::None,
 );
-
 
 /// Copy the dense values collected for one spread construct into the
 /// parameter prefix of an unpublished stack-owned callee frame.

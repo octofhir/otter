@@ -112,10 +112,6 @@ WeakMap w.c function
 WeakRef w.c function
 WeakSet w.c function
 Worker w.c function
-__otter_worker_drain w.c function
-__otter_worker_post_message w.c function
-__otter_worker_spawn w.c function
-__otter_worker_terminate w.c function
 clearImmediate w.c function
 clearInterval w.c function
 clearTimeout w.c function

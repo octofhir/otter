@@ -13,6 +13,8 @@
 //!   spans, and constants index.
 //! - [`BytecodeModule`] — top-level container the compiler emits and
 //!   the VM consumes.
+//! - [`VerifiedBytecodeModule`] — immutable admission proof carried by caches
+//!   into the VM.
 //! - [`disasm`] — text disassembler for CLI/debug output.
 //! - [`dump`] — JSON dump for tooling and tests.
 //! - [`opcode_schema`] — declarative opcode identity, wire-format, conservative
@@ -23,9 +25,9 @@
 //!   inside [`Function::spans`] are sorted by logical PC.
 //! - Decoded [`Instruction`] values and byte PCs never enter the hot execution
 //!   representation.
-//! - The VM verifies and translates compiler wordcode once into its own
-//!   execution records; this crate does not prescribe the interpreter's hot
-//!   layout.
+//! - Compiler output is verified once at final VM admission; decoded cache
+//!   artifacts retain the same proof through translation into VM execution
+//!   records.
 //! - Mnemonics are `SCREAMING_SNAKE_CASE` and match the strings the
 //!   disassembler emits.
 //! - Opcode byte assignments have one source in [`opcode_schema`]; encoding
@@ -41,7 +43,13 @@ pub mod encoding;
 pub mod method_id;
 pub mod opcode_audit;
 pub mod opcode_schema;
+pub mod verifier;
 pub mod wordcode;
+
+pub use verifier::{
+    BytecodeConstantKind, BytecodeRebaseError, BytecodeVerifyError, VerifiedBytecodeModule,
+    VerifiedFunction, verify_module, verify_module_at_base,
+};
 
 pub use wordcode::{
     FunctionCode, FunctionCodeBuilder, Instruction as WordInstruction,

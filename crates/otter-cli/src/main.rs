@@ -1185,23 +1185,10 @@ async fn run_file_with_cwd(
     // detection is AST-based (see `Otter::run_file` for the
     // shared helper used in the embedder Layer-A path).
     //
-    if let Some(profile) = cpu_profile {
-        return run_file_with_cpu_profile(
-            path,
-            args,
-            process_cwd,
-            json,
-            caps,
-            execution,
-            startup_timer,
-            profile,
-            max_heap_bytes,
-        )
-        .await;
-    }
     let mut builder = cli_otter_builder(caps, execution)
         .process_argv(process_argv_for_file(path, args))
-        .module_loader(cli_loader_config_for_entry(path).await);
+        .module_loader(cli_loader_config_for_entry(path).await)
+        .cpu_profile_interval(cpu_profile.map(|profile| profile.interval));
     if let Some(bytes) = max_heap_bytes {
         builder = builder.max_heap_bytes(bytes);
     }
@@ -1226,14 +1213,23 @@ async fn run_file_with_cwd(
     };
     startup_timer.mark("runtime_run_file");
     emit_otter_stats_if_requested(&result);
+    let profile_artifacts = match cpu_profile {
+        Some(options) => Some(report_cpu_profile(path, &result, options)?),
+        None => None,
+    };
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "completion": result.completion_string(),
-                "exitCode": result.exit_code()
-            })
-        );
+        let mut payload = serde_json::json!({
+            "completion": result.completion_string(),
+            "exitCode": result.exit_code()
+        });
+        if let Some((artifacts, samples)) = &profile_artifacts {
+            payload["cpuProfile"] = serde_json::json!({
+                "cpuprofile": artifacts.cpuprofile,
+                "folded": artifacts.folded,
+                "samples": samples,
+            });
+        }
+        println!("{payload}");
     }
     let code = result.exit_code();
     // The process is exiting; freeing the multi-MB GC heap and unwinding every
@@ -1247,68 +1243,26 @@ async fn run_file_with_cwd(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_file_with_cpu_profile(
-    path: &std::path::Path,
-    args: &[String],
-    process_cwd: Option<&Path>,
-    json: bool,
-    caps: &CapabilitySet,
-    execution: &CliExecutionConfig,
-    startup_timer: &CliStartupTimer,
-    profile_options: &CpuProfileOptions,
-    max_heap_bytes: Option<u64>,
-) -> Result<ExitCode, OtterError> {
-    let builder = otter_runtime::Runtime::builder()
-        .capabilities(caps.clone())
-        .with_node_apis()
-        .with_otter_modules()
-        .with_web_apis()
-        .snapshot_cache(true)
-        .process_argv(process_argv_for_file(path, args))
-        .module_loader(cli_loader_config_for_entry(path).await);
-    let mut builder = execution.apply_runtime_builder(builder);
-    if let Some(bytes) = max_heap_bytes {
-        builder = builder.max_heap_bytes(bytes);
-    }
-    if let Some(cwd) = process_cwd {
-        builder = builder.process_cwd(cwd.to_path_buf());
-    }
-    let mut runtime = builder.build()?;
-    startup_timer.mark("runtime_build");
-    runtime.enable_cpu_profiler(profile_options.interval);
-    let attempt = runtime.run_file_with_diagnostics(path);
-    let result = finish_jit_debug_attempt(execution, attempt)?;
-    startup_timer.mark("runtime_run_file");
-    let profile = runtime
-        .take_cpu_profile()
-        .unwrap_or_else(|| otter_runtime::CpuProfile {
-            interval: profile_options.interval.max(1),
-            samples: Vec::new(),
-            time_deltas_us: Vec::new(),
-        });
-    let artifacts = write_cpu_profile_artifacts(path, &profile, profile_options)?;
+/// Write this run's CPU-profile artifacts and say where they went.
+fn report_cpu_profile(
+    path: &Path,
+    result: &otter_runtime::ExecutionResult,
+    options: &CpuProfileOptions,
+) -> Result<(CpuProfileArtifacts, usize), OtterError> {
+    let empty = otter_runtime::CpuProfile {
+        interval: options.interval.max(1),
+        samples: Vec::new(),
+        time_deltas_us: Vec::new(),
+    };
+    let profile = result.cpu_profile().unwrap_or(&empty);
+    let artifacts = write_cpu_profile_artifacts(path, profile, options)?;
     eprintln!(
         "cpu profile written: {} ({} samples), {}",
         artifacts.cpuprofile.display(),
         profile.sample_count(),
         artifacts.folded.display()
     );
-    emit_otter_stats_if_requested(&result);
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "completion": result.completion_string(),
-                "exitCode": result.exit_code(),
-                "cpuProfile": {
-                    "cpuprofile": artifacts.cpuprofile,
-                    "folded": artifacts.folded,
-                    "samples": profile.sample_count(),
-                }
-            })
-        );
-    }
-    Ok(ExitCode::from(result.exit_code()))
+    Ok((artifacts, profile.sample_count()))
 }
 
 #[derive(Debug, Clone)]
@@ -2371,7 +2325,6 @@ fn cli_otter_builder(
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
-        .snapshot_cache(true)
         .process_env(project_env_files());
     execution.apply_otter_builder(builder)
 }

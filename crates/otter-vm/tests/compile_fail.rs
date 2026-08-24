@@ -1,5 +1,4 @@
-//! Compile-fail fixtures proving the VM / GC handle types are
-//! `!Send + !Sync` and so cannot be captured by Tokio futures.
+//! Compile-fail fixtures proving VM/GC ownership and snapshot boundaries.
 //!
 //! The active VM must reject these shapes at compile time:
 //!
@@ -7,6 +6,7 @@
 //! - capturing `Local<'gc, T>` in `tokio::spawn`;
 //! - holding a `RuntimeTurn<'_>` / `NativeCtx<'_>` across `.await`;
 //! - returning an internal `Value` from a `Send + 'static` future.
+//! - mutating the opaque isolate snapshot's raw heap image.
 //!
 //! Each fixture under `tests/compile_fail/` is a `.rs` snippet
 //! whose `cargo build` must fail — the canonical [`trybuild`]
@@ -65,4 +65,10 @@ fn compile_fail_branded_gc_session_invariants() {
     t.compile_fail("tests/compile_fail/raw_write_barrier_rejected.rs");
     t.compile_fail("tests/compile_fail/root_raw_gc_import_rejected.rs");
     t.compile_fail("tests/compile_fail/root_trace_table_import_rejected.rs");
+}
+
+#[test]
+fn compile_fail_snapshot_carrier_boundary() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/isolate_snapshot_raw_field_rejected.rs");
 }

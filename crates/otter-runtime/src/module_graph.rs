@@ -582,7 +582,7 @@ impl<'a> ModuleGraphBuilder<'a> {
         };
         let parsed = if timing_enabled {
             let (parsed, parse_time) =
-                otter_syntax::with_program_timing(text, kind, compile_program).map_err(
+                otter_syntax::with_program_timing(&text, kind, compile_program).map_err(
                     |error| GraphError::Parse {
                         url: url.clone(),
                         error,
@@ -591,7 +591,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             self.add_parse_time(parse_time);
             parsed
         } else {
-            with_program(text, kind, compile_program).map_err(|error| GraphError::Parse {
+            with_program(&text, kind, compile_program).map_err(|error| GraphError::Parse {
                 url: url.clone(),
                 error,
             })?
@@ -637,7 +637,7 @@ fn dynamic_failure_fragment(url: &str, err: &GraphError) -> Result<BytecodeModul
     let message_literal =
         serde_json::to_string(&message).unwrap_or_else(|_| "\"dynamic import failed\"".to_string());
     let source = format!("throw new {ctor}({message_literal});");
-    with_program(source, SourceKind::JavaScript, |program| {
+    with_program(&source, SourceKind::JavaScript, |program| {
         let host = ModuleHostInfo {
             module_url: url.to_string(),
             resolved_imports: HashMap::new(),
@@ -707,7 +707,7 @@ pub(crate) fn scan_module_requests(
     text: String,
     kind: SourceKind,
 ) -> Result<Vec<PrefetchRequest>, GraphError> {
-    with_program(text, kind, |program| {
+    with_program(&text, kind, |program| {
         Ok(collect_module_requests(program)
             .into_iter()
             .map(|request| PrefetchRequest {

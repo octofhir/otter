@@ -1,4 +1,4 @@
-# Otter Engine Redesign
+# Otter Engine Program
 
 This is the sole repository-level implementation tracker. Otter is pre-user
 and pre-stability: internal APIs, ABI, bytecode, metadata, artifacts, fixtures,
@@ -6,9 +6,228 @@ and tests may break whenever that produces the intended final architecture.
 Completed slice history and measurements live in git and the ignored
 `scratchpad/LEDGER.md`, not in this active plan.
 
-## Objective
+## North star
 
-Replace every compiled execution path with one typed, target-neutral pipeline:
+Build an embeddable TypeScript/JavaScript engine that is simultaneously:
+
+- safe for mutually untrusted tenants and deny-by-default hosts;
+- predictable in CPU, memory, code, I/O, worker, and queue consumption;
+- fast on representative application workloads, not only microbenchmarks;
+- standards-compatible, deterministic, and diagnosable;
+- pleasant to embed and extend without exposing VM or GC internals;
+- portable across the supported macOS, Linux, and Windows targets.
+
+"Best" is a measured outcome. Every performance or resource claim requires a
+reproducible baseline, unchanged-result checksum, and before/after evidence.
+Correctness, security, and boundedness are never traded for an unmeasured speed
+claim.
+
+## Non-negotiable invariants
+
+1. The active dependency direction remains
+   `otter-gc -> otter-vm -> otter-runtime -> product crates`.
+2. There is one current runtime, bytecode format, compiled pipeline, resource
+   policy, and extension boundary. Do not add compatibility readers, replay
+   paths, dual writers, or parked shims to the active graph.
+3. Every external effect is authorized at the last meaningful boundary before
+   it occurs. Redirects, retries, aliases, imports, and delegated work cannot
+   inherit an authorization decision for a different target.
+4. Moving GC roots are explicit. Native and extension code uses `NativeCtx`
+   handle scopes; raw heap mutation and compiled-frame plumbing remain private.
+5. Untrusted input is structurally validated before execution. Validation is
+   mandatory at the trust boundary, bounded, deterministic, and side-effect
+   free.
+6. Runtime limits are aggregate, observable, and fail closed. Per-isolate
+   limits do not excuse unbounded process-wide threads, code, queues, sources,
+   or external allocations.
+7. Public runtime and extension DTOs are owned and `Send + Sync` friendly. Do
+   not expose `Rc`, `RefCell`, raw VM handles, or GC carriers.
+8. JS/TS parsing and transformation remain AST-first through the active
+   frontend; never parse source semantics with regular expressions.
+9. `lib.rs` files remain crate maps and small glue surfaces. Non-trivial new
+   behavior belongs in focused, documented modules.
+
+## Live snapshot
+
+- Snapshot date: 2026-08-24.
+- Observed commit: `be5fad199485b1acfa9328b294fa8685051c4ee8`.
+- The checkout is intentionally dirty and changing in parallel. Re-snapshot
+  touched files immediately before each edit and merge with concurrent work;
+  never reset or overwrite it.
+- Recent focused core runs passed for `otter-bytecode`, `otter-gc`,
+  `otter-jit`, `otter-runtime`, and `otter-vm`. These are local
+  observations, not a publishable clean-tree baseline.
+- The published `ES_CONFORMANCE.md` snapshot is historical. A fresh full run
+  is required before claiming a new conformance number.
+- No performance result from this dirty snapshot is eligible for publication.
+
+## Program scorecard
+
+| ID | Lane | Priority | Status | Depends on | Active outcome |
+|---|---|---:|---|---|---|
+| H1 | Security | P0 | complete | none | every HTTP redirect hop and cached final alias is authorized |
+| H2 | Isolation | P0 | queued | R1 | bounded, capability-aware Workers with deterministic shutdown |
+| B1 | Bytecode | P0 | active | none | mandatory panic-free verifier before any bytecode executes |
+| R1 | Resources | P0 | active | none | one aggregate runtime budget and typed exhaustion errors |
+| R2 | Resources | P1 | queued | R1 | bound code, source, module, queue, worker, and external memory |
+| E1 | Embedding | P1 | started by H1 | none | one reusable capability evaluator for all host surfaces |
+| J1 | JIT | P1 | active lane | B1, R1 | one typed target-neutral compiled pipeline |
+| J2 | Portability | P1 | queued | J1 | x86-64 parity over the same Machine IR |
+| C1 | Conformance | P1 | queued | current slices | reproducible green targeted and full Test262 baselines |
+| O1 | Observability | P1 | queued | R1 | resource, scheduling, JIT, and denial telemetry |
+
+Status meanings: `active` is the current implementation slice, `queued` has
+a defined boundary but is not being edited, `complete` has passed its stated
+acceptance gates, and `blocked` may be used only when the named dependency
+truly prevents progress.
+
+## H — Security and trust boundaries
+
+### H1. Redirect capability enforcement
+
+Complete. `otter-runtime` owns one cloneable evaluator; Fetch and one-hop
+remote-module providers authorize every redirect before connection, preserve
+deny-wins across host/authority and IPv6 spellings, and re-authorize cached
+alias final URLs. Cancellation wins over late provider results. The built-in
+clients remain pooled with automatic redirects disabled.
+
+Focused denial-before-effect, allowed-follow/final-identity, redirect-loop,
+malformed-location, cancellation, and cache-policy paths pass together with
+runtime/Web clippy. DNS pinning, proxies, TLS, and network quotas remain
+explicit future slices rather than implicit H1 scope.
+
+### H2. Worker isolation
+
+Workers must inherit a narrowed, explicit capability evaluator; they may never
+silently regain host defaults. Introduce per-runtime and aggregate worker
+counts, bounded message bytes/items, wake-driven scheduling, deterministic
+cancellation, and join-on-shutdown. Reject before spawning or enqueueing when a
+limit is exhausted. No detached OS-thread or Tokio-task leak is acceptable.
+
+Acceptance includes adversarial spawn storms, queue floods, parent shutdown,
+worker exceptions, and capability-denial tests. Thread/task counts and queued
+bytes must return to baseline after every case.
+
+### H3. Remaining effect surfaces
+
+Inventory filesystem, sockets, subprocesses, environment, clocks, randomness,
+dynamic native installation, in-process snapshot restore, FFI, Node modules,
+and Web APIs. Each surface must name its evaluator call, effect point, resource
+charge, typed denial, cancellation behavior, and tests. Fix vertical slices;
+do not create a second generic host-call registry.
+
+## R — Resource accounting and isolation
+
+### R1. Aggregate runtime budget
+
+Define one runtime-owned budget model with explicit counters and reservations
+for heap, external memory, generated code, source/module bytes, workers, queued
+tasks/messages, timers, host operations, and CPU work. Reservations are
+transactional: reserve before the effect, commit exact usage, and release on
+all success, error, cancellation, and panic-safe teardown paths.
+
+CPU enforcement must be cooperative and deterministic through interpreter,
+JIT, microtask, native reentry, and event-loop boundaries. Limits report a
+typed cause and stable counters; they do not depend on wall-clock races alone.
+
+The runtime-independent `otter-resource` ledger now provides immutable limits,
+shared fixed-array accounting, transactional reservations, exact RAII leases,
+typed exhaustion/overflow, stable snapshots, and concurrent recovery tests.
+Runtime construction is role-aware and atomic before effects: direct runtimes,
+dedicated handle threads, and worker threads retain their exact isolate/worker/
+native-stack tuples, failed bootstrap and pool construction roll back as one
+unit, and the opaque in-process `RuntimeSnapshot` remains bound to its donor
+configuration, capability policy, and account. Public commands retain a
+`QueuedTasks` lease across the bounded inbox and deferred FIFO.
+
+The hosted scheduler is wake-driven: one bounded Tokio inbox and one ordered
+completion pump replace polling/retry loops; shutdown is cancellation-safe;
+timer handles are isolate-scoped and JavaScript-safe; process finalization
+detaches callback roots and host deadlines; the shared timer driver releases
+owners and compacts cancellation tombstones; IPC messages close untaken file
+descriptors. The next slices must bound the guaranteed-completion backlog,
+move dynamic-import liveness to an owned admission carrier, and charge retained
+message bodies, module sources, timers, host operations, external memory, and
+generated code at their physical owning lifetimes. Existing CPU reduction
+metering remains authoritative until it is folded into the same public budget
+configuration and telemetry surface.
+
+### R2. Close unbounded stores and queues
+
+Apply R1 to:
+
+- JIT `CodeSpace`, code objects, metadata, safepoints, and deopt maps;
+- module source text, redirect bodies, compiled modules, and cache entries;
+- Web/Node response bodies, stream buffers, timers, tasks, and messages;
+- worker count, OS threads, Tokio tasks, and cross-worker payloads;
+- GC external allocations and host-owned backing stores.
+
+Use streaming or bounded reads where whole-body collection is not semantically
+required. Eviction must be deterministic and must not invalidate live code or
+GC roots.
+
+### R3. Resource performance
+
+For each bounded resource record idle cost, steady-state cost, peak usage,
+rejection count, and recovery to baseline. Prefer zero-allocation fast checks,
+batched accounting, and cache-friendly counters, but only after correctness is
+measured.
+
+## B — Bytecode and artifact integrity
+
+### B1. Mandatory bytecode verifier
+
+Create a focused verifier owned by the bytecode/VM boundary. It validates all
+untrusted or deserialized functions before installation or execution:
+
+- opcode and operand decoding without out-of-bounds reads;
+- register, constant, upvalue, exception, jump, and source-map ranges;
+- instruction-boundary and control-flow targets;
+- stack/register dataflow needed by interpreter and JIT invariants;
+- handler nesting and abrupt-completion structure;
+- bounded work and memory for adversarial artifacts.
+
+Verification runs once per admitted artifact and produces an immutable trusted
+carrier consumed by the interpreter and compiler. There is no unchecked public
+constructor or compatibility verifier. Invalid input returns a typed error and
+cannot allocate executable code or mutate runtime state.
+
+Acceptance includes mutation/fuzz corpora, every opcode family, truncated and
+oversized artifacts, invalid CFGs/handlers, and agreement tests across
+interpreter/JIT consumers.
+
+The bytecode boundary now rejects malformed raw operand storage in debug and
+release; validates module/function/register/constant/upvalue/closure, metadata,
+handler, suspension, and abrupt-completion domains; and returns typed
+decoder/link errors. One immutable proof carrier crosses compile caches,
+CodeSpace publication, interpreter admission, and executable conversion
+without exposing a mutable unchecked DTO. The bytecode compile cache remains a
+distinct verified artifact boundary; it does not carry or restore GC pages.
+CFG analysis is bounded, tracks normal versus abrupt `finally` entries, models
+generator external `return`, and distinguishes local exceptions from
+caller-only frame exits.
+
+The legacy serialized heap-image boundary is removed: raw `HeapImage` and
+`IsolateSnapshot` bytes, snapshot-blob restore, and the disk snapshot cache can
+no longer turn arbitrary bytes into Rust/GC object bodies. Opaque,
+capture-produced in-process `RuntimeSnapshot` restore remains and keeps the
+donor resource account. A future durable snapshot requires a typed logical
+object format that validates and reconstructs values instead of copying Rust
+representations, followed by fresh startup and memory measurements. The
+remaining B1 closeout is the release verifier/mutation gate set.
+
+### B2. Fuzzing and differential checks
+
+Continuously fuzz parser -> compiler -> verifier -> interpreter, serialized
+artifacts, GC stress, and JIT deopt reconstruction. Minimized regressions become
+normal tests. Compare supported semantics with the interpreter oracle and,
+where licensing and determinism permit, established ECMAScript engines.
+
+## J — JIT, portability, and throughput
+
+### J1. One compiled pipeline
+
+The intended replacement path remains:
 
 ```text
 bytecode + feedback
@@ -22,475 +241,158 @@ Quick and optimizing tiers share HIR, Machine IR, target backends, frame
 layout, call descriptors, safepoints, deopt reconstruction, dispatch cells,
 and artifact schemas. They differ only in optimization budget and tier policy.
 
-## Current state
+The current AArch64 Machine path already owns substantial scalar CFG, OSR,
+typed values, direct calls/constructs, exact leaves, GC-aware allocation,
+element/property/binding access, string constants, intrinsics, exceptions, and
+deopt reconstruction. Keep extending the final path; do not translate new IR
+back into deleted/legacy SSA or add an emitter-specific semantic path.
 
-The active replacement path is:
+Active sequence:
 
-```text
-typed scalar HIR -> Machine IR -> regalloc2 -> AArch64 emitter
-```
+1. Complete reentrant call descriptors, exact safepoints, exception landing,
+   cancellation, and budget exits without interpreter-window root plumbing.
+2. Move nested/finally exceptional edges and remaining object/element families
+   to explicit Machine CFG.
+3. Add virtual objects, allocation sinking, broader inlining, and complete OSR
+   only after precise reconstruction is proven.
+4. Put quick compilation on the same pipeline, then delete Template-only ABI,
+   duplicated emitters, and obsolete artifacts.
+5. Add shared representation propagation, guard elimination, GVN, LICM, loop
+   scheduling, and cold outlining with separate optimization budgets.
 
-It already owns:
+### J2. Target parity
 
-- straight-line and reducible cyclic scalar CFGs, critical-edge splitting,
-  block parameters, edge moves, instruction-exact liveness, and loop OSR;
-- Tagged, Int32, Uint32, Float64, and Boolean values, including arbitrary
-  tagged parameters, constants, locals, `this`, ordinary returns, tagged
-  block parameters, tagged OSR inputs, checked arithmetic, and scalar VM leaves;
-- descriptor-driven leaf calls for exact tagged truthiness and strict equality,
-  including heap-cell semantics, scalar argument boxing, allocator clobbers,
-  and exact miss deopt without a VM-window shuttle. The shared static-native
-  registry also lowers the exact bootstrap `parseInt(Int32)` call as an
-  allocation-free identity leaf; every other tag, arity, radix, or replaced
-  global exits before coercion effects;
-- descriptor-driven allocating primitive string concatenation with exact
-  pre-operation deopt, allocator late-use roots, a reusable native root-save
-  area, VM `SafepointRecord` spill locations, and post-GC reloads. Rope length
-  uses checked `u32` arithmetic: an unrepresentable concatenation exits before
-  allocation and becomes one catchable `RangeError`, never a saturated body;
-- stack-owned zero-argument and exact-Int32 `ArrayConstruct` allocation through
-  one VM-owned `AllocValue3` boundary shared by template and Machine code. The
-  safepoint roots the complete generated frame plus allocator spill area; a
-  tag, sign, or allocation-status miss resumes the original opcode before any
-  constructor effect. Wider arities retain the canonical variadic path. When
-  Machine declines a compact construct plan for code-size or profitability
-  reasons, the function remains on Template and reports the exact
-  `unprofitable` lowering reason instead of a fake layout failure;
-- guarded dense indexed-element and complete miss-capable named-property loads
-  and stores in Machine IR. Property operations consume immutable settled
-  snapshot programs first, then a code-owned polymorphic cell, then one fixed
-  boxed-value canonical boundary. The cell learns own/prototype loads,
-  existing-slot stores, and guarded no-allocation add-property transitions;
-  all transition, extensibility, prototype, and capacity guards precede the
-  first mutation. This first transition program covers null prototypes and a
-  fast direct terminal prototype; the dictionary-backed bootstrap
-  `%Object.prototype%` remains on the canonical store boundary. Success or
-  throw commits exactly once without deopt replay. Local-catch sites remain on
-  Template until the property fast probe and committed cold call are explicit
-  Machine CFG before register allocation; the boundary already returns a pure
-  exception value. Ordinary arrays use Empty, holey-double,
-  packed-double, and terminal tagged physical storage; Machine IR consumes only
-  an immutable packed-double snapshot with exact receiver, exotic-state, and
-  storage-kind guards. Packed loads produce Float64 and packed stores consume
-  Float64 directly, so no element payload passes through `DecodeNumber`,
-  `BoxNumber`, a hole test, or a write barrier. A Float64 index produced by
-  guarded arithmetic uses an exact non-allocating Uint32 conversion before the
-  address guard. Integral values and `-0` stay generated (`-0` selects key 0);
-  fractional, negative, NaN, and out-of-Uint32 values exact-deopt before the
-  element operation. Dense-array and primitive-string `.length` share the
-  generated load family; lengths above int32 deopt to exact unsigned Number
-  boxing instead of wrapping. Fixed TypedArray views over resizable buffers
-  additionally prove the complete cached view extent against the live backing
-  byte length before either a load or a store. Missing or incompatible direct
-  element metadata stays within the Machine function through one fixed
-  boxed-value reentrant call with precise roots and effect-once success/throw
-  semantics. Generic element operations inside local catches remain on
-  Template until their fast probe and committed cold call are explicit Machine
-  CFG before register allocation; the boundary already returns a pure
-  exception value;
-- loop-scoped packed-double view caching in scalar Machine IR. The planner
-  selects only innermost reducible loops with an invariant receiver and no
-  allocation, reentry, or representation-changing effect. A bounded untraced
-  native-stack base/length pair replaces repeated receiver, cage, type, exotic,
-  and physical-kind proofs after the first hit; function entry, OSR entry, and
-  every external loop-entry edge clear the pair, while generated backedges may
-  retain it. Per-access index and bounds proofs remain exact;
-- prepared global lexical and guarded global-object reads in Machine IR. The
-  generated path reads the live permanent cell or live object slot after the
-  same TDZ, realm-epoch, shape, and slab proofs as the canonical path; every
-  failed proof exact-deoptimizes at the original `LoadGlobalOrThrow` before
-  publishing its result and no global-read safepoint exists;
-- tagged loose comparison with a static `null` or `undefined` operand in
-  Machine IR. Nullish and non-cell primitive inputs complete directly, while
-  every Cell exits before defining the Boolean result so canonical HTMLDDA and
-  coercion semantics remain authoritative;
-- direct captured-upvalue reads through the published native frame, cage, and
-  cell layout, with exact TDZ deopt and no runtime-call round trip. Scalar
-  backedges use the shared activation-local batch countdown rather than reading
-  interrupt and fuel cells on every iteration;
-- frozen four-run fresh-process B/C/C/B validation against the pre-slice binary
-  moved NavierStokes 7,748.5 -> 8,269 (+6.72%), RayTrace 782.5 -> 788
-  (+0.70%), and Box2D 1,018 -> 1,881 (+84.77%). The captured Box2D run recorded
-  59 generated `parse_int_i32_leaf` lowering events and reduced observed
-  plain-`Call` bails from the earlier profile's 710 to 132. Its hot f980 body
-  remains Machine IR with 30
-  property loads, two non-cell stores, zero spills, no write-barrier stub, and
-  5,788 bytes of code (down from 6,064 before store specialization);
-- descriptor-driven monomorphic plain/fixed-arity constructor calls and
-  complete dense one-to-four-target guarded method chains from Machine IR
-  through the shared generated-linkage emitter. One call descriptor, root
-  publication, safepoint, and exact pre-call FrameState cover the whole method
-  chain; each candidate retains its own receiver/prototype guard, callee
-  generation, and `targetIndex` / `targetCount` artifact identity. A final
-  guard miss deoptimizes before lookup or call effects. A call opcode that has
-  never executed may remain in an otherwise native body as a zero-effect cold
-  exit; the first real attempt invalidates that body, while attempted sites
-  without a complete Machine plan keep the function on Template;
-- allocator-driven spills, AAPCS64 callee-saved allocation, exact frame sizing,
-  fixed leaf ABI operands, and deterministic normalized allocation artifacts;
-- `MachineFrameState -> lower_deopt_table -> VM DeoptTable`, shared cold exits,
-  exact overflow PCs/windows, and backedge poll before phi moves;
-- stack-owned nested `NativeFrame` publication, stable generation cells, and
-  generated calls into template or optimizing callees; safepoint-free acyclic
-  scalar generations initially publish only their initialized parameter
-  prefix, while every cold exit expands the canonical VM window before reentry;
-- caller-reserved upvalue spines for generated plain, guarded-method, fixed
-  base-constructor, and spread linkage. Fresh callee cells are allocated into
-  the spine before publication, inherited closure cells are appended exactly,
-  and bounded two-edge target preparation closes an already-observed nested
-  closure call without unbounded call-graph compilation;
-- split base-constructor receiver preparation: exact class wrappers with an
-  already materialized own data prototype allocate the complete receiver from
-  a collector-published young from-space window in generated fixed, spread, and
-  superclass linkage. Guard, page-capacity, marking, GC-stress, heap-cap, and
-  OOM misses enter one rooted cold allocator before effects; accessors, proxies,
-  bound functions, lazy prototypes, and uncertain shapes still enter the one
-  observable fallback;
-- final-shape receiver allocation for conservative straight-line base
-  initializers. The shared fixed, spread, and generated-super preparation path
-  proves every initializer name absent from the selected prototype chain,
-  installs undefined own slots before entry, and lets the body overwrite them
-  without StoreProperty shape-transition reentry;
-- exact constructor field transitions at original `StoreProperty` sites. The
-  VM retains movement-stable shape identities, the compile snapshot resolves
-  live handles, and Machine IR guards the receiver plus the complete ordinary
-  prototype chain before publishing shape, slab length, inline storage, and
-  both GC barriers. Non-simple base/derived class fields and exact ordinary
-  function-constructor fields therefore stay native without moving initializer
-  effects earlier. Ordinary functions are admitted only when `new.target` is
-  the entered function; a distinct ordinary target retains the canonical path.
-  The immutable plan and reserved capacity are cached per exact constructor
-  chain, so receiver allocation does not rescan prototypes after the guarded
-  plan is installed;
-- generated superclass lookup, derived-`this` binding, and base/derived return
-  selection in Machine code. Materialized bind and invalid derived returns are
-  cold siblings; fixed/spread direct arguments remain late tagged roots across
-  receiver preparation, and result/type guards never replay a started callee.
-  The replaced base-result stub and descriptor no longer exist;
-- a VM-owned linked root chain for Machine values live across reentrant calls;
-  return, constructor receiver preparation, callee overflow/deopt, propagated
-  throw, nested/recursive generated calls, and moving minor GC all execute
-  without replay or conservative stack scanning;
-- one VM-owned compiled-entry completion transaction. After native frame and
-  direct-eval ownership are restored, the JIT hands back the sole
-  `NativeResultPair`; the VM roots a validated Return/Throw payload across
-  generated-feedback reconciliation and returns the collector-rewritten pair.
-  No root index, token, manual release phase, eval-environment handle, or
-  flattened native-ABI alias crosses the compiler boundary;
-- exact generated receiver-allocation attribution for attempts, successes,
-  structural and space misses, cold/Rust boundaries, GC, refills, OOM, and
-  deopts, plus `directConstructReceiverAllocFast` / `Cold` code-map proof;
-- complete legacy-optimizer splices consume dead numeric boxing at the removed
-  call boundary while constructor descriptors inside the spliced body retain
-  the shared generated linkage. Arguments, results, receiver roots, and
-  moving-GC refreshes use the published inline-frame window rather than
-  falling back to the generic construct transition;
-- indexed Map/Set keys finish with a low-bit avalanche before the GC-owned
-  ordered table selects a bucket. Adjacent integral doubles no longer collapse
-  into one collision chain: the alternating `native-boundary` process medians
-  fell by 59.02% with reductions, bytecode calls, JIT entries, deopts, runtime
-  transitions, and emitted code held identical;
-- optimizing guarded calls to `Math.abs`, `Math.max`, and `Math.min` complete
-  directly in AArch64 when every operand is proven Int32. The exact bootstrap
-  callee or receiver/prototype/method identity guard remains mandatory, and
-  `abs(INT32_MIN)` materializes `2147483648` without crossing the Rust leaf ABI.
-  Alternating long process medians fell by 31.47% for the isolated Math slice
-  and 3.21% for the full `native-boundary` workload, with identical semantic
-  checksums and transition totals;
-- optimizing guarded primitive-string calls complete directly in AArch64 for
-  `charCodeAt(Int32)` and single-code-unit `indexOf(String)` over contiguous
-  inline or sequential Latin-1 / UTF-16 bodies. The existing exact prototype
-  method identity guard remains mandatory; ropes, slices, coercive arguments,
-  out-of-range reads, and searches longer than 256 code units enter the one
-  canonical pre-effect fallback. Alternating long process medians fell by
-  30.29% for the isolated `charCodeAt` slice, 39.85% for `indexOf`, and 11.70%
-  for the full `native-boundary` workload with exact matching checksums and
-  zero optimizing deopts;
-- optimizing guarded `Map.get(Int32)` and existing-key
-  `Map.set(Int32, value)` calls hash and probe the GC-owned ordered table
-  directly in AArch64 after the exact receiver/prototype/method identity
-  proof. Map entries now occupy one stable 32-byte record containing the
-  original key, value, cached hash, chain link, and flags instead of retaining
-  a second projected `MapKey`; generated overwrites run the shared table-parent
-  write barrier only for cell values. Missing keys, `-0`/`+0` representation
-  aliases, long chains, insertions, and structural drift enter the canonical
-  pre-effect method path. Alternating 8-warmup/15-sample process medians fell
-  by 64.54% for isolated `Map.get`, 65.74% for `Map.set`, 58.60% for their
-  combined slice, and 39.13% for the full `native-boundary` workload with
-  exact matching checksums and unchanged optimizing entry/deopt topology;
-- optimizing outermost natural loops may cache multiple guarded Map, string, Math, and
-  spliced-method sites in one activation. Invariant receivers reuse their
-  validated body headers; varying exotic receivers revalidate the current body
-  while sharing the pinned prototype identity proof. Every entry and OSR path
-  starts empty, and any generated intrinsic miss clears all sites before the
-  canonical allocating/reentrant transition. A coercive replacement fixture
-  proves that a mid-loop `Map.prototype.get` mutation is observed after GC
-  pressure. Alternating 10-warmup/25-sample process medians for a five-site
-  Map/string/Math kernel fell by 13.08%, with exact matching checksum,
-  7,073,851 reductions, 35 optimized entries, 1,708 runtime-stub transitions,
-  and zero deopts; emitted native code grew by 348 bytes;
-- activation-local method caches now survive generated dense-element,
-  property-IC/exotic-length, and guarded global reads. Element and global
-  eligibility requires a prepared allocation-free hit path; every semantic
-  miss clears all raw method-cache slots before frame publication and generic
-  reentry. The regression combines a global lexical array read, dense indexing,
-  string length, five cached methods, and element/property accessor misses that
-  allocate and replace `Map.prototype.get`. Alternating 10-warmup/25-sample
-  process medians improved the existing mixed Map kernel by 15.61%, Map.set by
-  11.77%, and Map.get-plus-length by 11.51%, with exact checksums, unchanged
-  reductions/runtime-stub counts, and zero deopts. Native code grew by 120, 60,
-  and 132 bytes respectively;
-- primitive string constants now live in address-stable boxed cache cells.
-  Compile preparation eagerly materializes every cold literal under active
-  frame roots before taking a snapshot; failure declines optional compilation
-  without publishing a code object. Template and optimizing code then read the
-  live `Value` directly from prepared cells. Optimized `LoadString` no longer
-  materializes a frame or safepoint, and loop method caches may cross the pure
-  cell read. A
-  257-cell VM regression proves address stability across hash growth and full
-  GC; a production-tier regression executes compiled literal code after 300
-  new eval chunks and moving collection. Typed `stringConstantCell`
-  relocations redact the address. Alternating 10-warmup/25-sample medians
-  improved the existing `indexOf` kernel by 53.33% and full `native-boundary`
-  by 20.66%, with exact checksums, unchanged reductions/stub counts, zero
-  deopts, and native-boundary code shrinking from 6,848 to 6,740 bytes;
-- guarded global-object reads inside a completely generated outermost loop now
-  cache the live property-slot address after one realm-epoch and shape proof.
-  The loaded value remains live, and a cached builtin namespace becomes an
-  activation-invariant receiver that unlocks its method-identity caches. Entry,
-  OSR, and every generated miss clear global and method raw addresses together
-  before collection or reentry. Artifact coverage exposes
-  `loopInvariantGlobalObjectLoadCache`; a property getter replaces global
-  `Math`, allocates under GC stress, and proves the next iteration observes both
-  replacement methods. Alternating 10-warmup/25-sample medians improved the
-  Math-only kernel by 47.29% and full `native-boundary` by 18.77%, with exact
-  checksums, unchanged reductions/stub counts, zero deopts, and native-boundary
-  code growing from 6,740 to 7,544 bytes;
-- the final legacy-only allocation experiment (the backend is now deleted)
-  coalesced exact-bit `LoadLocal`,
-  `StoreLocal`, and `Reuse` SSA copy webs before linear scan, while unread
-  uninitialized/undefined/dead-phi heads remain literal-only deopt state. The
-  AArch64 allocator reclaims `x19` as a ninth GPR and reloads the root VM window
-  through `x20` only at cold boundaries. Optimizing direct-call linkage and
-  guarded native-method fallbacks now use allocator-aware load/store closures;
-  no template helper retains a hidden `x19 = register window` contract.
-  Generated Map, primitive-string, and Int32 Math method hits consume their
-  allocated receiver and return directly to the allocated result home;
-  transition-frame construction, VM-PC
-  publication, and interpreter-window result round-trips exist only on the
-  canonical miss. `optimized-ir.txt` reports copy-web/inactive counts and
-  `code-map.json` exposed `machineMethodIntrinsic`. The final `native-boundary`
-  artifact contains 11 copy webs, 23 coalesced values, 44 inactive values, six
-  frame-free intrinsic regions, six method caches, and two global caches; raw
-  and post-deopt spills fell from 33/48 to 8/12. Exact parent/current/current/
-  parent 10-warmup/25-sample medians improved the final full kernel 7.2376045 ->
-  5.2700000 ms (-27.19%), Math by 21.30%, Map.get by 14.28%, `charCodeAt` by
-  11.11%, Map.set by 10.39%, and mixed Map by 9.14%; checksums, 7,095,333 VM
-  reductions, 3,918 runtime-stub transitions, and zero deopts stayed identical.
-  Full-kernel emitted code grew from 7,544 to 8,216 bytes;
-- catch-only exception-region CFGs with explicit landing-pad successors; the
-  shared linkage fully unwinds publication, commits the thrown value to its
-  allocator home, and transfers at the exact call PC without replay;
-- representation-checked entry and OSR guards with no replay after a started
-  operation; method guard misses deopt before lookup effects and tier/frame
-  publication changes do not require caller recompilation;
-- one typed `RuntimeCall` boundary for scalar query/coercion, static value-load,
-  class-construction, ordinary prototype mutation, and built-in Array iterator
-  operations. These families
-  decode machine operand words once into owned descriptors, operate on either
-  materialized or generated stack-owned frames, and never recover an
-  interpreter frame index merely to complete semantics.
+Implement x86-64 selection, legalization, frames, calls, polls, safepoints, and
+deopt exits over the same Machine IR. JavaScript semantics stay above target
+selection. Every shared opcode needs cross-target verifier, allocation, and
+normalized-artifact tests.
 
-The bounded-method slice was frozen against the R47 release and run as two
-fresh B/C/C/B series, with a separate wrapper log and exit manifest for every
-process. Four-score medians moved DeltaBlue 571.5 -> 835 (+46.11%), Box2D
-1,895 -> 2,013.5 (+6.25%), and Richards 1,185.5 -> 1,162 (-1.98%); the
-three-workload geometric mean improved 15.02%. The Richards loss remains an
-explicit next-profile target rather than being relabelled as noise.
+### J3. Performance method
 
-Prepared global reads plus static-nullish loose equality were frozen against
-the immediately preceding release and run as four fresh B/C/C/B processes,
-with a unique wrapper log and exit manifest per process. Four-score medians
-moved DeltaBlue 852.5 -> 941.5 (+10.44%), Box2D 2,013 -> 1,996.5 (-0.82%),
-and NavierStokes 8,436 -> 8,388 (-0.57%); the three-workload geometric mean
-improved 2.89%. The two small losses remain visible rather than being rounded
-away. Logs, manifests, and both binaries are retained under
-`/tmp/otter-r51-ab.YqJmjC`.
+Optimize from profiles and stable workloads. Track wall time, retired
+instructions, compile latency, emitted and resident code bytes, deopts,
+allocation rate, peak RSS, and VM/Rust transitions. The result checksum must be
+identical. Failed or unvalidated observations remain visible but unscoreable.
 
-Guarded empty-feedback numeric lowering plus heterogeneous scalar phis were
-then frozen against that R51 release with the same fresh-process B/C/C/B
-protocol. The accepted slice keeps established Number/Uint32 SSA wide when a
-later interpreter observation contains only Int32 values, so recompilation
-cannot narrow a `ToNumeric` result and eject a hot loop back to the template
-tier. Both NavierStokes `lin_solve` kernels remain Machine IR after their call
-plans and arithmetic feedback settle. Medians moved DeltaBlue 786.5 -> 1,004
-(+27.65%), Box2D 1,844 -> 1,969 (+6.78%), and NavierStokes 8,150 -> 12,347
-(+51.50%); the three-workload geometric mean improved 27.34%. Logs, manifests,
-and immutable binaries are retained under `/tmp/otter-r53-ab.uUTAuN`.
+## E — Embedding and extension API
 
-The old optimizing compiler and template emitter remain in the active graph
-only for operations and function shapes not yet selected by the replacement
-pipeline. They are fallback, not contracts to preserve.
+### E1. Capability-aware host boundary
 
-Latest accepted gate: formatting; strict workspace all-target/all-feature
-Clippy; 53 bytecode, 338 JIT, and 856 VM tests; compile-fail/rooting and runtime
-coverage including the four guarded-numeric cases; kernel ledger; and 21/21
-differential interpreter/tier/GC-stress cases. Test262 was not run for the
-engine slices.
+The evaluator introduced by H1 becomes the single reusable authorization
+surface for runtime installers, dynamic natives, modules, Web APIs, Node APIs,
+and extensions. It is cloneable, immutable from extension code, cheap on the
+allowed fast path, and testable without constructing a VM.
 
-## Active work
+### E2. Stable contributor model
 
-### 1. Complete reentrant operation families
+Finish the descriptor/spec/builder/bootstrap path for constructors,
+prototypes, namespaces, and modules. Static specs and native function pointers
+are the backend; macros remain zero-cost syntax sugar. Preserve explicit JS
+name, arity, capability requirements, and install order.
 
-Plain calls, complete one-to-four-target guarded method chains, and fixed or
-spread base, derived, and superclass constructs now use the same descriptor,
-allocator roots, stable entry cells, frame publication, cold deopt machinery,
-and explicit catch landing edges. Cold unattempted plain/method sites are exact
-pre-effect exits; feedback records the first attempt before semantic work and
-evicts the obsolete caller generation, preventing a permanent deopt loop.
-Construction validates the generation before observable receiver work,
-publishes or inherits `new.target`, preserves the derived-`this` TDZ, and
-applies the one base/derived return contract without replaying `New` or
-`SuperConstruct`. `CallSpread`, `NewSpread`, and `SuperConstructSpread` own
-ordinary typed call feedback and bake monomorphic targets into this linkage.
-The spread array remains rooted across cold resolution/receiver preparation
-and a leaf runtime stub copies declared arguments directly into the unpublished
-callee frame; no second call, frame, root, or result ABI exists. Generated
-spread wrappers also keep the compiler-emitted default-Array iterator
-collection native: `GetIterator`, `IteratorNext`, and `ArrayPush` operate over
-the published stack-owned frame through the typed runtime boundary. An own,
-replaced, accessor-backed, or non-Array iterator refuses before effects and
-resumes the exact materialized path. Scalar query/coercion, static namespace /
-BigInt/string-index loads, and class heritage / computed naming now use this
-same boundary; their former `jit_runtime_*` materialized-frame entrypoints and
-JIT-prefixed VM modules are deleted. Fixed base `new` consumes the same
-generated linkage as plain and method calls, while fresh/inherited upvalues
-remain stack-owned. Ordinary materialized data prototypes now allocate the base
-receiver without reentry; the observable preparation sibling remains the
-single authority for accessors, proxies, bound functions, and uncertain
-  prototype state. Simple ordinary base initializers now share their one final
-hidden-class contract with generated fixed, spread, and superclass receiver
-allocation. The expanded causal kernel moved 4.2 million field additions out
-of StoreProperty stubs, reduced total runtime-stub transitions by 54.44% and
-reentrant transitions by 99.34%, and reduced the mean of alternating process
-medians by 15.34%; reductions, bytecode calls, generated calls, and zero call
-deopts remained identical. Extend the typed boundary to the remaining forms:
+Extension acceptance requires owned `Send + Sync` DTOs, handle-scoped native
+allocation, compile-fail boundary tests, no per-call metadata parsing, and the
+runtime behavior <-> `.d.ts` <-> docs/examples/tests triangle.
 
-- admit nested catch/finally regions and complete multi-frame state through
-  `lower_deopt_table`;
-- move the remaining reentrant natives onto typed descriptors instead of
-  opcode-specific materialization stubs;
-- prove constructor abrupt completion and interrupt/budget exits without
-  conservative scanning, replay, or an interpreter-window ABI.
+### E3. Ergonomics and diagnostics
 
-Leaf calls remain the no-safepoint case of this same descriptor boundary; do
-not add a second call format.
+Expose precise typed errors, source locations, cancellation, resource usage,
+and capability denials without leaking VM internals. Measure bootstrap time,
+bootstrap allocations, native-call allocations, and host-call transition cost.
 
-### 2. Move complete operation families onto Machine IR
+## C — Conformance and compatibility
 
-Implement in this order:
+### C1. Reproducible conformance baseline
 
-1. nested/finally exceptional edges and multi-frame state;
-2. extend the native settled own-data field and dense-element families to the
-   remaining prototype, dictionary, typed/exotic, and dependency-token forms
-   (the exact constructor-owned add-property slice is native);
-3. inline object allocation, constructors, and virtual objects;
-4. OSR at every reducible loop and incremental-GC handshakes.
+Before changing a language area, consult `ES_CONFORMANCE.md` and run its focused
+Test262 subset. After a substantial semantic slice, capture a fresh full run on
+a stable checkout and update the report with commit, configuration, pass/fail,
+timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Each slice must delete its old selector/emitter consumer from the active path.
-Do not translate new IR back into legacy SSA or legacy allocation.
+### C2. Web and Node compatibility
 
-### 3. Complete target parity
+Treat compatibility as vertical slices: runtime semantics, declaration files,
+docs/examples, adversarial tests, cancellation, permissions, and resource
+limits land together. Parked legacy crates are references only.
 
-- implement x86-64 selection, legalization, frame emission, calls, polls,
-  safepoints, and deopt exits over the same Machine IR;
-- keep JavaScript semantics above target selection;
-- make normalized function-local artifacts insensitive to runtime addresses
-  and unrelated source edits;
-- require cross-target verifier and allocation tests for every shared opcode.
+## O — Observability and diagnostics
 
-### 4. Finish the atomic compiler switch
+### O1. Runtime resource telemetry
 
-The legacy optimizing SSA/regalloc/emitter has been deleted. Once one complete
-supported-language boundary exists on both targets:
+Expose bounded, low-overhead counters for heap/live/external/code/source/module
+bytes, workers, tasks, queue depth/bytes, host operations, cancellations,
+denials, reductions, turn duration, and exhaustion causes. Counters must remain
+usable during failure and teardown and must not allocate on hot rejection paths.
 
-- make quick and optimizing compilation choose budgets over the same pipeline;
-- move quick compilation onto the same Machine pipeline, then delete the
-  Template compiler, its interpreter-window ABI, duplicated direct emitters,
-  and obsolete artifacts;
-- remove caller-visible callee tier/frame assumptions that are no longer part
-  of stable dispatch cells;
-- leave the interpreter as the semantic oracle and tier fallback, not as a
-  compiled-code ABI.
+### O2. JIT and execution evidence
 
-### 5. Shared semantic optimization
+Keep JIT events and artifacts typed, bounded, deterministic, and address-safe.
+Join compile decisions, code objects, deopts, safepoints, resource charges, and
+execution profiles without introducing a second execution ABI.
 
-After the atomic switch, add representation propagation, dependency-aware
-guard elimination, inlining, GVN, LICM, loop scheduling, and cold outlining.
-Quick compilation skips expensive global passes; it does not use a different
-backend or value/frame format.
+## Cross-cutting acceptance gates
 
-## Required gates
+Every substantial slice defines its affected subset of these gates before
+implementation:
 
-Every substantial slice must prove the affected invariants with focused native
-execution before the full gate. Before committing run:
+- **Correctness:** focused unit/integration tests, no new panic or timeout, then
+  `bash scripts/gate.sh` when the focused loop is green.
+- **GC:** exact rooting and `OTTER_GC_STRESS=1..16` for multi-allocation native
+  paths; no conservative scan or stale raw `Value` across allocation.
+- **Conformance:** focused Test262 before/after and a full reproducible run for
+  substantial language changes.
+- **Security:** deny tests for initial, intermediate, and final resource targets;
+  denial occurs before the external effect.
+- **Resources:** named counter, limit, rejection semantics, cancellation, and
+  adversarial recovery-to-baseline test.
+- **Performance:** fresh-process release A/B, unchanged checksum, predeclared
+  regression threshold, and clean-tree baseline before publication.
+- **API/extensibility:** owned boundary DTOs, no VM/GC carriers, and updated
+  declarations/docs/tests where JS-visible behavior changes.
+- **Architecture:** one final path; remove any replaced shim, registry, schema,
+  or ABI in the same slice.
+- **Documentation:** update the stable contract in the same patch; keep task
+  history out of this file.
 
-```text
-cargo fmt --all
-cargo test -p otter-jit
-cargo clippy -p otter-jit --all-targets --all-features -- -D warnings
-bash scripts/gate.sh
-```
+## Program metrics
 
-Additional correctness gates for the final switch:
+| Area | Required signals |
+|---|---|
+| CPU/JIT | wall time, retired instructions, compile latency, code bytes, deopts, VM/Rust transitions |
+| Memory | idle/peak RSS, live/allocated/page/external bytes, code/source/module bytes |
+| Scheduling | reductions, maximum turn duration, microtasks, queue depth, rejected/cancelled operations |
+| Isolation | active workers/tasks, thread budget, queued message bytes, aggregate cage pressure |
+| Conformance | targeted/full Test262 pass, fail, timeout, and delta |
+| Extensibility | bootstrap time/allocations, native-call allocations, boundary compile-fail tests |
 
-- recursive and mutually recursive calls;
-- exceptions and reentrant natives;
-- moving-GC stress across supported strides;
-- nested inline deopt reconstruction;
-- OSR entry/exit representation round trips;
-- identical normalized artifacts under unrelated source edits;
-- no conservative compiled-stack scan and no interpreter-window root ABI.
+## Global stop conditions
 
-Performance claims require validated fresh-process A/B measurements. Retired
-instructions are primary; wall time is a sanity check. Failed, unavailable, or
-unvalidated observations remain visible and are never scoreable. The focused
-kernel harness times actual tier-up compiler-hook invocations, snapshots final
-native-code residency, and carries a derived-constructor workload that proves
-hot fixed-arity `new Derived(...)` and `super(...)` linkage before a
-construction performance claim is accepted.
+Stop and revise the architecture instead of adding a workaround if any occurs:
 
-## Stop conditions
-
-Revise the architecture instead of adding a workaround if any occurs:
-
-1. x86-64 needs a JavaScript-semantic lowering fork.
-2. A moving root needs an interpreter window or conservative stack scan.
-3. A caller must be recompiled when a callee changes tier or frame size.
-4. Typed fields require another deopt, frame, or value schema.
-5. Inline allocation cannot share ordinary FrameState and stack-map machinery.
-6. Unrelated dead source changes normalized function-local artifacts.
-7. Exact post-allocation root/deopt locations require pervasive forced spills.
+1. A permission decision is duplicated or can be bypassed through redirects,
+   custom providers, aliases, retries, snapshots, or dynamic reattachment.
+2. A limit protects one isolate while process-wide threads, queues, code,
+   sources, or external memory remain unbounded.
+3. Unverified bytecode can reach the interpreter, JIT, deserializer, cache, or
+   embedding surface.
+4. A moving root requires an interpreter window or conservative stack scan.
+5. x86-64 requires a JavaScript-semantic lowering fork.
+6. A caller must be recompiled when a callee changes tier or frame size.
+7. An extension needs raw VM/GC types or a parallel registration/runtime path.
+8. A performance improvement changes results, moves cost outside measurement,
+   or lacks a reproducible baseline.
 
 ## Working rules
 
-- Parse JS/TS only through the existing AST frontend.
-- Keep `otter-gc -> otter-vm -> otter-runtime -> product crates` dependency
-  direction and never add `crates-legacy` to the active graph.
-- Do not add compatibility readers, schema versions, adapters, replay paths,
-  dual writers, or parallel IR/frame/value formats.
-- Keep the generated-code ABI private to `otter-jit` ↔ `otter-vm`. FFI,
-  extensions, and any future Node-facing modules enter through `NativeCtx` and
-  never consume `NativeFrame`, safepoint records, stub ids, or compiled result
-  pairs.
-- Keep one physical native result carrier. Compiled, committed, probe, and
-  exception-transition descriptors validate their distinct legal status
-  subsets over that carrier; they do not own parallel structs, aliases,
-  constructors, decoders, or duplicate ABI tests.
-- Keep GC roots explicit and allocation-driven. Contributor/native value
-  building has one high-level entry through branded `NativeCtx` handle scopes;
-  fixed JIT stubs immediately enter VM-owned scoped rooting and never expose a
-  second raw-GC API.
-- Keep `lib.rs` as a crate map and small glue surface.
-- Use focused tests during development and update this plan only with current
-  state, next work, and accepted gates.
+- Work on the current live checkout and re-read every touched dirty file before
+  applying a patch. Preserve unrelated concurrent edits.
+- Search the git-indexed repository with `fff`; use `rg` only when the service
+  is unavailable.
+- Keep patches vertical and reviewable. Prefer a clean breaking change over an
+  adapter or internal compatibility mode.
+- Keep GC roots explicit and allocation-driven. Native value construction has
+  one high-level entry through branded `NativeCtx` handle scopes.
+- Keep generated-code ABI private to `otter-jit` <-> `otter-vm`.
+- Use deterministic collections whenever observable ordering matters.
+- Record only current state, next work, dependencies, and accepted gates here.
+  Put completed history and raw measurements in git and `scratchpad/LEDGER.md`.

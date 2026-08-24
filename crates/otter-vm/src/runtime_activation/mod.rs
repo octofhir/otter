@@ -336,7 +336,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         (context, function)
     }
 
@@ -352,7 +353,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [Value::number_i32(3), Value::undefined()];
         let mut frame = NativeFrame::new(
@@ -393,7 +395,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
@@ -495,7 +498,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
@@ -562,7 +566,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
@@ -675,7 +680,8 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
-        });
+        })
+        .expect("valid bytecode fixture");
         drop(base_context);
 
         let mut vm = Interpreter::new();

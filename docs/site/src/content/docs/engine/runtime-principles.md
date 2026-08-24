@@ -191,6 +191,10 @@ per-op telemetry.
   resources, or event-loop turns must define how it is budgeted.
 - New external memory owners must use explicit accounting.
 - New native APIs must not retain VM values across async boundaries.
+- Redirecting or retrying host APIs must authorize the exact next target before
+  starting that effect; an initial authorization is not transferable.
+- Async transport providers should return one effect/result hop so runtime
+  policy, cancellation, resource accounting, and loop bounds stay centralized.
 - New bytecode/runtime hot-path structures must separate builder state from
   frozen execution state.
 - New diagnostics/profiling fields should be machine-readable.

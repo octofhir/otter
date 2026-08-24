@@ -424,7 +424,7 @@ pub enum JitDebugEvent {
         function_name: String,
         /// Native tier about to consume the snapshot.
         tier: JitDebugTier,
-        /// Function entry or loop-OSR target.
+        /// Entry request or loop header that triggered this whole-body compile.
         target: JitDebugTarget,
         /// Number of frame registers in the function.
         register_count: u32,

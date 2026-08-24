@@ -2637,6 +2637,7 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -2836,6 +2837,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-resource"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "otter-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2854,6 +2862,7 @@ dependencies = [
  "otter-modules",
  "otter-node",
  "otter-pm-manifest",
+ "otter-resource",
  "otter-syntax",
  "otter-vm",
  "otter-web",

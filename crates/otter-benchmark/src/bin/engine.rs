@@ -865,7 +865,15 @@ fn run_call(
             );
         }
     };
-    let context = ExecutionContext::from_module(module);
+    let context = match ExecutionContext::from_module(module) {
+        Ok(context) => context,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Compile,
+                format!("bytecode link failed: {error}"),
+            );
+        }
+    };
     let mut interpreter = Interpreter::new();
     configure_interpreter(&mut interpreter, jit_tier, jit_osr_threshold);
     let validate = |value: otter_vm::Value| {
@@ -1035,8 +1043,12 @@ fn compile_kernel_context(
         .find(|function| function.name == KERNEL_INVOCATION_FUNCTION)
         .expect("exactly one invocation function was counted")
         .id;
+    let context = ExecutionContext::from_module(module).map_err(|error| RunFailure {
+        kind: RunFailureKind::Compile,
+        message: format!("bytecode link failed: {error}"),
+    })?;
     Ok(PreparedKernel {
-        context: ExecutionContext::from_module(module),
+        context,
         invocation_id,
         compile_time_ns,
         bytecode_bytes,
@@ -1849,7 +1861,15 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
             );
         }
     };
-    let context = ExecutionContext::from_module(module);
+    let context = match ExecutionContext::from_module(module) {
+        Ok(context) => context,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Compile,
+                format!("bytecode link failed: {error}"),
+            );
+        }
+    };
     let expected = f64::from(iterations) * f64::from(iterations.saturating_add(1)) / 2.0;
     let mut measurements = Measurements::default();
     for _ in 0..samples {
@@ -1940,7 +1960,6 @@ enum IdleMemoryMessage {
         full_gc_time_ns: u64,
         release_binary_bytes: u64,
         pending_timers: u64,
-        pending_host_promises: u64,
     },
 }
 
@@ -1966,12 +1985,6 @@ fn write_idle_message(output: &mut impl Write, message: &IdleMemoryMessage) -> R
 fn ensure_runtime_idle(runtime: &Runtime) -> Result<(), String> {
     if runtime.has_pending_timer_callbacks() {
         return Err("empty runtime retained pending timer callbacks".into());
-    }
-    let pending_host_promises = runtime.pending_host_promise_count();
-    if pending_host_promises != 0 {
-        return Err(format!(
-            "empty runtime retained {pending_host_promises} host promises"
-        ));
     }
     Ok(())
 }
@@ -2059,8 +2072,6 @@ fn emit_idle_memory_sample(idle_ms: u64) -> Result<(), String> {
                 .saturating_sub(before.full_pause_ns_total),
             release_binary_bytes,
             pending_timers: u64::from(runtime.has_pending_timer_callbacks()),
-            pending_host_promises: u64::try_from(runtime.pending_host_promise_count())
-                .unwrap_or(u64::MAX),
         },
     )
 }
@@ -2215,7 +2226,6 @@ fn run_idle_memory(idle_ms: u64, samples: u32) -> RunRecord {
             full_gc_time_ns,
             release_binary_bytes,
             pending_timers,
-            pending_host_promises,
         } = complete
         else {
             return fail(
@@ -2223,11 +2233,11 @@ fn run_idle_memory(idle_ms: u64, samples: u32) -> RunRecord {
                 format!("idle-memory sample {} omitted complete phase", sample + 1),
             );
         };
-        if pending_timers != 0 || pending_host_promises != 0 {
+        if pending_timers != 0 {
             return fail(
                 RunFailureKind::Validation,
                 format!(
-                    "idle-memory sample {} ended non-idle: timers={pending_timers}, host-promises={pending_host_promises}",
+                    "idle-memory sample {} ended non-idle: timers={pending_timers}",
                     sample + 1
                 ),
             );

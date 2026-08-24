@@ -717,7 +717,10 @@ fn set_egid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 #[cfg(unix)]
 fn get_groups(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let groups = rustix::process::getgroups().map_err(|errno| {
-        credential_failure("getgroups", nix::errno::Errno::from_raw(errno.raw_os_error()))
+        credential_failure(
+            "getgroups",
+            nix::errno::Errno::from_raw(errno.raw_os_error()),
+        )
     })?;
     ctx.scope(|mut scope| {
         let result = scope.array(groups.len())?;

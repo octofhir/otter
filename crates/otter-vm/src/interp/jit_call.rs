@@ -27,10 +27,13 @@
 //! Canonical tier transitions retain one [`NativeFrame`] and register window;
 //! materialized [`Frame`] construction is confined to cold deoptimization and
 //! interpreter-owned dispatch.
+//! Template entry and loop OSR retain one canonical whole-function body per
+//! function id and select a header-specific trampoline from that shared object.
 //! A nested compiled return never allocates during post-entry bookkeeping: it
 //! only leaves feedback pending for the outermost activation. No result root
 //! index or token crosses the VM/JIT boundary.
 #![allow(unused_imports)]
+use super::jit_compile::TemplateCompileOutcome;
 use crate::*;
 use crate::{
     native_abi::{NativeFrame, NativeResultDomain, NativeResultPair, NativeResultStatus},
@@ -283,20 +286,15 @@ impl Interpreter {
             }
             (outcome, true)
         } else {
-            // The whole-body optimizer declined this function/header. Resolve
-            // the existing template OSR object exactly as before.
-            let osr_key = (fid, osr_pc);
-            let code = match self.jit_osr_code.get(&osr_key) {
-                Some(slot) => slot.clone(),
-                None => {
-                    let compiled = self.compile_jit_function(context, fid, Some(osr_pc));
-                    self.jit_osr_code.insert(osr_key, compiled.clone());
-                    compiled
+            // The whole-body optimizer declined this function/header. A
+            // Template body already contains the trampolines for every
+            // eligible loop header, so one function-owned object serves every
+            // OSR target instead of duplicating the whole executable mapping.
+            let code = match self.resolve_template_osr_code(context, fid, osr_pc) {
+                TemplateCompileOutcome::Installed(code) => code,
+                TemplateCompileOutcome::Unsupported | TemplateCompileOutcome::Deferred => {
+                    return Ok(None);
                 }
-            };
-            let Some(code) = code else {
-                self.jit_osr_disabled.insert((fid, osr_pc));
-                return Ok(None);
             };
             if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
                 return Ok(None);
@@ -349,6 +347,53 @@ impl Interpreter {
                 }
             }
             jit::JitExecOutcome::Fatal(err) => Err(err),
+        }
+    }
+
+    /// Resolve one whole-function Template body for loop OSR.
+    ///
+    /// `trigger_pc` identifies the header whose threshold caused the cold
+    /// compile and remains useful in diagnostics. It does not specialize the
+    /// emitted body: the returned object owns an OSR trampoline for every
+    /// eligible loop header in `fid` and is therefore cached by function only.
+    fn resolve_template_osr_code(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        trigger_pc: u32,
+    ) -> TemplateCompileOutcome {
+        let cached = self.jit_code.get(&fid).map(|slot| match slot {
+            Some(code) => TemplateCompileOutcome::Installed(code.clone()),
+            None => TemplateCompileOutcome::Unsupported,
+        });
+        let outcome = match cached {
+            Some(outcome) => outcome,
+            None => {
+                let outcome = self.compile_jit_function(context, fid, Some(trigger_pc));
+                self.retain_template_compile_outcome(fid, outcome)
+            }
+        };
+        match outcome {
+            TemplateCompileOutcome::Installed(code)
+                if self.jit_code_registry.is_current_for_entry(code.as_ref()) =>
+            {
+                self.jit_template_osr_fids.insert(fid);
+                TemplateCompileOutcome::Installed(code)
+            }
+            TemplateCompileOutcome::Installed(_) => {
+                self.jit_code.remove(&fid);
+                self.jit_code_cache = None;
+                self.jit_entry_osr_only.remove(&fid);
+                self.jit_template_osr_fids.remove(&fid);
+                self.jit_template_entry_retry_remaining
+                    .insert(fid, Self::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES);
+                TemplateCompileOutcome::Deferred
+            }
+            TemplateCompileOutcome::Unsupported => {
+                self.jit_osr_disabled.insert((fid, u32::MAX));
+                TemplateCompileOutcome::Unsupported
+            }
+            TemplateCompileOutcome::Deferred => TemplateCompileOutcome::Deferred,
         }
     }
 
@@ -446,6 +491,7 @@ impl Interpreter {
         self.invalidate_jit_function(fid);
         if exhausted {
             self.jit_code.insert(fid, None);
+            self.jit_osr_disabled.insert((fid, u32::MAX));
         }
     }
 
@@ -570,8 +616,10 @@ impl Interpreter {
         }
         self.jit_optimized_bail_counts
             .retain(|&(counted_fid, _), _| !affected.contains(&counted_fid));
-        self.jit_osr_code
-            .retain(|(fid, _), _| !affected.contains(fid));
+        self.jit_template_entry_retry_remaining
+            .retain(|fid, _| !affected.contains(fid));
+        self.jit_template_osr_fids
+            .retain(|fid| !affected.contains(fid));
         self.jit_osr_disabled
             .retain(|(fid, _)| !affected.contains(fid));
         self.jit_osr_counts
@@ -802,34 +850,42 @@ impl Interpreter {
         if self.jit_entry_osr_only.contains(&fid) {
             return None;
         }
-        let code = if let Some(slot) = self.jit_code.get(&fid) {
-            slot.clone()
-        } else {
-            if count < Self::JIT_TIER_UP_THRESHOLD {
-                return None;
+        let code = match self.jit_code.get(&fid) {
+            Some(Some(code)) => code.clone(),
+            Some(None) => return None,
+            None => {
+                if count < Self::JIT_TIER_UP_THRESHOLD || !self.template_entry_retry_ready(fid) {
+                    return None;
+                }
+                self.jit_runtime_stats.compile_attempts =
+                    self.jit_runtime_stats.compile_attempts.saturating_add(1);
+                let outcome = self.compile_jit_function(context, fid, None);
+                match self.retain_template_compile_outcome(fid, outcome) {
+                    TemplateCompileOutcome::Installed(code) => code,
+                    TemplateCompileOutcome::Unsupported | TemplateCompileOutcome::Deferred => {
+                        return None;
+                    }
+                }
             }
-            let compiled = self.compile_jit_function(context, fid, None);
-            self.jit_runtime_stats.compile_attempts =
-                self.jit_runtime_stats.compile_attempts.saturating_add(1);
-            self.jit_code.insert(fid, compiled.clone());
-            self.jit_code_cache = None;
-            compiled
         };
-        // The function-entry path never runs OSR-only code (compiled with
-        // unsupported opcodes emitted as bails); only loop OSR enters it, at a
-        // supported loop header. The code stays cached for that OSR path.
-        let code = code
-            .filter(|c| self.jit_code_registry.is_current_for_entry(c.as_ref()) && !c.osr_only());
-        if let Some(c) = &code {
-            self.jit_code_cache = Some((fid, c.clone()));
-        } else {
-            // Reached only past the tier-up threshold (a below-threshold fid
-            // returns early above), so `jit_code[fid]` is installed and its
-            // `None`/`osr_only` verdict is final: record it so the entry path
-            // stops re-probing it.
-            self.jit_entry_osr_only.insert(fid);
+        if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
+            self.jit_code.remove(&fid);
+            self.jit_code_cache = None;
+            self.jit_entry_osr_only.remove(&fid);
+            self.jit_template_osr_fids.remove(&fid);
+            self.jit_template_entry_retry_remaining
+                .insert(fid, Self::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES);
+            return None;
         }
-        code
+        // The function-entry path never runs OSR-only code (compiled with
+        // unsupported opcodes emitted as bails); only loop OSR enters it at a
+        // supported loop header. The canonical body remains available there.
+        if code.osr_only() {
+            self.jit_entry_osr_only.insert(fid);
+            return None;
+        }
+        self.jit_code_cache = Some((fid, code.clone()));
+        Some(code)
     }
 
     /// Finish one compiled entry as a single VM-owned result transaction.
@@ -1053,12 +1109,11 @@ impl Interpreter {
         self.invalidate_jit_baseline_generation(fid);
     }
 
-    /// Unlink only `fid`'s current template entry generation.
+    /// Unlink `fid`'s canonical Template generation.
     ///
-    /// Baseline feedback refresh is an entry-code replacement, not a function
-    /// invalidation. Optimizing entry/OSR objects have independent feedback and
-    /// remain installed so a hot loop does not fall back to template merely
-    /// because direct-call targets matured later.
+    /// Baseline feedback refresh replaces the one body shared by ordinary
+    /// entry and Template OSR. Machine entry/OSR objects have independent
+    /// feedback and remain installed.
     fn invalidate_jit_baseline_generation(&mut self, fid: u32) {
         let code = self.jit_code.remove(&fid).and_then(|slot| slot);
         if let Some(code) = code {
@@ -1073,6 +1128,12 @@ impl Interpreter {
                         .count() as u64,
                 );
         }
+        self.jit_template_entry_retry_remaining.remove(&fid);
+        self.jit_template_osr_fids.remove(&fid);
+        self.jit_osr_disabled
+            .retain(|(disabled_fid, _)| *disabled_fid != fid);
+        self.jit_osr_counts
+            .retain(|(counted_fid, _), _| *counted_fid != fid);
         if self
             .jit_code_cache
             .as_ref()
@@ -1276,6 +1337,163 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use otter_bytecode::{Function, FunctionCodeBuilder, Op, Operand};
+
+    const FAKE_TEMPLATE_MAPPING_BYTES: usize = 4096;
+
+    #[derive(Debug)]
+    struct MultiOsrTemplateCode {
+        code_object_id: u64,
+        function_id: u32,
+        osr_entries: Arc<[u32]>,
+    }
+
+    impl jit::JitFunctionCode for MultiOsrTemplateCode {
+        fn metadata(&self) -> native_abi::CodeObjectMetadata {
+            native_abi::CodeObjectMetadata {
+                id: self.code_object_id,
+                code_block_id: self.function_id,
+                entry_offset: 0,
+                code_size: FAKE_TEMPLATE_MAPPING_BYTES as u32,
+                safepoint_count: 0,
+                frame_map_count: 0,
+                spill_map_count: 0,
+                dependency_count: 0,
+            }
+        }
+
+        fn code_len(&self) -> usize {
+            FAKE_TEMPLATE_MAPPING_BYTES
+        }
+
+        fn entry_addr(&self) -> Option<usize> {
+            Some(0x10_0000 + self.code_object_id as usize * 16)
+        }
+
+        fn run_entry(&self, _activation: jit::VmRuntimeActivation) -> jit::JitExecOutcome {
+            unreachable!("the ownership fixture never enters at function entry")
+        }
+
+        fn osr_entry(
+            &self,
+            _activation: jit::VmRuntimeActivation,
+            logical_pc: u32,
+        ) -> Option<jit::JitExecOutcome> {
+            self.osr_entries
+                .binary_search(&logical_pc)
+                .ok()
+                .map(|_| jit::JitExecOutcome::Bailed(logical_pc))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingTemplateHook {
+        requests: Arc<Mutex<Vec<(u64, Option<u32>)>>>,
+    }
+
+    fn compiled_template_status(request: jit::JitCompileRequest) -> jit::JitCompileStatus {
+        jit::JitCompileStatus::Compiled {
+            code: Arc::new(MultiOsrTemplateCode {
+                code_object_id: request.code_object_id,
+                function_id: request.snapshot.code_block.id,
+                osr_entries: Arc::from(request.snapshot.code_block.loop_headers()),
+            }),
+            artifact: None,
+            diagnostics: Box::default(),
+        }
+    }
+
+    impl jit::JitCompilerHook for CountingTemplateHook {
+        fn compile_function(
+            &self,
+            request: jit::JitCompileRequest,
+        ) -> Result<jit::JitCompileStatus, jit::JitCompileError> {
+            self.requests
+                .lock()
+                .expect("compile requests")
+                .push((request.code_object_id, request.osr_pc));
+            Ok(compiled_template_status(request))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeferredOnceTemplateHook {
+        requests: AtomicUsize,
+    }
+
+    impl jit::JitCompilerHook for DeferredOnceTemplateHook {
+        fn compile_function(
+            &self,
+            request: jit::JitCompileRequest,
+        ) -> Result<jit::JitCompileStatus, jit::JitCompileError> {
+            if self.requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(jit::JitCompileStatus::Unavailable)
+            } else {
+                Ok(compiled_template_status(request))
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnsupportedTemplateHook {
+        requests: AtomicUsize,
+    }
+
+    impl jit::JitCompilerHook for UnsupportedTemplateHook {
+        fn compile_function(
+            &self,
+            _request: jit::JitCompileRequest,
+        ) -> Result<jit::JitCompileStatus, jit::JitCompileError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(jit::JitCompileStatus::Unsupported {
+                reason: "fixture is structurally unsupported".to_string(),
+            })
+        }
+    }
+
+    fn installed_template(outcome: TemplateCompileOutcome) -> Arc<dyn jit::JitFunctionCode> {
+        match outcome {
+            TemplateCompileOutcome::Installed(code) => code,
+            TemplateCompileOutcome::Unsupported => panic!("Template fixture was unsupported"),
+            TemplateCompileOutcome::Deferred => panic!("Template fixture was deferred"),
+        }
+    }
+
+    fn multi_loop_context(loop_count: usize) -> (ExecutionContext, Vec<u32>) {
+        let mut code = FunctionCodeBuilder::new();
+        for _ in 0..loop_count {
+            code.push(Op::JumpIfFalse, &[Operand::Imm32(2), Operand::Register(0)]);
+            code.push(Op::Nop, &[]);
+            code.push(Op::Jump, &[Operand::Imm32(-3)]);
+        }
+        code.push(Op::ReturnUndefined, &[]);
+        let context = ExecutionContext::from_module(otter_bytecode::BytecodeModule {
+            module: "template-osr-owner-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: otter_bytecode::SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "manyLoops".to_string(),
+                locals: 1,
+                code: code.finish(),
+                ..Function::default()
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+        .expect("valid multi-loop bytecode fixture");
+        let osr_entries = context
+            .exec_function(0)
+            .expect("main code block")
+            .loop_headers()
+            .to_vec();
+        assert_eq!(osr_entries.len(), loop_count);
+        (context, osr_entries)
+    }
 
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(otter_bytecode::BytecodeModule {
@@ -1287,6 +1505,197 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+        .expect("valid bytecode fixture")
+    }
+
+    #[test]
+    fn template_osr_reuses_one_function_body_for_every_loop_header() {
+        let (context, osr_entries) = multi_loop_context(8);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let hook = Arc::new(CountingTemplateHook {
+            requests: Arc::clone(&requests),
+        });
+        let mut vm = Interpreter::new();
+        vm.jit_hook = Some(hook);
+
+        let first = installed_template(vm.resolve_template_osr_code(&context, 0, osr_entries[0]));
+        for &osr_pc in &osr_entries[1..] {
+            let reused = installed_template(vm.resolve_template_osr_code(&context, 0, osr_pc));
+            assert!(Arc::ptr_eq(&first, &reused));
+        }
+
+        let expected_request = [(1, Some(osr_entries[0]))];
+        assert_eq!(
+            requests.lock().expect("compile requests").as_slice(),
+            &expected_request
+        );
+        assert_eq!(vm.jit_next_code_object_id, 2);
+        assert_eq!(vm.jit_code.len(), 1);
+        assert_eq!(vm.jit_template_osr_fids.len(), 1);
+
+        let residency = vm.jit_code_residency();
+        assert_eq!(residency.installed_entry_bodies, 1);
+        assert_eq!(residency.installed_osr_bodies, 1);
+        assert_eq!(residency.unique_code_objects, 1);
+        assert_eq!(residency.code_bytes, FAKE_TEMPLATE_MAPPING_BYTES as u64);
+
+        let generations = vm.jit_code_generation_snapshot();
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].code_object_id, 1);
+        assert_eq!(generations[0].function_id, 0);
+        assert_eq!(
+            generations[0].lifecycle,
+            native_abi::CodeLifetimeState::Installed
+        );
+
+        let activation = jit::VmRuntimeActivation::for_test(&mut vm);
+        for &osr_pc in &osr_entries {
+            assert!(matches!(
+                first.osr_entry(activation, osr_pc),
+                Some(jit::JitExecOutcome::Bailed(pc)) if pc == osr_pc
+            ));
+        }
+    }
+
+    #[test]
+    fn template_entry_and_osr_share_the_same_canonical_body() {
+        let (context, osr_entries) = multi_loop_context(2);
+
+        let entry_first_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut entry_first = Interpreter::new();
+        entry_first.jit_hook = Some(Arc::new(CountingTemplateHook {
+            requests: Arc::clone(&entry_first_requests),
+        }));
+        entry_first
+            .jit_call_counts
+            .insert(0, Interpreter::JIT_TIER_UP_THRESHOLD - 1);
+        let entry_body = entry_first
+            .resolve_jit_code_for_fid(&context, 0)
+            .expect("entry threshold compiles Template body");
+        let osr_body =
+            installed_template(entry_first.resolve_template_osr_code(&context, 0, osr_entries[0]));
+        assert!(Arc::ptr_eq(&entry_body, &osr_body));
+        assert_eq!(
+            entry_first_requests
+                .lock()
+                .expect("entry-first requests")
+                .as_slice(),
+            &[(1, None)]
+        );
+
+        let osr_first_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut osr_first = Interpreter::new();
+        osr_first.jit_hook = Some(Arc::new(CountingTemplateHook {
+            requests: Arc::clone(&osr_first_requests),
+        }));
+        let osr_body =
+            installed_template(osr_first.resolve_template_osr_code(&context, 0, osr_entries[0]));
+        let entry_body = osr_first
+            .resolve_jit_code_for_fid(&context, 0)
+            .expect("entry reuses entry-capable OSR body");
+        assert!(Arc::ptr_eq(&entry_body, &osr_body));
+        assert_eq!(
+            osr_first_requests
+                .lock()
+                .expect("OSR-first requests")
+                .as_slice(),
+            &[(1, Some(osr_entries[0]))]
+        );
+        let residency = osr_first.jit_code_residency();
+        assert_eq!(residency.installed_entry_bodies, 1);
+        assert_eq!(residency.installed_osr_bodies, 1);
+        assert_eq!(residency.unique_code_objects, 1);
+    }
+
+    #[test]
+    fn template_invalidation_replaces_the_single_shared_generation() {
+        let (context, osr_entries) = multi_loop_context(2);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = Interpreter::new();
+        vm.jit_hook = Some(Arc::new(CountingTemplateHook {
+            requests: Arc::clone(&requests),
+        }));
+
+        let first = installed_template(vm.resolve_template_osr_code(&context, 0, osr_entries[0]));
+        vm.invalidate_jit_function(0);
+        assert!(vm.jit_code.is_empty());
+        assert!(vm.jit_template_osr_fids.is_empty());
+        assert_eq!(vm.jit_code_residency().unique_code_objects, 0);
+        let invalidated = vm.jit_code_generation_snapshot();
+        assert_eq!(invalidated.len(), 1);
+        assert_eq!(
+            invalidated[0].lifecycle,
+            native_abi::CodeLifetimeState::Invalid
+        );
+
+        let replacement =
+            installed_template(vm.resolve_template_osr_code(&context, 0, osr_entries[1]));
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert_eq!(vm.jit_code_residency().unique_code_objects, 1);
+        assert_eq!(
+            requests.lock().expect("compile requests").as_slice(),
+            &[(1, Some(osr_entries[0])), (2, Some(osr_entries[1]))]
+        );
+        let generations = vm.jit_code_generation_snapshot();
+        assert_eq!(generations.len(), 2);
+        assert_eq!(
+            generations[0].lifecycle,
+            native_abi::CodeLifetimeState::Invalid
+        );
+        assert_eq!(
+            generations[1].lifecycle,
+            native_abi::CodeLifetimeState::Installed
+        );
+    }
+
+    #[test]
+    fn transient_template_failure_retries_after_bounded_entry_cooling() {
+        let (context, _) = multi_loop_context(1);
+        let hook = Arc::new(DeferredOnceTemplateHook {
+            requests: AtomicUsize::new(0),
+        });
+        let mut vm = Interpreter::new();
+        vm.jit_hook = Some(hook.clone());
+        vm.jit_call_counts
+            .insert(0, Interpreter::JIT_TIER_UP_THRESHOLD - 1);
+
+        assert!(vm.resolve_jit_code_for_fid(&context, 0).is_none());
+        assert!(!vm.jit_code.contains_key(&0));
+        assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            vm.jit_template_entry_retry_remaining.get(&0),
+            Some(&Interpreter::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES)
+        );
+
+        for _ in 1..Interpreter::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES {
+            assert!(vm.resolve_jit_code_for_fid(&context, 0).is_none());
+        }
+        assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
+        assert!(vm.resolve_jit_code_for_fid(&context, 0).is_some());
+        assert_eq!(hook.requests.load(Ordering::Relaxed), 2);
+        assert!(!vm.jit_template_entry_retry_remaining.contains_key(&0));
+    }
+
+    #[test]
+    fn permanent_template_failure_is_cached_for_the_whole_function() {
+        let (context, osr_entries) = multi_loop_context(2);
+        let hook = Arc::new(UnsupportedTemplateHook {
+            requests: AtomicUsize::new(0),
+        });
+        let mut vm = Interpreter::new();
+        vm.jit_hook = Some(hook.clone());
+
+        assert!(matches!(
+            vm.resolve_template_osr_code(&context, 0, osr_entries[0]),
+            TemplateCompileOutcome::Unsupported
+        ));
+        assert!(matches!(vm.jit_code.get(&0), Some(None)));
+        assert!(vm.jit_osr_disabled.contains(&(0, u32::MAX)));
+        assert!(matches!(
+            vm.resolve_template_osr_code(&context, 0, osr_entries[1]),
+            TemplateCompileOutcome::Unsupported
+        ));
+        assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
     }
 
     fn assert_moving_payload_is_rewritten(status: NativeResultStatus) {

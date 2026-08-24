@@ -375,7 +375,7 @@ pub fn compile_script_source_to_module(
     module_specifier: &str,
 ) -> Result<CompiledModule, CompileError> {
     let bytecode = compile_script_source(source, kind, module_specifier)?;
-    Ok(CompiledModule::from_bytecode(bytecode))
+    CompiledModule::from_bytecode(bytecode)
 }
 
 /// Compile an already parsed OXC program as a script.
@@ -1832,11 +1832,11 @@ pub fn compile_module_program_to_module(
 ) -> Result<CompiledModule, CompileError> {
     let module_metadata = collect_module_metadata(program, host);
     let bytecode = compile_module_program(program, source_kind, host)?;
-    let mut metadata = CompiledModuleMetadata::from_bytecode(
+    let mut metadata = CompiledModuleMetadata::span_only_from_bytecode_with_source(
         &bytecode,
-        host.module_url.clone(),
+        &host.module_url,
         bytecode_source_kind(source_kind),
-    );
+    )?;
     metadata.imports = module_metadata.imports;
     metadata.exports = module_metadata.exports;
     metadata.live_binding_slots = module_metadata.live_binding_slots;

@@ -45,7 +45,7 @@ use crate::{CapabilityRequest, CapabilitySet, RuntimeCapability, RuntimeHooks};
 
 /// One remote module fetched over http/https.
 #[derive(Debug, Clone)]
-pub struct RemoteModuleSource {
+pub(crate) struct RemoteModuleSource {
     /// UTF-8 source text.
     pub source: String,
     /// Response `Content-Type` header, used to classify the source kind
@@ -149,6 +149,29 @@ pub struct RemoteModuleRequest {
     pub cancellation: ModuleLoadCancellation,
 }
 
+/// One provider response for exactly one requested remote URL.
+///
+/// Providers do not follow redirects. They return the redirect location to the
+/// runtime, which owns redirect resolution, capability checks, loop bounds,
+/// canonical identity, and caching for every provider implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemoteModuleResponse {
+    /// Source body returned for the requested URL.
+    Source {
+        /// UTF-8 module source.
+        source: String,
+        /// Response `Content-Type`, when known.
+        content_type: Option<String>,
+    },
+    /// Redirect response. `location` may be absolute or relative to the
+    /// requested URL.
+    Redirect {
+        /// Raw redirect location supplied by the provider.
+        location: String,
+    },
+}
+
 /// Typed, owned remote module provider error.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -168,13 +191,16 @@ pub enum RemoteModuleError {
 
 /// Boxed provider future carrying owned data only.
 pub type RemoteModuleFuture =
-    Pin<Box<dyn Future<Output = Result<RemoteModuleSource, RemoteModuleError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<RemoteModuleResponse, RemoteModuleError>> + Send + 'static>>;
 
 /// Fully asynchronous remote-module source provider.
 ///
-/// The engine performs capability checks before calling this interface. Hosts
-/// may apply additional policy, caching, or transport decisions, but browser
-/// origin/CORS policy remains outside the engine.
+/// The engine performs capability checks before calling this interface and
+/// owns every redirect transition. A provider performs exactly one fetch for
+/// `request.url` and returns [`RemoteModuleResponse::Redirect`] instead of
+/// following it. This keeps custom and built-in providers on the same policy,
+/// loop-bound, identity, and cache path. Browser origin/CORS policy remains
+/// outside the engine.
 pub trait RemoteModuleProvider: Send + Sync + std::fmt::Debug + 'static {
     /// Fetch one module without blocking an isolate or Tokio worker.
     fn fetch(&self, request: RemoteModuleRequest) -> RemoteModuleFuture;
@@ -190,6 +216,16 @@ pub(crate) trait RemoteModuleFetch: Send + Sync + std::fmt::Debug {
 #[must_use]
 pub fn is_http_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
+}
+
+pub(crate) fn network_resource(url: &url::Url) -> String {
+    let Some(host) = url.host_str() else {
+        return url.to_string();
+    };
+    match url.port_or_known_default() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
 }
 
 /// Whether `url` is a `data:` URL — a module whose source is the
@@ -1047,11 +1083,7 @@ impl ModuleLoader {
         ) {
             return Ok(());
         }
-        let resource = match (url.host_str(), url.port()) {
-            (Some(host), Some(port)) => format!("{host}:{port}"),
-            (Some(host), None) => host.to_string(),
-            (None, _) => url.to_string(),
-        };
+        let resource = network_resource(&url);
         Err(LoaderError::CapabilityDenied {
             specifier: target.to_string(),
             capability: "net".to_string(),
@@ -1275,6 +1307,12 @@ mod tests {
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn network_resource_formats_ipv6_authority_once() {
+        let url = url::Url::parse("http://[::1]:8080/module.js").expect("IPv6 URL");
+        assert_eq!(network_resource(&url), "[::1]:8080");
     }
 
     #[test]

@@ -151,8 +151,10 @@ class StreamHandle {
     }
   }
 
-  _onData(latin1Payload) {
-    const chunk = Buffer.from(latin1Payload, 'latin1');
+  _onData(payload) {
+    // The host hands over the `ArrayBuffer` that owns the read bytes, so the
+    // Buffer is a view onto it rather than a fresh per-byte decode.
+    const chunk = Buffer.from(payload);
     if (!this.reading || this._parkedChunks.length > 0) {
       this._parkedChunks.push(chunk);
       return;
@@ -394,7 +396,12 @@ function startListen(handle, bind) {
   try {
     bound = bind();
   } catch (error) {
-    return uvCode(error?.code ?? 'EADDRINUSE');
+    // Only a failure the host classified is a listen error code. Anything
+    // else — a missing capability, a runtime without an IO loop — is an
+    // engine fault, and reporting it as EADDRINUSE sends the caller hunting
+    // for a port conflict that never happened.
+    if (error?.code === undefined) throw error;
+    return uvCode(error.code);
   }
   handle._serverId = bound.handle;
   servers.set(bound.handle, handle);

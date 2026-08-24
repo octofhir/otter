@@ -70,8 +70,8 @@ pub struct WeakRefBody {
 }
 
 impl otter_gc::trace::SeverRestoredPayload for WeakRefBody {
-    /// A restored weak target is a capture-process offset the weak
-    /// channel never relocates; clear it (the deref observes
+    /// A restored weak target is a source-isolate offset the weak channel does
+    /// not participate in relocating; clear it (the deref observes
     /// `undefined`, exactly as if the target had been collected).
     fn sever_restored_payload(&mut self) {
         self.target = RawGc::NULL;
@@ -79,8 +79,8 @@ impl otter_gc::trace::SeverRestoredPayload for WeakRefBody {
 }
 
 impl otter_gc::trace::SeverRestoredPayload for FinalizationRegistryBody {
-    /// The cell vector is capture-process malloc storage and its weak
-    /// targets are capture-process offsets; neither is readable here.
+    /// The copied cell vector aliases source-isolate malloc storage and its weak
+    /// targets are source-isolate offsets; neither may be retained here.
     /// Dropping the registrations is sound for a bootstrap image: its
     /// targets live in old space for the isolate's lifetime, so their
     /// finalizers could never have fired anyway. The capture-side

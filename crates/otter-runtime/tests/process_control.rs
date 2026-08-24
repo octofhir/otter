@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{CapabilitySet, Permission, Runtime, SourceInput};
-use otter_vm::TimerScheduler;
+use otter_vm::{TimerAdmission, TimerScheduler};
 
 /// Timers need a scheduler installed by the host; this one hands out tokens and
 /// never fires, which is exactly the "still pending" state the resource report
@@ -29,10 +29,20 @@ struct PendingScheduler {
 }
 
 impl TimerScheduler for PendingScheduler {
-    fn schedule(&self, _delay_ms: u64, _repeat_ms: Option<u64>) -> u64 {
+    fn admit(&self, _repeat: bool) -> Result<TimerAdmission, String> {
+        Ok(TimerAdmission::new(Box::new(())))
+    }
+
+    fn schedule(
+        &self,
+        admission: TimerAdmission,
+        _delay_ms: u64,
+        _repeat_ms: Option<u64>,
+    ) -> Result<u64, String> {
+        drop(admission);
         let mut next = self.next_token.lock().expect("token counter");
         *next += 1;
-        *next
+        Ok(*next)
     }
 
     fn cancel(&self, _token: u64) -> bool {

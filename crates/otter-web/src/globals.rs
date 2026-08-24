@@ -34,6 +34,9 @@ const WEB_FETCH: &str = include_str!("web_fetch.js");
 #[cfg(test)]
 const WEB_URLPATTERN: &str = include_str!("web_urlpattern.js");
 
+#[cfg(test)]
+const WEB_CONSOLE: &str = include_str!("web_console.js");
+
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
 pub fn web_globals_installer() -> RuntimeExtensionInstaller {
@@ -47,12 +50,14 @@ fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> 
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     // `fetch()` itself is the JS shim in `web_fetch.js`; it normalizes its
     // arguments and calls this private native transport member, which the shim
-    // consumes and deletes. The `net` allowlist is captured at install time
-    // (the per-call context does not expose it) and gates every request.
-    let capabilities = runtime.capabilities().clone();
-    let fetch_call: Arc<RuntimeNativeFn> = Arc::new(move |ctx, args, _captures| {
-        crate::fetch_ext::native_fetch(ctx, args, &capabilities)
-    });
+    // consumes and deletes. The complete immutable capability evaluator is
+    // captured at install time and checks the initial URL plus every redirect.
+    let transport = otter_runtime::web_fetch_host::FetchTransport::new(
+        runtime.capability_evaluator(),
+        format!("Otter/{}", env!("CARGO_PKG_VERSION")),
+    );
+    let fetch_call: Arc<RuntimeNativeFn> =
+        Arc::new(move |ctx, args, _captures| crate::fetch_ext::native_fetch(ctx, args, &transport));
     runtime.install_native_global_call(
         "__nativeFetch",
         5,
@@ -345,16 +350,15 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 #[cfg(test)]
 mod tests {
-    use super::{WEB_BOOTSTRAP, WEB_FETCH, WEB_STREAMS, WEB_URLPATTERN};
+    use super::{WEB_BOOTSTRAP, WEB_CONSOLE, WEB_FETCH, WEB_STREAMS, WEB_URLPATTERN};
     use std::collections::BTreeSet;
 
-    /// Scan a shim source for the `def('<name>')` calls that attach a global.
-    /// This is a literal substring scan (not a JS parse) used purely to keep
-    /// [`WEB_GLOBAL_NAMES`] in lockstep with the shim sources.
-    fn def_names(src: &str) -> BTreeSet<String> {
+    /// Scan one literal global-install pattern. This is deliberately not a JS
+    /// parser: the honesty check only recognizes the two explicit declaration
+    /// spellings accepted by these controlled bootstrap sources.
+    fn names_after(src: &str, needle: &[u8]) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         let bytes = src.as_bytes();
-        let needle = b"def('";
         let mut i = 0;
         while i + needle.len() < bytes.len() {
             if &bytes[i..i + needle.len()] == needle {
@@ -370,15 +374,22 @@ mod tests {
         out
     }
 
+    fn installed_global_names(src: &str) -> BTreeSet<String> {
+        let mut out = names_after(src, b"def('");
+        out.extend(names_after(src, b"Object.defineProperty(globalThis, '"));
+        out
+    }
+
     /// The romp! declaration's `defines` lists must match the
     /// `def('…')` globals each shim source actually installs — the
     /// build-time honesty check for declaration-derived lazy names.
     #[test]
     fn lazy_global_names_match_shim_def_calls() {
-        let mut from_shims = def_names(WEB_BOOTSTRAP);
-        from_shims.extend(def_names(WEB_STREAMS));
-        from_shims.extend(def_names(WEB_FETCH));
-        from_shims.extend(def_names(WEB_URLPATTERN));
+        let mut from_shims = installed_global_names(WEB_BOOTSTRAP);
+        from_shims.extend(installed_global_names(WEB_STREAMS));
+        from_shims.extend(installed_global_names(WEB_FETCH));
+        from_shims.extend(installed_global_names(WEB_URLPATTERN));
+        from_shims.extend(installed_global_names(WEB_CONSOLE));
         let declared: BTreeSet<String> = crate::WEB_EXTENSION
             .lazy_names()
             .map(str::to_string)

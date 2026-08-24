@@ -2761,9 +2761,8 @@ impl Interpreter {
     /// `kind` selects the entry behaviour per §27.5.3:
     /// - `Next(arg)`: write `arg` into the previous yield's dst and continue.
     /// - `Return(arg)`: act as if the body executed `return arg;` from the
-    ///   current pc — foundation simplification: mark the generator done and
-    ///   surface `{value: arg, done: true}` without running additional finally
-    ///   blocks.
+    ///   current pc. Active `finally` handlers run before the generator
+    ///   completes, and may replace that completion.
     /// - `Throw(reason)`: re-enter the body and immediately throw `reason`
     ///   from the current pc; finally / catch handlers take over per the
     ///   unwind machinery.

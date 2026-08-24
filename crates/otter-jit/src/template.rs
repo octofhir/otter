@@ -283,6 +283,31 @@ mod tests {
         ])
     }
 
+    /// Three independently targeted loops in one whole-function body.
+    fn multi_loop_view() -> JitCompileSnapshot {
+        view(&[
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(0, 3)), Operand::Register(0)],
+            ),
+            (Op::Nop, vec![]),
+            (Op::Jump, vec![Operand::Imm32(rel(2, 0))]),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(3, 6)), Operand::Register(0)],
+            ),
+            (Op::Nop, vec![]),
+            (Op::Jump, vec![Operand::Imm32(rel(5, 3))]),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(6, 9)), Operand::Register(0)],
+            ),
+            (Op::Nop, vec![]),
+            (Op::Jump, vec![Operand::Imm32(rel(8, 6))]),
+            (Op::ReturnUndefined, vec![]),
+        ])
+    }
+
     #[test]
     fn conditional_back_edge_terminates_on_falsy_int() {
         let v = countdown_view();
@@ -391,6 +416,20 @@ mod tests {
             code.code_len() < 2048,
             "countdown fixture grew to {} bytes",
             code.code_len()
+        );
+    }
+
+    #[test]
+    fn one_template_mapping_contains_every_loop_osr_trampoline() {
+        let view = multi_loop_view();
+        assert_eq!(view.code_block.loop_headers(), &[0, 3, 6]);
+        let code = compile(&view).expect("multi-loop Template body compiles");
+        assert_eq!(
+            code.osr_entries_for_test()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0, 3, 6]
         );
     }
 

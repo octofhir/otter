@@ -7,7 +7,7 @@
 //!
 //! # Contents
 //! - [`CompiledModule`] wraps VM bytecode with [`CompiledModuleMetadata`].
-//! - [`CompiledSourceSpan`] pins source spans to function ids and PCs.
+//! - [`CompiledFunctionSpans`] groups source spans under one function identity.
 //! - [`CompiledImport`], [`CompiledExport`], and [`LiveBindingSlot`] describe
 //!   module-surface metadata emitted from the OXC AST.
 //! - [`collect_module_metadata`] extracts metadata without string parsing.
@@ -16,6 +16,8 @@
 //! - Metadata is derived from the same OXC AST and bytecode the compiler
 //!   emits; no regex or source-string parsing is used.
 //! - Span ranges point into the original source text offsets.
+//! - Diagnostic strings are owned once per function and complete metadata
+//!   materialization is checked, hard-bounded, and fallibly reserved.
 //! - Live-binding slots are deterministic and sorted by exported name.
 //!
 //! # See also
@@ -24,12 +26,20 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use otter_bytecode::{BytecodeModule, SourceKind as BytecodeSourceKind};
+use otter_bytecode::{BytecodeModule, SourceKind as BytecodeSourceKind, SpanEntry};
 use oxc_ast::ast::{Expression, Program};
 use oxc_ast_visit::Visit;
 use serde::{Deserialize, Serialize};
 
-use crate::{ImportRequest, ModuleHostInfo, module_export_name_to_str};
+use crate::{CompileError, ImportRequest, ModuleHostInfo, module_export_name_to_str};
+
+/// Hard upper bound for the compiler-owned source-map DTO.
+///
+/// This is deliberately below the decoded bytecode admission ceiling. A
+/// hostile cache entry or generated source cannot use otherwise-valid span
+/// records to trigger an unbounded second materialization at the runtime
+/// boundary.
+pub const MAX_COMPILED_METADATA_BYTES: usize = 32 * 1024 * 1024;
 
 /// Frozen compiler/runtime boundary product for one source module.
 ///
@@ -52,12 +62,14 @@ impl CompiledModule {
     }
 
     /// Build a compiled module whose metadata is derived from bytecode spans.
-    #[must_use]
-    pub fn from_bytecode(bytecode: BytecodeModule) -> Self {
-        let source_url = bytecode.module.clone();
-        let source_kind = bytecode.source_kind;
-        let metadata = CompiledModuleMetadata::from_bytecode(&bytecode, source_url, source_kind);
-        Self { bytecode, metadata }
+    ///
+    /// # Errors
+    /// Returns [`CompileError::MetadataLimit`] when the compact source-map DTO
+    /// exceeds its hard budget, or [`CompileError::MetadataAllocation`] when a
+    /// bounded reservation fails.
+    pub fn from_bytecode(bytecode: BytecodeModule) -> Result<Self, CompileError> {
+        let metadata = CompiledModuleMetadata::span_only_from_bytecode(&bytecode)?;
+        Ok(Self { bytecode, metadata })
     }
 
     /// Split into the VM bytecode payload.
@@ -74,8 +86,9 @@ pub struct CompiledModuleMetadata {
     pub source_url: String,
     /// JavaScript or TypeScript source family used for bytecode emission.
     pub source_kind: BytecodeSourceKind,
-    /// Source-span table owned by the compiled module.
-    pub spans: Vec<CompiledSourceSpan>,
+    /// Source spans grouped by function so diagnostic strings are owned once
+    /// per function rather than once per program counter.
+    pub function_spans: Vec<CompiledFunctionSpans>,
     /// Static and literal-dynamic import edges observed in the source.
     pub imports: Vec<CompiledImport>,
     /// Export entries observed in the source.
@@ -147,7 +160,7 @@ impl Default for CompiledModuleMetadata {
         Self {
             source_url: String::new(),
             source_kind: BytecodeSourceKind::JavaScript,
-            spans: Vec::new(),
+            function_spans: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
@@ -158,38 +171,100 @@ impl Default for CompiledModuleMetadata {
 }
 
 impl CompiledModuleMetadata {
-    pub(crate) fn from_bytecode(
+    /// Reconstruct diagnostics-only metadata from an immutable bytecode
+    /// module.
+    ///
+    /// This is the cache-hit boundary for classic scripts: source spans,
+    /// function names, and module URLs are fully represented in bytecode, so
+    /// they can be restored without reparsing source. Import/export and live
+    /// binding tables require the original module AST and remain empty.
+    ///
+    /// # Errors
+    /// Returns [`CompileError::MetadataLimit`] when the compact source-map DTO
+    /// exceeds its hard budget, or [`CompileError::MetadataAllocation`] when a
+    /// bounded reservation fails.
+    pub fn span_only_from_bytecode(bytecode: &BytecodeModule) -> Result<Self, CompileError> {
+        Self::span_only_from_bytecode_with_budget(bytecode, MAX_COMPILED_METADATA_BYTES)
+    }
+
+    /// Reconstruct diagnostics metadata under a caller-selected stricter
+    /// budget.
+    ///
+    /// `budget` is capped at [`MAX_COMPILED_METADATA_BYTES`]; callers can fail
+    /// closed earlier but cannot bypass the engine-wide ceiling.
+    ///
+    /// # Errors
+    /// Returns [`CompileError::MetadataLimit`] when materialization exceeds the
+    /// effective budget, or [`CompileError::MetadataAllocation`] when a
+    /// bounded reservation fails.
+    pub fn span_only_from_bytecode_with_budget(
         bytecode: &BytecodeModule,
-        source_url: String,
+        budget: usize,
+    ) -> Result<Self, CompileError> {
+        Self::span_only_from_bytecode_with_budget_and_source(
+            bytecode,
+            &bytecode.module,
+            bytecode.source_kind,
+            budget.min(MAX_COMPILED_METADATA_BYTES),
+        )
+    }
+
+    pub(crate) fn span_only_from_bytecode_with_source(
+        bytecode: &BytecodeModule,
+        source_url: &str,
         source_kind: BytecodeSourceKind,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CompileError> {
+        Self::span_only_from_bytecode_with_budget_and_source(
+            bytecode,
             source_url,
             source_kind,
-            spans: compiled_spans_from_bytecode(bytecode),
+            MAX_COMPILED_METADATA_BYTES,
+        )
+    }
+
+    fn span_only_from_bytecode_with_budget_and_source(
+        bytecode: &BytecodeModule,
+        source_url: &str,
+        source_kind: BytecodeSourceKind,
+        budget: usize,
+    ) -> Result<Self, CompileError> {
+        let materialized_bytes = compiled_metadata_materialized_bytes(bytecode, source_url)?;
+        if materialized_bytes > budget {
+            return Err(CompileError::MetadataLimit {
+                requested_bytes: materialized_bytes,
+                limit_bytes: budget,
+            });
+        }
+
+        Ok(Self {
+            source_url: try_clone_metadata_string(source_url, materialized_bytes)?,
+            source_kind,
+            function_spans: compiled_spans_from_bytecode(bytecode, materialized_bytes)?,
             imports: Vec::new(),
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
             named_imports: Vec::new(),
             resolved_exports: std::collections::BTreeMap::new(),
-        }
+        })
     }
 }
 
-/// One source span attached to a bytecode program counter.
+/// Source spans owned by one compiled function.
+///
+/// Function and module strings are stored once regardless of how many PCs the
+/// function maps. `spans` retains the bytecode order and contains only compact
+/// numeric entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompiledSourceSpan {
-    /// Function id that owns the program counter.
+pub struct CompiledFunctionSpans {
+    /// Function id that owns every program counter in `spans`.
     pub function_id: u32,
     /// Function name for diagnostics and dumps.
     pub function_name: String,
     /// Module URL carried by the function, falling back to the top-level
     /// bytecode module name when the function is script-local.
     pub module_url: String,
-    /// Program counter.
-    pub pc: u32,
-    /// Byte offset range into the original source.
-    pub span: (u32, u32),
+    /// Compact program-counter/source-range entries for this function.
+    pub spans: Vec<SpanEntry>,
 }
 
 /// Import metadata emitted by the compiler.
@@ -290,23 +365,95 @@ pub(crate) fn collect_module_metadata(
     }
 }
 
-fn compiled_spans_from_bytecode(bytecode: &BytecodeModule) -> Vec<CompiledSourceSpan> {
-    let mut spans = Vec::new();
-    for function in &bytecode.functions {
+fn compiled_metadata_materialized_bytes(
+    bytecode: &BytecodeModule,
+    source_url: &str,
+) -> Result<usize, CompileError> {
+    let mut bytes = source_url.len();
+    for function in bytecode
+        .functions
+        .iter()
+        .filter(|function| !function.spans.is_empty())
+    {
         let module_url = if function.module_url.is_empty() {
-            bytecode.module.clone()
+            bytecode.module.as_str()
         } else {
-            function.module_url.clone()
+            function.module_url.as_str()
         };
-        spans.extend(function.spans.iter().map(|entry| CompiledSourceSpan {
-            function_id: function.id,
-            function_name: function.name.clone(),
-            module_url: module_url.clone(),
-            pc: entry.pc,
-            span: entry.span,
-        }));
+        bytes = bytes
+            .checked_add(std::mem::size_of::<CompiledFunctionSpans>())
+            .and_then(|bytes| bytes.checked_add(function.name.len()))
+            .and_then(|bytes| bytes.checked_add(module_url.len()))
+            .and_then(|bytes| {
+                function
+                    .spans
+                    .len()
+                    .checked_mul(std::mem::size_of::<SpanEntry>())
+                    .and_then(|span_bytes| bytes.checked_add(span_bytes))
+            })
+            .ok_or(CompileError::MetadataLimit {
+                requested_bytes: usize::MAX,
+                limit_bytes: MAX_COMPILED_METADATA_BYTES,
+            })?;
     }
-    spans
+    Ok(bytes)
+}
+
+fn compiled_spans_from_bytecode(
+    bytecode: &BytecodeModule,
+    materialized_bytes: usize,
+) -> Result<Vec<CompiledFunctionSpans>, CompileError> {
+    let function_count = bytecode
+        .functions
+        .iter()
+        .filter(|function| !function.spans.is_empty())
+        .count();
+    let mut function_spans = Vec::new();
+    function_spans
+        .try_reserve_exact(function_count)
+        .map_err(|_| CompileError::MetadataAllocation {
+            requested_bytes: materialized_bytes,
+        })?;
+
+    for function in bytecode
+        .functions
+        .iter()
+        .filter(|function| !function.spans.is_empty())
+    {
+        let module_url = if function.module_url.is_empty() {
+            bytecode.module.as_str()
+        } else {
+            function.module_url.as_str()
+        };
+        let mut spans = Vec::new();
+        spans.try_reserve_exact(function.spans.len()).map_err(|_| {
+            CompileError::MetadataAllocation {
+                requested_bytes: materialized_bytes,
+            }
+        })?;
+        spans.extend_from_slice(&function.spans);
+        function_spans.push(CompiledFunctionSpans {
+            function_id: function.id,
+            function_name: try_clone_metadata_string(&function.name, materialized_bytes)?,
+            module_url: try_clone_metadata_string(module_url, materialized_bytes)?,
+            spans,
+        });
+    }
+    Ok(function_spans)
+}
+
+fn try_clone_metadata_string(
+    value: &str,
+    materialized_bytes: usize,
+) -> Result<String, CompileError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.len())
+        .map_err(|_| CompileError::MetadataAllocation {
+            requested_bytes: materialized_bytes,
+        })?;
+    cloned.push_str(value);
+    Ok(cloned)
 }
 
 struct ModuleMetadataVisitor<'a> {
@@ -498,7 +645,7 @@ fn record_exports_from_declaration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ModuleHostInfo, compile_module_program_to_module};
+    use crate::{ModuleHostInfo, compile_module_program_to_module, compile_script_source};
     use otter_syntax::{SourceKind as SyntaxSourceKind, with_program};
 
     fn host_info(specifiers: &[(&str, &str)]) -> ModuleHostInfo {
@@ -574,7 +721,7 @@ mod tests {
                 .iter()
                 .any(|slot| slot.name == "answer")
         );
-        assert!(!compiled.metadata.spans.is_empty());
+        assert!(!compiled.metadata.function_spans.is_empty());
     }
 
     #[test]
@@ -616,5 +763,139 @@ mod tests {
             2,
             "host imports should be preserved in bytecode metadata"
         );
+    }
+
+    #[test]
+    fn compact_span_metadata_matches_each_bytecode_function_exactly() {
+        let bytecode = compile_script_source(
+            "function add(a, b) { return a + b; } add(20, 22);",
+            SyntaxSourceKind::JavaScript,
+            "file:///compact.js",
+        )
+        .expect("representative script compiles");
+        let metadata = CompiledModuleMetadata::span_only_from_bytecode(&bytecode)
+            .expect("ordinary metadata fits its budget");
+
+        let expected: Vec<_> = bytecode
+            .functions
+            .iter()
+            .filter(|function| !function.spans.is_empty())
+            .map(|function| {
+                (
+                    function.id,
+                    function.name.as_str(),
+                    if function.module_url.is_empty() {
+                        bytecode.module.as_str()
+                    } else {
+                        function.module_url.as_str()
+                    },
+                    function.spans.as_slice(),
+                )
+            })
+            .collect();
+        let actual: Vec<_> = metadata
+            .function_spans
+            .iter()
+            .map(|function| {
+                (
+                    function.function_id,
+                    function.function_name.as_str(),
+                    function.module_url.as_str(),
+                    function.spans.as_slice(),
+                )
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(metadata.source_url, bytecode.module);
+        assert_eq!(metadata.source_kind, bytecode.source_kind);
+    }
+
+    #[test]
+    fn compact_helper_and_explicit_default_budget_are_equivalent() {
+        let bytecode = compile_script_source(
+            "const answer = 42; answer;",
+            SyntaxSourceKind::JavaScript,
+            "file:///equivalent.js",
+        )
+        .expect("ordinary script compiles");
+
+        let ordinary = CompiledModuleMetadata::span_only_from_bytecode(&bytecode)
+            .expect("ordinary helper succeeds");
+        let explicit = CompiledModuleMetadata::span_only_from_bytecode_with_budget_and_source(
+            &bytecode,
+            &bytecode.module,
+            bytecode.source_kind,
+            MAX_COMPILED_METADATA_BYTES,
+        )
+        .expect("explicit default budget succeeds");
+
+        assert_eq!(ordinary, explicit);
+    }
+
+    #[test]
+    fn compact_span_metadata_serializes_one_identity_per_function() {
+        let bytecode = compile_script_source(
+            "function twice(value) { return value * 2; } twice(21);",
+            SyntaxSourceKind::JavaScript,
+            "file:///serialized.js",
+        )
+        .expect("representative script compiles");
+        let metadata = CompiledModuleMetadata::span_only_from_bytecode(&bytecode)
+            .expect("ordinary metadata fits its budget");
+
+        let encoded = serde_json::to_value(&metadata).expect("metadata serializes");
+        assert!(encoded.get("spans").is_none(), "flat schema was removed");
+        let groups = encoded["function_spans"]
+            .as_array()
+            .expect("grouped function span array");
+        assert_eq!(groups.len(), metadata.function_spans.len());
+        for group in groups {
+            assert!(group.get("function_name").is_some());
+            assert!(group.get("module_url").is_some());
+            for span in group["spans"].as_array().expect("compact spans") {
+                assert!(span.get("function_name").is_none());
+                assert!(span.get("module_url").is_none());
+            }
+        }
+
+        let decoded: CompiledModuleMetadata =
+            serde_json::from_value(encoded).expect("grouped metadata deserializes");
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn long_diagnostic_strings_and_many_spans_fail_the_checked_budget() {
+        let mut bytecode =
+            compile_script_source("0;", SyntaxSourceKind::JavaScript, "file:///seed.js")
+                .expect("seed script compiles");
+        bytecode.module = format!("file:///{}.js", "m".repeat(4_096));
+        let function = bytecode.functions.first_mut().expect("main function");
+        function.name = "n".repeat(4_096);
+        function.module_url = format!("file:///{}.js", "u".repeat(4_096));
+        function.spans = (0..2_048_u32)
+            .map(|pc| SpanEntry {
+                pc,
+                span: (pc, pc.saturating_add(1)),
+            })
+            .collect();
+
+        let error = CompiledModuleMetadata::span_only_from_bytecode_with_budget_and_source(
+            &bytecode,
+            &bytecode.module,
+            bytecode.source_kind,
+            1_024,
+        )
+        .expect_err("hostile metadata must be rejected before materialization");
+
+        assert!(matches!(
+            error,
+            CompileError::MetadataLimit {
+                requested_bytes,
+                limit_bytes: 1_024,
+            } if requested_bytes > 1_024
+        ));
+        assert_eq!(bytecode.functions[0].spans.len(), 2_048);
+        assert_eq!(bytecode.functions[0].name.len(), 4_096);
     }
 }

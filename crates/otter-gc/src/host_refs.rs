@@ -5,9 +5,8 @@
 //! page-image representation at all. The body therefore stores a `u32`
 //! index into this table and the table owns the payload, the same split
 //! [`crate::external_refs::ExternalRefTable`] makes for static entry
-//! addresses. A dump carries the index; a restore re-creates the
-//! payload (for the bootstrap graph, by re-installing the closure under
-//! its name) and the index resolves again.
+//! addresses. An in-process snapshot Arc-clones each payload into the same
+//! index before restored bodies can call it.
 //!
 //! Unlike the external-ref table, entries here are *owned*, not
 //! interned addresses, and bodies die: a released slot goes on a free

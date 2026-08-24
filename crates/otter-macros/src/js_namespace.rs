@@ -326,10 +326,11 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
                 })
             };
             quote! {
-                let __call = <#self_ty>::#fn_ident(#(#arg_names),*);
-                let __future = #future_expr;
                 let __out = __cx
-                    .promise_from_future(__future)
+                    .promise_from_future(|| {
+                        let __call = <#self_ty>::#fn_ident(#(#arg_names),*);
+                        #future_expr
+                    })
                     .map_err(|e| e.into_native(#op))?;
                 ::core::result::Result::Ok(__cx.escape(__out))
             }

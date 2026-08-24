@@ -431,11 +431,59 @@ mod tests {
         );
         assert!(throw.successors_exact.is_empty());
 
+        let load_this = row(&inventory, "LOAD_THIS");
+        assert!(load_this.may_throw);
+        assert!(!load_this.may_allocate);
+        assert!(!load_this.may_trigger_gc);
+        assert!(!load_this.may_reenter_javascript);
+        assert!(!load_this.safepoint_required);
+        assert_eq!(
+            load_this.exception_successors_exact,
+            vec![ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller]
+        );
+
+        for return_op in ["RETURN", "RETURN_VALUE", "RETURN_UNDEFINED"] {
+            let return_row = row(&inventory, return_op);
+            assert!(return_row.may_throw);
+            assert!(!return_row.may_allocate);
+            assert!(!return_row.may_trigger_gc);
+            assert!(!return_row.may_reenter_javascript);
+            assert!(!return_row.safepoint_required);
+            assert_eq!(
+                return_row.exception_successors_exact,
+                vec![ExceptionSuccessorSpec::CallerHandlerOrUncaught],
+                "{return_op} must not route post-frame completion errors into a local catch"
+            );
+        }
+
+        let tail_call = row(&inventory, "TAIL_CALL");
+        assert_eq!(
+            tail_call.exception_successors_exact,
+            vec![ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller],
+            "TailCall can fall back before frame removal while local handlers remain active"
+        );
+
         let end_finally = row(&inventory, "END_FINALLY");
         assert_eq!(
             end_finally.exception_successors_exact,
             vec![ExceptionSuccessorSpec::ResumeParkedAbruptCompletion]
         );
+
+        let yield_op = row(&inventory, "YIELD");
+        assert_eq!(
+            yield_op.exception_successors_exact,
+            vec![
+                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller,
+                ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn,
+            ]
+        );
+        for suspension in ["YIELD_DELEGATE", "AWAIT", "GENERATOR_START"] {
+            assert_eq!(
+                row(&inventory, suspension).exception_successors_exact,
+                vec![ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller],
+                "{suspension} must not manufacture an ordinary-yield return edge"
+            );
+        }
 
         let jump_via_finally = row(&inventory, "JUMP_VIA_FINALLY");
         assert!(matches!(

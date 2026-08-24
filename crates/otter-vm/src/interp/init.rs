@@ -203,6 +203,7 @@ impl Interpreter {
             array_index_accessor_protector: false,
             array_index_accessor_protector_epoch: 0,
             interrupt: InterruptFlag::new(),
+            atomics_wait_agent: crate::atomics_wait::WaitAgent::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
@@ -252,13 +253,15 @@ impl Interpreter {
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: Self::JIT_OSR_THRESHOLD,
             jit_code: rustc_hash::FxHashMap::default(),
+            jit_template_entry_retry_remaining: rustc_hash::FxHashMap::default(),
+            jit_template_osr_fids: rustc_hash::FxHashSet::default(),
+            jit_template_compiling: rustc_hash::FxHashSet::default(),
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
             jit_optimized_bail_pcs: std::collections::BTreeMap::new(),
             jit_optimized_bail_counts: rustc_hash::FxHashMap::default(),
             jit_optimized_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
-            jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_runtime_stats: JitRuntimeStats::default(),
@@ -1213,6 +1216,12 @@ impl Interpreter {
     /// that genuinely hot functions tier up early, high enough that one-shot
     /// calls never pay compile latency.
     pub(crate) const JIT_TIER_UP_THRESHOLD: u32 = 50;
+
+    /// Ordinary entries skipped after a transient Template compiler failure.
+    /// This fixed finite delay prevents allocation/backend outages from
+    /// turning every call into a compile attempt without erasing accumulated
+    /// hotness or permanently disabling the function.
+    pub(crate) const JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES: u32 = 64;
 
     /// Shared entry hotness at which a successful baseline generation gets one
     /// feedback-driven rebuild. Target readiness is checked separately before

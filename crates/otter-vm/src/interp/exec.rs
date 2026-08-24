@@ -91,19 +91,65 @@ impl Interpreter {
     /// `eval` / `new Function` / dynamic-import escape paths), and
     /// resolves the chunk's string constants to this isolate's global
     /// property-name atoms.
-    pub fn link_module(&mut self, module: otter_bytecode::BytecodeModule) -> ExecutionContext {
-        let function_count = u32::try_from(module.functions.len())
-            .expect("linked module function table exceeds u32 range");
-        let context = self.code_space.link_module(module);
+    ///
+    /// # Errors
+    /// Returns [`crate::BytecodeLinkError`] before publishing any code when the
+    /// module is malformed or the interpreter-wide id space is exhausted.
+    pub fn link_module(
+        &mut self,
+        module: otter_bytecode::BytecodeModule,
+    ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
+        let function_count = u32::try_from(module.functions.len()).map_err(|_| {
+            crate::BytecodeLinkError::FunctionIdCapacity {
+                base: 0,
+                function_count: module.functions.len(),
+            }
+        })?;
+        let context = self.code_space.link_module(module)?;
+        self.finish_linked_module(context, function_count)
+    }
+
+    /// Link a decoded or cached module while retaining its mandatory
+    /// verification proof through code-space rebasing and executable building.
+    ///
+    /// # Errors
+    /// Returns [`crate::BytecodeLinkError`] before publishing any code when the
+    /// interpreter-wide id space is exhausted or the retained proof cannot be
+    /// rebased.
+    pub fn link_verified_module(
+        &mut self,
+        module: otter_bytecode::VerifiedBytecodeModule,
+    ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
+        let function_count = u32::try_from(module.module().functions.len()).map_err(|_| {
+            crate::BytecodeLinkError::FunctionIdCapacity {
+                base: 0,
+                function_count: module.module().functions.len(),
+            }
+        })?;
+        let context = self.code_space.link_verified_module(module)?;
+        self.finish_linked_module(context, function_count)
+    }
+
+    fn finish_linked_module(
+        &mut self,
+        context: ExecutionContext,
+        function_count: u32,
+    ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         context.resolve_atoms(&self.names);
         if self.active_realm_id != 0 {
             let base = context.function_base();
-            for function_id in base..base + function_count {
+            let end = base.checked_add(function_count).ok_or(
+                crate::BytecodeLinkError::FunctionIdCapacity {
+                    base,
+                    function_count: function_count as usize,
+                },
+            )?;
+            for function_id in base..end {
                 self.function_realm_ids
                     .insert(function_id, self.active_realm_id);
             }
         }
-        context
+        Ok(context)
     }
 
     /// Execute `<main>` of `module` and return its completion value.

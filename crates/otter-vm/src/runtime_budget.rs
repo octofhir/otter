@@ -1,4 +1,4 @@
-//! Runtime budget policy and resource-accounting snapshots.
+//! Per-turn execution budget policy and VM accounting snapshots.
 //!
 //! This module owns the VM-side data contract for BEAM-style runtime
 //! accounting. The current slice is observational: it records reductions,
@@ -6,14 +6,16 @@
 //! call-shape counters without preempting execution.
 //!
 //! # Contents
-//! - [`RuntimeBudget`] — optional per-turn policy limits.
+//! - [`RuntimeBudget`] — optional per-turn policy limits and enforcement mode.
 //! - [`RuntimeBudgetExceededAction`] — outcome policy when a limit is crossed.
 //! - [`RuntimeBudgetStats`] — aggregate counters exposed for diagnostics.
 //! - Reduction cost helpers for the interpreter dispatch loop.
 //!
 //! # Invariants
 //! - Budget DTOs are owned, copyable data; no VM handles cross the boundary.
-//! - Exceeding a configured budget is counted but not enforced in this slice.
+//! - [`RuntimeBudgetExceededAction::Observe`] records an exceedance without
+//!   changing execution; [`RuntimeBudgetExceededAction::Reject`] returns a
+//!   structural budget error at the next cooperative checkpoint.
 //! - Reduction accounting is approximate and stable, not a wall-clock timer.
 //!
 //! # See also
@@ -25,10 +27,13 @@ use otter_gc::GcHeap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Optional runtime budget policy for one contiguous VM turn.
+/// Optional execution budget policy for one contiguous VM turn.
 ///
-/// The initial implementation records observations only. A future scheduler
-/// slice will use the same DTO to yield or reject when limits are exceeded.
+/// Interpreter dispatch checks rejecting budgets on every instruction. Native
+/// JIT loops decrement an inline fuel counter and re-enter the same checkpoint
+/// in bounded batches, while microtask drains enforce their independent count
+/// at the queue boundary. Observe mode preserves execution and records the
+/// same crossings for diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeBudget {
     /// Outcome policy when a configured limit is crossed.
@@ -126,11 +131,10 @@ pub struct RuntimeBudgetStats {
     pub max_stack_depth_observed: u32,
     /// Cooperative yields caused by budget enforcement.
     ///
-    /// This remains zero until the scheduler slice starts enforcing budgets.
+    /// Reject mode is currently the only enforcing action, so this remains
+    /// zero until an explicit yielding scheduler policy is added.
     pub forced_yields: u64,
     /// Hard budget rejections caused by budget enforcement.
-    ///
-    /// This remains zero until the scheduler slice starts enforcing budgets.
     pub budget_rejections: u64,
 }
 
@@ -345,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_exceedance_is_observed_not_rejected() {
+    fn observe_mode_records_exceedance_without_rejection() {
         let budget = RuntimeBudget {
             on_exceeded: RuntimeBudgetExceededAction::Observe,
             max_reductions_per_turn: Some(1),

@@ -542,6 +542,7 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+        .expect("valid bytecode fixture")
     }
 
     fn named_property_module() -> BytecodeModule {
@@ -733,7 +734,9 @@ mod tests {
     #[test]
     fn stack_owned_named_properties_decode_and_validate_published_pc() {
         let mut vm = Interpreter::new();
-        let context = vm.link_module(named_property_module());
+        let context = vm
+            .link_module(named_property_module())
+            .expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let mut receiver = vm
             .allocate_object_literal_value()
@@ -815,7 +818,9 @@ mod tests {
     #[test]
     fn stack_owned_wide_method_span_decodes_count_and_records_exact_target() {
         let mut vm = Interpreter::new();
-        let context = vm.link_module(wide_method_module());
+        let context = vm
+            .link_module(wide_method_module())
+            .expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let mut receiver = vm
             .allocate_object_literal_value()
@@ -904,7 +909,9 @@ mod tests {
     #[test]
     fn named_store_boundary_publishes_canonical_inline_add_transition() {
         let mut vm = Interpreter::new();
-        let context = vm.link_module(named_property_module());
+        let context = vm
+            .link_module(named_property_module())
+            .expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let mut first = vm
             .allocate_object_literal_value()
@@ -1020,7 +1027,9 @@ mod tests {
     #[test]
     fn named_store_default_prototype_keeps_cell_rhs_on_canonical_boundary() {
         let mut vm = Interpreter::new();
-        let context = vm.link_module(named_property_module());
+        let context = vm
+            .link_module(named_property_module())
+            .expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let mut first = Value::undefined();
         let mut second = Value::undefined();
@@ -1173,7 +1182,9 @@ mod tests {
     #[test]
     fn named_store_transition_encodes_direct_terminal_prototype_guard() {
         let mut vm = Interpreter::new();
-        let context = vm.link_module(named_property_module());
+        let context = vm
+            .link_module(named_property_module())
+            .expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let mut prototype = Value::object(
             vm.alloc_runtime_rooted_object_with_roots(&[], &[])
@@ -1253,7 +1264,7 @@ mod tests {
         let mut vm = Interpreter::new();
         let mut module = named_property_module();
         module.functions[0].is_strict = true;
-        let context = vm.link_module(module);
+        let context = vm.link_module(module).expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let receiver = vm
             .allocate_object_literal_value()

@@ -1,0 +1,13 @@
+[package]
+name = "otter-resource"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Deterministic resource accounting primitives for Otter."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }

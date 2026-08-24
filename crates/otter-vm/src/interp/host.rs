@@ -111,6 +111,19 @@ impl Interpreter {
         &self.timer_callbacks
     }
 
+    /// Cancel one host deadline and forget its callback.
+    ///
+    /// The callback is removed first so a late host fire cannot re-enter it.
+    /// Returns `true` when either side still knew the token.
+    #[doc(hidden)]
+    pub fn cancel_timer(&mut self, token: u64) -> bool {
+        let removed = self.timer_callbacks.remove(token).is_some();
+        let host_cancelled = self
+            .timer_scheduler()
+            .is_some_and(|scheduler| scheduler.cancel(token));
+        removed || host_cancelled
+    }
+
     /// Cancel and forget every timer owned by a disposed realm.
     #[doc(hidden)]
     pub fn cancel_timers_for_realm(&mut self, realm_id: u32) -> usize {
@@ -122,6 +135,24 @@ impl Interpreter {
             }
         }
         tokens.len()
+    }
+
+    /// Cancel and forget every timer callback owned by this interpreter.
+    ///
+    /// Callback entries are drained before their host deadlines are cancelled,
+    /// making late fires harmless during process or isolate teardown. Returns
+    /// the number of callbacks detached from the interpreter.
+    #[doc(hidden)]
+    pub fn cancel_all_timers(&mut self) -> usize {
+        let scheduler = self.timer_scheduler();
+        let mut cancelled = 0usize;
+        for token in self.timer_callbacks.drain_tokens() {
+            cancelled += 1;
+            if let Some(scheduler) = &scheduler {
+                let _ = scheduler.cancel(token);
+            }
+        }
+        cancelled
     }
 
     /// Insert a generic persistent root and return its id.
@@ -184,6 +215,15 @@ impl Interpreter {
     #[must_use]
     pub fn dynamic_import_realm_id(&self, token: u64) -> Option<u32> {
         self.dynamic_import_registry.realm_id(token)
+    }
+
+    /// Remove one pending dynamic-import registry entry without settling it.
+    /// Hosts use this only when process exit or a fatal infrastructure error
+    /// makes JavaScript delivery impossible; taking the entry releases the
+    /// registry's GC root deterministically.
+    #[doc(hidden)]
+    pub fn cancel_dynamic_import(&mut self, token: u64) -> bool {
+        self.dynamic_import_registry.take(token).is_some()
     }
 
     /// Forget pending dynamic imports owned by a disposed realm.
@@ -385,6 +425,14 @@ impl Interpreter {
         self.cpu_profiler = None;
     }
 
+    /// Take the samples collected so far, leaving the profiler installed.
+    #[must_use]
+    pub fn drain_cpu_profile(&mut self) -> Option<CpuProfile> {
+        self.cpu_profiler
+            .as_mut()
+            .map(cpu_profile::CpuProfiler::drain)
+    }
+
     /// Take and clear the current CPU profile, if profiling was enabled.
     #[must_use]
     pub fn take_cpu_profile(&mut self) -> Option<CpuProfile> {
@@ -439,7 +487,7 @@ impl Interpreter {
     /// Per-space, per-type-tag census of the live heap. Cheaper than
     /// [`Self::heap_snapshot_summary`] — a linear page walk with no
     /// edge graph — and it separates old space from the nursery, which
-    /// is what a bootstrap snapshot writer needs to size its dump.
+    /// lets the opaque in-process snapshot path size its retained image.
     #[must_use]
     pub fn heap_census(&self) -> otter_gc::HeapCensus {
         self.gc_heap.census()
@@ -460,12 +508,12 @@ impl Interpreter {
         self.gc_heap.audit_self_containment()
     }
 
-    /// Capture this isolate's old generation as a relocatable image.
+    /// Capture this isolate's old generation as an opaque relocatable image.
     ///
     /// # Errors
     /// Propagates [`otter_gc::ImageError`]; a build leaves the nursery
     /// empty, so a capture taken right after one succeeds.
-    pub fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
+    pub(crate) fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
         self.gc_heap.capture_old_space()
     }
 
@@ -554,6 +602,16 @@ impl Interpreter {
     #[must_use]
     pub fn interrupt_handle(&self) -> InterruptFlag {
         self.interrupt.clone()
+    }
+
+    /// Cloneable lifecycle handle for this isolate's `Atomics.wait` agent.
+    ///
+    /// Unlike [`Self::interrupt_handle`], cancellation through this handle is
+    /// permanent for the interpreter lifetime and wakes only waits registered
+    /// by this isolate.
+    #[must_use]
+    pub fn atomics_wait_agent_handle(&self) -> atomics_wait::WaitAgentHandle {
+        self.atomics_wait_agent.handle()
     }
 
     /// Configure whether this isolate may block in `Atomics.wait`.

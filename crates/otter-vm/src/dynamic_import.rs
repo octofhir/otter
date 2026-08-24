@@ -43,6 +43,7 @@
 //! - [`crate::microtask`] — reaction-microtask queue the
 //!   settlement enqueues onto.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,9 +52,53 @@ use otter_gc::raw::RawGc;
 use crate::JsPromiseHandle;
 use crate::execution_context::ExecutionContext;
 
+/// Unique runtime-owned credit for one dynamic-import completion.
+///
+/// The VM never inspects the payload. It acquires the carrier before creating
+/// the pending Promise and moves that same carrier back through
+/// [`DynamicImportLoader::schedule`]. Dropping it cancels the runtime's RAII
+/// accounting.
+pub struct DynamicImportAdmission(Option<Box<dyn Any + Send>>);
+
+impl DynamicImportAdmission {
+    /// Wrap an embedder-owned admission guard.
+    #[must_use]
+    pub fn new(token: Box<dyn Any + Send>) -> Self {
+        Self(Some(token))
+    }
+
+    /// Recover a guard of the expected concrete type in the loader that
+    /// created it. A foreign carrier is returned intact instead of panicking.
+    pub fn try_into_inner<T: Any + Send>(mut self) -> Result<Box<T>, Self> {
+        let Some(token) = self.0.take() else {
+            return Err(self);
+        };
+        match token.downcast::<T>() {
+            Ok(token) => Ok(token),
+            Err(token) => {
+                self.0 = Some(token);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DynamicImportAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicImportAdmission")
+            .field("live", &self.0.is_some())
+            .finish()
+    }
+}
+
 /// Host-side scheduler the runtime layer plugs in. Lives behind
 /// an [`Arc<dyn DynamicImportLoader>`] on [`crate::Interpreter`].
 pub trait DynamicImportLoader: Send + Sync {
+    /// Reserve one physically bounded terminal-completion slot before the VM
+    /// creates a pending Promise or roots it in the import registry.
+    fn admit(&self) -> Result<DynamicImportAdmission, String>;
+
     /// Schedule an on-demand module load. The VM has already
     /// registered a pending promise under `token`; the host posts
     /// a runtime inbox message that, on its next tick, drives the
@@ -64,7 +109,13 @@ pub trait DynamicImportLoader: Send + Sync {
     /// `referrer` is empty for entry-script callers; otherwise it
     /// is the canonical URL of the module that ran the
     /// `import(expr)` call.
-    fn schedule(&self, token: u64, specifier: String, referrer: String);
+    fn schedule(
+        &self,
+        admission: DynamicImportAdmission,
+        token: u64,
+        specifier: String,
+        referrer: String,
+    ) -> Result<(), String>;
 }
 
 /// Cloneable handle the VM uses to talk to the host scheduler.

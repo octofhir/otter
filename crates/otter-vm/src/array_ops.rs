@@ -625,6 +625,7 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+        .expect("valid bytecode fixture")
     }
 
     fn empty_module() -> BytecodeModule {

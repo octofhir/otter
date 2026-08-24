@@ -741,8 +741,8 @@ fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value
     };
     let name = read_warning(ctx, "name").unwrap_or_else(|| "Warning".to_string());
     let code = read_warning(ctx, "code");
-    if let Some(disabled) = read_process(ctx, "__otter_disabled_warnings__")
-        .and_then(Value::as_array)
+    if let Some(disabled) =
+        read_process(ctx, "__otter_disabled_warnings__").and_then(Value::as_array)
     {
         let length = otter_vm::array::len(disabled, ctx.heap());
         for index in 0..length {

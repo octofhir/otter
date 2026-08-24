@@ -2,7 +2,7 @@
 
 use otter_runtime::module_loader::{
     RemoteModuleError, RemoteModuleFuture, RemoteModuleProvider, RemoteModuleRequest,
-    RemoteModuleSource,
+    RemoteModuleResponse,
 };
 use otter_runtime::{CapabilitySet, Otter, Permission, Runtime, SourceInput, TokioRuntimeHost};
 use std::collections::BTreeMap;
@@ -20,10 +20,9 @@ impl RemoteModuleProvider for CachedModules {
                 url: request.url.clone(),
                 message: "cache miss".to_string(),
             })?;
-            Ok(RemoteModuleSource {
+            Ok(RemoteModuleResponse::Source {
                 source,
                 content_type: Some("text/javascript".to_string()),
-                final_url: request.url,
             })
         })
     }

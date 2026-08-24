@@ -1,0 +1,488 @@
+//! Shared isolate-resource admission across runtime construction paths.
+//!
+//! # Contents
+//! - Direct, sendable, pool, realm, worker, and snapshot admission tests.
+//! - Typed error and rollback assertions.
+//!
+//! # Invariants
+//! - Every live runtime owns exactly one `Isolates` charge plus the exact
+//!   stack/worker charges selected by its execution role.
+//! - Role admission is atomic, precedes construction effects, and every failed
+//!   path rolls back the complete tuple.
+//! - In-process runtime snapshots retain their donor account.
+//!
+//! # See also
+//! - `otter_resource::ResourceAccount`
+
+use otter_runtime::{
+    JitSelection, OtterError, OtterPool, RUNTIME_THREAD_STACK_BYTES, ResourceAccount,
+    ResourceClass, ResourceError, ResourceLimits, ResourceSnapshotEntry, Runtime, RuntimeBuilder,
+    RuntimeGlobalInstaller, SnapshotRuntimeOptions, SourceInput, Worker,
+};
+
+fn isolate_account(limit: u64) -> ResourceAccount {
+    ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::Isolates, limit)
+            .build(),
+    )
+}
+
+fn isolate_entry(account: &ResourceAccount) -> ResourceSnapshotEntry {
+    *account.snapshot().get(ResourceClass::Isolates)
+}
+
+fn resource_entry(account: &ResourceAccount, class: ResourceClass) -> ResourceSnapshotEntry {
+    *account.snapshot().get(class)
+}
+
+fn minimal_builder(account: ResourceAccount) -> RuntimeBuilder {
+    Runtime::builder()
+        .resource_account(account)
+        .process_global(false)
+        .worker_global(false)
+        .jit_selection(JitSelection::InterpreterOnly)
+}
+
+fn assert_isolate_exhausted(error: OtterError, in_use: u64, limit: u64) {
+    assert!(matches!(
+        error,
+        OtterError::Resource {
+            error: ResourceError::Exhausted {
+                class: ResourceClass::Isolates,
+                requested: 1,
+                in_use: actual_in_use,
+                limit: actual_limit,
+            }
+        } if actual_in_use == in_use && actual_limit == limit
+    ));
+}
+
+#[test]
+fn direct_runtimes_share_an_exact_isolate_limit_and_release_on_drop() {
+    let account = isolate_account(1);
+    let builder = minimal_builder(account.clone());
+
+    let first = builder.clone().build().expect("first isolate");
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (1, 1, 0)
+    );
+
+    let error = builder
+        .clone()
+        .build()
+        .expect_err("second isolate rejected");
+    assert_isolate_exhausted(error, 1, 1);
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (1, 1, 1)
+    );
+
+    drop(first);
+    assert_eq!(isolate_entry(&account).current(), 0);
+    drop(builder.build().expect("slot reusable after drop"));
+    assert_eq!(isolate_entry(&account).current(), 0);
+}
+
+#[test]
+fn runtime_roles_retain_their_exact_resource_tuples() {
+    let direct_account = ResourceAccount::default();
+    let direct = minimal_builder(direct_account.clone())
+        .build()
+        .expect("direct runtime");
+    assert_eq!(isolate_entry(&direct_account).current(), 1);
+    assert_eq!(
+        resource_entry(&direct_account, ResourceClass::Workers).current(),
+        0
+    );
+    assert_eq!(
+        resource_entry(&direct_account, ResourceClass::WorkerStackBytes).current(),
+        0
+    );
+    drop(direct);
+
+    let handle_account = ResourceAccount::default();
+    let handle = minimal_builder(handle_account.clone())
+        .build_handle()
+        .expect("handle runtime");
+    assert_eq!(isolate_entry(&handle_account).current(), 1);
+    assert_eq!(
+        resource_entry(&handle_account, ResourceClass::Workers).current(),
+        0
+    );
+    assert_eq!(
+        resource_entry(&handle_account, ResourceClass::WorkerStackBytes).current(),
+        RUNTIME_THREAD_STACK_BYTES as u64
+    );
+    drop(handle);
+
+    let worker_account = ResourceAccount::default();
+    let worker = Worker::builder()
+        .resource_account(worker_account.clone())
+        .build()
+        .expect("worker runtime");
+    assert_eq!(isolate_entry(&worker_account).current(), 1);
+    assert_eq!(
+        resource_entry(&worker_account, ResourceClass::Workers).current(),
+        1
+    );
+    assert_eq!(
+        resource_entry(&worker_account, ResourceClass::WorkerStackBytes).current(),
+        RUNTIME_THREAD_STACK_BYTES as u64
+    );
+    drop(worker);
+
+    for account in [direct_account, handle_account, worker_account] {
+        assert_eq!(isolate_entry(&account).current(), 0);
+        assert_eq!(
+            resource_entry(&account, ResourceClass::Workers).current(),
+            0
+        );
+        assert_eq!(
+            resource_entry(&account, ResourceClass::WorkerStackBytes).current(),
+            0
+        );
+    }
+}
+
+#[test]
+fn aggregate_admission_rejection_publishes_no_partial_peak() {
+    let account = ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::Isolates, 1)
+            .limit(ResourceClass::WorkerStackBytes, 0)
+            .build(),
+    );
+    let error = minimal_builder(account.clone())
+        .build_handle()
+        .expect_err("native stack limit must reject the handle");
+    assert!(matches!(
+        error,
+        OtterError::Resource {
+            error: ResourceError::Exhausted {
+                class: ResourceClass::WorkerStackBytes,
+                requested,
+                in_use: 0,
+                limit: 0,
+            }
+        } if requested == RUNTIME_THREAD_STACK_BYTES as u64
+    ));
+    let isolate = isolate_entry(&account);
+    let stack = resource_entry(&account, ResourceClass::WorkerStackBytes);
+    assert_eq!((isolate.current(), isolate.peak()), (0, 0));
+    assert_eq!(
+        (stack.current(), stack.peak(), stack.rejections()),
+        (0, 0, 1)
+    );
+}
+
+#[test]
+fn validation_happens_before_resource_admission() {
+    let account = isolate_account(0);
+    let error = minimal_builder(account.clone())
+        .max_stack_depth(0)
+        .build()
+        .expect_err("invalid config");
+    assert!(matches!(error, OtterError::Config { .. }));
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn handle_limit_rejects_before_event_loop_channel_or_thread_construction() {
+    let account = isolate_account(0);
+    let error = minimal_builder(account.clone())
+        .build_handle()
+        .expect_err("zero isolate limit");
+
+    assert_isolate_exhausted(error, 0, 0);
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 0, 1)
+    );
+}
+
+#[test]
+fn async_builder_without_tokio_rolls_admission_back() {
+    use std::future::Future as _;
+
+    let account = isolate_account(1);
+    let mut future = Box::pin(minimal_builder(account.clone()).build_handle_async());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let error = match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(Err(error)) => error,
+        std::task::Poll::Ready(Ok(_)) => panic!("async build unexpectedly found a Tokio host"),
+        std::task::Poll::Pending => panic!("missing Tokio host must fail before suspension"),
+    };
+
+    assert!(matches!(error, OtterError::Internal { .. }));
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 1, 0)
+    );
+}
+
+#[test]
+fn failed_bootstrap_rolls_admission_back() {
+    let account = isolate_account(1);
+    let installer = RuntimeGlobalInstaller::new(|_| {
+        Err(OtterError::Internal {
+            code: "TEST_RESOURCE_ROLLBACK".to_string(),
+            message: "intentional installer failure".to_string(),
+        })
+    });
+
+    let error = minimal_builder(account.clone())
+        .global_installer(installer)
+        .build()
+        .expect_err("installer must fail");
+    assert!(matches!(error, OtterError::Internal { .. }));
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 1, 0)
+    );
+}
+
+#[test]
+fn failed_handle_bootstrap_is_joined_and_releases_before_return() {
+    let account = isolate_account(1);
+    let installer = RuntimeGlobalInstaller::new(|_| {
+        Err(OtterError::Internal {
+            code: "TEST_HANDLE_RESOURCE_ROLLBACK".to_string(),
+            message: "intentional installer failure".to_string(),
+        })
+    });
+
+    let error = minimal_builder(account.clone())
+        .global_installer(installer)
+        .build_handle()
+        .expect_err("isolate thread bootstrap must fail");
+    assert!(matches!(error, OtterError::Internal { .. }));
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 1, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_clones_do_not_charge_and_shutdown_releases_before_last_clone() {
+    let account = isolate_account(1);
+    let builder = minimal_builder(account.clone());
+    let handle = builder.clone().build_handle().expect("handle isolate");
+    let surviving_clone = handle.clone();
+
+    assert_eq!(isolate_entry(&account).current(), 1);
+    let error = builder
+        .build_handle()
+        .expect_err("shared handle limit must reject");
+    assert_isolate_exhausted(error, 1, 1);
+
+    handle.shutdown_and_wait().await;
+    assert_eq!(isolate_entry(&account).current(), 0);
+    assert_eq!(
+        surviving_clone
+            .resource_snapshot()
+            .get(ResourceClass::Isolates)
+            .current(),
+        0
+    );
+}
+
+#[test]
+fn pool_build_failure_releases_already_started_isolates() {
+    let account = isolate_account(1);
+    let error = OtterPool::builder()
+        .workers(2)
+        .resource_account(account.clone())
+        .build()
+        .expect_err("second pool isolate must be rejected");
+    assert_isolate_exhausted(error, 1, 1);
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 1, 1)
+    );
+    let workers = resource_entry(&account, ResourceClass::Workers);
+    assert_eq!(
+        (workers.current(), workers.peak(), workers.rejections()),
+        (0, 1, 0)
+    );
+    let stacks = resource_entry(&account, ResourceClass::WorkerStackBytes);
+    assert_eq!(
+        (stacks.current(), stacks.peak(), stacks.rejections()),
+        (0, RUNTIME_THREAD_STACK_BYTES as u64, 0)
+    );
+}
+
+#[test]
+fn additional_realms_do_not_count_as_isolates() {
+    let account = isolate_account(1);
+    let mut runtime = minimal_builder(account.clone()).build().expect("runtime");
+    let realm = runtime.create_realm().expect("realm");
+    assert_eq!(isolate_entry(&account).current(), 1);
+    runtime.dispose_realm(realm).expect("dispose realm");
+    assert_eq!(isolate_entry(&account).current(), 1);
+    drop(runtime);
+    assert_eq!(isolate_entry(&account).current(), 0);
+}
+
+#[test]
+fn javascript_worker_is_rejected_before_child_channels_or_thread() {
+    let account = isolate_account(1);
+    let mut parent = Runtime::builder()
+        .resource_account(account.clone())
+        .process_global(false)
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .expect("parent isolate");
+
+    parent
+        .eval(SourceInput::from_javascript(
+            "new Worker('resource-limit-worker.js')",
+        ))
+        .expect_err("the parent occupies the only isolate slot");
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (1, 1, 1)
+    );
+    for class in [ResourceClass::Workers, ResourceClass::WorkerStackBytes] {
+        let entry = resource_entry(&account, class);
+        assert_eq!(
+            (entry.current(), entry.peak(), entry.rejections()),
+            (0, 0, 0)
+        );
+    }
+
+    drop(parent);
+    assert_eq!(isolate_entry(&account).current(), 0);
+}
+
+#[test]
+fn javascript_worker_role_rejection_does_not_publish_isolate_or_stack_peaks() {
+    let account = ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::Isolates, 2)
+            .limit(ResourceClass::Workers, 0)
+            .limit(
+                ResourceClass::WorkerStackBytes,
+                RUNTIME_THREAD_STACK_BYTES as u64,
+            )
+            .build(),
+    );
+    let mut parent = Runtime::builder()
+        .resource_account(account.clone())
+        .process_global(false)
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .expect("parent isolate");
+
+    parent
+        .eval(SourceInput::from_javascript(
+            "new Worker('worker-role-limit.js')",
+        ))
+        .expect_err("worker slot limit must reject before child setup");
+
+    let isolates = isolate_entry(&account);
+    assert_eq!(
+        (isolates.current(), isolates.peak(), isolates.rejections()),
+        (1, 1, 0)
+    );
+    let workers = resource_entry(&account, ResourceClass::Workers);
+    assert_eq!(
+        (workers.current(), workers.peak(), workers.rejections()),
+        (0, 0, 1)
+    );
+    let stacks = resource_entry(&account, ResourceClass::WorkerStackBytes);
+    assert_eq!(
+        (stacks.current(), stacks.peak(), stacks.rejections()),
+        (0, 0, 0)
+    );
+
+    drop(parent);
+    assert_eq!(isolate_entry(&account).current(), 0);
+}
+
+#[test]
+fn in_process_snapshot_restore_always_joins_the_donor_account() {
+    let donor_account = isolate_account(1);
+    let donor = minimal_builder(donor_account.clone())
+        .build()
+        .expect("donor");
+    let snapshot = donor.capture_isolate_snapshot().expect("snapshot");
+
+    let error = Runtime::from_isolate_snapshot_with(
+        &snapshot,
+        SnapshotRuntimeOptions {
+            jit_selection: JitSelection::InterpreterOnly,
+            ..SnapshotRuntimeOptions::default()
+        },
+    )
+    .expect_err("live donor occupies its only isolate slot");
+    assert_isolate_exhausted(error, 1, 1);
+
+    drop(donor);
+    let restored = Runtime::from_isolate_snapshot(&snapshot).expect("restore after donor drop");
+    assert_eq!(isolate_entry(&donor_account).current(), 1);
+    assert_eq!(
+        restored
+            .resource_account()
+            .snapshot()
+            .get(ResourceClass::Isolates)
+            .current(),
+        1
+    );
+    drop(restored);
+    assert_eq!(isolate_entry(&donor_account).current(), 0);
+}
+
+#[test]
+fn failed_in_process_restore_releases_its_admission() {
+    let account = isolate_account(1);
+    let snapshot = {
+        let donor = minimal_builder(account.clone()).build().expect("donor");
+        donor.capture_isolate_snapshot().expect("snapshot")
+    };
+    assert_eq!(isolate_entry(&account).current(), 0);
+
+    let error = Runtime::from_isolate_snapshot_with(
+        &snapshot,
+        SnapshotRuntimeOptions {
+            max_heap_bytes: 1,
+            jit_selection: JitSelection::InterpreterOnly,
+            ..SnapshotRuntimeOptions::default()
+        },
+    )
+    .expect_err("captured image cannot fit in a one-byte heap cap");
+    assert!(matches!(
+        error,
+        OtterError::OutOfMemory {
+            heap_limit_bytes: 1,
+            ..
+        }
+    ));
+    let entry = isolate_entry(&account);
+    assert_eq!(
+        (entry.current(), entry.peak(), entry.rejections()),
+        (0, 1, 0)
+    );
+}
+
+#[test]
+fn public_resource_diagnostics_are_send_sync() {
+    fn assert_send_sync<T: Send + Sync + 'static>() {}
+
+    assert_send_sync::<ResourceAccount>();
+    assert_send_sync::<otter_runtime::ResourceSnapshot>();
+    assert_send_sync::<otter_runtime::RuntimeHandle>();
+}

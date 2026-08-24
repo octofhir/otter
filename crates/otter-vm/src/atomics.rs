@@ -767,7 +767,10 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
                 return wait_async_result(ctx, method_name, true, "timed-out");
             }
         }
-        atomics_wait::register_async_waiter(buf_id, idx);
+        let wait_agent = ctx.interp_mut().atomics_wait_agent_handle();
+        if !atomics_wait::register_async_waiter(buf_id, idx, &wait_agent) {
+            return Err(NativeError::Interrupted);
+        }
         return wait_async_result(ctx, method_name, true, "ok");
     }
 
@@ -784,8 +787,14 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             let ms = timeout.min(u64::MAX as f64) as u64;
             Some(Duration::from_millis(ms))
         };
-        let interrupt = ctx.interp_mut().interrupt_handle();
-        match atomics_wait::park_until_notified(buf_id, idx, dur, Some(&interrupt)) {
+        let (interrupt, wait_agent) = {
+            let interp = ctx.interp_mut();
+            (
+                interp.interrupt_handle(),
+                interp.atomics_wait_agent_handle(),
+            )
+        };
+        match atomics_wait::park_until_notified(buf_id, idx, dur, Some(&interrupt), &wait_agent) {
             WaitOutcome::Ok => "ok",
             WaitOutcome::TimedOut => "timed-out",
             WaitOutcome::Interrupted | WaitOutcome::Cancelled => {

@@ -1,16 +1,13 @@
 //! Census of the native callables a built runtime leaves on the heap.
 //!
-//! A bootstrap snapshot restores heap pages verbatim, so every byte it
-//! dumps must survive a process boundary. [`NativeFunctionBody`] does
-//! not: it stores a raw Rust function pointer for static builtins and
-//! `Arc` closures for dynamic natives, both of which differ per build
-//! and per process (ASLR). The display name is a heap-owned string,
-//! so it rides the page dump like any other body field.
+//! An opaque in-process snapshot copies [`NativeFunctionBody`] pages verbatim.
+//! Static entry points remain valid in the same process; dynamic-native `Arc`s
+//! live in the host-ref table and are cloned at their exact indices. The
+//! display name is an ordinary heap-owned string.
 //!
-//! This module counts them honestly — by walking live bodies, not by
-//! grepping declaration sites — so the snapshot design knows exactly
-//! how large the re-installation problem is and which callables have
-//! no serializable form at all.
+//! This module counts them honestly — by walking live bodies, not by grepping
+//! declaration sites — so diagnostics expose dispatch mix, capture pressure,
+//! and host-ref ownership without rendering process addresses.
 //!
 //! # Contents
 //!
@@ -28,8 +25,7 @@
 //!   local_dynamic_count == total`.
 //! - `distinct_static_fns` counts unique function addresses, so it is
 //!   the lower bound on a native reference table's size, while
-//!   `static_count` is the number of table lookups a restore would
-//!   have to perform.
+//!   `static_count` is the number of bodies using those identities.
 //! - [`NativeCensus::closures`] is sorted by name so the rendered
 //!   table is stable across runs; addresses are never rendered.
 //!

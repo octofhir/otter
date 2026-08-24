@@ -425,7 +425,6 @@ fn ensure_node_tests_present(workspace_root: &Path) -> Result<()> {
     )
 }
 
-
 /// The subset of a test's `// Flags:` line the engine understands. V8-specific
 /// flags are skipped (the harness's own flag re-exec stays disabled), but the
 /// Node-level switches Otter implements are honored, so tests that assert on

@@ -8,16 +8,17 @@
 use crate::*;
 
 impl Interpreter {
-    /// Return the current observational runtime budget policy.
+    /// Return the current per-turn runtime budget policy.
     #[must_use]
     pub fn runtime_budget(&self) -> RuntimeBudget {
         self.runtime_budget
     }
 
-    /// Set the observational runtime budget policy.
+    /// Set the per-turn runtime budget policy.
     ///
-    /// The current VM records exceedance observations but does not preempt,
-    /// yield, or reject when limits are crossed.
+    /// Observe mode records crossings without changing execution. Reject mode
+    /// returns [`VmError::BudgetExceeded`] at interpreter instructions, JIT
+    /// backedge batches, and bounded microtask-drain checkpoints.
     pub fn set_runtime_budget(&mut self, budget: RuntimeBudget) {
         self.runtime_budget = budget;
     }

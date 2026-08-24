@@ -619,7 +619,12 @@ if (!Buffer) {
         : new Uint8Array(target.buffer, target.byteOffset, target.byteLength);
       if (targetStart >= targetBytes.length || sourceEnd <= sourceStart) return 0;
       const n = Math.min(sourceEnd - sourceStart, targetBytes.length - targetStart);
-      for (let i = 0; i < n; i++) targetBytes[targetStart + i] = this[sourceStart + i];
+      // One bulk typed-array store, not a byte-at-a-time JS loop: the engine
+      // copies same-kind views as bytes.
+      targetBytes.set(
+        Uint8Array.prototype.subarray.call(this, sourceStart, sourceStart + n),
+        targetStart,
+      );
       return n;
     }
 
@@ -1088,7 +1093,7 @@ if (!Buffer) {
         if (pos >= totalLength) break;
         const blen = b.byteLength;
         const n = Math.min(blen, totalLength - pos);
-        for (let i = 0; i < n; i++) out[pos + i] = b[i];
+        out.set(Uint8Array.prototype.subarray.call(b, 0, n), pos);
         pos += blen;
       }
       return out;

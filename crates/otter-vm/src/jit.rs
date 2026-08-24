@@ -120,8 +120,10 @@ pub struct JitCompileRequest {
     /// Keeping this optional avoids cloning names and module URLs on the
     /// ordinary default-off compilation path.
     pub artifact_identity: Option<crate::jit_artifact::JitArtifactIdentity>,
-    /// Loop-header logical PC for an OSR-target compile. `None` means normal
-    /// function-entry compilation.
+    /// Loop-header logical PC that triggered an OSR compile. `None` means
+    /// normal function-entry compilation. Template compilation uses this for
+    /// target diagnostics only: one returned whole-function body owns the
+    /// trampolines for every eligible loop header.
     pub osr_pc: Option<u32>,
     /// Unique isolate-assigned identity for the produced code object. The
     /// emitter stamps it into the code metadata and every published frame, so
@@ -1953,15 +1955,18 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
 /// On-demand snapshot of executable code retained by one interpreter.
 ///
 /// Code objects are deduplicated by allocation identity across the canonical
-/// entry/OSR maps and auxiliary direct-call caches. `code_bytes` sums finalized
-/// native buffer lengths, not Rust metadata or page-rounding overhead.
+/// shared Template cache, the separate Machine cache, and auxiliary direct-call
+/// caches. `code_bytes` sums finalized native buffer lengths, not Rust metadata
+/// or page-rounding overhead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCodeResidency {
     /// Installed optimizing-tier entry bodies.
     pub installed_optimized_bodies: u64,
-    /// Installed non-OSR function bodies.
+    /// Canonical Template bodies eligible for ordinary function entry.
     pub installed_entry_bodies: u64,
-    /// Installed OSR-target bodies.
+    /// Canonical Template bodies selected by at least one OSR header. A shared
+    /// entry-capable body contributes to both category counts but only once to
+    /// `unique_code_objects` and `code_bytes`.
     pub installed_osr_bodies: u64,
     /// Unique executable code objects reachable from all runtime caches.
     pub unique_code_objects: u64,

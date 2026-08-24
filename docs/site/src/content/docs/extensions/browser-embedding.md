@@ -67,14 +67,13 @@ from the browser registry. It signals shutdown without blocking the UI or a
 current-thread Tokio executor, then resolves after the isolate has released VM
 pages and traced host payloads. `RuntimeHandle::shutdown` is the fire-and-forget
 variant. Every clone observes the shutdown state and late task delivery fails.
-For async results that must become rich JavaScript objects,
-deliver an owned result DTO as a runtime task and call
-`Runtime::settle_pending_promise_with` inside that task; its materializer runs
-in a handle scope on the target isolate.
-
-Layer B `RuntimeHandle::settle_promise` is also non-blocking under inbox
-pressure: it retains the owned result and retries delivery on the shared Tokio
-host. Shutdown cancels the retry and releases its liveness accounting.
+Async native methods use the typed `promise_from_future` completion protocol.
+The runtime admits physically bounded terminal capacity before the future is
+first polled or a pending Promise is rooted, and the unique carrier follows the
+owned result through the wakeable inbox. Rich JavaScript objects are
+materialized on the isolate turn by the binding's `IntoJs` implementation.
+Shutdown drops that same carrier, releasing queue and host-operation accounting
+without a late raw Promise-id settlement path.
 
 Install `RuntimeBuilder::promise_rejection_hook` per page to translate the
 isolate's unhandled/later-handled rejection checkpoints into the browser's
@@ -87,12 +86,17 @@ Execute an already-fetched module entry with
 memory. Install an embedder transport with
 `RuntimeBuilder::remote_module_provider`; its `RemoteModuleProvider::fetch`
 method receives an owned URL and `ModuleLoadCancellation`, and returns an owned
-future. Otter capability-checks each target, fetches at most eight remote graph
-nodes concurrently, caches requested and post-redirect canonical URLs, and
-moves AST/compile/link work to Tokio's blocking pool. Static graphs and dynamic
-imports use this same pipeline. Command timeout, dropped waiters, and both
-runtime shutdown paths cancel in-flight provider work. Browser origin and CORS
-policy remain browser-owned and may be enforced by the provider.
+future for exactly one provider hop. The future returns either
+`RemoteModuleResponse::Source` or `RemoteModuleResponse::Redirect`; providers
+must not follow redirects internally. Otter resolves relative locations,
+capability-checks every next target before asking the provider to fetch it,
+bounds each chain to ten redirects, fetches at most eight remote graph nodes
+concurrently, and caches requested and final canonical URLs. The built-in HTTP
+provider uses a shared connection pool with automatic redirects disabled, so it
+passes through this same path. Static graphs and dynamic imports share the
+pipeline. Command timeout, dropped waiters, and both runtime shutdown paths
+cancel in-flight provider work. Browser origin and CORS policy remain
+browser-owned and may be enforced by the provider.
 
 File-backed `RuntimeHandle::run_module(path)` shares that graph pipeline.
 Direct thread-pinned `Runtime` remains network-transport agnostic; use the

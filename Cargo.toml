@@ -7,6 +7,7 @@ members = [
     "crates/otter-compiler",
     "crates/otter-gc",
     "crates/otter-regex",
+    "crates/otter-resource",
     "crates/otter-xml",
     "crates/otter-macros",
     "crates/otter-vm",
@@ -51,7 +52,7 @@ oxc_resolver    = "11.23"
 anyhow      = "1"
 chrono      = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 libc        = "0.2"
-nix         = { version = "0.31.3", features = ["fs", "process", "resource", "signal", "socket", "time", "uio", "user"] }
+nix         = { version = "0.31.3", features = ["dir", "fs", "process", "resource", "signal", "socket", "time", "uio", "user"] }
 # The credential family this engine reports on is withheld by `nix` on Apple
 # targets; `rustix` answers for it there with the same syscalls behind a safe
 # surface.
@@ -129,6 +130,7 @@ otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
 otter-jit       = { path = "crates/otter-jit" }
 otter-regex     = { path = "crates/otter-regex" }
+otter-resource  = { path = "crates/otter-resource" }
 otter-xml       = { path = "crates/otter-xml" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }

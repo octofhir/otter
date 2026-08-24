@@ -72,8 +72,9 @@ mod with_statement;
 
 use compiled_module::collect_module_metadata;
 pub use compiled_module::{
-    CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
-    CompiledSourceSpan, LiveBindingSlot, NamedImport, ResolvedBinding,
+    CompiledExport, CompiledFunctionSpans, CompiledImport, CompiledImportKind, CompiledModule,
+    CompiledModuleMetadata, LiveBindingSlot, MAX_COMPILED_METADATA_BYTES, NamedImport,
+    ResolvedBinding,
 };
 pub use entry::{
     EvalCallerBinding, compile_eval_source, compile_module_program,
@@ -750,6 +751,43 @@ mod tests {
             main.code
         );
         assert!(main.code.iter().any(|i| i.op == Op::EndFinally));
+    }
+
+    #[test]
+    fn loop_exits_unwind_catch_only_handlers() {
+        let sources = [
+            ("while (true) { try { break; } catch (e) {} }", true),
+            (
+                "let i = 0; while (i++ < 1) { try { continue; } catch (e) {} }",
+                true,
+            ),
+            ("for (const x of [1]) { try { break; } catch (e) {} }", true),
+            (
+                "for (const x of [1]) { try { continue; } catch (e) {} }",
+                true,
+            ),
+            (
+                "for (const x of [1]) { try { throw x; } catch (e) { break; } }",
+                false,
+            ),
+        ];
+
+        for (source, requires_handler_unwind) in sources {
+            let module = compile_script_src(source);
+            let main = module.main();
+            if requires_handler_unwind {
+                assert!(
+                    main.code
+                        .iter()
+                        .any(|instruction| instruction.op == Op::JumpViaFinally),
+                    "loop exit crossing a catch-only handler must unwind it: {source}\n{:?}",
+                    main.code
+                );
+            }
+            otter_bytecode::encoding::verify_wordcode_function(&main.code).unwrap_or_else(
+                |error| panic!("compiler emitted invalid wordcode for {source}: {error}"),
+            );
+        }
     }
 
     #[test]

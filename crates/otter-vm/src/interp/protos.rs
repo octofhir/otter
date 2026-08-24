@@ -44,7 +44,9 @@ impl Interpreter {
         // `Intl` payloads are `Rc`-backed, so their identity address is
         // stable. Iterators are ordinary GC bodies and move, which is why
         // their side state lives in the weak tables below instead.
-        value.as_intl(heap).map(|intl| intl.identity_addr() as usize)
+        value
+            .as_intl(heap)
+            .map(|intl| intl.identity_addr() as usize)
     }
 
     /// Side state for iterator exotics lives in weak tables keyed by the

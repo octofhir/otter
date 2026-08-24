@@ -669,6 +669,38 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
             ));
         }
         let off = ta_set_target_offset(offset_f, src_len, target_len)?;
+        // §23.2.3.26.1 steps 15-16 — identical element types copy the source's
+        // bytes rather than its elements, so a same-kind set is two memcpys
+        // instead of one boxed `Value` per element. The intermediate copy is
+        // what the spec itself prescribes when both views share a buffer, and
+        // it keeps an overlapping copy correct here for the same reason.
+        if src.kind() == kind {
+            let width = kind.bytes_per_element();
+            let byte_len = src_len * width;
+            let src_start = src.byte_offset(ctx.heap());
+            let dst_start = t.byte_offset(ctx.heap()) + off * width;
+            let source_buffer = src.buffer(ctx.heap());
+            let bytes = source_buffer.with_bytes(ctx.heap(), |bytes| {
+                bytes
+                    .get(src_start..src_start + byte_len)
+                    .map(<[u8]>::to_vec)
+            });
+            if let Some(bytes) = bytes {
+                let target_buffer = t.buffer(ctx.heap());
+                let copied = target_buffer.with_bytes_mut(ctx.heap_mut(), |target| {
+                    match target.get_mut(dst_start..dst_start + byte_len) {
+                        Some(window) => {
+                            window.copy_from_slice(&bytes);
+                            true
+                        }
+                        None => false,
+                    }
+                });
+                if copied {
+                    return Ok(Value::undefined());
+                }
+            }
+        }
         // Snapshot first to handle aliasing of the same buffer.
         let snapshot: Vec<Value> = {
             let mut tmp = Vec::with_capacity(src_len);

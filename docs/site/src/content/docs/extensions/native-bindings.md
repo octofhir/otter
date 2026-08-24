@@ -178,10 +178,14 @@ let runtime = Runtime::builder()
 ```
 
 Layer A remains driven by the embedder's loop. Install a
-`HostCompletionSink` that spawns the owned future and posts each
-`HostCompletionJob` into that loop. When the event reaches the runtime's owning
-thread, call `Runtime::run_host_completion(job)`. Never run the completion job
-on a Tokio worker; it re-enters the isolate and may touch the GC heap.
+`HostCompletionSink` whose `admit` method reserves finite terminal capacity,
+then spawn the owned future and post each unique
+`(HostCompletionAdmission, HostCompletionJob, HostCompletionOutcome)` tuple
+into that loop. Keep the admission attached until the event reaches the
+runtime's owning thread, call `Runtime::run_host_completion(job)`, and release
+the admission according to the terminal outcome. An eager-ready future uses
+`finish_inline` instead. Never run the completion job on a Tokio worker; it
+re-enters the isolate and may touch the GC heap.
 
 Macros may eventually reduce boilerplate, but they are syntax sugar over
 static specs and builders. Manual code is preferred when capability

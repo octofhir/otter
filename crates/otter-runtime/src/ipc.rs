@@ -64,6 +64,16 @@ impl IpcEvent {
     }
 }
 
+#[cfg(unix)]
+impl Drop for IpcEvent {
+    fn drop(&mut self) {
+        // A queued runtime task owns the event until it runs. If shutdown or
+        // inbox cancellation drops that task first, nobody gets a chance to
+        // take the descriptors, so the event itself is their final owner.
+        close_all(self.take_handles());
+    }
+}
+
 /// The open files one message arrived with, held until someone takes them.
 ///
 /// Whatever is left when this goes away was never handed to anyone, and is
@@ -246,7 +256,7 @@ impl IpcChannel {
                 accept_connected.store(false, Ordering::SeqCst);
                 release(&accept_keep_alive);
                 accept_spawner
-                    .enqueue_ordered_owned(deliver(IpcEvent::Closed), RuntimeLiveness::Unref)
+                    .enqueue_ordered(deliver(IpcEvent::Closed), RuntimeLiveness::Unref)
                     .await;
                 return;
             };
@@ -384,12 +394,7 @@ impl IpcChannel {
     /// the peer can tell which message they belong to without a protocol of
     /// their own.
     #[must_use]
-    pub fn send_with_handles(
-        &self,
-        payload: &str,
-        handles: Vec<RawFd>,
-        sent: Option<u32>,
-    ) -> bool {
+    pub fn send_with_handles(&self, payload: &str, handles: Vec<RawFd>, sent: Option<u32>) -> bool {
         // The descriptors belong to the frame from here on, so every way out
         // of this call closes them exactly once: the writer does it once they
         // have crossed, and dropping the frame does it if they never do.
@@ -476,14 +481,14 @@ async fn carry<T, F>(
             // would keep waiting to be told so.
             if let Some(in_flight) = frame.in_flight.take() {
                 writer_spawner
-                    .enqueue_ordered_owned(FrameWritten { in_flight }, RuntimeLiveness::Unref)
+                    .enqueue_ordered(FrameWritten { in_flight }, RuntimeLiveness::Unref)
                     .await;
             }
             // The message has gone; what it carried belongs to the peer now,
             // and the sender is told so it can let go of its own copy.
             if let Some(token) = frame.sent.take() {
                 writer_spawner
-                    .enqueue_ordered_owned(
+                    .enqueue_ordered(
                         writer_deliver(IpcEvent::Sent(token)),
                         RuntimeLiveness::Unref,
                     )
@@ -500,7 +505,7 @@ async fn carry<T, F>(
     // not the program ever calls `disconnect` itself.
     release(&keep_alive);
     spawner
-        .enqueue_ordered_owned(deliver(IpcEvent::Closed), RuntimeLiveness::Unref)
+        .enqueue_ordered(deliver(IpcEvent::Closed), RuntimeLiveness::Unref)
         .await;
 }
 
@@ -564,20 +569,18 @@ async fn read_loop<T, F>(
                 }
             }
             consumed = end;
-            // A message that cannot be reported is a message nobody will take
-            // the descriptors off, so they are closed here instead. Room in
-            // the inbox is worth waiting for — a peer that sends faster than
-            // the program reads must be made to wait, not go unheard — so only
-            // an isolate that is gone ends the loop.
-            let carried = handles.clone();
+            // Room in the inbox is worth waiting for — a peer that sends
+            // faster than the program reads must be made to wait, not go
+            // unheard — so only an isolate that is gone ends the loop. The
+            // event owns its descriptors, including when its queued task is
+            // cancelled before delivery.
             if !spawner
-                .enqueue_ordered_owned(
+                .enqueue_ordered(
                     deliver(IpcEvent::Message(payload, handles)),
                     RuntimeLiveness::Unref,
                 )
                 .await
             {
-                close_all(carried);
                 break 'reading;
             }
         }
@@ -704,7 +707,7 @@ fn take_frame_sized(buffer: &mut Vec<u8>) -> Option<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::take_frame_sized;
+    use super::{IpcEvent, take_frame_sized};
 
     fn frame(payload: &str) -> Vec<u8> {
         let mut bytes = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
@@ -761,5 +764,38 @@ mod tests {
             Some(payload)
         );
         assert!(buffer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_message_closes_untaken_handles() {
+        use std::os::fd::IntoRawFd;
+
+        let (read_end, _write_end) = nix::unistd::pipe().unwrap();
+        let raw = read_end.into_raw_fd();
+        drop(IpcEvent::Message("message".to_string(), vec![raw]));
+
+        assert_eq!(nix::unistd::close(raw), Err(nix::errno::Errno::EBADF));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn taking_handles_transfers_them_out_of_the_event() {
+        use std::os::fd::AsRawFd;
+
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        let raw = read_end.as_raw_fd();
+        let mut event = IpcEvent::Message("message".to_string(), vec![raw]);
+        let handles = event.take_handles();
+        assert_eq!(handles, vec![raw]);
+
+        // `read_end` remains the test's safe owner while the event temporarily
+        // carries its raw identity. A mistaken close in `Drop` would make the
+        // read below fail with EBADF; taking the handle must leave it open.
+        drop(event);
+        assert_eq!(nix::unistd::write(&write_end, b"x").unwrap(), 1);
+        let mut byte = [0_u8; 1];
+        assert_eq!(nix::unistd::read(&read_end, &mut byte).unwrap(), 1);
+        assert_eq!(byte, [b'x']);
     }
 }

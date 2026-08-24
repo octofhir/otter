@@ -11,6 +11,7 @@
 //! - [`ConfigError`] — companion enum for `OtterError::Config`.
 //! - [`RealmError`] — invalid or stale opaque realm identity.
 //! - [`IoErrorKind`] — small mapped subset of [`std::io::ErrorKind`].
+//! - [`otter_resource::ResourceError`] — typed shared-resource rejection.
 //! - [`OtterError::to_json`] — convenience for CLI `--json` output.
 //!
 //! # Invariants
@@ -106,6 +107,13 @@ pub enum OtterError {
         /// Configured heap limit (`0` = disabled).
         heap_limit_bytes: u64,
     },
+    /// A shared runtime resource limit rejected admission before its effect.
+    #[error("{error}")]
+    Resource {
+        /// Typed class, request, current usage, and configured limit.
+        #[from]
+        error: otter_resource::ResourceError,
+    },
     /// A guarded operation was denied.
     #[error("capability denied: {capability}")]
     Capability {
@@ -195,7 +203,7 @@ impl OtterError {
             | OtterError::Io { .. } => 2,
             OtterError::Capability { .. } => 3,
             OtterError::Timeout { .. } => 4,
-            OtterError::OutOfMemory { .. } => 5,
+            OtterError::OutOfMemory { .. } | OtterError::Resource { .. } => 5,
             OtterError::Interrupted => 130,
             // Node's "internal fatal exception handler failure".
             OtterError::Internal { code, .. } if code == "FATAL_HANDLER_INVALID" => 6,
@@ -225,6 +233,15 @@ impl From<otter_gc::OutOfMemory> for OtterError {
     }
 }
 
+impl From<otter_vm::BytecodeLinkError> for OtterError {
+    fn from(error: otter_vm::BytecodeLinkError) -> Self {
+        Self::Internal {
+            code: "VM_BYTECODE_INVALID".to_string(),
+            message: error.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorEnvelope<'a> {
     error: &'a OtterError,
@@ -250,6 +267,13 @@ pub enum ConfigError {
     /// `max_stack_depth` could not be honored.
     #[error("invalid stack depth limit: {message}")]
     InvalidStackDepth {
+        /// Detail.
+        message: String,
+    },
+    /// A physical completion-admission capacity exceeds Tokio's semaphore
+    /// representation and therefore cannot be constructed without panicking.
+    #[error("invalid completion capacity: {message}")]
+    InvalidCompletionCapacity {
         /// Detail.
         message: String,
     },
@@ -327,6 +351,41 @@ mod tests {
         let json = err.to_json().unwrap();
         let de: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
         assert!(matches!(de.error, OtterError::Config { .. }));
+    }
+
+    #[test]
+    fn resource_error_round_trips_with_typed_fields() {
+        let err = OtterError::from(otter_resource::ResourceError::Exhausted {
+            class: otter_resource::ResourceClass::Isolates,
+            requested: 1,
+            in_use: 2,
+            limit: 2,
+        });
+        let json = err.to_json().unwrap();
+        assert!(json.contains("\"kind\":\"resource\""));
+        assert!(json.contains("\"reason\":\"exhausted\""));
+        assert!(json.contains("\"class\":\"isolates\""));
+        let decoded: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded.error,
+            OtterError::Resource {
+                error: otter_resource::ResourceError::Exhausted {
+                    class: otter_resource::ResourceClass::Isolates,
+                    requested: 1,
+                    in_use: 2,
+                    limit: 2,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn bytecode_link_failures_use_stable_internal_code() {
+        let err = OtterError::from(otter_vm::BytecodeLinkError::CodeSpaceConflict);
+        assert!(matches!(
+            err,
+            OtterError::Internal { ref code, .. } if code == "VM_BYTECODE_INVALID"
+        ));
     }
 
     #[derive(Debug, Deserialize)]

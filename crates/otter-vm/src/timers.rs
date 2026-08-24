@@ -32,6 +32,9 @@
 //! - Cancellation deletes the entry from [`TimerCallbacks`] so a
 //!   late `TimerFired` (lost the cancel race) becomes a no-op
 //!   rather than running a stale callback.
+//! - Bulk teardown drains callback ownership before asking the host to cancel
+//!   deadlines. A cancellation race can therefore only observe a missing
+//!   callback, never revive a process that has already finalized.
 //! - Each callback is tagged with its scalar origin realm. Realm disposal
 //!   removes its entries and cancels the matching host deadlines.
 //!
@@ -40,6 +43,7 @@
 //! - [HTML setTimeout](https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout)
 //! - [Microtask queue](crate::microtask)
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -53,6 +57,45 @@ use crate::object::JsObject;
 use crate::runtime_cx::NativeCtx;
 use crate::{Attr, JsSurfaceError, ObjectBuilder, Value};
 
+/// Unique runtime-owned credit for one live timer origin.
+///
+/// The VM acquires this before retaining callback state or asking the host to
+/// arm a deadline, then moves the same carrier into [`TimerScheduler::schedule`].
+/// Dropping it rolls back the runtime's physical and resource-ledger credits.
+pub struct TimerAdmission(Option<Box<dyn Any + Send>>);
+
+impl TimerAdmission {
+    /// Wrap an embedder-owned timer admission guard.
+    #[must_use]
+    pub fn new(token: Box<dyn Any + Send>) -> Self {
+        Self(Some(token))
+    }
+
+    /// Recover a guard of the expected concrete type in the scheduler that
+    /// created it. A foreign carrier is returned intact instead of panicking.
+    pub fn try_into_inner<T: Any + Send>(mut self) -> Result<Box<T>, Self> {
+        let Some(token) = self.0.take() else {
+            return Err(self);
+        };
+        match token.downcast::<T>() {
+            Ok(token) => Ok(token),
+            Err(token) => {
+                self.0 = Some(token);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TimerAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TimerAdmission")
+            .field("live", &self.0.is_some())
+            .finish()
+    }
+}
+
 /// Host-side scheduler the runtime layer plugs in. Lives behind
 /// an [`Arc<dyn TimerScheduler>`] on [`crate::Interpreter`].
 ///
@@ -60,6 +103,10 @@ use crate::{Attr, JsSurfaceError, ObjectBuilder, Value};
 /// the handle on isolate-local state, but the underlying scheduler
 /// usually owns a Tokio runtime that crosses thread boundaries.
 pub trait TimerScheduler: Send + Sync {
+    /// Reserve one physically bounded live-timer slot before callback state is
+    /// retained or a host deadline is armed.
+    fn admit(&self, repeat: bool) -> Result<TimerAdmission, String>;
+
     /// Schedule a fresh one-shot or repeating timer. Returns the
     /// stable token the VM uses to identify the entry; the VM
     /// stores its callback under this key. The implementation MUST
@@ -68,12 +115,18 @@ pub trait TimerScheduler: Send + Sync {
     /// elapses so the isolate runner can re-enter the VM and run
     /// the callback. Repeating timers re-arm themselves on the
     /// host side until [`Self::cancel`] removes the token.
-    fn schedule(&self, delay_ms: u64, repeat_ms: Option<u64>) -> u64;
+    fn schedule(
+        &self,
+        admission: TimerAdmission,
+        delay_ms: u64,
+        repeat_ms: Option<u64>,
+    ) -> Result<u64, String>;
 
-    /// Cancel a pending timer. Returns `true` when the token was
-    /// known to the host and the schedule was suppressed before
-    /// firing. A late cancel (callback already invoked) returns
-    /// `false`; the VM additionally drops the entry from
+    /// Cancel a pending timer. Returns `true` when the token was known to the
+    /// host and its callback can still be suppressed, including a deadline
+    /// that fired concurrently but has not dispatched on the isolate. A late
+    /// cancel after ownership moved into dispatch returns `false`; the VM
+    /// additionally drops the entry from
     /// [`TimerCallbacks`] so the late fire is a no-op.
     fn cancel(&self, token: u64) -> bool;
 
@@ -164,6 +217,16 @@ impl TimerCallbacks {
     /// the host cancels them.
     pub fn remove(&mut self, token: u64) -> Option<TimerEntry> {
         self.entries.remove(&token)
+    }
+
+    /// Drain every registered callback and yield its host token.
+    ///
+    /// The entry is removed before its token is yielded, so a host fire racing
+    /// bulk process teardown observes the callback as missing. The iterator
+    /// allocates no intermediate token buffer, and dropping it early still
+    /// clears every remaining entry through [`HashMap::drain`].
+    pub fn drain_tokens(&mut self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.drain().map(|(token, _entry)| token)
     }
 
     /// The kind of every entry still pending, in token order so a host
@@ -321,16 +384,31 @@ fn ensure_callable(
     }
 }
 
-fn schedule_timer_common(
+fn schedule_timer_entry(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    repeat: bool,
+    callback: Value,
+    delay_ms: u64,
+    repeat_ms: Option<u64>,
+    extra_args: &[Value],
+    kind: TimerKind,
     native_name: &'static str,
-) -> Result<Value, NativeError> {
-    let callback = args.first().cloned().unwrap_or(Value::undefined());
+) -> Result<u64, NativeError> {
     ensure_callable(&callback, ctx.heap(), native_name)?;
-    let delay_ms = coerce_delay_ms(args.get(1), ctx.heap());
-    let extra: SmallVec<[Value; 4]> = args.iter().skip(2).cloned().collect();
+    let scheduler = ctx
+        .interp_mut()
+        .timer_scheduler()
+        .ok_or_else(|| NativeError::TypeError {
+            name: native_name,
+            reason: "host runtime did not install a timer scheduler".to_string(),
+        })?;
+    let admission =
+        scheduler
+            .admit(repeat_ms.is_some())
+            .map_err(|reason| NativeError::RangeError {
+                name: native_name,
+                reason,
+            })?;
+    let extra_args: SmallVec<[Value; 4]> = extra_args.iter().cloned().collect();
     let context = ctx
         .execution_context()
         .ok_or_else(|| NativeError::TypeError {
@@ -339,28 +417,66 @@ fn schedule_timer_common(
         })?
         .clone();
     let interp = ctx.interp_mut();
-    let scheduler = interp
-        .timer_scheduler()
-        .ok_or_else(|| NativeError::TypeError {
+    let async_context = interp.async_context();
+    let token = scheduler
+        .schedule(admission, delay_ms, repeat_ms)
+        .map_err(|reason| NativeError::RangeError {
             name: native_name,
-            reason: "host runtime did not install a timer scheduler".to_string(),
+            reason,
         })?;
     interp.record_runtime_host_op_enqueued();
-    let async_context = interp.async_context();
-    let token = scheduler.schedule(delay_ms, repeat.then_some(delay_ms));
     let realm_id = interp.active_host_realm_id();
     interp.timer_callbacks_mut().insert(
         token,
         TimerEntry {
             realm_id,
             callback,
-            extra_args: extra,
+            extra_args,
             context,
-            repeat_ms: repeat.then_some(delay_ms),
-            kind: TimerKind::Timeout,
+            repeat_ms,
+            kind,
             async_context,
         },
     );
+    Ok(token)
+}
+
+/// Schedule a rooted internal interval without consulting mutable JavaScript
+/// globals. This deliberately shares admission, host arming, and callback-table
+/// registration with the public timer builtins.
+pub(crate) fn schedule_interval_rooted(
+    ctx: &mut NativeCtx<'_>,
+    callback: Value,
+    delay_ms: u64,
+) -> Result<u64, NativeError> {
+    schedule_timer_entry(
+        ctx,
+        callback,
+        delay_ms,
+        Some(delay_ms),
+        &[],
+        TimerKind::Timeout,
+        "NativeScope::schedule_interval",
+    )
+}
+
+fn schedule_timer_common(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    repeat: bool,
+    native_name: &'static str,
+) -> Result<Value, NativeError> {
+    let callback = args.first().cloned().unwrap_or(Value::undefined());
+    let delay_ms = coerce_delay_ms(args.get(1), ctx.heap());
+    let token = schedule_timer_entry(
+        ctx,
+        callback,
+        delay_ms,
+        repeat.then_some(delay_ms),
+        args.get(2..).unwrap_or(&[]),
+        TimerKind::Timeout,
+        native_name,
+    )?;
     Ok(Value::number_f64(token as f64))
 }
 
@@ -381,10 +497,7 @@ fn cancel_timer_common(
         None => return Ok(Value::undefined()),
     };
     let interp = ctx.interp_mut();
-    interp.timer_callbacks_mut().remove(token);
-    if let Some(scheduler) = interp.timer_scheduler() {
-        let _ = scheduler.cancel(token);
-    }
+    let _ = interp.cancel_timer(token);
     Ok(Value::undefined())
 }
 
@@ -409,38 +522,15 @@ fn clear_interval_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 /// extra callback argument (there is no delay parameter).
 fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let callback = args.first().cloned().unwrap_or(Value::undefined());
-    ensure_callable(&callback, ctx.heap(), "setImmediate")?;
-    let extra: SmallVec<[Value; 4]> = args.iter().skip(1).cloned().collect();
-    let context = ctx
-        .execution_context()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "setImmediate",
-            reason: "timer callback is missing its execution context".to_string(),
-        })?
-        .clone();
-    let interp = ctx.interp_mut();
-    let scheduler = interp
-        .timer_scheduler()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "setImmediate",
-            reason: "host runtime did not install a timer scheduler".to_string(),
-        })?;
-    interp.record_runtime_host_op_enqueued();
-    let async_context = interp.async_context();
-    let token = scheduler.schedule(0, None);
-    let realm_id = interp.active_host_realm_id();
-    interp.timer_callbacks_mut().insert(
-        token,
-        TimerEntry {
-            realm_id,
-            callback,
-            extra_args: extra,
-            context,
-            repeat_ms: None,
-            kind: TimerKind::Immediate,
-            async_context,
-        },
-    );
+    let token = schedule_timer_entry(
+        ctx,
+        callback,
+        0,
+        None,
+        args.get(1..).unwrap_or(&[]),
+        TimerKind::Immediate,
+        "setImmediate",
+    )?;
     Ok(Value::number_f64(token as f64))
 }
 

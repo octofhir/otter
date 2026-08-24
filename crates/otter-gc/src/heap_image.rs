@@ -1,10 +1,9 @@
 //! Capture and restore the old generation as a page image.
 //!
-//! A runtime spends most of its startup building a graph that never
-//! changes: intrinsics, prototypes, shapes, native callables. Restoring
-//! that graph is strictly cheaper than rebuilding it, and this module is
-//! the mechanism — dump the old-space pages verbatim, put them back
-//! later.
+//! A runtime spends most of its startup building a graph that rarely
+//! changes: intrinsics, prototypes, shapes, native callables. An opaque
+//! in-process image can copy that graph into another isolate without
+//! rebuilding it.
 //!
 //! # Why this is cheap here
 //!
@@ -37,17 +36,14 @@
 //!   kept stale offset.
 //! - Restored pages are old-generation and unmarked. The image carries no
 //!   mark state; a restore starts a fresh collection cycle.
-//! - Payload bytes are copied verbatim, so any non-GC pointer a body
-//!   holds (a Rust `fn` entry, a `&'static str` into rodata) is copied
-//!   verbatim too. Those are the caller's to fix — see
-//!   [`Relocation::image_pointer_slide`].
-//! - **Bodies must be self-contained.** An image carries page bytes and
-//!   nothing else, so a body that owns storage outside the heap — a
-//!   `Vec` slab, a `Box<[u16]>` cache — restores as a second owner of
-//!   the original buffer, and a trace walk over it yields slot addresses
-//!   the image does not own. Restoring such a body is unsound. The VM's
-//!   own object and string bodies are not yet self-contained; moving
-//!   their storage into the heap is what makes them restorable.
+//! - An image never crosses a process, executable, or type-layout boundary.
+//!   It has no byte decoder and its page records are private. Static pointers
+//!   therefore remain valid without loader relocation.
+//! - **Bodies are self-contained or explicitly severed.** An image carries
+//!   page bytes and nothing else, so a body that owns storage outside the heap
+//!   would otherwise restore as a second owner. A registered sever hook must
+//!   replace such fields without reading or dropping the copied value before
+//!   the first trace; the safe VM wrapper then rebuilds semantic side state.
 //!
 //! # See also
 //!
@@ -89,9 +85,9 @@ pub enum ImageError {
     },
     /// The cage could not supply the pages the image needs.
     OutOfMemory(OutOfMemory),
-    /// A live body carries foreign-owned content the snapshot format
-    /// does not serialize; capturing would silently drop it.
-    ForeignPayloadNotSerializable {
+    /// A live body carries foreign-owned content the opaque image cannot
+    /// safely duplicate.
+    ForeignPayloadNotCapturable {
         /// The offending body type.
         type_name: &'static str,
     },
@@ -115,11 +111,11 @@ impl std::fmt::Display for ImageError {
             Self::UnregisteredTypeTag { type_tag } => {
                 write!(f, "image body has unregistered type tag {type_tag:#04x}")
             }
-            Self::OutOfMemory(err) => write!(f, "cage could not back the image: {err}"),
-            Self::ForeignPayloadNotSerializable { type_name } => {
+            Self::OutOfMemory(err) => write!(f, "heap could not admit the image: {err}"),
+            Self::ForeignPayloadNotCapturable { type_name } => {
                 write!(
                     f,
-                    "a live `{type_name}` holds content the snapshot cannot carry"
+                    "a live `{type_name}` holds content the image cannot capture"
                 )
             }
         }
@@ -135,7 +131,7 @@ impl From<OutOfMemory> for ImageError {
 }
 
 /// One captured page: where it lived and the bytes that were live in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct PageImage {
     /// Cage offset of the page base at capture time.
     cage_offset: u32,
@@ -151,13 +147,9 @@ struct PageImage {
 }
 
 /// A captured old generation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone)]
 pub struct HeapImage {
     pages: Vec<PageImage>,
-    /// Address of the binary image at capture time, so a restore can tell
-    /// how far the loader moved the executable. See
-    /// [`Relocation::image_pointer_slide`].
-    image_anchor: usize,
     /// Live objects captured, for diagnostics and for sizing a restore.
     object_count: u64,
     /// Live bytes captured.
@@ -188,113 +180,15 @@ impl HeapImage {
     pub fn byte_len(&self) -> usize {
         self.pages.iter().map(|p| p.bytes.len()).sum()
     }
-
-    /// Serialize to a flat byte stream. Little-endian, length-prefixed
-    /// pages, no graph walk — the format a same-binary cache reads
-    /// straight back with [`Self::from_bytes`]. The image anchor rides
-    /// along so the reader can compute the loader slide.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.byte_len());
-        out.extend_from_slice(IMAGE_MAGIC);
-        out.extend_from_slice(&(self.image_anchor as u64).to_le_bytes());
-        out.extend_from_slice(&self.object_count.to_le_bytes());
-        out.extend_from_slice(&self.live_bytes.to_le_bytes());
-        out.extend_from_slice(&(self.pages.len() as u32).to_le_bytes());
-        for page in &self.pages {
-            out.extend_from_slice(&page.cage_offset.to_le_bytes());
-            out.extend_from_slice(&page.span_pages.to_le_bytes());
-            out.extend_from_slice(&(page.bytes.len() as u32).to_le_bytes());
-            out.extend_from_slice(&page.bytes);
-        }
-        out
-    }
-
-    /// Decode a stream [`Self::to_bytes`] wrote. Any structural
-    /// mismatch yields `None`; the caller treats that as a cache miss
-    /// and bootstraps instead.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut r = ByteReader::new(bytes);
-        if r.take(IMAGE_MAGIC.len())? != IMAGE_MAGIC {
-            return None;
-        }
-        let image_anchor = r.u64()? as usize;
-        let object_count = r.u64()?;
-        let live_bytes = r.u64()?;
-        let page_count = r.u32()? as usize;
-        let mut pages = Vec::with_capacity(page_count.min(1024));
-        for _ in 0..page_count {
-            let cage_offset = r.u32()?;
-            let span_pages = r.u32()?;
-            let len = r.u32()? as usize;
-            let bytes = r.take(len)?.to_vec();
-            pages.push(PageImage {
-                cage_offset,
-                span_pages,
-                bytes,
-            });
-        }
-        if !r.is_empty() {
-            return None;
-        }
-        Some(Self {
-            pages,
-            image_anchor,
-            object_count,
-            live_bytes,
-        })
-    }
-}
-
-/// Format marker for [`HeapImage::to_bytes`]. Not versioned — the
-/// cache key already changes with every rebuild, so a stale stream is
-/// never found, only an absent one.
-const IMAGE_MAGIC: &[u8] = b"otter-heap-image\0";
-
-/// Bounds-checked little-endian cursor for [`HeapImage::from_bytes`].
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.bytes.len() < n {
-            return None;
-        }
-        let (head, rest) = self.bytes.split_at(n);
-        self.bytes = rest;
-        Some(head)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.take(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        self.take(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
 }
 
 /// The mapping a restore produced, so callers can rewrite handles they
 /// were holding outside the heap.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Relocation {
     /// `(captured page base, restored page base)`, ascending by captured
     /// base so a lookup can binary-search.
     pages: Vec<(u32, u32)>,
-    /// How far the binary image moved between capture and restore.
-    image_pointer_slide: isize,
 }
 
 impl Relocation {
@@ -355,35 +249,6 @@ impl Relocation {
         self.relocate(handle.offset())
             .map(|offset| unsafe { crate::compressed::Gc::from_offset(offset) })
     }
-
-    /// How far the binary image moved between the capture process and
-    /// this one.
-    ///
-    /// Payload bytes are copied verbatim, so a body that stored a Rust
-    /// `fn` entry or a `&'static str` still holds the capturing process's
-    /// address. Adding this slide to such a pointer yields the address it
-    /// has here. Zero when both processes loaded the image at the same
-    /// place, which is the common case only without ASLR.
-    #[must_use]
-    pub fn image_pointer_slide(&self) -> isize {
-        self.image_pointer_slide
-    }
-
-    /// Apply [`Self::image_pointer_slide`] to one captured address.
-    #[must_use]
-    pub fn slide_image_pointer(&self, addr: usize) -> usize {
-        if addr == 0 {
-            return 0;
-        }
-        addr.wrapping_add_signed(self.image_pointer_slide)
-    }
-}
-
-/// A function in this crate, used only for its address: the difference
-/// between its address in two processes is how far the loader moved the
-/// whole binary image.
-fn image_anchor() -> usize {
-    image_anchor as *const () as usize
 }
 
 impl GcHeap {
@@ -415,7 +280,6 @@ impl GcHeap {
         pages.sort_by_key(|p| p.cage_offset);
         Ok(HeapImage {
             pages,
-            image_anchor: image_anchor(),
             object_count: census.old.object_count,
             live_bytes: census.old.live_bytes,
         })
@@ -424,17 +288,47 @@ impl GcHeap {
     /// Restore a captured old generation into this heap, relocating every
     /// pointer slot to wherever the cage placed the pages.
     ///
-    /// The heap must already have every body type registered — the
-    /// relocation pass finds pointer slots through the trace table.
+    /// The heap must already have every body type registered — the relocation
+    /// pass finds pointer slots through the trace table.
+    ///
+    /// # Safety
+    ///
+    /// `image` must be an unmodified value returned by
+    /// [`Self::capture_old_space`] in this process, with the same executable,
+    /// Rust type layouts, and trace/sever registrations. Every captured body
+    /// that owns storage outside its page must have a matching sever hook or
+    /// otherwise be safe to duplicate. Violating these requirements can make
+    /// the trace walk interpret arbitrary bytes as Rust objects.
     ///
     /// # Errors
     ///
     /// See [`ImageError`].
-    pub fn restore_old_space(&mut self, image: &HeapImage) -> Result<Relocation, ImageError> {
+    pub unsafe fn restore_old_space(
+        &mut self,
+        image: &HeapImage,
+    ) -> Result<Relocation, ImageError> {
         if self.old_space_page_count() != 0 {
             return Err(ImageError::OldSpaceNotEmpty {
                 pages: self.old_space_page_count(),
             });
+        }
+        // Restored cells are ordinary heap usage. Reject the complete image
+        // before allocating or copying a page so a failed capped restore has
+        // no materialized side effect. `tracked_bytes` also includes any
+        // off-slot reservations already owned by this otherwise-empty heap.
+        let heap_limit = self.max_heap_bytes();
+        if heap_limit != 0 {
+            let in_use = self.tracked_bytes();
+            if in_use
+                .checked_add(image.live_bytes)
+                .is_none_or(|projected| projected > heap_limit)
+            {
+                return Err(OutOfMemory::HeapCapExceeded {
+                    requested_bytes: image.live_bytes,
+                    heap_limit_bytes: heap_limit,
+                }
+                .into());
+            }
         }
         // 1) Place the pages and record where each one landed. A target
         // page whose offset coincides with any CAPTURED page is held
@@ -488,8 +382,6 @@ impl GcHeap {
                 .iter()
                 .map(|(from, page)| (*from, page.cage_offset()))
                 .collect(),
-            image_pointer_slide: (image_anchor() as isize)
-                .wrapping_sub(image.image_anchor as isize),
         };
         relocation.pages.sort_by_key(|(from, _)| *from);
 
@@ -642,7 +534,9 @@ mod tests {
         // interpreter performs at construction.
         target.register_traceable::<OpaqueLeaf>();
         target.register_traceable::<OpaquePair>();
-        let relocation = target.restore_old_space(&image).expect("restore");
+        // SAFETY: `image` was captured above in this process from the same
+        // registered test body layouts.
+        let relocation = unsafe { target.restore_old_space(&image) }.expect("restore");
 
         let restored: Gc<OpaquePair> = unsafe {
             Gc::from_offset(
@@ -674,8 +568,36 @@ mod tests {
         target.register_traceable::<OpaqueLeaf>();
         target.register_traceable::<OpaquePair>();
         assert!(matches!(
-            target.restore_old_space(&image),
+            // SAFETY: the source and target use the same process-local test
+            // body layouts and trace registrations.
+            unsafe { target.restore_old_space(&image) },
             Err(ImageError::OldSpaceNotEmpty { .. })
+        ));
+    }
+
+    #[test]
+    fn restore_refuses_an_image_before_exceeding_the_heap_cap() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        let (source, _pair) = tenured_heap();
+        let image = source.capture_old_space().expect("capture");
+        assert!(image.live_bytes() > 1);
+        let cap = image.live_bytes() - 1;
+        let mut target = GcHeap::with_max_heap_bytes(cap).expect("target heap");
+        target.register_traceable::<OpaqueLeaf>();
+        target.register_traceable::<OpaquePair>();
+
+        let error =
+            // SAFETY: the source and target use the same process-local test
+            // body layouts and trace registrations.
+            unsafe { target.restore_old_space(&image) }.expect_err("cap must reject image");
+        assert_eq!(target.old_space_page_count(), 0);
+        assert_eq!(target.tracked_bytes(), 0);
+        assert!(matches!(
+            error,
+            ImageError::OutOfMemory(OutOfMemory::HeapCapExceeded {
+                requested_bytes,
+                heap_limit_bytes,
+            }) if requested_bytes == image.live_bytes() && heap_limit_bytes == cap
         ));
     }
 }
@@ -724,7 +646,9 @@ mod self_contained_tests {
         let mut target = GcHeap::new().expect("target heap");
         target.register_traceable::<OpaqueLeaf>();
         target.register_traceable::<OpaqueVector>();
-        let relocation = target.restore_old_space(&image).expect("restore");
+        // SAFETY: `image` was captured above in this process from the same
+        // registered test body layouts.
+        let relocation = unsafe { target.restore_old_space(&image) }.expect("restore");
 
         let restored = relocation.relocate_gc(vector).expect("vector was captured");
         assert_eq!(target.read_payload(restored, OpaqueVector::len), LEN);

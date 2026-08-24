@@ -5,7 +5,8 @@
 //! named-property IC sites from one record while byte coordinates stay cold.
 //!
 //! # Contents
-//! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
+//! - [`ExecutableModuleBuilder`] — transient builder over retained bytecode
+//!   admission proofs.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
 //! - [`CodeBlock`] — one verified function body: immutable wordcode/control
 //!   flow plus dense advisory feedback cells keyed by logical PC.
@@ -18,9 +19,11 @@
 //!   hot instruction records carry the canonical logical instruction PC.
 //! - Cold byte PCs are a one-way logical-PC source/profiling map; execution has
 //!   no byte-PC-to-instruction reverse lookup.
-//! - Operand payloads are untagged 32-bit words verified against the opcode
-//!   schema while the CodeBlock is built. Typed hot accessors read them without
+//! - Operand payloads are untagged 32-bit words already covered by the
+//!   [`VerifiedBytecodeModule`] proof. Typed hot accessors read them without
 //!   repeating schema or function-table lookup.
+//! - Executable construction consumes retained layouts and register-window
+//!   sizes; it never re-runs hostile-input validation.
 //! - Up to four operand words live in the execution record. Any longer
 //!   instruction uses the CodeBlock-owned overflow table; no parallel active
 //!   wordcode array or per-instruction reference count remains.
@@ -40,12 +43,9 @@
 pub(crate) mod code_block_cfg;
 
 use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, FunctionCode,
-    FunctionCodeBuilder, Op, Operand, SpanEntry,
-    encoding::{
-        FunctionLayout, layout_wordcode_function, measure_wordcode_function,
-        translate_spans_to_byte_pcs,
-    },
+    ArgumentBindingStorage, ArgumentsObjectKind, Function, FunctionCode, FunctionCodeBuilder, Op,
+    Operand, SpanEntry, VerifiedBytecodeModule, VerifiedFunction,
+    encoding::{measure_wordcode_function, translate_spans_to_byte_pcs},
 };
 use std::sync::Arc;
 
@@ -68,31 +68,38 @@ impl ExecutableModuleBuilder {
     /// Build a transient executable view from the compiler/debug module DTO.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
-        Self::from_bytecode_with_ic_base(module, 0)
+    pub(crate) fn from_bytecode(module: &otter_bytecode::BytecodeModule) -> Self {
+        let verified = VerifiedBytecodeModule::new(module.clone())
+            .expect("executable test fixture must be valid bytecode");
+        Self::from_verified_bytecode_with_ic_base(&verified, 0)
     }
 
-    /// Build a transient executable view whose dense property-IC site
-    /// ids start at `property_ic_base`, keeping sites globally unique
-    /// across chunks linked into one interpreter.
+    /// Build a transient executable view from a retained admission proof.
+    /// Dense property-IC site ids start at `property_ic_base`, keeping sites
+    /// globally unique across chunks linked into one interpreter.
     #[must_use]
-    pub(crate) fn from_bytecode_with_ic_base(
-        module: &BytecodeModule,
+    pub(crate) fn from_verified_bytecode_with_ic_base(
+        verified: &VerifiedBytecodeModule,
         property_ic_base: u32,
     ) -> Self {
+        let module = verified.module();
         let mut builder = Self {
             functions: Vec::with_capacity(module.functions.len()),
             next_property_ic_site: property_ic_base,
         };
-        for function in &module.functions {
-            builder.push_function(function, &module.module);
+        for (index, function) in module.functions.iter().enumerate() {
+            let proof = verified
+                .function(index)
+                .expect("verified carrier has one proof per function");
+            builder.push_function(function, proof, &module.module);
         }
         builder
     }
 
-    fn push_function(&mut self, function: &Function, module_url: &str) {
-        let function = Arc::new(CodeBlock::from_bytecode(
+    fn push_function(&mut self, function: &Function, proof: &VerifiedFunction, module_url: &str) {
+        let function = Arc::new(CodeBlock::from_verified_bytecode(
             function,
+            proof,
             module_url,
             &mut self.next_property_ic_site,
         ));
@@ -147,18 +154,19 @@ impl ExecutableModule {
     /// Build a frozen execution view from the compiler/debug module DTO.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
+    pub(crate) fn from_bytecode(module: &otter_bytecode::BytecodeModule) -> Self {
         ExecutableModuleBuilder::from_bytecode(module).freeze()
     }
 
-    /// Build a frozen execution view whose dense property-IC site ids
-    /// start at `property_ic_base`.
+    /// Build a frozen execution view from a retained admission proof. Dense
+    /// property-IC site ids start at `property_ic_base`.
     #[must_use]
-    pub(crate) fn from_bytecode_with_ic_base(
-        module: &BytecodeModule,
+    pub(crate) fn from_verified_bytecode_with_ic_base(
+        verified: &VerifiedBytecodeModule,
         property_ic_base: u32,
     ) -> Self {
-        ExecutableModuleBuilder::from_bytecode_with_ic_base(module, property_ic_base).freeze()
+        ExecutableModuleBuilder::from_verified_bytecode_with_ic_base(verified, property_ic_base)
+            .freeze()
     }
 
     /// Function-table lookup by chunk-local function index.
@@ -1000,70 +1008,16 @@ impl Clone for CodeBlock {
     }
 }
 
-/// Prove that every operand addressing the frame register window is inside it.
-///
-/// Dispatch reads and writes the window without re-checking each access, so
-/// this is the one place the bound is established. The schema declares which
-/// operands carry a register number — both the `Register`-encoded ones and the
-/// `Imm32` local indices of `LoadLocal` / `StoreLocal` — so the set is derived
-/// rather than enumerated here and cannot drift as opcodes are added.
-///
-/// A violation is a compiler defect, not input, and is rejected exactly like a
-/// schema violation.
-fn verify_register_operands(function: &Function, register_count: u16) {
-    for instruction in function.code.iter() {
-        let operand_count = instruction.operand_count();
-        for index in 0..operand_count {
-            if otter_bytecode::opcode_schema::register_access_at(instruction.op, index)
-                == otter_bytecode::opcode_schema::RegisterAccess::None
-            {
-                continue;
-            }
-            let operand = function
-                .code
-                .operand(instruction, index)
-                .expect("verified wordcode operand must decode");
-            let register = match operand {
-                Operand::Register(value) => u32::from(value),
-                Operand::Imm32(value) => u32::try_from(value).unwrap_or_else(|_| {
-                    panic!(
-                        "compiler emitted a negative register index: function={} id={} op={:?} operand={index} value={value}",
-                        function.name, function.id, instruction.op
-                    )
-                }),
-                Operand::ConstIndex(value) => value,
-            };
-            assert!(
-                register < u32::from(register_count),
-                "compiler emitted an out-of-range register: function={} id={} op={:?} operand={index} register={register} register_count={register_count}",
-                function.name,
-                function.id,
-                instruction.op
-            );
-        }
-    }
-}
-
 impl CodeBlock {
-    fn from_bytecode(
+    fn from_verified_bytecode(
         function: &Function,
+        proof: &VerifiedFunction,
         module_url: &str,
         next_property_ic_site: &mut u32,
     ) -> Self {
-        let register_count = function
-            .param_count
-            .saturating_add(function.locals)
-            .saturating_add(function.scratch);
-        let FunctionLayout {
-            total_bytes: code_byte_len,
-            instr_to_byte_pc,
-        } = layout_wordcode_function(&function.code).unwrap_or_else(|error| {
-            panic!(
-                "compiler emitted bytecode that violates the opcode schema: function={} id={}: {error}",
-                function.name, function.id
-            )
-        });
-        verify_register_operands(function, register_count);
+        let register_count = proof.register_count();
+        let code_byte_len = proof.layout().total_bytes;
+        let instr_to_byte_pc = proof.layout().instr_to_byte_pc.clone();
         let control_flow = CodeBlockControlFlow::from_verified_wordcode(&function.code);
         let mut overflow_operand_words = Vec::new();
         let code = function
@@ -1400,7 +1354,7 @@ mod tests {
     use crate::Value;
     use otter_bytecode::{BytecodeModule, Instruction, SourceKind};
 
-    fn function(code: Vec<Instruction>) -> Function {
+    fn function(mut code: Vec<Instruction>) -> Function {
         // Size the register window to the operands the test actually uses, so
         // the build-time register verifier accepts these hand-written bodies.
         let mut max_register = 0u32;
@@ -1419,6 +1373,11 @@ mod tests {
                 max_register = max_register.max(register + 1);
             }
         }
+        code.push(Instruction {
+            pc: code.len() as u32,
+            op: Op::ReturnUndefined,
+            operands: Vec::new(),
+        });
         Function {
             id: 0,
             name: "exec-test".to_string(),
@@ -1434,7 +1393,11 @@ mod tests {
             template_sites: Vec::new(),
             source_kind: SourceKind::JavaScript,
             functions: vec![function],
-            constants: Vec::new(),
+            constants: (0..8)
+                .map(|index| otter_bytecode::Constant::String {
+                    utf16: format!("name-{index}").encode_utf16().collect(),
+                })
+                .collect(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         }
@@ -1576,25 +1539,38 @@ mod tests {
 
     #[test]
     fn schema_accessors_round_trip_full_word_payloads() {
-        let function = function(vec![
-            Instruction {
-                pc: 0,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(60000), Operand::Imm32(i32::MIN)],
-            },
-            Instruction {
-                pc: 1,
-                op: Op::LoadNumber,
-                operands: vec![Operand::Register(7), Operand::ConstIndex(u32::MAX)],
-            },
-        ]);
-        let executable = ExecutableModule::from_bytecode(&module(function));
-        let function = executable.function(0).unwrap();
+        let mut builder = FunctionCodeBuilder::new();
+        builder.push(
+            Op::LoadInt32,
+            &[Operand::Register(60000), Operand::Imm32(i32::MIN)],
+        );
+        builder.push(
+            Op::LoadNumber,
+            &[Operand::Register(7), Operand::ConstIndex(u32::MAX)],
+        );
+        let wordcode = builder.finish();
+        let mut overflow = Vec::new();
+        let load_int = CodeBlockInstruction::from_wordcode(
+            &wordcode,
+            0,
+            0,
+            0,
+            NO_PROPERTY_IC_SITE,
+            &mut overflow,
+        );
+        let load_number = CodeBlockInstruction::from_wordcode(
+            &wordcode,
+            1,
+            0,
+            1,
+            NO_PROPERTY_IC_SITE,
+            &mut overflow,
+        );
 
-        assert_eq!(function.register(&function.code[0], 0), Some(60000));
-        assert_eq!(function.imm32(&function.code[0], 1), Some(i32::MIN));
-        assert_eq!(function.register(&function.code[1], 0), Some(7));
-        assert_eq!(function.const_index(&function.code[1], 1), Some(u32::MAX));
+        assert_eq!(load_int.reg(0), 60000);
+        assert_eq!(load_int.imm(1), i32::MIN);
+        assert_eq!(load_number.reg(0), 7);
+        assert_eq!(load_number.const_word(1), u32::MAX);
     }
 
     #[test]
@@ -1722,7 +1698,7 @@ mod tests {
 
         assert_eq!(view.code_block.id, 0);
         assert!(Arc::ptr_eq(&view.code_block, &executable.functions[0]));
-        assert_eq!(view.instructions.len(), 2);
+        assert_eq!(view.instructions.len(), 3);
         assert_eq!(view.instructions[0].op(&view.code_block), Op::LoadProperty);
         assert_eq!(view.instructions[0].byte_pc, 0);
         assert_eq!(
@@ -1781,7 +1757,7 @@ mod tests {
 
         let executable = builder.freeze();
         let exec_fn = executable.function(0).unwrap();
-        assert_eq!(exec_fn.code.len(), 2);
+        assert_eq!(exec_fn.code.len(), 3);
         assert_eq!(executable.property_ic_site_end(), 1);
         assert_eq!(
             exec_fn.operands(&exec_fn.code[1]).as_slice(),

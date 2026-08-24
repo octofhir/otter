@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use otter_runtime::{
     JitArtifactBatch, JitDebugReport, JitDebugRequest, JitDebugTier, JitSelection, OtterBuilder,
-    RuntimeBuilder, TracerFactory, WarningOptions,
+    TracerFactory, WarningOptions,
 };
 
 /// Owned execution settings shared by every runtime-backed CLI command.
@@ -127,8 +127,8 @@ impl CliExecutionConfig {
     fn stack_depth(&self) -> Option<u32> {
         const NODE_DEFAULT_STACK_KB: u64 = 984;
         let kilobytes = u64::from(self.stack_size?);
-        let frames = u64::from(otter_runtime::DEFAULT_MAX_STACK_DEPTH) * kilobytes
-            / NODE_DEFAULT_STACK_KB;
+        let frames =
+            u64::from(otter_runtime::DEFAULT_MAX_STACK_DEPTH) * kilobytes / NODE_DEFAULT_STACK_KB;
         Some(u32::try_from(frames.max(1)).unwrap_or(u32::MAX))
     }
 
@@ -215,31 +215,6 @@ impl CliExecutionConfig {
         if let Some(depth) = self.stack_depth() {
             builder = builder.max_stack_depth(depth);
         }
-        if let Some(threshold) = self.jit_osr_threshold {
-            builder = builder.jit_osr_threshold(threshold);
-        }
-        if let Some(timeout) = self.timeout {
-            builder = builder.timeout(timeout);
-        }
-        if let Some(target) = &self.trace_target {
-            builder = builder.tracer_factory(Some(trace_factory_for_target(target)));
-        }
-        builder
-    }
-
-    /// Apply the same execution settings to the local synchronous runtime.
-    ///
-    /// The runtime currently exposes its timeout as informational on this
-    /// direct path; keeping the configured value here avoids another CLI-only
-    /// source of truth when direct interruption support lands.
-    pub(crate) fn apply_runtime_builder(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
-        let mut builder = builder
-            .jit_selection(self.jit_selection)
-            .jit_debug(self.jit_debug_request())
-            // Node lets the main thread park in `Atomics.wait`; the CLI owns a
-            // watchdog and an interrupt handle, so the park is cancellable.
-            .allow_blocking_atomics_wait(true)
-            .warning_options(self.warning_options.clone());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }

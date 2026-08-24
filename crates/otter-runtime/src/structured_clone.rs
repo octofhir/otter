@@ -672,7 +672,9 @@ mod tests {
         )
         .expect("compile fixture");
         let mut interp = Interpreter::new();
-        let context = interp.link_module(compiled.bytecode);
+        let context = interp
+            .link_module(compiled.bytecode)
+            .expect("valid bytecode fixture");
         let value = interp.run(&context).expect("run fixture");
         clone_vm_value_with_options(&value, interp.gc_heap(), options)
     }

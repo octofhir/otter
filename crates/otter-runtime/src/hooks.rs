@@ -7,6 +7,8 @@
 //! - [`RuntimeJobHook`] — runtime-owned job enqueue boundary.
 //! - [`RuntimeDiagnosticHook`] — structured diagnostics sink.
 //! - [`RuntimeCapabilityHook`] — capability policy override point.
+//! - [`RuntimeCapabilityEvaluator`] — owned policy snapshot safe to capture in
+//!   async host work and extension closures.
 //! - [`RuntimeHooks`] — cloneable hook set stored on the runtime session.
 //!
 //! # Invariants
@@ -332,6 +334,73 @@ impl RuntimeHooks {
     }
 }
 
+/// Cloneable, immutable capability policy for host and extension boundaries.
+///
+/// The evaluator owns one snapshot of the configured capabilities and hooks,
+/// so async work can authorize its exact eventual target without retaining a
+/// runtime or isolate borrow. It deliberately exposes no VM or GC state.
+#[derive(Clone)]
+pub struct RuntimeCapabilityEvaluator {
+    inner: Arc<RuntimeCapabilityEvaluatorInner>,
+}
+
+struct RuntimeCapabilityEvaluatorInner {
+    capabilities: CapabilitySet,
+    hooks: RuntimeHooks,
+}
+
+impl std::fmt::Debug for RuntimeCapabilityEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeCapabilityEvaluator")
+            .field("capabilities", &self.inner.capabilities)
+            .field("hooks", &self.inner.hooks)
+            .finish()
+    }
+}
+
+impl RuntimeCapabilityEvaluator {
+    /// Build an owned evaluator from one immutable runtime policy snapshot.
+    #[must_use]
+    pub fn new(capabilities: CapabilitySet, hooks: RuntimeHooks) -> Self {
+        Self {
+            inner: Arc::new(RuntimeCapabilityEvaluatorInner {
+                capabilities,
+                hooks,
+            }),
+        }
+    }
+
+    pub(crate) fn from_refs(capabilities: &CapabilitySet, hooks: &RuntimeHooks) -> Self {
+        Self::new(capabilities.clone(), hooks.clone())
+    }
+
+    /// Borrow the configured capability set for diagnostics and narrowing.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilitySet {
+        &self.inner.capabilities
+    }
+
+    /// Evaluate one concrete request through the runtime's hook policy.
+    #[must_use]
+    pub fn check(&self, capability: RuntimeCapability, request: &CapabilityRequest<'_>) -> bool {
+        check_capability_with_hooks(
+            &self.inner.hooks,
+            &self.inner.capabilities,
+            capability,
+            request,
+        )
+    }
+
+    /// Evaluate an exact network target and the URL that initiated it.
+    #[must_use]
+    pub fn check_network(&self, url: &url::Url, initiator: Option<&url::Url>) -> bool {
+        self.check(
+            RuntimeCapability::Net,
+            &CapabilityRequest::Network { url, initiator },
+        )
+    }
+}
+
 /// Default capability policy used when no custom hook is installed.
 #[must_use]
 pub fn default_check_capability(
@@ -364,11 +433,15 @@ fn network_url_allowed(capabilities: &CapabilitySet, url: &url::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    if capabilities.net.matches(host) {
-        return true;
+    match url.port_or_known_default() {
+        Some(port) => {
+            // `Url::host_str()` already serializes IPv6 hosts with brackets,
+            // so appending the port is correct for names, IPv4, and IPv6.
+            let authority = format!("{host}:{port}");
+            capabilities.net.matches_any(&[host, &authority])
+        }
+        None => capabilities.net.matches(host),
     }
-    url.port()
-        .is_some_and(|port| capabilities.net.matches(&format!("{host}:{port}")))
 }
 
 /// Apply the active runtime hook while preserving non-overridable security
@@ -402,4 +475,67 @@ pub fn default_compile_source(
 ) -> Result<CompiledModule, OtterError> {
     otter_compiler::compile_script_source_to_module(&source.text, source.kind, specifier)
         .map_err(|err| crate::map_compile_error(err, specifier))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Permission;
+
+    fn network_allowed(permission: Permission<String>, target: &str) -> bool {
+        let mut capabilities = CapabilitySet::sandbox();
+        capabilities.net = permission;
+        let url = url::Url::parse(target).expect("URL");
+        default_check_capability(
+            &capabilities,
+            RuntimeCapability::Net,
+            &CapabilityRequest::Network {
+                url: &url,
+                initiator: None,
+            },
+        )
+    }
+
+    #[test]
+    fn network_matcher_treats_default_port_as_same_resource() {
+        assert!(network_allowed(
+            Permission::allow(["example.test:443".to_string()]),
+            "https://example.test/module.js",
+        ));
+    }
+
+    #[test]
+    fn network_matcher_cannot_bypass_bare_host_deny_with_port() {
+        assert!(!network_allowed(
+            Permission::allow_except(["*".to_string()], ["127.0.0.1".to_string()]),
+            "http://127.0.0.1:8080/module.js",
+        ));
+    }
+
+    #[test]
+    fn network_matcher_cannot_bypass_port_deny_with_bare_host() {
+        assert!(!network_allowed(
+            Permission::allow_except(
+                ["example.test".to_string()],
+                ["example.test:443".to_string()],
+            ),
+            "https://example.test/module.js",
+        ));
+    }
+
+    #[test]
+    fn network_matcher_accepts_ipv6_authority_allow() {
+        assert!(network_allowed(
+            Permission::allow(["[::1]:8080".to_string()]),
+            "http://[::1]:8080/module.js",
+        ));
+    }
+
+    #[test]
+    fn network_matcher_cannot_bypass_ipv6_port_deny_with_bare_host() {
+        assert!(!network_allowed(
+            Permission::allow_except(["[::1]".to_string()], ["[::1]:8080".to_string()],),
+            "http://[::1]:8080/module.js",
+        ));
+    }
 }

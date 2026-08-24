@@ -59,6 +59,28 @@ regression test
 `cargo test -p otter-runtime repeated_otter_build_drop_returns_gc_pages_to_cage`
 guards the same lifecycle at the public `Otter` handle boundary.
 
+## Snapshot Boundary
+
+Runtime startup does not load serialized GC pages. The supported
+`RuntimeSnapshot` is an opaque, capture-produced, in-process value and remains
+bound to its donor runtime configuration and resource account when restored.
+Capabilities, hooks, loaders, hosted modules, console policy, and nested-worker
+inheritance therefore cannot disagree with closures already captured in the
+heap. It is useful for repeated isolates inside one process, but it is not a
+portable artifact or a disk-cache format.
+
+Raw `HeapImage` and `IsolateSnapshot` byte serialization, snapshot-blob
+restore, and the disk snapshot cache were removed because arbitrary bytes
+cannot safely instantiate Rust GC bodies. A durable snapshot would need a
+typed logical-object format whose decoder validates records and reconstructs
+fresh runtime values. Its startup and memory effect must then be measured
+again; historical raw-page-cache numbers are not evidence for that future
+design.
+
+The bytecode compile cache is separate. Cached bytecode passes the mandatory
+bounded verifier and enters the VM through its immutable proof carrier; it
+never restores heap pages or bypasses runtime bootstrap invariants.
+
 ## Current Budgets
 
 The local 2026-05-06 ratchet values are:

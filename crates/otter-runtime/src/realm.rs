@@ -26,8 +26,9 @@
 //! - [`crate::RuntimeHandle`]
 
 use crate::{
-    CapabilitySet, DiagnosticCode, GlobalClassInner, OtterError, RealmError, RuntimeConfig,
-    RuntimeHooks, RuntimeNativeCall, RuntimeNativeFastFn, RuntimeTaskSpawner, SourceInput,
+    CapabilitySet, DiagnosticCode, GlobalClassInner, OtterError, RealmError,
+    RuntimeCapabilityEvaluator, RuntimeConfig, RuntimeHooks, RuntimeNativeCall,
+    RuntimeNativeFastFn, RuntimeTaskSpawner, SourceInput,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,6 +125,12 @@ impl<'a> RuntimeRealmContext<'a> {
         self.capabilities
     }
 
+    /// Owned capability policy safe to capture in host closures and async work.
+    #[must_use]
+    pub fn capability_evaluator(&self) -> RuntimeCapabilityEvaluator {
+        RuntimeCapabilityEvaluator::from_refs(self.capabilities, self.hooks)
+    }
+
     /// Owned task-delivery handle for async host closures, when Layer B is active.
     #[must_use]
     pub fn runtime_task_spawner(&self) -> Option<RuntimeTaskSpawner> {
@@ -160,38 +167,40 @@ impl<'a> RuntimeRealmContext<'a> {
     /// This surface is for extension installation. Page code should use
     /// [`crate::Runtime::run_script_in_realm`] or the corresponding handle API.
     pub fn install_script(&mut self, source: SourceInput) -> Result<(), OtterError> {
-        let bytecode = if let Some(hook) = self.hooks.compile_hook() {
+        let context = if let Some(hook) = self.hooks.compile_hook() {
             let resolved = crate::module_loader::ResolvedSource {
                 url: "<realm-installer>".to_string(),
                 kind: source.kind,
                 jsx: None,
                 text: source.text,
             };
-            hook.compile(crate::RuntimeCompileRequest { source: &resolved })?
-                .bytecode
+            let bytecode = hook
+                .compile(crate::RuntimeCompileRequest { source: &resolved })?
+                .bytecode;
+            self.interp.link_module(bytecode)?
         } else {
             // The same bootstrap sources on every launch, so the same cache.
             let cache = crate::compile_cache::CompileCache::user_default();
             let key = cache.as_ref().map(|_| {
                 crate::compile_cache::cache_key(&source.text, source.kind, "<realm-installer>")
             });
-            match (&cache, &key) {
-                (Some(cache), Some(key)) if let Some(bytecode) = cache.load(key) => bytecode,
-                _ => {
-                    let compiled = otter_compiler::compile_script_source_to_module(
-                        &source.text,
-                        source.kind,
-                        "<realm-installer>",
-                    )
-                    .map_err(|error| crate::map_compile_error(error, "<realm-installer>"))?;
-                    if let (Some(cache), Some(key)) = (&cache, &key) {
-                        cache.store(key, &compiled.bytecode);
-                    }
-                    compiled.bytecode
+            if let (Some(cache), Some(key)) = (&cache, &key)
+                && let Some(bytecode) = cache.load(key)
+            {
+                self.interp.link_verified_module(bytecode)?
+            } else {
+                let compiled = otter_compiler::compile_script_source_to_module(
+                    &source.text,
+                    source.kind,
+                    "<realm-installer>",
+                )
+                .map_err(|error| crate::map_compile_error(error, "<realm-installer>"))?;
+                if let (Some(cache), Some(key)) = (&cache, &key) {
+                    cache.store(key, &compiled.bytecode);
                 }
+                self.interp.link_module(compiled.bytecode)?
             }
         };
-        let context = self.interp.link_module(bytecode);
         self.interp.run(&context).map_err(crate::map_vm_error)?;
         self.interp
             .drain_microtasks(&context)
@@ -419,9 +428,6 @@ impl crate::Runtime {
             .interp
             .with_host_realm(realm.realm, |interp| Ok(interp.active_host_realm_id()))
             .map_err(map_realm_vm_error)?;
-        for root in self.promise_registry.take_realm(realm_id) {
-            let _ = self.interp.persistent_root_remove(root);
-        }
         let _ = self.interp.remove_dynamic_imports_for_realm(realm_id);
         let _ = self.interp.cancel_timers_for_realm(realm_id);
         self.module_records.dispose_realm(realm_id);
@@ -458,7 +464,10 @@ impl crate::Runtime {
         let (result, context) = self
             .interp
             .with_host_realm(realm.realm, |interp| {
-                let context = interp.link_module(compiled.bytecode);
+                let context = match interp.link_module(compiled.bytecode) {
+                    Ok(context) => context,
+                    Err(error) => return Ok(Err(OtterError::from(error))),
+                };
                 let script = interp.run(&context);
                 let checkpoint = interp.drain_microtasks(&context);
                 let result = match (script, checkpoint) {
@@ -487,9 +496,9 @@ impl crate::Runtime {
                     )
                     .with_exit_code(crate::process::exit_code(interp))),
                 };
-                Ok((result, context))
+                Ok(Ok((result, context)))
             })
-            .map_err(map_realm_vm_error)?;
+            .map_err(map_realm_vm_error)??;
         let result = result.map_err(crate::map_vm_error)?;
         self.pump_layer_a_dynamic_imports(&context)?;
         let result = self.attach_execution_stats(result);
@@ -645,8 +654,8 @@ fn execute_linked_module_in_active_realm(
                 });
         }
     });
+    let context = interp.link_module(module)?;
     records.mark_evaluating(realm_id);
-    let context = interp.link_module(module);
     let script = interp.run(&context);
     let checkpoint = interp.drain_microtasks(&context);
     let value = match (script, checkpoint) {

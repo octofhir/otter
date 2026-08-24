@@ -2387,6 +2387,7 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+        .expect("valid bytecode fixture")
     }
 
     fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {

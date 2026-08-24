@@ -14,6 +14,7 @@ otter-bytecode = { workspace = true }
 otter-compiler = { workspace = true }
 otter-gc = { workspace = true }
 otter-jit = { workspace = true }
+otter-resource = { workspace = true }
 otter-syntax = { workspace = true }
 otter-vm = { workspace = true }
 otter-xml = { workspace = true }
@@ -39,6 +40,9 @@ url = "2"
 libc = { workspace = true }
 nix = { workspace = true }
 rustix = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -363,9 +363,8 @@ impl JsRegExpBody {
     /// A restored body's `regex`, `pattern_utf16` and `source` alias the
     /// capture isolate's malloc storage byte-for-byte. Each owning field
     /// is overwritten via `ptr::write` with a freshly built value —
-    /// recompiling the pattern exactly as V8 recompiles RegExp code on
-    /// deserialization — so the alias is never dropped and both isolates
-    /// own their storage.
+    /// recompiling the pattern from the opaque snapshot's side record — so the
+    /// alias is never dropped and both isolates own their storage.
     pub(crate) fn rebuild_after_restore(&mut self, pattern_utf16: &[u16], source: &str) {
         let regex = engine::compile(
             source,
@@ -377,10 +376,9 @@ impl JsRegExpBody {
         )
         .expect("a captured pattern compiled once already");
         // SAFETY: overwriting without dropping (or reading) is the
-        // point — the old values are the capture isolate's property
-        // and may not even be readable in this process. The pattern
-        // text comes from the snapshot's own record, never from the
-        // restored bytes.
+        // point — the old values remain the source isolate's property. The
+        // pattern text comes from the snapshot's owned side record, never from
+        // the copied page field.
         unsafe {
             std::ptr::write(&mut self.regex, regex);
             std::ptr::write(&mut self.pattern_utf16, pattern_utf16.to_vec());

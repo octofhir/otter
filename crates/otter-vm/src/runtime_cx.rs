@@ -50,6 +50,7 @@ use otter_gc::raw::RawGc;
 use crate::{
     ActivationStack, ErrorSourcePosition, ExecutionContext, Interpreter, IteratorHandle,
     IteratorState, Local, NativeError, Value, VmError, array,
+    bigint::BigIntValue,
     binary::array_buffer::JsArrayBuffer,
     collections,
     handles::HandleScope,
@@ -361,6 +362,17 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub fn execution_context(&self) -> Option<&ExecutionContext> {
         self.context
+    }
+
+    /// Cancel one timer owned by this isolate without re-entering a mutable
+    /// JavaScript `clearTimeout`/`clearInterval` binding.
+    ///
+    /// Host objects that retain their timer token outside the JavaScript heap
+    /// use this during deterministic teardown. The interpreter removes the
+    /// callback root before asking the installed scheduler to disarm it, so a
+    /// concurrent late wake is a harmless miss.
+    pub fn cancel_timer(&mut self, token: u64) -> bool {
+        self.cx.interp.cancel_timer(token)
     }
 
     /// The stored context reference, decoupled from the `&self` borrow
@@ -797,7 +809,6 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let capture_roots = captures.clone();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -807,9 +818,6 @@ impl<'rt> NativeCtx<'rt> {
                 value_roots,
                 slice_roots,
             );
-            for value in &capture_roots {
-                value.trace_value_slots(visitor);
-            }
         };
         native_function::native_value_with_captures_unchecked_with_roots(
             self.heap_mut(),
@@ -2566,6 +2574,21 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::bigint_i128"))
     }
 
+    /// Allocate a rooted `BigInt` from its canonical decimal representation.
+    pub fn bigint_decimal(&mut self, value: &str) -> Result<Local<'scope>, NativeError> {
+        let bigint = BigIntValue::from_decimal(self.ctx.heap_mut(), value)
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::bigint_decimal",
+                reason: "invalid BigInt decimal representation".to_string(),
+            })?
+            .map_err(|error| NativeError::OutOfMemory {
+                name: "NativeScope::bigint_decimal",
+                requested_bytes: error.requested_bytes(),
+                heap_limit_bytes: error.heap_limit_bytes(),
+            })?;
+        Ok(self.value(Value::big_int(bigint)))
+    }
+
     /// Root `undefined`.
     #[must_use]
     pub fn undefined(&mut self) -> Local<'scope> {
@@ -3420,6 +3443,22 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.ctx.queue_microtask(callee, args)
     }
 
+    /// Schedule a repeating isolate timer for a rooted callback without
+    /// resolving or invoking the mutable JavaScript `setInterval` binding.
+    ///
+    /// The installed host scheduler reserves its finite timer admission before
+    /// the callback is retained or the deadline is armed. The returned token
+    /// can be passed to [`NativeCtx::cancel_timer`] during deterministic host
+    /// object teardown.
+    pub fn schedule_interval(
+        &mut self,
+        callback: Local<'_>,
+        delay_ms: u64,
+    ) -> Result<u64, NativeError> {
+        let callback = self.raw(callback);
+        crate::timers::schedule_interval_rooted(self.ctx, callback, delay_ms)
+    }
+
     /// Invoke a rooted callable synchronously and root its result.
     pub fn call(
         &mut self,
@@ -3614,6 +3653,68 @@ mod tests {
             after > before,
             "NativeCtx::array_from_elements should allocate through root-aware young allocation"
         );
+    }
+
+    #[test]
+    fn native_function_actual_capture_vector_survives_name_gc() {
+        const CHILD_MARKER: &str = "OTTER_NATIVE_CAPTURE_GC_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "runtime_cx::tests::native_function_actual_capture_vector_survives_name_gc",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("OTTER_GC_STRESS", "1")
+                .output()
+                .expect("spawn GC-stress child");
+            assert!(
+                output.status.success(),
+                "GC-stress child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let mut interp = Interpreter::new();
+        with_default_ctx(&mut interp, |ctx| {
+            ctx.scope(|mut scope| {
+                let captured = scope.object().expect("young capture");
+                let marker = scope.string("capture-identity").expect("marker");
+                scope.set(captured, "marker", marker).expect("mark capture");
+                let function = scope
+                    .native_closure(
+                        "captureIdentityAfterNameAllocation",
+                        0,
+                        &[captured],
+                        |_ctx, _args, captures| Ok(captures[0]),
+                    )
+                    .expect("captured native function");
+                let function_name = scope.get(function, "name").expect("native name");
+                assert_eq!(
+                    scope.string_value(function_name).unwrap(),
+                    "captureIdentityAfterNameAllocation"
+                );
+                let own_marker = scope.string("own-property").expect("own marker");
+                scope
+                    .set(function, "probe", own_marker)
+                    .expect("write native own property");
+                let stored_marker = scope.get(function, "probe").expect("read own property");
+                assert_eq!(scope.string_value(stored_marker).unwrap(), "own-property");
+                let this_value = scope.undefined();
+                let returned = scope
+                    .call(function, this_value, &[])
+                    .expect("invoke captured native function");
+                assert!(scope.strict_equals(returned, captured));
+                let returned_marker = scope.get(returned, "marker").expect("read marker");
+                assert_eq!(
+                    scope.string_value(returned_marker).unwrap(),
+                    "capture-identity"
+                );
+            });
+        });
     }
 
     #[test]

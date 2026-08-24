@@ -675,10 +675,9 @@ mod tests {
         // `SmallVec` spill; a symbol-property table (well-known symbols
         // installed on prototypes) and a slot-meta table (materialized
         // per-slot attributes) each replaced a sidecar `Vec`.
-        // Every native callable also allocates its display name as a
-        // heap string: a `&'static str` is a rodata address that could
-        // never survive a page dump, so the name must live in the heap
-        // for the bootstrap snapshot to carry it.
+        // Every native callable also allocates its display name as a heap
+        // string, keeping the name in ordinary traced engine storage instead
+        // of coupling the body layout to a `&'static str`.
         // The four `%Iterator.prototype%` additions (`chunks` /
         // `windows` / `includes` / `join`) and the three `%Iterator%`
         // statics (`concat` / `zip` / `zipKeyed`) each cost a callable

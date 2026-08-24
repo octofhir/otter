@@ -108,6 +108,7 @@ fn named_property_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
@@ -194,6 +195,7 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn own_named_load_loop(iterations: i32) -> ExecutionContext {
@@ -267,6 +269,7 @@ fn own_named_load_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn own_named_store_loop(iterations: i32) -> ExecutionContext {
@@ -341,6 +344,7 @@ fn own_named_store_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
@@ -420,6 +424,7 @@ fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
@@ -493,6 +498,7 @@ fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
@@ -555,6 +561,7 @@ fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
@@ -634,6 +641,7 @@ fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     })
+    .expect("valid bytecode fixture")
 }
 
 fn bench_property_ic(c: &mut Criterion) {

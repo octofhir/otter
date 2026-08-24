@@ -10,12 +10,12 @@
 //! backed by its event loop and inbox.
 //!
 //! # Contents
-//! - [`HostCompletionSink`] — spawn futures, post completion jobs,
-//!   hold liveness.
+//! - [`HostCompletionSink`] — admit and spawn futures, then post their
+//!   completion jobs.
 //! - [`HostCompletionJob`] — a `Send` closure run with full
 //!   interpreter access on the isolate thread.
-//! - [`HostKeepAlive`] — opaque liveness token; dropping it releases
-//!   the hold that keeps the event loop from going idle.
+//! - [`HostCompletionAdmission`] — opaque, unique runtime credit carried from
+//!   the synchronous prologue through terminal dispatch.
 //!
 //! # Invariants
 //! - The sink is per-interpreter state installed by the embedder —
@@ -30,6 +30,7 @@
 //! - `crates/otter-runtime/src/handle.rs` — the inbox-backed
 //!   implementation.
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -38,51 +39,103 @@ use crate::Interpreter;
 /// A completion job: runs on the isolate thread with full interpreter
 /// access. Built by the marshalling layer; carries only owned `Send`
 /// data.
-pub struct HostCompletionJob(Box<dyn FnOnce(&mut Interpreter) + Send>);
+pub struct HostCompletionJob {
+    run: Option<Box<dyn FnOnce(&mut Interpreter) + Send>>,
+    cancel: Option<Box<dyn FnOnce(&mut Interpreter) + Send>>,
+}
 
 impl HostCompletionJob {
     /// Wrap a closure as a completion job.
     #[must_use]
     pub fn new(job: impl FnOnce(&mut Interpreter) + Send + 'static) -> Self {
-        Self(Box::new(job))
+        Self {
+            run: Some(Box::new(job)),
+            cancel: None,
+        }
+    }
+
+    /// Wrap a completion plus the isolate-local cleanup to run if dispatch is
+    /// suppressed after process exit.
+    #[must_use]
+    pub fn new_with_cancel(
+        job: impl FnOnce(&mut Interpreter) + Send + 'static,
+        cancel: impl FnOnce(&mut Interpreter) + Send + 'static,
+    ) -> Self {
+        Self {
+            run: Some(Box::new(job)),
+            cancel: Some(Box::new(cancel)),
+        }
     }
 
     /// Run the job against the isolate's interpreter.
-    pub fn run(self, interp: &mut Interpreter) {
-        (self.0)(interp);
+    pub fn run(mut self, interp: &mut Interpreter) {
+        if let Some(job) = self.run.take() {
+            job(interp);
+        }
+    }
+
+    /// Suppress settlement and run only the job's isolate-local cleanup.
+    pub fn cancel(mut self, interp: &mut Interpreter) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel(interp);
+        }
+    }
+}
+
+/// Terminal accounting for an admitted future that completed synchronously,
+/// before a pending Promise or isolate-inbox job was needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCompletionOutcome {
+    /// The Rust result was converted into a fulfilled or rejected JS Promise.
+    Completed,
+    /// Promise construction or Rust-to-JS conversion failed synchronously.
+    Failed,
+    /// The host future was dropped or aborted before producing a result.
+    Cancelled,
+}
+
+/// Unique runtime-owned admission for one asynchronous host completion.
+///
+/// The VM treats the payload as opaque and only moves it back to the sink that
+/// created it. Dropping the carrier before handoff cancels the admission by
+/// dropping the runtime's RAII guard.
+pub struct HostCompletionAdmission(Option<Box<dyn Any + Send>>);
+
+impl HostCompletionAdmission {
+    /// Wrap one embedder-owned admission guard.
+    #[must_use]
+    pub fn new(token: Box<dyn Any + Send>) -> Self {
+        Self(Some(token))
+    }
+
+    /// Recover a guard of the expected concrete type in the sink that created
+    /// it. A carrier from another sink is returned intact instead of panicking.
+    pub fn try_into_inner<T: Any + Send>(mut self) -> Result<Box<T>, Self> {
+        let Some(token) = self.0.take() else {
+            return Err(self);
+        };
+        match token.downcast::<T>() {
+            Ok(token) => Ok(token),
+            Err(token) => {
+                self.0 = Some(token);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for HostCompletionAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostCompletionAdmission")
+            .field("live", &self.0.is_some())
+            .finish()
     }
 }
 
 impl std::fmt::Debug for HostCompletionJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostCompletionJob").finish_non_exhaustive()
-    }
-}
-
-/// Opaque liveness token. While held, the embedder's event loop must
-/// not consider the isolate idle (a completion is still expected);
-/// dropping releases the hold.
-pub struct HostKeepAlive(Option<Box<dyn std::any::Any + Send>>);
-
-impl HostKeepAlive {
-    /// Wrap an embedder-owned liveness guard.
-    #[must_use]
-    pub fn new(token: Box<dyn std::any::Any + Send>) -> Self {
-        Self(Some(token))
-    }
-
-    /// A no-op token for embeddings without liveness accounting.
-    #[must_use]
-    pub fn noop() -> Self {
-        Self(None)
-    }
-}
-
-impl std::fmt::Debug for HostKeepAlive {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostKeepAlive")
-            .field("held", &self.0.is_some())
-            .finish()
     }
 }
 
@@ -95,11 +148,25 @@ pub trait HostCompletionSink: Send + Sync {
 
     /// Post a completion job to run on the isolate thread at the next
     /// checkpoint.
-    fn complete(&self, job: HostCompletionJob);
+    fn complete(
+        &self,
+        admission: HostCompletionAdmission,
+        job: HostCompletionJob,
+        outcome: HostCompletionOutcome,
+    ) -> Result<(), String>;
 
-    /// Acquire a liveness hold that keeps the event loop alive until
-    /// the matching completion arrives (released on drop).
-    fn keep_alive(&self) -> HostKeepAlive;
+    /// Consume an admission whose future completed during its eager first poll.
+    /// No isolate-inbox job is needed, but origin and completion statistics must
+    /// still reach one explicit terminal state rather than looking cancelled.
+    fn finish_inline(
+        &self,
+        admission: HostCompletionAdmission,
+        outcome: HostCompletionOutcome,
+    ) -> Result<(), String>;
+
+    /// Admit one terminal completion before allocating a pending Promise or
+    /// starting its host future.
+    fn admit(&self) -> Result<HostCompletionAdmission, String>;
 
     /// Run `f` inside the host executor's context. The marshalling
     /// layer's eager first poll runs through this so reactor-backed

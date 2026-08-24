@@ -55,10 +55,6 @@ pub type RuntimeNativeError = otter_vm::NativeError;
 pub type RuntimeNativeFastFn = otter_vm::NativeFastFn;
 /// Runtime-owned dynamic native function.
 pub type RuntimeNativeFn = otter_vm::NativeFn;
-
-/// Snapshot-restore payload for one dynamic-native closure, re-created
-/// by a [`crate::DynamicNativeFactory`].
-pub type RuntimeDynamicNativePayload = otter_vm::snapshot::DynamicNativePayload;
 /// Runtime-owned native call target.
 pub type RuntimeNativeCall = otter_vm::NativeCall;
 /// Runtime-owned property attributes.

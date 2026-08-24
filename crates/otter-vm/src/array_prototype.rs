@@ -4217,7 +4217,11 @@ pub(crate) fn array_callback_native_dispatch(
         interp.push_iteration_anchor(this_arg);
         let mut output_target = match kind {
             ArrayCallbackKind::Map | ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
-                let species_len = if kind == ArrayCallbackKind::Map { len } else { 0 };
+                let species_len = if kind == ArrayCallbackKind::Map {
+                    len
+                } else {
+                    0
+                };
                 let created =
                     interp.array_species_create(stack, &context, receiver, species_len, &[args]);
                 match created {
@@ -5174,6 +5178,7 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         })
+        .expect("valid bytecode fixture")
     }
 
     #[test]

@@ -8,23 +8,28 @@
 //!
 //! # Contents
 //! - [`FetchRequest`] / [`FetchResponse`] — plain-data DTOs.
+//! - [`FetchTransport`] — reusable, capability-aware HTTP client pair.
 //! - [`perform_fetch`] — capability-gated async request.
 //!
 //! # Invariants
-//! - Outbound network is deny-by-default: [`perform_fetch`] rejects any host
-//!   the [`Permission`] allowlist does not match before a socket is opened.
+//! - Outbound network is deny-by-default: [`perform_fetch`] checks the initial
+//!   URL and the redirect policy checks every next URL before its socket is
+//!   opened.
+//! - A transport reuses its clients and connection pools across calls; policy
+//!   state is immutable and safe to capture in async work.
 //! - Errors are stringly-typed for the JS boundary; the shim maps them to the
 //!   spec `TypeError` a rejected `fetch()` promise carries.
 //!
 //! # See also
 //! - <https://fetch.spec.whatwg.org/>
 
+use std::error::Error as _;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::oneshot;
 
-use crate::Permission;
+use crate::RuntimeCapabilityEvaluator;
 
 /// Cancellation handle for an in-flight [`prepare_fetch`] request. Calling
 /// [`FetchAbort::abort`] cancels the request (closing the socket by dropping the
@@ -48,14 +53,111 @@ impl FetchAbort {
     }
 }
 
+/// Reusable HTTP transport bound to one immutable runtime capability policy.
+///
+/// Separate clients preserve Fetch's followed and non-followed redirect modes
+/// while sharing each mode's connection pool across requests. Construction is
+/// lazy so snapshot reattachment remains infallible; any client initialization
+/// failure becomes the rejected Fetch promise instead of a host panic.
+#[derive(Clone)]
+pub struct FetchTransport {
+    inner: Arc<FetchTransportInner>,
+}
+
+struct FetchTransportInner {
+    evaluator: RuntimeCapabilityEvaluator,
+    user_agent: String,
+    follow_client: OnceLock<Result<reqwest::Client, String>>,
+    no_redirect_client: OnceLock<Result<reqwest::Client, String>>,
+}
+
+impl std::fmt::Debug for FetchTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchTransport")
+            .field("evaluator", &self.inner.evaluator)
+            .field(
+                "follow_client_initialized",
+                &self.inner.follow_client.get().is_some(),
+            )
+            .field(
+                "no_redirect_client_initialized",
+                &self.inner.no_redirect_client.get().is_some(),
+            )
+            .finish()
+    }
+}
+
+impl FetchTransport {
+    /// Bind a reusable HTTP transport to one runtime policy snapshot.
+    #[must_use]
+    pub fn new(evaluator: RuntimeCapabilityEvaluator, user_agent: String) -> Self {
+        Self {
+            inner: Arc::new(FetchTransportInner {
+                evaluator,
+                user_agent,
+                follow_client: OnceLock::new(),
+                no_redirect_client: OnceLock::new(),
+            }),
+        }
+    }
+
+    fn client(&self, follow_redirects: bool) -> Result<reqwest::Client, String> {
+        let slot = if follow_redirects {
+            &self.inner.follow_client
+        } else {
+            &self.inner.no_redirect_client
+        };
+        slot.get_or_init(|| self.build_client(follow_redirects))
+            .clone()
+    }
+
+    fn build_client(&self, follow_redirects: bool) -> Result<reqwest::Client, String> {
+        let redirect_policy = if follow_redirects {
+            let evaluator = self.inner.evaluator.clone();
+            reqwest::redirect::Policy::custom(move |attempt| {
+                let initiator = attempt.previous().last();
+                if evaluator.check_network(attempt.url(), initiator) {
+                    reqwest::redirect::Policy::default().redirect(attempt)
+                } else {
+                    let target = attempt.url().to_string();
+                    attempt.error(NetworkRedirectDenied { target })
+                }
+            })
+        } else {
+            reqwest::redirect::Policy::none()
+        };
+        reqwest::Client::builder()
+            .user_agent(self.inner.user_agent.clone())
+            .redirect(redirect_policy)
+            .build()
+            .map_err(|error| format!("fetch client init failed: {error}"))
+    }
+}
+
+#[derive(Debug)]
+struct NetworkRedirectDenied {
+    target: String,
+}
+
+impl std::fmt::Display for NetworkRedirectDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "network access to \"{}\" is not allowed; grant it with --allow-net",
+            self.target
+        )
+    }
+}
+
+impl std::error::Error for NetworkRedirectDenied {}
+
 /// Build a cancellable outbound fetch. Returns the abort handle and the future
 /// to drive on the host executor; the future resolves with the response, or
 /// errors with `"fetch aborted"` if [`FetchAbort::abort`] fires first. The
 /// capability gate lives in [`perform_fetch`], so a refused host still rejects.
 pub fn prepare_fetch(
     request: FetchRequest,
-    user_agent: String,
-    net: Permission<String>,
+    transport: FetchTransport,
 ) -> (
     Arc<FetchAbort>,
     impl Future<Output = Result<(FetchResponseHead, ResponseBody), String>> + Send,
@@ -66,7 +168,7 @@ pub fn prepare_fetch(
     });
     let future = async move {
         tokio::select! {
-            result = perform_fetch(request, user_agent, net) => result,
+            result = perform_fetch(request, transport) => result,
             _ = receiver => Err("fetch aborted".to_string()),
         }
     };
@@ -137,26 +239,18 @@ impl ResponseBody {
 /// Perform an outbound HTTP request, gated by the `net` capability, and return
 /// the response head plus a streaming [`ResponseBody`].
 ///
-/// The URL's `host[:port]` must match `net` or the request is refused before a
-/// connection is made. Redirects follow reqwest's default policy. The body is
-/// left on the connection and streamed lazily through [`ResponseBody::pull`].
+/// The initial URL and every followed redirect target must pass the transport's
+/// capability evaluator before a connection is made. The body is left on the
+/// connection and streamed lazily through [`ResponseBody::pull`].
 pub async fn perform_fetch(
     request: FetchRequest,
-    user_agent: String,
-    net: Permission<String>,
+    transport: FetchTransport,
 ) -> Result<(FetchResponseHead, ResponseBody), String> {
     let parsed = reqwest::Url::parse(&request.url).map_err(|err| format!("invalid URL: {err}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("URL has no host: {}", request.url))?;
-    // `net` patterns are `host[:port]`; accept a match on either the bare host
-    // or the host with its effective port so `--allow-net=example.com` and
-    // `--allow-net=example.com:443` both work.
-    let host_allowed = net.matches(host)
-        || parsed
-            .port_or_known_default()
-            .is_some_and(|port| net.matches(&format!("{host}:{port}")));
-    if !host_allowed {
+    if !transport.inner.evaluator.check_network(&parsed, None) {
         return Err(format!(
             "network access to \"{host}\" is not allowed; grant it with --allow-net"
         ));
@@ -164,17 +258,9 @@ pub async fn perform_fetch(
 
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .map_err(|_| format!("invalid HTTP method: {}", request.method))?;
-    // `error` and `manual` both stop reqwest from following: `error` rejects
-    // below when a 3xx is seen, `manual` hands the 3xx back to the caller.
-    let redirect_policy = match request.redirect.as_str() {
-        "error" | "manual" => reqwest::redirect::Policy::none(),
-        _ => reqwest::redirect::Policy::default(),
-    };
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .redirect(redirect_policy)
-        .build()
-        .map_err(|err| format!("fetch client init failed: {err}"))?;
+    // `error` and `manual` both stop redirects: `error` rejects below when a
+    // 3xx is seen, while `manual` hands the response back to the caller.
+    let client = transport.client(request.redirect == "follow")?;
     let mut builder = client.request(method, parsed);
     for (name, value) in &request.headers {
         builder = builder.header(name.as_str(), value.as_str());
@@ -186,7 +272,7 @@ pub async fn perform_fetch(
     let response = builder
         .send()
         .await
-        .map_err(|err| format!("fetch failed: {err}"))?;
+        .map_err(|error| format_reqwest_error("fetch failed", &error))?;
     if request.redirect == "error" && response.status().is_redirection() {
         return Err(format!(
             "fetch failed: redirect to \"{}\" refused (redirect mode is \"error\")",
@@ -217,4 +303,15 @@ pub async fn perform_fetch(
         response: tokio::sync::Mutex::new(Some(response)),
     };
     Ok((head, body))
+}
+
+fn format_reqwest_error(prefix: &str, error: &reqwest::Error) -> String {
+    let mut message = format!("{prefix}: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }

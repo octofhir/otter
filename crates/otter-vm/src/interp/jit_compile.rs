@@ -23,6 +23,20 @@ use crate::*;
 
 const EAGER_DIRECT_TARGET_DEPTH: u8 = 2;
 
+/// Internal result of one Template compiler invocation.
+///
+/// Only [`TemplateCompileOutcome::Unsupported`] is stable enough to enter the
+/// function-wide canonical cache. Allocation, backend availability, hook,
+/// prewarm, and registry-admission failures are
+/// [`TemplateCompileOutcome::Deferred`] so execution can retry after a bounded
+/// cooling interval.
+#[derive(Debug, Clone)]
+pub(super) enum TemplateCompileOutcome {
+    Installed(std::sync::Arc<dyn jit::JitFunctionCode>),
+    Unsupported,
+    Deferred,
+}
+
 impl Interpreter {
     /// Snapshot installed, invalid, and retired-tombstone JIT generations.
     ///
@@ -56,9 +70,6 @@ impl Interpreter {
         for code in self.jit_optimized_code.values().flatten() {
             record(code);
         }
-        for code in self.jit_osr_code.values().flatten() {
-            record(code);
-        }
         if let Some((_, code)) = &self.jit_code_cache {
             record(code);
         }
@@ -67,11 +78,73 @@ impl Interpreter {
         }
         jit::JitCodeResidency {
             installed_optimized_bodies: self.jit_optimized_code.values().flatten().count() as u64,
-            installed_entry_bodies: self.jit_code.values().flatten().count() as u64,
-            installed_osr_bodies: self.jit_osr_code.values().flatten().count() as u64,
+            installed_entry_bodies: self
+                .jit_code
+                .values()
+                .flatten()
+                .filter(|code| !code.osr_only())
+                .count() as u64,
+            installed_osr_bodies: self
+                .jit_template_osr_fids
+                .iter()
+                .filter(|fid| matches!(self.jit_code.get(*fid), Some(Some(_))))
+                .count() as u64,
             unique_code_objects: seen.len() as u64,
             code_bytes,
         }
+    }
+
+    /// Publish one Template compile result into the single entry/OSR cache.
+    ///
+    /// A permanent unsupported verdict disables every OSR header. Deferred
+    /// failures retain no code/cache verdict and only arm the entry retry
+    /// countdown; each OSR header naturally waits for its next hotness
+    /// threshold before trying again.
+    pub(super) fn retain_template_compile_outcome(
+        &mut self,
+        fid: u32,
+        outcome: TemplateCompileOutcome,
+    ) -> TemplateCompileOutcome {
+        match &outcome {
+            TemplateCompileOutcome::Installed(code) => {
+                self.jit_code.insert(fid, Some(code.clone()));
+                self.jit_template_entry_retry_remaining.remove(&fid);
+                if code.osr_only() {
+                    self.jit_entry_osr_only.insert(fid);
+                } else {
+                    self.jit_entry_osr_only.remove(&fid);
+                }
+            }
+            TemplateCompileOutcome::Unsupported => {
+                self.jit_code.insert(fid, None);
+                self.jit_template_entry_retry_remaining.remove(&fid);
+                self.jit_template_osr_fids.remove(&fid);
+                self.jit_entry_osr_only.remove(&fid);
+                self.jit_osr_disabled.insert((fid, u32::MAX));
+                self.jit_osr_counts
+                    .retain(|(counted_fid, _), _| *counted_fid != fid);
+            }
+            TemplateCompileOutcome::Deferred => {
+                self.jit_template_entry_retry_remaining
+                    .insert(fid, Self::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES);
+            }
+        }
+        self.jit_code_cache = None;
+        outcome
+    }
+
+    /// Consume one ordinary entry from a transient-compile cooling interval.
+    /// Returns `true` exactly when compilation may be attempted now.
+    pub(super) fn template_entry_retry_ready(&mut self, fid: u32) -> bool {
+        let Some(remaining) = self.jit_template_entry_retry_remaining.get_mut(&fid) else {
+            return true;
+        };
+        if *remaining > 1 {
+            *remaining -= 1;
+            return false;
+        }
+        self.jit_template_entry_retry_remaining.remove(&fid);
+        true
     }
 
     fn record_jit_compile_prepared(
@@ -510,12 +583,12 @@ impl Interpreter {
     /// installed code, or `None` when the hook declines (unsupported subset or
     /// executable memory unavailable) — either way execution stays correct on
     /// the interpreter.
-    pub(crate) fn compile_jit_function(
+    pub(super) fn compile_jit_function(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         osr_pc: Option<u32>,
-    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+    ) -> TemplateCompileOutcome {
         self.compile_jit_function_with_direct_targets(
             context,
             fid,
@@ -532,14 +605,46 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
         eager_direct_target_depth: u8,
-    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        let hook = self.jit_hook.as_ref()?.clone();
-        self.prewarm_string_constant_cells(context, fid)?;
-        let mut view = context.jit_compile_snapshot(fid)?;
+    ) -> TemplateCompileOutcome {
+        if !self.jit_template_compiling.insert(fid) {
+            return TemplateCompileOutcome::Deferred;
+        }
+        let outcome = self.compile_jit_function_with_direct_targets_unchecked(
+            context,
+            fid,
+            osr_pc,
+            eager_direct_target_depth,
+        );
+        self.jit_template_compiling.remove(&fid);
+        outcome
+    }
+
+    /// Compile after the per-function in-flight guard has been acquired.
+    fn compile_jit_function_with_direct_targets_unchecked(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        osr_pc: Option<u32>,
+        eager_direct_target_depth: u8,
+    ) -> TemplateCompileOutcome {
+        let Some(hook) = self.jit_hook.as_ref().cloned() else {
+            return TemplateCompileOutcome::Deferred;
+        };
+        if self.prewarm_string_constant_cells(context, fid).is_none() {
+            return TemplateCompileOutcome::Deferred;
+        }
+        let Some(mut view) = context.jit_compile_snapshot(fid) else {
+            return TemplateCompileOutcome::Deferred;
+        };
         self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
-        self.bake_string_constant_cells(&mut view, context, fid)?;
+        if self
+            .bake_string_constant_cells(&mut view, context, fid)
+            .is_none()
+        {
+            return TemplateCompileOutcome::Deferred;
+        }
         self.bake_global_lexical_loads(&mut view, context, fid);
         self.bake_binding_hit_proofs(&mut view, context, fid);
         self.bake_inline_callees(
@@ -611,9 +716,14 @@ impl Interpreter {
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                 }
-                installed.then_some(code)
+                if installed {
+                    TemplateCompileOutcome::Installed(code)
+                } else {
+                    TemplateCompileOutcome::Deferred
+                }
             }
-            _ => None,
+            Ok(jit::JitCompileStatus::Unsupported { .. }) => TemplateCompileOutcome::Unsupported,
+            Ok(jit::JitCompileStatus::Unavailable) | Err(_) => TemplateCompileOutcome::Deferred,
         }
     }
 
@@ -1219,17 +1329,13 @@ impl Interpreter {
         }
         self.jit_runtime_stats.compile_attempts =
             self.jit_runtime_stats.compile_attempts.saturating_add(1);
-        let compiled = self.compile_jit_function_with_direct_targets(
+        let outcome = self.compile_jit_function_with_direct_targets(
             context,
             function.id,
             None,
             eager_depth - 1,
         );
-        self.jit_code.insert(function.id, compiled.clone());
-        self.jit_code_cache = None;
-        if compiled.is_some() {
-            self.jit_entry_osr_only.remove(&function.id);
-        }
+        self.retain_template_compile_outcome(function.id, outcome);
         self.current_direct_callee_plan(function)
     }
 
@@ -2225,7 +2331,9 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interpreter = Interpreter::new();
-        let context = interpreter.link_module(module);
+        let context = interpreter
+            .link_module(module)
+            .expect("valid bytecode fixture");
         assert!(
             interpreter
                 .prewarm_string_constant_cells(&context, 0)
@@ -2336,7 +2444,9 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interpreter = Interpreter::new();
-        let context = interpreter.link_module(module);
+        let context = interpreter
+            .link_module(module)
+            .expect("valid bytecode fixture");
         let mut stack = ActivationStack::new();
         let (caller, nested) = interpreter.with_runtime_turn(&mut stack, |turn| {
             let (interpreter, _) = turn.into_parts();

@@ -56,12 +56,7 @@ impl Interpreter {
             .string_constant_str_for_function(frame.function_id(), name_idx)
             .and_then(|name| {
                 let env = frame.eval_env()?;
-                crate::eval_env::eval_env_lookup_chain_bounded(
-                    &self.gc_heap,
-                    env,
-                    name,
-                    eval_depth,
-                )
+                crate::eval_env::eval_env_lookup_chain_bounded(&self.gc_heap, env, name, eval_depth)
             });
         if let Some(cell) = dynamic_cell {
             return Ok(crate::read_upvalue(&self.gc_heap, cell));
@@ -128,12 +123,7 @@ impl Interpreter {
             .string_constant_str_for_function(frame.function_id(), name_idx)
             .and_then(|name| {
                 let env = frame.eval_env()?;
-                crate::eval_env::eval_env_lookup_chain_bounded(
-                    &self.gc_heap,
-                    env,
-                    name,
-                    eval_depth,
-                )
+                crate::eval_env::eval_env_lookup_chain_bounded(&self.gc_heap, env, name, eval_depth)
             });
         if let Some(cell) = dynamic_cell {
             crate::store_upvalue(&mut self.gc_heap, cell, value);

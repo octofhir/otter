@@ -21,6 +21,21 @@ fn test_function(
     scratch: u16,
     code: Vec<Instruction>,
 ) -> Function {
+    // Mandatory verification rejects a reachable function end: cap every
+    // fixture body with an explicit terminator when the test did not.
+    let mut code = code;
+    let needs_terminator = !matches!(
+        code.last().map(|instruction| instruction.op),
+        Some(Op::Return | Op::ReturnUndefined | Op::Throw)
+    );
+    if needs_terminator {
+        let pc = code.last().map_or(0, |instruction| instruction.pc + 1);
+        code.push(Instruction {
+            pc,
+            op: Op::ReturnUndefined,
+            operands: vec![],
+        });
+    }
     let spans = spans_for(&code);
     Function {
         id,
@@ -4549,20 +4564,28 @@ fn runtime_budget_stats_record_host_ops_and_external_bytes() {
 }
 
 #[test]
-fn missing_return_errors() {
-    let module = module_with(
-        vec![Instruction {
-            pc: 0,
-            op: Op::Nop,
-            operands: vec![],
-        }],
-        0,
-    );
+fn missing_return_is_rejected_at_verification() {
+    // A body whose end is reachable can no longer reach the interpreter:
+    // mandatory verification refuses it before linking. Build the function
+    // directly so the fixture helper's terminator cap does not apply.
+    let mut module = module_with(Vec::new(), 0);
+    module.functions[0].code = vec![Instruction {
+        pc: 0,
+        op: Op::Nop,
+        operands: vec![],
+    }]
+    .into();
+    module.functions[0].spans = vec![SpanEntry {
+        pc: 0,
+        span: (0, 0),
+    }];
     let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
-    assert_eq!(
-        interp.run(&context).unwrap_err().error,
-        VmError::MissingReturn
+    let error = interp
+        .link_module(module)
+        .expect_err("terminator-less body must fail verification");
+    assert!(
+        error.to_string().contains("reaches function end"),
+        "unexpected admission error: {error}"
     );
 }
 

@@ -1123,15 +1123,9 @@ mod tests {
             .expect("target object");
         let prototype = crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut())
             .expect("prototype object");
-        let context = crate::ExecutionContext::from_module(crate::BytecodeModule {
-            module: "shape-epoch-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::TypeScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        let context = crate::ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("shape-epoch-test.js"),
+        )
         .expect("valid bytecode fixture");
         let target_value = crate::Value::object(target);
         let prototype_value = crate::Value::object(prototype);

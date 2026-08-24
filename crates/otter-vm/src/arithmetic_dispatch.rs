@@ -1135,15 +1135,9 @@ mod tests {
     use super::*;
 
     fn empty_context() -> crate::ExecutionContext {
-        crate::ExecutionContext::from_module(crate::BytecodeModule {
-            module: "numeric-runtime-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: otter_bytecode::SourceKind::TypeScript,
-            functions: Vec::new(),
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-        })
+        crate::ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
+            "numeric-runtime-test.js",
+        ))
         .expect("valid bytecode fixture")
     }
 
@@ -1224,17 +1218,10 @@ mod tests {
             JsString::from_str(lhs_text, interp.gc_heap_mut()).expect("left string allocation"),
         );
         let mut stack = crate::ActivationStack::new();
-        let context =
-            crate::execution_context::ExecutionContext::from_module(crate::BytecodeModule {
-                module: "add-kernel-rooting-test.js".to_string(),
-                template_sites: Vec::new(),
-                source_kind: otter_bytecode::SourceKind::TypeScript,
-                functions: Vec::new(),
-                constants: Vec::new(),
-                module_resolutions: Vec::new(),
-                module_inits: Vec::new(),
-            })
-            .expect("valid bytecode fixture");
+        let context = crate::execution_context::ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("add-kernel-rooting-test.js"),
+        )
+        .expect("valid bytecode fixture");
         let result = interp
             .add_value(&mut stack, &context, lhs, Value::number_i32(7))
             .expect("string addition");

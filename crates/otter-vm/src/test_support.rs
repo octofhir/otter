@@ -28,6 +28,30 @@ use crate::promise::JsPromiseHandle;
 use crate::weak_refs::{self, JsFinalizationRegistry, JsWeakRef};
 use crate::{JsArray, Value, VmError};
 
+/// Minimal verifier-valid bytecode module for unit-test fixtures: one
+/// `<main>` function whose body returns undefined. Fixtures that only need
+/// an [`ExecutionContext`] use this instead of an empty function table,
+/// which mandatory verification rejects.
+pub fn minimal_bytecode_module(name: &str) -> otter_bytecode::BytecodeModule {
+    let mut code = otter_bytecode::FunctionCodeBuilder::new();
+    code.push(otter_bytecode::Op::ReturnUndefined, &[]);
+    otter_bytecode::BytecodeModule {
+        module: name.to_string(),
+        template_sites: Vec::new(),
+        source_kind: otter_bytecode::SourceKind::JavaScript,
+        functions: vec![otter_bytecode::Function {
+            id: 0,
+            name: "<main>".to_string(),
+            locals: 2,
+            code: code.finish(),
+            ..otter_bytecode::Function::default()
+        }],
+        constants: Vec::new(),
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
+    }
+}
+
 /// Allocate an old-space object for raw mark/sweep regression fixtures.
 pub fn alloc_old_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
     crate::object::alloc_object_old_for_fixture(heap)

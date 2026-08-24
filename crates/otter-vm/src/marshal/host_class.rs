@@ -106,6 +106,11 @@ pub struct HostInstance {
     cast_mut: for<'a> fn(&'a mut dyn Any, TypeId) -> Option<&'a mut dyn Any>,
     bytes: for<'a> fn(&'a dyn Any) -> Option<&'a [u8]>,
     class_name: &'static str,
+    /// Heap external-memory charge for the byte payload the data exposes.
+    /// Held for the instance's lifetime so GC pacing and the heap cap see
+    /// host-owned bytes (Blob backing stores); released when the collector
+    /// finalizes the host object and drops this cell.
+    _external: Option<otter_gc::ExternalMemory>,
 }
 
 impl crate::object::HostObjectData for HostInstance {}
@@ -128,7 +133,13 @@ impl HostInstance {
             cast_mut: cast_mut_thunk::<T>,
             bytes: bytes_thunk::<T>,
             class_name,
+            _external: None,
         }
+    }
+
+    /// Attach the heap external-memory charge for the data's byte payload.
+    pub fn set_external_charge(&mut self, external: otter_gc::ExternalMemory) {
+        self._external = Some(external);
     }
 
     /// The declared JS class name of the stored data.
@@ -235,9 +246,10 @@ pub fn construct_instance<'s, T: HostAncestry>(
     // `new.target.prototype` (JS subclasses); everything else — plain
     // factory calls from Rust — uses the registered class prototype.
     let proto = prototype_for_construction(cx, class_name);
+    let instance = charged_instance(cx, class_name, data)?;
     let instance = cx
         .ctx()
-        .alloc_host_object(HostInstance::new(class_name, data))
+        .alloc_host_object(instance)
         .map_err(|err| JsError::Type(err.to_string()))?;
     let handle = cx.park(Value::object(instance));
     if let Some(proto) = proto {
@@ -248,6 +260,28 @@ pub fn construct_instance<'s, T: HostAncestry>(
         }
     }
     Ok(handle)
+}
+
+/// Build the branded cell and charge its byte payload as heap external
+/// memory before the object exists. A class without a byte view charges
+/// nothing; a rejected reservation (heap cap) fails construction before
+/// any allocation effect.
+fn charged_instance<T: HostAncestry>(
+    cx: &mut MarshalCx<'_, '_, '_>,
+    class_name: &'static str,
+    data: T,
+) -> Result<HostInstance, JsError> {
+    let mut instance = HostInstance::new(class_name, data);
+    if let Some(len) = instance.bytes().map(<[u8]>::len)
+        && len != 0
+    {
+        let external = cx
+            .heap_mut()
+            .reserve_external(len as u64)
+            .map_err(|err| JsError::Type(err.to_string()))?;
+        instance.set_external_charge(external);
+    }
+    Ok(instance)
 }
 
 /// The prototype a fresh instance of `class_name` must carry, parked in
@@ -311,9 +345,10 @@ pub fn class_instance<'s, T: HostAncestry>(
         .ctx()
         .class_instance_prototype(class_name)
         .map(|proto| cx.park(proto));
+    let instance = charged_instance(cx, class_name, data)?;
     let instance = cx
         .ctx()
-        .alloc_host_object(HostInstance::new(class_name, data))
+        .alloc_host_object(instance)
         .map_err(|err| JsError::Type(err.to_string()))?;
     let handle = cx.park(Value::object(instance));
     if let Some(proto) = proto {

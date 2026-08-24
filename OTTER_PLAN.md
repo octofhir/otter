@@ -192,8 +192,11 @@ Still open, in R1 terms:
 
 - `CodeSpace` chunk retention (append-only bytecode + executable modules,
   uncharged) and size-driven code eviction policy;
-- Web/Node response bodies, stream buffers, and host-owned backing stores;
-- GC external allocations.
+- Web/Node stream buffers and remaining host-owned backing stores. Host-class
+  byte payloads (Blob/File backing stores) now charge heap external memory at
+  construction and release on collection; the native fetch boundary already
+  streams per-chunk with pull backpressure;
+- folding heap external charges into the runtime ledger's `ExternalBytes`.
 
 Use streaming or bounded reads where whole-body collection is not semantically
 required. Eviction must be deterministic and must not invalidate live code or

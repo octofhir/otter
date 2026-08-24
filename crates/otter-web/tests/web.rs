@@ -1,4 +1,4 @@
-use otter_runtime::{Runtime, SourceInput};
+use otter_runtime::{Runtime, RuntimeHandle, SourceInput};
 use otter_web::blob::Blob;
 use otter_web::url::WebUrl;
 use otter_web::{WebApiBuilderExt, web_api_classes};
@@ -6,6 +6,22 @@ use otter_web::{WebApiBuilderExt, web_api_classes};
 fn eval_string(runtime: &mut Runtime, source: &str) -> String {
     runtime
         .eval(SourceInput::from_javascript(source))
+        .unwrap()
+        .completion_string()
+        .to_string()
+}
+
+/// Managed-isolate evaluation for surfaces whose natives complete through
+/// host completions (Blob async reads, SubtleCrypto digests). A direct
+/// runtime deliberately rejects those.
+fn eval_managed(handle: &RuntimeHandle, source: &str) -> String {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("test tokio runtime");
+    runtime
+        .block_on(handle.eval(SourceInput::from_javascript(source)))
         .unwrap()
         .completion_string()
         .to_string()
@@ -55,9 +71,9 @@ fn blob_slices_and_decodes_text() {
 
 #[test]
 fn blob_constructor_assembles_parts_and_async_reads() {
-    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
-    let result = eval_string(
-        &mut runtime,
+    let handle = Runtime::builder().with_web_apis().build_handle().unwrap();
+    let result = eval_managed(
+        &handle,
         r#"
         globalThis.out = "pending";
         // Mixed BlobParts: string, typed-array bytes, ArrayBuffer, nested Blob.
@@ -76,9 +92,44 @@ fn blob_constructor_assembles_parts_and_async_reads() {
     );
     // Synchronous portion: size, normalized type, and a thenable arrayBuffer().
     assert_eq!(result, "7|text/plain|true");
-    // "ab" + "-" + "ef" + "cd" = "ab-efcd" (7 bytes), read after microtasks drain.
-    let after = eval_string(&mut runtime, "out");
+    // "ab" + "-" + "ef" + "cd" = "ab-efcd" (7 bytes), read after the
+    // managed event loop delivered the completion.
+    let after = eval_managed(&handle, "out");
     assert_eq!(after, "7|text/plain|true|true|7|ab-efcd");
+}
+
+#[test]
+fn blob_backing_bytes_are_charged_against_the_heap_cap() {
+    // 8 MiB heap cap; a 32 MiB Blob's backing store must be rejected as a
+    // typed error before the host object exists, while a small Blob fits.
+    let mut runtime = Runtime::builder()
+        .with_web_apis()
+        .max_heap_bytes(8 * 1024 * 1024)
+        .build()
+        .unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        // Each Blob copies the 1 MiB payload into a host-owned backing
+        // store. Charged as external memory, the copies exhaust the 8 MiB
+        // cap after a handful of Blobs; uncharged they would all fit.
+        const payload = new Uint8Array(1024 * 1024);
+        const retained = [];
+        let outcome = "unbounded";
+        for (let i = 0; i < 64; i += 1) {
+          try {
+            retained.push(new Blob([payload]));
+          } catch (error) {
+            outcome = error instanceof TypeError ? "rejected@" + (i < 16) : "wrong: " + error;
+            break;
+          }
+        }
+        retained.length = 0;
+        const small = new Blob(["ok"]);
+        outcome + "|" + small.size
+        "#,
+    );
+    assert_eq!(result, "rejected@true|2");
 }
 
 #[test]
@@ -1292,9 +1343,9 @@ fn crypto_random_uuid_is_version_4_and_unique() {
 
 #[test]
 fn crypto_subtle_digest_matches_known_vectors_and_rejects_unknowns() {
-    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
-    let result = eval_string(
-        &mut runtime,
+    let handle = Runtime::builder().with_web_apis().build_handle().unwrap();
+    let result = eval_managed(
+        &handle,
         r#"
         // Slot-indexed results: reaction ORDER between independent
         // promises is not part of the contract (a真 async digest adds
@@ -1317,7 +1368,7 @@ fn crypto_subtle_digest_matches_known_vectors_and_rejects_unknowns() {
         "#,
     );
     assert_eq!(result, "true");
-    let after = eval_string(&mut runtime, "slots.join('|')");
+    let after = eval_managed(&handle, "slots.join('|')");
     assert_eq!(
         after,
         "true|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|\

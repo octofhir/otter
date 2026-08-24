@@ -3,8 +3,7 @@
 //! # Contents
 //! - `Array.fromAsync` has the finalized builtin metadata shape.
 //! - The builtin is callable but not constructible.
-//! - Direct calls still report the intentionally missing async
-//!   collection implementation.
+//! - Direct calls collect synchronous iterables with awaited elements.
 //!
 //! # Invariants
 //! - Static Array methods are installed through the shared JS surface
@@ -80,16 +79,19 @@ fn array_from_async_is_not_constructible() {
 }
 
 #[test]
-fn array_from_async_direct_call_reports_missing_algorithm() {
-    let err = run_throwing("Array.fromAsync([]);");
-    let OtterError::Runtime { diagnostic } = err else {
-        panic!("expected Runtime error, got {err:?}");
-    };
-    assert!(
-        diagnostic
-            .message
-            .contains("Array.fromAsync collection is not implemented"),
-        "expected not-implemented diagnostic, got {:?}",
-        diagnostic.message
-    );
+fn array_from_async_direct_call_collects_a_synchronous_iterable() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    let completion = rt
+        .run_script(
+            SourceInput::from_javascript(
+                "const collected = await Array.fromAsync([1, Promise.resolve(2), 3]);\n\
+                 JSON.stringify(collected);",
+            )
+            .with_top_level_await(),
+            "<array-from-async-test>",
+        )
+        .expect("script")
+        .completion_string()
+        .to_string();
+    assert_eq!(completion, "[1,2,3]");
 }

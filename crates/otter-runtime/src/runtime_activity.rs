@@ -152,14 +152,21 @@ impl RuntimeTaskSpawner {
             .await
     }
 
-    fn admit_guaranteed(
+    /// Reserve bounded terminal-completion capacity before the effect that
+    /// will eventually deliver a guaranteed task. Worker construction holds
+    /// one admission as the pre-reserved terminal credit for its Error/Closed
+    /// delivery.
+    pub(crate) fn admit_guaranteed(
         &self,
         liveness: RuntimeLiveness,
     ) -> Result<otter_vm::host_completion::HostCompletionAdmission, OtterError> {
         self.queue.admit_boxed_guaranteed(liveness)
     }
 
-    fn enqueue_guaranteed(
+    /// Deliver one task through the pre-reserved guaranteed admission. Cannot
+    /// be lost to inbox pressure: the wake-driven guaranteed FIFO carries it
+    /// when the bounded inbox is full.
+    pub(crate) fn enqueue_guaranteed(
         &self,
         admission: otter_vm::host_completion::HostCompletionAdmission,
         task: impl RuntimeTask,

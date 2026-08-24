@@ -1396,3 +1396,12 @@ mod tests {
         assert_eq!(run_module(module), Value::boolean(true));
     }
 }
+
+#[cfg(test)]
+mod send_probe_tests {
+    #[test]
+    fn execution_context_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::ExecutionContext>();
+    }
+}

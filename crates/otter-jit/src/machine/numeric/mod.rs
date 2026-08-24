@@ -1806,8 +1806,16 @@ fn select_with_packed_double_view_caches(
                     operands.push(MachineOperand::register_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::register_input));
                     operands.push(MachineOperand::register_output(result));
+                    // The construct receiver's tagged root must sit at
+                    // `result_index + 1`: the arm64 construct forms resolve
+                    // the receiver root positionally there and publish the
+                    // fresh allocation into that root's save slot before the
+                    // argument-spine copy re-reads every argument from its
+                    // canonical save slot. Emitting the receiver from the
+                    // sorted root set instead would alias an argument's slot
+                    // and clobber it with the receiver.
                     if let Some(receiver) = construct_receiver {
-                        call_roots.insert(receiver);
+                        operands.push(MachineOperand::tagged_root(receiver));
                     }
                     operands.extend(call_roots.into_iter().map(MachineOperand::tagged_root));
                     let mut call = MachineInstruction::plain(

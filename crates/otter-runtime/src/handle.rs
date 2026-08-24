@@ -1369,7 +1369,9 @@ enum GuaranteedPayload {
     DynamicImportGraphPrepared {
         token: u64,
         target_url: String,
-        result: Result<crate::module_graph::LinkedProgram, String>,
+        /// Boxed: a linked program embeds a whole bytecode module and its
+        /// shared source snapshot, far larger than the sibling variants.
+        result: Result<Box<crate::module_graph::LinkedProgram>, String>,
     },
 }
 
@@ -2637,10 +2639,10 @@ impl PendingDynamicImportPreparation {
     }
 
     fn finish(mut self, result: Result<crate::module_graph::LinkedProgram, String>) {
-        self.send(result);
+        self.send(result.map(Box::new));
     }
 
-    fn send(&mut self, result: Result<crate::module_graph::LinkedProgram, String>) {
+    fn send(&mut self, result: Result<Box<crate::module_graph::LinkedProgram>, String>) {
         let Some((token, target_url, completion)) = self.post.take() else {
             return;
         };
@@ -3237,10 +3239,11 @@ impl IsolateRunner {
                     return TickOutcome::Processed;
                 }
                 let active = completion.begin_dispatch();
-                match self
-                    .runtime
-                    .complete_dynamic_import_prepared(token, &target_url, result)
-                {
+                match self.runtime.complete_dynamic_import_prepared(
+                    token,
+                    &target_url,
+                    result.map(|linked| *linked),
+                ) {
                     Ok(_) => active.complete(),
                     Err(error) => {
                         let _ = self.runtime.cancel_dynamic_import(token);

@@ -107,6 +107,7 @@ fn named_property_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -194,6 +195,7 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -268,6 +270,7 @@ fn own_named_load_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -343,6 +346,7 @@ fn own_named_store_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -423,6 +427,7 @@ fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -497,6 +502,7 @@ fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -560,6 +566,7 @@ fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("missing")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }
@@ -640,6 +647,7 @@ fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
         constants: vec![string_constant("foo")],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     })
     .expect("valid bytecode fixture")
 }

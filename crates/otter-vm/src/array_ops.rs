@@ -611,7 +611,7 @@ mod tests {
                 uses_arguments_callee: false,
                 arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
-                source_text: None,
+                source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
@@ -632,6 +632,7 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         })
         .expect("valid bytecode fixture")
     }
@@ -664,7 +665,7 @@ mod tests {
                 uses_arguments_callee: false,
                 arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
-                source_text: None,
+                source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
@@ -685,6 +686,7 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         }
     }
 

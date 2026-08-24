@@ -220,6 +220,7 @@ fn fixture_module() -> BytecodeModule {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     }
 }
 

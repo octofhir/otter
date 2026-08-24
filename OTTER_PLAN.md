@@ -183,14 +183,15 @@ bytes — executable mapping, operand/IC/safepoint tables, dependencies, OSR
 map, and the full deopt-frame metadata — to `GeneratedCodeBytes` through the
 isolate registry, sharing the runtime account with source admission. A
 rejected budget declines the install (the function stays on its previous
-tier) with a visible rejection; physical retirement releases the charge.
+tier) with a visible rejection; physical retirement releases the charge. Per-function `[[SourceText]]` no
+longer duplicates the module source: functions carry validated byte ranges
+into one shared module-level snapshot, and `Function.prototype.toString`
+slices it through the owning chunk.
 
 Still open, in R1 terms:
 
 - `CodeSpace` chunk retention (append-only bytecode + executable modules,
   uncharged) and size-driven code eviction policy;
-- per-function `FunctionRecord.source_text` duplicates module source inside
-  retained bytecode (uncharged second copy);
 - Web/Node response bodies, stream buffers, and host-owned backing stores;
 - GC external allocations.
 

@@ -1075,6 +1075,7 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        function_source: None,
     }
 }
 
@@ -1848,6 +1849,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
         constants,
         module_resolutions,
         module_inits,
+        function_source: None,
     }
 }
 

@@ -92,6 +92,7 @@ fn encode_module_with_limit(
     out.seq(&module.constants, Writer::constant);
     out.seq(&module.module_resolutions, Writer::module_resolution);
     out.seq(&module.module_inits, Writer::module_init);
+    out.optional_string(module.function_source.as_ref());
     out.finish()
 }
 
@@ -170,6 +171,7 @@ fn decode_unverified_module(bytes: &[u8]) -> Option<BytecodeModule> {
     let constants = input.seq(Reader::constant)?;
     let module_resolutions = input.seq(Reader::module_resolution)?;
     let module_inits = input.seq(Reader::module_init)?;
+    let function_source = input.optional_string()?;
     if !input.is_at_end() {
         return None;
     }
@@ -178,6 +180,7 @@ fn decode_unverified_module(bytes: &[u8]) -> Option<BytecodeModule> {
         template_sites,
         source_kind,
         functions,
+        function_source,
         constants,
         module_resolutions,
         module_inits,
@@ -496,7 +499,13 @@ impl Writer {
         );
         self.string(&function.module_url);
         self.seq(&function.direct_eval_bindings, Self::direct_eval_binding);
-        self.optional_string(function.source_text.as_ref());
+        match function.source_text_range {
+            Some(range) => {
+                self.bool(true);
+                self.span(range);
+            }
+            None => self.bool(false),
+        }
         match function.source_text_span {
             Some(span) => {
                 self.bool(true);
@@ -786,7 +795,11 @@ impl<'a> Reader<'a> {
         let mapped_argument_bindings = self.seq(Self::mapped_argument_binding)?;
         let module_url = self.string()?;
         let direct_eval_bindings = self.seq(Self::direct_eval_binding)?;
-        let source_text = self.optional_string()?;
+        let source_text_range = if self.bool()? {
+            Some(self.span()?)
+        } else {
+            None
+        };
         let source_text_span = if self.bool()? {
             Some(self.span()?)
         } else {
@@ -822,7 +835,7 @@ impl<'a> Reader<'a> {
             module_url,
             direct_eval_bindings,
             contains_direct_eval,
-            source_text,
+            source_text_range,
             source_text_span,
             code,
             spans,
@@ -900,7 +913,7 @@ mod tests {
                     fn_self_name: false,
                 }],
                 contains_direct_eval: true,
-                source_text: Some("function main() {}".to_string()),
+                source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
                 code: code.finish(),
                 spans: vec![SpanEntry {
@@ -913,6 +926,7 @@ mod tests {
                     class_function_id: 0,
                 }],
             }],
+            function_source: Some("function main() {}".to_string()),
             constants: vec![
                 Constant::String {
                     utf16: vec![0xD83D, 0xDE00],

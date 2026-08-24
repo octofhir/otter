@@ -541,6 +541,7 @@ mod tests {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         })
         .expect("valid bytecode fixture")
     }
@@ -602,6 +603,7 @@ mod tests {
             ],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         }
     }
 
@@ -661,6 +663,7 @@ mod tests {
                 .collect(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         }
     }
 

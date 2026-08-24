@@ -2329,6 +2329,7 @@ mod tests {
             }],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         };
         let mut interpreter = Interpreter::new();
         let context = interpreter
@@ -2442,6 +2443,7 @@ mod tests {
             ],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         };
         let mut interpreter = Interpreter::new();
         let context = interpreter

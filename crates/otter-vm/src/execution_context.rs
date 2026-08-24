@@ -279,6 +279,28 @@ impl ExecutionContext {
             .get((function_id - tables.function_base) as usize)
     }
 
+    /// §20.2.3.5 [[SourceText]] for a function: its validated range
+    /// sliced from the owning module's shared source snapshot. Resolves
+    /// foreign ids through the same chunk lookup as [`Self::function`].
+    #[must_use]
+    pub fn function_source_text(&self, function_id: u32) -> Option<&str> {
+        let (module, local) = if let Some(local) = self.local_function_index(function_id) {
+            (&*self.module, local as usize)
+        } else {
+            let tables = self.sibling_tables(function_id)?;
+            (
+                &*tables.module,
+                (function_id - tables.function_base) as usize,
+            )
+        };
+        let function = module.functions.get(local)?;
+        let (start, end) = function.source_text_range?;
+        module
+            .function_source
+            .as_deref()?
+            .get(start as usize..end as usize)
+    }
+
     /// Executable function lookup by global VM function id. Foreign
     /// ids resolve like [`Self::function`]. Dispatch must still swap
     /// to the owning chunk's context (via [`Self::for_function`])
@@ -747,7 +769,7 @@ mod tests {
                 uses_arguments_callee: false,
                 arguments_object_kind: ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
-                source_text: None,
+                source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
@@ -760,6 +782,7 @@ mod tests {
             constants,
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            function_source: None,
         }
     }
 

@@ -87,6 +87,8 @@ pub fn resolve_ctx(
         &crate::intl::supported::is_supported_numbering_system,
         "latn",
     );
+    // §ResolveLocale — NumberFormat's only relevant extension key is `nu`.
+    let locale = crate::intl::helpers::retain_unicode_extension_keys(&locale, &["nu"]);
     let style = get_string_option(
         ctx,
         options,
@@ -207,7 +209,7 @@ pub fn resolve_ctx(
         "minimumFractionDigits",
         CLASS,
         0.0,
-        20.0,
+        100.0,
         None,
     )?
     .map(|n| n as u8);
@@ -217,7 +219,7 @@ pub fn resolve_ctx(
         "maximumFractionDigits",
         CLASS,
         0.0,
-        20.0,
+        100.0,
         None,
     )?
     .map(|n| n as u8);
@@ -323,6 +325,23 @@ pub fn resolve_ctx(
         } else {
             (minimum_significant_digits, maximum_significant_digits)
         };
+    // §15.1.6 steps 25-26 — a non-unit roundingIncrement is only valid
+    // for pure fraction-digit rounding (TypeError otherwise), and pins
+    // maximumFractionDigits to minimumFractionDigits (RangeError).
+    if rounding_increment != 1 {
+        if rounding_priority != "auto" || minimum_significant_digits.is_some() {
+            return Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "roundingIncrement requires fraction-digit rounding".to_string(),
+            });
+        }
+        if maximum_fraction_digits != minimum_fraction_digits {
+            return Err(range(
+                "roundingIncrement requires maximumFractionDigits to equal minimumFractionDigits"
+                    .to_string(),
+            ));
+        }
+    }
     let trailing_zero_display = get_string_option(
         ctx,
         options,
@@ -342,18 +361,34 @@ pub fn resolve_ctx(
         Some("short"),
     )?
     .unwrap_or_else(|| "short".to_string());
-    // useGrouping accepts a boolean or "min2"/"auto"/"always".
+    // §GetBooleanOrStringNumberFormatOption — useGrouping accepts a
+    // boolean or one of "min2"/"auto"/"always": undefined → "auto",
+    // true → "always", false → off, "true"/"false" strings and anything
+    // else invalid → RangeError.
     let use_grouping_val = if options.is_undefined() {
         Value::undefined()
     } else {
         get_option_value(ctx, options, "useGrouping", CLASS)?
     };
     let use_grouping = if use_grouping_val.is_undefined() {
-        true
-    } else if let Some(b) = use_grouping_val.as_boolean() {
-        b
+        "auto".to_string()
+    } else if use_grouping_val.as_boolean() == Some(true) {
+        "always".to_string()
+    } else if !use_grouping_val.to_boolean(ctx.heap()) {
+        // Any falsy value (false, 0, null, "") disables grouping.
+        String::new()
+    } else if use_grouping_val.as_string(ctx.heap()).is_some() {
+        let raw = option_to_string(ctx, use_grouping_val, CLASS)?;
+        match raw.as_str() {
+            "min2" | "auto" | "always" => raw,
+            // The string spellings of the booleans read as unset.
+            "true" | "false" => "auto".to_string(),
+            _ => {
+                return Err(range(format!("invalid useGrouping value '{raw}'")));
+            }
+        }
     } else {
-        option_to_string(ctx, use_grouping_val, CLASS)? != "false"
+        return Err(range("invalid useGrouping value".to_string()));
     };
     let sign_display = get_string_option(
         ctx,
@@ -985,6 +1020,14 @@ pub(crate) fn number_format_resolved_options(
         // significant option present) reports the significant-digit pair and
         // omits the inert fraction-digit pair, matching the spec's internal
         // slots.
+        let report_fraction =
+            payload.minimum_significant_digits.is_none() || payload.rounding_priority != "auto";
+        if report_fraction {
+            let minimum = scope.number(f64::from(payload.minimum_fraction_digits));
+            scope.set(result, "minimumFractionDigits", minimum)?;
+            let maximum = scope.number(f64::from(payload.maximum_fraction_digits));
+            scope.set(result, "maximumFractionDigits", maximum)?;
+        }
         if let (Some(minimum), Some(maximum)) = (
             payload.minimum_significant_digits,
             payload.maximum_significant_digits,
@@ -993,14 +1036,14 @@ pub(crate) fn number_format_resolved_options(
             scope.set(result, "minimumSignificantDigits", minimum)?;
             let maximum = scope.number(f64::from(maximum));
             scope.set(result, "maximumSignificantDigits", maximum)?;
-        } else {
-            let minimum = scope.number(f64::from(payload.minimum_fraction_digits));
-            scope.set(result, "minimumFractionDigits", minimum)?;
-            let maximum = scope.number(f64::from(payload.maximum_fraction_digits));
-            scope.set(result, "maximumFractionDigits", maximum)?;
         }
-        let use_grouping = scope.boolean(payload.use_grouping);
-        scope.set(result, "useGrouping", use_grouping)?;
+        if payload.use_grouping.is_empty() {
+            let use_grouping = scope.boolean(false);
+            scope.set(result, "useGrouping", use_grouping)?;
+        } else {
+            let use_grouping = scope.string(&payload.use_grouping)?;
+            scope.set(result, "useGrouping", use_grouping)?;
+        }
         let notation = scope.string(&payload.notation)?;
         scope.set(result, "notation", notation)?;
         if payload.notation == "compact" {
@@ -1009,6 +1052,14 @@ pub(crate) fn number_format_resolved_options(
         }
         let sign_display = scope.string(&payload.sign_display)?;
         scope.set(result, "signDisplay", sign_display)?;
+        let rounding_increment = scope.number(f64::from(payload.rounding_increment));
+        scope.set(result, "roundingIncrement", rounding_increment)?;
+        let rounding_mode = scope.string(&payload.rounding_mode)?;
+        scope.set(result, "roundingMode", rounding_mode)?;
+        let rounding_priority = scope.string(&payload.rounding_priority)?;
+        scope.set(result, "roundingPriority", rounding_priority)?;
+        let trailing_zero_display = scope.string(&payload.trailing_zero_display)?;
+        scope.set(result, "trailingZeroDisplay", trailing_zero_display)?;
 
         Ok(scope.finish(result))
     })
@@ -1284,7 +1335,7 @@ fn format_compact_mantissa(m: f64, payload: &NumberFormatPayload) -> String {
         .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
         .expect("default locale parses");
     let mut options = DecimalFormatterOptions::default();
-    options.grouping_strategy = Some(if payload.use_grouping {
+    options.grouping_strategy = Some(if !payload.use_grouping.is_empty() {
         GroupingStrategy::Min2
     } else {
         GroupingStrategy::Never
@@ -1482,6 +1533,23 @@ fn round_decimal_exact_scaled(
     if scale_len < 0 {
         return Some("0".to_string());
     }
+    // Every stored digit sits at or above the rounding position (huge
+    // integers from a shortest-round-trip repr): the value is exact —
+    // render it digit-for-digit with zero padding, no i128 needed.
+    if increment == 1 && scale_len as usize >= digits.len() {
+        let int_len = point.max(1) as usize;
+        let mut out: String = digits.iter().map(|d| char::from(b'0' + d)).collect();
+        while out.len() < int_len {
+            out.push('0');
+        }
+        if frac_digits > 0 {
+            while out.len() < int_len + frac_digits as usize {
+                out.push('0');
+            }
+            out.insert(int_len, '.');
+        }
+        return Some(out);
+    }
     // Consume EVERY available digit so the remainder comparison below
     // is exact — trailing digits contribute real distance, not just a
     // tie-break (1.750 at one fraction digit by increments of 5 is an
@@ -1559,6 +1627,10 @@ fn round_significant_exact(
     mode: &str,
 ) -> Option<String> {
     if abs == 0.0 {
+        // Zero still pads to `minimumSignificantDigits` ("0.00" for 3).
+        if min_sig > 1 {
+            return Some(format!("0.{}", "0".repeat(usize::from(min_sig) - 1)));
+        }
         return Some("0".to_string());
     }
     let repr = format!("{abs}");
@@ -1642,10 +1714,11 @@ fn format_decimal_signed(n: f64, is_negative: bool, payload: &NumberFormatPayloa
         .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
         .expect("default locale parses");
     let mut options = DecimalFormatterOptions::default();
-    options.grouping_strategy = Some(if payload.use_grouping {
-        GroupingStrategy::Auto
-    } else {
-        GroupingStrategy::Never
+    options.grouping_strategy = Some(match payload.use_grouping.as_str() {
+        "" => GroupingStrategy::Never,
+        "min2" => GroupingStrategy::Min2,
+        "always" => GroupingStrategy::Always,
+        _ => GroupingStrategy::Auto,
     });
     let formatter = match DecimalFormatter::try_new((&locale).into(), options) {
         Ok(f) => f,
@@ -1718,7 +1791,12 @@ fn format_decimal_signed(n: f64, is_negative: bool, payload: &NumberFormatPayloa
         Ok(d) => d,
         Err(_) => return rust_fallback_format(n, payload),
     };
-    if payload.maximum_significant_digits.is_none() {
+    // §15.5.3 FormatNumericToString step: `stripIfInteger` removes the
+    // whole fraction of an integer result — including the zeros
+    // `minimumFractionDigits` would otherwise pad back.
+    let stripped_integer =
+        payload.trailing_zero_display == "stripIfInteger" && !trimmed.contains('.');
+    if payload.maximum_significant_digits.is_none() && !stripped_integer {
         decimal.pad_end(-(payload.minimum_fraction_digits as i16));
     }
     if payload.minimum_integer_digits > 1 {
@@ -1878,7 +1956,7 @@ fn rust_fallback_format(n: f64, payload: &NumberFormatPayload) -> String {
         let pad = payload.minimum_integer_digits as usize - int_len;
         s = format!("{}{}", "0".repeat(pad), s);
     }
-    if payload.use_grouping {
+    if !payload.use_grouping.is_empty() {
         s = group_thousands(&s);
     }
     s

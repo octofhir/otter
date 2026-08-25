@@ -78,8 +78,9 @@ pub struct NumberFormatPayload {
     /// `maximumSignificantDigits` — see
     /// [`Self::minimum_significant_digits`].
     pub maximum_significant_digits: Option<u8>,
-    /// `useGrouping` option.
-    pub use_grouping: bool,
+    /// `useGrouping` option — `"auto"`, `"always"`, `"min2"`, or the
+    /// empty string for `false` (v3 GetBooleanOrStringNumberFormatOption).
+    pub use_grouping: String,
     /// `signDisplay` option (`"auto"` / `"always"` / `"never"` /
     /// `"exceptZero"` / `"negative"`) — controls when a plus/minus sign
     /// is shown.

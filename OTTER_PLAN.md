@@ -119,7 +119,9 @@ rejects `Worker` synchronously without resource effect. Census-to-baseline,
 family-limit, nested-worker, transfer-preservation, oversized-graph,
 terminal-race, busy-inbox, idle-wakeup, and GC-stress tests pass.
 
-Future narrowing options (worker-scoped capability subsets) remain E1 scope.
+Worker-scoped capability narrowing is landed (see E1): `new Worker(url,
+{ otter: { capabilities } })` requests a subset, and the child runs under
+the intersection of the parent set and the request.
 
 ### H3. Remaining effect surfaces
 
@@ -358,6 +360,17 @@ The evaluator introduced by H1 becomes the single reusable authorization
 surface for runtime installers, dynamic natives, modules, Web APIs, Node APIs,
 and extensions. It is cloneable, immutable from extension code, cheap on the
 allowed fast path, and testable without constructing a VM.
+
+Landed: sound capability narrowing. `Permission::Intersect` composes two
+rule sets with deny-wins evaluation at check time (pattern languages have
+no computable intersection, so both layers are kept), `CapabilitySet::
+narrowed` applies it per class, and `new Worker(url, { otter: {
+capabilities } })` requests a worker-scoped subset — `false` denies a
+class, `true`/missing inherits, a pattern list allows only what the
+parent also allows. Option parsing reads plain data properties (no
+getters) and validates before the spawn effect; nested workers narrow
+again from the already-narrowed set. Escalation and inheritance paths
+are covered by unit and end-to-end worker tests.
 
 ### E2. Stable contributor model
 

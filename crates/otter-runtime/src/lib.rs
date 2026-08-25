@@ -1253,6 +1253,22 @@ impl CapabilitySet {
             ffi: Permission::AllowAll,
         }
     }
+
+    /// Narrow every capability by `requested`: the result permits an
+    /// operation only when **both** this set and the requested set permit
+    /// it, so a requested subset can never escalate past the grantor.
+    /// Used for worker-scoped capability subsets.
+    #[must_use]
+    pub fn narrowed(&self, requested: Self) -> Self {
+        Self {
+            read: self.read.narrowed(requested.read),
+            write: self.write.narrowed(requested.write),
+            net: self.net.narrowed(requested.net),
+            env: self.env.narrowed(requested.env),
+            run: self.run.narrowed(requested.run),
+            ffi: self.ffi.narrowed(requested.ffi),
+        }
+    }
 }
 
 /// Names what a launched process was granted by the one that started it. The
@@ -1311,6 +1327,16 @@ pub enum Permission<T> {
         #[serde(default = "Vec::new")]
         deny_list: Vec<T>,
     },
+    /// Both layers must allow; a deny in either wins. Produced by
+    /// capability narrowing (worker-scoped subsets): pattern languages
+    /// have no computable intersection, so the sound composition keeps
+    /// both rule sets and evaluates them together at check time.
+    Intersect {
+        /// The granting layer being narrowed (e.g. the parent's rule set).
+        outer: Box<Permission<T>>,
+        /// The narrowing layer (e.g. the worker-requested subset).
+        inner: Box<Permission<T>>,
+    },
 }
 
 impl<T> Permission<T> {
@@ -1340,8 +1366,12 @@ impl<T> Permission<T> {
 
     /// `true` when this permission is unconditional (`AllowAll`).
     #[must_use]
-    pub const fn is_allow_all(&self) -> bool {
-        matches!(self, Self::AllowAll)
+    pub fn is_allow_all(&self) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::Intersect { outer, inner } => outer.is_allow_all() && inner.is_allow_all(),
+            _ => false,
+        }
     }
 
     /// `true` when this permission rejects every operation.
@@ -1351,6 +1381,29 @@ impl<T> Permission<T> {
             Self::Deny => true,
             Self::Scoped { allow_list, .. } => allow_list.is_empty(),
             Self::AllowAll => false,
+            Self::Intersect { outer, inner } => outer.is_deny() || inner.is_deny(),
+        }
+    }
+
+    /// Narrow this permission by `requested`: the result allows an
+    /// operation only when **both** rule sets allow it, so a requested
+    /// subset can never escalate past `self`. Trivial layers collapse
+    /// (`AllowAll` is the identity, `Deny` absorbs); the general case
+    /// keeps both rule sets and evaluates them together.
+    #[must_use]
+    pub fn narrowed(&self, requested: Self) -> Self
+    where
+        T: Clone,
+    {
+        match (self, requested) {
+            (Self::Deny, _) => Self::Deny,
+            (_, Self::Deny) => Self::Deny,
+            (Self::AllowAll, requested) => requested,
+            (parent, Self::AllowAll) => parent.clone(),
+            (parent, requested) => Self::Intersect {
+                outer: Box::new(parent.clone()),
+                inner: Box::new(requested),
+            },
         }
     }
 }
@@ -1379,6 +1432,7 @@ impl Permission<String> {
                     .iter()
                     .any(|p| glob_match_string(p.as_str(), value))
             }
+            Self::Intersect { outer, inner } => outer.matches(value) && inner.matches(value),
         }
     }
 
@@ -1408,6 +1462,9 @@ impl Permission<String> {
                 allow_list
                     .iter()
                     .any(|pattern| values.iter().any(|value| glob_match_string(pattern, value)))
+            }
+            Self::Intersect { outer, inner } => {
+                outer.matches_any(values) && inner.matches_any(values)
             }
         }
     }
@@ -1446,6 +1503,9 @@ impl Permission<PathBuf> {
                     return false;
                 }
                 allow_list.iter().any(covers)
+            }
+            Self::Intersect { outer, inner } => {
+                outer.matches_path(value) && inner.matches_path(value)
             }
         }
     }

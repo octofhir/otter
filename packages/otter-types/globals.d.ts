@@ -4,10 +4,38 @@
 declare global {
     type WorkerMessageHandler = (event: WorkerMessageEvent) => void;
 
+    /**
+     * One capability class in a worker narrowing request:
+     * `false` denies the class, `true` (or omitting it) inherits the
+     * parent's rule set, and a pattern array allows only operations
+     * matching those patterns — bounded by what the parent also allows,
+     * so a request can never escalate.
+     */
+    type WorkerCapabilityRequest = boolean | string[];
+
+    /** Otter-specific worker options. */
+    interface WorkerOtterOptions {
+        /**
+         * Narrow the worker's capabilities to a subset of the parent's.
+         * Each class is evaluated as the intersection of the parent's
+         * rule set and the request.
+         */
+        capabilities?: {
+            read?: WorkerCapabilityRequest;
+            write?: WorkerCapabilityRequest;
+            net?: WorkerCapabilityRequest;
+            env?: WorkerCapabilityRequest;
+            run?: WorkerCapabilityRequest;
+            ffi?: WorkerCapabilityRequest;
+        };
+    }
+
     interface WorkerOptions {
         type?: "classic" | "module";
         name?: string;
         credentials?: "omit" | "same-origin" | "include";
+        /** Otter extensions (capability narrowing). */
+        otter?: WorkerOtterOptions;
     }
 
     interface WorkerMessageEvent<T = any> {

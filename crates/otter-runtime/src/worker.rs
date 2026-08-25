@@ -60,9 +60,10 @@ use crate::event_loop::RuntimeLiveness;
 use crate::module_loader;
 use crate::runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 use crate::{
-    CapabilitySet, ExecutionResult, OtterError, ResourceAccount, ResourceLimits, ResourceSnapshot,
-    Runtime, RuntimeActivityStats, RuntimeBuilder, RuntimeConfig, RuntimeHandle, SourceInput,
-    StructuredCloneNumber, StructuredCloneTransferList, StructuredCloneValue, TokioRuntimeHost,
+    CapabilitySet, ExecutionResult, OtterError, Permission, ResourceAccount, ResourceLimits,
+    ResourceSnapshot, Runtime, RuntimeActivityStats, RuntimeBuilder, RuntimeConfig, RuntimeHandle,
+    SourceInput, StructuredCloneNumber, StructuredCloneTransferList, StructuredCloneValue,
+    TokioRuntimeHost,
 };
 
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
@@ -349,13 +350,16 @@ fn worker_constructor_call(
             ));
         };
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+        // Validate the narrowing request before any spawn effect.
+        let requested_capabilities = parse_worker_capability_request(ctx, args.get(1))?;
         let parent_context = ctx.execution_context().cloned().ok_or_else(|| {
             type_err(
                 "Worker",
                 "Worker construction requires an execution context".to_string(),
             )
         })?;
-        let record = spawn_managed_worker(&host, &parent_spawner, specifier)?;
+        let record =
+            spawn_managed_worker(&host, &parent_spawner, specifier, requested_capabilities)?;
         let result = build_worker_object(ctx, &host, &record, parent_context);
         if result.is_err()
             && let Some(record) = host.remove(record.id.get())
@@ -373,6 +377,7 @@ fn spawn_managed_worker(
     host: &Arc<WorkerHostState>,
     parent_spawner: &RuntimeTaskSpawner,
     specifier: String,
+    requested_capabilities: Option<CapabilitySet>,
 ) -> Result<Arc<WorkerRecord>, NativeError> {
     let id = next_worker_id()
         .ok_or_else(|| type_err("Worker", "worker id space is exhausted".to_string()))?;
@@ -388,7 +393,8 @@ fn spawn_managed_worker(
     let terminal = parent_spawner
         .admit_guaranteed(RuntimeLiveness::Unref)
         .map_err(|err| type_err("Worker", err.to_string()))?;
-    let child_config = configure_worker_child(host.config.clone(), parent_spawner);
+    let child_config =
+        configure_worker_child(host.config.clone(), parent_spawner, requested_capabilities);
     let child = RuntimeHandle::spawn_worker(child_config)
         .map_err(|err| type_err("Worker", err.to_string()))?;
     let child_spawner = child.task_spawner();
@@ -438,6 +444,7 @@ fn spawn_managed_worker(
 fn configure_worker_child(
     mut config: RuntimeConfig,
     parent_spawner: &RuntimeTaskSpawner,
+    requested_capabilities: Option<CapabilitySet>,
 ) -> RuntimeConfig {
     config.allow_blocking_atomics_wait = true;
     if config.runtime_host.is_none()
@@ -445,7 +452,115 @@ fn configure_worker_child(
     {
         config.runtime_host = Some(TokioRuntimeHost::from_handle(io_handle));
     }
+    // Worker-scoped narrowing: the child permits only what both the parent
+    // set and the requested subset permit, so a request can never escalate.
+    // Nested workers narrow again from the already-narrowed set.
+    if let Some(requested) = requested_capabilities {
+        config.capabilities = config.capabilities.narrowed(requested);
+    }
     config
+}
+
+/// Parse the `otter.capabilities` narrowing request from the Worker options
+/// argument.
+///
+/// Shape: `new Worker(url, { otter: { capabilities: { read, write, net,
+/// env, run, ffi } } })`, where each class is `false` (deny), `true`
+/// (inherit the parent rule set), or an array of pattern strings (allow
+/// only those the parent also allows). A missing class inherits. The walk
+/// reads plain data properties through the heap — no getters run, keeping
+/// validation side-effect free before the spawn effect.
+fn parse_worker_capability_request(
+    ctx: &NativeCtx<'_>,
+    options: Option<&Value>,
+) -> Result<Option<CapabilitySet>, NativeError> {
+    let Some(options) = options.filter(|value| !value.is_nullish()) else {
+        return Ok(None);
+    };
+    let options = options
+        .as_object()
+        .ok_or_else(|| type_err("Worker", "options must be an object".to_string()))?;
+    let heap = ctx.heap();
+    let Some(otter) = object::get(options, heap, "otter").filter(|value| !value.is_nullish())
+    else {
+        return Ok(None);
+    };
+    let otter = otter
+        .as_object()
+        .ok_or_else(|| type_err("Worker", "options.otter must be an object".to_string()))?;
+    let Some(capabilities) =
+        object::get(otter, heap, "capabilities").filter(|value| !value.is_nullish())
+    else {
+        return Ok(None);
+    };
+    let capabilities = capabilities.as_object().ok_or_else(|| {
+        type_err(
+            "Worker",
+            "options.otter.capabilities must be an object".to_string(),
+        )
+    })?;
+
+    enum ClassRequest {
+        /// Missing key or `true`: keep the parent rule set (the
+        /// narrowing identity).
+        Inherit,
+        /// `false`: deny the whole class.
+        Deny,
+        /// Pattern list: allow only these, bounded by the parent set.
+        Allow(Vec<String>),
+    }
+
+    let class_request = |key: &'static str| -> Result<ClassRequest, NativeError> {
+        let Some(value) = object::get(capabilities, heap, key).filter(|v| !v.is_undefined()) else {
+            return Ok(ClassRequest::Inherit);
+        };
+        if let Some(flag) = value.as_boolean() {
+            return Ok(if flag {
+                ClassRequest::Inherit
+            } else {
+                ClassRequest::Deny
+            });
+        }
+        let Some(list) = value.as_array() else {
+            return Err(type_err(
+                "Worker",
+                format!("options.otter.capabilities.{key} must be a boolean or string array"),
+            ));
+        };
+        let len = array::len(list, heap);
+        let mut entries = Vec::with_capacity(len);
+        for idx in 0..len {
+            let element = array::get(list, heap, idx);
+            let Some(text) = element.as_string(heap) else {
+                return Err(type_err(
+                    "Worker",
+                    format!("options.otter.capabilities.{key}[{idx}] must be a string"),
+                ));
+            };
+            entries.push(text.to_lossy_string(heap));
+        }
+        Ok(ClassRequest::Allow(entries))
+    };
+
+    let string_permission = |request: ClassRequest| match request {
+        ClassRequest::Inherit => Permission::AllowAll,
+        ClassRequest::Deny => Permission::Deny,
+        ClassRequest::Allow(entries) => Permission::allow(entries),
+    };
+    let path_permission = |request: ClassRequest| match request {
+        ClassRequest::Inherit => Permission::AllowAll,
+        ClassRequest::Deny => Permission::Deny,
+        ClassRequest::Allow(entries) => Permission::allow(entries.into_iter().map(PathBuf::from)),
+    };
+
+    Ok(Some(CapabilitySet {
+        read: path_permission(class_request("read")?),
+        write: path_permission(class_request("write")?),
+        net: string_permission(class_request("net")?),
+        env: string_permission(class_request("env")?),
+        run: string_permission(class_request("run")?),
+        ffi: path_permission(class_request("ffi")?),
+    }))
 }
 
 fn build_worker_object(

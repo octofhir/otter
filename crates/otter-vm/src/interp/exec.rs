@@ -105,7 +105,9 @@ impl Interpreter {
                 function_count: module.functions.len(),
             }
         })?;
-        let context = self.code_space.link_module(module)?;
+        let context = self
+            .code_space
+            .link_module(module, self.module_sources.account())?;
         self.finish_linked_module(context, function_count)
     }
 
@@ -126,7 +128,9 @@ impl Interpreter {
                 function_count: module.module().functions.len(),
             }
         })?;
-        let context = self.code_space.link_verified_module(module)?;
+        let context = self
+            .code_space
+            .link_verified_module(module, self.module_sources.account())?;
         self.finish_linked_module(context, function_count)
     }
 

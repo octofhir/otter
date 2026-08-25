@@ -263,6 +263,19 @@ impl AtomTable {
         AtomTableBuilder::from_constants(constants).freeze()
     }
 
+    /// Heap bytes this table retains for the owning chunk's lifetime: the
+    /// slot array plus every decoded string spelling.
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        let mut total = std::mem::size_of_val::<[AtomSlot]>(&self.slots) as u64;
+        for slot in &self.slots {
+            if let Some(text) = slot.text.as_deref() {
+                total = total.saturating_add(text.len() as u64);
+            }
+        }
+        total
+    }
+
     /// Resolve every string constant to `names`' global atom id.
     ///
     /// Idempotent: resolving twice against the same interner rewrites the same

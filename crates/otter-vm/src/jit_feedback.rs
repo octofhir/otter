@@ -807,6 +807,26 @@ impl Clone for FeedbackVector {
 }
 
 impl FeedbackVector {
+    /// Heap bytes the two dense per-instruction tables retain for the owning
+    /// code block's lifetime, including boxed out-of-line slot payloads.
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        let mut total = (std::mem::size_of_val::<[InstructionFeedback]>(&self.cells) as u64)
+            .saturating_add(std::mem::size_of_val::<[TypedFeedbackSlot]>(&self.typed_slots) as u64);
+        for slot in &self.typed_slots {
+            total = total.saturating_add(match slot {
+                TypedFeedbackSlot::None | TypedFeedbackSlot::Method => 0,
+                TypedFeedbackSlot::Property(payload) => {
+                    std::mem::size_of_val::<AtomicPropertyFeedback>(payload) as u64
+                }
+                TypedFeedbackSlot::Call(payload) => {
+                    std::mem::size_of_val::<AtomicCallFeedback>(payload) as u64
+                }
+            });
+        }
+        total
+    }
+
     /// Allocate one zeroed feedback cell per canonical instruction.
     #[must_use]
     pub fn with_instruction_count(instruction_count: usize) -> Self {

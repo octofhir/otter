@@ -188,10 +188,25 @@ longer duplicates the module source: functions carry validated byte ranges
 into one shared module-level snapshot, and `Function.prototype.toString`
 slices it through the owning chunk.
 
+Also landed: every linked `CodeSpace` chunk charges its exact retained bytes
+(bytecode module, executable view, atom table) to `SourceModuleBytes` at link
+time, before publication, against the linking interpreter's account; a
+rejected budget is a typed `BytecodeLinkError::RetainedBytes` that leaves the
+registry unchanged, and the charge is released when the code space drops with
+its isolate. Restored snapshot isolates keep their donor-charged chunks.
+
 Still open, in R1 terms:
 
-- `CodeSpace` chunk retention (append-only bytecode + executable modules,
-  uncharged) and size-driven code eviction policy;
+- Size-driven chunk eviction. Design constraints from the ownership audit:
+  escaped function values are bare `u32` ids with no ownership edge to their
+  chunk, so eviction requires a liveness proof, not a refcount. The intended
+  shape is a GC-census pipeline at an explicit between-turns safepoint:
+  select candidate chunks (unloaded eval/dynamic-import graphs), invalidate
+  and retire any JIT code for the id range, prove via full-heap census that
+  no live closure/frame/module-registry/timer reference carries an id in the
+  range, then splice the chunk under the single-writer link lock, leaving a
+  slim tombstone node so lock-free readers never observe a freed link.
+  Resolution of an evicted id must stay a typed miss, never a stale hit;
 - Web/Node stream buffers and remaining host-owned backing stores. Host-class
   byte payloads (Blob/File backing stores) now charge heap external memory at
   construction and release on collection; the native fetch boundary already

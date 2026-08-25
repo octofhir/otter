@@ -48,6 +48,11 @@
 //! - Linked chunks live for the registry's lifetime. Escaped function
 //!   values may be called arbitrarily late (timers, jobs), so nothing
 //!   is evicted.
+//! - Every published chunk carries an exact `SourceModuleBytes` lease for
+//!   its retained bytecode, executable view, and atom table, reserved
+//!   against the linking caller's account before publication. A rejected
+//!   budget is a typed [`BytecodeLinkError::RetainedBytes`] and leaves the
+//!   registry unchanged; the lease is released when the registry drops.
 //! - IC-site bases keep dense property-IC ids globally unique, so two
 //!   chunks never alias one interpreter IC slot.
 //!
@@ -61,6 +66,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use otter_bytecode::{
     BytecodeModule, BytecodeRebaseError, BytecodeVerifyError, Constant, Op, VerifiedBytecodeModule,
 };
+use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease};
 
 use crate::ExecutionContext;
 use crate::executable::ExecutableModule;
@@ -129,6 +135,9 @@ pub enum BytecodeLinkError {
     /// The append slot was unexpectedly already occupied while holding the
     /// single-writer lock.
     CodeSpaceConflict,
+    /// The chunk's retained bytes were rejected by the linking account's
+    /// `SourceModuleBytes` budget.
+    RetainedBytes(ResourceError),
 }
 
 impl std::fmt::Display for BytecodeLinkError {
@@ -160,6 +169,9 @@ impl std::fmt::Display for BytecodeLinkError {
             Self::CodeSpaceConflict => {
                 write!(f, "code-space append slot was already occupied")
             }
+            Self::RetainedBytes(error) => {
+                write!(f, "cannot admit linked chunk's retained bytes: {error}")
+            }
         }
     }
 }
@@ -169,8 +181,15 @@ impl std::error::Error for BytecodeLinkError {
         match self {
             Self::Verify(error) => Some(error),
             Self::RebaseVerified(error) => Some(error),
+            Self::RetainedBytes(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<ResourceError> for BytecodeLinkError {
+    fn from(error: ResourceError) -> Self {
+        Self::RetainedBytes(error)
     }
 }
 
@@ -203,7 +222,22 @@ fn next_bases(tables: &ChunkTables) -> Result<(u32, u32), BytecodeLinkError> {
 #[derive(Debug)]
 struct CodeChunk {
     tables: ChunkTables,
+    /// Exact `SourceModuleBytes` charge for the chunk's retained bytecode,
+    /// executable view, and atom table. Chunks are never evicted, so the
+    /// lease is released only when the registry itself is dropped.
+    _retained_lease: ResourceLease,
     next: OnceLock<Arc<CodeChunk>>,
+}
+
+/// Exact bytes one linked chunk retains for the registry's lifetime.
+fn chunk_retained_bytes(tables: &ChunkTables) -> u64 {
+    (std::mem::size_of::<CodeChunk>() as u64)
+        .saturating_add(std::mem::size_of::<BytecodeModule>() as u64)
+        .saturating_add(tables.module.retained_bytes())
+        .saturating_add(std::mem::size_of::<ExecutableModule>() as u64)
+        .saturating_add(tables.executable.retained_bytes())
+        .saturating_add(std::mem::size_of::<AtomTable>() as u64)
+        .saturating_add(tables.atoms.retained_bytes())
 }
 
 fn ensure_function_id_capacity(base: u32, function_count: usize) -> Result<u32, BytecodeLinkError> {
@@ -271,7 +305,8 @@ fn build_chunk(
     function_base: u32,
     function_count: u32,
     property_ic_base: u32,
-) -> Arc<CodeChunk> {
+    account: &ResourceAccount,
+) -> Result<Arc<CodeChunk>, BytecodeLinkError> {
     let executable = Arc::new(ExecutableModule::from_verified_bytecode_with_ic_base(
         &verified,
         property_ic_base,
@@ -284,10 +319,17 @@ fn build_chunk(
         atoms: Arc::new(AtomTable::from_constants(&module.constants)),
         module: Arc::new(module),
     };
-    Arc::new(CodeChunk {
+    // Retained-bytes admission: a rejected budget declines the link before
+    // publication and the rejection is visible on the ledger.
+    let retained_lease = account.reserve_exact(
+        ResourceClass::SourceModuleBytes,
+        chunk_retained_bytes(&tables),
+    )?;
+    Ok(Arc::new(CodeChunk {
         tables,
+        _retained_lease: retained_lease,
         next: OnceLock::new(),
-    })
+    }))
 }
 
 fn publish_chunk(
@@ -316,11 +358,12 @@ impl CodeSpace {
     /// lock covers base selection through publication.
     ///
     /// # Errors
-    /// Returns a typed verification or code-space capacity error. No chunk is
-    /// published on failure.
+    /// Returns a typed verification, code-space capacity, or retained-bytes
+    /// admission error. No chunk is published on failure.
     pub(crate) fn link_module(
         self: &Arc<Self>,
         mut module: BytecodeModule,
+        account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
         let mut tail = self
             .tail
@@ -337,7 +380,13 @@ impl CodeSpace {
         rebase_module(&mut module, function_base)?;
         let verified = VerifiedBytecodeModule::new_at_base(module, function_base)?;
 
-        let chunk = build_chunk(verified, function_base, function_count, property_ic_base);
+        let chunk = build_chunk(
+            verified,
+            function_base,
+            function_count,
+            property_ic_base,
+            account,
+        )?;
         publish_chunk(self, &mut tail, Arc::clone(&chunk))?;
         Ok(ExecutionContext::from_chunk_tables(
             chunk.tables.clone(),
@@ -350,11 +399,12 @@ impl CodeSpace {
     /// base without re-running wordcode or metadata verification.
     ///
     /// # Errors
-    /// Returns a typed capacity, proof-rebase, or publication error. No chunk
-    /// is published on failure.
+    /// Returns a typed capacity, proof-rebase, retained-bytes admission, or
+    /// publication error. No chunk is published on failure.
     pub(crate) fn link_verified_module(
         self: &Arc<Self>,
         verified: VerifiedBytecodeModule,
+        account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
         let mut tail = self
             .tail
@@ -370,7 +420,13 @@ impl CodeSpace {
         ensure_append_slot_empty(self, tail.as_ref())?;
 
         let verified = verified.rebase_to(function_base)?;
-        let chunk = build_chunk(verified, function_base, function_count, property_ic_base);
+        let chunk = build_chunk(
+            verified,
+            function_base,
+            function_count,
+            property_ic_base,
+            account,
+        )?;
         publish_chunk(self, &mut tail, Arc::clone(&chunk))?;
         Ok(ExecutionContext::from_chunk_tables(
             chunk.tables.clone(),
@@ -504,6 +560,10 @@ mod tests {
 
     use super::{BytecodeLinkError, CodeSpace, rebase_module};
 
+    fn unlimited() -> otter_resource::ResourceAccount {
+        otter_resource::ResourceAccount::default()
+    }
+
     fn module_with_functions(count: u32) -> BytecodeModule {
         let functions = (0..count)
             .map(|id| Function {
@@ -541,7 +601,7 @@ mod tests {
     fn first_chunk_links_at_base_zero_unrebased() {
         let space = Arc::new(CodeSpace::default());
         let context = space
-            .link_module(module_with_functions(3))
+            .link_module(module_with_functions(3), &unlimited())
             .expect("valid first chunk links");
         assert_eq!(context.function_base(), 0);
         assert_eq!(context.function_id_constant(0), Some(1));
@@ -554,10 +614,10 @@ mod tests {
     fn second_chunk_rebases_ids_constants_and_inits() {
         let space = Arc::new(CodeSpace::default());
         let _first = space
-            .link_module(module_with_functions(3))
+            .link_module(module_with_functions(3), &unlimited())
             .expect("valid first chunk links");
         let second = space
-            .link_module(module_with_functions(2))
+            .link_module(module_with_functions(2), &unlimited())
             .expect("valid second chunk links");
         assert_eq!(second.function_base(), 3);
         assert_eq!(second.function_id_constant(0), Some(4));
@@ -575,13 +635,13 @@ mod tests {
     fn verified_cache_carrier_rebases_without_aliasing_existing_ids() {
         let space = Arc::new(CodeSpace::default());
         space
-            .link_module(module_with_functions(3))
+            .link_module(module_with_functions(3), &unlimited())
             .expect("first chunk links");
         let verified = VerifiedBytecodeModule::new(module_with_functions(2))
             .expect("cache fixture verifies once");
 
         let second = space
-            .link_verified_module(verified)
+            .link_verified_module(verified, &unlimited())
             .expect("retained proof rebases onto the selected range");
         assert_eq!(second.function_base(), 3);
         assert_eq!(second.function(3).map(|function| function.id), Some(3));
@@ -593,10 +653,10 @@ mod tests {
     fn foreign_ids_resolve_through_any_linked_context() {
         let space = Arc::new(CodeSpace::default());
         let first = space
-            .link_module(module_with_functions(3))
+            .link_module(module_with_functions(3), &unlimited())
             .expect("valid first chunk links");
         let second = space
-            .link_module(module_with_functions(2))
+            .link_module(module_with_functions(2), &unlimited())
             .expect("valid second chunk links");
         let foreign = first.for_function(4).expect("second chunk's id resolves");
         assert_eq!(foreign.function_base(), 3);
@@ -637,9 +697,11 @@ mod tests {
         }];
         module.module_inits.clear();
         let second_module = module.clone();
-        let first = space.link_module(module).expect("valid first chunk links");
+        let first = space
+            .link_module(module, &unlimited())
+            .expect("valid first chunk links");
         let second = space
-            .link_module(second_module)
+            .link_module(second_module, &unlimited())
             .expect("valid second chunk links");
         assert_eq!(first.property_ic_site_end(), 1);
         assert_eq!(second.property_ic_site_end(), 2);
@@ -655,7 +717,7 @@ mod tests {
             let space = Arc::clone(&space);
             joins.push(std::thread::spawn(move || {
                 space
-                    .link_module(module_with_functions(2))
+                    .link_module(module_with_functions(2), &unlimited())
                     .expect("valid concurrent chunk links")
                     .function_base()
             }));
@@ -679,7 +741,7 @@ mod tests {
         malformed.functions[0].id = 7;
 
         assert!(matches!(
-            space.link_module(malformed),
+            space.link_module(malformed, &unlimited()),
             Err(BytecodeLinkError::Verify(BytecodeVerifyError::FunctionId {
                 function_index: 0,
                 expected: 0,
@@ -696,7 +758,7 @@ mod tests {
         );
 
         let context = space
-            .link_module(module_with_functions(2))
+            .link_module(module_with_functions(2), &unlimited())
             .expect("valid module still claims base zero");
         assert_eq!(context.function_base(), 0);
     }
@@ -722,7 +784,7 @@ mod tests {
         .into();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            space.link_module(malformed)
+            space.link_module(malformed, &unlimited())
         }));
         assert!(matches!(
             result,
@@ -739,7 +801,7 @@ mod tests {
         assert!(space.first.get().is_none());
 
         let context = space
-            .link_module(module_with_functions(2))
+            .link_module(module_with_functions(2), &unlimited())
             .expect("valid module still claims base zero");
         assert_eq!(context.function_base(), 0);
     }
@@ -773,7 +835,7 @@ mod tests {
         assert!(space.first.get().is_none());
 
         let context = space
-            .link_module(module_with_functions(2))
+            .link_module(module_with_functions(2), &unlimited())
             .expect("failed cache admission leaves base zero available");
         assert_eq!(context.function_base(), 0);
     }
@@ -802,7 +864,7 @@ mod tests {
         .into();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            space.link_module(malformed)
+            space.link_module(malformed, &unlimited())
         }));
         assert!(matches!(
             result,
@@ -816,6 +878,54 @@ mod tests {
             )))
         ));
         assert!(space.first.get().is_none());
+    }
+
+    #[test]
+    fn linked_chunk_bytes_are_charged_limited_and_released() {
+        use otter_resource::{ResourceAccount, ResourceClass, ResourceLimits};
+
+        let space = Arc::new(CodeSpace::default());
+        let account = unlimited();
+        space
+            .link_module(module_with_functions(2), &account)
+            .expect("valid chunk links against an unlimited account");
+        let per_chunk = account
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current();
+        assert!(per_chunk > 0, "a linked chunk retains a nonzero charge");
+
+        // A budget below one chunk declines the link with a typed error and
+        // leaves the registry untouched; the rejection is on the ledger.
+        let limited = ResourceAccount::new(
+            ResourceLimits::builder()
+                .limit(ResourceClass::SourceModuleBytes, per_chunk / 2)
+                .build(),
+        );
+        let rejecting_space = Arc::new(CodeSpace::default());
+        let error = rejecting_space
+            .link_module(module_with_functions(2), &limited)
+            .expect_err("budget below one chunk rejects the link");
+        assert!(matches!(error, BytecodeLinkError::RetainedBytes(_)));
+        assert!(rejecting_space.first.get().is_none());
+        let entry = *limited.snapshot().get(ResourceClass::SourceModuleBytes);
+        assert_eq!(entry.current(), 0);
+        assert_eq!(entry.rejections(), 1);
+
+        // The failed admission leaves base zero claimable.
+        rejecting_space
+            .link_module(module_with_functions(2), &unlimited())
+            .expect("valid module still claims base zero");
+
+        // Dropping the registry releases every chunk's charge.
+        drop(space);
+        assert_eq!(
+            account
+                .snapshot()
+                .get(ResourceClass::SourceModuleBytes)
+                .current(),
+            0
+        );
     }
 
     #[test]

@@ -98,7 +98,8 @@ impl ExecutionContext {
     /// Returns [`crate::BytecodeLinkError`] before constructing a context when
     /// the module is malformed.
     pub fn from_module(module: BytecodeModule) -> Result<Self, crate::BytecodeLinkError> {
-        Arc::new(CodeSpace::default()).link_module(module)
+        Arc::new(CodeSpace::default())
+            .link_module(module, &otter_resource::ResourceAccount::default())
     }
 
     /// Build a standalone context from decoded/cache bytecode while retaining
@@ -113,7 +114,8 @@ impl ExecutionContext {
     pub fn from_verified_module(
         module: otter_bytecode::VerifiedBytecodeModule,
     ) -> Result<Self, crate::BytecodeLinkError> {
-        Arc::new(CodeSpace::default()).link_verified_module(module)
+        Arc::new(CodeSpace::default())
+            .link_verified_module(module, &otter_resource::ResourceAccount::default())
     }
 
     /// Wrap one linked chunk's tables. Only [`CodeSpace::link_module`] and

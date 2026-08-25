@@ -141,6 +141,16 @@ impl FunctionCode {
         (&self.instructions, &self.overflow_operand_words)
     }
 
+    /// Heap bytes this body retains for its owner's lifetime: the fixed
+    /// instruction records plus the overflow operand words. Saturating, so a
+    /// saturated total still exceeds any real budget and fails admission
+    /// closed.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        (std::mem::size_of_val::<[Instruction]>(&self.instructions) as u64)
+            .saturating_add(std::mem::size_of_val::<[u32]>(&self.overflow_operand_words) as u64)
+    }
+
     /// Number of logical instructions.
     #[must_use]
     pub fn len(&self) -> usize {

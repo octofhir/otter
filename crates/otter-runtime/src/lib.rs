@@ -3745,7 +3745,9 @@ impl Runtime {
         let cached = self
             .interp
             .with_dynamic_import_realm(token, |interp| {
-                Ok(interp.module_env(&target_url).map(otter_vm::Value::object))
+                Ok(interp
+                    .get_or_create_module_namespace(&target_url)
+                    .map(otter_vm::Value::object))
             })
             .map_err(realm::map_realm_vm_error)?
             .flatten();
@@ -3893,8 +3895,10 @@ impl Runtime {
                 "dynamic import: cannot resolve \"{specifier}\": {e:?}"
             ))
         })?;
-        if let Some(env) = self.interp.module_env(&target_url) {
-            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
+        if let Some(namespace) = self.interp.get_or_create_module_namespace(&target_url) {
+            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
+                namespace,
+            )));
         }
         // HTTPS / HTTP targets take a separate fetch path because
         // `module_graph::load_program` only walks file:// URLs.
@@ -3932,10 +3936,12 @@ impl Runtime {
                 )
             })?;
             let loaded = self.evaluate_dynamic_linked_module(&synthetic_url, linked)?;
-            let Some(env) = self.interp.module_env(&target_url) else {
+            let Some(namespace) = self.interp.get_or_create_module_namespace(&target_url) else {
                 return Ok(loaded);
             };
-            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
+            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
+                namespace,
+            )));
         }
         // A `data:` module has no file to walk either: its source is the
         // specifier, so it is linked straight from the decoded text.
@@ -4037,11 +4043,14 @@ impl Runtime {
                 )));
             }
         }
-        let namespace = self.interp.module_env(target_url).ok_or_else(|| {
-            DynLoadError::type_error(format!(
-                "dynamic import: namespace missing after load: \"{target_url}\""
-            ))
-        })?;
+        let namespace = self
+            .interp
+            .get_or_create_module_namespace(target_url)
+            .ok_or_else(|| {
+                DynLoadError::type_error(format!(
+                    "dynamic import: namespace missing after load: \"{target_url}\""
+                ))
+            })?;
         Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
             namespace,
         )))
@@ -7309,11 +7318,13 @@ fn evaluate_dynamic_linked_module_on(
             )));
         }
     }
-    let namespace = interp.module_env(target_url).ok_or_else(|| {
-        DynLoadError::type_error(format!(
-            "dynamic import: namespace missing after load: \"{target_url}\""
-        ))
-    })?;
+    let namespace = interp
+        .get_or_create_module_namespace(target_url)
+        .ok_or_else(|| {
+            DynLoadError::type_error(format!(
+                "dynamic import: namespace missing after load: \"{target_url}\""
+            ))
+        })?;
     Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
         namespace,
     )))

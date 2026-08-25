@@ -2163,7 +2163,41 @@ where
     }
 }
 
+/// §13.3 — `ImportCall` is a `CallExpression`, never a `MemberExpression`,
+/// so a `new` operand may not reach one through a property-access chain
+/// (`new import('').prop`). Parentheses promote the call to a
+/// `PrimaryExpression` and make the chain legal, so the walk stops at
+/// `ParenthesizedExpression`. oxc rejects the bare `new import('')` form
+/// itself; this covers the member-chain forms it accepts.
+fn new_callee_reaches_import_call(mut callee: &Expression<'_>) -> Option<(u32, u32)> {
+    loop {
+        match callee {
+            Expression::ImportExpression(import) => {
+                return Some((import.span.start, import.span.end));
+            }
+            Expression::StaticMemberExpression(member) => callee = &member.object,
+            Expression::ComputedMemberExpression(member) => callee = &member.object,
+            Expression::PrivateFieldExpression(member) => callee = &member.object,
+            _ => return None,
+        }
+    }
+}
+
 impl<'a> Visit<'a> for BlockLexicalValidator {
+    fn visit_new_expression(&mut self, it: &oxc_ast::ast::NewExpression<'a>) {
+        if let Some(range) = new_callee_reaches_import_call(&it.callee) {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "NEW_TARGETS_IMPORT_CALL".to_string(),
+                message: "SyntaxError: `new` cannot target a dynamic import call \
+                          (§13.3 — ImportCall is not a MemberExpression)"
+                    .to_string(),
+                range: Some(range),
+                help: Some("wrap the import() call in parentheses".to_string()),
+            });
+        }
+        walk::walk_new_expression(self, it);
+    }
+
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         // §10.2.11 — a function body's top-level StatementList obeys
         // the duplicate-lexical / lexical-var rules with hoistable

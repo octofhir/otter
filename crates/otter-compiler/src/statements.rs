@@ -776,13 +776,27 @@ pub(crate) fn compile_statement(
                     // pending `for…of` iterator close (which would have to
                     // run *after* the value, defeating the tail position)
                     // lowers through the proper-tail-call path.
-                    if cx.is_strict && close_regs.is_empty() {
+                    if cx.is_strict && close_regs.is_empty() && !cx.is_async_generator {
                         compile_tail_return(cx, arg, span)?;
                     } else {
                         // Evaluate the return value first, then close every
                         // enclosing `for…of` iterator (§7.4.9) innermost-
                         // first before the abrupt return propagates.
-                        let reg = compile_expr(cx, arg, span)?;
+                        let mut reg = compile_expr(cx, arg, span)?;
+                        // §14.10.1 step 3 — `return <expr>` in an async
+                        // generator awaits the value before the return
+                        // completion propagates, so an explicit
+                        // `return undefined` settles one tick after an
+                        // implicit return.
+                        if cx.is_async_generator {
+                            let awaited = cx.alloc_scratch();
+                            cx.emit(
+                                Op::Await,
+                                [Operand::Register(awaited), Operand::Register(reg)],
+                                span,
+                            );
+                            reg = awaited;
+                        }
                         for creg in close_regs {
                             cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
                         }

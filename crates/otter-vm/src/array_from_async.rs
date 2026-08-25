@@ -151,7 +151,7 @@ impl Interpreter {
                             "iterator method did not answer with an object",
                         ));
                     }
-                    Some(self.create_async_from_sync_iterator(sync)?)
+                    Some(self.create_async_from_sync_iterator(stack, context, sync)?)
                 }
                 None => None,
             }

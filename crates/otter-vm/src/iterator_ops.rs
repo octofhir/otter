@@ -261,7 +261,7 @@ impl Interpreter {
         // result record. Without it `for await` over an array of promises
         // hands the body the promises themselves.
         let iterator = self.get_sync_iterator_object(stack, context, value)?;
-        let wrapped = self.create_async_from_sync_iterator(iterator)?;
+        let wrapped = self.create_async_from_sync_iterator(stack, context, iterator)?;
         write_register(&mut stack[top_idx], dst, wrapped)?;
         stack[top_idx].advance_pc()?;
         Ok(())

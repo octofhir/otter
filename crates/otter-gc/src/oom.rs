@@ -60,6 +60,20 @@ pub enum OutOfMemory {
         /// Maximum bytes supported by one GC page.
         max_bytes: u64,
     },
+    /// The shared runtime ledger refused the external-bytes reservation
+    /// before any heap state changed.
+    #[error(
+        "out of memory: external-bytes budget exceeded ({requested_bytes} requested, {in_use} in use, limit {limit})"
+    )]
+    ExternalBudgetExceeded {
+        /// Bytes requested by the rejected reservation.
+        requested_bytes: u64,
+        /// External bytes already charged on the shared ledger.
+        in_use: u64,
+        /// Configured `ExternalBytes` limit (`u64::MAX` when the refusal
+        /// was a counter overflow on an unlimited class).
+        limit: u64,
+    },
 }
 
 impl OutOfMemory {
@@ -74,6 +88,9 @@ impl OutOfMemory {
             }
             | Self::AllocationTooLarge {
                 requested_bytes, ..
+            }
+            | Self::ExternalBudgetExceeded {
+                requested_bytes, ..
             } => *requested_bytes,
         }
     }
@@ -83,7 +100,9 @@ impl OutOfMemory {
     #[must_use]
     pub fn heap_limit_bytes(&self) -> u64 {
         match self {
-            Self::CageExhausted | Self::AllocationTooLarge { .. } => 0,
+            Self::CageExhausted
+            | Self::AllocationTooLarge { .. }
+            | Self::ExternalBudgetExceeded { .. } => 0,
             Self::HeapCapExceeded {
                 heap_limit_bytes, ..
             } => *heap_limit_bytes,

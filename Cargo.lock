@@ -2667,6 +2667,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "libc",
+ "otter-resource",
  "serde_json",
  "smallvec",
  "static_assertions",

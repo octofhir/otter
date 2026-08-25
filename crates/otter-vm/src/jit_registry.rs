@@ -1020,7 +1020,9 @@ mod tests {
                 )
                 .build(),
         );
-        interp.set_resource_account(account.clone());
+        interp
+            .set_resource_account(account.clone())
+            .expect("an idle interpreter installs against any budget");
 
         assert!(interp.jit_code_registry.register(61, code));
         let entry = *account

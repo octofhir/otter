@@ -210,8 +210,18 @@ Still open, in R1 terms:
 - Web/Node stream buffers and remaining host-owned backing stores. Host-class
   byte payloads (Blob/File backing stores) now charge heap external memory at
   construction and release on collection; the native fetch boundary already
-  streams per-chunk with pull backpressure;
-- folding heap external charges into the runtime ledger's `ExternalBytes`.
+  streams per-chunk with pull backpressure.
+
+Also landed: heap external charges are folded into the runtime ledger.
+`GcHeap` mirrors its outstanding external/off-slot reservation bytes into an
+aggregate resizable `ExternalBytes` lease on the runtime account; growth is
+admitted on the ledger before any heap booking (typed
+`OutOfMemory::ExternalBudgetExceeded` on refusal), shrinks follow every
+release path, and installation charges already-outstanding bytes atomically.
+`ExternalMemory` tokens no longer hold a raw heap pointer — releases flow
+through the shared deferred-release channel, so payload-embedded tokens stay
+sound across isolate moves and heap teardown (the old raw-pointer release
+wrote through stale heap copies after a move).
 
 Use streaming or bounded reads where whole-body collection is not semantically
 required. Eviction must be deterministic and must not invalidate live code or

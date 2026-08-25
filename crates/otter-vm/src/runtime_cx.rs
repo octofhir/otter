@@ -583,10 +583,14 @@ impl<'rt> NativeCtx<'rt> {
         let adjusted = (i128::from(current) + i128::from(change_in_bytes))
             .clamp(0, i128::from(i64::MAX)) as u64;
 
-        if let Some(reservation) = self.cx.interp.external_memory_adjustment.as_mut() {
-            reservation.resize(adjusted)?;
-            if adjusted == 0 {
-                self.cx.interp.external_memory_adjustment = None;
+        if let Some(mut reservation) = self.cx.interp.external_memory_adjustment.take() {
+            if let Err(error) = reservation.resize(self.heap_mut(), adjusted) {
+                // A failed grow leaves the token unchanged; keep it installed.
+                self.cx.interp.external_memory_adjustment = Some(reservation);
+                return Err(error);
+            }
+            if adjusted != 0 {
+                self.cx.interp.external_memory_adjustment = Some(reservation);
             }
         } else if adjusted != 0 {
             let reservation = self.reserve_external(adjusted)?;

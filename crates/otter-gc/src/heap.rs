@@ -228,6 +228,11 @@ pub struct GcHeap {
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
     shared_external: Arc<SharedExternalState>,
+    /// Optional shared-ledger mirror of [`Self::reserved_bytes`] as
+    /// `ExternalBytes`. Growth is admitted on the ledger before any heap
+    /// state changes; shrinks follow every release path, including drained
+    /// shared-token releases. `None` until the runtime installs its account.
+    external_ledger: Option<otter_resource::ResourceLease>,
     /// Old-space byte high-water mark that triggers a major
     /// (full) GC when no hard cap is configured. After every major
     /// GC it is recomputed as `live × MAJOR_GC_GROWTH_NUM /
@@ -398,6 +403,7 @@ impl GcHeap {
             ephemerons: EphemeronRegistry::default(),
             weak_finalization: WeakFinalizationRegistry::default(),
             shared_external: Arc::new(SharedExternalState::default()),
+            external_ledger: None,
             stats: HeapStats::default(),
             gc_stats: GcStats::default(),
             max_heap_bytes: cap,
@@ -456,6 +462,11 @@ impl GcHeap {
         self.effective_tracked_bytes()
     }
 
+    /// Shared release channel handed to external reservation tokens.
+    pub(crate) fn shared_external_state(&self) -> Arc<SharedExternalState> {
+        Arc::clone(&self.shared_external)
+    }
+
     fn pending_shared_external_releases(&self) -> u64 {
         self.shared_external
             .released_bytes()
@@ -485,6 +496,83 @@ impl GcHeap {
         if self.max_heap_bytes != 0 {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(actual);
         }
+        self.shrink_external_ledger(actual);
+    }
+
+    /// Reconcile deferred external-token releases now.
+    ///
+    /// Token drops record their byte counts in the shared release channel;
+    /// every accounting operation drains it implicitly. This explicit hook
+    /// gives hosts and tests a deterministic reconciliation point without
+    /// booking anything.
+    pub fn drain_external_releases(&mut self) {
+        self.drain_shared_external_releases();
+    }
+
+    /// Install (or replace) the shared runtime ledger mirroring this heap's
+    /// outstanding external/off-slot reservation bytes as `ExternalBytes`.
+    /// The currently outstanding bytes are charged immediately; replacing the
+    /// account releases the previous account's charge in full.
+    ///
+    /// # Errors
+    /// Returns the ledger refusal without changing either ledger.
+    pub fn set_external_bytes_account(
+        &mut self,
+        account: &otter_resource::ResourceAccount,
+    ) -> Result<(), otter_resource::ResourceError> {
+        self.drain_shared_external_releases();
+        let lease = account.reserve_exact(
+            otter_resource::ResourceClass::ExternalBytes,
+            self.reserved_bytes,
+        )?;
+        self.external_ledger = Some(lease);
+        Ok(())
+    }
+
+    /// Admit `bytes` more outstanding external bytes on the installed shared
+    /// ledger. Runs before any heap-side booking, so a refusal is typed and
+    /// changes nothing. The heap-local OOM flag stays clear: an aggregate
+    /// budget refusal is not this isolate's heap exhaustion.
+    fn admit_external_growth(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        let Some(lease) = self.external_ledger.as_mut() else {
+            return Ok(());
+        };
+        let charged = lease.amount();
+        let target = charged.saturating_add(bytes);
+        match lease.resize(target) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // The lease-replacement error reports usage *independent of*
+                // this lease; add the lease's own charge back so the refusal
+                // names the full outstanding total.
+                let (in_use, limit) = match error {
+                    otter_resource::ResourceError::Exhausted { in_use, limit, .. } => {
+                        (in_use.saturating_add(charged), limit)
+                    }
+                    otter_resource::ResourceError::Overflow { in_use, limit, .. } => {
+                        (in_use.saturating_add(charged), limit.unwrap_or(u64::MAX))
+                    }
+                };
+                Err(OutOfMemory::ExternalBudgetExceeded {
+                    requested_bytes: bytes,
+                    in_use,
+                    limit,
+                })
+            }
+        }
+    }
+
+    /// Shrink the installed ledger mirror by exactly `bytes`, following a
+    /// heap-side release or a rolled-back admission.
+    fn shrink_external_ledger(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(lease) = self.external_ledger.as_mut() {
+            let target = lease.amount().saturating_sub(bytes);
+            let shrunk = lease.resize(target);
+            debug_assert!(shrunk.is_ok(), "shrinking an external lease cannot fail");
+        }
     }
 
     /// Cooperative-cancellation OOM flag. Cloned cheaply; safe to
@@ -509,18 +597,23 @@ impl GcHeap {
     /// emergency full GC.
     pub fn reserve_bytes(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
         self.drain_shared_external_releases();
+        self.admit_external_growth(bytes)?;
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
         }
         if bytes > self.max_heap_bytes {
+            self.shrink_external_ledger(bytes);
             self.oom_flag.store(true, Ordering::Relaxed);
             return Err(OutOfMemory::HeapCapExceeded {
                 requested_bytes: bytes,
                 heap_limit_bytes: self.max_heap_bytes,
             });
         }
-        self.account_or_collect(bytes)?;
+        if let Err(error) = self.account_or_collect(bytes) {
+            self.shrink_external_ledger(bytes);
+            return Err(error);
+        }
         self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
         Ok(())
     }
@@ -544,18 +637,23 @@ impl GcHeap {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
         self.drain_shared_external_releases();
+        self.admit_external_growth(bytes)?;
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
         }
         if bytes > self.max_heap_bytes {
+            self.shrink_external_ledger(bytes);
             self.oom_flag.store(true, Ordering::Relaxed);
             return Err(OutOfMemory::HeapCapExceeded {
                 requested_bytes: bytes,
                 heap_limit_bytes: self.max_heap_bytes,
             });
         }
-        self.account_or_collect_with_roots(bytes, external_visit)?;
+        if let Err(error) = self.account_or_collect_with_roots(bytes, external_visit) {
+            self.shrink_external_ledger(bytes);
+            return Err(error);
+        }
         self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
         Ok(())
     }
@@ -616,12 +714,14 @@ impl GcHeap {
     /// the configured cap.
     pub fn reserve_bytes_no_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
         self.drain_shared_external_releases();
+        self.admit_external_growth(bytes)?;
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
         }
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected > self.max_heap_bytes {
+            self.shrink_external_ledger(bytes);
             self.oom_flag.store(true, Ordering::Relaxed);
             return Err(OutOfMemory::HeapCapExceeded {
                 requested_bytes: bytes,
@@ -644,6 +744,7 @@ impl GcHeap {
         if self.max_heap_bytes != 0 {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(actual);
         }
+        self.shrink_external_ledger(actual);
     }
 
     /// Account `bytes` against the cap. Outlined so the alloc

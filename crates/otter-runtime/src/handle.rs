@@ -126,6 +126,11 @@ pub struct RuntimeActivityStats {
     pub microtask_generation: u64,
     /// `true` after the handle has begun shutdown.
     pub shutdown: bool,
+    /// Shared-ledger byte and resource counters captured with the activity
+    /// counters: heap external, source/module, generated-code, and queued
+    /// byte classes plus worker/task/timer populations, each with current,
+    /// peak, rejection, and limit values.
+    pub resources: otter_resource::ResourceSnapshot,
 }
 
 /// Cloneable, sendable runtime command API.
@@ -2192,6 +2197,7 @@ impl RuntimeHandle {
                 .microtask_generation
                 .load(Ordering::Relaxed),
             shutdown: self.inner.counters.shutdown.load(Ordering::Relaxed),
+            resources: self.inner.resources.snapshot(),
         }
     }
 

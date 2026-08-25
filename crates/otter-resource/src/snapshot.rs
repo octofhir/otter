@@ -80,6 +80,17 @@ pub struct ResourceSnapshot {
     entries: [ResourceSnapshotEntry; RESOURCE_CLASS_COUNT],
 }
 
+impl Default for ResourceSnapshot {
+    /// An empty snapshot: every class at zero usage with no limit. The shape
+    /// diagnostics carriers embed before their first real capture.
+    fn default() -> Self {
+        Self {
+            entries: ResourceClass::ALL
+                .map(|class| ResourceSnapshotEntry::new(class, 0, 0, 0, None)),
+        }
+    }
+}
+
 impl ResourceSnapshot {
     pub(crate) const fn new(entries: [ResourceSnapshotEntry; RESOURCE_CLASS_COUNT]) -> Self {
         Self { entries }

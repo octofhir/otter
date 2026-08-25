@@ -207,10 +207,14 @@ Still open, in R1 terms:
   range, then splice the chunk under the single-writer link lock, leaving a
   slim tombstone node so lock-free readers never observe a freed link.
   Resolution of an evicted id must stay a typed miss, never a stale hit;
-- Web/Node stream buffers and remaining host-owned backing stores. Host-class
-  byte payloads (Blob/File backing stores) now charge heap external memory at
-  construction and release on collection; the native fetch boundary already
-  streams per-chunk with pull backpressure.
+- Remaining host-owned backing stores outside the ArrayBuffer/Blob paths.
+  JS-side body buffering (`response.text()`/`arrayBuffer()` chunk collection,
+  stream queues) accumulates `Uint8Array` chunks whose ArrayBuffer backing
+  stores charge heap external memory and therefore the `ExternalBytes`
+  ledger; host-class byte payloads (Blob/File) charge at construction and
+  release on collection; the native fetch boundary holds one bounded chunk
+  with pull backpressure. Residual audit target: any Rust-side retained
+  `Vec<u8>`/`BytesMut` accumulation not represented by a charged token.
 
 Also landed: heap external charges are folded into the runtime ledger.
 `GcHeap` mirrors its outstanding external/off-slot reservation bytes into an

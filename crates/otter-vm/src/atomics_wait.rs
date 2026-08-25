@@ -695,8 +695,8 @@ mod tests {
         let agent_b = WaitAgent::new();
         let handle_a = agent_a.handle();
         let handle_b = agent_b.handle();
-        assert!(register_async_waiter(101, 5, &handle_a));
-        assert!(register_async_waiter(101, 5, &handle_b));
+        assert!(register_async_waiter(101, 5, &handle_a, None).is_some());
+        assert!(register_async_waiter(101, 5, &handle_b, None).is_some());
 
         assert_eq!(handle_a.cancel(), 0);
         assert_eq!(notify_async_waiters(101, 5, usize::MAX), 1);

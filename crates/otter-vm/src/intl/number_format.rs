@@ -371,7 +371,12 @@ pub fn resolve_ctx(
         get_option_value(ctx, options, "useGrouping", CLASS)?
     };
     let use_grouping = if use_grouping_val.is_undefined() {
-        "auto".to_string()
+        // Compact notation defaults to "min2" (§15.1.2 step 22).
+        if notation == "compact" {
+            "min2".to_string()
+        } else {
+            "auto".to_string()
+        }
     } else if use_grouping_val.as_boolean() == Some(true) {
         "always".to_string()
     } else if !use_grouping_val.to_boolean(ctx.heap()) {
@@ -809,10 +814,13 @@ pub(crate) fn partition_number(
     if payload.style == "currency" && n.is_finite() {
         // `accounting` wraps negatives in parenthesis literals instead of
         // a minus-sign part.
-        let accounting_negative = sign == SignKind::Minus && payload.currency_sign == "accounting";
+        let accounting_negative = sign == SignKind::Minus
+            && payload.currency_sign == "accounting"
+            && accounting_uses_parentheses(&payload.locale);
         let full = currency_string(n.abs(), payload);
         let core = format_decimal_signed(n.abs(), is_neg, payload);
         if let Some(idx) = full.find(&core) {
+            let (dec_sep, group_sep) = locale_separators(&payload.locale);
             if accounting_negative {
                 parts.push(("literal", "(".to_string()));
             } else {
@@ -820,12 +828,12 @@ pub(crate) fn partition_number(
             }
             let prefix = &full[..idx];
             if !prefix.is_empty() {
-                parts.push(("currency", prefix.to_string()));
+                push_currency_affix(&mut parts, prefix, false);
             }
-            push_number_parts(&mut parts, &core);
+            push_number_parts_sep(&mut parts, &core, dec_sep, group_sep);
             let suffix = &full[idx + core.len()..];
             if !suffix.is_empty() {
-                parts.push(("currency", suffix.to_string()));
+                push_currency_affix(&mut parts, suffix, true);
             }
             if accounting_negative {
                 parts.push(("literal", ")".to_string()));
@@ -845,9 +853,11 @@ pub(crate) fn partition_number(
         let full = unit_string(n.abs(), payload);
         let core = format_decimal_signed(n.abs(), is_neg, payload);
         if let Some(idx) = full.find(&core) {
-            push_sign(&mut parts, sign);
+            let (dec_sep, group_sep) = locale_separators(&payload.locale);
+            // The sign sits with the number inside the unit pattern.
             push_unit_affix(&mut parts, &full[..idx], false);
-            push_number_parts(&mut parts, &core);
+            push_sign(&mut parts, sign);
+            push_number_parts_sep(&mut parts, &core, dec_sep, group_sep);
             push_unit_affix(&mut parts, &full[idx + core.len()..], true);
             return parts;
         }
@@ -902,6 +912,37 @@ pub(crate) fn partition_number(
 
 /// Split a formatted unsigned decimal core (`"1,234.50"`) into
 /// `integer` / `group` / `decimal` / `fraction` parts.
+/// Emit a currency pattern affix: whitespace adjacent to the number is a
+/// `literal` part, the remaining text the `currency` part.
+fn push_currency_affix(parts: &mut Vec<(&'static str, String)>, affix: &str, trailing: bool) {
+    if affix.is_empty() {
+        return;
+    }
+    if trailing {
+        let sym_start = affix
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(affix.len());
+        if sym_start > 0 {
+            parts.push(("literal", affix[..sym_start].to_string()));
+        }
+        if sym_start < affix.len() {
+            parts.push(("currency", affix[sym_start..].to_string()));
+        }
+    } else {
+        let sym_end = affix
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        if sym_end > 0 {
+            parts.push(("currency", affix[..sym_end].to_string()));
+        }
+        if sym_end < affix.len() {
+            parts.push(("literal", affix[sym_end..].to_string()));
+        }
+    }
+}
+
 /// Emit a unit pattern affix (the text before or after the number in
 /// `"1 m"` / `"1m"`). Whitespace adjacent to the number is a `literal`
 /// part; the remaining text is the `unit` part. `trailing` selects which
@@ -1079,7 +1120,7 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     // `accounting` sign can wrap negatives in the locale affixes.
     if payload.style == "currency" && n.is_finite() {
         let body = currency_string(n.abs(), payload);
-        return apply_currency_sign(&body, sign_kind, &payload.currency_sign);
+        return apply_currency_sign(&body, sign_kind, &payload.currency_sign, &payload.locale);
     }
 
     let sign = sign_prefix(sign_kind);
@@ -1106,7 +1147,22 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
     } else {
         match payload.style.as_str() {
             "currency" => currency_string(n.abs(), payload),
-            "unit" => unit_string(n.abs(), payload),
+            "unit" => {
+                // The sign attaches to the NUMBER inside the unit
+                // pattern ("時速 -987 キロメートル"), not to the whole
+                // rendering.
+                let full = unit_string(n.abs(), payload);
+                let core = format_decimal_signed(n.abs(), is_neg, payload);
+                let sign_text = sign_prefix(sign_kind);
+                if !sign_text.is_empty()
+                    && let Some(idx) = full.find(&core)
+                {
+                    let mut out = full.clone();
+                    out.insert_str(idx, sign_text);
+                    return out;
+                }
+                full
+            }
             "percent" => {
                 format!(
                     "{}%",
@@ -1123,10 +1179,10 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
 /// `accounting` currency sign a negative is wrapped in parentheses (the
 /// CLDR accounting affix for en + CJK locales) rather than prefixed with
 /// a minus.
-fn apply_currency_sign(body: &str, kind: SignKind, currency_sign: &str) -> String {
+fn apply_currency_sign(body: &str, kind: SignKind, currency_sign: &str, locale: &str) -> String {
     match kind {
         SignKind::Minus => {
-            if currency_sign == "accounting" {
+            if currency_sign == "accounting" && accounting_uses_parentheses(locale) {
                 format!("({body})")
             } else {
                 format!("-{body}")
@@ -1135,6 +1191,16 @@ fn apply_currency_sign(body: &str, kind: SignKind, currency_sign: &str) -> Strin
         SignKind::Plus => format!("+{body}"),
         SignKind::None => body.to_string(),
     }
+}
+
+/// Whether the locale's CLDR accounting currency pattern wraps negatives
+/// in parentheses (en + CJK families) rather than using a minus sign
+/// (most European locales).
+fn accounting_uses_parentheses(locale: &str) -> bool {
+    matches!(
+        locale.split('-').next().unwrap_or(locale),
+        "en" | "ja" | "ko" | "zh" | "th" | "hi" | "he" | "id" | "ms" | "fil" | "vi"
+    )
 }
 
 /// Decompose `abs` into a `(mantissa, exponent)` pair for scientific

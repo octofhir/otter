@@ -419,6 +419,15 @@ pub fn option_to_string(
         if let Some(b) = prim.as_boolean() {
             return Ok((if b { "true" } else { "false" }).to_string());
         }
+        // §7.1.17 ToString over the remaining primitives: a `toString`
+        // returning undefined/null still yields their string spellings
+        // (a symbol result is the only genuine TypeError).
+        if prim.is_undefined() {
+            return Ok("undefined".to_string());
+        }
+        if prim.is_null() {
+            return Ok("null".to_string());
+        }
     }
     Err(NativeError::TypeError {
         name: class,

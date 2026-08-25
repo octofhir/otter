@@ -2130,24 +2130,54 @@ pub fn call(
         // are left to follow-ups.
         // <https://tc39.es/ecma262/#sec-object.assign>
         M::Assign => {
-            let mut target = expect_object(args.first())?;
-            for src in args.iter().skip(1) {
-                if src.is_undefined() || src.is_null() {
-                    // Per spec, null/undefined sources are skipped.
-                    continue;
+            let target_value = Value::object(expect_object(args.first())?);
+            interp.with_handle_scope(|interp, scope| {
+                // Park the target and every object source before the first
+                // write: `set` below can allocate (shape transition, storage
+                // growth) and move any raw carrier.
+                let target = interp.scoped_value(scope, target_value);
+                let mut sources = Vec::new();
+                for src in args.iter().skip(1) {
+                    if src.is_undefined() || src.is_null() {
+                        // Per spec, null/undefined sources are skipped.
+                        continue;
+                    }
+                    if src.as_object().is_none() {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    sources.push(interp.scoped_value(scope, *src));
                 }
-                let o = src.as_object().ok_or(VmError::TypeMismatch)?;
-                let entries: Vec<(String, Value)> =
-                    crate::object::with_properties(o, gc_heap, |p| {
-                        p.enumerable_data_iter()
-                            .map(|(k, v)| (k.to_string(), v))
-                            .collect()
-                    });
-                for (k, v) in entries {
-                    crate::object::set(&mut target, gc_heap, &k, v);
+                for src in sources {
+                    let source = interp
+                        .escape_scoped(src)
+                        .as_object()
+                        .ok_or(VmError::TypeMismatch)?;
+                    let raw_entries: Vec<(String, Value)> =
+                        crate::object::with_properties(source, interp.gc_heap_for_cx_mut(), |p| {
+                            p.enumerable_data_iter()
+                                .map(|(k, v)| (k.to_string(), v))
+                                .collect()
+                        });
+                    let entries: Vec<(String, crate::handles::Local<'_>)> = raw_entries
+                        .into_iter()
+                        .map(|(k, v)| (k, interp.scoped_value(scope, v)))
+                        .collect();
+                    for (k, v) in entries {
+                        let mut target_object = interp
+                            .escape_scoped(target)
+                            .as_object()
+                            .ok_or(VmError::TypeMismatch)?;
+                        let value = interp.escape_scoped(v);
+                        crate::object::set(
+                            &mut target_object,
+                            interp.gc_heap_for_cx_mut(),
+                            &k,
+                            value,
+                        );
+                    }
                 }
-            }
-            Ok(Value::object(target))
+                Ok(interp.escape_scoped(target))
+            })
         }
         // §20.1.2.7 Object.fromEntries(iterable). Foundation accepts
         // an array of `[k, v]` pairs (the most common shape) and a
@@ -2155,24 +2185,70 @@ pub fn call(
         // iterator protocol once it lands here too — filed.
         // <https://tc39.es/ecma262/#sec-object.fromentries>
         M::FromEntries => {
-            let iter = args.first().cloned().unwrap_or(Value::undefined());
-            let iter_root = iter;
-            let result = rooted_object(gc_heap, &[&iter_root], &[args])?;
-            if let Some(arr) = iter.as_array() {
-                let snapshot: Vec<Value> =
-                    crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
-                for entry in snapshot {
-                    let (key, value) = read_entry_pair_heap(&entry, gc_heap)?;
-                    set_from_entries_key_heap(result, &key, value, gc_heap)?;
-                }
-            } else if let Some(m) = iter.as_map() {
-                for (key, value) in crate::collections::map_entries(m, gc_heap) {
-                    set_from_entries_key_heap(result, &key, value, gc_heap)?;
-                }
-            } else {
+            let iter_value = args.first().cloned().unwrap_or(Value::undefined());
+            if !iter_value.is_object_type() {
                 return Err(VmError::TypeMismatch);
             }
-            Ok(Value::object(result))
+            interp.with_handle_scope(|interp, scope| {
+                // Park the iterable, the result, and every snapshotted entry
+                // before the write loop: key coercion and `set` both allocate
+                // and can move raw carriers between iterations.
+                let iter = interp.scoped_value(scope, iter_value);
+                let result = interp.scoped_object(scope)?;
+                let entries: Vec<crate::handles::Local<'_>> = {
+                    let iter_now = interp.escape_scoped(iter);
+                    if let Some(arr) = iter_now.as_array() {
+                        let snapshot: Vec<Value> = crate::array::with_elements(
+                            arr,
+                            interp.gc_heap_for_cx_mut(),
+                            |elements| elements.to_vec(),
+                        );
+                        snapshot
+                            .into_iter()
+                            .map(|entry| interp.scoped_value(scope, entry))
+                            .collect()
+                    } else if let Some(map) = iter_now.as_map() {
+                        let mut parked = Vec::new();
+                        for (key, value) in
+                            crate::collections::map_entries(map, interp.gc_heap_for_cx_mut())
+                        {
+                            parked.push(interp.scoped_value(scope, key));
+                            parked.push(interp.scoped_value(scope, value));
+                        }
+                        for pair in parked.chunks(2) {
+                            let result_object = interp
+                                .escape_scoped(result)
+                                .as_object()
+                                .ok_or(VmError::TypeMismatch)?;
+                            set_from_entries_key_heap(
+                                result_object,
+                                &interp.escape_scoped(pair[0]),
+                                interp.escape_scoped(pair[1]),
+                                interp.gc_heap_for_cx_mut(),
+                            )?;
+                        }
+                        return Ok(interp.escape_scoped(result));
+                    } else {
+                        return Err(VmError::TypeMismatch);
+                    }
+                };
+                for entry in entries {
+                    let entry_value = interp.escape_scoped(entry);
+                    let (key, value) =
+                        read_entry_pair_heap(&entry_value, interp.gc_heap_for_cx_mut())?;
+                    let result_object = interp
+                        .escape_scoped(result)
+                        .as_object()
+                        .ok_or(VmError::TypeMismatch)?;
+                    set_from_entries_key_heap(
+                        result_object,
+                        &key,
+                        value,
+                        interp.gc_heap_for_cx_mut(),
+                    )?;
+                }
+                Ok(interp.escape_scoped(result))
+            })
         }
         // §20.1.2.13 Object.hasOwn(O, P) — Stage 4 ergonomic
         // alternative to `Object.prototype.hasOwnProperty.call`.

@@ -174,7 +174,68 @@ fn intl_construct(
         ctx.interp_mut()
             .set_non_gc_exotic_prototype_override(&value, Some(proto));
     }
+    // §Legacy Intl-constructed objects — a call form (`Intl.<Kind>.call(x)`)
+    // whose receiver inherits from %<Kind>.prototype% chains the fresh
+    // formatter onto the receiver under %FallbackSymbol% and returns the
+    // receiver; prototype methods unwrap through the same symbol.
+    if !ctx.is_construct_call()
+        && matches!(kind, IntlKind::DateTimeFormat | IntlKind::NumberFormat)
+        && let this = *ctx.this_value()
+        && let Some(receiver) = this.as_object()
+        && receiver_inherits_class_prototype(ctx, class, receiver)
+    {
+        let symbol =
+            ctx.interp_mut()
+                .intl_fallback_symbol()
+                .map_err(|_| NativeError::TypeError {
+                    name: class,
+                    reason: "out of memory".to_string(),
+                })?;
+        let descriptor = crate::object::PropertyDescriptor::data(value, false, false, false);
+        crate::object::define_own_symbol_property(receiver, ctx.heap_mut(), symbol, descriptor);
+        return Ok(this);
+    }
     Ok(value)
+}
+
+/// Does `receiver`'s prototype chain contain `%Intl.<class>.prototype%`?
+/// (OrdinaryHasInstance against the current realm's constructor.)
+fn receiver_inherits_class_prototype(
+    ctx: &mut NativeCtx<'_>,
+    class: &'static str,
+    receiver: crate::object::JsObject,
+) -> bool {
+    let global = *ctx.interp_mut().global_this();
+    let ctor = crate::object::get(global, ctx.heap(), "Intl")
+        .and_then(|intl| intl.as_object())
+        .and_then(|intl| crate::object::get(intl, ctx.heap(), class))
+        .and_then(|ctor| ctor.as_native_function());
+    let Some(ctor) = ctor else {
+        return false;
+    };
+    let Ok(Some(descriptor)) = ctor.own_property_descriptor(ctx.heap_mut(), "prototype") else {
+        return false;
+    };
+    let class_prototype = match &descriptor.kind {
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
+        crate::object::DescriptorKind::Accessor { .. } => None,
+    };
+    let Some(class_prototype) = class_prototype else {
+        return false;
+    };
+    let mut current = crate::object::prototype(receiver, ctx.heap());
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if proto == class_prototype {
+            return true;
+        }
+        hops += 1;
+        if hops > 128 {
+            return false;
+        }
+        current = crate::object::prototype(proto, ctx.heap());
+    }
+    false
 }
 
 fn collator_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

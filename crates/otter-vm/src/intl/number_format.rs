@@ -460,7 +460,8 @@ fn require_number_format(
         name,
         reason: "intrinsic called on a non-Intl.NumberFormat receiver".to_string(),
     };
-    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    let intl =
+        crate::intl::helpers::unwrap_legacy_receiver(ctx, *ctx.this_value()).ok_or_else(bad)?;
     match intl.payload_clone(ctx.heap()) {
         IntlPayload::NumberFormat(n) => Ok(n),
         _ => Err(bad()),

@@ -1426,6 +1426,11 @@ pub struct Interpreter {
     /// (§13.15.2 reference resolution order). Starts at 1 so sequence 0
     /// reads as "created before any snapshot".
     eval_binding_seq: u64,
+    /// Lazily-created `%FallbackSymbol%` for the legacy Intl-constructed
+    /// compatibility path (`Intl.DateTimeFormat.call(obj)` /
+    /// `Intl.NumberFormat.call(obj)` on an instance-shaped receiver).
+    /// Traced as a GC root once created.
+    intl_fallback_symbol: Option<crate::symbol::JsSymbol>,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].
@@ -1706,6 +1711,26 @@ impl Interpreter {
         let replaced = self.string_constant_cells.insert(key, Box::new(value));
         debug_assert!(replaced.is_none(), "string constants canonicalize once");
         Ok(value)
+    }
+
+    /// The legacy `%FallbackSymbol%` (description
+    /// "IntlLegacyConstructedSymbol"), created on first use.
+    pub(crate) fn intl_fallback_symbol(
+        &mut self,
+    ) -> Result<crate::symbol::JsSymbol, otter_gc::OutOfMemory> {
+        if let Some(symbol) = self.intl_fallback_symbol {
+            return Ok(symbol);
+        }
+        let description =
+            crate::JsString::from_str("IntlLegacyConstructedSymbol", &mut self.gc_heap)?;
+        let symbol = crate::symbol::JsSymbol::new(&mut self.gc_heap, Some(description))?;
+        self.intl_fallback_symbol = Some(symbol);
+        Ok(symbol)
+    }
+
+    /// Trace accessor for the lazily-created legacy Intl fallback symbol.
+    pub(crate) fn intl_fallback_symbol_for_trace(&self) -> Option<&crate::symbol::JsSymbol> {
+        self.intl_fallback_symbol.as_ref()
     }
 
     /// Push `value` into JSON's strict-stack range in the shared handle arena,

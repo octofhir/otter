@@ -33,10 +33,28 @@ impl Interpreter {
         uv_idx: usize,
         eval_depth: u32,
     ) -> Result<(), VmError> {
+        self.run_load_shadowed_upvalue_snap_reg(
+            context, frame, dst, name_idx, uv_idx, eval_depth, None,
+        )
+    }
+
+    /// [`Self::run_load_shadowed_upvalue_reg`] with an optional pre-RHS
+    /// binding-sequence snapshot bounding which eval bindings are visible.
+    pub(crate) fn run_load_shadowed_upvalue_snap_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        name_idx: u32,
+        uv_idx: usize,
+        eval_depth: u32,
+        snapshot: Option<u64>,
+    ) -> Result<(), VmError> {
         let mut frame = ActiveFrameMut::materialized(frame);
         let index = u32::try_from(uv_idx).map_err(|_| VmError::InvalidOperand)?;
-        let value =
-            self.load_shadowed_upvalue_value(context, &mut frame, name_idx, index, eval_depth)?;
+        let value = self.load_shadowed_upvalue_value(
+            context, &mut frame, name_idx, index, eval_depth, snapshot,
+        )?;
         frame.write(dst, value)?;
         frame.advance_pc()?;
         Ok(())
@@ -51,12 +69,19 @@ impl Interpreter {
         name_idx: u32,
         index: u32,
         eval_depth: u32,
+        snapshot: Option<u64>,
     ) -> Result<Value, VmError> {
         let dynamic_cell = context
             .string_constant_str_for_function(frame.function_id(), name_idx)
             .and_then(|name| {
                 let env = frame.eval_env()?;
-                crate::eval_env::eval_env_lookup_chain_bounded(&self.gc_heap, env, name, eval_depth)
+                crate::eval_env::eval_env_lookup_chain_bounded_snap(
+                    &self.gc_heap,
+                    env,
+                    name,
+                    eval_depth,
+                    snapshot,
+                )
             });
         if let Some(cell) = dynamic_cell {
             return Ok(crate::read_upvalue(&self.gc_heap, cell));
@@ -88,6 +113,7 @@ impl Interpreter {
         name_idx: u32,
         uv_idx: usize,
         policy_imm: i32,
+        snapshot: Option<u64>,
     ) -> Result<(), VmError> {
         let policy =
             otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(policy_imm)
@@ -103,12 +129,14 @@ impl Interpreter {
             policy.eval_depth,
             policy.fallback,
             value,
+            snapshot,
         )?;
         frame.advance_pc()?;
         Ok(())
     }
 
     /// Value core of the shadowed-capture write.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn store_shadowed_upvalue_value(
         &mut self,
         context: &ExecutionContext,
@@ -118,12 +146,19 @@ impl Interpreter {
         eval_depth: u32,
         fallback: otter_bytecode::opcode_schema::ShadowedUpvalueFallback,
         value: Value,
+        snapshot: Option<u64>,
     ) -> Result<(), VmError> {
         let dynamic_cell = context
             .string_constant_str_for_function(frame.function_id(), name_idx)
             .and_then(|name| {
                 let env = frame.eval_env()?;
-                crate::eval_env::eval_env_lookup_chain_bounded(&self.gc_heap, env, name, eval_depth)
+                crate::eval_env::eval_env_lookup_chain_bounded_snap(
+                    &self.gc_heap,
+                    env,
+                    name,
+                    eval_depth,
+                    snapshot,
+                )
             });
         if let Some(cell) = dynamic_cell {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
@@ -218,6 +253,7 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 as u32,
                     u32::MAX,
+                    None,
                 )?;
                 frame.write(arg0 as u16, value)?;
                 frame.advance_pc()?;
@@ -227,4 +263,21 @@ impl Interpreter {
         frame.set_pc(saved_pc);
         Ok(())
     }
+}
+
+/// Decode the snapshot operand of the `*Snap` opcodes: a positive
+/// integral number issued by [`otter_bytecode::Op::EvalBindingSeq`].
+pub(crate) fn read_snapshot_register(
+    frame: &crate::Frame,
+    register: u16,
+) -> Result<u64, crate::VmError> {
+    let value = *crate::read_register(frame, register)?;
+    let number = value
+        .as_number()
+        .map(|number| number.as_f64())
+        .ok_or(crate::VmError::InvalidOperand)?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(crate::VmError::InvalidOperand);
+    }
+    Ok(number as u64)
 }

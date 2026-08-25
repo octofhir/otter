@@ -995,7 +995,9 @@ pub(crate) fn finalize_virtual_capture_indices(
                 }
             }
             Op::LoadShadowedUpvalue
+            | Op::LoadShadowedUpvalueSnap
             | Op::StoreShadowedUpvalueChecked
+            | Op::StoreShadowedUpvalueCheckedSnap
             | Op::DeleteShadowedUpvalue => {
                 if let Some(Operand::Imm32(v)) = code.operand(pc, 2) {
                     assert!(code.set_operand(pc, 2, Operand::Imm32(remap(v))));

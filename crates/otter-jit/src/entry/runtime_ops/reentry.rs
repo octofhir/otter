@@ -777,7 +777,7 @@ pub(crate) extern "C" fn jit_structural_op_stub(
     opcode: u64,
     arg0: u64,
     arg1: u64,
-    _reserved: u64,
+    arg2: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -791,7 +791,8 @@ pub(crate) extern "C" fn jit_structural_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_structural_op(context, stack, frame_index, opcode as u8, arg0, arg1) {
+    match vm.jit_runtime_structural_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
+    {
         Ok(()) => NativeResultStatus::Success as u64,
         Err(err) => {
             park_jit_error(ctx, err);

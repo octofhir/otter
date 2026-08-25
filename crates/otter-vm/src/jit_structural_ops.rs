@@ -31,21 +31,27 @@ impl Interpreter {
         opcode: u8,
         arg0: u64,
         arg1: u64,
+        arg2: u64,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
             return Err(VmError::InvalidOperand);
         }
         let saved_pc = stack[frame_index].pc;
-        let ops = [
-            Operand::Register(arg0 as u16),
-            Operand::Register(arg1 as u16),
-        ];
         match opcode {
             value if value == Op::ForInKeys as u8 => {
+                let ops = [
+                    Operand::Register(arg0 as u16),
+                    Operand::Register(arg1 as u16),
+                ];
                 self.run_for_in_keys_operands(context, stack, &ops)?;
             }
             value if value == Op::CopyDataProperties as u8 => {
+                let ops = [
+                    Operand::Register(arg0 as u16),
+                    Operand::Register(arg1 as u16),
+                    Operand::Register(arg2 as u16),
+                ];
                 self.run_copy_data_properties_operands(context, stack, &ops)?;
             }
             _ => return Err(VmError::InvalidOperand),

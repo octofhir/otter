@@ -1252,7 +1252,8 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::GetPrototype | Op::ArrayLength | Op::GetIterator | Op::GetAsyncIterator => {
             OperandShape::Fixed(WRITE_READ)
         }
-        Op::SetPrototype | Op::ArrayPush | Op::CopyDataProperties => OperandShape::Fixed(READ_READ),
+        Op::SetPrototype | Op::ArrayPush => OperandShape::Fixed(READ_READ),
+        Op::CopyDataProperties => OperandShape::Fixed(READ_READ_READ),
         Op::LoadElement | Op::DeleteElement | Op::HasProperty | Op::Instanceof => {
             OperandShape::Fixed(WRITE_READ_READ)
         }

@@ -463,7 +463,12 @@ pub(crate) enum TemplateOp {
     /// Complete one structural object opcode (`ForInKeys`,
     /// `CopyDataProperties`) through the shared reentrant structural transition.
     /// `arg0`/`arg1` name the destination/target and source registers.
-    StructuralOp { opcode: u8, arg0: u64, arg1: u64 },
+    StructuralOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Complete one class-construction opcode (`ClassCheck` or
     /// `SetFunctionName`) through the shared reentrant class transition.
     ClassOp {
@@ -1314,12 +1319,22 @@ impl TemplatePlan {
                         arg2: u64::from(operands.extra),
                     }
                 }
-                Op::ForInKeys | Op::CopyDataProperties => {
+                Op::ForInKeys => {
                     let operands = lowered.unary_operands()?;
                     TemplateOp::StructuralOp {
                         opcode: lowered.op as u8,
                         arg0: u64::from(operands.dst),
                         arg1: u64::from(operands.src),
+                        arg2: 0,
+                    }
+                }
+                Op::CopyDataProperties => {
+                    let operands = lowered.element_store_operands()?;
+                    TemplateOp::StructuralOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.receiver),
+                        arg1: u64::from(operands.index),
+                        arg2: u64::from(operands.value),
                     }
                 }
                 Op::ArrayConstruct => {

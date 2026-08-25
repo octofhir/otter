@@ -1136,7 +1136,12 @@ pub(super) fn compile(
                     fatal,
                 );
             }
-            TemplateOp::StructuralOp { opcode, arg0, arg1 } => {
+            TemplateOp::StructuralOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
                 structural::emit_structural_op(
                     &mut ops,
                     &mut relocations,
@@ -1144,6 +1149,7 @@ pub(super) fn compile(
                     opcode,
                     arg0,
                     arg1,
+                    arg2,
                     bail,
                     threw,
                     fatal,

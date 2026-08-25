@@ -497,9 +497,15 @@ pub(crate) fn compile_object_literal(
             oxc_ast::ast::ObjectPropertyKind::SpreadProperty(s) => {
                 let s_span = (s.span.start, s.span.end);
                 let src = compile_expr(cx, &s.argument, s_span)?;
+                let no_excluded = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(no_excluded)], s_span);
                 cx.emit(
                     Op::CopyDataProperties,
-                    [Operand::Register(dst), Operand::Register(src)],
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(src),
+                        Operand::Register(no_excluded),
+                    ],
                     s_span,
                 );
             }

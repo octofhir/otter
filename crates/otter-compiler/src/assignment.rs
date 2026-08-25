@@ -1439,43 +1439,46 @@ pub(crate) fn assign_object_pattern(
     }
     if let Some(rest) = obj.rest.as_ref() {
         // §13.15.5 RestObjectAssignment — same shape as the
-        // BindingPattern variant.
+        // BindingPattern variant: the previously-extracted keys are
+        // excluded inside the copy (§7.3.31), so a Proxy source never
+        // sees a [[GetOwnProperty]] trap for them.
         let rest_obj = cx.alloc_scratch();
         cx.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
+        let excluded = cx.alloc_scratch();
         cx.emit(
-            Op::CopyDataProperties,
-            [Operand::Register(rest_obj), Operand::Register(value_reg)],
+            Op::NewArray,
+            [Operand::Register(excluded), Operand::ConstIndex(0)],
             span,
         );
         for key in &extracted_keys {
-            match key {
+            let key_reg = match key {
                 ExtractedKey::Static(s) => {
                     let key_const = cx.intern_string_constant(s);
-                    let del_dst = cx.alloc_scratch();
+                    let r = cx.alloc_scratch();
                     cx.emit(
-                        Op::DeleteProperty,
-                        vec![
-                            Operand::Register(del_dst),
-                            Operand::Register(rest_obj),
-                            Operand::ConstIndex(key_const),
-                        ],
+                        Op::LoadString,
+                        [Operand::Register(r), Operand::ConstIndex(key_const)],
                         span,
                     );
+                    r
                 }
-                ExtractedKey::Runtime(key_reg) => {
-                    let del_dst = cx.alloc_scratch();
-                    cx.emit(
-                        Op::DeleteElement,
-                        vec![
-                            Operand::Register(del_dst),
-                            Operand::Register(rest_obj),
-                            Operand::Register(*key_reg),
-                        ],
-                        span,
-                    );
-                }
-            }
+                ExtractedKey::Runtime(key_reg) => *key_reg,
+            };
+            cx.emit(
+                Op::ArrayPush,
+                [Operand::Register(excluded), Operand::Register(key_reg)],
+                span,
+            );
         }
+        cx.emit(
+            Op::CopyDataProperties,
+            vec![
+                Operand::Register(rest_obj),
+                Operand::Register(value_reg),
+                Operand::Register(excluded),
+            ],
+            span,
+        );
         assign_to_target(cx, &rest.target, rest_obj, span)?;
     }
     Ok(())

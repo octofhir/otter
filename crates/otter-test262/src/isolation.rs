@@ -29,9 +29,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use otter_runtime::{
-    ExecutionResult, InterruptHandle, JitSelection, OtterError, Runtime, RuntimeExtensionInstaller,
-    RuntimeSnapshot, SnapshotRuntimeOptions, SourceInput,
+    CapabilitySet, ExecutionResult, InterruptHandle, JitSelection, OtterError, Permission, Runtime,
+    RuntimeExtensionInstaller, RuntimeSnapshot, SnapshotRuntimeOptions, SourceInput,
 };
+
+/// Capability set for corpus tests: filesystem reads are allowed so
+/// sibling-fixture module imports (`./x_FIXTURE.js`, staged or in-tree)
+/// resolve per the corpus convention; everything else stays denied so a
+/// test cannot write, connect, or spawn from inside the runner.
+fn corpus_capabilities() -> CapabilitySet {
+    CapabilitySet {
+        read: Permission::AllowAll,
+        ..CapabilitySet::sandbox()
+    }
+}
 
 /// Build a fresh runtime with the configured per-test caps.
 ///
@@ -48,6 +59,7 @@ pub fn fresh_runtime(
         .max_heap_bytes(max_heap_bytes)
         .allow_blocking_atomics_wait(allow_blocking_atomics_wait)
         .jit_selection(jit_selection)
+        .capabilities(corpus_capabilities())
         .process_global(false)
         .worker_global(false)
         .extension_installer(RuntimeExtensionInstaller::new(

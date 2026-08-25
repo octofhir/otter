@@ -741,6 +741,17 @@ fn stage_test_entry(
     if let Err(err) = std::fs::write(&entry, source) {
         return Err(format!("tempfile write failed: {err}"));
     }
+    // INTERPRETING.md — every corpus file reached through a module load is a
+    // Source Text Module, including marker-less sibling fixtures (a bare
+    // `throw new URIError()` file). Stamp the staged directory as a module
+    // package so the loader's package-scope rule classifies them as ES
+    // modules instead of wrapping them in the CommonJS interop shim.
+    if let Err(err) = std::fs::write(
+        dir.path().join("package.json"),
+        "{ \"type\": \"module\" }\n",
+    ) {
+        return Err(format!("staged package.json write failed: {err}"));
+    }
     // Hard-link every sibling `.js` file from the test's source
     // directory into the temp dir so corpus-convention sibling
     // imports (`./<other>_FIXTURE.js`, sibling test files used in

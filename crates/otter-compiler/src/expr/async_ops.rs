@@ -247,8 +247,18 @@ pub(crate) fn compile_yield(
             );
         }
         let return_to_check = cx.emit_branch_placeholder(Op::Jump, None, span);
-        // No `return` method: GeneratorReturn(received.value).
+        // No `return` method: GeneratorReturn(received.value). §27.6.3.8
+        // step 7.c.iii.1 — the async form awaits the received value AGAIN
+        // before the return completion propagates (its `then` getter is
+        // observably read a second time).
         cx.patch_branch_to_here(return_absent);
+        if is_async {
+            cx.emit(
+                Op::Await,
+                [Operand::Register(recv_reg), Operand::Register(recv_reg)],
+                span,
+            );
+        }
         cx.emit(Op::ReturnValue, [Operand::Register(recv_reg)], span);
 
         // Common: innerResult must be an Object.

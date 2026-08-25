@@ -3071,7 +3071,29 @@ impl Interpreter {
                     .map(|cold| cold.active_iterator_closers.clone())
                     .unwrap_or_default();
                 for (iterator, _) in closers.iter().rev() {
-                    self.iterator_close_value_sync(stack, context, *iterator)?;
+                    if let Err(err) = self.iterator_close_value_sync(stack, context, *iterator) {
+                        // §7.4.11 IteratorClose throwing (a `return` method
+                        // yielding a non-object, or itself throwing) turns
+                        // this resumption into a throw completion. An async
+                        // generator answers through its queued request —
+                        // the error must reject that promise, never escape
+                        // as a bare VmError that leaves it forever pending.
+                        if handle.is_async(&self.gc_heap) {
+                            let reason = self.take_pending_uncaught_throw().unwrap_or_else(|| {
+                                crate::promise_dispatch::rejection_value_for(self, &err)
+                            });
+                            handle.mark_done(&mut self.gc_heap);
+                            self.async_generator_complete_step(
+                                context,
+                                handle,
+                                Err(reason),
+                                true,
+                            )?;
+                            self.async_generator_drain_done(stack, context, handle)?;
+                            return Ok(Value::undefined());
+                        }
+                        return Err(err);
+                    }
                 }
                 // §27.5.3.4 GeneratorResumeAbrupt(return) — if the body
                 // is suspended inside a `try` with a `finally`, resume

@@ -271,6 +271,17 @@ pub(crate) fn destructure_object_inner(
     for prop in &pattern.properties {
         let prop_span = (prop.span.start, prop.span.end);
         let value_reg = parent.alloc_scratch();
+        // §14.3.3.3 KeyedBindingInitialization with no target environment
+        // (a `var` pattern): the binding Reference resolves after the
+        // PropertyName but BEFORE GetV reads the source property, so a
+        // `with` object's HasBinding trap fires in that exact slot and a
+        // present with-binding receives the store.
+        let mut with_probe = None;
+        let leaf_name = if assign_existing && !parent.active_with_envs.is_empty() {
+            identifier_leaf_name(&prop.value)
+        } else {
+            None
+        };
         if prop.computed {
             // §13.15.5 — computed key evaluated at destructuring
             // time, then `obj[key]` via `Op::LoadElement`.
@@ -285,8 +296,26 @@ pub(crate) fn destructure_object_inner(
                     );
                     r
                 }
-                _ => compile_expr_as_property_key(parent, &prop.key, prop_span)?,
+                _ => {
+                    // ComputedPropertyName — ToPropertyKey runs at
+                    // PropertyName evaluation, before the binding target
+                    // resolves, so a `toString` side effect keeps its
+                    // spec position.
+                    let r = compile_expr_as_property_key(parent, &prop.key, prop_span)?;
+                    let key = parent.alloc_scratch();
+                    parent.emit(
+                        Op::ToPropertyKey,
+                        [Operand::Register(key), Operand::Register(r)],
+                        prop_span,
+                    );
+                    key
+                }
             };
+            if let Some(name) = leaf_name {
+                let envs = parent.active_with_envs.clone();
+                with_probe =
+                    crate::with_statement::emit_with_binding_probe(parent, name, &envs, prop_span)?;
+            }
             parent.emit(
                 Op::LoadElement,
                 vec![
@@ -325,6 +354,12 @@ pub(crate) fn destructure_object_inner(
             match key_str {
                 Some(s) => {
                     let key_const = parent.intern_string_constant(&s);
+                    if let Some(name) = leaf_name {
+                        let envs = parent.active_with_envs.clone();
+                        with_probe = crate::with_statement::emit_with_binding_probe(
+                            parent, name, &envs, prop_span,
+                        )?;
+                    }
                     parent.emit(
                         Op::LoadProperty,
                         vec![
@@ -344,7 +379,30 @@ pub(crate) fn destructure_object_inner(
                 }
             }
         }
-        destructure_pattern(parent, value_reg, &prop.value, prop_span, assign_existing)?;
+        if let (Some(probe), Some(name)) = (&with_probe, leaf_name) {
+            // The reference resolved before GetV; a default still applies
+            // after the read (§14.3.3.3 step 3), then the store goes to
+            // the with object when its HasBinding answered true.
+            if let oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) = &prop.value {
+                let inferred = Some(name);
+                apply_default_into_with_name(parent, value_reg, &asgn.right, inferred, prop_span)?;
+            }
+            let fallback =
+                parent.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), prop_span);
+            crate::with_statement::emit_with_set_mutable_binding(
+                parent,
+                probe.object_reg,
+                name,
+                value_reg,
+                prop_span,
+            );
+            let done = parent.emit_branch_placeholder(Op::Jump, None, prop_span);
+            parent.patch_branch_to_here(fallback);
+            crate::assignment::store_identifier(parent, name, value_reg, prop_span)?;
+            parent.patch_branch_to_here(done);
+        } else {
+            destructure_pattern(parent, value_reg, &prop.value, prop_span, assign_existing)?;
+        }
     }
 
     if let Some(rest) = pattern.rest.as_ref() {
@@ -390,4 +448,17 @@ pub(crate) fn destructure_object_inner(
         destructure_pattern(parent, rest_obj, &rest.argument, span, assign_existing)?;
     }
     Ok(())
+}
+
+/// The identifier name of a plain (optionally defaulted) binding leaf, when
+/// the pattern is one.
+fn identifier_leaf_name<'a>(pattern: &'a oxc_ast::ast::BindingPattern<'_>) -> Option<&'a str> {
+    match pattern {
+        oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+        oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) => match &asgn.left {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }

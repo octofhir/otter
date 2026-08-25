@@ -1313,13 +1313,14 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::LeaveTry | Op::GeneratorStart => OperandShape::Fixed(EMPTY),
         Op::NewError
         | Op::ImportMetaResolve
-        | Op::ImportNamespaceDynamic
         | Op::PromiseFulfilledOf
         | Op::NewWeakRef
         | Op::NewFinalizationRegistry
         | Op::Yield => OperandShape::Fixed(WRITE_READ),
         Op::CallSpread => OperandShape::Fixed(WRITE_READ_READ_READ),
-        Op::NewSpread | Op::SuperConstructSpread => OperandShape::Fixed(WRITE_READ_READ),
+        Op::NewSpread | Op::SuperConstructSpread | Op::ImportNamespaceDynamic => {
+            OperandShape::Fixed(WRITE_READ_READ)
+        }
         Op::MakeClass => OperandShape::Fixed(WRITE_FOUR_READS),
         Op::CollectRest | Op::CollectArguments => OperandShape::Fixed(WRITE),
         Op::Eval | Op::Increment => OperandShape::Fixed(WRITE_READ_IMM),

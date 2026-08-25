@@ -1319,6 +1319,104 @@ impl Interpreter {
         Ok(())
     }
 
+    /// §13.3.10.1 steps 7-10 — validate the ImportCall options bag and
+    /// extract the one host-supported attribute (`type`). `Ok(Ok(attr))`
+    /// continues the import, `Ok(Err(reason))` rejects the import promise
+    /// with `reason` (IfAbruptRejectPromise), and `Err(_)` propagates a
+    /// fatal VM error.
+    fn evaluate_import_call_options(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        options: &Value,
+    ) -> Result<Result<Option<String>, Value>, VmError> {
+        if options.is_undefined() {
+            return Ok(Ok(None));
+        }
+        if !options.is_object_type() {
+            let reason =
+                self.make_type_error_with_stack_roots(stack, "import options must be an object")?;
+            return Ok(Err(reason));
+        }
+        let attributes = self.with_handle_scope(|interp, scope| -> Result<_, VmError> {
+            let options = interp.scoped_value(scope, *options);
+            let with_value = {
+                let options_now = interp.escape_scoped(options);
+                interp.get_property_value_for_call(stack, context, options_now, "with")?
+            };
+            if with_value.is_undefined() {
+                return Ok(Ok(None));
+            }
+            if !with_value.is_object_type() {
+                let reason = interp.make_type_error_with_stack_roots(
+                    stack,
+                    "import attributes must be an object",
+                )?;
+                return Ok(Err(reason));
+            }
+            // §7.3.24 EnumerableOwnProperties(key+value): own keys in
+            // [[OwnPropertyKeys]] order, string keys only, each value read
+            // through [[Get]] so getters and Proxy traps fire.
+            let with_handle = interp.scoped_value(scope, with_value);
+            let with_now = interp.escape_scoped(with_handle);
+            let keys = interp.own_property_keys_value(stack, context, &with_now)?;
+            let key_handles: Vec<_> = keys
+                .into_iter()
+                .map(|key| interp.scoped_value(scope, key))
+                .collect();
+            let mut attr_type: Option<String> = None;
+            for key_handle in key_handles {
+                let key_value = interp.escape_scoped(key_handle);
+                let Some(key_string) = key_value.as_string(&interp.gc_heap) else {
+                    // Symbol keys are filtered by EnumerableOwnProperties.
+                    continue;
+                };
+                let key = key_string.to_lossy_string(&interp.gc_heap);
+                let with_now = interp.escape_scoped(with_handle);
+                let descriptor = interp.get_own_property_descriptor_for_value(
+                    stack,
+                    context,
+                    with_now,
+                    Some(&interp.escape_scoped(key_handle)),
+                )?;
+                if !descriptor.is_some_and(|descriptor| descriptor.enumerable()) {
+                    continue;
+                }
+                let with_now = interp.escape_scoped(with_handle);
+                let value =
+                    interp.get_property_value_for_call(stack, context, with_now, key.as_str())?;
+                let Some(value_string) = value.as_string(&interp.gc_heap) else {
+                    let reason = interp.make_type_error_with_stack_roots(
+                        stack,
+                        &format!("import attribute \"{key}\" value must be a string"),
+                    )?;
+                    return Ok(Err(reason));
+                };
+                if key != "type" {
+                    let reason = interp.make_type_error_with_stack_roots(
+                        stack,
+                        &format!("unsupported import attribute \"{key}\""),
+                    )?;
+                    return Ok(Err(reason));
+                }
+                attr_type = Some(value_string.to_lossy_string(&interp.gc_heap));
+            }
+            Ok(Ok(attr_type))
+        });
+        match attributes {
+            Ok(result) => Ok(result),
+            Err(VmError::Uncaught) => Ok(Err(self
+                .take_pending_uncaught_throw()
+                .unwrap_or_else(Value::undefined))),
+            Err(error) => {
+                let reason = self
+                    .vm_error_to_throwable_with_stack_roots(Some(context), stack, &error)
+                    .ok_or(error)?;
+                Ok(Err(reason))
+            }
+        }
+    }
+
     pub(crate) fn run_import_namespace_dynamic_operands(
         &mut self,
         context: &ExecutionContext,
@@ -1328,6 +1426,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let spec_reg = register_operand(operands.get(1))?;
+        let options_reg = register_operand(operands.get(2))?;
         let spec_value = *read_register(&stack[top_idx], spec_reg)?;
         let referrer: String = context
             .exec_function(stack[top_idx].function_id)
@@ -1336,9 +1435,34 @@ impl Interpreter {
         let import_context = context.clone();
         let promise = match self.coerce_to_string(stack, context, &spec_value) {
             Ok(specifier) => {
-                if let Some(target) =
-                    context.module_resolution_target(referrer.as_str(), &specifier, None)
-                {
+                // Re-read the options register after specifier coercion: the
+                // coercion can collect, and registers are the traced home.
+                let options_value = *read_register(&stack[top_idx], options_reg)?;
+                let attr_type =
+                    match self.evaluate_import_call_options(stack, context, &options_value)? {
+                        Ok(attr_type) => attr_type,
+                        Err(reason) => {
+                            let promise = promise_dispatch::PromiseBuilder::with_context(
+                                import_context.clone(),
+                            )
+                            .rejected_stack_rooted(
+                                self,
+                                stack,
+                                reason,
+                                &[],
+                                &[],
+                            )?;
+                            let frame = &mut stack[top_idx];
+                            write_register(frame, dst, Value::promise(promise))?;
+                            frame.advance_pc()?;
+                            return Ok(());
+                        }
+                    };
+                if let Some(target) = context.module_resolution_target(
+                    referrer.as_str(),
+                    &specifier,
+                    attr_type.as_deref(),
+                ) {
                     let target = target.to_string();
                     // §16.2.1.4 Evaluate step 1 / §13.3.10 — a dynamic
                     // import during an active Evaluate DFS must not
@@ -1439,7 +1563,13 @@ impl Interpreter {
                                 import_context.clone(),
                                 self.active_realm_id,
                             );
-                            match loader.schedule(admission, token, specifier, referrer.clone()) {
+                            match loader.schedule(
+                                admission,
+                                token,
+                                specifier,
+                                referrer.clone(),
+                                attr_type,
+                            ) {
                                 Ok(()) => self.record_runtime_host_op_enqueued(),
                                 Err(error) => {
                                     let reason = self.make_type_error_with_stack_roots(

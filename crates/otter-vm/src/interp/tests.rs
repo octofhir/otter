@@ -4026,7 +4026,7 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
 
 #[test]
 fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
-    let module = module_with(Vec::new(), 2);
+    let module = module_with(Vec::new(), 3);
     let mut interp = Interpreter::new();
     let context = interp
         .link_module(module.clone())
@@ -4036,8 +4036,13 @@ fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[1] = Value::number(NumberValue::Smi(12));
+    frame.registers[2] = Value::undefined();
     stack.push(frame);
-    let operands = vec![Operand::Register(0), Operand::Register(1)];
+    let operands = vec![
+        Operand::Register(0),
+        Operand::Register(1),
+        Operand::Register(2),
+    ];
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     interp

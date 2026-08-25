@@ -98,10 +98,7 @@ pub(crate) fn compile_import(
             // import().
             let specifier = lit.value.as_str().to_string();
             let spec_const = cx.intern_string_constant(&specifier);
-            if is_defer_phase && cx.module_state.is_some() {
-                if let Some(options) = &imp.options {
-                    compile_expr(cx, options, span)?;
-                }
+            if is_defer_phase && cx.module_state.is_some() && imp.options.is_none() {
                 let ns_dst = cx.alloc_scratch();
                 cx.emit(
                     Op::ImportNamespaceDeferred,
@@ -129,13 +126,24 @@ pub(crate) fn compile_import(
         // PromiseFulfilledOf wrap is needed.
         other => compile_expr(cx, other, span)?,
     };
-    if let Some(options) = &imp.options {
-        compile_expr(cx, options, span)?;
-    }
+    // §13.3.10.1 step 3 — the options expression evaluates after the
+    // specifier; its value feeds the opcode's attribute validation.
+    let options_reg = match &imp.options {
+        Some(options) => compile_expr(cx, options, span)?,
+        None => {
+            let reg = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(reg)], span);
+            reg
+        }
+    };
     let promise_dst = cx.alloc_scratch();
     cx.emit(
         Op::ImportNamespaceDynamic,
-        [Operand::Register(promise_dst), Operand::Register(spec_reg)],
+        [
+            Operand::Register(promise_dst),
+            Operand::Register(spec_reg),
+            Operand::Register(options_reg),
+        ],
         span,
     );
     Ok(promise_dst)

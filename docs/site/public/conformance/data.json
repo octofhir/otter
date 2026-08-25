@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "37922aa96e52b8bb7086820e1ace60fe70e8c37b",
-  "ran_at": "2026-08-25T12:09:04.807245+00:00",
+  "engine_commit": "cf1c35377021dc91e94005c5ccde8c3eed1d23f9",
+  "ran_at": "2026-08-25T15:51:49.169180+00:00",
   "totals": {
     "total": 53459,
-    "passed": 51737,
-    "failed": 622,
+    "passed": 51855,
+    "failed": 504,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -1598,8 +1598,8 @@
     },
     "built-ins/AsyncGeneratorFunction/invoked-as-function-multiple-arguments.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1616,8 +1616,8 @@
     },
     "built-ins/AsyncGeneratorFunction/invoked-as-function-single-argument.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1697,8 +1697,8 @@
     },
     "built-ins/AsyncGeneratorPrototype/next": {
       "total": 11,
-      "passed": 7,
-      "failed": 4,
+      "passed": 11,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1706,8 +1706,8 @@
     },
     "built-ins/AsyncGeneratorPrototype/return": {
       "total": 19,
-      "passed": 14,
-      "failed": 5,
+      "passed": 19,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1715,8 +1715,8 @@
     },
     "built-ins/AsyncGeneratorPrototype/throw": {
       "total": 16,
-      "passed": 13,
-      "failed": 3,
+      "passed": 16,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -1877,8 +1877,8 @@
     },
     "built-ins/Atomics/waitAsync": {
       "total": 101,
-      "passed": 91,
-      "failed": 10,
+      "passed": 101,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -9077,8 +9077,8 @@
     },
     "built-ins/Promise/allKeyed": {
       "total": 45,
-      "passed": 36,
-      "failed": 9,
+      "passed": 45,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -9095,8 +9095,8 @@
     },
     "built-ins/Promise/allSettledKeyed": {
       "total": 44,
-      "passed": 32,
-      "failed": 12,
+      "passed": 44,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -15260,8 +15260,8 @@
     },
     "built-ins/SharedArrayBuffer/prototype-from-newtarget.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27905,8 +27905,8 @@
     },
     "language/expressions/async-generator": {
       "total": 623,
-      "passed": 602,
-      "failed": 20,
+      "passed": 620,
+      "failed": 2,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -27968,8 +27968,8 @@
     },
     "language/expressions/class": {
       "total": 4059,
-      "passed": 4022,
-      "failed": 17,
+      "passed": 4039,
+      "failed": 0,
       "skipped": 20,
       "crashed": 0,
       "timed_out": 0,
@@ -28049,8 +28049,8 @@
     },
     "language/expressions/dynamic-import": {
       "total": 1005,
-      "passed": 762,
-      "failed": 5,
+      "passed": 767,
+      "failed": 0,
       "skipped": 238,
       "crashed": 0,
       "timed_out": 0,
@@ -28256,8 +28256,8 @@
     },
     "language/expressions/object": {
       "total": 1170,
-      "passed": 1163,
-      "failed": 7,
+      "passed": 1169,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -37121,8 +37121,8 @@
     },
     "language/module-code/top-level-await": {
       "total": 251,
-      "passed": 250,
-      "failed": 1,
+      "passed": 251,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -38318,8 +38318,8 @@
     },
     "language/statements/async-generator": {
       "total": 301,
-      "passed": 290,
-      "failed": 11,
+      "passed": 298,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -38354,8 +38354,8 @@
     },
     "language/statements/class": {
       "total": 4367,
-      "passed": 4336,
-      "failed": 17,
+      "passed": 4353,
+      "failed": 0,
       "skipped": 14,
       "crashed": 0,
       "timed_out": 0,
@@ -40332,276 +40332,6 @@
       "reason": "sloppy: Test262Error: Promise should be rejected Expected a CatchError to be thrown asynchronously but got a TypeError"
     },
     {
-      "path": "built-ins/AsyncGeneratorFunction/invoked-as-function-multiple-arguments.js",
-      "esid": "sec-asyncgeneratorfunction",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: First result `value` Expected SameValue(«undefined», «5») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorFunction/invoked-as-function-single-argument.js",
-      "esid": "sec-asyncgeneratorfunction",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: First result `value` Expected SameValue(«undefined», «1») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/next/request-queue-await-order.js",
-      "esid": "sec-asyncgenerator-prototype-next",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «2») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/next/request-queue-order-state-executing.js",
-      "esid": "sec-asyncgenerator-prototype-throw",
-      "outcome": "fail",
-      "reason": "sloppy: $DONE was never called"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/next/request-queue-order.js",
-      "esid": "sec-asyncgenerator-prototype-next",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/next/request-queue-promise-resolve-order.js",
-      "esid": "sec-asyncgenerator-prototype-next",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/return/return-state-completed-broken-promise.js",
-      "esid": "sec-asyncgenerator-prototype-return",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected rejection"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/return/return-suspendedStart-broken-promise.js",
-      "esid": "sec-asyncgenerator-prototype-return",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected rejection"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/return/return-suspendedStart-promise.js",
-      "esid": "sec-asyncgenerator-prototype-return",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: AsyncGeneratorResolve(generator, completion.[[Value]], true) Expected SameValue(«[object Promise]», «\"unwrapped-value\"») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/return/return-suspendedYield-broken-promise-try-catch.js",
-      "esid": "sec-asyncgenerator-prototype-return",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: Cannot read property of null or undefined\n    at built-ins/AsyncGeneratorPrototype/return/return-suspendedYield-broken-promise-try-catch.js:25:20"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/return/return-suspendedYield-promise.js",
-      "esid": "sec-asyncgenerator-prototype-return",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: AsyncGeneratorResolve(generator, resultValue, true) Expected SameValue(«[object Promise]», «\"unwrapped-value\"») to be true"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/throw/request-queue-order-state-executing.js",
-      "esid": "sec-asyncgenerator-prototype-throw",
-      "outcome": "fail",
-      "reason": "sloppy: Error: Catch me.\n    at built-ins/AsyncGeneratorPrototype/throw/request-queue-order-state-executing.js:4:17"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/throw/throw-suspendedYield-promise.js",
-      "esid": "sec-asyncgenerator-prototype-throw",
-      "outcome": "fail",
-      "reason": "sloppy: [object Promise]"
-    },
-    {
-      "path": "built-ins/AsyncGeneratorPrototype/throw/throw-suspendedYield.js",
-      "esid": "sec-asyncgenerator-prototype-throw",
-      "outcome": "fail",
-      "reason": "sloppy: Error: boop\n    at built-ins/AsyncGeneratorPrototype/throw/throw-suspendedYield.js:3:13"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/bigint/nan-for-timeout-agent.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT * 4)), 0) must return 1 Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/bigint/undefined-for-timeout-agent.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT * 4)), 0, 2) must return the value of NOTIFYCOUNT Expected SameValue(«0», «2») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/bigint/undefined-index-defaults-to-zero-agent.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT * 4)), 0, 2) must return the value of NOTIFYCOUNT Expected SameValue(«0», «2») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/bigint/waiterlist-block-indexedposition-wake.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT * 5)), 2) must return 1 Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/bigint/was-woken-before-timeout.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT * 4)), 0) must return 1 Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/nan-for-timeout-agent.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4)), 0) must return 1 Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/undefined-for-timeout-agent.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4)), 0, 2) must return the value of NOTIFYCOUNT Expected SameValue(«0», «2») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/undefined-index-defaults-to-zero-agent.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4)), 0, 2) must return the value of NOTIFYCOUNT Expected SameValue(«0», «2») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/waiterlist-block-indexedposition-wake.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 5)), 2) must return 1 Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Atomics/waitAsync/was-woken-before-timeout.js",
-      "esid": "sec-atomics.waitasync",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4)), 0) must return 1 Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/arg-is-function.js",
-      "esid": "sec-promise.allkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/capability-resolve-throws-reject.js",
-      "esid": "sec-promise.allkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: "
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/get-value-not-called-for-non-enumerable.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/getownproperty-not-enumerable.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/key-order-preserved.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/non-enumerable-properties-ignored.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/prototype-keys-ignored.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/result-property-descriptors.js",
-      "esid": "sec-createkeyedpromisecombinatorresultobject",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allKeyed/symbol-keys.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/arg-is-function.js",
-      "esid": "sec-promise.allsettledkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/capability-resolve-throws-reject.js",
-      "esid": "sec-promise.allsettledkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: "
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/get-value-not-called-for-non-enumerable.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/getownproperty-not-enumerable.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/key-order-preserved.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/non-enumerable-properties-ignored.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/prototype-keys-ignored.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/resolved-all-fulfilled.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/resolved-all-mixed.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/resolved-all-rejected.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/result-property-descriptors.js",
-      "esid": "sec-createkeyedpromisecombinatorresultobject",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
-      "path": "built-ins/Promise/allSettledKeyed/symbol-keys.js",
-      "esid": "sec-performpromiseallkeyed",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true"
-    },
-    {
       "path": "built-ins/Promise/exception-after-resolve-in-executor.js",
       "outcome": "fail",
       "reason": "sloppy: Error: ignored exception\n    at executor (built-ins/Promise/exception-after-resolve-in-executor.js:11:9)\n    at built-ins/Promise/exception-after-resolve-in-executor.js:14:1"
@@ -40688,12 +40418,6 @@
       "esid": "sec-promise.try",
       "outcome": "fail",
       "reason": "sloppy: Test262Error: error thrown from callback must become a rejection Expected a Test262Error to be thrown asynchronously but thrown value was not an object"
-    },
-    {
-      "path": "built-ins/SharedArrayBuffer/prototype-from-newtarget.js",
-      "esid": "sec-sharedarraybuffer-length",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: NewTarget is built-in Object constructor Expected SameValue(«[object SharedArrayBuffer]», «[object Object]») to be true"
     },
     {
       "path": "built-ins/Temporal/Duration/compare/order-of-operations.js",
@@ -41329,114 +41053,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [source, target, target-key, source-key, source-key-tostring, get, target-key-tostring, set] and expected [source, source-key, source-key-tostring, target, target-key, get, target-key-tostring, set] should have the same contents. "
     },
     {
-      "path": "language/expressions/async-generator/expression-await-as-yield-operand.js",
-      "esid": "sec-generator-function-definitions",
-      "outcome": "fail",
-      "reason": "sloppy: $DONE was never called"
-    },
-    {
-      "path": "language/expressions/async-generator/expression-await-promise-as-yield-operand.js",
-      "esid": "sec-generator-function-definitions",
-      "outcome": "fail",
-      "reason": "sloppy: $DONE was never called"
-    },
-    {
-      "path": "language/expressions/async-generator/expression-await-thenable-as-yield-operand.js",
-      "esid": "sec-generator-function-definitions",
-      "outcome": "fail",
-      "reason": "sloppy: $DONE was never called"
-    },
-    {
-      "path": "language/expressions/async-generator/expression-yield-as-operand.js",
-      "esid": "sec-generator-function-definitions",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: First result `value` Expected SameValue(«undefined», «1») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/expression-yield-as-statement.js",
-      "esid": "sec-generator-function-definitions",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Without right-hand-side: first result `done` flag Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/expression-yield-newline.js",
-      "esid": "sec-generator-function-definitions",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: First result `done` flag Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/named-yield-identifier-non-strict.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «43») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/named-yield-identifier-spread-non-strict.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «10») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/named-yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at g (language/expressions/async-generator/named-yield-spread-arr-multiple.js:10:10)\n    at language/expressions/async-generator/named-yield-spread-arr-multiple.js:19:20"
-    },
-    {
-      "path": "language/expressions/async-generator/named-yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/async-generator/named-yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/named-yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/yield-identifier-non-strict.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «43») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/yield-identifier-spread-non-strict.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «10») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at gen (language/expressions/async-generator/yield-spread-arr-multiple.js:10:10)\n    at language/expressions/async-generator/yield-spread-arr-multiple.js:19:20"
-    },
-    {
-      "path": "language/expressions/async-generator/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/async-generator/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/async-generator/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorExpression",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
       "path": "language/expressions/async-generator/yield-thenable-create-resolving-functions-reject.js",
       "esid": "sec-generator-function-definitions-runtime-semantics-evaluation",
       "outcome": "fail",
@@ -41458,107 +41074,6 @@
       "path": "language/expressions/call/11.2.3-3_3.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalled Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method-static/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at gen (language/expressions/class/async-gen-method-static/yield-spread-arr-multiple.js:10:12)\n    at language/expressions/class/async-gen-method-static/yield-spread-arr-multiple.js:21:20"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method-static/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method-static/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method-static/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at gen (language/expressions/class/async-gen-method/yield-spread-arr-multiple.js:10:12)\n    at language/expressions/class/async-gen-method/yield-spread-arr-multiple.js:21:20"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/class/async-gen-method/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method-static/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at #gen (language/expressions/class/elements/async-gen-private-method-static/yield-spread-arr-multiple.js:11:16)\n    at language/expressions/class/elements/async-gen-private-method-static/yield-spread-arr-multiple.js:32:20"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method-static/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method-static/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method-static/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at #gen (language/expressions/class/elements/async-gen-private-method/yield-spread-arr-multiple.js:11:16)\n    at language/expressions/class/elements/async-gen-private-method/yield-spread-arr-multiple.js:38:20"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/class/elements/async-gen-private-method/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/expressions/class/subclass-builtins/subclass-SharedArrayBuffer.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
     },
     {
       "path": "language/expressions/compound-assignment/S11.13.2_A6.10_T1.js",
@@ -41616,76 +41131,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: innerX === 2. Actual: 1"
     },
     {
-      "path": "language/expressions/dynamic-import/for-await-resolution-and-error-agen-yield.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: $DONE was never called"
-    },
-    {
-      "path": "language/expressions/dynamic-import/for-await-resolution-and-error-agen.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: $DONE was never called"
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-errored-module.js",
-      "esid": "sec-ContinueDynamicImport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: The import should reject (second import) Expected a Error to be thrown asynchronously but no exception was thrown at all"
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-fulfilled-member-of-errored-cycle.js",
-      "esid": "sec-moduleevaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: The import of C should reject Expected SameValue(«null», «null») to be false"
-    },
-    {
-      "path": "language/expressions/dynamic-import/usage-from-eval.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: cannot resolve \"./module-code_FIXTURE.js\": Resolve { specifier: \"./module-code_FIXTURE.js\", referrer: \"<entry>\", message: \"Cannot find module './module-code_FIXTURE.js'; resolver context: importer `<entry>`, specifier `./module-code_FIXTURE.js`, import kind `esm`, conditions [otter, import, node, default]\" }"
-    },
-    {
       "path": "language/expressions/object/dstr/object-rest-proxy-gopd-not-called-on-excluded-keys.js",
       "esid": "sec-destructuring-binding-patterns-runtime-semantics-restbindinginitialization",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Symbol(excluded_symbol), excludedString, 0, Symbol(included_symbol), includedString, 1] and expected [Symbol(included_symbol), includedString, 1] should have the same contents. "
-    },
-    {
-      "path": "language/expressions/object/method-definition/async-gen-yield-identifier-non-strict.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «43») to be true"
-    },
-    {
-      "path": "language/expressions/object/method-definition/async-gen-yield-identifier-spread-non-strict.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «10») to be true"
-    },
-    {
-      "path": "language/expressions/object/method-definition/async-gen-yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at method (language/expressions/object/method-definition/async-gen-yield-spread-arr-multiple.js:10:12)\n    at language/expressions/object/method-definition/async-gen-yield-spread-arr-multiple.js:20:20"
-    },
-    {
-      "path": "language/expressions/object/method-definition/async-gen-yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/expressions/object/method-definition/async-gen-yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/expressions/object/method-definition/async-gen-yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
     },
     {
       "path": "language/expressions/tagged-template/cache-eval-inner-function.js",
@@ -41706,52 +41155,10 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [B, A-before-await, Middle-before-nsD.z, Middle-after-nsD.z, resolve-blocker, C, A-after-await, D] and expected [B, A-before-await, resolve-blocker, A-after-await, Middle-before-nsD.z, D, Middle-after-nsD.z, C] should have the same contents. "
     },
     {
-      "path": "language/module-code/top-level-await/dynamic-import-of-waiting-module.js",
-      "esid": "sec-ContinueDynamicImport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: The second import should not resolve before the first one"
-    },
-    {
       "path": "language/statements/async-generator/return-undefined-implicit-and-explicit.js",
       "esid": "sec-return-statement-runtime-semantics-evaluation",
       "outcome": "fail",
       "reason": "sloppy: Test262Error: Actual [tick 1, g1 ret, g2 ret, g3 ret, g4 ret, tick 2] and expected [tick 1, g1 ret, g2 ret, tick 2, g3 ret, g4 ret] should have the same contents. Ticks for implicit and explicit return undefined"
-    },
-    {
-      "path": "language/statements/async-generator/yield-identifier-non-strict.js",
-      "esid": "prod-AsyncGeneratorDeclaration",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «43») to be true"
-    },
-    {
-      "path": "language/statements/async-generator/yield-identifier-spread-non-strict.js",
-      "esid": "prod-AsyncGeneratorDeclaration",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «10») to be true"
-    },
-    {
-      "path": "language/statements/async-generator/yield-return-then-getter-ticks.js",
-      "esid": "sec-generator-function-definitions-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Actual [start, stop - never reached, tick 1, tick 2] and expected [start, tick 1, get then, tick 2] should have the same contents. Ticks for return with thenable getter"
-    },
-    {
-      "path": "language/statements/async-generator/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorDeclaration",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at gen (language/statements/async-generator/yield-spread-arr-multiple.js:10:10)\n    at language/statements/async-generator/yield-spread-arr-multiple.js:19:20"
-    },
-    {
-      "path": "language/statements/async-generator/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorDeclaration",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/statements/async-generator/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorDeclaration",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
     },
     {
       "path": "language/statements/async-generator/yield-star-promise-not-unwrapped.js",
@@ -41760,123 +41167,10 @@
       "reason": "sloppy: Test262Error: yield* should not unwrap promises from manually-implemented async iterators Expected SameValue(«\"unwrapped value\"», «[object Promise]») to be true"
     },
     {
-      "path": "language/statements/async-generator/yield-star-return-missing-value-is-awaited.js",
-      "esid": "sec-generator-function-definitions-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«[object Promise]», «3») to be true"
-    },
-    {
       "path": "language/statements/async-generator/yield-star-return-then-getter-ticks.js",
       "esid": "sec-generator-function-definitions-runtime-semantics-evaluation",
       "outcome": "fail",
-      "reason": "sloppy: Test262Error: Actual [start, tick 1, tick 2, tick 3] and expected [start, tick 1, get then, tick 2, get return, get then, tick 3] should have the same contents. Ticks for return with thenable getter"
-    },
-    {
-      "path": "language/statements/async-generator/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorDeclaration",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/statements/class/async-gen-method-static/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at gen (language/statements/class/async-gen-method-static/yield-spread-arr-multiple.js:10:12)\n    at language/statements/class/async-gen-method-static/yield-spread-arr-multiple.js:21:20"
-    },
-    {
-      "path": "language/statements/class/async-gen-method-static/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/statements/class/async-gen-method-static/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/statements/class/async-gen-method-static/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/statements/class/async-gen-method/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at gen (language/statements/class/async-gen-method/yield-spread-arr-multiple.js:10:12)\n    at language/statements/class/async-gen-method/yield-spread-arr-multiple.js:21:20"
-    },
-    {
-      "path": "language/statements/class/async-gen-method/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/statements/class/async-gen-method/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/statements/class/async-gen-method/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method-static/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at #gen (language/statements/class/elements/async-gen-private-method-static/yield-spread-arr-multiple.js:11:16)\n    at language/statements/class/elements/async-gen-private-method-static/yield-spread-arr-multiple.js:32:20"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method-static/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method-static/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method-static/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method/yield-spread-arr-multiple.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: type mismatch: this operation does not accept a value of this type\n    at #gen (language/statements/class/elements/async-gen-private-method/yield-spread-arr-multiple.js:11:16)\n    at language/statements/class/elements/async-gen-private-method/yield-spread-arr-multiple.js:38:20"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method/yield-spread-arr-single.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: value is an Array exotic object"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method/yield-spread-obj.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «42») to be true"
-    },
-    {
-      "path": "language/statements/class/elements/async-gen-private-method/yield-star-sync-next.js",
-      "esid": "prod-AsyncGeneratorPrivateMethod",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"get next\"», «\"call next\"») to be true"
-    },
-    {
-      "path": "language/statements/class/subclass-builtins/subclass-SharedArrayBuffer.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
+      "reason": "sloppy: Test262Error: Actual [start, tick 1, get then, tick 2, get return, tick 3] and expected [start, tick 1, get then, tick 2, get return, get then, tick 3] should have the same contents. Ticks for return with thenable getter"
     },
     {
       "path": "language/statements/for-await-of/async-from-sync-iterator-continuation-abrupt-completion-get-constructor.js",
@@ -41888,7 +41182,7 @@
       "path": "language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-rtrn-close-null.js",
       "esid": "sec-for-in-and-for-of-statements-runtime-semantics-labelledevaluation",
       "outcome": "fail",
-      "reason": "sloppy: TypeError: iterator `return` did not yield an object\n    at language/statements/for-await-of/async-gen-decl-dstr-array-elem-iter-rtrn-close-null.js:37:3"
+      "reason": "sloppy: $DONE was never called"
     },
     {
       "path": "language/statements/for-await-of/ticks-with-async-iter-resolved-promise-and-constructor-lookup-two.js",
@@ -42829,7 +42123,7 @@
     {
       "path": "intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Tue Aug 25 2026 15:08:53 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [8/25/2026, 3:08:53 PM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Tue Aug 25 2026 18:51:38 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [8/25/2026, 6:51:38 PM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
     },
     {
       "path": "intl402/Date/prototype/throws-same-exceptions-as-DateTimeFormat.js",
@@ -42857,7 +42151,7 @@
     {
       "path": "intl402/DateTimeFormat/date-time-options.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 8/25/2026, 3:08:53 PM,Tue, 8/25/2026, 3:08:53 PM, got Tue Aug 25 2026 15:08:53 GMT+0300. Expected SameValue(«-1», «-1») to be false"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 8/25/2026, 6:51:38 PM,Tue, 8/25/2026, 6:51:38 PM, got Tue Aug 25 2026 18:51:38 GMT+0300. Expected SameValue(«-1», «-1») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/ignore-invalid-unicode-ext-values.js",

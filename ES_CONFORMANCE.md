@@ -1,28 +1,27 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `c5cffb9653ce110f2f4c203dcee472488ba55ecb`
+- **Engine commit:** `37922aa96e52b8bb7086820e1ace60fe70e8c37b`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-25T10:15:52.310776+00:00
+- **Captured:** 2026-08-25T12:09:04.807245+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 51623 |
-| failed     | 735 |
+| passed     | 51737 |
+| failed     | 622 |
 | skipped    | 1100 |
-| crashed    | 1 |
+| crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 98.59%
+**Pass rate (excl. skipped):** 98.81%
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
-| language/expressions/dynamic-import | 1005 | 649 | 118 | 84.6% |
 | intl402/DateTimeFormat/prototype | 180 | 143 | 37 | 79.4% |
 | built-ins/Temporal/ZonedDateTime | 901 | 871 | 30 | 96.7% |
 | built-ins/Temporal/Duration | 540 | 512 | 28 | 94.8% |
@@ -65,6 +64,7 @@
 | built-ins/Temporal/PlainYearMonth | 509 | 504 | 5 | 99.0% |
 | intl402/PluralRules/prototype | 34 | 29 | 5 | 85.3% |
 | intl402/Temporal/Instant | 17 | 12 | 5 | 70.6% |
+| language/expressions/dynamic-import | 1005 | 762 | 5 | 99.3% |
 | language/statements/for-await-of | 1234 | 1227 | 5 | 99.6% |
 | built-ins/AsyncGeneratorPrototype/next | 11 | 7 | 4 | 63.6% |
 | language/expressions/assignment | 485 | 481 | 4 | 99.2% |

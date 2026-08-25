@@ -1,13 +1,13 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "c5cffb9653ce110f2f4c203dcee472488ba55ecb",
-  "ran_at": "2026-08-25T10:15:52.310776+00:00",
+  "engine_commit": "37922aa96e52b8bb7086820e1ace60fe70e8c37b",
+  "ran_at": "2026-08-25T12:09:04.807245+00:00",
   "totals": {
     "total": 53459,
-    "passed": 51623,
-    "failed": 735,
+    "passed": 51737,
+    "failed": 622,
     "skipped": 1100,
-    "crashed": 1,
+    "crashed": 0,
     "timed_out": 0,
     "oom": 0
   },
@@ -17114,10 +17114,10 @@
     },
     "built-ins/TypedArrayConstructors/internals": {
       "total": 240,
-      "passed": 229,
+      "passed": 230,
       "failed": 0,
       "skipped": 10,
-      "crashed": 1,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
@@ -28049,8 +28049,8 @@
     },
     "language/expressions/dynamic-import": {
       "total": 1005,
-      "passed": 649,
-      "failed": 118,
+      "passed": 762,
+      "failed": 5,
       "skipped": 238,
       "crashed": 0,
       "timed_out": 0,
@@ -41260,12 +41260,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: OrdinaryToPrimitive could not convert object to primitive"
     },
     {
-      "path": "built-ins/TypedArrayConstructors/internals/Set/bigint-tonumber.js",
-      "esid": "sec-assignment-operators-runtime-semantics-evaluation",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
       "path": "language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js",
       "esid": "sec-destructuring-binding-patterns-runtime-semantics-propertybindinginitialization",
       "outcome": "fail",
@@ -41622,112 +41616,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: #1: innerX === 2. Actual: 1"
     },
     {
-      "path": "language/expressions/dynamic-import/catch/nested-arrow-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-arrow-function-await-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-arrow-function-return-await-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-function-await-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-function-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-function-return-await-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-gen-await-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-async-gen-return-await-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-block-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-block-labeled-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-do-while-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-else-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-function-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-if-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/nested-while-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/catch/top-level-import-catch-eval-rqstd-abrupt-urierror.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"TypeError\"», «\"URIError\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/eval-self-once-script.js",
-      "esid": "sec-hostimportmoduledynamically",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-Nfg27E/eval-self-once-script.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-Nfg27E/eval-self-once-script.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-Nfg27E/eval-self-once-script.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
       "path": "language/expressions/dynamic-import/for-await-resolution-and-error-agen-yield.js",
       "esid": "sec-finishdynamicimport",
       "outcome": "fail",
-      "reason": "sloppy: Test262Error: c Expected SameValue(«TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-0GAKop/for-await-resolution-and-error-poisoned_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-0GAKop/for-await-resolution-and-error-poisoned_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-0GAKop/for-await-resolution-and-error-poisoned_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })», «\"foo\"») to be true"
+      "reason": "sloppy: $DONE was never called"
     },
     {
       "path": "language/expressions/dynamic-import/for-await-resolution-and-error-agen.js",
@@ -41736,592 +41628,16 @@
       "reason": "sloppy: $DONE was never called"
     },
     {
-      "path": "language/expressions/dynamic-import/for-await-resolution-and-error.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-MhwLKf/for-await-resolution-and-error-poisoned_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-MhwLKf/for-await-resolution-and-error-poisoned_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-MhwLKf/for-await-resolution-and-error-poisoned_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })», «\"foo\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-get-with-error.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected an error, but observed no error"
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-non-object.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Promise for null was not rejected."
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-with-enumeration-abrupt.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected promise to be rejected, but promise was fulfilled."
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-with-non-object.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Promise for null was not rejected."
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-with-type-text.js",
-      "esid": "sec-create-text-module",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-XoSUNr/2nd-param_FIXTURE.json\": Loader(Extension { url: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-XoSUNr/2nd-param_FIXTURE.json\", extension: \"json\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-with-value-abrupt.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected promise to be rejected, but it was fulfilled"
-    },
-    {
-      "path": "language/expressions/dynamic-import/import-attributes/2nd-param-with-value-non-string.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Promise for undefined was not rejected."
-    },
-    {
       "path": "language/expressions/dynamic-import/import-errored-module.js",
       "esid": "sec-ContinueDynamicImport",
       "outcome": "fail",
-      "reason": "sloppy: Test262Error: The import should reject (first import) Expected a Error to be thrown asynchronously but got a TypeError"
+      "reason": "sloppy: Test262Error: The import should reject (second import) Expected a Error to be thrown asynchronously but no exception was thrown at all"
     },
     {
       "path": "language/expressions/dynamic-import/import-fulfilled-member-of-errored-cycle.js",
       "esid": "sec-moduleevaluation",
       "outcome": "fail",
       "reason": "sloppy: Test262Error: The import of C should reject Expected SameValue(«null», «null») to be false"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-Symbol-toStringTag.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «\"Module\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-define-own-property.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Reflect.defineProperty: local2 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-delete-exported-init-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: delete: default Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-delete-exported-init-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: Test262Error: delete: default Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-delete-non-exported-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-k0B9zp/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-k0B9zp/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-k0B9zp/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-delete-non-exported-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-TzP35D/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-TzP35D/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-TzP35D/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-extensible.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-get-nested-namespace-dflt-direct.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: ns.productionNS2: is non-configurable Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-get-own-property-str-found-init.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: local1 configurable Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-get-own-property-sym.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-get-sym-found.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"undefined\"», «\"string\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-has-property-sym-found.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: in: Symbol.toStringTag"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-own-property-keys-sort.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: stringKeys[0] === \"$\" Expected SameValue(«\"default\"», «\"$\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-prevent-extensions-object.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-CcSIrb/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-CcSIrb/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-CcSIrb/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-prevent-extensions-reflect.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-stvmoU/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-stvmoU/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-stvmoU/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-prop-descs.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: default: is non-configurable Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-set-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-set-prototype-of-null.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-KAwCPR/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-KAwCPR/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-KAwCPR/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-set-prototype-of.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-set-same-values-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-set-same-values-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/await-ns-set-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/default-property-not-set-own.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-aT03Em/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-aT03Em/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-aT03Em/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-Symbol-toStringTag.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«undefined», «\"Module\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-define-own-property.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Reflect.defineProperty: local2 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-delete-exported-init-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: delete: default Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-delete-exported-init-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: Test262Error: delete: default Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-delete-non-exported-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-bcpmDY/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-bcpmDY/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-bcpmDY/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-delete-non-exported-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-SquDzg/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-SquDzg/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-SquDzg/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-extensible.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-get-nested-namespace-dflt-direct.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: ns.productionNS2: is non-configurable Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-get-own-property-str-found-init.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: local1 configurable Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-get-own-property-sym.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-get-sym-found.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected SameValue(«\"undefined\"», «\"string\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-has-property-sym-found.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: in: Symbol.toStringTag"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-own-property-keys-sort.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: stringKeys[0] === \"$\" Expected SameValue(«\"default\"», «\"$\"») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-prevent-extensions-object.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-d6cNq5/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-d6cNq5/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-d6cNq5/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-prevent-extensions-reflect.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-PbFyUt/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-PbFyUt/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-PbFyUt/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-prop-descs.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: default: is non-configurable Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-set-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-set-prototype-of-null.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-vJYnuu/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-vJYnuu/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-vJYnuu/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-set-prototype-of.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-set-same-values-no-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "sloppy: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-set-same-values-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/namespace/promise-then-ns-set-strict.js",
-      "esid": "sec-finishdynamicimport",
-      "outcome": "fail",
-      "reason": "strict: Test262Error: Reflect.set: local1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "language/expressions/dynamic-import/reuse-namespace-object-from-script.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-ohr8Q4/empty_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-ohr8Q4/empty_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-ohr8Q4/empty_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-arrow-assignment-expression-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-arrow-assignment-expression-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-arrow-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-arrow-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-arrow-function-await-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-arrow-function-await-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-arrow-function-return-await-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-arrow-function-return-await-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-function-await-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-function-await-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-function-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-function-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-function-return-await-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-function-return-await-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-gen-await-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-async-gen-await-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-block-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-block-labeled-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-block-labeled-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-block-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-do-while-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-do-while-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-else-braceless-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-else-braceless-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-else-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-else-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-function-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-function-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-function-return-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-function-return-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-if-braceless-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-if-braceless-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-if-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-if-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-while-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-while-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-with-expression-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-with-expression-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-with-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/nested-with-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/top-level-import-defer-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "language/expressions/dynamic-import/syntax/invalid/top-level-no-new-call-expression-prop-access.js",
-      "esid": "sec-import-call-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
     },
     {
       "path": "language/expressions/dynamic-import/usage-from-eval.js",
@@ -42393,7 +41709,7 @@
       "path": "language/module-code/top-level-await/dynamic-import-of-waiting-module.js",
       "esid": "sec-ContinueDynamicImport",
       "outcome": "fail",
-      "reason": "sloppy: TypeError: dynamic import: load failed for \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-Ljzx3P/dynamic-import-of-waiting-module-2_FIXTURE.js\": Loader(Resolve { specifier: \"node:module\", referrer: \"file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-Ljzx3P/dynamic-import-of-waiting-module-2_FIXTURE.js\", message: \"Cannot find module 'node:module'; resolver context: importer `file:///private/var/folders/d1/jvgyk3g96yx22kj6d3dvz7f00000gn/T/otter-test262-Ljzx3P/dynamic-import-of-waiting-module-2_FIXTURE.js`, specifier `node:module`, import kind `esm`, conditions [otter, import, node, default]\" })"
+      "reason": "sloppy: Test262Error: The second import should not resolve before the first one"
     },
     {
       "path": "language/statements/async-generator/return-undefined-implicit-and-explicit.js",
@@ -43513,7 +42829,7 @@
     {
       "path": "intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Tue Aug 25 2026 13:15:41 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [8/25/2026, 1:15:41 PM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Tue Aug 25 2026 15:08:53 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [8/25/2026, 3:08:53 PM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
     },
     {
       "path": "intl402/Date/prototype/throws-same-exceptions-as-DateTimeFormat.js",
@@ -43541,7 +42857,7 @@
     {
       "path": "intl402/DateTimeFormat/date-time-options.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 8/25/2026, 1:15:41 PM,Tue, 8/25/2026, 1:15:41 PM, got Tue Aug 25 2026 13:15:41 GMT+0300. Expected SameValue(«-1», «-1») to be false"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 8/25/2026, 3:08:53 PM,Tue, 8/25/2026, 3:08:53 PM, got Tue Aug 25 2026 15:08:53 GMT+0300. Expected SameValue(«-1», «-1») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/ignore-invalid-unicode-ext-values.js",

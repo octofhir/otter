@@ -39,6 +39,12 @@ struct Civil {
     minute: u8,
     second: u8,
     nanosecond: u32,
+    /// The UTC instant this wall-clock tuple was derived from, when the
+    /// input carried one (epoch number, `Date`, `Temporal.Instant`,
+    /// `Temporal.ZonedDateTime`). Plain Temporal types have none — and
+    /// per §HandleDateTimeValue they never render a time-zone name, so
+    /// zone formatting keys off this field.
+    epoch_millis: Option<i64>,
 }
 
 impl Civil {
@@ -59,7 +65,13 @@ impl Civil {
             minute,
             second,
             nanosecond,
+            epoch_millis: None,
         }
+    }
+
+    fn with_epoch_millis(mut self, epoch_millis: i64) -> Self {
+        self.epoch_millis = Some(epoch_millis);
+        self
     }
 }
 
@@ -440,14 +452,40 @@ fn apply_temporal_field_intersection(
 /// every option getter in the observation order pinned by
 /// `constructor-options-order`, with ToString / ToNumber / ToBoolean
 /// coercion and RangeError validation, and a canonicalized locale.
+/// §ToDateTimeOptions `required` / `defaults` pairing for the caller
+/// (constructor vs the `Date.prototype.toLocale*String` trio).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateTimeOptionsMode {
+    /// required ~any~, defaults ~date~ — the constructor.
+    AnyDate,
+    /// required ~any~, defaults ~all~ — `toLocaleString`.
+    AnyAll,
+    /// required ~date~, defaults ~date~ — `toLocaleDateString`.
+    DateDate,
+    /// required ~time~, defaults ~time~ — `toLocaleTimeString`.
+    TimeTime,
+}
+
+/// §11.1.2 `CreateDateTimeFormat` — spec-faithful construction firing
+/// every option getter in the observation order pinned by
+/// `constructor-options-order`, with ToString / ToNumber / ToBoolean
+/// coercion and RangeError validation, and a canonicalized locale.
 pub fn resolve_ctx(
     ctx: &mut NativeCtx<'_>,
     locales: Value,
     options: Value,
 ) -> Result<DateTimeFormatPayload, NativeError> {
+    resolve_ctx_with_mode(ctx, locales, options, DateTimeOptionsMode::AnyDate)
+}
+
+pub(crate) fn resolve_ctx_with_mode(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options: Value,
+    mode: DateTimeOptionsMode,
+) -> Result<DateTimeFormatPayload, NativeError> {
     use crate::intl::helpers::{
         get_bool_option, get_number_option, get_numbering_system_option, get_string_option,
-        require_options_object,
     };
 
     let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
@@ -455,7 +493,9 @@ pub fn resolve_ctx(
         .into_iter()
         .next()
         .unwrap_or_else(|| crate::intl::helpers::DEFAULT_LOCALE.to_string());
-    let options = require_options_object(options, CLASS)?;
+    // §ToDateTimeOptions step 1 — ToObject: null throws, other primitives
+    // box to wrappers whose option reads all yield undefined.
+    let options = crate::intl::helpers::to_object_options(options, CLASS)?;
 
     // Read a validated enum option then map it through a parser (the
     // value list already rejects out-of-range values with a RangeError).
@@ -516,7 +556,7 @@ pub fn resolve_ctx(
     );
     let calendar = crate::intl::supported::canonicalize_calendar(&calendar)
         .unwrap_or_else(|| "gregory".to_string());
-    let (numbering_system, locale) = crate::intl::helpers::resolve_unicode_keyword(
+    let (numbering_system, mut locale) = crate::intl::helpers::resolve_unicode_keyword(
         &locale,
         "nu",
         get_numbering_system_option(ctx, options, CLASS)?,
@@ -548,6 +588,15 @@ pub fn resolve_ctx(
         Some(false) => DtHourCycle::H23,
         None => hour_cycle_option.or(hc_extension).unwrap_or(default_hc),
     });
+    // §ResolveLocale — an `-u-hc-` extension survives into the resolved
+    // locale only when it is the value actually in effect; an `hour12`
+    // option or a different `hourCycle` option overrides it and drops it
+    // from [[Locale]].
+    if let Some(extension) = hc_extension
+        && Some(extension) != hour_cycle
+    {
+        locale = crate::intl::helpers::strip_unicode_extension_key(&locale, "hc");
+    }
     // §11.1.2 — the timeZone option must name an available IANA zone
     // (matched case-insensitively, reported in canonical case) or be a
     // normalized offset string; anything else is a RangeError. Route
@@ -573,9 +622,9 @@ pub fn resolve_ctx(
     let mut month = enum_opt!("month", MONTH, parse_month_width);
     let mut day = enum_opt!("day", NUM, parse_num_width);
     let day_period = enum_opt!("dayPeriod", TEXT, parse_text_width);
-    let hour = enum_opt!("hour", NUM, parse_num_width);
-    let minute = enum_opt!("minute", NUM, parse_num_width);
-    let second = enum_opt!("second", NUM, parse_num_width);
+    let mut hour = enum_opt!("hour", NUM, parse_num_width);
+    let mut minute = enum_opt!("minute", NUM, parse_num_width);
+    let mut second = enum_opt!("second", NUM, parse_num_width);
     // fractionalSecondDigits — integer 1..=3 (RangeError otherwise).
     let fractional_second_digits = get_number_option(
         ctx,
@@ -611,7 +660,8 @@ pub fn resolve_ctx(
         || hour.is_some()
         || minute.is_some()
         || second.is_some()
-        || fractional_second_digits.is_some();
+        || fractional_second_digits.is_some()
+        || time_zone_name.is_some();
     // §11.1.2 step — `hasExplicitFormatComponents` with a style set is a
     // TypeError (not a RangeError).
     if (date_style.is_some() || time_style.is_some()) && has_components {
@@ -622,27 +672,65 @@ pub fn resolve_ctx(
         });
     }
 
-    // §ToDateTimeOptions(options, "date") `needDefaults` keys off the
-    // weekday/year/month/day (date) and dayPeriod/hour/minute/second/
-    // fractionalSecondDigits (time) component sets — `era` does NOT count
-    // (`{ era }` alone still defaults to numeric year/month/day). When
-    // neither a style nor any of those is present, fill numeric
-    // year/month/day. The `Temporal.*.prototype.toLocaleString` paths
-    // re-derive type-appropriate components at format time (see
-    // `apply_temporal_defaults`) from this bare-date default.
-    let needs_defaults = weekday.is_none()
-        && year.is_none()
-        && month.is_none()
-        && day.is_none()
-        && day_period.is_none()
+    // §ToDateTimeOptions `needDefaults` keys off the required component
+    // set — weekday/year/month/day for ~date~, dayPeriod/hour/minute/
+    // second/fractionalSecondDigits for ~time~, both for ~any~ — `era`
+    // does NOT count (`{ era }` alone still defaults). A style also
+    // suppresses defaults, and a style conflicting with the caller's
+    // `required` set is a TypeError. When defaults apply, fill numeric
+    // components per the caller's `defaults` set. The
+    // `Temporal.*.prototype.toLocaleString` paths re-derive
+    // type-appropriate components at format time (see
+    // `apply_temporal_defaults`) from the constructor's bare-date
+    // default.
+    let date_components_absent =
+        weekday.is_none() && year.is_none() && month.is_none() && day.is_none();
+    let time_components_absent = day_period.is_none()
         && hour.is_none()
         && minute.is_none()
         && second.is_none()
         && fractional_second_digits.is_none();
+    let needs_defaults = match mode {
+        DateTimeOptionsMode::AnyDate | DateTimeOptionsMode::AnyAll => {
+            date_components_absent && time_components_absent
+        }
+        DateTimeOptionsMode::DateDate => date_components_absent,
+        DateTimeOptionsMode::TimeTime => time_components_absent,
+    };
+    match mode {
+        DateTimeOptionsMode::DateDate if time_style.is_some() => {
+            return Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "timeStyle is not allowed when only a date is requested".to_string(),
+            });
+        }
+        DateTimeOptionsMode::TimeTime if date_style.is_some() => {
+            return Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "dateStyle is not allowed when only a time is requested".to_string(),
+            });
+        }
+        _ => {}
+    }
     if date_style.is_none() && time_style.is_none() && needs_defaults {
-        year = Some(DtNumWidth::Numeric);
-        month = Some(DtMonthWidth::Numeric);
-        day = Some(DtNumWidth::Numeric);
+        if matches!(
+            mode,
+            DateTimeOptionsMode::AnyDate
+                | DateTimeOptionsMode::AnyAll
+                | DateTimeOptionsMode::DateDate
+        ) {
+            year = Some(DtNumWidth::Numeric);
+            month = Some(DtMonthWidth::Numeric);
+            day = Some(DtNumWidth::Numeric);
+        }
+        if matches!(
+            mode,
+            DateTimeOptionsMode::AnyAll | DateTimeOptionsMode::TimeTime
+        ) {
+            hour = Some(DtNumWidth::Numeric);
+            minute = Some(DtNumWidth::Numeric);
+            second = Some(DtNumWidth::Numeric);
+        }
     }
 
     Ok(DateTimeFormatPayload {
@@ -733,6 +821,35 @@ fn bound_format_call(
         apply_temporal_field_intersection(&mut payload, arg, "format", ctx.heap())?;
     }
     let civil = arg_to_civil(ctx, args.first(), "format", &payload)?;
+    let formatted = format_components(civil, &payload);
+    Ok(Value::string(JsString::from_str(
+        &formatted,
+        ctx.heap_mut(),
+    )?))
+}
+
+/// Shared `Date.prototype.toLocaleString` / `toLocaleDateString` /
+/// `toLocaleTimeString` body — §21.4.4.38-.40: construct a fresh
+/// `DateTimeFormat` with the caller's required/defaults pairing and
+/// format the receiver's `[[DateValue]]`.
+pub(crate) fn date_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    epoch_millis: f64,
+    args: &[Value],
+    mode: DateTimeOptionsMode,
+) -> Result<Value, NativeError> {
+    if epoch_millis.is_nan() {
+        return Ok(Value::string(JsString::from_str(
+            "Invalid Date",
+            ctx.heap_mut(),
+        )?));
+    }
+    let locales = args.first().copied().unwrap_or_else(Value::undefined);
+    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+    let payload = resolve_ctx_with_mode(ctx, locales, options, mode)?;
+    let millis = epoch_millis as i64;
+    let civil =
+        epoch_millis_to_civil_for_payload(&mut ctx.interp_mut().local_time_zone, millis, &payload);
     let formatted = format_components(civil, &payload);
     Ok(Value::string(JsString::from_str(
         &formatted,
@@ -1068,6 +1185,10 @@ fn range_payload(
         });
     }
     let mut filtered = payload.clone();
+    // Same §HandleDateTimeValue pipeline as `format`: a bare-default
+    // formatter substitutes the endpoint type's components before the
+    // relevant-field intersection runs.
+    apply_temporal_defaults(&mut filtered, start, heap);
     apply_temporal_field_intersection(&mut filtered, start, name, heap)?;
     Ok(filtered)
 }
@@ -1344,6 +1465,25 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     builder.time_precision = payload_time_precision(payload);
     builder.year_style = payload_year_style(payload);
     if builder.date_fields.is_none() && builder.time_precision.is_some() {
+        if let Some(zone_style) = payload_zone_style(payload)
+            && let Some(zone) = icu_zone_info(civil, payload)
+        {
+            builder.zone_style = Some(zone_style);
+            let fieldset = builder.build_composite().ok()?;
+            let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+            let zdt = icu_time::ZonedDateTime {
+                date: Date::try_new_iso(civil.year, civil.month, civil.day).ok()?,
+                time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond)
+                    .ok()?,
+                zone,
+            };
+            let mut formatted = formatter.format(&zdt).to_string();
+            localize_fraction_separator(&mut formatted, payload);
+            pad_two_digit_hour(&mut formatted, payload);
+            normalize_day_period_separator(&mut formatted, payload);
+            substitute_flexible_day_period(&mut formatted, civil, payload);
+            return Some(formatted);
+        }
         let fieldset = builder.build_time().ok()?;
         let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
         let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
@@ -1355,9 +1495,28 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         append_time_zone_text(&mut formatted, payload);
         return Some(formatted);
     }
-    // Date + time without a zone — input is a plain `DateTime`, no
-    // `TimeZoneInfo` required (zone formatting lands with the timeZone
-    // option work).
+    // An instant-bearing input with a zone-rendering formatter formats
+    // through ICU's zone machinery (localized specific/generic names and
+    // offsets); everything else is a plain `DateTime`.
+    if let Some(zone_style) = payload_zone_style(payload)
+        && let Some(zone) = icu_zone_info(civil, payload)
+    {
+        builder.zone_style = Some(zone_style);
+        let fieldset = builder.build_composite().ok()?;
+        let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+        let zdt = icu_time::ZonedDateTime {
+            date: Date::try_new_iso(civil.year, civil.month, civil.day).ok()?,
+            time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?,
+            zone,
+        };
+        let mut formatted = formatter.format(&zdt).to_string();
+        localize_fraction_separator(&mut formatted, payload);
+        pad_two_digit_hour(&mut formatted, payload);
+        normalize_day_period_separator(&mut formatted, payload);
+        substitute_flexible_day_period(&mut formatted, civil, payload);
+        shorten_short_style_year(&mut formatted, civil, payload);
+        return Some(formatted);
+    }
     let fieldset = builder.build_composite_datetime().ok()?;
     let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
     let dt = DateTime {
@@ -1369,6 +1528,7 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     pad_two_digit_hour(&mut formatted, payload);
     normalize_day_period_separator(&mut formatted, payload);
     substitute_flexible_day_period(&mut formatted, civil, payload);
+    shorten_short_style_year(&mut formatted, civil, payload);
     append_time_zone_text(&mut formatted, payload);
     Some(formatted)
 }
@@ -1467,6 +1627,26 @@ fn icu_format_segments(
     builder.date_fields = payload_date_fields(payload);
     builder.time_precision = payload_time_precision(payload);
     builder.year_style = payload_year_style(payload);
+    if let Some(zone_style) = payload_zone_style(payload)
+        && let Some(zone) = icu_zone_info(civil, payload)
+    {
+        builder.zone_style = Some(zone_style);
+        let fieldset = builder.build_composite().ok()?;
+        let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+        let zdt = icu_time::ZonedDateTime {
+            date: Date::try_new_iso(civil.year, civil.month, civil.day).ok()?,
+            time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?,
+            zone,
+        };
+        let mut sink = DateTimePartCollector {
+            segments: Vec::new(),
+            current: "literal",
+        };
+        formatter.format(&zdt).write_to_parts(&mut sink).ok()?;
+        substitute_flexible_day_period_parts(&mut sink.segments, civil, payload);
+        shorten_short_style_year_parts(&mut sink.segments, civil, payload);
+        return Some(sink.segments);
+    }
     if builder.date_fields.is_none() && builder.time_precision.is_some() {
         let fieldset = builder.build_time().ok()?;
         let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
@@ -1492,8 +1672,66 @@ fn icu_format_segments(
     };
     formatter.format(&dt).write_to_parts(&mut sink).ok()?;
     substitute_flexible_day_period_parts(&mut sink.segments, civil, payload);
+    shorten_short_style_year_parts(&mut sink.segments, civil, payload);
     append_time_zone_part(&mut sink.segments, payload);
     Some(sink.segments)
+}
+
+/// The ICU zone style this formatter renders, when it renders one:
+/// an explicit `timeZoneName` maps directly, and `timeStyle: "full"` /
+/// `"long"` imply the long / short specific non-location names their
+/// CLDR patterns carry.
+fn payload_zone_style(
+    payload: &DateTimeFormatPayload,
+) -> Option<icu_datetime::fieldsets::builder::ZoneStyle> {
+    use icu_datetime::fieldsets::builder::ZoneStyle;
+    if let Some(zone_name) = payload.time_zone_name {
+        return Some(match zone_name {
+            DtZoneName::Long => ZoneStyle::SpecificLong,
+            DtZoneName::Short => ZoneStyle::SpecificShort,
+            DtZoneName::ShortOffset => ZoneStyle::LocalizedOffsetShort,
+            DtZoneName::LongOffset => ZoneStyle::LocalizedOffsetLong,
+            DtZoneName::ShortGeneric => ZoneStyle::GenericShort,
+            DtZoneName::LongGeneric => ZoneStyle::GenericLong,
+        });
+    }
+    match payload.time_style {
+        Some(DtStyle::Full) => Some(ZoneStyle::SpecificLong),
+        Some(DtStyle::Long) => Some(ZoneStyle::SpecificShort),
+        _ => None,
+    }
+}
+
+/// UTC offset of `zone` at `epoch_millis`, in seconds.
+fn zone_offset_seconds(epoch_millis: i64, zone: &str) -> Option<i32> {
+    let tz = temporal_rs::TimeZone::try_from_str(zone).ok()?;
+    let nanos = i128::from(epoch_millis) * 1_000_000;
+    let zdt =
+        temporal_rs::ZonedDateTime::try_new(nanos, tz, temporal_rs::Calendar::default()).ok()?;
+    i32::try_from(zdt.offset_nanoseconds() / 1_000_000_000).ok()
+}
+
+/// The fully-resolved ICU time-zone input for this civil instant, when
+/// the formatter both renders a zone and formats an instant-bearing
+/// value (a plain Temporal type has no instant — and never a zone name).
+fn icu_zone_info(
+    civil: Civil,
+    payload: &DateTimeFormatPayload,
+) -> Option<icu_time::TimeZoneInfo<icu_time::zone::models::AtTime>> {
+    use icu_datetime::input::{Date, Time};
+    use icu_time::zone::{IanaParser, UtcOffset};
+
+    let epoch_millis = civil.epoch_millis?;
+    let iana = payload.time_zone.as_deref()?;
+    let time_zone = IanaParser::new().parse(iana);
+    let offset = zone_offset_seconds(epoch_millis, iana)?;
+    let date = Date::try_new_iso(civil.year, civil.month, civil.day).ok()?;
+    let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
+    Some(
+        time_zone
+            .with_offset(UtcOffset::try_from_seconds(offset).ok())
+            .at_date_time(icu_time::DateTime { date, time }),
+    )
 }
 
 fn time_zone_display_name(payload: &DateTimeFormatPayload) -> Option<String> {
@@ -1624,6 +1862,51 @@ fn is_localized_digit(ch: char, payload: &DateTimeFormatPayload) -> bool {
         .into_iter()
         .flatten()
         .any(|digit| digit.starts_with(ch))
+}
+
+/// CLDR's `en` short date pattern abbreviates the year to two digits
+/// (`M/d/yy`); ICU4X's semantic skeletons never emit a two-digit year,
+/// so the full year in a `dateStyle: "short"` rendering is shortened
+/// after the fact. Parts renderings adjust the `year` segment instead.
+fn shorten_short_style_year(formatted: &mut String, civil: Civil, payload: &DateTimeFormatPayload) {
+    if !matches!(payload.date_style, Some(DtStyle::Short)) {
+        return;
+    }
+    if !(0..=9999).contains(&civil.year) {
+        return;
+    }
+    let full = localize_ascii_digits(&civil.year.to_string(), payload);
+    if full.chars().count() < 3 {
+        return;
+    }
+    let two = localize_ascii_digits(&format!("{:02}", civil.year.rem_euclid(100)), payload);
+    if let Some(idx) = formatted.rfind(&full) {
+        formatted.replace_range(idx..idx + full.len(), &two);
+    }
+}
+
+fn shorten_short_style_year_parts(
+    parts: &mut [(&'static str, String)],
+    civil: Civil,
+    payload: &DateTimeFormatPayload,
+) {
+    if !matches!(payload.date_style, Some(DtStyle::Short)) {
+        return;
+    }
+    if !(0..=9999).contains(&civil.year) {
+        return;
+    }
+    let full = localize_ascii_digits(&civil.year.to_string(), payload);
+    if full.chars().count() < 3 {
+        return;
+    }
+    let two = localize_ascii_digits(&format!("{:02}", civil.year.rem_euclid(100)), payload);
+    for (kind, text) in parts.iter_mut() {
+        if *kind == "year" && *text == full {
+            *text = two;
+            break;
+        }
+    }
 }
 
 fn pad_two_digit_hour(formatted: &mut String, payload: &DateTimeFormatPayload) {
@@ -1944,7 +2227,7 @@ fn epoch_millis_to_civil_for_payload(
     epoch_millis: i64,
     payload: &DateTimeFormatPayload,
 ) -> Civil {
-    match payload.time_zone.as_deref() {
+    let civil = match payload.time_zone.as_deref() {
         None => crate::date::local_broken_down(zone, epoch_millis as f64)
             .map(civil_from_broken_down)
             .unwrap_or_else(|| epoch_millis_to_civil(epoch_millis)),
@@ -1956,7 +2239,8 @@ fn epoch_millis_to_civil_for_payload(
         Some(zone) => {
             zoned_civil(epoch_millis, zone).unwrap_or_else(|| epoch_millis_to_civil(epoch_millis))
         }
-    }
+    };
+    civil.with_epoch_millis(epoch_millis)
 }
 
 /// Wall-clock components of `epoch_millis` in `zone`, via

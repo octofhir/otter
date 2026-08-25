@@ -193,6 +193,26 @@ pub fn coerce_options_object(options: Value, class: &'static str) -> Result<Valu
     Ok(Value::undefined())
 }
 
+/// `ToObject(options)` per §ToDateTimeOptions step 1 — `undefined` stays
+/// an absent bag, `null` (and nothing else) throws TypeError, an object
+/// passes through, and any other primitive boxes to a wrapper with no
+/// relevant own properties, modelled as an absent bag.
+pub fn to_object_options(options: Value, class: &'static str) -> Result<Value, NativeError> {
+    if options.is_undefined() {
+        return Ok(Value::undefined());
+    }
+    if options.is_null() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options cannot be null".to_string(),
+        });
+    }
+    if options.is_object_type() || options.as_array().is_some() {
+        return Ok(options);
+    }
+    Ok(Value::undefined())
+}
+
 /// `[[Get]]` on the options bag (firing a getter), treating an absent
 /// (`undefined`) bag as one whose every read yields `undefined`.
 fn option_get(

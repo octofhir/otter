@@ -1,22 +1,22 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `cf1c35377021dc91e94005c5ccde8c3eed1d23f9`
+- **Engine commit:** `62f668797e30f154323af16e60316af909ece1b3`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-25T15:51:49.169180+00:00
+- **Captured:** 2026-08-25T20:03:37.853973+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 51855 |
-| failed     | 504 |
+| passed     | 51903 |
+| failed     | 456 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.04%
+**Pass rate (excl. skipped):** 99.13%
 
 ## Top failing sections (top 50)
 
@@ -31,9 +31,7 @@
 | intl402/Locale/prototype | 107 | 93 | 14 | 86.9% |
 | staging/sm/class | 94 | 80 | 14 | 85.1% |
 | intl402/Temporal/PlainDate | 493 | 481 | 12 | 97.6% |
-| language/expressions/compound-assignment | 454 | 443 | 11 | 97.6% |
 | staging/sm/RegExp | 91 | 80 | 11 | 87.9% |
-| built-ins/Promise/prototype | 124 | 114 | 10 | 91.9% |
 | intl402/Temporal/PlainDateTime | 483 | 473 | 10 | 97.9% |
 | intl402/Temporal/PlainYearMonth | 327 | 318 | 9 | 97.2% |
 | staging/sm/Array | 90 | 81 | 9 | 90.0% |
@@ -55,48 +53,30 @@
 | built-ins/Temporal/PlainYearMonth | 509 | 504 | 5 | 99.0% |
 | intl402/PluralRules/prototype | 34 | 29 | 5 | 85.3% |
 | intl402/Temporal/Instant | 17 | 12 | 5 | 70.6% |
-| language/statements/for-await-of | 1234 | 1227 | 5 | 99.6% |
-| language/expressions/assignment | 485 | 481 | 4 | 99.2% |
 | staging/sm/PrivateName | 17 | 13 | 4 | 76.5% |
 | staging/sm/fields | 8 | 4 | 4 | 50.0% |
 | staging/sm/strict | 51 | 47 | 4 | 92.2% |
 | built-ins/Temporal/Now | 66 | 63 | 3 | 95.5% |
 | built-ins/Temporal/PlainDate | 652 | 649 | 3 | 99.5% |
 | intl402/Temporal/PlainTime | 12 | 9 | 3 | 75.0% |
-| language/statements/async-generator | 301 | 298 | 3 | 99.0% |
 | staging/sm/Reflect | 17 | 14 | 3 | 82.4% |
 | staging/sm/eval | 20 | 17 | 3 | 85.0% |
 | staging/sm/object | 65 | 62 | 3 | 95.4% |
-| built-ins/AsyncFromSyncIteratorPrototype/next | 13 | 11 | 2 | 84.6% |
-| built-ins/AsyncFromSyncIteratorPrototype/throw | 15 | 13 | 2 | 86.7% |
 | intl402/Array/prototype | 2 | 0 | 2 | 0.0% |
 | intl402/BigInt/prototype | 11 | 9 | 2 | 81.8% |
 | intl402/Date/prototype | 12 | 10 | 2 | 83.3% |
+| language/import/import-defer | 103 | 100 | 2 | 98.0% |
+| staging/sm/BigInt | 5 | 3 | 2 | 60.0% |
+| staging/sm/syntax | 11 | 9 | 2 | 81.8% |
+| annexB/language/function-code | 159 | 158 | 1 | 99.4% |
+| built-ins/Temporal/keys.js | 1 | 0 | 1 | 0.0% |
+| built-ins/Temporal/toStringTag | 2 | 1 | 1 | 50.0% |
+| intl402/DateTimeFormat/constructor-options-invalid-explicit-components.js | 1 | 0 | 1 | 0.0% |
 
 ## Top failing-test patterns (top 100)
 
 | Outcome | Reason (truncated) | Path |
 |---|---|---|
-| fail | sloppy: Test262Error: iterator closed properly Expected SameValue(«0», «1») to b… | `built-ins/AsyncFromSyncIteratorPrototype/next/iterator-result-poisoned-wrapper.js` |
-| fail | sloppy: Test262Error: iterator closed properly Expected SameValue(«0», «1») to b… | `built-ins/AsyncFromSyncIteratorPrototype/next/next-result-poisoned-wrapper.js` |
-| fail | sloppy: Test262Error: iterator closed properly Expected SameValue(«0», «1») to b… | `built-ins/AsyncFromSyncIteratorPrototype/throw/throw-result-poisoned-wrapper.js` |
-| fail | sloppy: Test262Error: Promise should be rejected Expected a CatchError to be thr… | `built-ins/AsyncFromSyncIteratorPrototype/throw/throw-undefined-poisoned-return.js` |
-| fail | sloppy: Error: ignored exception     at executor (built-ins/Promise/exception-af… | `built-ins/Promise/exception-after-resolve-in-executor.js` |
-| fail | sloppy: [object Object] | `built-ins/Promise/exception-after-resolve-in-thenable-job.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«4», «5») to be true | `built-ins/Promise/prototype/finally/rejected-observable-then-calls-PromiseResolve.js` |
-| fail | sloppy: Test262Error: `then` invoked with one argument Expected SameValue(«2», «… | `built-ins/Promise/prototype/finally/rejected-observable-then-calls-argument.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«4», «5») to be true | `built-ins/Promise/prototype/finally/resolved-observable-then-calls-PromiseResolve.js` |
-| fail | sloppy: Test262Error: 7 new promises were created Expected SameValue(«6», «7») t… | `built-ins/Promise/prototype/finally/species-constructor.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«6», «7») to be true | `built-ins/Promise/prototype/finally/subclass-reject-count.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«6», «7») to be true | `built-ins/Promise/prototype/finally/subclass-resolve-count.js` |
-| fail | sloppy: The promise should be fulfilled with the resolution value of the provide… | `built-ins/Promise/prototype/then/resolve-pending-fulfilled-prms-cstm-then.js` |
-| fail | sloppy: The promise should be fulfilled with the resolution value of the provide… | `built-ins/Promise/prototype/then/resolve-pending-rejected-prms-cstm-then.js` |
-| fail | sloppy: The promise should be fulfilled with the resolution value of the provide… | `built-ins/Promise/prototype/then/resolve-settled-fulfilled-prms-cstm-then.js` |
-| fail | sloppy: The promise should be fulfilled with the resolution value of the provide… | `built-ins/Promise/prototype/then/resolve-settled-rejected-prms-cstm-then.js` |
-| fail | sloppy: c | `built-ins/Promise/race/resolved-then-catch-finally.js` |
-| fail | sloppy: The promise should be fulfilled with the provided value. | `built-ins/Promise/resolve-prms-cstm-then-deferred.js` |
-| fail | sloppy: The promise should be fulfilled with the provided value. | `built-ins/Promise/resolve-prms-cstm-then-immed.js` |
-| fail | sloppy: Test262Error: error thrown from callback must become a rejection Expecte… | `built-ins/Promise/try/throws.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Du… | `built-ins/Temporal/Duration/compare/order-of-operations.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour pro… | `built-ins/Temporal/Duration/compare/relativeto-propertybag-infinity-throws-rangeerror.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: case whe… | `built-ins/Temporal/Duration/from/argument-duration-precision-exact-numerical-values.js` |
@@ -177,4 +157,24 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration… | `built-ins/Temporal/ZonedDateTime/prototype/until/float64-representable-integer.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/prototype/until/order-of-operations.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/with/disambiguation-invalid-string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Exp… | `built-ins/Temporal/ZonedDateTime/prototype/with/disambiguation-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/with/invalid-disambiguation.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/with/invalid-offset.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/with/minimum-instant-with-one-hour-offset.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/with/offset-invalid-string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: "00:00 i… | `built-ins/Temporal/ZonedDateTime/prototype/with/offset-property-invalid-string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Exp… | `built-ins/Temporal/ZonedDateTime/prototype/with/offset-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/prototype/with/options-read-before-algorithmic-validation.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial … | `built-ins/Temporal/ZonedDateTime/prototype/with/options-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/prototype/with/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/ZonedDateTime/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: An ISO s… | `built-ins/Temporal/ZonedDateTime/timezone-iso-string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/keys.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: Ord… | `built-ins/Temporal/toStringTag/string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: argume… | `language/eval-code/direct/arrow-fn-body-cntns-arguments-func-decl-arrow-func-declare-arguments-assign-incl-def-param-arrow-arguments.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: argume… | `language/eval-code/direct/arrow-fn-body-cntns-arguments-var-bind-arrow-func-declare-arguments-assign-incl-def-param-arrow-arguments.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct e… | `language/eval-code/direct/global-env-rec-with.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: non stri… | `language/eval-code/direct/lex-env-heritage.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: binding … | `language/eval-code/direct/var-env-func-init-local-new-delete.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `language/eval-code/direct/var-env-lower-lex-non-strict.js` |
 

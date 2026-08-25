@@ -148,7 +148,9 @@ impl RuntimeCall<'_> {
                     .filter(|depth| *depth != 0)
                     .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
                 self.with_frame(|frame| {
-                    vm.load_shadowed_upvalue_value(context, frame, name_idx, index, eval_depth)
+                    vm.load_shadowed_upvalue_value(
+                        context, frame, name_idx, index, eval_depth, None,
+                    )
                 })
             }
             BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
@@ -240,6 +242,7 @@ impl RuntimeCall<'_> {
                         policy.eval_depth,
                         policy.fallback,
                         value0,
+                        None,
                     )
                 })
                 .map(|()| Value::undefined())

@@ -1336,6 +1336,23 @@ pub enum Op {
     /// the bounded physical eval depth with mutable checked assignment,
     /// immutable throw, or immutable silent fallback behavior.
     StoreShadowedUpvalueChecked,
+    /// `EvalBindingSeq dst` — snapshot the isolate's monotonically
+    /// increasing eval-binding sequence into `dst`. §13.15.2 resolves an
+    /// assignment target's reference BEFORE the RHS runs; bindings a
+    /// direct eval introduces during the RHS carry later sequence numbers,
+    /// so the snapshot-filtered load/store variants below see exactly the
+    /// pre-RHS environment.
+    EvalBindingSeq,
+    /// `LoadShadowedUpvalueSnap dst, name_const, upvalue_idx, eval_depth,
+    /// snapshot_reg` — [`Op::LoadShadowedUpvalue`] restricted to
+    /// eval-chain bindings created before the snapshot in `snapshot_reg`.
+    LoadShadowedUpvalueSnap,
+    /// `StoreShadowedUpvalueCheckedSnap value, name_const, upvalue_idx,
+    /// policy, snapshot_reg` — [`Op::StoreShadowedUpvalueChecked`]
+    /// restricted the same way, so PutValue writes through the reference
+    /// resolved before the RHS even when the RHS's direct eval shadowed
+    /// the name.
+    StoreShadowedUpvalueCheckedSnap,
     /// `DeleteShadowedUpvalue dst, name_const, upvalue_idx, eval_depth` —
     /// delete a nearer binding only within the bounded inner eval prefix. If
     /// the name still resolves to the captured declarative binding, leave it
@@ -1520,6 +1537,9 @@ impl Op {
             Op::PrivateBrandCheck => "PRIVATE_BRAND_CHECK",
             Op::LoadShadowedUpvalue => "LOAD_SHADOWED_UPVALUE",
             Op::StoreShadowedUpvalueChecked => "STORE_SHADOWED_UPVALUE_CHECKED",
+            Op::EvalBindingSeq => "EVAL_BINDING_SEQ",
+            Op::LoadShadowedUpvalueSnap => "LOAD_SHADOWED_UPVALUE_SNAP",
+            Op::StoreShadowedUpvalueCheckedSnap => "STORE_SHADOWED_UPVALUE_CHECKED_SNAP",
             Op::DeleteShadowedUpvalue => "DELETE_SHADOWED_UPVALUE",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
@@ -1549,6 +1569,8 @@ impl Op {
         }
         match self {
             Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => 0,
+            Op::EvalBindingSeq => 1,
+            Op::LoadShadowedUpvalueSnap | Op::StoreShadowedUpvalueCheckedSnap => 5,
             Op::LoadUndefined
             | Op::LoadHole
             | Op::LoadNull

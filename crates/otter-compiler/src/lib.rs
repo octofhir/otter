@@ -943,16 +943,20 @@ function outer() {
             .find(|function| function.name == "hot")
             .expect("hot function");
         assert!(
-            hot.code
-                .iter()
-                .any(|instruction| instruction.op == Op::LoadShadowedUpvalue),
+            hot.code.iter().any(|instruction| matches!(
+                instruction.op,
+                Op::LoadShadowedUpvalue | Op::LoadShadowedUpvalueSnap
+            )),
             "compound/logical reads must probe eval shadow: {:?}",
             hot.code
         );
         assert_eq!(
             hot.code
                 .iter()
-                .filter(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+                .filter(|instruction| matches!(
+                    instruction.op,
+                    Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+                ))
                 .count(),
             3,
             "plain, compound, and logical stores share the typed family"
@@ -970,17 +974,19 @@ function outer() {
             .find(|function| function.name == "descendant")
             .expect("descendant function");
         assert!(
-            descendant
-                .code
-                .iter()
-                .any(|instruction| instruction.op == Op::LoadShadowedUpvalue),
+            descendant.code.iter().any(|instruction| matches!(
+                instruction.op,
+                Op::LoadShadowedUpvalue | Op::LoadShadowedUpvalueSnap
+            )),
             "a descendant closure inherits the leaking eval chain"
         );
         for instruction in hot.code.iter().filter(|instruction| {
             matches!(
                 instruction.op,
                 Op::LoadShadowedUpvalue
+                    | Op::LoadShadowedUpvalueSnap
                     | Op::StoreShadowedUpvalueChecked
+                    | Op::StoreShadowedUpvalueCheckedSnap
                     | Op::DeleteShadowedUpvalue
             )
         }) {
@@ -988,7 +994,10 @@ function outer() {
                 Some(Operand::Imm32(encoded)) => encoded,
                 other => panic!("shadow depth/policy must be an immediate: {other:?}"),
             };
-            let depth = if instruction.op == Op::StoreShadowedUpvalueChecked {
+            let depth = if matches!(
+                instruction.op,
+                Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+            ) {
                 otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(encoded)
                     .expect("valid store policy")
                     .eval_depth
@@ -1024,7 +1033,9 @@ function outer() {
                 matches!(
                     instruction.op,
                     Op::LoadShadowedUpvalue
+                        | Op::LoadShadowedUpvalueSnap
                         | Op::StoreShadowedUpvalueChecked
+                        | Op::StoreShadowedUpvalueCheckedSnap
                         | Op::DeleteShadowedUpvalue
                 )
             })
@@ -1039,7 +1050,10 @@ function outer() {
                 Some(Operand::Imm32(encoded)) => encoded,
                 other => panic!("shadow depth/policy must be an immediate: {other:?}"),
             };
-            let depth = if instruction.op == Op::StoreShadowedUpvalueChecked {
+            let depth = if matches!(
+                instruction.op,
+                Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+            ) {
                 otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(encoded)
                     .expect("valid store policy")
                     .eval_depth
@@ -1145,14 +1159,20 @@ function owner() {
         for instruction in leaf.code.iter().filter(|instruction| {
             matches!(
                 instruction.op,
-                Op::LoadShadowedUpvalue | Op::StoreShadowedUpvalueChecked
+                Op::LoadShadowedUpvalue
+                    | Op::LoadShadowedUpvalueSnap
+                    | Op::StoreShadowedUpvalueChecked
+                    | Op::StoreShadowedUpvalueCheckedSnap
             )
         }) {
             let encoded = match leaf.code.operand(instruction, 3) {
                 Some(Operand::Imm32(encoded)) => encoded,
                 other => panic!("shadow depth/policy must be an immediate: {other:?}"),
             };
-            let depth = if instruction.op == Op::StoreShadowedUpvalueChecked {
+            let depth = if matches!(
+                instruction.op,
+                Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+            ) {
                 otter_bytecode::opcode_schema::ShadowedUpvalueStorePolicy::from_imm32(encoded)
                     .expect("valid store policy")
                     .eval_depth
@@ -1186,7 +1206,12 @@ function outer() {
         let store = hot
             .code
             .iter()
-            .find(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+            .find(|instruction| {
+                matches!(
+                    instruction.op,
+                    Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+                )
+            })
             .expect("shadowed const store");
         let policy = match hot.code.operand(store, 3) {
             Some(Operand::Imm32(encoded)) => {
@@ -1220,12 +1245,10 @@ function outer() {
             .iter()
             .find(|function| function.name == "selfName")
             .expect("named function expression");
-        assert!(
-            function
-                .code
-                .iter()
-                .any(|instruction| instruction.op == Op::LoadShadowedUpvalue)
-        );
+        assert!(function.code.iter().any(|instruction| matches!(
+            instruction.op,
+            Op::LoadShadowedUpvalue | Op::LoadShadowedUpvalueSnap
+        )));
         assert!(
             function
                 .code
@@ -1235,7 +1258,12 @@ function outer() {
         let stores = function
             .code
             .iter()
-            .filter(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+            .filter(|instruction| {
+                matches!(
+                    instruction.op,
+                    Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+                )
+            })
             .collect::<Vec<_>>();
         assert!(
             stores.len() >= 4,
@@ -1276,7 +1304,10 @@ function outer() {
         assert_eq!(
             hot.code
                 .iter()
-                .filter(|instruction| instruction.op == Op::StoreShadowedUpvalueChecked)
+                .filter(|instruction| matches!(
+                    instruction.op,
+                    Op::StoreShadowedUpvalueChecked | Op::StoreShadowedUpvalueCheckedSnap
+                ))
                 .count(),
             3,
             "all assignment forms resolve the eval shadow at their store site"

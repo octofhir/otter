@@ -1666,7 +1666,63 @@ impl Interpreter {
                     let policy = function.imm32(instr, 3).unwrap_or(0);
                     let frame = &mut stack[top_idx];
                     self.run_store_shadowed_upvalue_checked_reg(
-                        context, frame, value_reg, name_idx, uv_idx, policy,
+                        context, frame, value_reg, name_idx, uv_idx, policy, None,
+                    )?;
+                    continue;
+                }
+                // §13.15.2 — snapshot the eval-binding sequence so the
+                // assignment target's reference resolves before the RHS.
+                Op::EvalBindingSeq => {
+                    let dst = instr.reg(0);
+                    let seq = self.current_eval_binding_seq();
+                    let frame = &mut stack[top_idx];
+                    crate::write_register(frame, dst, Value::number_f64(seq as f64))?;
+                    frame.advance_pc()?;
+                    continue;
+                }
+                Op::LoadShadowedUpvalueSnap => {
+                    let dst = function.reg(instr, 0);
+                    let name_idx = function
+                        .const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
+                    let eval_depth = function.imm32(instr, 3).unwrap_or(i32::MAX) as u32;
+                    let snapshot = crate::jit_control_ops::read_snapshot_register(
+                        &stack[top_idx],
+                        function.reg(instr, 4),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_shadowed_upvalue_snap_reg(
+                        context,
+                        frame,
+                        dst,
+                        name_idx,
+                        uv_idx,
+                        eval_depth,
+                        Some(snapshot),
+                    )?;
+                    continue;
+                }
+                Op::StoreShadowedUpvalueCheckedSnap => {
+                    let value_reg = function.reg(instr, 0);
+                    let name_idx = function
+                        .const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
+                    let policy = function.imm32(instr, 3).unwrap_or(0);
+                    let snapshot = crate::jit_control_ops::read_snapshot_register(
+                        &stack[top_idx],
+                        function.reg(instr, 4),
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_shadowed_upvalue_checked_reg(
+                        context,
+                        frame,
+                        value_reg,
+                        name_idx,
+                        uv_idx,
+                        policy,
+                        Some(snapshot),
                     )?;
                     continue;
                 }

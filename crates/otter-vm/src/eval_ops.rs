@@ -78,6 +78,19 @@ impl DynamicFunctionKind {
 }
 
 impl Interpreter {
+    /// Issue the next eval-binding creation sequence number.
+    pub(crate) fn next_eval_binding_seq(&mut self) -> u64 {
+        let seq = self.eval_binding_seq;
+        self.eval_binding_seq += 1;
+        seq
+    }
+
+    /// Current eval-binding sequence: bindings created from here on carry
+    /// numbers at or above this value.
+    pub(crate) fn current_eval_binding_seq(&self) -> u64 {
+        self.eval_binding_seq
+    }
+
     pub(crate) fn run_eval_operands(
         &mut self,
         context: &ExecutionContext,
@@ -374,11 +387,13 @@ impl Interpreter {
         // the caller's current record; strict eval uses its fresh private
         // child, so an adopted binding can never leak across that boundary.
         for (name, cell) in adopted {
+            let seq = self.next_eval_binding_seq();
             if !crate::eval_env::eval_env_insert_current(
                 &mut self.gc_heap,
                 entry_eval_env,
                 name,
                 cell,
+                seq,
             ) {
                 return Err(VmError::InvalidOperand);
             }

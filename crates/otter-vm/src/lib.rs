@@ -1421,6 +1421,11 @@ pub struct Interpreter {
     /// [`Interpreter::poll_async_atomic_waits`] settles notified or
     /// timed-out entries.
     pending_atomic_waits: Vec<atomics::PendingAtomicWait>,
+    /// Monotonic creation sequence for eval-introduced bindings. Snapshot
+    /// opcodes compare against it to see the pre-RHS environment
+    /// (§13.15.2 reference resolution order). Starts at 1 so sequence 0
+    /// reads as "created before any snapshot".
+    eval_binding_seq: u64,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].

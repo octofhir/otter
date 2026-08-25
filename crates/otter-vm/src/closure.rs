@@ -721,6 +721,7 @@ mod tests {
             let body = EvalEnvBody {
                 names: vec!["evalSentinel".to_string()],
                 cells: vec![derived_cell],
+                seqs: Vec::new(),
                 parent: None,
             };
             let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {

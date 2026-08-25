@@ -1011,6 +1011,9 @@ opcode_schema! {
     (Op::DeleteShadowedUpvalue, 0xB3),
     (Op::AsyncIteratorReturn, 0xB4),
     (Op::CheckIteratorResult, 0xB5),
+    (Op::EvalBindingSeq, 0xB6),
+    (Op::LoadShadowedUpvalueSnap, 0xB7),
+    (Op::StoreShadowedUpvalueCheckedSnap, 0xB8),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1268,6 +1271,9 @@ const fn operand_shape(op: Op) -> OperandShape {
             OperandShape::Fixed(WRITE_CONST_IMM_IMM)
         }
         Op::StoreShadowedUpvalueChecked => OperandShape::Fixed(READ_CONST_IMM_IMM),
+        Op::EvalBindingSeq => OperandShape::Fixed(WRITE),
+        Op::LoadShadowedUpvalueSnap => OperandShape::Fixed(&[W, CONST, IMM, IMM, R]),
+        Op::StoreShadowedUpvalueCheckedSnap => OperandShape::Fixed(&[R, CONST, IMM, IMM, R]),
         Op::JumpViaFinally => OperandShape::Fixed(JUMP_VIA_FINALLY),
         Op::PopParkedFinally => OperandShape::Fixed(&[IMM]),
         Op::QueueMicrotask => OperandShape::Variadic {

@@ -45,6 +45,11 @@ pub struct EvalEnvBody {
     pub names: Vec<String>,
     /// One live cell per eval-introduced binding.
     pub cells: Vec<UpvalueCell>,
+    /// Isolate-issued creation sequence, parallel to `cells`. Snapshot-
+    /// filtered lookups (§13.15.2 pre-RHS reference resolution) skip
+    /// bindings whose sequence is at or past the snapshot.
+    #[pelt(skip)]
+    pub seqs: Vec<u64>,
     /// The enclosing function's record, when that function also
     /// contains a direct eval call site.
     pub parent: Option<otter_gc::Gc<EvalEnvBody>>,
@@ -76,6 +81,7 @@ pub(crate) fn alloc_eval_env(
     heap.alloc_old(EvalEnvBody {
         names: Vec::new(),
         cells: Vec::new(),
+        seqs: Vec::new(),
         parent,
     })
 }
@@ -99,6 +105,7 @@ pub(crate) fn alloc_eval_env_with_roots(
         EvalEnvBody {
             names: Vec::new(),
             cells: Vec::new(),
+            seqs: Vec::new(),
             parent: None,
         },
         &mut visit,
@@ -155,13 +162,16 @@ pub fn eval_env_lookup_chain(
 ///
 /// The shadowed-upvalue opcodes carry a compiler-computed bound: only eval
 /// records strictly inside the captured binding's declaration owner may
-/// shadow it, so the probe must not walk past them into outer scopes.
-#[must_use]
-pub fn eval_env_lookup_chain_bounded(
+/// shadow it, so the probe must not walk past them into outer scopes. With a
+/// `snapshot`, only bindings created before it are visible — the environment
+/// exactly as a reference resolved at snapshot time saw it (§13.15.2 PutValue
+/// through a pre-RHS reference).
+pub fn eval_env_lookup_chain_bounded_snap(
     heap: &otter_gc::GcHeap,
     env: EvalEnvHandle,
     name: &str,
     depth: u32,
+    snapshot: Option<u64>,
 ) -> Option<UpvalueCell> {
     let mut current = Some(env);
     let mut remaining = depth;
@@ -175,6 +185,11 @@ pub fn eval_env_lookup_chain_bounded(
                 .names
                 .iter()
                 .position(|candidate| candidate == name)
+                .filter(|&index| {
+                    snapshot.is_none_or(|snapshot| {
+                        body.seqs.get(index).copied().unwrap_or(0) < snapshot
+                    })
+                })
                 .map(|index| body.cells[index]);
             (found, body.parent)
         });
@@ -189,7 +204,7 @@ pub fn eval_env_lookup_chain_bounded(
 /// Remove `name` from the nearest record within the bounded prefix.
 ///
 /// Mirrors [`eval_env_delete_chain`] with the same compiler-computed bound as
-/// [`eval_env_lookup_chain_bounded`]: a binding declared outside the prefix is
+/// [`eval_env_lookup_chain_bounded_snap`]: a binding declared outside the prefix is
 /// left intact and the delete reports `false`.
 pub fn eval_env_delete_chain_bounded(
     heap: &mut otter_gc::GcHeap,
@@ -231,6 +246,7 @@ pub fn eval_env_insert_current(
     env: EvalEnvHandle,
     name: String,
     cell: UpvalueCell,
+    seq: u64,
 ) -> bool {
     let inserted = heap.with_payload(env, |body| {
         if body.names.iter().any(|candidate| candidate == &name) {
@@ -238,6 +254,7 @@ pub fn eval_env_insert_current(
         }
         body.names.push(name);
         body.cells.push(cell);
+        body.seqs.push(seq);
         true
     });
     if inserted {
@@ -333,18 +350,21 @@ mod tests {
             outer,
             "z".to_string(),
             outer_z,
+            1,
         ));
         assert!(eval_env_insert_current(
             &mut heap,
             outer,
             "dup".to_string(),
             outer_dup,
+            2,
         ));
         assert!(eval_env_insert_current(
             &mut heap,
             outer,
             "a".to_string(),
             outer_a,
+            3,
         ));
 
         let mut no_extra_roots = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
@@ -355,18 +375,21 @@ mod tests {
             inner,
             "b".to_string(),
             inner_b,
+            4,
         ));
         assert!(eval_env_insert_current(
             &mut heap,
             inner,
             "dup".to_string(),
             inner_dup,
+            5,
         ));
         assert!(!eval_env_insert_current(
             &mut heap,
             inner,
             "dup".to_string(),
             outer_dup,
+            6,
         ));
 
         assert_eq!(eval_env_lookup_current(&heap, inner, "a"), None);
@@ -406,6 +429,7 @@ mod tests {
             outer,
             "x".to_string(),
             outer_cell,
+            7,
         ));
         let mut no_extra_roots = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         let inner = alloc_eval_env_with_roots(&mut heap, Some(outer), &mut no_extra_roots)
@@ -415,6 +439,7 @@ mod tests {
             inner,
             "x".to_string(),
             inner_cell,
+            8,
         ));
 
         assert!(eval_env_delete_chain(&mut heap, inner, "x"));

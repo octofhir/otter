@@ -444,6 +444,17 @@ pub(crate) fn compile_assignment(
     };
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+    // §13.15.2 steps 1c-1d — the target reference resolves before the RHS.
+    // For a capture whose name a direct eval may shadow, snapshot the
+    // eval-binding sequence now: the compound read and the final store use
+    // the pre-RHS environment even when the RHS's eval declares the name.
+    let eval_snapshot = captured
+        .filter(|(_, _, eval_depth)| *eval_depth != 0)
+        .map(|_| {
+            let snap = cx.alloc_scratch();
+            cx.emit(Op::EvalBindingSeq, [Operand::Register(snap)], span);
+            snap
+        });
     let dynamic = storage.is_none() && cx.any_enclosing_leaking_direct_eval();
     // §6.2.5.6 — a strict assignment to an unresolvable identifier
     // throws off the reference resolved BEFORE the RHS runs: snapshot
@@ -499,7 +510,14 @@ pub(crate) fn compile_assignment(
                 }
                 Some(_) if captured.is_some() => {
                     let (index, _, eval_depth) = captured.expect("captured storage");
-                    cx.emit_captured_binding_load(current, &name, index, eval_depth, span);
+                    cx.emit_captured_binding_load_snap(
+                        current,
+                        &name,
+                        index,
+                        eval_depth,
+                        eval_snapshot,
+                        span,
+                    );
                 }
                 Some(s) => cx.emit_load_storage(current, s, span),
                 None => {
@@ -555,7 +573,15 @@ pub(crate) fn compile_assignment(
         }
         Some(s) => {
             if let Some((index, info, eval_depth)) = captured {
-                cx.emit_captured_binding_store(value, &name, index, info, eval_depth, span);
+                cx.emit_captured_binding_store_snap(
+                    value,
+                    &name,
+                    index,
+                    info,
+                    eval_depth,
+                    eval_snapshot,
+                    span,
+                );
             } else {
                 cx.emit_store_storage(value, s, span);
             }
@@ -625,13 +651,19 @@ pub(crate) fn compile_logical_assignment(
     // and computed keys are captured here and reused by the store,
     // so `base[key()] ||= rhs` never re-runs `key()`.
     enum LogicalTarget {
-        Ident(String),
+        Ident {
+            name: String,
+            /// Pre-RHS eval-binding snapshot for a capture a direct eval
+            /// may shadow (§13.15.2 — the reference resolves once).
+            eval_snapshot: Option<u16>,
+        },
         Prepared(PreparedAssignmentTarget),
     }
     let (target, cur) = match &a.left {
         AssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
             let load = cx.alloc_scratch();
+            let mut eval_snapshot = None;
             if let Some(info) = cx.lookup_binding(&name) {
                 // §13.15.2 step 2 — `GetValue(lref)` runs before the
                 // short-circuit test, so reading a `let`/`const`/`class`
@@ -646,7 +678,19 @@ pub(crate) fn compile_logical_assignment(
                     cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
                 }
             } else if let Some((idx, _, eval_depth)) = cx.resolve_capture_with_info(&name) {
-                cx.emit_captured_binding_load(load, &name, idx, eval_depth, span);
+                if eval_depth != 0 {
+                    let snap = cx.alloc_scratch();
+                    cx.emit(Op::EvalBindingSeq, [Operand::Register(snap)], span);
+                    eval_snapshot = Some(snap);
+                }
+                cx.emit_captured_binding_load_snap(
+                    load,
+                    &name,
+                    idx,
+                    eval_depth,
+                    eval_snapshot,
+                    span,
+                );
             } else if cx.any_enclosing_leaking_direct_eval() {
                 let name_idx = cx.intern_string_constant(&name);
                 cx.emit(
@@ -669,7 +713,13 @@ pub(crate) fn compile_logical_assignment(
                     span,
                 );
             }
-            (LogicalTarget::Ident(name), load)
+            (
+                LogicalTarget::Ident {
+                    name,
+                    eval_snapshot,
+                },
+                load,
+            )
         }
         AssignmentTarget::StaticMemberExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
@@ -828,13 +878,16 @@ pub(crate) fn compile_logical_assignment(
     // performs NamedEvaluation; member targets store through the
     // ALREADY-EVALUATED Reference.
     let new_value = match &target {
-        LogicalTarget::Ident(name) => {
+        LogicalTarget::Ident { name, .. } => {
             crate::expr::compile_expr_with_inferred_name(cx, &a.right, name, span)?
         }
         LogicalTarget::Prepared(_) => compile_expr(cx, &a.right, span)?,
     };
     match target {
-        LogicalTarget::Ident(name) => {
+        LogicalTarget::Ident {
+            name,
+            eval_snapshot,
+        } => {
             // §13.15.2 PutValue on a function-expression self-name
             // binding is immutable: the RHS has already evaluated, then
             // strict mode throws while sloppy mode silently drops the
@@ -853,6 +906,20 @@ pub(crate) fn compile_logical_assignment(
                         span,
                     );
                 }
+            } else if let (Some(snapshot), Some((index, info, eval_depth))) =
+                (eval_snapshot, cx.resolve_capture_with_info(&name))
+            {
+                // The reference resolved before the RHS: bindings the RHS's
+                // direct eval introduced are invisible to this store.
+                cx.emit_captured_binding_store_snap(
+                    new_value,
+                    &name,
+                    index,
+                    info,
+                    eval_depth,
+                    Some(snapshot),
+                    span,
+                );
             } else {
                 assign_to_target(cx, &a.left, new_value, span)?;
             }

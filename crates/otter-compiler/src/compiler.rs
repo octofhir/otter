@@ -383,17 +383,46 @@ impl Compiler {
         eval_depth: u32,
         span: (u32, u32),
     ) {
+        self.emit_captured_binding_load_snap(destination, name, index, eval_depth, None, span);
+    }
+
+    /// [`Self::emit_captured_binding_load`] reading through a pre-resolved
+    /// reference: `snapshot` holds the eval-binding sequence captured by
+    /// [`Op::EvalBindingSeq`] before the RHS ran (§13.15.2).
+    pub(crate) fn emit_captured_binding_load_snap(
+        &mut self,
+        destination: u16,
+        name: &str,
+        index: u16,
+        eval_depth: u32,
+        snapshot: Option<u16>,
+        span: (u32, u32),
+    ) {
         if eval_depth != 0 {
             let name = self.intern_string_constant(name);
+            let depth_imm =
+                Operand::Imm32(i32::try_from(eval_depth).expect("eval-environment depth overflow"));
+            if let Some(snapshot) = snapshot {
+                self.emit(
+                    Op::LoadShadowedUpvalueSnap,
+                    vec![
+                        Operand::Register(destination),
+                        Operand::ConstIndex(name),
+                        Operand::Imm32(i32::from(index)),
+                        depth_imm,
+                        Operand::Register(snapshot),
+                    ],
+                    span,
+                );
+                return;
+            }
             self.emit(
                 Op::LoadShadowedUpvalue,
                 [
                     Operand::Register(destination),
                     Operand::ConstIndex(name),
                     Operand::Imm32(i32::from(index)),
-                    Operand::Imm32(
-                        i32::try_from(eval_depth).expect("eval-environment depth overflow"),
-                    ),
+                    depth_imm,
                 ],
                 span,
             );
@@ -423,6 +452,23 @@ impl Compiler {
         eval_depth: u32,
         span: (u32, u32),
     ) {
+        self.emit_captured_binding_store_snap(value, name, index, info, eval_depth, None, span);
+    }
+
+    /// [`Self::emit_captured_binding_store`] writing through a pre-resolved
+    /// reference (§13.15.2 PutValue): bindings a direct eval introduced
+    /// during the RHS are invisible to the bounded lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_captured_binding_store_snap(
+        &mut self,
+        value: u16,
+        name: &str,
+        index: u16,
+        info: BindingInfo,
+        eval_depth: u32,
+        snapshot: Option<u16>,
+        span: (u32, u32),
+    ) {
         use otter_bytecode::opcode_schema::{ShadowedUpvalueFallback, ShadowedUpvalueStorePolicy};
 
         let fallback = if info.fn_self_name {
@@ -444,6 +490,20 @@ impl Compiler {
             }
             .to_imm32()
             .expect("shadowed-upvalue store policy overflow");
+            if let Some(snapshot) = snapshot {
+                self.emit(
+                    Op::StoreShadowedUpvalueCheckedSnap,
+                    vec![
+                        Operand::Register(value),
+                        Operand::ConstIndex(name),
+                        Operand::Imm32(i32::from(index)),
+                        Operand::Imm32(policy),
+                        Operand::Register(snapshot),
+                    ],
+                    span,
+                );
+                return;
+            }
             self.emit(
                 Op::StoreShadowedUpvalueChecked,
                 [

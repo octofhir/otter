@@ -937,8 +937,11 @@ mod tests {
         Op::Increment,
         Op::PrivateBrandCheck,
         Op::LoadShadowedUpvalue,
+        Op::LoadShadowedUpvalueSnap,
         Op::GetTemplateObject,
         Op::StoreShadowedUpvalueChecked,
+        Op::StoreShadowedUpvalueCheckedSnap,
         Op::DeleteShadowedUpvalue,
+        Op::EvalBindingSeq,
     ];
 }

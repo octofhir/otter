@@ -2596,13 +2596,18 @@ impl Interpreter {
         value: Value,
     ) -> Result<(), VmError> {
         let owner_value = Value::generator(*owner);
+        // Values carried across the two handler allocations are parked in
+        // the handle arena and re-read afterwards — a stack-local `Value`
+        // "updated in place" through a shared reference is not a root the
+        // optimizer has to honor.
         let inner_value = self.promise_resolve_value(stack, context, value)?;
+        let base = self.json_root_push(inner_value);
 
         let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             "AsyncGeneratorYield",
             smallvec::smallvec![owner_value],
-            &mut |visitor| inner_value.trace_value_slots(visitor),
+            &mut |_visitor| {},
             move |ctx, args, captures| {
                 let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
                     return Ok(Value::undefined());
@@ -2625,14 +2630,12 @@ impl Interpreter {
                 Ok(Value::undefined())
             },
         )?;
+        let fulfilled_root = self.json_root_push(on_fulfilled);
         let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             "AsyncGeneratorYieldRejected",
             smallvec::smallvec![owner_value],
-            &mut |visitor| {
-                inner_value.trace_value_slots(visitor);
-                on_fulfilled.trace_value_slots(visitor);
-            },
+            &mut |_visitor| {},
             move |ctx, args, captures| {
                 let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
                     return Ok(Value::undefined());
@@ -2664,14 +2667,15 @@ impl Interpreter {
                 Ok(Value::undefined())
             },
         )?;
+        let rejected_root = self.json_root_push(on_rejected);
         let capability = crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(
-                self,
-                stack,
-                &[&on_fulfilled, &on_rejected, &inner_value],
-                &[],
-            )?;
-        let inner = inner_value.as_promise().ok_or(VmError::InvalidOperand)?;
+            .capability_stack_rooted(self, stack, &[], &[])?;
+        let inner = self
+            .json_root_get(base)
+            .as_promise()
+            .ok_or(VmError::InvalidOperand)?;
+        let on_fulfilled = self.json_root_get(fulfilled_root);
+        let on_rejected = self.json_root_get(rejected_root);
         let async_context = self.async_context();
         let outcome = crate::promise::JsPromise::perform_then_with_context(
             &inner,
@@ -2685,6 +2689,7 @@ impl Interpreter {
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
         }
+        self.json_root_pop_to(base);
         Ok(())
     }
 
@@ -2798,11 +2803,16 @@ impl Interpreter {
         };
         let owner_value = Value::generator(*handle);
         let resume_body_value = Value::boolean(resume_body);
+        // Values carried across the two handler allocations are parked in
+        // the handle arena and re-read afterwards — a stack-local `Value`
+        // "updated in place" through a shared reference is not a root the
+        // optimizer has to honor.
+        let base = self.json_root_push(inner_value);
         let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             "AsyncGeneratorAwaitReturnFulfilled",
             smallvec::smallvec![owner_value, resume_body_value],
-            &mut |visitor| inner_value.trace_value_slots(visitor),
+            &mut |_visitor| {},
             move |ctx, args, captures| {
                 let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
                     return Ok(Value::undefined());
@@ -2824,14 +2834,12 @@ impl Interpreter {
                 Ok(Value::undefined())
             },
         )?;
+        let fulfilled_root = self.json_root_push(on_fulfilled);
         let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             "AsyncGeneratorAwaitReturnRejected",
             smallvec::smallvec![owner_value, resume_body_value],
-            &mut |visitor| {
-                inner_value.trace_value_slots(visitor);
-                on_fulfilled.trace_value_slots(visitor);
-            },
+            &mut |_visitor| {},
             move |ctx, args, captures| {
                 let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
                     return Ok(Value::undefined());
@@ -2853,14 +2861,15 @@ impl Interpreter {
                 Ok(Value::undefined())
             },
         )?;
+        let rejected_root = self.json_root_push(on_rejected);
         let capability = crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(
-                self,
-                stack,
-                &[&on_fulfilled, &on_rejected, &inner_value],
-                &[],
-            )?;
-        let inner = inner_value.as_promise().ok_or(VmError::InvalidOperand)?;
+            .capability_stack_rooted(self, stack, &[], &[])?;
+        let inner = self
+            .json_root_get(base)
+            .as_promise()
+            .ok_or(VmError::InvalidOperand)?;
+        let on_fulfilled = self.json_root_get(fulfilled_root);
+        let on_rejected = self.json_root_get(rejected_root);
         let async_context = self.async_context();
         let outcome = crate::promise::JsPromise::perform_then_with_context(
             &inner,
@@ -2874,6 +2883,7 @@ impl Interpreter {
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
         }
+        self.json_root_pop_to(base);
         Ok(())
     }
 
@@ -3083,12 +3093,7 @@ impl Interpreter {
                                 crate::promise_dispatch::rejection_value_for(self, &err)
                             });
                             handle.mark_done(&mut self.gc_heap);
-                            self.async_generator_complete_step(
-                                context,
-                                handle,
-                                Err(reason),
-                                true,
-                            )?;
+                            self.async_generator_complete_step(context, handle, Err(reason), true)?;
                             self.async_generator_drain_done(stack, context, handle)?;
                             return Ok(Value::undefined());
                         }

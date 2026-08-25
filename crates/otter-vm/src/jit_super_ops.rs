@@ -46,8 +46,10 @@ impl Interpreter {
         match opcode {
             value if value == Op::LoadSuperProperty as u8 => {
                 let dst = arg0 as u16;
+                // Chunk-local atom index; resolve against the frame's own
+                // chunk (a generated direct call can cross chunks).
                 let atom = context
-                    .property_atom(arg2 as u32)
+                    .property_atom_for_function(stack[frame_index].function_id, arg2 as u32)
                     .ok_or(VmError::InvalidOperand)?;
                 let name = atom.name();
                 let home = *read_register(&stack[frame_index], arg1 as u16)?;
@@ -75,7 +77,7 @@ impl Interpreter {
             }
             value if value == Op::SetSuperProperty as u8 => {
                 let atom = context
-                    .property_atom(arg1 as u32)
+                    .property_atom_for_function(stack[frame_index].function_id, arg1 as u32)
                     .ok_or(VmError::InvalidOperand)?;
                 let name = atom.name();
                 let home = *read_register(&stack[frame_index], arg0 as u16)?;

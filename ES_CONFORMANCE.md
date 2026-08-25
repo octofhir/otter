@@ -1,22 +1,22 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `37922aa96e52b8bb7086820e1ace60fe70e8c37b`
+- **Engine commit:** `cf1c35377021dc91e94005c5ccde8c3eed1d23f9`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-25T12:09:04.807245+00:00
+- **Captured:** 2026-08-25T15:51:49.169180+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 51737 |
-| failed     | 622 |
+| passed     | 51855 |
+| failed     | 504 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 98.81%
+**Pass rate (excl. skipped):** 99.04%
 
 ## Top failing sections (top 50)
 
@@ -27,21 +27,14 @@
 | built-ins/Temporal/Duration | 540 | 512 | 28 | 94.8% |
 | intl402/Temporal/ZonedDateTime | 583 | 557 | 26 | 95.5% |
 | intl402/NumberFormat/prototype | 179 | 155 | 24 | 86.6% |
-| language/expressions/async-generator | 623 | 602 | 20 | 96.8% |
-| language/expressions/class | 4059 | 4022 | 17 | 99.6% |
-| language/statements/class | 4367 | 4336 | 17 | 99.6% |
 | staging/sm/regress | 106 | 91 | 15 | 85.8% |
 | intl402/Locale/prototype | 107 | 93 | 14 | 86.9% |
 | staging/sm/class | 94 | 80 | 14 | 85.1% |
-| built-ins/Promise/allSettledKeyed | 44 | 32 | 12 | 72.7% |
 | intl402/Temporal/PlainDate | 493 | 481 | 12 | 97.6% |
 | language/expressions/compound-assignment | 454 | 443 | 11 | 97.6% |
-| language/statements/async-generator | 301 | 290 | 11 | 96.3% |
 | staging/sm/RegExp | 91 | 80 | 11 | 87.9% |
-| built-ins/Atomics/waitAsync | 101 | 91 | 10 | 90.1% |
 | built-ins/Promise/prototype | 124 | 114 | 10 | 91.9% |
 | intl402/Temporal/PlainDateTime | 483 | 473 | 10 | 97.9% |
-| built-ins/Promise/allKeyed | 45 | 36 | 9 | 80.0% |
 | intl402/Temporal/PlainYearMonth | 327 | 318 | 9 | 97.2% |
 | staging/sm/Array | 90 | 81 | 9 | 90.0% |
 | staging/sm/Date | 28 | 19 | 9 | 67.9% |
@@ -52,26 +45,33 @@
 | annexB/language/expressions | 26 | 19 | 7 | 73.1% |
 | intl402/Temporal/PlainMonthDay | 90 | 83 | 7 | 92.2% |
 | language/eval-code/direct | 286 | 279 | 7 | 97.6% |
-| language/expressions/object | 1170 | 1163 | 7 | 99.4% |
 | staging/sm/TypedArray | 96 | 89 | 7 | 92.7% |
 | built-ins/Temporal/Instant | 465 | 459 | 6 | 98.7% |
 | built-ins/Temporal/PlainDateTime | 773 | 767 | 6 | 99.2% |
 | built-ins/Temporal/PlainTime | 493 | 487 | 6 | 98.8% |
 | intl402/DurationFormat/prototype | 81 | 75 | 6 | 92.6% |
 | staging/sm/Proxy | 24 | 18 | 6 | 75.0% |
-| built-ins/AsyncGeneratorPrototype/return | 19 | 14 | 5 | 73.7% |
 | built-ins/Temporal/PlainMonthDay | 199 | 194 | 5 | 97.5% |
 | built-ins/Temporal/PlainYearMonth | 509 | 504 | 5 | 99.0% |
 | intl402/PluralRules/prototype | 34 | 29 | 5 | 85.3% |
 | intl402/Temporal/Instant | 17 | 12 | 5 | 70.6% |
-| language/expressions/dynamic-import | 1005 | 762 | 5 | 99.3% |
 | language/statements/for-await-of | 1234 | 1227 | 5 | 99.6% |
-| built-ins/AsyncGeneratorPrototype/next | 11 | 7 | 4 | 63.6% |
 | language/expressions/assignment | 485 | 481 | 4 | 99.2% |
 | staging/sm/PrivateName | 17 | 13 | 4 | 76.5% |
 | staging/sm/fields | 8 | 4 | 4 | 50.0% |
 | staging/sm/strict | 51 | 47 | 4 | 92.2% |
-| built-ins/AsyncGeneratorPrototype/throw | 16 | 13 | 3 | 81.2% |
+| built-ins/Temporal/Now | 66 | 63 | 3 | 95.5% |
+| built-ins/Temporal/PlainDate | 652 | 649 | 3 | 99.5% |
+| intl402/Temporal/PlainTime | 12 | 9 | 3 | 75.0% |
+| language/statements/async-generator | 301 | 298 | 3 | 99.0% |
+| staging/sm/Reflect | 17 | 14 | 3 | 82.4% |
+| staging/sm/eval | 20 | 17 | 3 | 85.0% |
+| staging/sm/object | 65 | 62 | 3 | 95.4% |
+| built-ins/AsyncFromSyncIteratorPrototype/next | 13 | 11 | 2 | 84.6% |
+| built-ins/AsyncFromSyncIteratorPrototype/throw | 15 | 13 | 2 | 86.7% |
+| intl402/Array/prototype | 2 | 0 | 2 | 0.0% |
+| intl402/BigInt/prototype | 11 | 9 | 2 | 81.8% |
+| intl402/Date/prototype | 12 | 10 | 2 | 83.3% |
 
 ## Top failing-test patterns (top 100)
 
@@ -81,51 +81,6 @@
 | fail | sloppy: Test262Error: iterator closed properly Expected SameValue(«0», «1») to b… | `built-ins/AsyncFromSyncIteratorPrototype/next/next-result-poisoned-wrapper.js` |
 | fail | sloppy: Test262Error: iterator closed properly Expected SameValue(«0», «1») to b… | `built-ins/AsyncFromSyncIteratorPrototype/throw/throw-result-poisoned-wrapper.js` |
 | fail | sloppy: Test262Error: Promise should be rejected Expected a CatchError to be thr… | `built-ins/AsyncFromSyncIteratorPrototype/throw/throw-undefined-poisoned-return.js` |
-| fail | sloppy: Test262Error: First result `value` Expected SameValue(«undefined», «5») … | `built-ins/AsyncGeneratorFunction/invoked-as-function-multiple-arguments.js` |
-| fail | sloppy: Test262Error: First result `value` Expected SameValue(«undefined», «1») … | `built-ins/AsyncGeneratorFunction/invoked-as-function-single-argument.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«undefined», «2») to be true | `built-ins/AsyncGeneratorPrototype/next/request-queue-await-order.js` |
-| fail | sloppy: $DONE was never called | `built-ins/AsyncGeneratorPrototype/next/request-queue-order-state-executing.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«1», «3») to be true | `built-ins/AsyncGeneratorPrototype/next/request-queue-order.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«1», «3») to be true | `built-ins/AsyncGeneratorPrototype/next/request-queue-promise-resolve-order.js` |
-| fail | sloppy: Test262Error: Expected rejection | `built-ins/AsyncGeneratorPrototype/return/return-state-completed-broken-promise.js` |
-| fail | sloppy: Test262Error: Expected rejection | `built-ins/AsyncGeneratorPrototype/return/return-suspendedStart-broken-promise.js` |
-| fail | sloppy: Test262Error: AsyncGeneratorResolve(generator, completion.[[Value]], tru… | `built-ins/AsyncGeneratorPrototype/return/return-suspendedStart-promise.js` |
-| fail | sloppy: TypeError: Cannot read property of null or undefined     at built-ins/As… | `built-ins/AsyncGeneratorPrototype/return/return-suspendedYield-broken-promise-try-catch.js` |
-| fail | sloppy: Test262Error: AsyncGeneratorResolve(generator, resultValue, true) Expect… | `built-ins/AsyncGeneratorPrototype/return/return-suspendedYield-promise.js` |
-| fail | sloppy: Error: Catch me.     at built-ins/AsyncGeneratorPrototype/throw/request-… | `built-ins/AsyncGeneratorPrototype/throw/request-queue-order-state-executing.js` |
-| fail | sloppy: [object Promise] | `built-ins/AsyncGeneratorPrototype/throw/throw-suspendedYield-promise.js` |
-| fail | sloppy: Error: boop     at built-ins/AsyncGeneratorPrototype/throw/throw-suspend… | `built-ins/AsyncGeneratorPrototype/throw/throw-suspendedYield.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(Big… | `built-ins/Atomics/waitAsync/bigint/nan-for-timeout-agent.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(Big… | `built-ins/Atomics/waitAsync/bigint/undefined-for-timeout-agent.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(Big… | `built-ins/Atomics/waitAsync/bigint/undefined-index-defaults-to-zero-agent.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(Big… | `built-ins/Atomics/waitAsync/bigint/waiterlist-block-indexedposition-wake.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new BigInt64Array(new SharedArrayBuffer(Big… | `built-ins/Atomics/waitAsync/bigint/was-woken-before-timeout.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32A… | `built-ins/Atomics/waitAsync/nan-for-timeout-agent.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32A… | `built-ins/Atomics/waitAsync/undefined-for-timeout-agent.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32A… | `built-ins/Atomics/waitAsync/undefined-index-defaults-to-zero-agent.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32A… | `built-ins/Atomics/waitAsync/waiterlist-block-indexedposition-wake.js` |
-| fail | sloppy: Test262Error: Atomics.notify(new Int32Array(new SharedArrayBuffer(Int32A… | `built-ins/Atomics/waitAsync/was-woken-before-timeout.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allKeyed/arg-is-function.js` |
-| fail | sloppy: Test262Error:  | `built-ins/Promise/allKeyed/capability-resolve-throws-reject.js` |
-| fail | sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Objec… | `built-ins/Promise/allKeyed/get-value-not-called-for-non-enumerable.js` |
-| fail | sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Objec… | `built-ins/Promise/allKeyed/getownproperty-not-enumerable.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allKeyed/key-order-preserved.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allKeyed/non-enumerable-properties-ignored.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allKeyed/prototype-keys-ignored.js` |
-| fail | sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Objec… | `built-ins/Promise/allKeyed/result-property-descriptors.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allKeyed/symbol-keys.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/arg-is-function.js` |
-| fail | sloppy: Test262Error:  | `built-ins/Promise/allSettledKeyed/capability-resolve-throws-reject.js` |
-| fail | sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Objec… | `built-ins/Promise/allSettledKeyed/get-value-not-called-for-non-enumerable.js` |
-| fail | sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Objec… | `built-ins/Promise/allSettledKeyed/getownproperty-not-enumerable.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/key-order-preserved.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/non-enumerable-properties-ignored.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/prototype-keys-ignored.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/resolved-all-fulfilled.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/resolved-all-mixed.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/resolved-all-rejected.js` |
-| fail | sloppy: Test262Error: result is null-prototype Expected SameValue(«[object Objec… | `built-ins/Promise/allSettledKeyed/result-property-descriptors.js` |
-| fail | sloppy: Test262Error: Expected SameValue(«[object Object]», «null») to be true | `built-ins/Promise/allSettledKeyed/symbol-keys.js` |
 | fail | sloppy: Error: ignored exception     at executor (built-ins/Promise/exception-af… | `built-ins/Promise/exception-after-resolve-in-executor.js` |
 | fail | sloppy: [object Object] | `built-ins/Promise/exception-after-resolve-in-thenable-job.js` |
 | fail | sloppy: Test262Error: Expected SameValue(«4», «5») to be true | `built-ins/Promise/prototype/finally/rejected-observable-then-calls-PromiseResolve.js` |
@@ -142,7 +97,6 @@
 | fail | sloppy: The promise should be fulfilled with the provided value. | `built-ins/Promise/resolve-prms-cstm-then-deferred.js` |
 | fail | sloppy: The promise should be fulfilled with the provided value. | `built-ins/Promise/resolve-prms-cstm-then-immed.js` |
 | fail | sloppy: Test262Error: error thrown from callback must become a rejection Expecte… | `built-ins/Promise/try/throws.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: NewTarge… | `built-ins/SharedArrayBuffer/prototype-from-newtarget.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Du… | `built-ins/Temporal/Duration/compare/order-of-operations.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour pro… | `built-ins/Temporal/Duration/compare/relativeto-propertybag-infinity-throws-rangeerror.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: case whe… | `built-ins/Temporal/Duration/from/argument-duration-precision-exact-numerical-values.js` |
@@ -177,4 +131,50 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/Instant/prototype/subtract/minimum-maximum-instant.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration… | `built-ins/Temporal/Instant/prototype/until/float64-representable-integer.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/Instant/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: prototyp… | `built-ins/Temporal/Now/builtin.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Now desc… | `built-ins/Temporal/Now/prop-desc.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: Ord… | `built-ins/Temporal/Now/toStringTag/string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial … | `built-ins/Temporal/PlainDate/prototype/with/options-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainDate/prototype/with/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/PlainDate/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration… | `built-ins/Temporal/PlainDateTime/prototype/since/float64-representable-integer.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration… | `built-ins/Temporal/PlainDateTime/prototype/until/float64-representable-integer.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: can retu… | `built-ins/Temporal/PlainDateTime/prototype/until/units-changed.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial … | `built-ins/Temporal/PlainDateTime/prototype/with/options-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainDateTime/prototype/with/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/PlainDateTime/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Pl… | `built-ins/Temporal/PlainMonthDay/from/fields-object.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainMonthDay/prototype/toPlainDate/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial … | `built-ins/Temporal/PlainMonthDay/prototype/with/options-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainMonthDay/prototype/with/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/PlainMonthDay/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: millisec… | `built-ins/Temporal/PlainTime/compare/exhaustive.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainTime/from/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainTime/prototype/with/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDat… | `built-ins/Temporal/PlainTime/prototype/with/plaintimelike-invalid.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: temporal… | `built-ins/Temporal/PlainTime/prototype/with/throws-if-time-is-invalid-when-overflow-is-reject.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/PlainTime/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Pl… | `built-ins/Temporal/PlainYearMonth/from/argument-plaindate.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainYearMonth/prototype/toPlainDate/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial … | `built-ins/Temporal/PlainYearMonth/prototype/with/options-wrong-type.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/PlainYearMonth/prototype/with/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance… | `built-ins/Temporal/PlainYearMonth/subclass.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Zo… | `built-ins/Temporal/ZonedDateTime/argument-convert.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/compare/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.Z… | `built-ins/Temporal/ZonedDateTime/from/argument-string-limits.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.Z… | `built-ins/Temporal/ZonedDateTime/from/offset-overrides-critical-flag.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: UTC offs… | `built-ins/Temporal/ZonedDateTime/from/offset-string-invalid.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/from/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.Z… | `built-ins/Temporal/ZonedDateTime/from/zoneddatetime-string.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/prototype/equals/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/direction-undefined.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Zo… | `built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/hoursInDay/get-start-of-day-throws.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Next day… | `built-ins/Temporal/ZonedDateTime/prototype/hoursInDay/next-day-out-of-range.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration… | `built-ins/Temporal/ZonedDateTime/prototype/since/float64-representable-integer.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: does not… | `built-ins/Temporal/ZonedDateTime/prototype/since/largestunit.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/prototype/since/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration… | `built-ins/Temporal/ZonedDateTime/prototype/until/float64-representable-integer.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `built-ins/Temporal/ZonedDateTime/prototype/until/order-of-operations.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `built-ins/Temporal/ZonedDateTime/prototype/with/disambiguation-invalid-string.js` |
 

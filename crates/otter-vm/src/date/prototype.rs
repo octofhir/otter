@@ -284,6 +284,25 @@ fn to_time_string_impl(
     Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
 
+/// §21.4.4.38-.40 `toLocaleString` / `toLocaleDateString` /
+/// `toLocaleTimeString` — a fresh `Intl.DateTimeFormat` with the
+/// method's §ToDateTimeOptions required/defaults pairing formats the
+/// `[[DateValue]]`.
+fn to_locale_string_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    use crate::intl::date_time_format::DateTimeOptionsMode;
+    let time = this_time(ctx, name)?;
+    let mode = match name {
+        "toLocaleDateString" => DateTimeOptionsMode::DateDate,
+        "toLocaleTimeString" => DateTimeOptionsMode::TimeTime,
+        _ => DateTimeOptionsMode::AnyAll,
+    };
+    crate::intl::date_time_format::date_to_locale_string(ctx, time, args, mode)
+}
+
 /// §21.4.4.x `Date.prototype.set*` — `ToNumber` every provided
 /// argument in declaration order. A `valueOf` callback may mutate the
 /// receiver's `[[DateValue]]` via `setTime`; the captured time is read
@@ -734,9 +753,9 @@ date_prototype_methods!(
     bridge_to_gmt_string         => to_string_impl,            "toGMTString",         0;
     bridge_to_date_string        => to_date_string_impl,       "toDateString",        0;
     bridge_to_time_string        => to_time_string_impl,       "toTimeString",        0;
-    bridge_to_locale_string      => to_string_impl,            "toLocaleString",      0;
-    bridge_to_locale_date_string => to_date_string_impl,       "toLocaleDateString",  0;
-    bridge_to_locale_time_string => to_time_string_impl,       "toLocaleTimeString",  0;
+    bridge_to_locale_string      => to_locale_string_impl,      "toLocaleString",      0;
+    bridge_to_locale_date_string => to_locale_string_impl,      "toLocaleDateString",  0;
+    bridge_to_locale_time_string => to_locale_string_impl,      "toLocaleTimeString",  0;
     bridge_set_time              => set_time_impl,             "setTime",             1;
     bridge_set_full_year         => set_full_year_impl,        "setFullYear",         3;
     bridge_set_utc_full_year     => set_full_year_impl,        "setUTCFullYear",      3;

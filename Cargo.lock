@@ -2934,6 +2934,7 @@ dependencies = [
  "icu_list",
  "icu_locale",
  "icu_normalizer",
+ "icu_time",
  "indexmap",
  "itoa",
  "num-bigint 0.4.6",

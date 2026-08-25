@@ -150,8 +150,112 @@ struct ParkState {
 type Registry = HashMap<(u64, usize), Vec<Arc<ParkSlot>>>;
 
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static ASYNC_REGISTRY: LazyLock<Mutex<HashMap<(u64, usize), VecDeque<u64>>>> =
+
+/// Wakes isolates that drive their async waiters by polling (embeddings
+/// without a host completion sink, e.g. direct runtimes on plain threads).
+/// `notify_async_waiters` bumps the generation and notifies.
+static ASYNC_POLL_WAKE: LazyLock<(Mutex<u64>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+
+/// Block up to `timeout` for the next async-waiter notify generation.
+/// Returns immediately when a notify already happened after `seen`.
+pub fn wait_for_async_notify(seen: u64, timeout: std::time::Duration) -> u64 {
+    let (lock, cv) = &*ASYNC_POLL_WAKE;
+    let mut generation = lock.lock().expect("async poll wake poisoned");
+    if *generation != seen {
+        return *generation;
+    }
+    let (next, _timed_out) = cv
+        .wait_timeout(generation, timeout)
+        .expect("async poll wake poisoned");
+    generation = next;
+    *generation
+}
+
+/// Current async notify generation, for [`wait_for_async_notify`].
+pub fn async_notify_generation() -> u64 {
+    *ASYNC_POLL_WAKE.0.lock().expect("async poll wake poisoned")
+}
+
+fn bump_async_notify_generation() {
+    let (lock, cv) = &*ASYNC_POLL_WAKE;
+    let mut generation = lock.lock().expect("async poll wake poisoned");
+    *generation = generation.wrapping_add(1);
+    cv.notify_all();
+}
+static ASYNC_REGISTRY: LazyLock<Mutex<HashMap<(u64, usize), VecDeque<Arc<AsyncWaitSlot>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One parked `Atomics.waitAsync` waiter. The slot is claimed exactly once —
+/// by a matching `Atomics.notify` (which posts the stored isolate wake), by
+/// the waiter's own timeout timer, or by agent cancellation.
+pub struct AsyncWaitSlot {
+    agent_id: u64,
+    /// 0 = pending, 1 = claimed by notify, 2 = claimed by timeout / cancel.
+    state: std::sync::atomic::AtomicU8,
+    /// One-shot isolate wake consumed by the notify claim.
+    wake: Mutex<Option<AsyncWaiterWake>>,
+}
+
+const ASYNC_WAIT_PENDING: u8 = 0;
+const ASYNC_WAIT_NOTIFIED: u8 = 1;
+const ASYNC_WAIT_CLOSED: u8 = 2;
+
+/// Cross-thread wake payload for one async waiter: the owning isolate's
+/// completion sink plus the admitted job that settles the wait promise.
+pub struct AsyncWaiterWake {
+    /// Completion sink of the isolate that parked the waiter.
+    pub sink: Arc<dyn crate::host_completion::HostCompletionSink>,
+    /// Reserved completion slot; dropping it unconsumed cancels cleanly.
+    pub admission: crate::host_completion::HostCompletionAdmission,
+    /// Isolate-side settle job (resolve the promise with "ok").
+    pub job: crate::host_completion::HostCompletionJob,
+}
+
+impl AsyncWaitSlot {
+    /// `true` once a notify claimed this slot (poll-mode consumers settle
+    /// it from their own isolate).
+    pub fn is_notified(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ASYNC_WAIT_NOTIFIED
+    }
+
+    /// `true` once a timeout or cancellation closed this slot.
+    pub fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ASYNC_WAIT_CLOSED
+    }
+
+    /// Claim this slot for its timeout (or cancellation) path. Returns
+    /// `true` when the caller owns settlement; the parked wake is dropped,
+    /// releasing its completion admission.
+    pub fn claim_for_close(&self) -> bool {
+        let claimed = self
+            .state
+            .compare_exchange(
+                ASYNC_WAIT_PENDING,
+                ASYNC_WAIT_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if claimed {
+            let _ = self.wake.lock().expect("async wait slot poisoned").take();
+        }
+        claimed
+    }
+}
+
+/// Drop one parked async waiter from the registry (timeout / cancel path).
+pub fn remove_async_waiter(buf_id: u64, idx: usize, slot: &Arc<AsyncWaitSlot>) {
+    let mut reg = ASYNC_REGISTRY
+        .lock()
+        .expect("Atomics async wait registry poisoned");
+    if let Some(waiters) = reg.get_mut(&(buf_id, idx)) {
+        waiters.retain(|candidate| !Arc::ptr_eq(candidate, slot));
+        if waiters.is_empty() {
+            reg.remove(&(buf_id, idx));
+        }
+    }
+}
 
 /// Outcome of [`park_until_notified`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,40 +391,94 @@ pub fn notify_waiters(buf_id: u64, idx: usize, count: usize) -> usize {
     woken
 }
 
-/// Register a non-blocking `Atomics.waitAsync` waiter. The current foundation
-/// tracks wake counts here so `Atomics.notify` observes async waiters after its
-/// blocking-waiter quota. Returns `false` when the owning agent was already
-/// cancelled and no registration was made.
-pub fn register_async_waiter(buf_id: u64, idx: usize, agent: &WaitAgentHandle) -> bool {
+/// Register a non-blocking `Atomics.waitAsync` waiter with its isolate
+/// wake. Returns the parked slot, or `None` when the owning agent was
+/// already cancelled and no registration was made.
+pub fn register_async_waiter(
+    buf_id: u64,
+    idx: usize,
+    agent: &WaitAgentHandle,
+    wake: Option<AsyncWaiterWake>,
+) -> Option<Arc<AsyncWaitSlot>> {
     let mut reg = ASYNC_REGISTRY
         .lock()
         .expect("Atomics async wait registry poisoned");
     if agent.is_cancelled() {
-        return false;
+        return None;
     }
-    reg.entry((buf_id, idx)).or_default().push_back(agent.id());
-    true
+    let slot = Arc::new(AsyncWaitSlot {
+        agent_id: agent.id(),
+        state: std::sync::atomic::AtomicU8::new(ASYNC_WAIT_PENDING),
+        wake: Mutex::new(wake),
+    });
+    reg.entry((buf_id, idx))
+        .or_default()
+        .push_back(Arc::clone(&slot));
+    Some(slot)
 }
 
-/// Wake async waiters registered through [`register_async_waiter`].
+/// Wake async waiters registered through [`register_async_waiter`]: claim up
+/// to `count` pending slots in FIFO order and post each parked isolate wake
+/// through its completion sink. Returns how many waiters were woken.
 pub fn notify_async_waiters(buf_id: u64, idx: usize, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
-    let mut reg = ASYNC_REGISTRY
-        .lock()
-        .expect("Atomics async wait registry poisoned");
-    let Some(waiters) = reg.get_mut(&(buf_id, idx)) else {
-        return 0;
+    let claimed: Vec<Arc<AsyncWaitSlot>> = {
+        let mut reg = ASYNC_REGISTRY
+            .lock()
+            .expect("Atomics async wait registry poisoned");
+        let Some(waiters) = reg.get_mut(&(buf_id, idx)) else {
+            return 0;
+        };
+        let mut claimed = Vec::new();
+        waiters.retain(|slot| {
+            if claimed.len() >= count {
+                return true;
+            }
+            let took = slot
+                .state
+                .compare_exchange(
+                    ASYNC_WAIT_PENDING,
+                    ASYNC_WAIT_NOTIFIED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+            if took {
+                claimed.push(Arc::clone(slot));
+            }
+            // Slots that lost their claim race were already settled by a
+            // timeout or cancellation and just await removal.
+            !took
+        });
+        reg.retain(|_, waiters| !waiters.is_empty());
+        claimed
     };
-    let n = count.min(waiters.len());
-    for _ in 0..n {
-        waiters.pop_front();
+    let woken = claimed.len();
+    for slot in claimed {
+        // Poll-mode slots carry no wake: their owning isolate observes the
+        // Notified state on its next poll, prompted by the generation bump.
+        let Some(wake) = slot.wake.lock().expect("async wait slot poisoned").take() else {
+            continue;
+        };
+        let AsyncWaiterWake {
+            sink,
+            admission,
+            job,
+        } = wake;
+        // A failed post means the isolate is shutting down; the admission
+        // and job carriers clean up through their own RAII.
+        let _ = sink.complete(
+            admission,
+            job,
+            crate::host_completion::HostCompletionOutcome::Completed,
+        );
     }
-    if waiters.is_empty() {
-        reg.remove(&(buf_id, idx));
+    if woken != 0 {
+        bump_async_notify_generation();
     }
-    n
+    woken
 }
 
 /// Cancel every currently blocked waiter and wake its owning host
@@ -373,10 +531,20 @@ fn cancel_agent(state: &WaitAgentState) -> usize {
             .lock()
             .expect("Atomics async wait registry poisoned");
         for waiters in reg.values_mut() {
-            waiters.retain(|agent_id| *agent_id != state.id);
+            waiters.retain(|slot| {
+                if slot.agent_id != state.id {
+                    return true;
+                }
+                // Claiming drops the parked wake, releasing its completion
+                // admission; a slot already claimed by notify keeps its
+                // in-flight settle job.
+                let _ = slot.claim_for_close();
+                false
+            });
         }
         reg.retain(|_, waiters| !waiters.is_empty());
     }
+    bump_async_notify_generation();
 
     let cancelled = drained.len();
     for slot in drained {

@@ -1416,6 +1416,11 @@ pub struct Interpreter {
     /// Generic persistent roots owned by host resources. Host data stores root
     /// ids from this table rather than raw JS values.
     persistent_roots: persistent_roots::PersistentRoots,
+    /// Poll-driven `Atomics.waitAsync` waiters owned by this isolate
+    /// (sink-less embeddings). Promises live behind persistent roots;
+    /// [`Interpreter::poll_async_atomic_waits`] settles notified or
+    /// timed-out entries.
+    pending_atomic_waits: Vec<atomics::PendingAtomicWait>,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].

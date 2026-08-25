@@ -464,7 +464,20 @@ fn run_agent_thread(
     combined.push_str(&source);
 
     match runtime.run_script(SourceInput::from_javascript(combined), "<test262-agent>") {
-        Ok(_) | Err(OtterError::Interrupted) => {}
+        Ok(_) | Err(OtterError::Interrupted) => {
+            // The agent body may still be parked on `Atomics.waitAsync`;
+            // drive those waiters (and the reactions they queue) so the
+            // agent's reports reach the main test before this thread exits.
+            // The interrupt handle bounds runaway agents.
+            loop {
+                match runtime.drive_pending_atomic_waits(Duration::from_millis(100)) {
+                    // All settled — or every waiter was cancelled by
+                    // teardown, which reaps them the same way.
+                    Ok(true) | Err(_) => break,
+                    Ok(false) => {}
+                }
+            }
+        }
         Err(err) => {
             AGENTS
                 .lock()
@@ -595,7 +608,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 // $262.agent.sleep(ms) / monotonicNow()
 // =====================================================================
 
-fn agent_sleep(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_sleep(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let ms = match args.first() {
         None => 0.0,
         Some(v) if v.is_undefined() => 0.0,
@@ -607,6 +620,12 @@ fn agent_sleep(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     if ms.is_finite() && ms > 0.0 {
         thread::sleep(Duration::from_millis(ms as u64));
     }
+    // The harness setTimeout shim rides this primitive, so it is where a
+    // polling test observes time passing. Settle any poll-mode
+    // `Atomics.waitAsync` waiters (notified cross-agent, or past their
+    // deadline) here; the fulfilment reactions drain at this native's
+    // ordinary checkpoint.
+    let _ = ctx.interp_mut().poll_async_atomic_waits();
     Ok(Value::undefined())
 }
 

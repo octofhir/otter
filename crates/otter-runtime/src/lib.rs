@@ -5077,6 +5077,56 @@ impl Runtime {
     ///
     /// # Errors
     /// See [`OtterError`] variants.
+    /// Drive this isolate's poll-mode `Atomics.waitAsync` waiters until
+    /// they all settle or `budget` elapses: poll, drain the reactions each
+    /// settlement queued, then block on the global notify generation (or
+    /// the nearest waiter deadline) and poll again. Returns `true` when no
+    /// waiter remains pending.
+    ///
+    /// # Errors
+    /// Propagates a microtask-drain failure.
+    pub fn drive_pending_atomic_waits(&mut self, budget: Duration) -> Result<bool, OtterError> {
+        let started = std::time::Instant::now();
+        loop {
+            let (settled, pending) = self.interp.poll_async_atomic_waits();
+            if settled > 0 {
+                if let Err(err) = self.interp.drain_microtasks_with_default(None)
+                    && !self.absorb_termination(&err)
+                {
+                    return Err(enrich_runtime_diagnostic_with_cause(
+                        &mut self.interp,
+                        map_vm_error(err),
+                    ));
+                }
+                // The drained reactions may have parked fresh waiters;
+                // re-poll before deciding anything about the queue.
+                continue;
+            }
+            if pending == 0 {
+                return Ok(true);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                return Ok(false);
+            }
+            let mut wait = budget - elapsed;
+            if let Some(deadline) = self.interp.next_atomic_wait_deadline() {
+                let until_deadline = deadline.saturating_duration_since(std::time::Instant::now());
+                wait = wait.min(until_deadline);
+            }
+            // A capped slice keeps the loop responsive to interrupts.
+            wait = wait
+                .min(Duration::from_millis(50))
+                .max(Duration::from_millis(1));
+            let seen = otter_vm::atomics_wait::async_notify_generation();
+            let _ = otter_vm::atomics_wait::wait_for_async_notify(seen, wait);
+        }
+    }
+
+    /// Compile and execute `source` as a script.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
     pub fn run_script(
         &mut self,
         source: SourceInput,

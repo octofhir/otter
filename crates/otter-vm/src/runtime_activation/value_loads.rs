@@ -67,7 +67,15 @@ impl RuntimeCall<'_> {
         // SAFETY: RuntimeCall brands exclusive mutator access for this operation.
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let context = unsafe { self.context.as_ref() };
+        // Constant indexes are chunk-local, and a generated direct call can
+        // enter a sibling chunk's function under the caller's activation, so
+        // resolve the frame's owning chunk before decoding any constant index
+        // (mirrors `run_compiled_frame`'s entry resolution).
+        let ambient = unsafe { self.context.as_ref() };
+        let context = ambient
+            .for_function(self.function_id())
+            .ok_or(VmError::InvalidOperand)?;
+        let context = &*context;
         let (dst, value) = match operation {
             ValueLoadRuntimeOp::Math { dst, name_index } => {
                 let name = context

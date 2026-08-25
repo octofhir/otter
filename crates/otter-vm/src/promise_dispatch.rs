@@ -2115,7 +2115,10 @@ fn static_all_keyed_generic(
             let mut cap = cap_handles.current(interp, context.clone());
             let values_raw = interp.escape_scoped(slots_handle);
             let keys_raw = interp.escape_scoped(keys_handle);
-            resolve_keyed_slots_runtime(
+            // IfAbruptRejectPromise — a throwing capability resolve (or an
+            // abrupt result build) rejects the capability instead of
+            // escaping the combinator.
+            if let Err(error) = resolve_keyed_slots_runtime(
                 interp,
                 stack,
                 &mut cap,
@@ -2124,7 +2127,10 @@ fn static_all_keyed_generic(
                 name,
                 &[],
                 &[],
-            )?;
+            ) {
+                let mut cap = cap_handles.current(interp, context.clone());
+                return reject_capability_error(interp, stack, &mut cap, error);
+            }
         }
         Ok(cap_handles.current(interp, context).promise)
     })
@@ -2283,6 +2289,8 @@ fn create_keyed_result_runtime(
     let obj = interp
         .alloc_runtime_rooted_object_with_roots(value_roots, all_slice_roots.as_slice())
         .map_err(|_| oom_native(name))?;
+    // The await-dictionary result is OrdinaryObjectCreate(null).
+    crate::object::set_prototype(obj, interp.gc_heap_mut(), None);
     define_keyed_result_properties(obj, interp.gc_heap_mut(), keys, values, name)?;
     Ok(Value::object(obj))
 }
@@ -2296,6 +2304,8 @@ fn create_keyed_result_native(
     let obj = ctx
         .alloc_object_with_roots(&[], &[keys, values])
         .map_err(|_| oom_native(name))?;
+    // The await-dictionary result is OrdinaryObjectCreate(null).
+    crate::object::set_prototype(obj, ctx.heap_mut(), None);
     define_keyed_result_properties(obj, ctx.heap_mut(), keys, values, name)?;
     Ok(Value::object(obj))
 }

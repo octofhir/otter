@@ -1361,14 +1361,13 @@ pub(crate) fn assign_object_pattern(
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                 let pspan = span;
-                // §13.15.5.6 KeyedDestructuringAssignmentEvaluation
-                // step 1 — the target Reference (member bases, a
-                // derived-constructor `this`, computed keys) evaluates
-                // BEFORE GetV reads the source property.
-                let prepared = prepare_maybe_default_target(cx, &p.binding, pspan)?;
-                let val = cx.alloc_scratch();
-                if p.computed {
-                    let key_reg = match &p.name {
+                // §13.15.5.3 AssignmentProperty — the PropertyName
+                // (including ToPropertyKey on a computed key) evaluates
+                // FIRST, then §13.15.5.6 step 1 evaluates the target
+                // Reference (member bases, a derived-constructor `this`),
+                // and only then does GetV read the source property.
+                let computed_key = if p.computed {
+                    Some(match &p.name {
                         PropertyKey::StaticIdentifier(id) => {
                             let r = cx.alloc_scratch();
                             let s = cx.intern_string_constant(id.name.as_str());
@@ -1379,8 +1378,27 @@ pub(crate) fn assign_object_pattern(
                             );
                             r
                         }
-                        _ => compile_expr_as_property_key(cx, &p.name, pspan)?,
-                    };
+                        _ => {
+                            // ComputedPropertyName — ToPropertyKey runs at
+                            // PropertyName evaluation, before the target
+                            // Reference, so a `toString` side effect keeps
+                            // its spec position.
+                            let r = compile_expr_as_property_key(cx, &p.name, pspan)?;
+                            let key = cx.alloc_scratch();
+                            cx.emit(
+                                Op::ToPropertyKey,
+                                [Operand::Register(key), Operand::Register(r)],
+                                pspan,
+                            );
+                            key
+                        }
+                    })
+                } else {
+                    None
+                };
+                let prepared = prepare_maybe_default_target(cx, &p.binding, pspan)?;
+                let val = cx.alloc_scratch();
+                if let Some(key_reg) = computed_key {
                     cx.emit(
                         Op::LoadElement,
                         vec![

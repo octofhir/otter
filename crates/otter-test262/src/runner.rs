@@ -632,29 +632,60 @@ fn finish_async_test(
     if !is_async || !matches!(outcome, Outcome::Pass) {
         return outcome;
     }
-    let probe = run_with_watchdog(runtime, timeout, |rt| {
-        rt.run_script(
-            SourceInput::from_javascript(DONE_PROBE.to_string()),
-            "test262-done-probe.js",
-        )
-    });
-    let reported = match probe {
-        WatchdogOutcome::Ok(result) => result.completion_string().to_string(),
-        other => return map_watchdog_outcome(other),
-    };
-    match reported.as_str() {
-        "ok" => Outcome::Pass,
-        "pending" => Outcome::Fail {
-            reason: "$DONE was never called".to_string(),
-            stack: None,
-        },
-        _ => Outcome::Fail {
-            reason: reported
-                .strip_prefix("fail:")
-                .unwrap_or(&reported)
-                .to_string(),
-            stack: None,
-        },
+    // A test may still be waiting on cross-agent work: parked
+    // `Atomics.waitAsync` promises and timer-driven report polls settle
+    // after the body script returns. Drive them inside the same wall-clock
+    // budget the watchdog grants, re-probing until `$DONE` fires.
+    let deadline = std::time::Instant::now() + effective_async_budget(timeout);
+    loop {
+        let probe = run_with_watchdog(runtime, timeout, |rt| {
+            rt.run_script(
+                SourceInput::from_javascript(DONE_PROBE.to_string()),
+                "test262-done-probe.js",
+            )
+        });
+        let reported = match probe {
+            WatchdogOutcome::Ok(result) => result.completion_string().to_string(),
+            other => return map_watchdog_outcome(other),
+        };
+        match reported.as_str() {
+            "ok" => return Outcome::Pass,
+            "pending" => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Outcome::Fail {
+                        reason: "$DONE was never called".to_string(),
+                        stack: None,
+                    };
+                }
+                let slice = (deadline - now).min(Duration::from_millis(100));
+                if runtime.drive_pending_atomic_waits(slice).is_err() {
+                    return Outcome::Fail {
+                        reason: "$DONE was never called".to_string(),
+                        stack: None,
+                    };
+                }
+            }
+            _ => {
+                return Outcome::Fail {
+                    reason: reported
+                        .strip_prefix("fail:")
+                        .unwrap_or(&reported)
+                        .to_string(),
+                    stack: None,
+                };
+            }
+        }
+    }
+}
+
+/// Wall-clock budget for post-body async settling. A zero per-test
+/// timeout (deliberate stress runs) still gets a bounded slice.
+fn effective_async_budget(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_secs(5)
+    } else {
+        timeout
     }
 }
 

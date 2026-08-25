@@ -32,6 +32,15 @@ use crate::{
 };
 
 impl Interpreter {
+    /// Enqueue every reaction microtask a promise settlement produced,
+    /// recording rejection observations for the unhandled-rejection hook.
+    pub(crate) fn enqueue_promise_settle_jobs(&mut self, jobs: crate::promise::PromiseSettleJobs) {
+        self.note_settle_rejection(&jobs);
+        for job in jobs.jobs {
+            self.microtasks.enqueue(job);
+        }
+    }
+
     pub(crate) fn run_promise_fulfilled_of_regs(
         &mut self,
         context: &ExecutionContext,

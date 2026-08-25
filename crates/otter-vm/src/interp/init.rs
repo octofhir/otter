@@ -306,6 +306,7 @@ impl Interpreter {
             iterator_prototype_overrides: None,
             iterator_user_props: None,
             persistent_roots: persistent_roots::PersistentRoots::new(),
+            pending_atomic_waits: Vec::new(),
             console_sink: console::default_console_sink(),
             timer_scheduler: None,
             host_completion_sink: None,

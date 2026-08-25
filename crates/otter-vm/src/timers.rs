@@ -384,7 +384,7 @@ fn ensure_callable(
     }
 }
 
-fn schedule_timer_entry(
+pub(crate) fn schedule_timer_entry(
     ctx: &mut NativeCtx<'_>,
     callback: Value,
     delay_ms: u64,

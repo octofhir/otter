@@ -1370,6 +1370,7 @@ enum GuaranteedPayload {
         token: u64,
         specifier: String,
         referrer: String,
+        attr_type: Option<String>,
     },
     DynamicImportGraphPrepared {
         token: u64,
@@ -2687,6 +2688,7 @@ impl DynamicImportLoader for InboxDynamicImportLoader {
         token: u64,
         specifier: String,
         referrer: String,
+        attr_type: Option<String>,
     ) -> Result<(), String> {
         let completion = admission
             .try_into_inner::<QueuedCompletion>()
@@ -2699,6 +2701,7 @@ impl DynamicImportLoader for InboxDynamicImportLoader {
                 token,
                 specifier,
                 referrer,
+                attr_type,
             },
             completion: *completion,
         });
@@ -3195,16 +3198,19 @@ impl IsolateRunner {
                 token,
                 specifier,
                 referrer,
+                attr_type,
             } => {
                 if self.exit_finalized {
                     let _ = self.runtime.cancel_dynamic_import(token);
                     drop(completion);
                     return TickOutcome::Processed;
                 }
-                match self
-                    .runtime
-                    .begin_dynamic_import(token, &specifier, &referrer)
-                {
+                match self.runtime.begin_dynamic_import(
+                    token,
+                    &specifier,
+                    &referrer,
+                    attr_type.as_deref(),
+                ) {
                     Ok(DynamicImportBegin::Settled) => completion.begin_dispatch().complete(),
                     Err(error) => {
                         let _ = self.runtime.cancel_dynamic_import(token);
@@ -4073,7 +4079,7 @@ mod inbox_tests {
             .expect("dynamic admission from first isolate");
         assert!(
             loader_b
-                .schedule(admission, 1, "x".to_string(), String::new())
+                .schedule(admission, 1, "x".to_string(), String::new(), None)
                 .is_err()
         );
         assert!(
@@ -4083,6 +4089,7 @@ mod inbox_tests {
                     2,
                     "x".to_string(),
                     String::new(),
+                    None,
                 )
                 .is_err()
         );
@@ -4600,6 +4607,7 @@ mod inbox_tests {
                 token: load_token,
                 specifier: module_url,
                 referrer: String::new(),
+                attr_type: None,
             },
             completion: QueuedCompletion::admit_host(
                 &runner.completion_pool,

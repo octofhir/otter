@@ -3331,6 +3331,7 @@ struct LayerADynamicImportRequest {
     token: u64,
     specifier: String,
     referrer: String,
+    attr_type: Option<String>,
 }
 
 /// Shared physically bounded FIFO of dynamic-import requests awaiting the
@@ -3361,6 +3362,7 @@ impl otter_vm::DynamicImportLoader for LayerADynamicImportLoader {
         token: u64,
         specifier: String,
         referrer: String,
+        attr_type: Option<String>,
     ) -> Result<(), String> {
         let admission = admission
             .try_into_inner::<completion_admission::CompletionAdmission>()
@@ -3376,6 +3378,7 @@ impl otter_vm::DynamicImportLoader for LayerADynamicImportLoader {
                 token,
                 specifier,
                 referrer,
+                attr_type,
             });
         Ok(())
     }
@@ -3596,6 +3599,7 @@ impl Runtime {
         token: u64,
         specifier: &str,
         referrer: &str,
+        attr_type: Option<&str>,
     ) -> Result<DynamicImportBegin, OtterError> {
         let Some(realm_id) = self.interp.dynamic_import_realm_id(token) else {
             return Ok(DynamicImportBegin::Settled);
@@ -3603,7 +3607,7 @@ impl Runtime {
         if realm_id != 0 {
             return self.begin_dynamic_import_in_extra_realm(token, specifier, referrer);
         }
-        match self.load_dynamic_module(specifier, referrer) {
+        match self.load_dynamic_module(specifier, referrer, attr_type) {
             Ok(DynamicModuleLoad::Loaded(namespace)) => self
                 .settle_dynamic_import_result(token, Ok(namespace))
                 .map(|_| DynamicImportBegin::Settled),
@@ -3884,6 +3888,7 @@ impl Runtime {
         &mut self,
         specifier: &str,
         referrer: &str,
+        attr_type: Option<&str>,
     ) -> Result<DynamicModuleLoad, DynLoadError> {
         use std::path::PathBuf;
         let (entry_for_loader, referrer_opt) = dynamic_import_origin(referrer).map_err(|e| {
@@ -3895,6 +3900,49 @@ impl Runtime {
                 "dynamic import: cannot resolve \"{specifier}\": {e:?}"
             ))
         })?;
+        // A `type` attribute selects the data-module pipeline. Route through
+        // a synthetic wrapper whose one static edge carries the attribute, so
+        // the graph machinery that serves static attributed imports serves
+        // the dynamic form identically; the wrapper record is keyed by
+        // (type, target) so the same file imported plainly stays a distinct
+        // module record.
+        if let Some(kind) = attr_type {
+            let synthetic_url = format!("otter-attr-dynamic:{kind}:{target_url}");
+            if let Some(namespace) = self.interp.get_or_create_module_namespace(&synthetic_url) {
+                return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
+                    namespace,
+                )));
+            }
+            let specifier_literal =
+                serde_json::to_string(&target_url).unwrap_or_else(|_| "\"\"".to_string());
+            let type_literal = serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".to_string());
+            let text = format!(
+                "import __otterData from {specifier_literal} with {{ type: {type_literal} }};\n\
+                 export default __otterData;\n"
+            );
+            let text = module_loader::admit_source(loader.resource_account(), &synthetic_url, text)
+                .map_err(module_graph::GraphError::Loader)
+                .map_err(|e| DynLoadError::from_graph_error(&e, &synthetic_url))?;
+            let entry = module_loader::ResolvedSource {
+                url: synthetic_url.clone(),
+                kind: SourceKind::JavaScript,
+                jsx: None,
+                text,
+            };
+            let linked = module_graph::load_program_source(&loader, entry).map_err(|e| {
+                DynLoadError::from_graph_error(
+                    &e,
+                    format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
+                )
+            })?;
+            let loaded = self.evaluate_dynamic_linked_module(&synthetic_url, linked)?;
+            let Some(namespace) = self.interp.get_or_create_module_namespace(&synthetic_url) else {
+                return Ok(loaded);
+            };
+            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
+                namespace,
+            )));
+        }
         if let Some(namespace) = self.interp.get_or_create_module_namespace(&target_url) {
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
                 namespace,
@@ -5110,10 +5158,16 @@ impl Runtime {
                     token,
                     specifier,
                     referrer,
+                    attr_type,
                 } = request;
                 let active = admission.begin_dispatch();
                 let result = (|| -> Result<(), OtterError> {
-                    match self.begin_dynamic_import(token, &specifier, &referrer)? {
+                    match self.begin_dynamic_import(
+                        token,
+                        &specifier,
+                        &referrer,
+                        attr_type.as_deref(),
+                    )? {
                         DynamicImportBegin::Settled => {}
                         DynamicImportBegin::FetchHttps { target_url } => {
                             let message = format!(
@@ -8889,6 +8943,7 @@ mod tests {
                 1,
                 "x".to_string(),
                 String::new(),
+                None,
             )
             .is_err()
         );
@@ -8899,6 +8954,7 @@ mod tests {
                 2,
                 "x".to_string(),
                 String::new(),
+                None,
             )
             .is_err()
         );
@@ -8960,6 +9016,7 @@ mod tests {
                 token: queued_token,
                 specifier: "unused".to_string(),
                 referrer: String::new(),
+                attr_type: None,
             });
 
         runtime.cancel_layer_a_dynamic_imports_after_failure(current_token);

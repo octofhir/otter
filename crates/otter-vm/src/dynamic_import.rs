@@ -115,6 +115,7 @@ pub trait DynamicImportLoader: Send + Sync {
         token: u64,
         specifier: String,
         referrer: String,
+        attr_type: Option<String>,
     ) -> Result<(), String>;
 }
 

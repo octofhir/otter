@@ -52,8 +52,11 @@ impl Interpreter {
             value if value == Op::DeleteProperty as u8 => {
                 let obj_reg = arg1 as u16;
                 let name_idx = arg2 as u32;
+                // The atom index is chunk-local and a generated direct call
+                // can run a sibling chunk's function under this activation,
+                // so resolve against the frame's own chunk.
                 let key = context
-                    .property_atom(name_idx)
+                    .property_atom_for_function(stack[frame_index].function_id, name_idx)
                     .ok_or(VmError::InvalidOperand)?;
                 let receiver = *read_register(&stack[frame_index], obj_reg)?;
                 if receiver.as_object().is_some_and(|o| {

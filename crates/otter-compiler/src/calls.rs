@@ -164,8 +164,14 @@ pub(crate) fn compile_method_call(
     // Bare `Error("msg")` / `TypeError("msg")` / etc. without
     // `new` is treated like the matching `new <Kind>("msg")` per
     // ES spec §20.5.1.1 — same lowering.
+    // Same static-resolution guard as the `new` form: any enclosing
+    // binding, `with` object, or live sloppy direct-eval scope wins over
+    // the global error class.
     if let Expression::Identifier(id) = callee
         && cx.lookup_binding(id.name.as_str()).is_none()
+        && cx.captured_binding_owner(id.name.as_str()).is_none()
+        && !cx.any_enclosing_leaking_direct_eval()
+        && cx.active_with_envs.is_empty()
         && find_module_import_binding(cx, id.name.as_str()).is_none()
         && is_builtin_error_class_name(id.name.as_str())
         && builtin_error_construct_fast_path_applies(id.name.as_str(), &call.arguments)

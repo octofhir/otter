@@ -298,7 +298,7 @@ fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let on_rejected = args.first().cloned().unwrap_or(Value::undefined());
-    promise_dispatch::invoke_then(ctx, this_value, Value::undefined(), on_rejected)
+    promise_dispatch::invoke_then(ctx, this_value, &[Value::undefined(), on_rejected])
 }
 
 fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

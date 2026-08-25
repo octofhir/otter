@@ -129,6 +129,9 @@ pub(crate) fn compile_identifier_without_with(
     //
     // <https://tc39.es/ecma262/#sec-error-objects>
     if cx.lookup_binding(name).is_none()
+        && cx.captured_binding_owner(name).is_none()
+        && !cx.any_enclosing_leaking_direct_eval()
+        && cx.active_with_envs.is_empty()
         && find_module_import_binding(cx, name).is_none()
         && is_builtin_error_class_name(name)
     {

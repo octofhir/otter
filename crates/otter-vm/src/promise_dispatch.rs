@@ -35,9 +35,7 @@
 use crate::activation_stack::ActivationStack;
 use crate::error_classes::{ErrorClassRegistry, ErrorKind};
 use crate::execution_context::ExecutionContext;
-use crate::native_function::{
-    NativeError, local_native_value_with_length, native_value_with_captures_unchecked_with_roots,
-};
+use crate::native_function::{NativeError, local_native_value_with_length};
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
     PromiseThenOutcome,
@@ -431,13 +429,17 @@ impl PromiseBuilder {
         let promise = self.pending_runtime_rooted(interp, value_roots, slice_roots)?;
         let root_base = interp.json_root_push(Value::promise(promise));
         let result = (|| {
+            let already_resolved = alloc_already_resolved_cell(interp.gc_heap_mut())?;
+            let flag_root = interp.json_root_push(already_resolved);
             let promise = interp
                 .json_root_get(root_base)
                 .as_promise()
                 .expect("rooted promise survives allocation");
+            let already_resolved = interp.json_root_get(flag_root);
             let resolve = make_resolve_native_runtime_rooted(
                 interp,
                 promise,
+                already_resolved,
                 self.context.clone(),
                 value_roots,
                 slice_roots,
@@ -447,8 +449,14 @@ impl PromiseBuilder {
                 .json_root_get(root_base)
                 .as_promise()
                 .expect("rooted promise survives resolve allocation");
-            let reject =
-                make_reject_native_runtime_rooted(interp, promise, value_roots, slice_roots)?;
+            let already_resolved = interp.json_root_get(flag_root);
+            let reject = make_reject_native_runtime_rooted(
+                interp,
+                promise,
+                already_resolved,
+                value_roots,
+                slice_roots,
+            )?;
             Ok((
                 interp
                     .json_root_get(root_base)
@@ -472,14 +480,18 @@ impl PromiseBuilder {
         let promise = self.pending_stack_rooted(interp, stack, value_roots, slice_roots)?;
         let root_base = interp.json_root_push(Value::promise(promise));
         let result = (|| {
+            let already_resolved = alloc_already_resolved_cell(interp.gc_heap_mut())?;
+            let flag_root = interp.json_root_push(already_resolved);
             let promise = interp
                 .json_root_get(root_base)
                 .as_promise()
                 .expect("rooted promise survives allocation");
+            let already_resolved = interp.json_root_get(flag_root);
             let resolve = make_resolve_native_stack_rooted(
                 interp,
                 stack,
                 promise,
+                already_resolved,
                 self.context.clone(),
                 value_roots,
                 slice_roots,
@@ -489,8 +501,15 @@ impl PromiseBuilder {
                 .json_root_get(root_base)
                 .as_promise()
                 .expect("rooted promise survives resolve allocation");
-            let reject =
-                make_reject_native_stack_rooted(interp, stack, promise, value_roots, slice_roots)?;
+            let already_resolved = interp.json_root_get(flag_root);
+            let reject = make_reject_native_stack_rooted(
+                interp,
+                stack,
+                promise,
+                already_resolved,
+                value_roots,
+                slice_roots,
+            )?;
             Ok((
                 interp
                     .json_root_get(root_base)
@@ -513,14 +532,18 @@ impl PromiseBuilder {
         let promise = self.pending_native_rooted(ctx, value_roots, slice_roots)?;
         let root_base = ctx.interp_mut().json_root_push(Value::promise(promise));
         let result = (|| {
+            let already_resolved = alloc_already_resolved_cell(ctx.interp_mut().gc_heap_mut())?;
+            let flag_root = ctx.interp_mut().json_root_push(already_resolved);
             let promise = ctx
                 .interp_mut()
                 .json_root_get(root_base)
                 .as_promise()
                 .expect("rooted promise survives allocation");
+            let already_resolved = ctx.interp_mut().json_root_get(flag_root);
             let resolve = make_resolve_native_native_rooted(
                 ctx,
                 promise,
+                already_resolved,
                 self.context.clone(),
                 value_roots,
                 slice_roots,
@@ -531,7 +554,14 @@ impl PromiseBuilder {
                 .json_root_get(root_base)
                 .as_promise()
                 .expect("rooted promise survives resolve allocation");
-            let reject = make_reject_native_native_rooted(ctx, promise, value_roots, slice_roots)?;
+            let already_resolved = ctx.interp_mut().json_root_get(flag_root);
+            let reject = make_reject_native_native_rooted(
+                ctx,
+                promise,
+                already_resolved,
+                value_roots,
+                slice_roots,
+            )?;
             Ok((
                 ctx.interp_mut()
                     .json_root_get(root_base)
@@ -682,39 +712,6 @@ fn visit_runtime_roots(
             value.trace_value_slots(visitor);
         }
     }
-}
-
-fn native_value_with_captures_native_rooted<F>(
-    ctx: &mut NativeCtx<'_>,
-    name: &'static str,
-    captures: smallvec::SmallVec<[Value; 4]>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-    call: F,
-) -> Result<Value, otter_gc::OutOfMemory>
-where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
-{
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let new_target = ctx.new_target().cloned();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        crate::runtime_cx::visit_native_roots(
-            visitor,
-            &roots,
-            &this_value,
-            new_target.as_ref(),
-            value_roots,
-            slice_roots,
-        );
-    };
-    native_value_with_captures_unchecked_with_roots(
-        ctx.heap_mut(),
-        name,
-        captures,
-        &mut external_visit,
-        call,
-    )
 }
 
 fn promise_native_runtime<F>(
@@ -941,35 +938,46 @@ pub fn prototype_call(
 /// supplied receiver. Used by `Promise.prototype.catch` and
 /// `Promise.prototype.finally` so user-supplied `.then` overrides
 /// (including monkey-patches on plain thenables) are observable.
+/// `Invoke(receiver, "then", args)` passing exactly the given arguments —
+/// the §27.2.5.3.1/.2 finally closures pass only their thunk, `catch`
+/// passes « undefined, onRejected », and a patched `then` can observe
+/// `arguments.length`.
 pub fn invoke_then(
     ctx: &mut NativeCtx<'_>,
     receiver: Value,
-    on_fulfilled: Value,
-    on_rejected: Value,
+    args: &[Value],
 ) -> Result<Value, NativeError> {
+    const NAME: &str = "Promise.prototype";
     let exec = ctx
         .execution_context()
         .cloned()
         .ok_or_else(|| NativeError::TypeError {
-            name: "Promise.prototype",
+            name: NAME,
             reason: "missing execution context".to_string(),
         })?;
     ctx.scope(|mut scope| {
         let receiver = scope.value(receiver);
-        let on_fulfilled = scope.value(on_fulfilled);
-        let on_rejected = scope.value(on_rejected);
+        let args: SmallVec<[_; 2]> = args.iter().map(|arg| scope.value(*arg)).collect();
         let receiver_raw = scope.raw(receiver);
-        let on_fulfilled_raw = scope.raw(on_fulfilled);
-        let on_rejected_raw = scope.raw(on_rejected);
+        let args_raw: SmallVec<[Value; 2]> = args.iter().map(|arg| scope.raw(*arg)).collect();
         let result = scope.with_turn_parts(|interp, stack| {
-            invoke_then_interp(
-                interp,
-                stack,
-                &exec,
-                receiver_raw,
-                on_fulfilled_raw,
-                on_rejected_raw,
-            )
+            interp.with_handle_scope(|interp, scope| {
+                let receiver = interp.scoped_value(scope, receiver_raw);
+                let args: SmallVec<[_; 2]> = args_raw
+                    .iter()
+                    .map(|arg| interp.scoped_value(scope, *arg))
+                    .collect();
+                let receiver_raw = interp.escape_scoped(receiver);
+                let then = get_callable_property(interp, stack, &exec, receiver_raw, "then", NAME)?;
+                let then = interp.scoped_value(scope, then);
+                let then = interp.escape_scoped(then);
+                let receiver = interp.escape_scoped(receiver);
+                let args: SmallVec<[Value; 8]> =
+                    args.iter().map(|arg| interp.escape_scoped(*arg)).collect();
+                interp
+                    .run_callable_sync_rooted(stack, &exec, &then, receiver, args)
+                    .map_err(|err| promise_vm_error(interp, NAME, err))
+            })
         })?;
         let result = scope.value(result);
         Ok(scope.finish(result))
@@ -1153,12 +1161,7 @@ fn make_then_finally(
                 let value_thunk = scope.value(value_thunk);
                 let resolved_raw = scope.raw(resolved);
                 let value_thunk_raw = scope.raw(value_thunk);
-                let result = invoke_then(
-                    scope.context(),
-                    resolved_raw,
-                    value_thunk_raw,
-                    Value::undefined(),
-                )?;
+                let result = invoke_then(scope.context(), resolved_raw, &[value_thunk_raw])?;
                 let result = scope.value(result);
                 Ok(scope.finish(result))
             })
@@ -1206,12 +1209,7 @@ fn make_catch_finally(
                 let thrower = scope.value(thrower);
                 let resolved_raw = scope.raw(resolved);
                 let thrower_raw = scope.raw(thrower);
-                let result = invoke_then(
-                    scope.context(),
-                    resolved_raw,
-                    thrower_raw,
-                    Value::undefined(),
-                )?;
+                let result = invoke_then(scope.context(), resolved_raw, &[thrower_raw])?;
                 let result = scope.value(result);
                 Ok(scope.finish(result))
             })
@@ -1727,45 +1725,6 @@ fn call_promise_resolve(
     })
 }
 
-fn attach_then_value(
-    interp: &mut Interpreter,
-    stack: &mut ActivationStack,
-    context: &ExecutionContext,
-    promise: Value,
-    on_fulfilled: Value,
-    on_rejected: Value,
-) -> Result<(), NativeError> {
-    interp.with_handle_scope(|interp, scope| {
-        let promise = interp.scoped_value(scope, promise);
-        let on_fulfilled = interp.scoped_value(scope, on_fulfilled);
-        let on_rejected = interp.scoped_value(scope, on_rejected);
-        let promise_raw = interp.escape_scoped(promise);
-        let then = get_callable_property(
-            interp,
-            stack,
-            context,
-            promise_raw,
-            "then",
-            "Promise combinator",
-        )?;
-        let then = interp.scoped_value(scope, then);
-        let then = interp.escape_scoped(then);
-        let promise = interp.escape_scoped(promise);
-        let on_fulfilled = interp.escape_scoped(on_fulfilled);
-        let on_rejected = interp.escape_scoped(on_rejected);
-        interp
-            .run_callable_sync_rooted(
-                stack,
-                context,
-                &then,
-                promise,
-                smallvec![on_fulfilled, on_rejected],
-            )
-            .map_err(|err| promise_vm_error(interp, "Promise combinator", err))?;
-        Ok(())
-    })
-}
-
 fn static_resolve(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
@@ -1826,9 +1785,41 @@ fn static_resolve_generic(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let value = args.first().cloned().unwrap_or(Value::undefined());
+    // §27.2.4.7 step 1 — a non-object receiver throws before the
+    // pass-through check can compare against it.
+    if !constructor.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: "Promise.resolve",
+            reason: "`this` is not an Object".to_string(),
+        });
+    }
     interp.with_handle_scope(|interp, scope| {
         let value = interp.scoped_value(scope, value);
         let constructor_handle = interp.scoped_value(scope, constructor);
+        // §27.2.4.7 PromiseResolve step 2 — a promise whose `constructor`
+        // is C passes through unchanged: no fresh capability, no extra
+        // `then` tick.
+        if interp.escape_scoped(value).is_promise()
+            && let Some(exec) = context.as_ref()
+        {
+            let value_raw = interp.escape_scoped(value);
+            let value_constructor = get_property_runtime(
+                interp,
+                stack,
+                exec,
+                value_raw,
+                "constructor",
+                "Promise.resolve",
+            )?;
+            let value_constructor = interp.scoped_value(scope, value_constructor);
+            if crate::abstract_ops::same_value(
+                &interp.escape_scoped(value_constructor),
+                &interp.escape_scoped(constructor_handle),
+                interp.gc_heap(),
+            ) {
+                return Ok(interp.escape_scoped(value));
+            }
+        }
         constructor = interp.escape_scoped(constructor_handle);
         let cap = new_generic_promise_capability(interp, stack, context.clone(), &mut constructor)?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
@@ -1923,12 +1914,14 @@ fn static_try_generic(
                 return Err(crate::NativeError::Exit { code });
             }
             Err(crate::VmError::Interrupted) => return Err(crate::NativeError::Interrupted),
-            Err(crate::VmError::Uncaught) => {
-                let reason = rejection_value_for(interp, &crate::VmError::Uncaught);
-                call_capability_reject(interp, stack, &mut cap, reason)?;
-            }
+            // §27.2.4.6 step 5 — the capability carries the ORIGINAL thrown
+            // value; a caught user `throw` parks it on
+            // `pending_uncaught_throw`, so prefer that over a re-rendered
+            // error object.
             Err(other) => {
-                let reason = rejection_value_for(interp, &other);
+                let reason = interp
+                    .take_pending_uncaught_throw()
+                    .unwrap_or_else(|| rejection_value_for(interp, &other));
                 call_capability_reject(interp, stack, &mut cap, reason)?;
             }
         }
@@ -3184,47 +3177,43 @@ fn perform_then_with_handlers(
     })
 }
 
-fn attach_then(
+fn attach_then_value(
     interp: &mut Interpreter,
-    context: Option<ExecutionContext>,
-    promise: &JsPromiseHandle,
-    on_fulfilled: Option<Value>,
-    on_rejected: Option<Value>,
-) {
-    // Reusable "result-of-then" path that the combinators don't
-    // expose to user code. We still need a capability so the
-    // reaction has somewhere to settle, even if we never read it.
+    stack: &mut ActivationStack,
+    context: &ExecutionContext,
+    promise: Value,
+    on_fulfilled: Value,
+    on_rejected: Value,
+) -> Result<(), NativeError> {
     interp.with_handle_scope(|interp, scope| {
-        let promise = interp.scoped_value(scope, Value::promise(*promise));
-        let on_fulfilled = on_fulfilled.map(|value| interp.scoped_value(scope, value));
-        let on_rejected = on_rejected.map(|value| interp.scoped_value(scope, value));
-        let capability = match PromiseBuilder::with_optional_context(context.clone())
-            .capability_runtime_rooted(interp, &[], &[])
-        {
-            Ok(capability) => capability,
-            Err(_) => return,
-        };
-        let capability_handles = CapabilityHandles::park(interp, scope, &capability);
-        let promise = interp
-            .escape_scoped(promise)
-            .as_promise()
-            .expect("adopted promise remains rooted");
-        let on_fulfilled = on_fulfilled.map(|value| interp.escape_scoped(value));
-        let on_rejected = on_rejected.map(|value| interp.escape_scoped(value));
-        let capability = capability_handles.current(interp, context.clone());
-        let async_context = interp.async_context();
-        let outcome = promise.perform_then_with_context(
-            interp.gc_heap_mut(),
-            on_fulfilled,
-            on_rejected,
-            capability,
+        let promise = interp.scoped_value(scope, promise);
+        let on_fulfilled = interp.scoped_value(scope, on_fulfilled);
+        let on_rejected = interp.scoped_value(scope, on_rejected);
+        let promise_raw = interp.escape_scoped(promise);
+        let then = get_callable_property(
+            interp,
+            stack,
             context,
-            async_context,
-        );
-        if let Some(job) = outcome.immediate_job {
-            interp.microtasks_mut().enqueue(job);
-        }
-    });
+            promise_raw,
+            "then",
+            "Promise combinator",
+        )?;
+        let then = interp.scoped_value(scope, then);
+        let then = interp.escape_scoped(then);
+        let promise = interp.escape_scoped(promise);
+        let on_fulfilled = interp.escape_scoped(on_fulfilled);
+        let on_rejected = interp.escape_scoped(on_rejected);
+        interp
+            .run_callable_sync_rooted(
+                stack,
+                context,
+                &then,
+                promise,
+                smallvec![on_fulfilled, on_rejected],
+            )
+            .map_err(|err| promise_vm_error(interp, "Promise combinator", err))?;
+        Ok(())
+    })
 }
 
 /// Read the settled promise handle from a settle-native's GC-traced captures.
@@ -3244,9 +3233,42 @@ fn settle_native_promise(captures: &[Value]) -> JsPromiseHandle {
         .expect("promise settle native function captures the promise handle at index 0")
 }
 
+/// §27.2.1.3 `[[AlreadyResolved]]` — one shared boolean cell per resolving-
+/// function pair, packed as an opaque GC value so both natives trace it
+/// through their captures. A fresh pair (Promise constructor, capability
+/// executor, or PromiseResolveThenableJob) always gets its own cell.
+fn alloc_already_resolved_cell(
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    let cell = crate::alloc_upvalue(heap, Value::boolean(false))?;
+    Ok(Value::from_object_gc(cell.raw()))
+}
+
+/// Consume the pair's `[[AlreadyResolved]]` flag from `captures[1]`.
+///
+/// Returns `true` exactly once per cell — the call that flips it — so a
+/// resolve or reject function whose pair already ran becomes a no-op even
+/// while the promise is still pending on an in-flight thenable job.
+fn consume_already_resolved(interp: &mut Interpreter, captures: &[Value]) -> bool {
+    let cell = captures
+        .get(1)
+        .and_then(|flag| flag.as_raw_gc())
+        .and_then(|raw| raw.checked_cast::<crate::UpvalueCellBody>())
+        .expect("resolving pair captures its [[AlreadyResolved]] cell at index 1");
+    if crate::read_upvalue(interp.gc_heap(), cell)
+        .as_boolean()
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    crate::store_upvalue(interp.gc_heap_mut(), cell, Value::boolean(true));
+    true
+}
+
 fn make_resolve_native_runtime_rooted(
     interp: &mut Interpreter,
     promise: JsPromiseHandle,
+    already_resolved: Value,
     context: Option<ExecutionContext>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
@@ -3256,17 +3278,10 @@ fn make_resolve_native_runtime_rooted(
         interp,
         "",
         1,
-        smallvec![Value::promise(promise)],
+        smallvec![Value::promise(promise), already_resolved],
         value_roots,
         slice_roots,
-        move |ctx, args, captures| {
-            resolve_native_body(
-                ctx,
-                args,
-                settle_native_promise(captures),
-                &captured_context,
-            )
-        },
+        move |ctx, args, captures| resolve_native_body(ctx, args, captures, &captured_context),
     )
 }
 
@@ -3274,6 +3289,7 @@ fn make_resolve_native_stack_rooted(
     interp: &mut Interpreter,
     stack: &ActivationStack,
     promise: JsPromiseHandle,
+    already_resolved: Value,
     context: Option<ExecutionContext>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
@@ -3284,23 +3300,17 @@ fn make_resolve_native_stack_rooted(
         stack,
         "",
         1,
-        smallvec![Value::promise(promise)],
+        smallvec![Value::promise(promise), already_resolved],
         value_roots,
         slice_roots,
-        move |ctx, args, captures| {
-            resolve_native_body(
-                ctx,
-                args,
-                settle_native_promise(captures),
-                &captured_context,
-            )
-        },
+        move |ctx, args, captures| resolve_native_body(ctx, args, captures, &captured_context),
     )
 }
 
 fn make_resolve_native_native_rooted(
     ctx: &mut NativeCtx<'_>,
     promise: JsPromiseHandle,
+    already_resolved: Value,
     context: Option<ExecutionContext>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
@@ -3310,26 +3320,27 @@ fn make_resolve_native_native_rooted(
         ctx,
         "",
         1,
-        smallvec![Value::promise(promise)],
+        smallvec![Value::promise(promise), already_resolved],
         value_roots,
         slice_roots,
-        move |ctx, args, captures| {
-            resolve_native_body(
-                ctx,
-                args,
-                settle_native_promise(captures),
-                &captured_context,
-            )
-        },
+        move |ctx, args, captures| resolve_native_body(ctx, args, captures, &captured_context),
     )
 }
 
+/// §27.2.1.3.2 Promise Resolve Functions. The pair's `[[AlreadyResolved]]`
+/// flag is consumed first, so a second call — or the constructor's
+/// throw-after-resolve reject — is a no-op even while a thenable job for the
+/// first resolution is still in flight.
 fn resolve_native_body(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
-    promise: JsPromiseHandle,
+    captures: &[Value],
     captured_context: &Option<ExecutionContext>,
 ) -> Result<Value, NativeError> {
+    let promise = settle_native_promise(captures);
+    if !consume_already_resolved(ctx.interp_mut(), captures) {
+        return Ok(Value::undefined());
+    }
     let context = ctx
         .execution_context()
         .cloned()
@@ -3371,39 +3382,12 @@ fn resolve_native_body(
             return Ok(Value::undefined());
         }
 
-        if scope.raw(value).is_promise() {
-            let promise_handle = scope
-                .raw(promise)
-                .as_promise()
-                .expect("resolver promise remains rooted");
-            let value_root = scope.raw(value);
-            let (on_fulfill, on_reject) = make_resolve_adoption_handlers_native_rooted(
-                scope.context(),
-                promise_handle,
-                &[&value_root],
-                &[],
-            )?;
-            let on_fulfill = scope.value(on_fulfill);
-            let on_reject = scope.value(on_reject);
-            let inner = scope
-                .raw(value)
-                .as_promise()
-                .expect("adopted promise remains rooted");
-            let on_fulfill = scope.raw(on_fulfill);
-            let on_reject = scope.raw(on_reject);
-            attach_then(
-                scope.context().interp_mut(),
-                context.clone(),
-                &inner,
-                Some(on_fulfill),
-                Some(on_reject),
-            );
-            return Ok(Value::undefined());
-        }
-
         // §27.2.1.3.2 Promise Resolve Functions steps 8-13 — any object
         // with a callable `then` is a thenable: read `then` (firing an
-        // accessor and rejecting on its throw), then enqueue the job.
+        // accessor and rejecting on its throw), then enqueue the job. A
+        // native promise takes the same observable path: the `then` read and
+        // the job tick are both required (a custom `then` on the instance,
+        // its class, or a patched %Promise.prototype.then% must win).
         if scope.raw(value).is_object_type()
             && let Some(exec) = context.clone()
         {
@@ -3426,19 +3410,40 @@ fn resolve_native_body(
                 }
             };
             if scope.is_callable(then) {
+                // §27.2.1.3.2 PromiseResolveThenableJob runs
+                // CreateResolvingFunctions afresh: the handlers are FULL
+                // resolve/reject functions with their own flag, so a
+                // thenable that resolves with another thenable keeps
+                // unwrapping instead of fulfilling with it verbatim.
+                let already_resolved =
+                    alloc_already_resolved_cell(scope.context().interp_mut().gc_heap_mut())?;
+                let already_resolved = scope.value(already_resolved);
                 let promise_handle = scope
                     .raw(promise)
                     .as_promise()
                     .expect("resolver promise remains rooted");
-                let value_raw = scope.raw(value);
-                let then_raw = scope.raw(then);
-                let (on_fulfill, on_reject) = make_resolve_adoption_handlers_native_rooted(
+                let already_resolved_raw = scope.raw(already_resolved);
+                let on_fulfill = make_resolve_native_native_rooted(
                     scope.context(),
                     promise_handle,
-                    &[&value_raw, &then_raw],
+                    already_resolved_raw,
+                    Some(exec.clone()),
+                    &[],
                     &[],
                 )?;
                 let on_fulfill = scope.value(on_fulfill);
+                let promise_handle = scope
+                    .raw(promise)
+                    .as_promise()
+                    .expect("resolver promise remains rooted");
+                let already_resolved_raw = scope.raw(already_resolved);
+                let on_reject = make_reject_native_native_rooted(
+                    scope.context(),
+                    promise_handle,
+                    already_resolved_raw,
+                    &[],
+                    &[],
+                )?;
                 let on_reject = scope.value(on_reject);
                 let value_raw = scope.raw(value);
                 let then_raw = scope.raw(then);
@@ -3509,30 +3514,6 @@ pub(crate) fn resolve_promise_from_interpreter(
             return Ok(());
         }
 
-        if interp.escape_scoped(value).is_promise() {
-            let promise_handle = interp
-                .escape_scoped(promise)
-                .as_promise()
-                .expect("async resolver promise remains rooted");
-            let (on_fulfill, on_reject) =
-                make_resolve_adoption_handlers_runtime_rooted(interp, promise_handle, &[], &[])
-                    .map_err(crate::oom_to_vm)?;
-            let on_fulfill = interp.scoped_value(scope, on_fulfill);
-            let on_reject = interp.scoped_value(scope, on_reject);
-            let inner = interp
-                .escape_scoped(value)
-                .as_promise()
-                .expect("adopted async promise remains rooted");
-            attach_then(
-                interp,
-                context,
-                &inner,
-                Some(interp.escape_scoped(on_fulfill)),
-                Some(interp.escape_scoped(on_reject)),
-            );
-            return Ok(());
-        }
-
         // §27.2.1.3.2 step 6 — resolving a promise with itself is a
         // TypeError, not a wait for something that can never arrive.
         if interp.escape_scoped(value) == interp.escape_scoped(promise) {
@@ -3595,10 +3576,37 @@ pub(crate) fn resolve_promise_from_interpreter(
                     .escape_scoped(promise)
                     .as_promise()
                     .expect("async resolver promise remains rooted");
-                let (on_fulfill, on_reject) =
-                    make_resolve_adoption_handlers_runtime_rooted(interp, promise_handle, &[], &[])
-                        .map_err(crate::oom_to_vm)?;
+                // §27.2.1.3.2 PromiseResolveThenableJob runs
+                // CreateResolvingFunctions afresh: the handlers are FULL
+                // resolve/reject functions with their own flag, so nested
+                // thenables keep unwrapping.
+                let already_resolved =
+                    alloc_already_resolved_cell(interp.gc_heap_mut()).map_err(crate::oom_to_vm)?;
+                let already_resolved = interp.scoped_value(scope, already_resolved);
+                let already_resolved_raw = interp.escape_scoped(already_resolved);
+                let on_fulfill = make_resolve_native_runtime_rooted(
+                    interp,
+                    promise_handle,
+                    already_resolved_raw,
+                    Some(exec.clone()),
+                    &[],
+                    &[],
+                )
+                .map_err(crate::oom_to_vm)?;
                 let on_fulfill = interp.scoped_value(scope, on_fulfill);
+                let promise_handle = interp
+                    .escape_scoped(promise)
+                    .as_promise()
+                    .expect("async resolver promise remains rooted");
+                let already_resolved_raw = interp.escape_scoped(already_resolved);
+                let on_reject = make_reject_native_runtime_rooted(
+                    interp,
+                    promise_handle,
+                    already_resolved_raw,
+                    &[],
+                    &[],
+                )
+                .map_err(crate::oom_to_vm)?;
                 let on_reject = interp.scoped_value(scope, on_reject);
                 let job = make_resolve_thenable_job_runtime_rooted(
                     interp,
@@ -3755,111 +3763,10 @@ fn make_resolve_thenable_job_runtime_rooted(
     .map_err(crate::oom_to_vm)
 }
 
-fn make_resolve_adoption_handlers_runtime_rooted(
-    interp: &mut Interpreter,
-    resolver: JsPromiseHandle,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<(Value, Value), otter_gc::OutOfMemory> {
-    let resolver_value = Value::promise(resolver);
-    let mut fulfill_roots = Vec::with_capacity(value_roots.len() + 1);
-    fulfill_roots.extend_from_slice(value_roots);
-    fulfill_roots.push(&resolver_value);
-    let on_fulfill = promise_native_runtime(
-        interp,
-        "Promise resolve adopt fulfill",
-        1,
-        smallvec![resolver_value],
-        &fulfill_roots,
-        slice_roots,
-        move |ctx, args, captures| {
-            let resolver = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            let v = args.first().cloned().unwrap_or(Value::undefined());
-            let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
-            drain_jobs(interp, jobs);
-            Ok(Value::undefined())
-        },
-    )?;
-
-    let resolver_reject_value = Value::promise(resolver);
-    let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
-    reject_roots.extend_from_slice(value_roots);
-    reject_roots.push(&resolver_reject_value);
-    reject_roots.push(&on_fulfill);
-    let on_reject = promise_native_runtime(
-        interp,
-        "Promise resolve adopt reject",
-        1,
-        smallvec![resolver_reject_value],
-        &reject_roots,
-        slice_roots,
-        move |ctx, args, captures| {
-            let resolver = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            let reason = args.first().cloned().unwrap_or(Value::undefined());
-            let jobs = resolver.reject(interp.gc_heap_mut(), reason);
-            drain_jobs(interp, jobs);
-            Ok(Value::undefined())
-        },
-    )?;
-
-    Ok((on_fulfill, on_reject))
-}
-
-fn make_resolve_adoption_handlers_native_rooted(
-    ctx: &mut NativeCtx<'_>,
-    resolver: JsPromiseHandle,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<(Value, Value), otter_gc::OutOfMemory> {
-    let resolver_value = Value::promise(resolver);
-    let mut fulfill_roots = Vec::with_capacity(value_roots.len() + 1);
-    fulfill_roots.extend_from_slice(value_roots);
-    fulfill_roots.push(&resolver_value);
-    let on_fulfill = native_value_with_captures_native_rooted(
-        ctx,
-        "Promise resolve adopt fulfill",
-        smallvec![resolver_value],
-        &fulfill_roots,
-        slice_roots,
-        move |ctx, args, captures| {
-            let resolver = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            let v = args.first().cloned().unwrap_or(Value::undefined());
-            let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
-            drain_jobs(interp, jobs);
-            Ok(Value::undefined())
-        },
-    )?;
-
-    let resolver_reject_value = Value::promise(resolver);
-    let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
-    reject_roots.extend_from_slice(value_roots);
-    reject_roots.push(&resolver_reject_value);
-    reject_roots.push(&on_fulfill);
-    let on_reject = native_value_with_captures_native_rooted(
-        ctx,
-        "Promise resolve adopt reject",
-        smallvec![resolver_reject_value],
-        &reject_roots,
-        slice_roots,
-        move |ctx, args, captures| {
-            let resolver = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            let reason = args.first().cloned().unwrap_or(Value::undefined());
-            let jobs = resolver.reject(interp.gc_heap_mut(), reason);
-            drain_jobs(interp, jobs);
-            Ok(Value::undefined())
-        },
-    )?;
-
-    Ok((on_fulfill, on_reject))
-}
-
 fn make_reject_native_runtime_rooted(
     interp: &mut Interpreter,
     promise: JsPromiseHandle,
+    already_resolved: Value,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
@@ -3867,19 +3774,10 @@ fn make_reject_native_runtime_rooted(
         interp,
         "",
         1,
-        smallvec![Value::promise(promise)],
+        smallvec![Value::promise(promise), already_resolved],
         value_roots,
         slice_roots,
-        move |ctx, args, captures| {
-            let promise = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-                let reason = args.first().cloned().unwrap_or(Value::undefined());
-                let jobs = promise.reject(interp.gc_heap_mut(), reason);
-                drain_jobs(interp, jobs);
-            }
-            Ok(Value::undefined())
-        },
+        move |ctx, args, captures| Ok(reject_native_body(ctx, args, captures)),
     )
 }
 
@@ -3887,6 +3785,7 @@ fn make_reject_native_stack_rooted(
     interp: &mut Interpreter,
     stack: &ActivationStack,
     promise: JsPromiseHandle,
+    already_resolved: Value,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
@@ -3895,25 +3794,17 @@ fn make_reject_native_stack_rooted(
         stack,
         "",
         1,
-        smallvec![Value::promise(promise)],
+        smallvec![Value::promise(promise), already_resolved],
         value_roots,
         slice_roots,
-        move |ctx, args, captures| {
-            let promise = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-                let reason = args.first().cloned().unwrap_or(Value::undefined());
-                let jobs = promise.reject(interp.gc_heap_mut(), reason);
-                drain_jobs(interp, jobs);
-            }
-            Ok(Value::undefined())
-        },
+        move |ctx, args, captures| Ok(reject_native_body(ctx, args, captures)),
     )
 }
 
 fn make_reject_native_native_rooted(
     ctx: &mut NativeCtx<'_>,
     promise: JsPromiseHandle,
+    already_resolved: Value,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
@@ -3921,20 +3812,27 @@ fn make_reject_native_native_rooted(
         ctx,
         "",
         1,
-        smallvec![Value::promise(promise)],
+        smallvec![Value::promise(promise), already_resolved],
         value_roots,
         slice_roots,
-        move |ctx, args, captures| {
-            let promise = settle_native_promise(captures);
-            let interp = ctx.interp_mut();
-            if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-                let reason = args.first().cloned().unwrap_or(Value::undefined());
-                let jobs = promise.reject(interp.gc_heap_mut(), reason);
-                drain_jobs(interp, jobs);
-            }
-            Ok(Value::undefined())
-        },
+        move |ctx, args, captures| Ok(reject_native_body(ctx, args, captures)),
     )
+}
+
+/// §27.2.1.3.1 Promise Reject Functions — consume the pair's
+/// `[[AlreadyResolved]]` flag, then reject the captured promise.
+fn reject_native_body(ctx: &mut NativeCtx<'_>, args: &[Value], captures: &[Value]) -> Value {
+    let promise = settle_native_promise(captures);
+    if !consume_already_resolved(ctx.interp_mut(), captures) {
+        return Value::undefined();
+    }
+    let interp = ctx.interp_mut();
+    if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
+        let reason = args.first().cloned().unwrap_or(Value::undefined());
+        let jobs = promise.reject(interp.gc_heap_mut(), reason);
+        drain_jobs(interp, jobs);
+    }
+    Value::undefined()
 }
 
 fn drain_jobs(interp: &mut Interpreter, jobs: PromiseSettleJobs) {

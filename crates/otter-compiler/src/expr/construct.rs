@@ -54,8 +54,14 @@ pub(crate) fn compile_new(
     // for the right prototype linkage.
     //
     // <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
+    // The lowering is valid only when the name statically resolves to the
+    // global: a same-named binding in ANY enclosing function (captured
+    // upvalue), a `with` object, or a live sloppy direct-eval scope must win.
     if let Expression::Identifier(id) = callee
         && cx.lookup_binding(id.name.as_str()).is_none()
+        && cx.captured_binding_owner(id.name.as_str()).is_none()
+        && !cx.any_enclosing_leaking_direct_eval()
+        && cx.active_with_envs.is_empty()
         && find_module_import_binding(cx, id.name.as_str()).is_none()
         && is_builtin_error_class_name(id.name.as_str())
         && builtin_error_construct_fast_path_applies(id.name.as_str(), &new_expr.arguments)

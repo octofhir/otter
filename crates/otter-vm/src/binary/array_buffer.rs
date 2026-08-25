@@ -227,6 +227,10 @@ pub struct SharedArrayBufferBodyGc {
     /// = C` for the species protocol, `sab.x = 1`). Per-isolate — own
     /// properties are a local view, never shipped across the `Arc`.
     pub expando: Option<crate::object::JsObject>,
+    /// Subclass `[[Prototype]]` stamped at construction. Per-isolate,
+    /// like the expando: the prototype is a local view, never shipped
+    /// across the `Arc`.
+    pub prototype_override: Option<crate::Value>,
 }
 
 impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
@@ -236,6 +240,9 @@ impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
         if let Some(expando) = &mut self.expando {
             let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
+        }
+        if let Some(proto) = &mut self.prototype_override {
+            proto.trace_value_slot_mut(visitor);
         }
         // Bytes live behind an `Arc` outside the cage.
     }
@@ -257,6 +264,7 @@ pub fn alloc_shared_array_buffer(
     heap.alloc_old(SharedArrayBufferBodyGc {
         inner,
         expando: None,
+        prototype_override: None,
     })
 }
 
@@ -681,15 +689,21 @@ impl JsArrayBuffer {
     pub fn custom_proto(self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
         match self.storage {
             BufferStorage::Local(h) => heap.read_payload(h, |body| body.prototype_override),
-            BufferStorage::Shared(_) => None,
+            BufferStorage::Shared(h) => heap.read_payload(h, |body| body.prototype_override),
         }
     }
 
     /// Stamp the construction-time subclass prototype (local buffers).
     pub fn set_custom_proto(self, heap: &mut otter_gc::GcHeap, proto: crate::Value) {
-        if let BufferStorage::Local(h) = self.storage {
-            heap.with_payload(h, |body| body.prototype_override = Some(proto));
-            heap.record_write(h, &proto);
+        match self.storage {
+            BufferStorage::Local(h) => {
+                heap.with_payload(h, |body| body.prototype_override = Some(proto));
+                heap.record_write(h, &proto);
+            }
+            BufferStorage::Shared(h) => {
+                heap.with_payload(h, |body| body.prototype_override = Some(proto));
+                heap.record_write(h, &proto);
+            }
         }
     }
 

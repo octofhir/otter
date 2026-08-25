@@ -262,7 +262,7 @@ impl Interpreter {
                                 .async_generator_complete_step(context, &owner, Err(reason), true)
                                 .map_err(RunError::bare)?;
                             interp
-                                .async_generator_drain_done(context, &owner)
+                                .async_generator_drain_done(stack, context, &owner)
                                 .map_err(RunError::bare)?;
                             return Ok(());
                         }
@@ -281,7 +281,7 @@ impl Interpreter {
                             .map_err(RunError::bare)?;
                         owner.mark_done(&mut interp.gc_heap);
                         interp
-                            .async_generator_drain_done(context, &owner)
+                            .async_generator_drain_done(stack, context, &owner)
                             .map_err(RunError::bare)?;
                         return Ok(());
                     }
@@ -312,7 +312,7 @@ impl Interpreter {
                             .map_err(RunError::bare)?;
                         owner.mark_done(&mut interp.gc_heap);
                         interp
-                            .async_generator_drain_done(context, &owner)
+                            .async_generator_drain_done(stack, context, &owner)
                             .map_err(RunError::bare)?;
                         Ok(())
                     }
@@ -320,7 +320,7 @@ impl Interpreter {
                         owner.mark_done(&mut interp.gc_heap);
                         if matches!(error, VmError::MissingReturn) {
                             interp
-                                .async_generator_drain_done(context, &owner)
+                                .async_generator_drain_done(stack, context, &owner)
                                 .map_err(RunError::bare)?;
                             return Ok(());
                         }
@@ -338,7 +338,7 @@ impl Interpreter {
                                 .async_generator_complete_step(context, &owner, Err(reason), true)
                                 .map_err(RunError::bare)?;
                             interp
-                                .async_generator_drain_done(context, &owner)
+                                .async_generator_drain_done(stack, context, &owner)
                                 .map_err(RunError::bare)?;
                             Ok(())
                         } else {

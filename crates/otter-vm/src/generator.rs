@@ -55,6 +55,9 @@ pub enum AsyncGeneratorState {
     Executing,
     /// Body is parked on an awaited promise.
     Awaiting,
+    /// The front `return` request's value is being awaited
+    /// (§27.6.3.5.1 AsyncGeneratorAwaitReturn).
+    AwaitingReturn,
     /// Body finished; queued requests drain as done.
     Draining,
     /// No frame or queued work remains.

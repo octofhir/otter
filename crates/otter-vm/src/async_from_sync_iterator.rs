@@ -38,16 +38,24 @@ impl Interpreter {
     /// Returns the failure behind allocating the wrapper or its methods.
     pub(crate) fn create_async_from_sync_iterator(
         &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
         sync_iterator: Value,
     ) -> Result<Value, VmError> {
-        let wrapper = self.alloc_runtime_rooted_object_with_roots(&[&sync_iterator], &[])?;
+        // §27.1.4.1 / GetIteratorDirect — the sync record caches its `next`
+        // method once at adapter creation; every later step calls the
+        // cached function instead of re-reading the property.
+        let next_method = self.iterator_member(stack, context, sync_iterator, "next")?;
+        let wrapper =
+            self.alloc_runtime_rooted_object_with_roots(&[&sync_iterator, &next_method], &[])?;
         let wrapper_value = Value::object(wrapper);
-        for (name, call) in [
-            ("next", step_next as StepFn),
-            ("return", step_return as StepFn),
-            ("throw", step_throw as StepFn),
+        for (name, call, cached) in [
+            ("next", step_next as StepFn, Some(next_method)),
+            ("return", step_return as StepFn, None),
+            ("throw", step_throw as StepFn, None),
         ] {
-            let method = self.async_from_sync_step(name, call, sync_iterator, &wrapper_value)?;
+            let method =
+                self.async_from_sync_step(name, call, sync_iterator, cached, &wrapper_value)?;
             let Some(wrapper) = wrapper_value.as_object() else {
                 return Err(VmError::InvalidOperand);
             };
@@ -64,17 +72,23 @@ impl Interpreter {
         name: &'static str,
         call: StepFn,
         sync_iterator: Value,
+        cached_method: Option<Value>,
         wrapper_root: &Value,
     ) -> Result<Value, VmError> {
+        let mut captures = SmallVec::from_slice(&[sync_iterator]);
+        if let Some(method) = cached_method {
+            captures.push(method);
+        }
         crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             name,
-            SmallVec::from_slice(&[sync_iterator]),
+            captures,
             &mut |visitor| wrapper_root.trace_value_slots(visitor),
             move |ctx, args, captures| {
                 let sync_iterator = captures.first().copied().unwrap_or_else(Value::undefined);
+                let cached_method = captures.get(1).copied();
                 let argument = args.first().copied();
-                call(ctx, sync_iterator, argument)
+                call(ctx, sync_iterator, cached_method, argument)
             },
         )
         .map_err(VmError::from)
@@ -257,7 +271,8 @@ fn type_error_value(ctx: &mut NativeCtx<'_>, message: &str) -> Value {
 
 /// The shape of one wrapper method: the sync iterator plus the argument the
 /// caller passed.
-type StepFn = fn(&mut NativeCtx<'_>, Value, Option<Value>) -> Result<Value, NativeError>;
+type StepFn =
+    fn(&mut NativeCtx<'_>, Value, Option<Value>, Option<Value>) -> Result<Value, NativeError>;
 
 /// `{ value, done }`, freshly allocated per step.
 fn iter_result_object(
@@ -279,50 +294,70 @@ fn iter_result_object(
 fn step_next(
     ctx: &mut NativeCtx<'_>,
     sync_iterator: Value,
+    cached_method: Option<Value>,
     argument: Option<Value>,
 ) -> Result<Value, NativeError> {
-    step(ctx, sync_iterator, "next", argument, true, |_, _| {
-        // `next` is required: an iterator without one is not one.
-        None
-    })
+    step(
+        ctx,
+        sync_iterator,
+        "next",
+        cached_method,
+        argument,
+        true,
+        |_, _| {
+            // `next` is required: an iterator without one is not one.
+            None
+        },
+    )
 }
 
 /// §27.1.4.2.2 `%AsyncFromSyncIteratorPrototype%.return`.
 fn step_return(
     ctx: &mut NativeCtx<'_>,
     sync_iterator: Value,
+    _cached_method: Option<Value>,
     argument: Option<Value>,
 ) -> Result<Value, NativeError> {
-    step(ctx, sync_iterator, "return", argument, false, |ctx, arg| {
-        // A sync iterator with no `return` is already finished, and the
-        // answer is still a promise.
-        let context = ctx.execution_context().cloned()?;
-        let record = match iter_result_object(ctx, arg.unwrap_or_else(Value::undefined), true) {
-            Ok(record) => record,
-            Err(err) => return Some(Err(err)),
-        };
-        Some(ctx.with_turn_parts(|interp, stack| {
-            crate::promise_dispatch::PromiseBuilder::with_context(context)
-                .fulfilled_stack_rooted(interp, stack, record, &[&record], &[])
-                .map(Value::promise)
-                .map_err(|_| NativeError::TypeError {
-                    name: "AsyncFromSyncIterator.return",
-                    reason: "promise allocation failed".to_string(),
-                })
-        }))
-    })
+    step(
+        ctx,
+        sync_iterator,
+        "return",
+        None,
+        argument,
+        false,
+        |ctx, arg| {
+            // A sync iterator with no `return` is already finished, and the
+            // answer is still a promise.
+            let context = ctx.execution_context().cloned()?;
+            let record = match iter_result_object(ctx, arg.unwrap_or_else(Value::undefined), true) {
+                Ok(record) => record,
+                Err(err) => return Some(Err(err)),
+            };
+            Some(ctx.with_turn_parts(|interp, stack| {
+                crate::promise_dispatch::PromiseBuilder::with_context(context)
+                    .fulfilled_stack_rooted(interp, stack, record, &[&record], &[])
+                    .map(Value::promise)
+                    .map_err(|_| NativeError::TypeError {
+                        name: "AsyncFromSyncIterator.return",
+                        reason: "promise allocation failed".to_string(),
+                    })
+            }))
+        },
+    )
 }
 
 /// §27.1.4.2.3 `%AsyncFromSyncIteratorPrototype%.throw`.
 fn step_throw(
     ctx: &mut NativeCtx<'_>,
     sync_iterator: Value,
+    _cached_method: Option<Value>,
     argument: Option<Value>,
 ) -> Result<Value, NativeError> {
     step(
         ctx,
         sync_iterator,
         "throw",
+        None,
         argument,
         true,
         move |ctx, _arg| {
@@ -351,6 +386,7 @@ fn step(
     ctx: &mut NativeCtx<'_>,
     sync_iterator: Value,
     name: &'static str,
+    cached_method: Option<Value>,
     argument: Option<Value>,
     close_on_rejection: bool,
     missing: impl FnOnce(&mut NativeCtx<'_>, Option<Value>) -> Option<Result<Value, NativeError>>,
@@ -362,9 +398,14 @@ fn step(
             name,
             reason: "missing execution context".to_string(),
         })?;
-    let method = ctx.with_turn_parts(|interp, stack| {
-        interp.iterator_member(stack, &context, sync_iterator, name)
-    });
+    let method = match cached_method {
+        // The sync record cached this method at adapter creation
+        // (GetIteratorDirect); no per-step property read.
+        Some(method) => Ok(method),
+        None => ctx.with_turn_parts(|interp, stack| {
+            interp.iterator_member(stack, &context, sync_iterator, name)
+        }),
+    };
     let method = match method {
         Ok(method) => method,
         Err(err) => return rejected_promise(ctx, &context, err, name),

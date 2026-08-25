@@ -231,60 +231,15 @@ impl Interpreter {
                 .capability_stack_rooted(self, stack, &[&recv_value], &[])?;
             let promise = cap.promise;
 
-            if g.async_state(&self.gc_heap) == crate::generator::AsyncGeneratorState::Completed {
-                match kind {
-                    GeneratorResumeKind::Throw(reason) => {
-                        self.async_generator_settle_capability(context, &cap, Err(reason), true)?;
-                    }
-                    GeneratorResumeKind::Next(_) => {
-                        self.async_generator_settle_capability(
-                            context,
-                            &cap,
-                            Ok(Value::undefined()),
-                            true,
-                        )?;
-                    }
-                    GeneratorResumeKind::Return(value) => {
-                        self.async_generator_settle_capability(context, &cap, Ok(value), true)?;
-                    }
-                }
-            } else {
-                let state = g.async_state(&self.gc_heap);
-                // §27.6.3.2 AsyncGeneratorResumeNext — a throw
-                // completion delivered while the body is still
-                // suspended-start closes the generator without
-                // ever resuming it; the request settles as a
-                // rejection.
-                if matches!(state, crate::generator::AsyncGeneratorState::SuspendedStart)
-                    && let GeneratorResumeKind::Throw(reason) = kind
-                {
-                    g.mark_done(&mut self.gc_heap);
-                    g.set_async_state(
-                        &mut self.gc_heap,
-                        crate::generator::AsyncGeneratorState::Completed,
-                    );
-                    self.async_generator_settle_capability(context, &cap, Err(reason), true)?;
-                } else {
-                    let queued = g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
-                    // Drive the generator only when this request is the
-                    // front of the queue: an earlier request that has not
-                    // settled yet owns the next resume through its
-                    // settlement chain (§27.6.3.5.2), and resuming here
-                    // would deliver this request's completion to that
-                    // earlier request's suspension point.
-                    if queued == 1
-                        && matches!(
-                            state,
-                            crate::generator::AsyncGeneratorState::SuspendedStart
-                                | crate::generator::AsyncGeneratorState::SuspendedYield
-                        )
-                    {
-                        let resume = g
-                            .front_async_resume(&self.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        self.resume_generator(stack, context, &g, resume)?;
-                    }
-                }
+            // §27.6.3.3 AsyncGeneratorEnqueue — every request queues; the
+            // shared resume-next walk drives the generator only when this
+            // request is the queue front. An earlier unsettled request owns
+            // the next resume through its settlement chain (§27.6.3.5.2),
+            // and resuming here would deliver this request's completion to
+            // that earlier request's suspension point.
+            let queued = g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
+            if queued == 1 {
+                self.async_generator_resume_next(stack, context, &g)?;
             }
             return Ok(promise);
         }

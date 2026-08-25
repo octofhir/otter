@@ -2658,7 +2658,7 @@ impl Interpreter {
                             Err(reason),
                             true,
                         );
-                        let _ = interp.async_generator_drain_done(&context, &owner);
+                        let _ = interp.async_generator_drain_done(stack, &context, &owner);
                     }
                 });
                 Ok(Value::undefined())
@@ -2688,23 +2688,220 @@ impl Interpreter {
         Ok(())
     }
 
-    /// §27.6.3.5.2 AsyncGeneratorResumeNext — when the generator is parked
-    /// at a yield and requests remain queued (they arrived while the body
-    /// was executing or awaiting), resume it with the front request.
+    /// §27.6.3.5.2 AsyncGeneratorResumeNext — drive the front queued
+    /// request when the generator is not executing or awaiting. `next` and
+    /// `throw` resume the suspended body directly (a `throw` at
+    /// suspended-start closes without resuming, and a done body answers
+    /// from the queue); `return` routes through
+    /// [`Self::async_generator_await_return`] so its value is awaited
+    /// before anything resumes (§27.6.3.5.1).
     pub(crate) fn async_generator_resume_next(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
-        if handle.async_state(&self.gc_heap) != AsyncGeneratorState::SuspendedYield {
-            return Ok(());
+        loop {
+            let state = handle.async_state(&self.gc_heap);
+            if matches!(
+                state,
+                AsyncGeneratorState::Executing
+                    | AsyncGeneratorState::Awaiting
+                    | AsyncGeneratorState::AwaitingReturn
+            ) {
+                return Ok(());
+            }
+            let Some(resume) = handle.front_async_resume(&self.gc_heap) else {
+                return Ok(());
+            };
+            let done = handle.is_done(&self.gc_heap) || state == AsyncGeneratorState::Completed;
+            match resume {
+                crate::GeneratorResumeKind::Next(value) => {
+                    if done {
+                        self.async_generator_complete_step(
+                            context,
+                            handle,
+                            Ok(Value::undefined()),
+                            true,
+                        )?;
+                        continue;
+                    }
+                    self.resume_generator(
+                        stack,
+                        context,
+                        handle,
+                        crate::GeneratorResumeKind::Next(value),
+                    )?;
+                    return Ok(());
+                }
+                crate::GeneratorResumeKind::Throw(reason) => {
+                    if done || state == AsyncGeneratorState::SuspendedStart {
+                        // §27.6.3.5.2 — a throw completion delivered while
+                        // the body never ran closes the generator.
+                        handle.mark_done(&mut self.gc_heap);
+                        handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Completed);
+                        self.async_generator_complete_step(context, handle, Err(reason), true)?;
+                        continue;
+                    }
+                    self.resume_generator(
+                        stack,
+                        context,
+                        handle,
+                        crate::GeneratorResumeKind::Throw(reason),
+                    )?;
+                    return Ok(());
+                }
+                crate::GeneratorResumeKind::Return(value) => {
+                    return self.async_generator_await_return(stack, context, handle, value);
+                }
+            }
         }
-        let Some(resume) = handle.front_async_resume(&self.gc_heap) else {
-            return Ok(());
+    }
+
+    /// §27.6.3.5.1 AsyncGeneratorAwaitReturn — await the front `return`
+    /// request's value before delivering it. A fulfilled await resumes a
+    /// suspended-yield body with a return completion (or settles the
+    /// request when the body never ran / already finished); a rejection —
+    /// including an abrupt `PromiseResolve` on a poisoned thenable —
+    /// delivers a throw completion the same way.
+    pub(crate) fn async_generator_await_return(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        handle: &crate::generator::JsGenerator,
+        value: Value,
+    ) -> Result<(), VmError> {
+        // A body parked at a yield receives the awaited completion as its
+        // resumption; a body that never ran (suspended-start) or already
+        // finished settles the request without resuming.
+        let resume_body = handle.async_state(&self.gc_heap) == AsyncGeneratorState::SuspendedYield;
+        handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::AwaitingReturn);
+        let inner_value = match self.promise_resolve_value(stack, context, value) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let reason = match error {
+                    VmError::Uncaught => self
+                        .take_pending_uncaught_throw()
+                        .unwrap_or_else(Value::undefined),
+                    other => self
+                        .vm_error_to_throwable_with_stack_roots(Some(context), stack, &other)
+                        .ok_or(other)?,
+                };
+                return self.async_generator_deliver_return_completion(
+                    stack,
+                    context,
+                    handle,
+                    resume_body,
+                    Err(reason),
+                );
+            }
         };
-        self.resume_generator(stack, context, handle, resume)
-            .map(|_| ())
+        let owner_value = Value::generator(*handle);
+        let resume_body_value = Value::boolean(resume_body);
+        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "AsyncGeneratorAwaitReturnFulfilled",
+            smallvec::smallvec![owner_value, resume_body_value],
+            &mut |visitor| inner_value.trace_value_slots(visitor),
+            move |ctx, args, captures| {
+                let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
+                    return Ok(Value::undefined());
+                };
+                let resume_body =
+                    captures.get(1).and_then(|value| value.as_boolean()) == Some(true);
+                let value = args.first().copied().unwrap_or_else(Value::undefined);
+                ctx.with_turn_parts(|interp, stack| {
+                    if let Some(context) = interp.realm_execution_context() {
+                        let _ = interp.async_generator_deliver_return_completion(
+                            stack,
+                            &context,
+                            &owner,
+                            resume_body,
+                            Ok(value),
+                        );
+                    }
+                });
+                Ok(Value::undefined())
+            },
+        )?;
+        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
+            &mut self.gc_heap,
+            "AsyncGeneratorAwaitReturnRejected",
+            smallvec::smallvec![owner_value, resume_body_value],
+            &mut |visitor| {
+                inner_value.trace_value_slots(visitor);
+                on_fulfilled.trace_value_slots(visitor);
+            },
+            move |ctx, args, captures| {
+                let Some(owner) = captures.first().and_then(|value| value.as_generator()) else {
+                    return Ok(Value::undefined());
+                };
+                let resume_body =
+                    captures.get(1).and_then(|value| value.as_boolean()) == Some(true);
+                let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                ctx.with_turn_parts(|interp, stack| {
+                    if let Some(context) = interp.realm_execution_context() {
+                        let _ = interp.async_generator_deliver_return_completion(
+                            stack,
+                            &context,
+                            &owner,
+                            resume_body,
+                            Err(reason),
+                        );
+                    }
+                });
+                Ok(Value::undefined())
+            },
+        )?;
+        let capability = crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_stack_rooted(
+                self,
+                stack,
+                &[&on_fulfilled, &on_rejected, &inner_value],
+                &[],
+            )?;
+        let inner = inner_value.as_promise().ok_or(VmError::InvalidOperand)?;
+        let async_context = self.async_context();
+        let outcome = crate::promise::JsPromise::perform_then_with_context(
+            &inner,
+            &mut self.gc_heap,
+            Some(on_fulfilled),
+            Some(on_rejected),
+            capability,
+            Some(context.clone()),
+            async_context,
+        );
+        if let Some(job) = outcome.immediate_job {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
+    }
+
+    /// Deliver an awaited `return` completion: a suspended-yield body is
+    /// resumed with it (finally blocks run and may override); a body that
+    /// never ran or already finished settles the front request directly.
+    fn async_generator_deliver_return_completion(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        handle: &crate::generator::JsGenerator,
+        resume_body: bool,
+        completion: Result<Value, Value>,
+    ) -> Result<(), VmError> {
+        if resume_body && handle.has_frame(&self.gc_heap) && !handle.is_done(&self.gc_heap) {
+            handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::SuspendedYield);
+            let kind = match completion {
+                Ok(value) => crate::GeneratorResumeKind::Return(value),
+                Err(reason) => crate::GeneratorResumeKind::Throw(reason),
+            };
+            return self
+                .resume_generator(stack, context, handle, kind)
+                .map(|_| ());
+        }
+        handle.mark_done(&mut self.gc_heap);
+        handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Completed);
+        self.async_generator_complete_step(context, handle, completion, true)?;
+        self.async_generator_resume_next(stack, context, handle)
     }
 
     /// Complete the front async-generator request.
@@ -2748,32 +2945,17 @@ impl Interpreter {
     }
 
     /// Drain queued async-generator requests after the body is done.
+    /// `next` answers `{undefined, true}`, `throw` rejects, and `return`
+    /// awaits its value first (§27.6.3.5.1) — all through the shared
+    /// resume-next walk.
     pub(crate) fn async_generator_drain_done(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
-        handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Draining);
-        while let Some(resume) = handle.front_async_resume(&self.gc_heap) {
-            match resume {
-                GeneratorResumeKind::Throw(reason) => {
-                    self.async_generator_complete_step(context, handle, Err(reason), true)?;
-                }
-                GeneratorResumeKind::Next(_) => {
-                    self.async_generator_complete_step(
-                        context,
-                        handle,
-                        Ok(Value::undefined()),
-                        true,
-                    )?;
-                }
-                GeneratorResumeKind::Return(value) => {
-                    self.async_generator_complete_step(context, handle, Ok(value), true)?;
-                }
-            }
-        }
         handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Completed);
-        Ok(())
+        self.async_generator_resume_next(stack, context, handle)
     }
 
     /// Resume a generator object above a floor on the current activation stack
@@ -2908,7 +3090,8 @@ impl Interpreter {
                     // it: the front request with the value `return` carried,
                     // and every request behind it as done.
                     if handle.is_async(&self.gc_heap) {
-                        self.async_generator_drain_done(context, handle)?;
+                        self.async_generator_complete_step(context, handle, Ok(*arg), true)?;
+                        self.async_generator_drain_done(stack, context, handle)?;
                         return Ok(Value::undefined());
                     }
                     return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
@@ -2950,11 +3133,34 @@ impl Interpreter {
                 Err(err) => {
                     handle.mark_done(&mut self.gc_heap);
                     self.release_frames_above(stack, floor);
+                    self.pending_generator_throw = None;
+                    // An async generator answers through its queued
+                    // request: the uncaught throw is that request's
+                    // rejection, not an escaping dispatch error.
+                    if handle.is_async(&self.gc_heap) {
+                        let reason = if matches!(err, VmError::Uncaught) {
+                            self.take_pending_uncaught_throw().unwrap_or(reason)
+                        } else {
+                            reason
+                        };
+                        self.async_generator_complete_step(context, handle, Err(reason), true)?;
+                        self.async_generator_drain_done(stack, context, handle)?;
+                        return Ok(Value::undefined());
+                    }
                     return Err(err);
                 }
             }
             if stack.is_at_floor(floor) {
                 handle.mark_done(&mut self.gc_heap);
+                self.pending_generator_throw = None;
+                // An async generator answers through its queued request; the
+                // uncaught body throw becomes that request's rejection
+                // instead of escaping the dispatch tick.
+                if handle.is_async(&self.gc_heap) {
+                    self.async_generator_complete_step(context, handle, Err(reason), true)?;
+                    self.async_generator_drain_done(stack, context, handle)?;
+                    return Ok(Value::undefined());
+                }
                 return Err(self.err_uncaught(("generator-throw".to_string()).into()));
             }
             // A handler caught the throw — clear the side channel.
@@ -3020,7 +3226,7 @@ impl Interpreter {
                 handle.mark_done(&mut self.gc_heap);
                 if is_async {
                     self.async_generator_complete_step(context, handle, Ok(value), true)?;
-                    self.async_generator_drain_done(context, handle)?;
+                    self.async_generator_drain_done(stack, context, handle)?;
                     return Ok(Value::undefined());
                 }
                 self.make_runtime_rooted_iter_result(value, true, &[], &[])
@@ -3029,7 +3235,7 @@ impl Interpreter {
                 handle.mark_done(&mut self.gc_heap);
                 if is_async {
                     if matches!(err, VmError::MissingReturn) {
-                        self.async_generator_drain_done(context, handle)?;
+                        self.async_generator_drain_done(stack, context, handle)?;
                         return Ok(Value::undefined());
                     }
                     let rejection = if let Some(thrown) = self.pending_generator_throw.take() {
@@ -3041,7 +3247,7 @@ impl Interpreter {
                     };
                     if let Some(reason) = rejection {
                         self.async_generator_complete_step(context, handle, Err(reason), true)?;
-                        self.async_generator_drain_done(context, handle)?;
+                        self.async_generator_drain_done(stack, context, handle)?;
                         return Ok(Value::undefined());
                     }
                 }

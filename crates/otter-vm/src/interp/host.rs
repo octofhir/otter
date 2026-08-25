@@ -217,6 +217,12 @@ impl Interpreter {
         self.dynamic_import_registry.realm_id(token)
     }
 
+    /// Origin execution context of one pending dynamic import, cloned.
+    #[must_use]
+    pub fn dynamic_import_context(&self, token: u64) -> Option<ExecutionContext> {
+        self.dynamic_import_registry.context(token)
+    }
+
     /// Remove one pending dynamic-import registry entry without settling it.
     /// Hosts use this only when process exit or a fatal infrastructure error
     /// makes JavaScript delivery impossible; taking the entry releases the

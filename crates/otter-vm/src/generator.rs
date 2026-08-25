@@ -463,18 +463,23 @@ impl JsGenerator {
         heap.with_payload(self.inner, |body| body.async_state = state);
     }
 
-    /// Enqueue an async-generator request.
+    /// Enqueue an async-generator request. Returns the queue length after
+    /// the push, so the caller can tell whether the new request is the
+    /// front — only then may it drive the generator itself; otherwise the
+    /// front request's settlement chain owns the next resume
+    /// (§27.6.3.5.2 AsyncGeneratorResumeNext).
     pub fn enqueue_async_request(
         &self,
         heap: &mut otter_gc::GcHeap,
         resume: GeneratorResumeKind,
         capability: crate::promise::PromiseCapability,
-    ) {
+    ) -> usize {
         let barrier_resume = resume.clone();
         let barrier_capability = capability.clone();
-        heap.with_payload(self.inner, |body| {
+        let queued = heap.with_payload(self.inner, |body| {
             body.async_requests
                 .push_back(AsyncGeneratorRequest { resume, capability });
+            body.async_requests.len()
         });
         match barrier_resume {
             GeneratorResumeKind::Next(value)
@@ -482,6 +487,7 @@ impl JsGenerator {
             | GeneratorResumeKind::Throw(value) => heap.record_write(self.inner, &value),
         }
         heap.record_write(self.inner, &barrier_capability);
+        queued
     }
 
     /// Clear all queued async-generator requests.

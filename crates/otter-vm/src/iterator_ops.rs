@@ -2608,7 +2608,7 @@ impl Interpreter {
                     return Ok(Value::undefined());
                 };
                 let value = args.first().copied().unwrap_or_else(Value::undefined);
-                ctx.with_turn_parts(|interp, _stack| {
+                ctx.with_turn_parts(|interp, stack| {
                     if let Some(context) = interp.realm_execution_context() {
                         let _ = interp.async_generator_complete_step(
                             &context,
@@ -2616,6 +2616,10 @@ impl Interpreter {
                             Ok(value),
                             false,
                         );
+                        // §27.6.3.5.2 AsyncGeneratorResumeNext — requests
+                        // queued while the body was executing or awaiting
+                        // drive it again now that this yield settled.
+                        let _ = interp.async_generator_resume_next(stack, &context, &owner);
                     }
                 });
                 Ok(Value::undefined())
@@ -2682,6 +2686,25 @@ impl Interpreter {
             self.microtasks.enqueue(job);
         }
         Ok(())
+    }
+
+    /// §27.6.3.5.2 AsyncGeneratorResumeNext — when the generator is parked
+    /// at a yield and requests remain queued (they arrived while the body
+    /// was executing or awaiting), resume it with the front request.
+    pub(crate) fn async_generator_resume_next(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        handle: &crate::generator::JsGenerator,
+    ) -> Result<(), VmError> {
+        if handle.async_state(&self.gc_heap) != AsyncGeneratorState::SuspendedYield {
+            return Ok(());
+        }
+        let Some(resume) = handle.front_async_resume(&self.gc_heap) else {
+            return Ok(());
+        };
+        self.resume_generator(stack, context, handle, resume)
+            .map(|_| ())
     }
 
     /// Complete the front async-generator request.

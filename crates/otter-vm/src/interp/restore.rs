@@ -229,6 +229,7 @@ impl Interpreter {
             persistent_roots: crate::persistent_roots::PersistentRoots::new(),
             pending_atomic_waits: Vec::new(),
             eval_binding_seq: 1,
+            intl_fallback_symbol: None,
             console_sink: crate::console::default_console_sink(),
             timer_scheduler: None,
             host_completion_sink: None,

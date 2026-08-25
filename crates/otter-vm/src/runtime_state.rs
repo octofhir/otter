@@ -167,6 +167,9 @@ impl<'a> RuntimeState<'a> {
         interp.dynamic_import_registry().trace_gc_roots(visitor);
         // 4) Symbol registry + well-known table.
         interp.symbol_registry_for_trace().trace_gc_roots(visitor);
+        if let Some(symbol) = interp.intl_fallback_symbol_for_trace() {
+            symbol.trace_value_slots(visitor);
+        }
         interp
             .well_known_symbols_for_trace()
             .trace_gc_roots(visitor);

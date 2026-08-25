@@ -270,6 +270,49 @@ pub fn strip_unicode_extension_key(locale: &str, key: &str) -> String {
     }
 }
 
+/// §ResolveLocale — drop every `-u-` keyword outside the formatter's
+/// relevant-extension-key set from the resolved locale.
+pub fn retain_unicode_extension_keys(locale: &str, relevant: &[&str]) -> String {
+    let mut result = locale.to_string();
+    loop {
+        let Some(u_start) = result.find("-u-") else {
+            return result;
+        };
+        if let Some(private) = result.find("-x-")
+            && private < u_start
+        {
+            return result;
+        }
+        let tail = &result[u_start + 3..];
+        let mut stray: Option<String> = None;
+        let mut current_key: Option<&str> = None;
+        for seg in tail.split('-') {
+            if seg.len() == 1 {
+                break;
+            }
+            if seg.len() == 2 && seg.chars().all(|c| c.is_ascii_alphanumeric()) {
+                current_key = Some(seg);
+                if !relevant.contains(&seg) {
+                    stray = Some(seg.to_string());
+                    break;
+                }
+            } else if current_key.is_none() {
+                // An attribute subtag (no preceding key) is never relevant.
+                stray = Some(seg.to_string());
+                break;
+            }
+        }
+        let Some(stray) = stray else {
+            return result;
+        };
+        let next = strip_unicode_extension_key(&result, &stray);
+        if next == result {
+            return result;
+        }
+        result = next;
+    }
+}
+
 /// ECMA-402 ResolveLocale for one `-u-` keyword: a SUPPORTED options
 /// value wins, else a supported extension value, else `default_value`.
 /// Returns the resolved value plus the locale with the extension
@@ -488,4 +531,19 @@ pub fn get_number_option(
         });
     }
     Ok(Some(n))
+}
+
+/// §UnwrapDateTimeFormat / §UnwrapNumberFormat — the receiver itself, or
+/// the formatter a legacy `Intl.<Kind>.call(receiver)` chained onto it
+/// under `%FallbackSymbol%`.
+pub(crate) fn unwrap_legacy_receiver(
+    ctx: &NativeCtx<'_>,
+    receiver: crate::Value,
+) -> Option<crate::intl::payload::JsIntl> {
+    if let Some(intl) = receiver.as_intl(ctx.heap()) {
+        return Some(intl);
+    }
+    let object = receiver.as_object()?;
+    let symbol = *ctx.cx.interp.intl_fallback_symbol_for_trace()?;
+    crate::object::get_symbol(object, ctx.heap(), symbol)?.as_intl(ctx.heap())
 }

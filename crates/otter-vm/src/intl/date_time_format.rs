@@ -414,12 +414,24 @@ fn apply_temporal_field_intersection(
                         .to_string(),
                 });
             }
+            // §AdjustDateTimeStyleFormat — a dateStyle keeps its CLDR
+            // month/year shape for the year-month subset: named months for
+            // full/long/medium, a numeric month with a two-digit year for
+            // short.
+            let style = payload.date_style.take();
             payload.weekday = None;
             payload.day = None;
-            payload.date_style = None;
             clear_time_request(payload);
             payload.time_zone_name = None;
-            if payload.year.is_none() && payload.month.is_none() {
+            if let Some(style) = style {
+                let (month, year) = match style {
+                    DtStyle::Full | DtStyle::Long => (DtMonthWidth::Long, DtNumWidth::Numeric),
+                    DtStyle::Medium => (DtMonthWidth::Short, DtNumWidth::Numeric),
+                    DtStyle::Short => (DtMonthWidth::Numeric, DtNumWidth::TwoDigit),
+                };
+                payload.month = Some(month);
+                payload.year = Some(year);
+            } else if payload.year.is_none() && payload.month.is_none() {
                 payload.year = Some(DtNumWidth::Numeric);
                 payload.month = Some(DtMonthWidth::Numeric);
             }
@@ -433,13 +445,23 @@ fn apply_temporal_field_intersection(
                         .to_string(),
                 });
             }
+            // §AdjustDateTimeStyleFormat — CLDR month/day shapes per style:
+            // named months for full/long/medium, numeric for short.
+            let style = payload.date_style.take();
             payload.weekday = None;
             payload.era = None;
             payload.year = None;
-            payload.date_style = None;
             clear_time_request(payload);
             payload.time_zone_name = None;
-            if payload.month.is_none() && payload.day.is_none() {
+            if let Some(style) = style {
+                let month = match style {
+                    DtStyle::Full | DtStyle::Long => DtMonthWidth::Long,
+                    DtStyle::Medium => DtMonthWidth::Short,
+                    DtStyle::Short => DtMonthWidth::Numeric,
+                };
+                payload.month = Some(month);
+                payload.day = Some(DtNumWidth::Numeric);
+            } else if payload.month.is_none() && payload.day.is_none() {
                 payload.month = Some(DtMonthWidth::Numeric);
                 payload.day = Some(DtNumWidth::Numeric);
             }
@@ -561,7 +583,7 @@ pub(crate) fn resolve_ctx_with_mode(
         "nu",
         get_numbering_system_option(ctx, options, CLASS)?,
         &crate::intl::supported::is_supported_numbering_system,
-        "latn",
+        default_numbering_system(&locale),
     );
 
     let hour12 = get_bool_option(ctx, options, "hour12", CLASS, None)?;
@@ -597,6 +619,10 @@ pub(crate) fn resolve_ctx_with_mode(
     {
         locale = crate::intl::helpers::strip_unicode_extension_key(&locale, "hc");
     }
+    // §ResolveLocale — DateTimeFormat's relevant extension keys are
+    // `ca`, `hc`, and `nu`; anything else (`cu`, `tz`, …) is ignored and
+    // dropped from [[Locale]].
+    locale = crate::intl::helpers::retain_unicode_extension_keys(&locale, &["ca", "hc", "nu"]);
     // §11.1.2 — the timeZone option must name an available IANA zone
     // (matched case-insensitively, reported in canonical case) or be a
     // normalized offset string; anything else is a RangeError. Route
@@ -764,7 +790,8 @@ fn require_date_time(
         name,
         reason: "intrinsic called on a non-Intl.DateTimeFormat receiver".to_string(),
     };
-    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    let intl =
+        crate::intl::helpers::unwrap_legacy_receiver(ctx, *ctx.this_value()).ok_or_else(bad)?;
     match intl.payload_clone(ctx.heap()) {
         IntlPayload::DateTimeFormat(d) => Ok(d),
         _ => Err(bad()),
@@ -1494,6 +1521,31 @@ pub(crate) fn date_time_format_resolved_options(
 /// The locale's default hour cycle. Hand-rolled CLDR subset covering
 /// the languages test262 exercises — h12 for English-like locales, h23
 /// for most of Europe and East Asia's 24-hour cultures.
+/// CLDR default numbering system of a locale, for the principal locales
+/// whose default is not `latn`.
+fn default_numbering_system(locale: &str) -> &'static str {
+    let language = locale.split('-').next().unwrap_or(locale);
+    match language {
+        // Maghreb Arabic locales default to latn.
+        "ar" => {
+            let region = locale
+                .split('-')
+                .find(|seg| seg.len() == 2 && seg.chars().all(|c| c.is_ascii_uppercase()));
+            match region {
+                Some("DZ" | "EH" | "LY" | "MA" | "TN") => "latn",
+                _ => "arab",
+            }
+        }
+        "ckb" | "sd" => "arab",
+        "fa" | "ps" => "arabext",
+        "bn" | "as" => "beng",
+        "mr" | "ne" | "sa" => "deva",
+        "my" => "mymr",
+        "dz" => "tibt",
+        _ => "latn",
+    }
+}
+
 fn default_hour_cycle(locale: &str) -> DtHourCycle {
     match locale.split('-').next().unwrap_or("en") {
         "en" | "es" | "ar" | "hi" | "ko" | "zh" | "fil" | "he" => DtHourCycle::H12,
@@ -1883,8 +1935,12 @@ fn numbering_system_for_digits(payload: &DateTimeFormatPayload) -> &str {
 fn digit_table(payload: &DateTimeFormatPayload) -> Option<[&'static str; 10]> {
     match numbering_system_for_digits(payload) {
         "arab" => Some(["٠", "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩"]),
+        "arabext" => Some(["۰", "۱", "۲", "۳", "۴", "۵", "۶", "۷", "۸", "۹"]),
+        "beng" => Some(["০", "১", "২", "৩", "৪", "৫", "৬", "৭", "৮", "৯"]),
         "deva" => Some(["०", "१", "२", "३", "४", "५", "६", "७", "८", "९"]),
         "hanidec" => Some(["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"]),
+        "mymr" => Some(["၀", "၁", "၂", "၃", "၄", "၅", "၆", "၇", "၈", "၉"]),
+        "tibt" => Some(["༠", "༡", "༢", "༣", "༤", "༥", "༦", "༧", "༨", "༩"]),
         _ => None,
     }
 }
@@ -2330,11 +2386,30 @@ fn manual_format_segments(
         if parts.len() > weekday_len {
             parts.push(("literal", "/".to_string()));
         }
+        // Era-aware year: with an `era` component the proleptic-Gregorian
+        // year maps onto AD/BC (year 0 is 1 BC).
+        let display_year = if payload.era.is_some() && civil.year <= 0 {
+            1 - i64::from(civil.year)
+        } else {
+            i64::from(civil.year)
+        };
         let ascii = match width {
-            DtNumWidth::Numeric => civil.year.to_string(),
-            DtNumWidth::TwoDigit => format!("{:02}", civil.year.rem_euclid(100)),
+            DtNumWidth::Numeric => display_year.to_string(),
+            DtNumWidth::TwoDigit => format!("{:02}", display_year.rem_euclid(100)),
         };
         parts.push(("year", localize_ascii_digits(&ascii, payload)));
+        if let Some(era_width) = payload.era {
+            let era = match (civil.year <= 0, era_width) {
+                (true, DtTextWidth::Long) => "Before Christ",
+                (true, DtTextWidth::Short) => "BC",
+                (true, DtTextWidth::Narrow) => "B",
+                (false, DtTextWidth::Long) => "Anno Domini",
+                (false, DtTextWidth::Short) => "AD",
+                (false, DtTextWidth::Narrow) => "A",
+            };
+            parts.push(("literal", " ".to_string()));
+            parts.push(("era", era.to_string()));
+        }
     }
     let date_len = parts.len();
     if let Some(width) = payload.hour {

@@ -190,6 +190,13 @@ impl DynamicImportRegistry {
         self.entries.get(&token).map(|entry| entry.realm_id)
     }
 
+    /// Origin execution context of one pending import, cloned. The runtime
+    /// uses it to gate an import of an already-async-evaluating record on
+    /// that record's evaluation promise.
+    pub fn context(&self, token: u64) -> Option<ExecutionContext> {
+        self.entries.get(&token).map(|entry| entry.context.clone())
+    }
+
     /// Drop pending imports owned by a disposed realm.
     pub fn remove_realm(&mut self, realm_id: u32) -> usize {
         let before = self.entries.len();

@@ -1428,9 +1428,31 @@ impl Interpreter {
         let spec_reg = register_operand(operands.get(1))?;
         let options_reg = register_operand(operands.get(2))?;
         let spec_value = *read_register(&stack[top_idx], spec_reg)?;
-        let referrer: String = context
-            .exec_function(stack[top_idx].function_id)
-            .map(|f| f.module_url.as_ref().to_string())
+        // §13.3.10 step 1 / GetActiveScriptOrModule — eval-compiled chunks
+        // carry no module URL of their own, so walk the live activations
+        // down to the nearest frame whose function does. `exec_function`
+        // resolves sibling chunks transparently through the shared code
+        // space.
+        let referrer: String = (0..=top_idx)
+            .rev()
+            .find_map(|index| {
+                let function_id = stack[index].function_id;
+                // Per-function URL first (module fragments); the linker's
+                // synthesized `<entry>` driver and script fragments carry
+                // none, so fall back to the owning chunk's module
+                // specifier — the script URL the host compiled it under.
+                let function_url = context
+                    .exec_function(function_id)
+                    .map(|f| f.module_url.as_ref())
+                    .filter(|url| !url.is_empty() && !url.starts_with('<'))
+                    .map(str::to_string);
+                function_url.or_else(|| {
+                    context
+                        .for_function(function_id)
+                        .map(|resolved| resolved.module_name().to_string())
+                        .filter(|name| !name.is_empty() && !name.starts_with('<'))
+                })
+            })
             .unwrap_or_default();
         let import_context = context.clone();
         let promise = match self.coerce_to_string(stack, context, &spec_value) {

@@ -101,4 +101,34 @@ impl Interpreter {
         self.module_record(url)
             .map_or(ModuleStatus::New, |r| r.status)
     }
+
+    /// `[[EvaluationError]]` of `url`'s record, if its evaluation completed
+    /// abruptly. §16.2.1.4 Evaluate reads the error through the record's
+    /// `[[CycleRoot]]`, so a fulfilled-looking member of an errored cycle
+    /// still reports the cycle's error. §16.2.1.5 requires every later
+    /// Evaluate — including a repeat dynamic `import()` — to rethrow this
+    /// exact value, so hosts consult it before answering an import from a
+    /// cached environment.
+    #[must_use]
+    pub fn module_evaluation_error(&self, url: &str) -> Option<Value> {
+        let record = self.module_record(url)?;
+        if let Some(thrown) = record.evaluation_error {
+            return Some(thrown);
+        }
+        let root = record.cycle_root.as_deref()?;
+        self.module_record(root)?.evaluation_error
+    }
+
+    /// Evaluation gate of a record whose top-level-await subtree is still
+    /// settling. A repeat import of such a record must settle on this
+    /// promise — after every import that attached earlier — instead of
+    /// answering immediately from the cached environment (§16.2.1.9).
+    #[must_use]
+    pub fn module_pending_evaluation_gate(&self, url: &str) -> Option<crate::JsPromiseHandle> {
+        let record = self.module_record(url)?;
+        if record.status != ModuleStatus::EvaluatingAsync {
+            return None;
+        }
+        record.evaluation_promise
+    }
 }

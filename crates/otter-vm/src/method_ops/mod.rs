@@ -265,12 +265,20 @@ impl Interpreter {
                     );
                     self.async_generator_settle_capability(context, &cap, Err(reason), true)?;
                 } else {
-                    g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
-                    if matches!(
-                        state,
-                        crate::generator::AsyncGeneratorState::SuspendedStart
-                            | crate::generator::AsyncGeneratorState::SuspendedYield
-                    ) {
+                    let queued = g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
+                    // Drive the generator only when this request is the
+                    // front of the queue: an earlier request that has not
+                    // settled yet owns the next resume through its
+                    // settlement chain (§27.6.3.5.2), and resuming here
+                    // would deliver this request's completion to that
+                    // earlier request's suspension point.
+                    if queued == 1
+                        && matches!(
+                            state,
+                            crate::generator::AsyncGeneratorState::SuspendedStart
+                                | crate::generator::AsyncGeneratorState::SuspendedYield
+                        )
+                    {
                         let resume = g
                             .front_async_resume(&self.gc_heap)
                             .ok_or(VmError::InvalidOperand)?;

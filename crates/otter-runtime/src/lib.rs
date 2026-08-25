@@ -3386,6 +3386,13 @@ impl otter_vm::DynamicImportLoader for LayerADynamicImportLoader {
 
 enum DynamicModuleLoad {
     Loaded(otter_vm::Value),
+    /// The record is already async-evaluating (top-level await in its
+    /// subtree): this import gates on the record's existing evaluation
+    /// promise, so it settles after every import that attached earlier.
+    GateOnEvaluation {
+        promise: otter_vm::JsPromiseHandle,
+        target_url: String,
+    },
     /// The loaded graph evaluates async (top-level await somewhere in
     /// the target's subtree) — the import must not settle until the
     /// target's per-record evaluation gate does (§16.2.1.9).
@@ -3611,6 +3618,37 @@ impl Runtime {
             Ok(DynamicModuleLoad::Loaded(namespace)) => self
                 .settle_dynamic_import_result(token, Ok(namespace))
                 .map(|_| DynamicImportBegin::Settled),
+            Ok(DynamicModuleLoad::GateOnEvaluation {
+                promise,
+                target_url,
+            }) => {
+                let Some(context) = self.interp.dynamic_import_context(token) else {
+                    return Ok(DynamicImportBegin::Settled);
+                };
+                self.interp
+                    .settle_dynamic_import_on_async_inits(
+                        &context,
+                        token,
+                        vec![promise],
+                        std::sync::Arc::from(target_url.as_str()),
+                    )
+                    .map_err(|err| {
+                        map_vm_error(otter_vm::RunError {
+                            error: err,
+                            frames: Vec::new(),
+                            detail: None,
+                        })
+                    })?;
+                if let Err(err) = self.interp.drain_microtasks_with_default(Some(context))
+                    && !self.absorb_termination(&err)
+                {
+                    return Err(enrich_runtime_diagnostic_with_cause(
+                        &mut self.interp,
+                        map_vm_error(err),
+                    ));
+                }
+                Ok(DynamicImportBegin::Settled)
+            }
             Ok(DynamicModuleLoad::PendingAsyncEvaluation {
                 promise,
                 target_url,
@@ -3677,6 +3715,34 @@ impl Runtime {
         {
             Ok(DynamicModuleLoad::Loaded(namespace)) => {
                 self.settle_dynamic_import_result(token, Ok(namespace))
+            }
+            Ok(DynamicModuleLoad::GateOnEvaluation {
+                promise,
+                target_url,
+            }) => {
+                let Some(context) = self.interp.dynamic_import_context(token) else {
+                    return Ok(true);
+                };
+                self.interp
+                    .settle_dynamic_import_on_async_inits(
+                        &context,
+                        token,
+                        vec![promise],
+                        std::sync::Arc::from(target_url.as_str()),
+                    )
+                    .map_err(|error| {
+                        map_vm_error(otter_vm::RunError {
+                            error,
+                            frames: Vec::new(),
+                            detail: None,
+                        })
+                    })?;
+                self.interp
+                    .drain_microtasks_with_default(Some(context))
+                    .map_err(|error| {
+                        enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(error))
+                    })?;
+                Ok(true)
             }
             Ok(DynamicModuleLoad::PendingAsyncEvaluation {
                 promise,
@@ -3749,15 +3815,18 @@ impl Runtime {
         let cached = self
             .interp
             .with_dynamic_import_realm(token, |interp| {
+                if let Some(thrown) = interp.module_evaluation_error(&target_url) {
+                    return Ok(Some(Err(thrown)));
+                }
                 Ok(interp
                     .get_or_create_module_namespace(&target_url)
-                    .map(otter_vm::Value::object))
+                    .map(|namespace| Ok(otter_vm::Value::object(namespace))))
             })
             .map_err(realm::map_realm_vm_error)?
             .flatten();
-        if let Some(namespace) = cached {
+        if let Some(outcome) = cached {
             return self
-                .settle_extra_realm_dynamic_import(token, Ok(namespace))
+                .settle_extra_realm_dynamic_import(token, outcome)
                 .map(|_| DynamicImportBegin::Settled);
         }
         if module_loader::is_http_url(&target_url) {
@@ -3942,6 +4011,21 @@ impl Runtime {
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
                 namespace,
             )));
+        }
+        // §16.2.1.5 — a record whose evaluation completed abruptly answers
+        // every later import by rethrowing the same [[EvaluationError]]; a
+        // cached environment must not shortcut past that.
+        if let Some(thrown) = self.interp.module_evaluation_error(&target_url) {
+            return Err(DynLoadError::Thrown(thrown));
+        }
+        // §16.2.1.9 — a record still awaiting its top-level-await subtree
+        // gates this import on the same evaluation promise, preserving
+        // settlement order across repeat imports.
+        if let Some(promise) = self.interp.module_pending_evaluation_gate(&target_url) {
+            return Ok(DynamicModuleLoad::GateOnEvaluation {
+                promise,
+                target_url: target_url.clone(),
+            });
         }
         if let Some(namespace) = self.interp.get_or_create_module_namespace(&target_url) {
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
@@ -7259,6 +7343,34 @@ fn evaluate_and_settle_dynamic_linked_module_on(
     match outcome {
         Ok(DynamicModuleLoad::Loaded(namespace)) => {
             settle_dynamic_import_result_on(interp, token, Ok(namespace))
+        }
+        Ok(DynamicModuleLoad::GateOnEvaluation {
+            promise,
+            target_url,
+        }) => {
+            let Some(context) = interp.dynamic_import_context(token) else {
+                return Ok(true);
+            };
+            interp
+                .settle_dynamic_import_on_async_inits(
+                    &context,
+                    token,
+                    vec![promise],
+                    std::sync::Arc::from(target_url.as_str()),
+                )
+                .map_err(|error| {
+                    map_vm_error(otter_vm::RunError {
+                        error,
+                        frames: Vec::new(),
+                        detail: None,
+                    })
+                })?;
+            interp
+                .drain_microtasks_with_default(Some(context))
+                .map_err(|error| {
+                    enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error))
+                })?;
+            Ok(true)
         }
         Ok(DynamicModuleLoad::PendingAsyncEvaluation {
             promise,

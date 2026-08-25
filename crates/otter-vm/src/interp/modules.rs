@@ -215,7 +215,7 @@ impl Interpreter {
             move |ncx, _args, _captures| {
                 let interp = ncx.interp_mut();
                 let namespace = interp
-                    .module_env(&url)
+                    .get_or_create_module_namespace(&url)
                     .map(Value::object)
                     .unwrap_or_else(Value::undefined);
                 let _ = interp.settle_dynamic_import(token, Ok(namespace));
@@ -368,7 +368,7 @@ impl Interpreter {
     /// environment of `target_url`, created on first use and cached so
     /// every `import * as ns` / re-export of the same module yields the
     /// identical object.
-    pub(crate) fn get_or_create_module_namespace(&mut self, target_url: &str) -> Option<JsObject> {
+    pub fn get_or_create_module_namespace(&mut self, target_url: &str) -> Option<JsObject> {
         let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target_url);
         if let Some(ns) = self.module_namespaces.get(&target_rc) {
             return Some(*ns);

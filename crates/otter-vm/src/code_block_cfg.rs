@@ -158,6 +158,17 @@ pub(crate) struct CodeBlockControlFlow {
 }
 
 impl CodeBlockControlFlow {
+    /// Heap bytes the four precomputed tables retain for the owning code
+    /// block's lifetime.
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        (std::mem::size_of_val::<[u32]>(&self.block_starts) as u64)
+            .saturating_add(std::mem::size_of_val::<[u32]>(&self.loop_headers) as u64)
+            .saturating_add(std::mem::size_of_val::<[(u32, u32)]>(&self.loop_latches) as u64)
+            .saturating_add(std::mem::size_of_val::<[CodeBlockExceptionRegion]>(
+                &self.exception_regions,
+            ) as u64)
+    }
+
     /// Build tables from wordcode that has already passed schema verification.
     pub(crate) fn from_verified_wordcode(code: &FunctionCode) -> Self {
         let mut block_starts = BTreeSet::new();

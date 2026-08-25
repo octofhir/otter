@@ -400,7 +400,10 @@ impl Interpreter {
     }
 
     /// Install the shared ledger charged for VM-retained allocations:
-    /// synthesized sources and installed generated code.
+    /// synthesized sources, linked code-space chunks, and installed
+    /// generated code. Chunks linked after installation charge this
+    /// account; earlier bootstrap chunks keep their construction-time
+    /// charge.
     pub fn set_resource_account(&mut self, account: otter_resource::ResourceAccount) {
         self.module_sources.set_account(account.clone());
         self.jit_code_registry.set_account(account);

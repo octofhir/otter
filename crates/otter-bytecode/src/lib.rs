@@ -2363,4 +2363,104 @@ impl BytecodeModule {
     pub fn main(&self) -> &Function {
         &self.functions[0]
     }
+
+    /// Heap bytes this module retains for its owner's lifetime: every
+    /// function body, the constant pool, the shared source snapshot, and the
+    /// linker tables. Excludes `size_of::<Self>()`, which the owning
+    /// allocation accounts for. Saturating, so a saturated total still
+    /// exceeds any real budget and fails admission closed.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        let mut total = self.module.len() as u64;
+        total = total
+            .saturating_add(std::mem::size_of_val::<[TemplateSite]>(&self.template_sites) as u64);
+        for site in &self.template_sites {
+            total = total
+                .saturating_add(std::mem::size_of_val::<[Option<String>]>(&site.cooked) as u64)
+                .saturating_add(std::mem::size_of_val::<[String]>(&site.raw) as u64);
+            for cooked in site.cooked.iter().flatten() {
+                total = total.saturating_add(cooked.len() as u64);
+            }
+            for raw in &site.raw {
+                total = total.saturating_add(raw.len() as u64);
+            }
+        }
+        total = total.saturating_add(std::mem::size_of_val::<[Function]>(&self.functions) as u64);
+        for function in &self.functions {
+            total = total.saturating_add(function.retained_bytes());
+        }
+        if let Some(source) = &self.function_source {
+            total = total.saturating_add(source.len() as u64);
+        }
+        total = total.saturating_add(std::mem::size_of_val::<[Constant]>(&self.constants) as u64);
+        for constant in &self.constants {
+            total = total.saturating_add(constant.retained_bytes());
+        }
+        total = total.saturating_add(std::mem::size_of_val::<[ModuleResolution]>(
+            &self.module_resolutions,
+        ) as u64);
+        for resolution in &self.module_resolutions {
+            total = total
+                .saturating_add(resolution.referrer.len() as u64)
+                .saturating_add(resolution.specifier.len() as u64)
+                .saturating_add(
+                    resolution
+                        .attr_type
+                        .as_ref()
+                        .map_or(0, |attr| attr.len() as u64),
+                )
+                .saturating_add(resolution.target.len() as u64);
+        }
+        total =
+            total.saturating_add(std::mem::size_of_val::<[ModuleInit]>(&self.module_inits) as u64);
+        for init in &self.module_inits {
+            total = total.saturating_add(init.url.len() as u64);
+        }
+        total
+    }
+}
+
+impl Function {
+    /// Heap bytes this compiled function retains: name, wordcode body, span
+    /// table, eval-binding and mapped-arguments tables, and annotation-hint
+    /// tables. Excludes `size_of::<Self>()`, which the owning function table
+    /// accounts for.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        let mut total = (self.name.len() as u64).saturating_add(self.module_url.len() as u64);
+        total = total.saturating_add(std::mem::size_of_val::<[MappedArgumentBinding]>(
+            &self.mapped_argument_bindings,
+        ) as u64);
+        for binding in &self.mapped_argument_bindings {
+            total = total.saturating_add(binding.formal_name.len() as u64);
+        }
+        total = total.saturating_add(std::mem::size_of_val::<[DirectEvalBinding]>(
+            &self.direct_eval_bindings,
+        ) as u64);
+        for binding in &self.direct_eval_bindings {
+            total = total.saturating_add(binding.name.len() as u64);
+        }
+        total
+            .saturating_add(self.code.retained_bytes())
+            .saturating_add(std::mem::size_of_val::<[SpanEntry]>(&self.spans) as u64)
+            .saturating_add(std::mem::size_of_val::<[u32]>(&self.number_hint_sites) as u64)
+            .saturating_add(std::mem::size_of_val::<[ClassHintSite]>(&self.class_hint_sites) as u64)
+    }
+}
+
+impl Constant {
+    /// Heap bytes this constant retains beyond its pool slot.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::String { utf16 } => std::mem::size_of_val::<[u16]>(utf16) as u64,
+            Self::Number { .. } | Self::FunctionId { .. } => 0,
+            Self::BigInt { decimal } => decimal.len() as u64,
+            Self::RegExp {
+                pattern_utf16,
+                flags,
+            } => (std::mem::size_of_val::<[u16]>(pattern_utf16) as u64)
+                .saturating_add(flags.len() as u64),
+        }
+    }
 }

@@ -188,6 +188,21 @@ impl ExecutableModule {
         self.property_ic_site_end
     }
 
+    /// Heap bytes this execution view retains for the owning chunk's
+    /// lifetime: the function table plus every CodeBlock body. Saturating, so
+    /// a saturated total still exceeds any real budget and fails admission
+    /// closed.
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        let mut total = std::mem::size_of_val::<[Arc<CodeBlock>]>(&self.functions) as u64;
+        for code_block in &self.functions {
+            total = total
+                .saturating_add(std::mem::size_of::<CodeBlock>() as u64)
+                .saturating_add(code_block.retained_bytes());
+        }
+        total
+    }
+
     /// Build directory entries for the property/method sites in this chunk.
     pub(crate) fn feedback_slot_addresses(&self) -> Vec<(usize, FeedbackSlotAddress)> {
         let mut slots = Vec::new();
@@ -209,6 +224,34 @@ impl ExecutableModule {
 }
 
 impl CodeBlock {
+    /// Heap bytes this code block retains beyond `size_of::<Self>()`: the
+    /// instruction stream, overflow operand words, control-flow and span
+    /// tables, feedback vector, and annotation-hint tables.
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        (std::mem::size_of_val::<[ExecMappedArgumentBinding]>(&self.mapped_argument_bindings)
+            as u64)
+            .saturating_add(self.module_url.len() as u64)
+            .saturating_add(std::mem::size_of_val::<[ExecDirectEvalBinding]>(
+                &self.direct_eval_bindings,
+            ) as u64)
+            .saturating_add(
+                self.direct_eval_bindings
+                    .iter()
+                    .fold(0u64, |total, binding| {
+                        total.saturating_add(binding.name.len() as u64)
+                    }),
+            )
+            .saturating_add(std::mem::size_of_val::<[CodeBlockInstruction]>(&self.code) as u64)
+            .saturating_add(std::mem::size_of_val::<[u32]>(&self.overflow_operand_words) as u64)
+            .saturating_add(self.control_flow.retained_bytes())
+            .saturating_add(self.feedback.retained_bytes())
+            .saturating_add(std::mem::size_of_val::<[u32]>(&self.byte_pcs) as u64)
+            .saturating_add(std::mem::size_of_val::<[SpanEntry]>(&self.byte_spans) as u64)
+            .saturating_add(std::mem::size_of_val::<[u64]>(&self.number_hints) as u64)
+            .saturating_add(std::mem::size_of_val::<[(u32, u32)]>(&self.class_hints) as u64)
+    }
+
     /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.
     #[must_use]
     pub(crate) fn jit_compile_snapshot(self: &Arc<Self>) -> crate::jit::JitCompileSnapshot {

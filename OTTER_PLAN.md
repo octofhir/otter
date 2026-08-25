@@ -77,7 +77,7 @@ claim.
 | J1 | JIT | P1 | active lane | B1, R1 | one typed target-neutral compiled pipeline |
 | J2 | Portability | P1 | queued | J1 | x86-64 parity over the same Machine IR |
 | C1 | Conformance | P1 | queued | current slices | reproducible green targeted and full Test262 baselines |
-| O1 | Observability | P1 | queued | R1 | resource, scheduling, JIT, and denial telemetry |
+| O1 | Observability | P1 | started | R1 | resource, scheduling, JIT, and denial telemetry |
 
 Status meanings: `active` is the current implementation slice, `queued` has
 a defined boundary but is not being edited, `complete` has passed its stated
@@ -128,6 +128,17 @@ dynamic native installation, in-process snapshot restore, FFI, Node modules,
 and Web APIs. Each surface must name its evaluator call, effect point, resource
 charge, typed denial, cancellation behavior, and tests. Fix vertical slices;
 do not create a second generic host-call registry.
+
+Inventory captured (2026-08-25): every active surface checks its capability
+before the effect with a typed denial — `Otter.serve` (net), `fetch` (H1
+evaluator), module import (net), `otter:kv`/`otter:sql` (fs allowlists),
+`otter:ffi` (ffi path), `process.execve` and `child_process` spawn (run),
+`process.env` (env filter), `node:fs` bindings (fs_read/fs_write path
+checks), snapshot restore (donor capability set). Deliberate non-gates:
+Web Crypto RNG (spec-mandated), Worker construction (H2 resource bounds,
+capability narrowing stays E1 scope), `Date.now` (interpreter opcode; a
+gated clock would be a new E1 surface). No duplicated or post-effect checks
+found. Remaining H3 work is E1 unification, not new gates.
 
 ## R — Resource accounting and isolation
 
@@ -388,6 +399,12 @@ Expose bounded, low-overhead counters for heap/live/external/code/source/module
 bytes, workers, tasks, queue depth/bytes, host operations, cancellations,
 denials, reductions, turn duration, and exhaustion causes. Counters must remain
 usable during failure and teardown and must not allocate on hot rejection paths.
+
+Landed: `RuntimeActivityStats` embeds the shared-ledger `ResourceSnapshot`
+(current/peak/rejections/limit for every class, including `ExternalBytes`,
+`SourceModuleBytes`, and `GeneratedCodeBytes`), so one handle call captures
+activity and resource telemetry together. Remaining: reductions/turn-duration
+counters and denial causes on the same surface.
 
 ### O2. JIT and execution evidence
 

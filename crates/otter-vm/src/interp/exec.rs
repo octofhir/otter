@@ -500,24 +500,22 @@ impl Interpreter {
                     *effective_this,
                     std::mem::take(effective_args),
                 ) {
-                    Ok(value) => {
-                        self.settle_microtask_capability(
-                            context,
-                            result_capability.take(),
-                            Ok(value),
-                        );
-                        Ok(())
-                    }
+                    Ok(value) => self.settle_microtask_capability(
+                        context,
+                        stack,
+                        result_capability.take(),
+                        Ok(value),
+                    ),
                     Err(vm_err) => {
                         if result_capability.is_some() && !vm_err.is_termination() {
                             let reason =
                                 crate::promise_dispatch::rejection_value_for(self, &vm_err);
                             self.settle_microtask_capability(
                                 context,
+                                stack,
                                 result_capability.take(),
                                 Err(reason),
-                            );
-                            Ok(())
+                            )
                         } else {
                             Err(RunError {
                                 error: vm_err,
@@ -544,7 +542,12 @@ impl Interpreter {
             };
             return match raw {
                 Ok(value) => {
-                    self.settle_microtask_capability(context, result_capability.take(), Ok(value));
+                    self.settle_microtask_capability(
+                        context,
+                        stack,
+                        result_capability.take(),
+                        Ok(value),
+                    )?;
                     Ok(())
                 }
                 Err(vm_err) => {
@@ -564,10 +567,10 @@ impl Interpreter {
                         });
                         self.settle_microtask_capability(
                             context,
+                            stack,
                             result_capability.take(),
                             Err(reason),
-                        );
-                        Ok(())
+                        )
                     } else {
                         Err(RunError {
                             error: vm_err,
@@ -590,7 +593,12 @@ impl Interpreter {
             let args = std::mem::take(effective_args);
             return match self.run_callable_sync_rooted(stack, context, &callee, this_value, args) {
                 Ok(value) => {
-                    self.settle_microtask_capability(context, result_capability.take(), Ok(value));
+                    self.settle_microtask_capability(
+                        context,
+                        stack,
+                        result_capability.take(),
+                        Ok(value),
+                    )?;
                     Ok(())
                 }
                 Err(vm_err) => {
@@ -600,10 +608,10 @@ impl Interpreter {
                         });
                         self.settle_microtask_capability(
                             context,
+                            stack,
                             result_capability.take(),
                             Err(reason),
-                        );
-                        Ok(())
+                        )
                     } else {
                         Err(RunError {
                             error: vm_err,
@@ -741,10 +749,10 @@ impl Interpreter {
                 };
                 self.settle_microtask_capability(
                     context,
+                    stack,
                     result_capability.take(),
                     Ok(settle_value),
-                );
-                Ok(())
+                )
             }
             Err(error) => {
                 if result_capability.is_some() && !error.is_termination() {
@@ -762,10 +770,10 @@ impl Interpreter {
                     });
                     self.settle_microtask_capability(
                         context,
+                        stack,
                         result_capability.take(),
                         Err(reason),
-                    );
-                    Ok(())
+                    )
                 } else {
                     let frames = snapshot_frames(context, stack);
                     Err(RunError {
@@ -788,30 +796,28 @@ impl Interpreter {
     pub(crate) fn settle_microtask_capability(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         cap: Option<microtask::MicrotaskCapability>,
         outcome: Result<Value, Value>,
-    ) {
+    ) -> Result<(), RunError> {
         let Some(cap) = cap else {
-            return;
+            return Ok(());
         };
-        let (callee, args): (Value, SmallVec<[Value; 4]>) = match outcome {
+        let (callee, args): (Value, SmallVec<[Value; 8]>) = match outcome {
             Ok(v) => (cap.resolve, smallvec::smallvec![v]),
             Err(reason) => (cap.reject, smallvec::smallvec![reason]),
         };
-        // Settling enqueues another microtask so the resolve/
-        // reject native runs in a fresh job (matches spec
-        // ordering — the next reaction picks it up on the next
-        // generation).
-        let async_context = self.async_context();
-        self.microtasks.enqueue(Microtask {
-            callee,
-            this_value: Value::undefined(),
-            args,
-            context: Some(context.clone()),
-            result_capability: None,
-            kind: microtask::MicrotaskKind::Call,
-            async_context,
-        });
+        // §27.2.2.1 PromiseReactionJob step 2 — the capability's resolve /
+        // reject runs INSIDE this job, so the downstream settles before any
+        // job that was already queued behind this one. A deferred call here
+        // adds an observable tick and reorders `Promise.race` winners.
+        self.run_callable_sync_rooted(stack, context, &callee, Value::undefined(), args)
+            .map(|_| ())
+            .map_err(|error| RunError {
+                error,
+                frames: Vec::new(),
+                detail: self.take_error_detail(),
+            })
     }
 
     /// Internal driver. Pulls the snapshot capture out of the

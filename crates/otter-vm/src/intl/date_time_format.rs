@@ -1123,7 +1123,7 @@ pub(crate) fn date_time_format_format_to_parts(
     }
     let civil = arg_to_civil(ctx, args.first(), "formatToParts", &payload)?;
     let parts = icu_format_segments(civil, &payload)
-        .unwrap_or_else(|| vec![("literal", format_components(civil, &payload))]);
+        .unwrap_or_else(|| manual_format_segments(civil, &payload));
 
     ctx.scope(|mut scope| {
         let result = scope.array(parts.len())?;
@@ -1152,6 +1152,20 @@ fn range_civil(
     name: &'static str,
     payload: &DateTimeFormatPayload,
 ) -> Result<(Civil, Civil), NativeError> {
+    let start = arg_to_civil(ctx, args.first(), name, payload)?;
+    let end = arg_to_civil(ctx, args.get(1), name, payload)?;
+    Ok((start, end))
+}
+
+/// §12.1.9 steps 4-5 — ToDateTimeFormattable on both range endpoints:
+/// a missing/undefined endpoint is a TypeError, a Temporal object passes
+/// through, and anything else runs ToNumber (its `valueOf` fires here,
+/// BEFORE the same-type and calendar checks — but its TimeClip does not).
+fn range_formattable(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<(Value, Value), NativeError> {
     let undef = |v: Option<&Value>| v.is_none() || v.is_some_and(|x| x.is_undefined());
     if undef(args.first()) || undef(args.get(1)) {
         return Err(NativeError::TypeError {
@@ -1159,9 +1173,45 @@ fn range_civil(
             reason: "startDate and endDate must not be undefined".to_string(),
         });
     }
-    let start = arg_to_civil(ctx, args.first(), name, payload)?;
-    let end = arg_to_civil(ctx, args.get(1), name, payload)?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    let formattable = |ctx: &mut NativeCtx<'_>, value: &Value| -> Result<Value, NativeError> {
+        if value.as_temporal(ctx.heap()).is_some() {
+            return Ok(*value);
+        }
+        let number = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, &exec, value)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+        })?;
+        Ok(Value::number(number))
+    };
+    let start = formattable(ctx, &args[0])?;
+    let end = formattable(ctx, &args[1])?;
     Ok((start, end))
+}
+
+/// The calendar identifier of a calendared Temporal value, when the
+/// argument is one (`Instant` and `PlainTime` carry no calendar).
+fn temporal_calendar_id(value: &Value, heap: &otter_gc::GcHeap) -> Option<&'static str> {
+    let payload = value.as_temporal(heap)?.payload_clone(heap);
+    let identifier = match payload {
+        TemporalPayload::PlainDate(d) => d.calendar().identifier(),
+        TemporalPayload::PlainDateTime(d) => d.calendar().identifier(),
+        TemporalPayload::PlainYearMonth(d) => d.calendar().identifier(),
+        TemporalPayload::PlainMonthDay(d) => d.calendar().identifier(),
+        TemporalPayload::ZonedDateTime(d) => d.calendar().identifier(),
+        TemporalPayload::Instant(_)
+        | TemporalPayload::PlainTime(_)
+        | TemporalPayload::Duration(_) => {
+            return None;
+        }
+    };
+    Some(identifier)
 }
 
 fn range_payload(
@@ -1184,6 +1234,18 @@ fn range_payload(
             reason: "startDate and endDate must be the same date-time value type".to_string(),
         });
     }
+    // §PartitionDateTimeRangePattern — two calendared Temporal endpoints
+    // must carry the same calendar to share one range rendering.
+    if let (Some(start_cal), Some(end_cal)) = (
+        temporal_calendar_id(start, heap),
+        temporal_calendar_id(end, heap),
+    ) && start_cal != end_cal
+    {
+        return Err(NativeError::RangeError {
+            name,
+            reason: "startDate and endDate must have the same calendar".to_string(),
+        });
+    }
     let mut filtered = payload.clone();
     // Same §HandleDateTimeValue pipeline as `format`: a bare-default
     // formatter substitutes the endpoint type's components before the
@@ -1191,6 +1253,39 @@ fn range_payload(
     apply_temporal_defaults(&mut filtered, start, heap);
     apply_temporal_field_intersection(&mut filtered, start, name, heap)?;
     Ok(filtered)
+}
+
+/// §PartitionDateTimeRangePattern shared-prefix split. CLDR range
+/// patterns repeat the whole rendering when any date-category field
+/// differs, and collapse to one shared date with a time range when the
+/// difference is confined to the time portion. Returns the shared
+/// prefix length when the collapsed form applies.
+fn range_shared_prefix_len(
+    start: &[(&'static str, String)],
+    end: &[(&'static str, String)],
+) -> Option<usize> {
+    let mut diverge = 0;
+    let limit = start.len().min(end.len());
+    while diverge < limit && start[diverge] == end[diverge] {
+        diverge += 1;
+    }
+    const TIME_KINDS: [&str; 6] = [
+        "hour",
+        "minute",
+        "second",
+        "fractionalSecond",
+        "dayPeriod",
+        "timeZoneName",
+    ];
+    let first_time = start
+        .iter()
+        .position(|(kind, _)| TIME_KINDS.contains(kind))?;
+    if first_time == 0 || diverge < first_time {
+        return None;
+    }
+    // Trim a trailing shared literal separator ("8/4/2021, ") — CLDR
+    // keeps it with the shared date, so include it in the prefix.
+    Some(first_time)
 }
 
 /// §12.4.4 `Intl.DateTimeFormat.prototype.formatRange(startDate, endDate)`.
@@ -1205,14 +1300,34 @@ pub(crate) fn date_time_format_format_range(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRange")?;
-    let payload = range_payload(&payload, args, ctx.heap(), "formatRange")?;
-    let (s, e) = range_civil(ctx, args, "formatRange", &payload)?;
+    let (x, y) = range_formattable(ctx, args, "formatRange")?;
+    let converted = [x, y];
+    let payload = range_payload(&payload, &converted, ctx.heap(), "formatRange")?;
+    let (s, e) = range_civil(ctx, &converted, "formatRange", &payload)?;
     let start_str = format_components(s, &payload);
     let end_str = format_components(e, &payload);
     let combined = if start_str == end_str {
         start_str
     } else {
-        format!("{start_str}{RANGE_SEPARATOR}{end_str}")
+        let shared = icu_format_segments(s, &payload)
+            .zip(icu_format_segments(e, &payload))
+            .and_then(|(start_parts, end_parts)| {
+                let prefix = range_shared_prefix_len(&start_parts, &end_parts)?;
+                let head: String = start_parts[..prefix]
+                    .iter()
+                    .map(|(_, value)| value.as_str())
+                    .collect();
+                let start_tail: String = start_parts[prefix..]
+                    .iter()
+                    .map(|(_, value)| value.as_str())
+                    .collect();
+                let end_tail: String = end_parts[prefix..]
+                    .iter()
+                    .map(|(_, value)| value.as_str())
+                    .collect();
+                Some(format!("{head}{start_tail}{RANGE_SEPARATOR}{end_tail}"))
+            });
+        shared.unwrap_or_else(|| format!("{start_str}{RANGE_SEPARATOR}{end_str}"))
     };
     Ok(Value::string(JsString::from_str(
         &combined,
@@ -1232,54 +1347,58 @@ pub(crate) fn date_time_format_format_range_to_parts(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRangeToParts")?;
-    let payload = range_payload(&payload, args, ctx.heap(), "formatRangeToParts")?;
-    let (s, e) = range_civil(ctx, args, "formatRangeToParts", &payload)?;
-    let start_parts = icu_format_segments(s, &payload)
-        .unwrap_or_else(|| vec![("literal", format_components(s, &payload))]);
-    let end_parts = icu_format_segments(e, &payload)
-        .unwrap_or_else(|| vec![("literal", format_components(e, &payload))]);
+    let (x, y) = range_formattable(ctx, args, "formatRangeToParts")?;
+    let converted = [x, y];
+    let payload = range_payload(&payload, &converted, ctx.heap(), "formatRangeToParts")?;
+    let (s, e) = range_civil(ctx, &converted, "formatRangeToParts", &payload)?;
+    let start_parts =
+        icu_format_segments(s, &payload).unwrap_or_else(|| manual_format_segments(s, &payload));
+    let end_parts =
+        icu_format_segments(e, &payload).unwrap_or_else(|| manual_format_segments(e, &payload));
 
     let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
     let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();
     let collapsed = start_str == end_str;
-    let result_len = if collapsed {
-        start_parts.len()
+    // (type, value, source) rows, resolved before any allocation so the
+    // result array is created at its exact length.
+    let mut rows: Vec<(&'static str, String, &'static str)> = Vec::new();
+    if collapsed {
+        for (ty, value) in &start_parts {
+            rows.push((ty, value.clone(), "shared"));
+        }
+    } else if let Some(prefix) = range_shared_prefix_len(&start_parts, &end_parts) {
+        for (ty, value) in &start_parts[..prefix] {
+            rows.push((ty, value.clone(), "shared"));
+        }
+        for (ty, value) in &start_parts[prefix..] {
+            rows.push((ty, value.clone(), "startRange"));
+        }
+        rows.push(("literal", RANGE_SEPARATOR.to_string(), "shared"));
+        for (ty, value) in &end_parts[prefix..] {
+            rows.push((ty, value.clone(), "endRange"));
+        }
     } else {
-        start_parts.len() + 1 + end_parts.len()
-    };
+        for (ty, value) in &start_parts {
+            rows.push((ty, value.clone(), "startRange"));
+        }
+        rows.push(("literal", RANGE_SEPARATOR.to_string(), "shared"));
+        for (ty, value) in &end_parts {
+            rows.push((ty, value.clone(), "endRange"));
+        }
+    }
 
     ctx.scope(|mut scope| {
-        let result = scope.array(result_len)?;
-        let mut index = 0usize;
-        {
-            let mut append = |ty: &str, value: &str, source: &str| -> Result<(), NativeError> {
-                let part = scope.object()?;
-                let ty = scope.string(ty)?;
-                scope.set(part, "type", ty)?;
-                let value = scope.string(value)?;
-                scope.set(part, "value", value)?;
-                let source = scope.string(source)?;
-                scope.set(part, "source", source)?;
-                scope.set_index(result, index, part)?;
-                index += 1;
-                Ok(())
-            };
-
-            if collapsed {
-                for (ty, value) in &start_parts {
-                    append(ty, value, "shared")?;
-                }
-            } else {
-                for (ty, value) in &start_parts {
-                    append(ty, value, "startRange")?;
-                }
-                append("literal", RANGE_SEPARATOR, "shared")?;
-                for (ty, value) in &end_parts {
-                    append(ty, value, "endRange")?;
-                }
-            }
+        let result = scope.array(rows.len())?;
+        for (index, (ty, value, source)) in rows.iter().enumerate() {
+            let part = scope.object()?;
+            let ty = scope.string(ty)?;
+            scope.set(part, "type", ty)?;
+            let value = scope.string(value)?;
+            scope.set(part, "value", value)?;
+            let source = scope.string(source)?;
+            scope.set(part, "source", source)?;
+            scope.set_index(result, index, part)?;
         }
-
         Ok(scope.finish(result))
     })
 }
@@ -2151,61 +2270,111 @@ fn format_components(civil: Civil, payload: &DateTimeFormatPayload) -> String {
     if let Some(s) = icu_format_components(civil, payload) {
         return s;
     }
-    let mut date_part = String::new();
+    manual_format_segments(civil, payload)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// Typed-part fallback rendering for inputs ICU cannot represent
+/// (years beyond ±9999): the same `M/d/y, h:mm:ss` shape
+/// [`format_components`] would build, segment by segment, so
+/// `formatToParts` still labels month/day/year instead of collapsing
+/// the whole rendering into one literal.
+fn manual_format_segments(
+    civil: Civil,
+    payload: &DateTimeFormatPayload,
+) -> Vec<(&'static str, String)> {
+    let mut parts: Vec<(&'static str, String)> = Vec::new();
+    if let Some(width) = payload.weekday {
+        let dow = weekday_index(civil.year, civil.month, civil.day);
+        const LONG: [&str; 7] = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ];
+        const SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const NARROW: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
+        let name = match width {
+            DtTextWidth::Long => LONG[dow],
+            DtTextWidth::Short => SHORT[dow],
+            DtTextWidth::Narrow => NARROW[dow],
+        };
+        parts.push(("weekday", name.to_string()));
+    }
+    if payload.weekday.is_some()
+        && (payload.month.is_some() || payload.day.is_some() || payload.year.is_some())
+    {
+        parts.push(("literal", ", ".to_string()));
+    }
+    let weekday_len = parts.len();
     if let Some(width) = payload.month {
         let width = match width {
             DtMonthWidth::Numeric => DtNumWidth::Numeric,
             DtMonthWidth::TwoDigit => DtNumWidth::TwoDigit,
             DtMonthWidth::Narrow | DtMonthWidth::Short | DtMonthWidth::Long => DtNumWidth::Numeric,
         };
-        date_part.push_str(&format_number_field(civil.month, width, payload));
+        parts.push(("month", format_number_field(civil.month, width, payload)));
     }
     if let Some(width) = payload.day {
-        if !date_part.is_empty() {
-            date_part.push('/');
+        if parts.len() > weekday_len {
+            parts.push(("literal", "/".to_string()));
         }
-        date_part.push_str(&format_number_field(civil.day, width, payload));
+        parts.push(("day", format_number_field(civil.day, width, payload)));
     }
     if let Some(width) = payload.year {
-        if !date_part.is_empty() {
-            date_part.push('/');
+        if parts.len() > weekday_len {
+            parts.push(("literal", "/".to_string()));
         }
         let ascii = match width {
             DtNumWidth::Numeric => civil.year.to_string(),
             DtNumWidth::TwoDigit => format!("{:02}", civil.year.rem_euclid(100)),
         };
-        date_part.push_str(&localize_ascii_digits(&ascii, payload));
+        parts.push(("year", localize_ascii_digits(&ascii, payload)));
     }
-    let mut time_part = String::new();
+    let date_len = parts.len();
     if let Some(width) = payload.hour {
-        time_part.push_str(&format_number_field(civil.hour, width, payload));
+        if date_len > 0 {
+            parts.push(("literal", ", ".to_string()));
+        }
+        parts.push(("hour", format_number_field(civil.hour, width, payload)));
     }
     if let Some(width) = payload.minute {
-        if !time_part.is_empty() {
-            time_part.push(':');
+        if parts.len() > date_len {
+            parts.push(("literal", ":".to_string()));
+        } else if date_len > 0 {
+            parts.push(("literal", ", ".to_string()));
         }
-        time_part.push_str(&format_number_field(civil.minute, width, payload));
+        parts.push(("minute", format_number_field(civil.minute, width, payload)));
     }
     if let Some(width) = payload.second {
-        if !time_part.is_empty() {
-            time_part.push(':');
+        if parts.len() > date_len {
+            parts.push(("literal", ":".to_string()));
+        } else if date_len > 0 {
+            parts.push(("literal", ", ".to_string()));
         }
-        time_part.push_str(&format_number_field(civil.second, width, payload));
+        parts.push(("second", format_number_field(civil.second, width, payload)));
     }
     if let Some(digits) = payload.fractional_second_digits {
-        if !time_part.is_empty() {
-            time_part.push_str(decimal_separator(payload));
+        if parts.len() > date_len {
+            parts.push(("literal", decimal_separator(payload).to_string()));
         }
-        time_part.push_str(&fractional_second_digits(civil, digits, payload));
+        parts.push((
+            "fractionalSecond",
+            fractional_second_digits(civil, digits, payload),
+        ));
     }
-    let mut formatted = match (date_part.is_empty(), time_part.is_empty()) {
-        (false, false) => format!("{date_part}, {time_part}"),
-        (false, true) => date_part,
-        (true, false) => time_part,
-        (true, true) => String::new(),
-    };
-    append_time_zone_text(&mut formatted, payload);
-    formatted
+    if let Some(zone) = time_zone_display_name(payload) {
+        if !parts.is_empty() {
+            parts.push(("literal", ", ".to_string()));
+        }
+        parts.push(("timeZoneName", zone));
+    }
+    parts
 }
 
 fn subsecond_nanos(millisecond: u16, microsecond: u16, nanosecond: u16) -> u32 {
@@ -2271,6 +2440,24 @@ fn civil_from_broken_down(bd: crate::date::BrokenDown) -> Civil {
         bd.second,
         u32::from(bd.millisecond) * 1_000_000,
     )
+}
+
+/// Days since the Unix epoch of a civil date — Hinnant's
+/// `days_from_civil`, the inverse of [`epoch_to_civil`].
+fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let y = i64::from(if month <= 2 { year - 1 } else { year });
+    let m = u32::from(month);
+    let d = u32::from(day);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + i64::from(doe) - 719_468
+}
+
+/// Day of week, 0 = Sunday. 1970-01-01 was a Thursday (index 4).
+fn weekday_index(year: i32, month: u8, day: u8) -> usize {
+    (days_from_civil(year, month, day) + 4).rem_euclid(7) as usize
 }
 
 /// Convert UTC epoch seconds to a civil tuple using the proleptic

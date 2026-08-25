@@ -13,11 +13,14 @@
 //!
 //! # Invariants
 //!
-//! - A token is tied to one live [`crate::GcHeap`] and must be dropped
-//!   before that heap is destroyed.
-//! - Resizing books the delta before publishing a larger byte count.
-//! - Dropping or shrinking releases exactly the currently booked
-//!   bytes, saturating through [`crate::GcHeap::release_bytes`].
+//! - Tokens hold no heap pointer: releases record into the owning heap's
+//!   shared release channel and are drained by the next accounting
+//!   operation or stats query. A token dropped during or after heap
+//!   teardown (payload drops, moved isolates) is therefore sound.
+//! - Resizing books the delta against the caller-provided owning heap
+//!   before publishing a larger byte count.
+//! - Dropping, shrinking, or releasing gives back exactly the currently
+//!   booked bytes, saturating at the heap's outstanding reservation.
 //!
 //! # See also
 //!
@@ -56,7 +59,11 @@ impl SharedExternalState {
 
 /// RAII reservation for memory outside GC cell payloads.
 ///
-/// The token is isolate-local and intentionally `!Send + !Sync`.
+/// The token is isolate-local and intentionally `!Send + !Sync`. It holds
+/// no heap pointer: dropping or releasing records the byte count in the
+/// owning heap's shared release channel, which the heap drains on its next
+/// accounting operation or stats query. This keeps payload-embedded tokens
+/// sound across isolate moves and heap teardown.
 ///
 /// # Example
 ///
@@ -65,14 +72,14 @@ impl SharedExternalState {
 /// let mut backing = heap.reserve_external(1024).unwrap();
 /// assert_eq!(backing.bytes(), 1024);
 ///
-/// backing.resize(2048).unwrap();
+/// backing.resize(&mut heap, 2048).unwrap();
 /// assert_eq!(backing.bytes(), 2048);
 ///
 /// backing.release();
 /// assert_eq!(heap.tracked_bytes(), 0);
 /// ```
 pub struct ExternalMemory {
-    heap: *mut GcHeap,
+    state: Arc<SharedExternalState>,
     bytes: u64,
     _not_send: PhantomData<*mut ()>,
 }
@@ -81,7 +88,7 @@ impl ExternalMemory {
     pub(crate) fn new(heap: &mut GcHeap, bytes: u64) -> Result<Self, OutOfMemory> {
         heap.reserve_bytes(bytes)?;
         Ok(Self {
-            heap,
+            state: heap.shared_external_state(),
             bytes,
             _not_send: PhantomData,
         })
@@ -94,7 +101,7 @@ impl ExternalMemory {
     ) -> Result<Self, OutOfMemory> {
         heap.reserve_bytes_with_roots(bytes, external_visit)?;
         Ok(Self {
-            heap,
+            state: heap.shared_external_state(),
             bytes,
             _not_send: PhantomData,
         })
@@ -106,19 +113,20 @@ impl ExternalMemory {
         self.bytes
     }
 
-    /// Resize this reservation.
+    /// Resize this reservation against its owning heap.
     ///
     /// # Errors
     ///
     /// Returns [`OutOfMemory`] when growing would exceed the owning
-    /// heap cap.
-    pub fn resize(&mut self, new_bytes: u64) -> Result<(), OutOfMemory> {
+    /// heap cap or the shared external-bytes budget.
+    pub fn resize(&mut self, heap: &mut GcHeap, new_bytes: u64) -> Result<(), OutOfMemory> {
+        debug_assert!(
+            Arc::ptr_eq(&self.state, &heap.shared_external_state()),
+            "external tokens resize only against their owning heap"
+        );
         if new_bytes == self.bytes {
             return Ok(());
         }
-        // SAFETY: constructor stores a live heap pointer and the token
-        // is isolate-local; callers must drop tokens before the heap.
-        let heap = unsafe { &mut *self.heap };
         if new_bytes > self.bytes {
             let delta = new_bytes - self.bytes;
             heap.reserve_bytes(delta)?;
@@ -138,9 +146,7 @@ impl ExternalMemory {
         if self.bytes == 0 {
             return;
         }
-        // SAFETY: same as [`Self::resize`].
-        let heap = unsafe { &mut *self.heap };
-        heap.release_bytes(self.bytes);
+        self.state.release(self.bytes);
         self.bytes = 0;
     }
 }

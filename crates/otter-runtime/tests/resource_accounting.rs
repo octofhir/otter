@@ -573,3 +573,33 @@ fn source_byte_limit_rejects_an_oversized_module_before_retention() {
         "a rejected source must not stay charged"
     );
 }
+
+#[test]
+fn array_buffer_backing_stores_charge_external_bytes_and_release_with_the_isolate() {
+    let account = ResourceAccount::default();
+    let mut runtime = Runtime::builder()
+        .resource_account(account.clone())
+        .process_global(false)
+        .jit_selection(JitSelection::InterpreterOnly)
+        .build()
+        .expect("runtime");
+    let baseline = resource_entry(&account, ResourceClass::ExternalBytes).current();
+
+    runtime
+        .eval(SourceInput::from_javascript(
+            "globalThis.buf = new ArrayBuffer(1 << 20);",
+        ))
+        .expect("allocate a 1 MiB backing store");
+    let charged = resource_entry(&account, ResourceClass::ExternalBytes).current();
+    assert!(
+        charged >= baseline + (1 << 20),
+        "backing store must charge ExternalBytes: baseline {baseline}, charged {charged}"
+    );
+
+    drop(runtime);
+    assert_eq!(
+        resource_entry(&account, ResourceClass::ExternalBytes).current(),
+        0,
+        "external charges must die with the isolate"
+    );
+}

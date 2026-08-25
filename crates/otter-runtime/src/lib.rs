@@ -2799,7 +2799,7 @@ impl Runtime {
             })?;
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
-        interp.set_resource_account(config.resource_account.clone());
+        interp.set_resource_account(config.resource_account.clone())?;
         interp.set_console_sink(config.console_sink.clone());
         // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
         // heap state, so a restored isolate wires it fresh.
@@ -2895,7 +2895,7 @@ impl Runtime {
         interp.gc_heap_mut().set_tenure_all(true);
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
-        interp.set_resource_account(config.resource_account.clone());
+        interp.set_resource_account(config.resource_account.clone())?;
         interp.set_console_sink(config.console_sink.clone());
         if let Some(hook) = config.promise_rejection_hook.clone() {
             interp.set_promise_rejection_hook(hook);

@@ -400,13 +400,23 @@ impl Interpreter {
     }
 
     /// Install the shared ledger charged for VM-retained allocations:
-    /// synthesized sources, linked code-space chunks, and installed
-    /// generated code. Chunks linked after installation charge this
-    /// account; earlier bootstrap chunks keep their construction-time
-    /// charge.
-    pub fn set_resource_account(&mut self, account: otter_resource::ResourceAccount) {
+    /// synthesized sources, linked code-space chunks, installed generated
+    /// code, and the heap's outstanding external backing-store bytes.
+    /// Chunks linked after installation charge this account; earlier
+    /// bootstrap chunks keep their construction-time charge.
+    ///
+    /// # Errors
+    /// Returns the ledger refusal when the account cannot admit the heap's
+    /// already-outstanding `ExternalBytes`; the previous account remains
+    /// installed everywhere.
+    pub fn set_resource_account(
+        &mut self,
+        account: otter_resource::ResourceAccount,
+    ) -> Result<(), otter_resource::ResourceError> {
+        self.gc_heap.set_external_bytes_account(&account)?;
         self.module_sources.set_account(account.clone());
         self.jit_code_registry.set_account(account);
+        Ok(())
     }
 
     /// The ledger charged for VM-synthesized retained sources.

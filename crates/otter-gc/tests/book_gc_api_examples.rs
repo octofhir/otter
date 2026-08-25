@@ -28,7 +28,7 @@ fn book_example_accounts_external_memory_with_raii() {
     let mut backing = heap.reserve_external(1024).unwrap();
     assert_eq!(backing.bytes(), 1024);
 
-    backing.resize(2048).unwrap();
+    backing.resize(&mut heap, 2048).unwrap();
     assert_eq!(backing.bytes(), 2048);
 
     backing.release();

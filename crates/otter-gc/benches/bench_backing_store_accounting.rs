@@ -22,8 +22,8 @@ fn bench(c: &mut Criterion) {
     group.bench_function("resize_4k_to_8k_to_1k", |b| {
         b.iter(|| {
             let mut token = heap.reserve_external(4096).expect("reserve");
-            token.resize(8192).expect("grow");
-            token.resize(1024).expect("shrink");
+            token.resize(&mut heap, 8192).expect("grow");
+            token.resize(&mut heap, 1024).expect("shrink");
             std::hint::black_box(token.bytes());
             drop(token);
         });

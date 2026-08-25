@@ -406,45 +406,48 @@ pub(crate) fn destructure_object_inner(
     }
 
     if let Some(rest) = pattern.rest.as_ref() {
-        // §13.15.5 RestObjectAssignment — build a fresh object,
-        // copy every enumerable own property of `src`, then delete
-        // each previously-extracted key.
+        // §13.15.5 RestObjectAssignment — build a fresh object and copy
+        // every enumerable own property of `src` except the
+        // previously-extracted keys. The exclusion happens inside the copy
+        // (§7.3.31), so a Proxy source never sees a [[GetOwnProperty]]
+        // trap for an excluded name.
         let rest_obj = parent.alloc_scratch();
         parent.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
+        let excluded = parent.alloc_scratch();
         parent.emit(
-            Op::CopyDataProperties,
-            [Operand::Register(rest_obj), Operand::Register(src_reg)],
+            Op::NewArray,
+            [Operand::Register(excluded), Operand::ConstIndex(0)],
             span,
         );
         for key in &extracted_keys {
-            match key {
+            let key_reg = match key {
                 ExtractedKey::Static(s) => {
                     let key_const = parent.intern_string_constant(s);
-                    let del_dst = parent.alloc_scratch();
+                    let r = parent.alloc_scratch();
                     parent.emit(
-                        Op::DeleteProperty,
-                        vec![
-                            Operand::Register(del_dst),
-                            Operand::Register(rest_obj),
-                            Operand::ConstIndex(key_const),
-                        ],
+                        Op::LoadString,
+                        [Operand::Register(r), Operand::ConstIndex(key_const)],
                         span,
                     );
+                    r
                 }
-                ExtractedKey::Runtime(key_reg) => {
-                    let del_dst = parent.alloc_scratch();
-                    parent.emit(
-                        Op::DeleteElement,
-                        vec![
-                            Operand::Register(del_dst),
-                            Operand::Register(rest_obj),
-                            Operand::Register(*key_reg),
-                        ],
-                        span,
-                    );
-                }
-            }
+                ExtractedKey::Runtime(key_reg) => *key_reg,
+            };
+            parent.emit(
+                Op::ArrayPush,
+                [Operand::Register(excluded), Operand::Register(key_reg)],
+                span,
+            );
         }
+        parent.emit(
+            Op::CopyDataProperties,
+            vec![
+                Operand::Register(rest_obj),
+                Operand::Register(src_reg),
+                Operand::Register(excluded),
+            ],
+            span,
+        );
         destructure_pattern(parent, rest_obj, &rest.argument, span, assign_existing)?;
     }
     Ok(())

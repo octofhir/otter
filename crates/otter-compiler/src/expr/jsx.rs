@@ -199,9 +199,19 @@ fn compile_jsx_props(
             JSXAttributeItem::SpreadAttribute(spread) => {
                 let spread_span = (spread.span.start, spread.span.end);
                 let src = compile_expr(cx, &spread.argument, spread_span)?;
+                let no_excluded = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadUndefined,
+                    [Operand::Register(no_excluded)],
+                    spread_span,
+                );
                 cx.emit(
                     Op::CopyDataProperties,
-                    [Operand::Register(props), Operand::Register(src)],
+                    vec![
+                        Operand::Register(props),
+                        Operand::Register(src),
+                        Operand::Register(no_excluded),
+                    ],
                     spread_span,
                 );
             }

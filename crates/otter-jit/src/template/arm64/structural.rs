@@ -25,6 +25,7 @@ pub(super) fn emit_structural_op(
     opcode: u8,
     arg0: u64,
     arg1: u64,
+    arg2: u64,
     bail: DynamicLabel,
     threw: DynamicLabel,
     fatal: DynamicLabel,
@@ -33,6 +34,7 @@ pub(super) fn emit_structural_op(
     emit_load_u64(ops, 1, u64::from(opcode));
     emit_load_u64(ops, 2, arg0);
     emit_load_u64(ops, 3, arg1);
+    emit_load_u64(ops, 4, arg2);
     emit_load_runtime_stub(
         ops,
         relocations,

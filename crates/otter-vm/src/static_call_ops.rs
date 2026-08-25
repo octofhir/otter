@@ -208,8 +208,11 @@ impl Interpreter {
     }
 
     /// `Op::CopyDataProperties` — §7.3.31 CopyDataProperties applied
-    /// to `target` from `src`. No return value (compiler discards it).
-    /// Routes around any user shadow of `Object.assign`.
+    /// to `target` from `src`, skipping the property keys listed in the
+    /// third operand's array (a rest element's already-extracted names).
+    /// Excluded keys are filtered BEFORE `[[GetOwnProperty]]`, so a Proxy
+    /// source never sees a trap for them. No return value (the compiler
+    /// discards it). Routes around any user shadow of `Object.assign`.
     pub(crate) fn run_copy_data_properties_operands(
         &mut self,
         context: &ExecutionContext,
@@ -217,17 +220,28 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
-        let (target, src) = {
+        let (target, src, excluded_value) = {
             let frame = &stack[top_idx];
             let target_reg = register_operand(operands.first())?;
             let src_reg = register_operand(operands.get(1))?;
+            let excluded_reg = register_operand(operands.get(2))?;
             (
                 *read_register(frame, target_reg)?,
                 *read_register(frame, src_reg)?,
+                *read_register(frame, excluded_reg)?,
             )
         };
+        let excluded: Vec<Value> = match excluded_value.as_array() {
+            Some(array) => {
+                let len = crate::array::len(array, &self.gc_heap);
+                (0..len)
+                    .map(|idx| crate::array::get(array, &self.gc_heap, idx))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         let args = [target, src];
-        let _ = self.do_object_assign(context, stack, &args)?;
+        let _ = self.do_object_assign_excluding(context, stack, &args, &excluded)?;
         let frame = &mut stack[top_idx];
         frame.advance_pc()?;
         Ok(())
@@ -621,6 +635,18 @@ impl Interpreter {
         stack: &mut ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
+        self.do_object_assign_excluding(context, stack, args, &[])
+    }
+
+    /// [`Self::do_object_assign`] skipping `excluded` property keys before
+    /// any `[[GetOwnProperty]]` (§7.3.31 CopyDataProperties semantics).
+    pub(crate) fn do_object_assign_excluding(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        args: &[Value],
+        excluded: &[Value],
+    ) -> Result<Value, VmError> {
         let target_input = args.first().cloned().unwrap_or(Value::undefined());
         // §20.1.2.1 step 2 — `ToObject(target)`. The spec returns the
         // resulting object as `target`, so Array / RegExp / Map / etc.
@@ -667,7 +693,15 @@ impl Interpreter {
                     )?;
                 }
             } else if assign_source_uses_own_property_keys(src) {
-                assign_copy_source_keys(self, stack, context, &target_value, target_object, src)?;
+                assign_copy_source_keys(
+                    self,
+                    stack,
+                    context,
+                    &target_value,
+                    target_object,
+                    src,
+                    excluded,
+                )?;
             } else {
                 // Primitive Boolean / Number / Symbol / BigInt
                 // wrappers have no enumerable own properties in
@@ -1788,6 +1822,7 @@ fn assign_source_uses_own_property_keys(source: &Value) -> bool {
     is_property_bearing_object(source)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assign_copy_source_keys(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
@@ -1795,63 +1830,139 @@ fn assign_copy_source_keys(
     target_value: &Value,
     target_object: Option<crate::object::JsObject>,
     source: &Value,
+    excluded: &[Value],
 ) -> Result<(), VmError> {
+    let _ = target_object;
     let keys = interp.own_property_keys_value(stack, context, source)?;
-    for key_value in &keys {
-        let key = if let Some(s) = key_value.as_string(interp.gc_heap()) {
-            VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap()))
-        } else if let Some(sym) = key_value.as_symbol(interp.gc_heap()) {
-            VmPropertyKey::Symbol(sym)
-        } else {
-            return Err(interp.err_type(
-                ("Object.assign source ownKeys returned non-property key".to_string()).into(),
-            ));
-        };
-        let desc =
-            interp.ordinary_get_own_property_descriptor_value(stack, context, *source, &key, 0)?;
-        let Some(desc) = desc else {
-            continue;
-        };
-        if !desc.enumerable() {
-            continue;
-        }
-        let value = match interp.ordinary_get_value(stack, context, *source, *source, &key, 0)? {
-            crate::VmGetOutcome::Value(value) => value,
-            crate::VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
-                stack,
-                context,
-                &getter,
-                *source,
-                SmallVec::new(),
-            )?,
-        };
-        match &key {
-            VmPropertyKey::Symbol(sym) => {
-                assign_set_symbol(
-                    interp,
-                    stack,
-                    context,
-                    target_value,
-                    target_object,
-                    *sym,
-                    value,
-                )?;
-            }
-            _ => {
-                assign_set_string(
-                    interp,
-                    stack,
-                    context,
-                    target_value,
-                    target_object,
-                    key.string_name()
-                        .expect("non-symbol key has string spelling"),
-                    value,
-                )?;
-            }
-        }
+    // Proxy traps and accessors reenter JavaScript below, and every
+    // reentry can collect: park the source, target, excluded keys, and
+    // the whole ownKeys list in the handle arena and re-read them per
+    // step — raw `Vec<Value>` entries and stack locals are not roots.
+    let base = interp.json_root_push(*source);
+    let target_root = interp.json_root_push(*target_value);
+    let excluded_base = interp.json_root_push(Value::undefined()) + 1;
+    for candidate in excluded {
+        interp.json_root_push(*candidate);
     }
-    Ok(())
+    let keys_base = interp.json_root_push(Value::undefined()) + 1;
+    for key in &keys {
+        interp.json_root_push(*key);
+    }
+    let key_count = keys.len();
+    let excluded_count = excluded.len();
+    drop(keys);
+    let result = (|| {
+        for index in 0..key_count {
+            let key_value = interp.json_root_get(keys_base + index);
+            let key = if let Some(s) = key_value.as_string(interp.gc_heap()) {
+                VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap()))
+            } else if key_value.as_symbol(interp.gc_heap()).is_some() {
+                VmPropertyKey::Symbol(
+                    interp
+                        .json_root_get(keys_base + index)
+                        .as_symbol(interp.gc_heap())
+                        .expect("symbol key remains a symbol"),
+                )
+            } else {
+                return Err(interp.err_type(
+                    ("Object.assign source ownKeys returned non-property key".to_string()).into(),
+                ));
+            };
+            // §7.3.31 step 3.a — an excluded name never reaches
+            // [[GetOwnProperty]], so a Proxy source observes no trap for
+            // it. Excluded entries are ToPropertyKey results, but a
+            // numeric key survives as a number value; compare through its
+            // canonical string spelling.
+            let is_excluded = (0..excluded_count).any(|j| {
+                let candidate = interp.json_root_get(excluded_base + j);
+                let key_value = interp.json_root_get(keys_base + index);
+                if let (Some(a), Some(b)) = (
+                    candidate.as_symbol(interp.gc_heap()),
+                    key_value.as_symbol(interp.gc_heap()),
+                ) {
+                    return a.ptr_eq(b);
+                }
+                let Some(key_name) = key.string_name() else {
+                    return false;
+                };
+                if let Some(a) = candidate.as_string(interp.gc_heap()) {
+                    return a.to_lossy_string(interp.gc_heap()) == key_name;
+                }
+                if let Some(number) = candidate.as_number() {
+                    return number.to_display_string() == key_name;
+                }
+                false
+            });
+            if is_excluded {
+                continue;
+            }
+            let source = interp.json_root_get(base);
+            let desc = interp
+                .ordinary_get_own_property_descriptor_value(stack, context, source, &key, 0)?;
+            let Some(desc) = desc else {
+                continue;
+            };
+            if !desc.enumerable() {
+                continue;
+            }
+            // The descriptor trap may have collected: rebuild a symbol key
+            // from its parked slot before the read and the write.
+            let key = match key {
+                VmPropertyKey::Symbol(_) => VmPropertyKey::Symbol(
+                    interp
+                        .json_root_get(keys_base + index)
+                        .as_symbol(interp.gc_heap())
+                        .expect("symbol key remains a symbol"),
+                ),
+                other => other,
+            };
+            let source = interp.json_root_get(base);
+            let value = match interp.ordinary_get_value(stack, context, source, source, &key, 0)? {
+                crate::VmGetOutcome::Value(value) => value,
+                crate::VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &getter,
+                    source,
+                    SmallVec::new(),
+                )?,
+            };
+            let target_value = interp.json_root_get(target_root);
+            let target_object = target_value.as_object();
+            match &key {
+                VmPropertyKey::Symbol(_) => {
+                    let sym = interp
+                        .json_root_get(keys_base + index)
+                        .as_symbol(interp.gc_heap())
+                        .expect("symbol key remains a symbol");
+                    assign_set_symbol(
+                        interp,
+                        stack,
+                        context,
+                        &target_value,
+                        target_object,
+                        sym,
+                        value,
+                    )?;
+                }
+                _ => {
+                    assign_set_string(
+                        interp,
+                        stack,
+                        context,
+                        &target_value,
+                        target_object,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                        value,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    interp.json_root_pop_to(base);
+    result
 }
 
 /// `Object.assign` value-level write helper. Routes string-keyed

@@ -398,16 +398,18 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.13% at
-`62f66879`, 456 fails, 0 crashes/timeouts. Remaining fail mass, largest first:
-intl402 (~170 — DateTimeFormat calendar-data and range-pattern families,
-NumberFormat, Locale), Temporal (~110 — ZonedDateTime/Duration edges),
-staging/sm (~140, heterogeneous), annexB parser cluster (7, oxc-level
-assignment-target coverage). In progress: DateTimeFormat wave — ICU4X zone
-names (icu_time), §HandleDateTimeValue overlap matrix, ToDateTimeOptions
-required/defaults modes with `Date.prototype.toLocale*String` routed through
-DateTimeFormat (intl402/DateTimeFormat 46→29 fails, intl402 202→170, zero
-regressions).
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.44% at
+`7bded890`, 293 fails, 0 crashes/timeouts. The intl402 wave closed 163
+tests with zero regressions: DateTimeFormat runs on ICU4X zone names and
+ToDateTimeOptions modes (46→11), NumberFormat implements v3 options and
+exact mathematical values (37→2), PluralRules/DurationFormat/intl402-Date
+are green, Locale resolves region-preference data, and Temporal gained
+zone-adopting toLocaleString, calendar checks, and eraless-calendar
+handling. Remaining fail mass, largest first: staging/sm (~140,
+heterogeneous), Temporal core calendar/dst edges (~80 — islamic variants,
+ZonedDateTime dst/sub-minute offsets), DateTimeFormat
+chinese/dangi/japanese rendering (~10), annexB parser cluster (7,
+oxc-level), legacy Intl-constructed symbol object model (4).
 
 ### C2. Web and Node compatibility
 

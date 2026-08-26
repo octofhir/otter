@@ -1891,6 +1891,11 @@ pub struct EvalCompileOptions {
     /// inside a derived class constructor, making `super()` legal in
     /// the eval body.
     pub super_call_allowed: bool,
+    /// §20.2.1.1 CreateDynamicFunction — the source is a synthesized
+    /// `(function anonymous(...) {...})` whose outer function gets NO
+    /// self-name binding (`typeof anonymous` inside the body is
+    /// `"undefined"`).
+    pub function_constructor: bool,
 }
 
 /// Where an error's captured stack points, resolved against the source the

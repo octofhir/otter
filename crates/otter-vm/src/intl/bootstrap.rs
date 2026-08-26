@@ -196,24 +196,82 @@ fn intl_construct(
     // whose receiver inherits from %<Kind>.prototype% chains the fresh
     // formatter onto the receiver under %FallbackSymbol% and returns the
     // receiver; prototype methods unwrap through the same symbol.
-    if !ctx.is_construct_call()
-        && matches!(kind, IntlKind::DateTimeFormat | IntlKind::NumberFormat)
-        && let this = *ctx.this_value()
-        && let Some(receiver) = this.as_object()
-        && receiver_inherits_class_prototype(ctx, class, receiver)
+    if !ctx.is_construct_call() && matches!(kind, IntlKind::DateTimeFormat | IntlKind::NumberFormat)
     {
-        let symbol =
+        let this = *ctx.this_value();
+        // An Intl service instance receiver (its own props live in the
+        // identity-keyed exotic bag) chains exactly like an ordinary
+        // object inheriting from the class prototype.
+        let target_bag = if let Some(receiver) = this.as_object() {
+            receiver_inherits_class_prototype(ctx, class, receiver).then_some(receiver)
+        } else if this.as_intl(ctx.heap()).is_some()
+            && intl_value_inherits_class_prototype(ctx, class, this)
+        {
             ctx.interp_mut()
-                .intl_fallback_symbol()
+                .ensure_non_gc_exotic_user_props(&this)
                 .map_err(|_| NativeError::TypeError {
                     name: class,
                     reason: "out of memory".to_string(),
-                })?;
-        let descriptor = crate::object::PropertyDescriptor::data(value, false, false, false);
-        crate::object::define_own_symbol_property(receiver, ctx.heap_mut(), symbol, descriptor);
-        return Ok(this);
+                })?
+        } else {
+            None
+        };
+        if let Some(receiver) = target_bag {
+            let symbol =
+                ctx.interp_mut()
+                    .intl_fallback_symbol()
+                    .map_err(|_| NativeError::TypeError {
+                        name: class,
+                        reason: "out of memory".to_string(),
+                    })?;
+            let descriptor = crate::object::PropertyDescriptor::data(value, false, false, false);
+            crate::object::define_own_symbol_property(receiver, ctx.heap_mut(), symbol, descriptor);
+            return Ok(this);
+        }
     }
     Ok(value)
+}
+
+/// As [`receiver_inherits_class_prototype`] for a non-`JsObject`
+/// receiver (an Intl service instance): walk [[GetPrototypeOf]] from
+/// the value through the interpreter's exotic-aware resolver.
+fn intl_value_inherits_class_prototype(
+    ctx: &mut NativeCtx<'_>,
+    class: &'static str,
+    receiver: Value,
+) -> bool {
+    let global = *ctx.interp_mut().global_this();
+    let ctor = crate::object::get(global, ctx.heap(), "Intl")
+        .and_then(|intl| intl.as_object())
+        .and_then(|intl| crate::object::get(intl, ctx.heap(), class))
+        .and_then(|ctor| ctor.as_native_function());
+    let Some(ctor) = ctor else {
+        return false;
+    };
+    let Ok(Some(descriptor)) = ctor.own_property_descriptor(ctx.heap_mut(), "prototype") else {
+        return false;
+    };
+    let class_prototype = match &descriptor.kind {
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
+        crate::object::DescriptorKind::Accessor { .. } => None,
+    };
+    let Some(class_prototype) = class_prototype else {
+        return false;
+    };
+    let mut current = receiver;
+    for _ in 0..128 {
+        let Ok(proto) = ctx.interp_mut().get_prototype_for_op(&current) else {
+            return false;
+        };
+        if proto.is_null() || proto.is_undefined() {
+            return false;
+        }
+        if proto.as_object() == Some(class_prototype) {
+            return true;
+        }
+        current = proto;
+    }
+    false
 }
 
 /// Does `receiver`'s prototype chain contain `%Intl.<class>.prototype%`?

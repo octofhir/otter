@@ -783,7 +783,7 @@ pub(crate) fn resolve_ctx_with_mode(
 }
 
 fn require_date_time(
-    ctx: &NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     name: &'static str,
 ) -> Result<DateTimeFormatPayload, NativeError> {
     let bad = || NativeError::TypeError {

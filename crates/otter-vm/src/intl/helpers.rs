@@ -549,13 +549,38 @@ pub fn get_number_option(
 /// the formatter a legacy `Intl.<Kind>.call(receiver)` chained onto it
 /// under `%FallbackSymbol%`.
 pub(crate) fn unwrap_legacy_receiver(
-    ctx: &NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     receiver: crate::Value,
 ) -> Option<crate::intl::payload::JsIntl> {
     if let Some(intl) = receiver.as_intl(ctx.heap()) {
         return Some(intl);
     }
-    let object = receiver.as_object()?;
     let symbol = *ctx.cx.interp.intl_fallback_symbol_for_trace()?;
-    crate::object::get_symbol(object, ctx.heap(), symbol)?.as_intl(ctx.heap())
+    if let Some(object) = receiver.as_object() {
+        return crate::object::get_symbol(object, ctx.heap(), symbol)?.as_intl(ctx.heap());
+    }
+    if receiver.is_proxy() {
+        // §UnwrapDateTimeFormat step 2 — Get(dtf, %FallbackSymbol%) is
+        // an ordinary observable [[Get]], so a Proxy receiver's get
+        // trap fires and can hand back the chained formatter.
+        let exec = ctx.execution_context().cloned()?;
+        let got = ctx
+            .with_turn_parts(|interp, stack| {
+                let key = crate::VmPropertyKey::Symbol(symbol);
+                match interp.ordinary_get_value(stack, &exec, receiver, receiver, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => Ok(v),
+                    crate::VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            &exec,
+                            &getter,
+                            receiver,
+                            smallvec::SmallVec::new(),
+                        ),
+                }
+            })
+            .ok()?;
+        return got.as_intl(ctx.heap());
+    }
+    None
 }

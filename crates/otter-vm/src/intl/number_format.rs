@@ -514,7 +514,7 @@ fn is_well_formed_unit(unit: &str) -> bool {
 }
 
 fn require_number_format(
-    ctx: &NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     name: &'static str,
 ) -> Result<NumberFormatPayload, NativeError> {
     let bad = || NativeError::TypeError {

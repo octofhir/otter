@@ -328,6 +328,27 @@ impl Interpreter {
         target: &Value,
         key: &VmPropertyKey,
     ) -> Option<object::PropertyDescriptor> {
+        // A class constructor's `prototype` is a non-writable
+        // non-configurable own data property — the one function-shaped
+        // descriptor the §10.5.8 get-trap invariant can trip over.
+        if let Some(class) = target.as_class_constructor() {
+            if key.string_name() == Some("prototype") {
+                if let Some(desc) = object::get_own_descriptor(
+                    class.statics(&self.gc_heap),
+                    &self.gc_heap,
+                    "prototype",
+                ) {
+                    return Some(desc);
+                }
+                return Some(object::PropertyDescriptor::data(
+                    Value::object(class.prototype(&self.gc_heap)),
+                    false,
+                    false,
+                    false,
+                ));
+            }
+            return None;
+        }
         let obj = target.as_object()?;
         if let Some(key) = key.string_name() {
             object::get_own_descriptor(obj, &self.gc_heap, key)
@@ -547,7 +568,12 @@ impl Interpreter {
             regexp.prevent_extensions(&mut self.gc_heap);
             return Ok(true);
         }
-        if value.is_map() || value.is_set() || value.is_generator() {
+        if value.is_map()
+            || value.is_set()
+            || value.is_weak_map()
+            || value.is_weak_set()
+            || value.is_generator()
+        {
             // Materialise the expando and mark it non-extensible so the
             // collection reports [[IsExtensible]] = false and rejects
             // further own-property additions.
@@ -908,7 +934,13 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        if target.is_map() || target.is_set() || target.is_generator() || target.is_iterator() {
+        if target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator()
+            || target.is_iterator()
+        {
             let mut keys = Vec::new();
             let bag = self
                 .collection_expando(&target)

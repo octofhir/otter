@@ -326,10 +326,35 @@ impl Interpreter {
                         _ => Value::undefined(),
                     },
                 },
-                None => self
-                    .load_function_prototype_method(name)
-                    .or_else(|| self.load_object_prototype_method(name))
-                    .unwrap_or(Value::undefined()),
+                None => {
+                    // A [[Prototype]] override (bind copies the
+                    // target's prototype; setPrototypeOf lands here
+                    // too) replaces the %Function.prototype% walk.
+                    if let Some(proto) = bound.prototype_override(&self.gc_heap) {
+                        if proto.is_nullish() {
+                            Value::undefined()
+                        } else {
+                            let key = VmPropertyKey::String(name);
+                            match self
+                                .ordinary_get_value(stack, context, proto, receiver, &key, 0)?
+                            {
+                                VmGetOutcome::Value(value) => value,
+                                VmGetOutcome::InvokeGetter { getter } => self
+                                    .run_callable_sync_rooted(
+                                        stack,
+                                        context,
+                                        &getter,
+                                        receiver,
+                                        SmallVec::new(),
+                                    )?,
+                            }
+                        }
+                    } else {
+                        self.load_function_prototype_method(name)
+                            .or_else(|| self.load_object_prototype_method(name))
+                            .unwrap_or(Value::undefined())
+                    }
+                }
             }
         } else if receiver.as_regexp().is_some() {
             // §10.1.8 [[Get]] on a RegExp: route through the shared
@@ -451,7 +476,41 @@ impl Interpreter {
                     }
                 }
             } else {
-                temporal::load_property(t, &mut self.gc_heap, name)
+                let direct = temporal::load_property(t, &mut self.gc_heap, name);
+                if direct.is_undefined() {
+                    // Prototype walk with the temporal as receiver: a
+                    // method loaded as a value (`zdt.toString`), a
+                    // subclass-prototype property, or a fallible
+                    // accessor (`hoursInDay` out of range) that the
+                    // internal-slot table cannot surface resolves —
+                    // and can throw — through the real chain.
+                    let proto = t
+                        .prototype_override(&self.gc_heap)
+                        .or_else(|| self.temporal_prototype_object(t.kind()));
+                    if let Some(proto_obj) = proto {
+                        let key = VmPropertyKey::String(name);
+                        match self.ordinary_get_value(
+                            stack,
+                            context,
+                            Value::object(proto_obj),
+                            receiver,
+                            &key,
+                            0,
+                        )? {
+                            VmGetOutcome::Value(v) => v,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                                self.run_callable_sync_rooted(
+                                    stack, context, &getter, receiver, args,
+                                )?
+                            }
+                        }
+                    } else {
+                        direct
+                    }
+                } else {
+                    direct
+                }
             }
         } else if let Some(b) = receiver.as_array_buffer() {
             // Own expando bag (species `constructor` override, or a
@@ -1231,7 +1290,12 @@ impl Interpreter {
                 )?;
             }
             None
-        } else if receiver.is_map() || receiver.is_set() || receiver.is_generator() {
+        } else if receiver.is_map()
+            || receiver.is_set()
+            || receiver.is_weak_map()
+            || receiver.is_weak_set()
+            || receiver.is_generator()
+        {
             // §10.1.9 OrdinarySet — a user-assigned own property
             // (`m.x = 5`) lands in the lazy expando; the prototype
             // walk first lets a getter-only accessor (`size`) reject

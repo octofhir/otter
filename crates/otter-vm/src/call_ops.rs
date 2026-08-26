@@ -1242,7 +1242,15 @@ impl Interpreter {
             let c = crate::closure::JsClosure::from_parts(handle, function_id);
             let upvalues: crate::frame_state::UpvalueSpine =
                 c.upvalues_snapshot(heap).into_boxed_slice();
-            let this_value = bound_this.unwrap_or(effective_this);
+            let mut this_value = bound_this.unwrap_or(effective_this);
+            // An arrow closed over a derived constructor's pre-super()
+            // `this` snapshot carries the hole; the live value arrives
+            // through the shared derived-this cell once super() runs.
+            if this_value.is_hole()
+                && let Some(cell) = bound_derived_this
+            {
+                this_value = crate::read_upvalue(heap, cell);
+            }
             return Ok((
                 function_id,
                 upvalues,

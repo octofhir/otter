@@ -660,7 +660,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         top_idx: usize,
-        home: Value,
+        base: Value,
         key: SuperReadKey<'_>,
         value: Value,
         strict: bool,
@@ -669,7 +669,10 @@ impl Interpreter {
         if actual_this.is_hole() {
             return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
         }
-        let base = self.get_prototype_for_op(&home)?;
+        // §13.3.5.3 MakeSuperPropertyReference — `base` was resolved by
+        // the lowering (home's [[GetPrototypeOf]]) BEFORE the RHS
+        // evaluated, so a setPrototypeOf side effect inside the RHS is
+        // not observable here.
         if base.is_null() || base.is_undefined() {
             return Err(self.err_type(
                 ("cannot write property of null or undefined super reference".to_string()).into(),
@@ -922,6 +925,10 @@ impl Interpreter {
             crate::collections::weak_map_prototype_override(map, &self.gc_heap)
         } else if let Some(set) = receiver.as_weak_set() {
             crate::collections::weak_set_prototype_override(set, &self.gc_heap)
+        } else if let Some(buffer) = receiver.as_array_buffer() {
+            buffer.custom_proto(&self.gc_heap)
+        } else if let Some(view) = receiver.as_data_view() {
+            view.custom_proto(&self.gc_heap)
         } else {
             None
         }
@@ -1138,6 +1145,40 @@ pub(crate) fn map_ensure_expando_pub(
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     crate::collections::map_set_expando(m, heap, bag);
+    Ok(bag)
+}
+
+/// As [`map_ensure_expando_pub`] for a WeakMap.
+pub(crate) fn weak_map_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    m: crate::collections::JsWeakMap,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = crate::collections::weak_map_expando(m, heap) {
+        return Ok(existing);
+    }
+    let recv = Value::weak_map(m);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    crate::collections::weak_map_set_expando(m, heap, bag);
+    Ok(bag)
+}
+
+/// As [`map_ensure_expando_pub`] for a WeakSet.
+pub(crate) fn weak_set_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    s: crate::collections::JsWeakSet,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = crate::collections::weak_set_expando(s, heap) {
+        return Ok(existing);
+    }
+    let recv = Value::weak_set(s);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    crate::collections::weak_set_set_expando(s, heap, bag);
     Ok(bag)
 }
 

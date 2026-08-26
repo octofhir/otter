@@ -1711,16 +1711,19 @@ impl Interpreter {
         // lazy expando bag. Integrity operations must freeze/test that bag;
         // Set's internal [[SetData]] intentionally remains mutable unless a
         // host API explicitly marks its snapshot read-only.
-        let collection_integrity =
-            matches!(
-                method,
-                M::Freeze
-                    | M::Seal
-                    | M::IsFrozen
-                    | M::IsSealed
-                    | M::IsExtensible
-                    | M::PreventExtensions
-            ) && (target.is_map() || target.is_set() || target.is_generator());
+        let collection_integrity = matches!(
+            method,
+            M::Freeze
+                | M::Seal
+                | M::IsFrozen
+                | M::IsSealed
+                | M::IsExtensible
+                | M::PreventExtensions
+        ) && (target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator());
         if !target.is_proxy()
             && !namespace_integrity
             && !typed_array_integrity

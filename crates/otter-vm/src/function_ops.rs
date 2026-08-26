@@ -481,14 +481,39 @@ impl Interpreter {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_bind_function = None;
                 }
+                let mut target = state.target;
+                let mut bound_this = state.bound_this;
+                let mut bound_args = state.bound_args;
+                let mut target_name = target_name;
+                let mut produced = produced;
+                let proto = {
+                    let target_snapshot = target;
+                    let mut holds: Vec<&mut Value> = vec![
+                        &mut bound_this,
+                        &mut target_name,
+                        &mut produced,
+                        &mut target,
+                    ];
+                    holds.extend(bound_args.iter_mut());
+                    match self.bind_target_proto_anchored(
+                        stack,
+                        context,
+                        &mut holds,
+                        &target_snapshot,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => return Some(Err(e)),
+                    }
+                };
                 self.finish_bind_function(
                     stack,
                     dst,
-                    state.target,
-                    state.bound_this,
-                    state.bound_args,
+                    target,
+                    bound_this,
+                    bound_args,
                     target_name,
                     produced,
+                    proto,
                 )
             }
         })
@@ -511,6 +536,22 @@ impl Interpreter {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_bind_function = None;
                 }
+                let mut target = target;
+                let mut bound_this = bound_this;
+                let mut bound_args = bound_args;
+                let mut target_name = target_name;
+                let mut target_length = target_length;
+                let proto = {
+                    let target_snapshot = target;
+                    let mut holds: Vec<&mut Value> = vec![
+                        &mut bound_this,
+                        &mut target_name,
+                        &mut target_length,
+                        &mut target,
+                    ];
+                    holds.extend(bound_args.iter_mut());
+                    self.bind_target_proto_anchored(stack, context, &mut holds, &target_snapshot)?
+                };
                 self.finish_bind_function(
                     stack,
                     dst,
@@ -519,6 +560,7 @@ impl Interpreter {
                     bound_args,
                     target_name,
                     target_length,
+                    proto,
                 )
             }
             BindMetadataGet::Getter(getter) => {
@@ -537,6 +579,33 @@ impl Interpreter {
         }
     }
 
+    /// §10.4.1.3 step 1 — the bind target's [[GetPrototypeOf]] result,
+    /// trap-observable for a Proxy target. Every bind value the caller
+    /// still holds is anchored across the trap (it can run user code),
+    /// re-read via the returned anchor base afterwards.
+    fn bind_target_proto_anchored(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        values: &mut [&mut Value],
+        target: &Value,
+    ) -> Result<Value, VmError> {
+        if !target.is_proxy() {
+            return self.get_prototype_for_op(target);
+        }
+        let base = self.push_iteration_anchor(*target) - 1;
+        for v in values.iter() {
+            self.push_iteration_anchor(**v);
+        }
+        let anchored_target = self.iteration_anchor(base);
+        let proto = self.ordinary_get_prototype_value(stack, context, anchored_target, 0)?;
+        for (i, v) in values.iter_mut().enumerate() {
+            **v = self.iteration_anchor(base + 1 + i);
+        }
+        self.pop_iteration_anchors_to(base);
+        Ok(proto)
+    }
+
     fn finish_bind_function(
         &mut self,
         stack: &mut ActivationStack,
@@ -546,6 +615,7 @@ impl Interpreter {
         bound_args: SmallVec<[Value; 4]>,
         target_name: Value,
         target_length: Value,
+        target_proto: Value,
     ) -> Result<(), VmError> {
         let metadata = function_metadata::bound_create_metadata_from_values(
             &target_name,
@@ -553,6 +623,12 @@ impl Interpreter {
             bound_args.len(),
             &self.gc_heap,
         );
+        // §10.4.1.3 BoundFunctionCreate step 1 — the bound function's
+        // [[Prototype]] is the target's [[GetPrototypeOf]] result,
+        // resolved by the caller. Only a non-default result needs the
+        // body override.
+        let default_proto = self.function_prototype_object().ok().map(Value::object);
+        let proto_override = (Some(target_proto) != default_proto).then_some(target_proto);
         let target_root = target;
         let bound_this_root = bound_this;
         let bound_args_root = bound_args.clone();
@@ -566,6 +642,9 @@ impl Interpreter {
             for arg in &bound_args_root {
                 arg.trace_value_slots(visitor);
             }
+            if let Some(p) = &proto_override {
+                p.trace_value_slots(visitor);
+            }
         };
         let bound = BoundFunction::new_with_metadata_and_roots(
             &mut self.gc_heap,
@@ -575,6 +654,9 @@ impl Interpreter {
             metadata,
             &mut external_visit,
         )?;
+        if let Some(proto) = proto_override {
+            bound.set_prototype_override(&mut self.gc_heap, proto);
+        }
         let top_idx = stack.len() - 1;
         if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
             cold.pending_bind_function = None;
@@ -636,7 +718,22 @@ impl Interpreter {
             }
         };
 
+        // Anchor the produced length across the prototype trap and the
+        // bound-function allocation, like the name above.
+        let length_anchor = self.push_iteration_anchor(target_length) - 1;
+
+        // §10.4.1.3 step 1 — resolve the target's [[GetPrototypeOf]]
+        // (trap-observable for a Proxy target) before allocation. The
+        // trap can run user code, so the anchored / frame-sourced
+        // values re-read after it.
+        let target = *read_register(&stack[top_idx], callee_reg)?;
+        let target_proto = if target.is_proxy() {
+            self.ordinary_get_prototype_value(stack, context, target, 0)?
+        } else {
+            self.get_prototype_for_op(&target)?
+        };
         let target_name = self.iteration_anchor(name_anchor);
+        let target_length = self.iteration_anchor(length_anchor);
         let target = *read_register(&stack[top_idx], callee_reg)?;
         let bound_this = *read_register(&stack[top_idx], this_reg)?;
         let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(arg_regs.len());
@@ -651,6 +748,7 @@ impl Interpreter {
             bound_args,
             target_name,
             target_length,
+            target_proto,
         );
         self.pop_iteration_anchors_to(name_anchor);
         result
@@ -815,6 +913,19 @@ impl Interpreter {
                 // bound-function storage boundary. No VM allocation can occur
                 // between taking it from the registered state and handing it
                 // to the constructor, which roots its exact owned parameters.
+                // §10.4.1.3 BoundFunctionCreate step 1 — the bound
+                // function's [[Prototype]] is the target's current
+                // [[GetPrototypeOf]] result (trap-observable for a
+                // Proxy target).
+                let target_proto = {
+                    let target = roots.target();
+                    if target.is_proxy() {
+                        self.ordinary_get_prototype_value(stack, context, target, 0)?
+                    } else {
+                        self.get_prototype_for_op(&target)?
+                    }
+                };
+                roots.set_scratch(0, target_proto);
                 let bound_args: SmallVec<[Value; 4]> = roots.take_args().into_iter().collect();
                 let target = roots.target();
                 let receiver = roots.receiver_value();
@@ -827,6 +938,11 @@ impl Interpreter {
                     metadata,
                     &mut external_visit,
                 )?;
+                let default_proto = self.function_prototype_object().ok().map(Value::object);
+                let target_proto = roots.scratch(0);
+                if Some(target_proto) != default_proto {
+                    bound.set_prototype_override(&mut self.gc_heap, target_proto);
+                }
                 Ok(Value::bound_function(bound))
             }
             VmIntrinsicFunction::FunctionPrototypeToString => {

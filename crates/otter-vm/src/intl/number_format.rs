@@ -571,7 +571,11 @@ fn exact_decimal_text(raw: &str) -> Option<(bool, String)> {
 
 /// Exact rendering of a decimal-string argument for the standard-notation
 /// decimal/currency/percent shapes; `None` falls back to the f64 path.
-fn format_exact(negative: bool, text: &str, payload: &NumberFormatPayload) -> Option<String> {
+pub(crate) fn format_exact(
+    negative: bool,
+    text: &str,
+    payload: &NumberFormatPayload,
+) -> Option<String> {
     if payload.notation != "standard"
         || payload.maximum_significant_digits.is_some()
         || payload.style == "unit"
@@ -636,13 +640,6 @@ fn format_exact(negative: bool, text: &str, payload: &NumberFormatPayload) -> Op
         }
         _ => format!("{sign}{core}"),
     })
-}
-
-fn coerce_format_arg(ctx: &mut NativeCtx<'_>, first: Option<&Value>) -> Result<f64, NativeError> {
-    match coerce_format_arg_numeric(ctx, first)? {
-        NumericArg::Number(n) => Ok(n),
-        exact => Ok(exact.approx()),
-    }
 }
 
 /// §ToIntlMathematicalValue — a string or BigInt argument keeps its exact
@@ -790,8 +787,12 @@ pub(crate) fn number_format_format_to_parts(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "formatToParts")?;
-    let n = coerce_format_arg(ctx, args.first())?;
-    let parts = partition_number(n, &payload);
+    let arg = coerce_format_arg_numeric(ctx, args.first())?;
+    let parts = match &arg {
+        NumericArg::Exact { negative, text } => partition_exact(*negative, text, &payload)
+            .unwrap_or_else(|| partition_number(arg.approx(), &payload)),
+        NumericArg::Number(n) => partition_number(*n, &payload),
+    };
 
     ctx.scope(|mut scope| {
         let result = scope.array(parts.len())?;
@@ -802,6 +803,32 @@ pub(crate) fn number_format_format_to_parts(
         }
         Ok(scope.finish(result))
     })
+}
+
+/// Exact-digit part partitioning for the decimal-style standard-notation
+/// shapes `format_exact` covers; `None` falls back to the f64 path.
+fn partition_exact(
+    negative: bool,
+    text: &str,
+    payload: &NumberFormatPayload,
+) -> Option<Vec<(&'static str, String)>> {
+    if payload.style != "decimal" {
+        return None;
+    }
+    let rendered = format_exact(negative, text, payload)?;
+    let mut parts: Vec<(&'static str, String)> = Vec::new();
+    let (dec_sep, group_sep) = locale_separators(&payload.locale);
+    let core = if let Some(stripped) = rendered.strip_prefix('-') {
+        parts.push(("minusSign", "-".to_string()));
+        stripped
+    } else if let Some(stripped) = rendered.strip_prefix('+') {
+        parts.push(("plusSign", "+".to_string()));
+        stripped
+    } else {
+        rendered.as_str()
+    };
+    push_number_parts_sep(&mut parts, core, dec_sep, group_sep);
+    Some(parts)
 }
 
 /// Fill one already-rooted parts-array slot without retaining transient

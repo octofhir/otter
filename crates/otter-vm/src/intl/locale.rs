@@ -404,7 +404,13 @@ fn canonicalize_keyword_values(loc: &mut Locale) {
 fn make_locale(ctx: &mut NativeCtx<'_>, canonical: String) -> Result<Value, NativeError> {
     let payload = IntlPayload::Locale(LocalePayload { locale: canonical });
     let intl = JsIntl::new(ctx.heap_mut(), payload).map_err(|_| type_err("out of memory"))?;
-    Ok(Value::intl(intl))
+    let value = Value::intl(intl);
+    // Subclass construction: honor `new.target.prototype`.
+    if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "Locale")? {
+        ctx.interp_mut()
+            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,11 +558,218 @@ fn string_array(ctx: &mut NativeCtx<'_>, items: &[String]) -> Result<Value, Nati
     })
 }
 
+/// §RegionPreference lookup region: the `rg` override wins, then the
+/// region subtag, then the `sd` subdivision's region, then the region
+/// Add Likely Subtags computes, then the `001` world region.
+fn lookup_region(loc: &Locale) -> String {
+    if let Some(rg) = keyword_str(loc, "rg")
+        && rg.len() >= 2
+        && rg.as_bytes()[..2].iter().all(u8::is_ascii_alphabetic)
+    {
+        return rg[..2].to_ascii_uppercase();
+    }
+    if let Some(region) = loc.id.region {
+        return region.as_str().to_ascii_uppercase();
+    }
+    if let Some(sd) = keyword_str(loc, "sd")
+        && sd.len() >= 2
+        && sd.as_bytes()[..2].iter().all(u8::is_ascii_alphabetic)
+    {
+        return sd[..2].to_ascii_uppercase();
+    }
+    let mut id = loc.id.clone();
+    LocaleExpander::new_extended().maximize(&mut id);
+    id.region
+        .map(|r| r.as_str().to_ascii_uppercase())
+        .unwrap_or_else(|| "001".to_string())
+}
+
+/// CLDR `calendarPreferenceData` — the calendar list of a region
+/// (world default: gregory only).
+fn calendars_for_region(region: &str) -> Vec<&'static str> {
+    match region {
+        "AE" | "BH" | "DJ" | "DZ" | "EH" | "ER" | "ID" | "IQ" | "JO" | "KM" | "KW" | "LB"
+        | "LY" | "MA" | "MR" | "OM" | "PS" | "QA" | "SD" | "SY" | "TD" | "TN" | "YE" => {
+            vec!["gregory", "islamic", "islamic-civil", "islamic-tbla"]
+        }
+        "AF" | "IR" => vec![
+            "persian",
+            "gregory",
+            "islamic",
+            "islamic-civil",
+            "islamic-tbla",
+        ],
+        "CN" | "CX" | "HK" | "MO" | "SG" => vec!["gregory", "chinese"],
+        "EG" => vec![
+            "gregory",
+            "coptic",
+            "islamic",
+            "islamic-civil",
+            "islamic-tbla",
+        ],
+        "ET" => vec!["gregory", "ethiopic"],
+        "IL" => vec![
+            "gregory",
+            "hebrew",
+            "islamic",
+            "islamic-civil",
+            "islamic-tbla",
+        ],
+        "IN" => vec!["gregory", "indian"],
+        "JP" => vec!["gregory", "japanese"],
+        "KR" => vec!["gregory", "dangi"],
+        "SA" => vec!["islamic-umalqura", "gregory", "islamic", "islamic-rgsa"],
+        "TH" => vec!["buddhist", "gregory"],
+        "TW" => vec!["gregory", "roc", "chinese"],
+        _ => vec!["gregory"],
+    }
+}
+
+/// CLDR `timeData` — regions whose preferred hour cycle is the 1-12
+/// clock; the world default is h23.
+fn region_prefers_h12(region: &str) -> bool {
+    matches!(
+        region,
+        "AE" | "AG"
+            | "AL"
+            | "AS"
+            | "AU"
+            | "BB"
+            | "BD"
+            | "BH"
+            | "BM"
+            | "BN"
+            | "BS"
+            | "BT"
+            | "CA"
+            | "CC"
+            | "CK"
+            | "CO"
+            | "CY"
+            | "DJ"
+            | "DM"
+            | "DO"
+            | "DZ"
+            | "EG"
+            | "EH"
+            | "ER"
+            | "ET"
+            | "FJ"
+            | "FM"
+            | "GD"
+            | "GH"
+            | "GM"
+            | "GU"
+            | "GY"
+            | "HK"
+            | "HN"
+            | "ID"
+            | "IL"
+            | "IN"
+            | "IQ"
+            | "IR"
+            | "JM"
+            | "JO"
+            | "KH"
+            | "KI"
+            | "KN"
+            | "KP"
+            | "KR"
+            | "KW"
+            | "KY"
+            | "LB"
+            | "LC"
+            | "LR"
+            | "LS"
+            | "LY"
+            | "MH"
+            | "MO"
+            | "MP"
+            | "MR"
+            | "MS"
+            | "MT"
+            | "MW"
+            | "MX"
+            | "MY"
+            | "NA"
+            | "NF"
+            | "NG"
+            | "NI"
+            | "NR"
+            | "OM"
+            | "PA"
+            | "PE"
+            | "PG"
+            | "PH"
+            | "PK"
+            | "PR"
+            | "PS"
+            | "PW"
+            | "QA"
+            | "SA"
+            | "SB"
+            | "SD"
+            | "SG"
+            | "SL"
+            | "SO"
+            | "SR"
+            | "SS"
+            | "ST"
+            | "SV"
+            | "SY"
+            | "SZ"
+            | "TC"
+            | "TD"
+            | "TN"
+            | "TO"
+            | "TT"
+            | "TW"
+            | "TZ"
+            | "UG"
+            | "UM"
+            | "US"
+            | "VC"
+            | "VE"
+            | "VG"
+            | "VI"
+            | "WS"
+            | "YE"
+            | "ZM"
+    )
+}
+
+/// CLDR week data: 1 = Monday … 7 = Sunday.
+fn first_day_for_region(region: &str) -> u8 {
+    match region {
+        "AE" | "AF" | "BH" | "DJ" | "DZ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "OM"
+        | "QA" | "SD" | "SY" => 6,
+        "AG" | "AS" | "BD" | "BR" | "BS" | "BT" | "BW" | "BZ" | "CA" | "CN" | "CO" | "DM"
+        | "DO" | "ET" | "GT" | "GU" | "HK" | "HN" | "ID" | "IL" | "IN" | "JM" | "JP" | "KE"
+        | "KH" | "KR" | "LA" | "MH" | "MM" | "MO" | "MT" | "MX" | "MZ" | "NI" | "NP" | "PA"
+        | "PE" | "PH" | "PK" | "PR" | "PT" | "PY" | "SA" | "SG" | "SV" | "TH" | "TT" | "TW"
+        | "UM" | "US" | "VE" | "VI" | "WS" | "YE" | "ZA" | "ZW" => 7,
+        _ => 1,
+    }
+}
+
+/// CLDR week data weekend, 1 = Monday … 7 = Sunday.
+fn weekend_for_region(region: &str) -> Vec<u8> {
+    match region {
+        "AF" | "BH" | "DZ" | "EG" | "IL" | "IQ" | "IR" | "JO" | "KW" | "LY" | "OM" | "PS"
+        | "QA" | "SA" | "SD" | "SY" | "YE" => vec![5, 6],
+        "IN" => vec![7],
+        _ => vec![6, 7],
+    }
+}
+
 pub(crate) fn get_calendars(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let list = match keyword_str(&loc, "ca") {
         Some(c) => vec![c],
-        None => vec!["gregory".to_string()],
+        None => calendars_for_region(&lookup_region(&loc))
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     };
     string_array(ctx, &list)
 }
@@ -567,7 +780,8 @@ pub(crate) fn get_collations(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Va
     // collations.
     let list = match keyword_str(&loc, "co") {
         Some(c) if c != "standard" && c != "search" => vec![c],
-        _ => vec!["emoji".to_string()],
+        // §CollationsOfLocale — the root fallback list.
+        _ => vec!["emoji".to_string(), "eor".to_string()],
     };
     string_array(ctx, &list)
 }
@@ -576,7 +790,22 @@ pub(crate) fn get_hour_cycles(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<V
     let loc = parse_payload(&require_locale(ctx)?);
     let list = match keyword_str(&loc, "hc") {
         Some(c) if ["h11", "h12", "h23", "h24"].contains(&c.as_str()) => vec![c],
-        _ => vec!["h23".to_string()],
+        _ => {
+            let region = lookup_region(&loc);
+            let language = loc.id.language.as_str().to_ascii_lowercase();
+            // CLDR timeData carries language-region entries that override
+            // the region row (French Canada keeps the 24-hour clock).
+            let h12 = match (language.as_str(), region.as_str()) {
+                ("fr", "CA") => false,
+                ("es", "US") => true,
+                _ => region_prefers_h12(&region),
+            };
+            if h12 {
+                vec!["h12".to_string()]
+            } else {
+                vec!["h23".to_string()]
+            }
+        }
     };
     string_array(ctx, &list)
 }
@@ -617,6 +846,7 @@ pub(crate) fn get_text_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
 
 pub(crate) fn get_week_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
+    let region = lookup_region(&loc);
     let first_day = match keyword_str(&loc, "fw").as_deref() {
         Some("mon") => 1,
         Some("tue") => 2,
@@ -625,18 +855,19 @@ pub(crate) fn get_week_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
         Some("fri") => 5,
         Some("sat") => 6,
         Some("sun") => 7,
-        _ => 7,
+        _ => first_day_for_region(&region),
     };
+    let weekend = weekend_for_region(&region);
     ctx.scope(|mut scope| {
         let object = scope.object()?;
         let first_day = scope.number(f64::from(first_day));
-        let weekend = scope.array(2)?;
-        let saturday = scope.number(6.0);
-        scope.set_index(weekend, 0, saturday)?;
-        let sunday = scope.number(7.0);
-        scope.set_index(weekend, 1, sunday)?;
+        let weekend_array = scope.array(weekend.len())?;
+        for (index, day) in weekend.iter().enumerate() {
+            let day = scope.number(f64::from(*day));
+            scope.set_index(weekend_array, index, day)?;
+        }
         scope.set(object, "firstDay", first_day)?;
-        scope.set(object, "weekend", weekend)?;
+        scope.set(object, "weekend", weekend_array)?;
         Ok(scope.finish(object))
     })
 }

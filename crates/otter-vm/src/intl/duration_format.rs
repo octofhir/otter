@@ -191,9 +191,21 @@ pub(crate) fn duration_format_ctor(
     if !ctx.is_construct_call() {
         return Err(type_err("constructor Intl.DurationFormat requires 'new'"));
     }
-
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let options_arg = args.get(1).copied().unwrap_or_else(Value::undefined);
+    let payload = resolve_payload(ctx, locales, options_arg)?;
+    let intl = JsIntl::new(ctx.heap_mut(), IntlPayload::DurationFormat(payload))
+        .map_err(|_| type_err("out of memory"))?;
+    Ok(Value::intl(intl))
+}
+
+/// §1.1.2 InitializeDurationFormat — the shared option ladder behind
+/// the constructor and `Temporal.Duration.prototype.toLocaleString`.
+fn resolve_payload(
+    ctx: &mut NativeCtx<'_>,
+    locales: Value,
+    options_arg: Value,
+) -> Result<DurationFormatPayload, NativeError> {
     if !options_arg.is_undefined() && !options_arg.is_object_type() {
         return Err(type_err("options must be an object"));
     }
@@ -301,15 +313,23 @@ pub(crate) fn duration_format_ctor(
 
     let fractional_digits = get_fractional_digits(ctx, options_arg)?;
 
-    let payload = IntlPayload::DurationFormat(DurationFormatPayload {
+    // §ResolveLocale for the `nu` keyword: a SUPPORTED option value wins,
+    // then a supported `-u-nu-` extension, then latn; the extension stays
+    // in [[Locale]] only when it supplied the winning value.
+    let (numbering_system, locale) = crate::intl::helpers::resolve_unicode_keyword(
+        &locale,
+        "nu",
+        numbering_system.filter(|ns| crate::intl::supported::is_supported_numbering_system(ns)),
+        &crate::intl::supported::is_supported_numbering_system,
+        "latn",
+    );
+    Ok(DurationFormatPayload {
         locale,
-        numbering_system: numbering_system.unwrap_or_else(|| "latn".to_string()),
+        numbering_system,
         style,
         units,
         fractional_digits,
-    });
-    let intl = JsIntl::new(ctx.heap_mut(), payload).map_err(|_| type_err("out of memory"))?;
-    Ok(Value::intl(intl))
+    })
 }
 
 /// `GetNumberOption(options, "fractionalDigits", 0, 9, undefined)`.
@@ -424,17 +444,53 @@ fn to_duration_record(ctx: &mut NativeCtx<'_>, arg: Value) -> Result<[f64; 10], 
             return Err(range_err(format!("{name} out of range")));
         }
     }
-    let total_seconds = record[3].abs() * 86_400.0
-        + record[4].abs() * 3_600.0
-        + record[5].abs() * 60.0
-        + record[6].abs()
-        + record[7].abs() / 1e3
-        + record[8].abs() / 1e6
-        + record[9].abs() / 1e9;
-    if total_seconds >= 9_007_199_254_740_992.0 {
+    // Exact accumulation in nanoseconds (every field is a validated
+    // integer): an f64 sum rounds at the 2^53-second boundary and
+    // rejects valid durations one ULP below it.
+    let total_nanos = record[3].abs() as i128 * 86_400_000_000_000
+        + record[4].abs() as i128 * 3_600_000_000_000
+        + record[5].abs() as i128 * 60_000_000_000
+        + record[6].abs() as i128 * 1_000_000_000
+        + record[7].abs() as i128 * 1_000_000
+        + record[8].abs() as i128 * 1_000
+        + record[9].abs() as i128;
+    const MAX_NANOS: i128 = 9_007_199_254_740_992 * 1_000_000_000;
+    if total_nanos >= MAX_NANOS {
         return Err(range_err("duration time total out of range"));
     }
+    // Normalize negative zeros so a `-0` field renders as `0`.
+    for field in &mut record {
+        if *field == 0.0 {
+            *field = 0.0;
+        }
+    }
     Ok(record)
+}
+
+/// Exact decimal spelling of the folded fractional unit at `exponent`
+/// (9 = seconds carrying ms/us/ns, 6 = milliseconds carrying us/ns,
+/// 3 = microseconds carrying ns): integer accumulation in nanoseconds,
+/// so digit strings past 2^53 stay exact.
+fn fractional_value_text(d: &[f64; 10], exponent: i32) -> String {
+    let (sec, ms, us, ns) = (
+        d[6].abs() as i128,
+        d[7].abs() as i128,
+        d[8].abs() as i128,
+        d[9].abs() as i128,
+    );
+    let (total, scale) = match exponent {
+        9 => (sec * 1_000_000_000 + ms * 1_000_000 + us * 1_000 + ns, 9),
+        6 => (ms * 1_000_000 + us * 1_000 + ns, 6),
+        _ => (us * 1_000 + ns, 3),
+    };
+    let divisor = 10i128.pow(scale);
+    let int = total / divisor;
+    let frac = total % divisor;
+    if frac == 0 {
+        int.to_string()
+    } else {
+        format!("{int}.{frac:0width$}", width = scale as usize)
+    }
 }
 
 /// Combine seconds + sub-seconds into a single fractional value (spec
@@ -485,8 +541,10 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
         // Seconds / milli / micro fold into a fraction when the next
         // unit is numeric.
         let mut fractional = false;
+        let mut exact_text: Option<String> = None;
         if (6..=8).contains(&i) && payload.units[i + 1].0 == "numeric" {
             value = fractional_value(d, [9, 6, 3][i - 6]);
+            exact_text = Some(fractional_value_text(d, [9, 6, 3][i - 6]));
             fractional = true;
         }
 
@@ -561,7 +619,7 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                     unit: None,
                     unit_display: "short".to_string(),
                     compact_display: "short".to_string(),
-                    rounding_mode: "halfExpand".to_string(),
+                    rounding_mode: "trunc".to_string(),
                     rounding_increment: 1,
                     trailing_zero_display: "auto".to_string(),
                     rounding_priority: "auto".to_string(),
@@ -585,13 +643,18 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                     unit: Some(SINGULAR[i].to_string()),
                     unit_display: style.to_string(),
                     compact_display: "short".to_string(),
-                    rounding_mode: "halfExpand".to_string(),
+                    rounding_mode: "trunc".to_string(),
                     rounding_increment: 1,
                     trailing_zero_display: "auto".to_string(),
                     rounding_priority: "auto".to_string(),
                 }
             };
-            let rendered = crate::intl::number_format::format_number(value, &np);
+            let rendered = exact_text
+                .as_deref()
+                .and_then(|text| {
+                    crate::intl::number_format::format_exact(value.is_sign_negative(), text, &np)
+                })
+                .unwrap_or_else(|| crate::intl::number_format::format_number(value, &np));
 
             if need_separator {
                 if let Some(last) = result.last_mut() {
@@ -616,8 +679,29 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
 pub(crate) fn format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let payload = require_payload(ctx)?;
     let arg = args.first().copied().unwrap_or_else(Value::undefined);
+    format_with_payload(ctx, &payload, arg)
+}
+
+/// `Temporal.Duration.prototype.toLocaleString(locales, options)` — the
+/// spec constructs a fresh `Intl.DurationFormat` and formats the
+/// receiver through it, so the two render identically.
+pub(crate) fn duration_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    duration: Value,
+    locales: Value,
+    options: Value,
+) -> Result<Value, NativeError> {
+    let payload = resolve_payload(ctx, locales, options)?;
+    format_with_payload(ctx, &payload, duration)
+}
+
+fn format_with_payload(
+    ctx: &mut NativeCtx<'_>,
+    payload: &DurationFormatPayload,
+    arg: Value,
+) -> Result<Value, NativeError> {
     let record = to_duration_record(ctx, arg)?;
-    let elements = partition(&payload, &record);
+    let elements = partition(payload, &record);
 
     let list_style = if payload.style == "digital" {
         "short".to_string()
@@ -733,7 +817,7 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                     unit: None,
                     unit_display: "short".to_string(),
                     compact_display: "short".to_string(),
-                    rounding_mode: "halfExpand".to_string(),
+                    rounding_mode: "trunc".to_string(),
                     rounding_increment: 1,
                     trailing_zero_display: "auto".to_string(),
                     rounding_priority: "auto".to_string(),
@@ -757,7 +841,7 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                     unit: Some(unit.to_string()),
                     unit_display: style.to_string(),
                     compact_display: "short".to_string(),
-                    rounding_mode: "halfExpand".to_string(),
+                    rounding_mode: "trunc".to_string(),
                     rounding_increment: 1,
                     trailing_zero_display: "auto".to_string(),
                     rounding_priority: "auto".to_string(),

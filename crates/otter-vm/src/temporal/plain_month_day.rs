@@ -149,13 +149,6 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be a plain object".to_string(),
         });
     }
-    let options = arg_or_undef(args, 1);
-    if !options.is_undefined() && !options.is_object_type() {
-        return Err(NativeError::TypeError {
-            name: CLASS,
-            reason: "options must be an object or undefined".to_string(),
-        });
-    }
     crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
     let calendar = pmd.calendar().clone();
     let fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
@@ -163,6 +156,15 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         return Err(NativeError::TypeError {
             name: CLASS,
             reason: "with() requires at least one recognized field".to_string(),
+        });
+    }
+    // §GetOptionsObject — runs AFTER the fields object's reads (a
+    // primitive options argument still observes every field [[Get]]).
+    let options = arg_or_undef(args, 1);
+    if !options.is_undefined() && !options.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be an object or undefined".to_string(),
         });
     }
     let overflow = parse_overflow(ctx, args, 1)?;
@@ -182,7 +184,31 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     }
     let calendar = pmd.calendar().clone();
-    let year_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
+    // §PrepareCalendarFields with only the year unit: era, eraYear
+    // (era-bearing calendars), and year — nothing else is read.
+    let mut year_fields = temporal_rs::fields::CalendarFields::default();
+    if !calendar.is_iso() {
+        if let Some(era) = crate::temporal::helpers::read_option_string(ctx, arg, "era", CLASS)? {
+            let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&era).map_err(|_| {
+                NativeError::RangeError {
+                    name: CLASS,
+                    reason: "invalid era".to_string(),
+                }
+            })?;
+            year_fields.era = Some(era);
+        }
+        if let Some(v) = crate::temporal::helpers::read_partial_integer(ctx, arg, "eraYear", CLASS)?
+        {
+            year_fields.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
+        if matches!(calendar.identifier(), "chinese" | "dangi") {
+            year_fields.era = None;
+            year_fields.era_year = None;
+        }
+    }
+    if let Some(v) = crate::temporal::helpers::read_partial_integer(ctx, arg, "year", CLASS)? {
+        year_fields.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
     let result = pmd
         .to_plain_date(Some(year_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

@@ -847,7 +847,7 @@ pub fn read_display_time_zone_name(
     }
 }
 
-fn read_partial_integer(
+pub(crate) fn read_partial_integer(
     ctx: &mut NativeCtx<'_>,
     target: Value,
     name: &str,
@@ -1301,6 +1301,29 @@ pub fn parse_relative_fields(
     calendar: &temporal_rs::Calendar,
     class: &'static str,
 ) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>, Value), NativeError> {
+    parse_zoned_bag_fields(ctx, target, calendar, class, true)
+}
+
+/// §Temporal.ZonedDateTime.prototype.with field read: the date-time
+/// keys with `offset` interleaved (no `timeZone` — the reject check
+/// already ran), one alphabetical pass.
+pub fn parse_zoned_with_fields(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    calendar: &temporal_rs::Calendar,
+    class: &'static str,
+) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>), NativeError> {
+    let (fields, offset, _) = parse_zoned_bag_fields(ctx, target, calendar, class, false)?;
+    Ok((fields, offset))
+}
+
+fn parse_zoned_bag_fields(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    calendar: &temporal_rs::Calendar,
+    class: &'static str,
+    include_time_zone: bool,
+) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>, Value), NativeError> {
     let has_eras = !calendar.is_iso();
     let mut cf = temporal_rs::fields::CalendarFields::default();
     let mut time = temporal_rs::partial::PartialTime::default();
@@ -1362,7 +1385,11 @@ pub fn parse_relative_fields(
     if let Some(v) = read_partial_integer(ctx, target, "second", class)? {
         time.second = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
-    let time_zone = get_option_value(ctx, target, "timeZone", class)?;
+    let time_zone = if include_time_zone {
+        get_option_value(ctx, target, "timeZone", class)?
+    } else {
+        Value::undefined()
+    };
     if let Some(v) = read_partial_integer(ctx, target, "year", class)? {
         cf.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }

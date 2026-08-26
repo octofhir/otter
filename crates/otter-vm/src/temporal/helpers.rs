@@ -1290,6 +1290,92 @@ pub fn parse_date_time_fields(
     })
 }
 
+/// §ToRelativeTemporalObject property-bag read: the date-time keys plus
+/// `offset` and `timeZone`, ALL in one alphabetical pass (…nanosecond,
+/// offset, second, timeZone, year), each via a getter/Proxy-aware
+/// [[Get]]. Returns the fields together with the raw `offset` string
+/// and the raw `timeZone` value (`undefined` when absent).
+pub fn parse_relative_fields(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    calendar: &temporal_rs::Calendar,
+    class: &'static str,
+) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>, Value), NativeError> {
+    let has_eras = !calendar.is_iso();
+    let mut cf = temporal_rs::fields::CalendarFields::default();
+    let mut time = temporal_rs::partial::PartialTime::default();
+    if let Some(v) = read_partial_integer(ctx, target, "day", class)? {
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "day must be a positive integer".to_string(),
+            });
+        }
+        cf.day = Some(v.min(u8::MAX as i64) as u8);
+    }
+    if has_eras {
+        if let Some(s) = read_option_string(ctx, target, "era", class)? {
+            let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
+                NativeError::RangeError {
+                    name: class,
+                    reason: "invalid era".to_string(),
+                }
+            })?;
+            cf.era = Some(era);
+        }
+        if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
+            cf.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
+        if matches!(calendar.identifier(), "chinese" | "dangi") {
+            cf.era = None;
+            cf.era_year = None;
+        }
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "hour", class)? {
+        time.hour = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "microsecond", class)? {
+        time.microsecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "millisecond", class)? {
+        time.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "minute", class)? {
+        time.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "month must be a positive integer".to_string(),
+            });
+        }
+        cf.month = Some(v.min(u8::MAX as i64) as u8);
+    }
+    if let Some(code) = read_month_code(ctx, target, class)? {
+        cf.month_code = Some(code);
+    }
+    if let Some(v) = read_partial_integer(ctx, target, "nanosecond", class)? {
+        time.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    let offset = read_required_string(ctx, target, "offset", class)?;
+    if let Some(v) = read_partial_integer(ctx, target, "second", class)? {
+        time.second = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    let time_zone = get_option_value(ctx, target, "timeZone", class)?;
+    if let Some(v) = read_partial_integer(ctx, target, "year", class)? {
+        cf.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
+    Ok((
+        temporal_rs::fields::DateTimeFields {
+            calendar_fields: cf,
+            time,
+        },
+        offset,
+        time_zone,
+    ))
+}
+
 pub fn parse_year_month_fields(
     ctx: &mut NativeCtx<'_>,
     target: Value,

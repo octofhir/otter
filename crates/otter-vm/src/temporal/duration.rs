@@ -11,7 +11,6 @@ use std::str::FromStr;
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::object;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, options_object,
@@ -252,7 +251,7 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         let rel = crate::temporal::helpers::get_option_value(ctx, total_of, "relativeTo", CLASS)?;
         let relative_to = parse_relative_to_value(ctx, rel)?;
         let unit_name = crate::temporal::helpers::read_option_string(ctx, total_of, "unit", CLASS)?
-            .ok_or_else(|| NativeError::TypeError {
+            .ok_or_else(|| NativeError::RangeError {
                 name: CLASS,
                 reason: "options must include a `unit` string".to_string(),
             })?;
@@ -298,35 +297,54 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         microseconds: Some(dur.microseconds()),
         nanoseconds: Some(dur.nanoseconds()),
     };
+    let mut any_field = false;
     if let Some(v) = optional_field(ctx, arg, "days")? {
         p.days = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "hours")? {
         p.hours = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "microseconds")? {
         p.microseconds = Some(v as i128);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "milliseconds")? {
         p.milliseconds = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "minutes")? {
         p.minutes = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "months")? {
         p.months = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "nanoseconds")? {
         p.nanoseconds = Some(v as i128);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "seconds")? {
         p.seconds = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "weeks")? {
         p.weeks = Some(v);
+        any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "years")? {
         p.years = Some(v);
+        any_field = true;
+    }
+    // §7.5.16 ToTemporalPartialDurationRecord step 22 — a bag with no
+    // recognised field at all is a TypeError.
+    if !any_field {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "with() requires at least one duration field".to_string(),
+        });
     }
     let result =
         temporal_rs::Duration::from_partial_duration(p).map_err(|e| temporal_err(e, CLASS))?;
@@ -376,18 +394,45 @@ fn parse_relative_to_value(
             .map(Some)
             .map_err(|e| temporal_err(e, CLASS));
     }
-    if let Some(obj) = rel.as_object() {
-        if object::get(obj, ctx.heap(), "timeZone")
-            .filter(|v| !v.is_undefined())
-            .is_some()
-        {
-            return Ok(Some(
-                crate::temporal::zoned_date_time::parse_zdt_arg(ctx, &rel)?.into(),
-            ));
+    if rel.is_object_type() {
+        // §ToRelativeTemporalObject property bag — one alphabetical
+        // pass over the date-time keys with `offset` and `timeZone`
+        // interleaved, then the timeZone value picks the zoned or
+        // plain interpretation.
+        let calendar = crate::temporal::helpers::read_calendar_field(ctx, rel, CLASS)?;
+        let (fields, offset, time_zone) =
+            crate::temporal::helpers::parse_relative_fields(ctx, rel, &calendar, CLASS)?;
+        if time_zone.is_undefined() {
+            let partial = temporal_rs::partial::PartialDate {
+                calendar_fields: fields.calendar_fields,
+                calendar,
+            };
+            let pd = temporal_rs::PlainDate::from_partial(
+                partial,
+                Some(temporal_rs::options::Overflow::Constrain),
+            )
+            .map_err(|e| temporal_err(e, CLASS))?;
+            return Ok(Some(pd.into()));
         }
-        return Ok(Some(
-            crate::temporal::plain_date::parse_plain_date_arg(ctx, &rel)?.into(),
-        ));
+        let tz = crate::temporal::helpers::parse_time_zone(&time_zone, ctx.heap(), CLASS)?;
+        let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
+            .with_calendar_fields(fields.calendar_fields)
+            .with_time(fields.time)
+            .with_timezone(Some(tz));
+        partial.calendar = calendar;
+        if let Some(o) = offset {
+            let parsed = temporal_rs::UtcOffset::from_utf8(o.as_bytes())
+                .map_err(|e| temporal_err(e, CLASS))?;
+            partial = partial.with_offset(parsed);
+        }
+        let zdt = temporal_rs::ZonedDateTime::from_partial(
+            partial,
+            None,
+            None,
+            Some(temporal_rs::options::OffsetDisambiguation::Reject),
+        )
+        .map_err(|e| temporal_err(e, CLASS))?;
+        return Ok(Some(zdt.into()));
     }
     Err(NativeError::TypeError {
         name: CLASS,
@@ -433,7 +478,9 @@ fn parse_duration_round_options(
             reason: "round() requires an options object or smallest-unit string".to_string(),
         });
     }
+    let mut largest_given = false;
     if let Some(name) = read_option_string(ctx, v, "largestUnit", CLASS)? {
+        largest_given = true;
         options.largest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
             NativeError::RangeError {
                 name: CLASS,
@@ -462,6 +509,16 @@ fn parse_duration_round_options(
                     reason: "invalid `smallestUnit`".to_string(),
                 }
             })?);
+    }
+    // §7.3.22 step 10 — an options bag with neither `largestUnit` nor
+    // `smallestUnit` is a RangeError (after every read fired). The
+    // temporal_rs default carries `largest_unit: Auto`, so explicit
+    // presence is tracked separately.
+    if options.smallest_unit.is_none() && !largest_given {
+        return Err(NativeError::RangeError {
+            name: CLASS,
+            reason: "round() requires either largestUnit or smallestUnit".to_string(),
+        });
     }
     Ok((options, relative_to))
 }

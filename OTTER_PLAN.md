@@ -398,8 +398,8 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.63% at
-`b6175e33`, 197 fails, 0 crashes/timeouts. Recent slices: legacy
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.68% at
+`bf54a372`, 169 fails, 0 crashes/timeouts. Recent slices: legacy
 fn.caller/fn.arguments magic reads, exotic-sidecar stale-handle fix
 (Date brand loss under heap caps), RegExp UTF-16 pattern pipeline +
 iu word classes + code-point backreferences, optional-chain delete +

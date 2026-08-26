@@ -74,6 +74,15 @@ fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         parse_overflow(ctx, args, 1)?;
         return make_temporal(ctx, TemporalPayload::PlainTime(pt));
     }
+    // Property-bag / instance path: the bag's field reads come FIRST,
+    // then GetTemporalOverflowOption fires (observably) — §ToTemporalTime.
+    if arg.is_object_type() && arg.as_temporal(ctx.heap()).is_none() {
+        let partial = parse_partial_time(ctx, arg, CLASS)?;
+        let overflow = parse_overflow(ctx, args, 1)?;
+        let pt = temporal_rs::PlainTime::from_partial(partial, overflow)
+            .map_err(|e| temporal_err(e, CLASS))?;
+        return make_temporal(ctx, TemporalPayload::PlainTime(pt));
+    }
     let overflow = parse_overflow(ctx, args, 1)?;
     let pt = parse_plain_time_arg_with_overflow(ctx, &arg, overflow)?;
     make_temporal(ctx, TemporalPayload::PlainTime(pt))
@@ -249,7 +258,17 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     }
+    crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
     let partial = parse_partial_time(ctx, arg, CLASS)?;
+    // §GetOptionsObject — runs AFTER the fields object's reads (a
+    // primitive options argument still observes every field [[Get]]).
+    let options = arg_or_undef(args, 1);
+    if !options.is_undefined() && !options.is_object_type() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    }
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pt
         .with(partial, overflow)

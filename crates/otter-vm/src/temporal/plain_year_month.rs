@@ -11,9 +11,9 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::parse_overflow;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
-    parse_calendar_fields, parse_difference_settings, parse_display_calendar,
-    parse_year_month_fields, read_calendar_field, require_construct, require_plain_year_month,
-    str_or_undef, temporal_err, to_integer_with_truncation,
+    parse_difference_settings, parse_display_calendar, parse_year_month_fields,
+    read_calendar_field, require_construct, require_plain_year_month, str_or_undef, temporal_err,
+    to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -234,6 +234,11 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be a plain object".to_string(),
         });
     }
+    crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
+    let calendar = pym.calendar().clone();
+    let fields = parse_year_month_fields(ctx, arg, &calendar, CLASS)?;
+    // §GetOptionsObject — runs AFTER the fields object's reads (a
+    // primitive options argument still observes every field [[Get]]).
     let options = arg_or_undef(args, 1);
     if !options.is_undefined() && !options.is_object_type() {
         return Err(NativeError::TypeError {
@@ -241,9 +246,6 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "options must be an object or undefined".to_string(),
         });
     }
-    crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
-    let calendar = pym.calendar().clone();
-    let fields = parse_year_month_fields(ctx, arg, &calendar, CLASS)?;
     let overflow = parse_overflow(ctx, args, 1)?;
     let result = pym
         .with(fields, overflow)
@@ -260,8 +262,18 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "first argument must be a plain object with a `day` field".to_string(),
         });
     }
-    let calendar = pym.calendar().clone();
-    let day_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
+    // §PrepareCalendarFields with only the day unit — nothing else is
+    // read.
+    let mut day_fields = temporal_rs::fields::CalendarFields::default();
+    if let Some(v) = crate::temporal::helpers::read_partial_integer(ctx, arg, "day", CLASS)? {
+        if v < 1 {
+            return Err(NativeError::RangeError {
+                name: CLASS,
+                reason: "day must be a positive integer".to_string(),
+            });
+        }
+        day_fields.day = Some(v.min(u8::MAX as i64) as u8);
+    }
     let result = pym
         .to_plain_date(Some(day_fields))
         .map_err(|e| temporal_err(e, CLASS))?;

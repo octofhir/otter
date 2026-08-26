@@ -18,10 +18,9 @@ use crate::string::JsString;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::read_calendar_field;
 use crate::temporal::helpers::{
-    arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
-    parse_difference_settings, parse_overflow, parse_partial_time, parse_rounding_options,
-    parse_time_zone, read_option_string, require_construct, require_zoned_date_time, str_or_undef,
-    temporal_err,
+    arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_difference_settings,
+    parse_overflow, parse_rounding_options, parse_time_zone, read_option_string, require_construct,
+    require_zoned_date_time, str_or_undef, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -105,17 +104,20 @@ pub(crate) fn parse_zdt_arg_with_options(
         return Ok(zdt);
     }
     if v.is_object_type() {
-        // §ToTemporalZonedDateTime property bag: `timeZone` is
-        // required; calendar/time fields and `offset` are optional.
-        // Reads fire through getter/Proxy-aware [[Get]]s.
+        // §ToTemporalZonedDateTime property bag — one alphabetical
+        // pass over the date-time keys with `offset` and `timeZone`
+        // interleaved (…nanosecond, offset, second, timeZone, year),
+        // each via a getter/Proxy-aware [[Get]]. `timeZone` is
+        // required.
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
-        let calendar_fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;
-        let offset = crate::temporal::helpers::read_required_string(ctx, *v, "offset", CLASS)?
+        let (fields, offset_str, tz_v) =
+            crate::temporal::helpers::parse_relative_fields(ctx, *v, &calendar, CLASS)?;
+        let calendar_fields = fields.calendar_fields;
+        let offset = offset_str
             .map(|s| {
                 temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))
             })
             .transpose()?;
-        let tz_v = crate::temporal::helpers::get_option_value(ctx, *v, "timeZone", CLASS)?;
         if tz_v.is_undefined() {
             return Err(NativeError::TypeError {
                 name: CLASS,
@@ -123,7 +125,7 @@ pub(crate) fn parse_zdt_arg_with_options(
             });
         }
         let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
-        let time = parse_partial_time(ctx, *v, CLASS)?;
+        let time = fields.time;
         let (overflow, disambiguation, offset_option) = read_zdt_options(ctx, options_args)?;
         let mut partial = temporal_rs::partial::PartialZonedDateTime::new()
             .with_calendar_fields(calendar_fields)
@@ -449,25 +451,33 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "with() requires a plain ZonedDateTime-like object".to_string(),
         });
     }
-    let options = arg_or_undef(args, 1);
-    if !options.is_undefined() && !options.is_object_type() {
-        return Err(NativeError::TypeError {
-            name: CLASS,
-            reason: "options must be an object or undefined".to_string(),
-        });
-    }
     crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
     let calendar = zdt.calendar().clone();
-    let calendar_fields = parse_calendar_fields(ctx, arg, &calendar, CLASS)?;
-    let time = parse_partial_time(ctx, arg, CLASS)?;
+    let (dt_fields, offset_str) =
+        crate::temporal::helpers::parse_zoned_with_fields(ctx, arg, &calendar, CLASS)?;
+    let offset = offset_str
+        .map(|s| {
+            temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))
+        })
+        .transpose()?;
     let fields = temporal_rs::fields::ZonedDateTimeFields {
-        calendar_fields,
-        time,
-        offset: None,
+        calendar_fields: dt_fields.calendar_fields,
+        time: dt_fields.time,
+        offset,
     };
-    let overflow = parse_overflow(ctx, args, 1)?;
+    // §GetOptionsObject — runs AFTER the fields object's reads (a
+    // primitive options argument still observes every field [[Get]]),
+    // then `disambiguation`, `offset`, and `overflow` read
+    // alphabetically.
+    let (overflow, disambiguation, offset_option) = read_zdt_options(ctx, Some(args))?;
+    // §Temporal.ZonedDateTime.prototype.with step defaults —
+    // disambiguation "compatible", offset "prefer".
+    let disambiguation =
+        Some(disambiguation.unwrap_or(temporal_rs::options::Disambiguation::Compatible));
+    let offset_option =
+        Some(offset_option.unwrap_or(temporal_rs::options::OffsetDisambiguation::Prefer));
     let result = zdt
-        .with(fields, None, None, overflow)
+        .with(fields, disambiguation, offset_option, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }

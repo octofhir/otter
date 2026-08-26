@@ -132,7 +132,7 @@ impl Interpreter {
                 self.escape_scoped(receiver_handle)
             ];
             return match self.invoke_proxy_trap(stack, context, &proxy, "get", trap_args)? {
-                Some(value) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(value) => {
                     let proxy = self
                         .escape_scoped(base_handle)
                         .as_proxy()
@@ -140,22 +140,18 @@ impl Interpreter {
                     self.validate_proxy_get_invariants(&proxy.target(&self.gc_heap), key, &value)?;
                     Ok(VmGetOutcome::Value(value))
                 }
-                None => {
-                    let proxy = self
-                        .escape_scoped(base_handle)
-                        .as_proxy()
-                        .ok_or(VmError::TypeMismatch)?;
-                    self.continue_ordinary_get_value_scoped(
-                        stack,
-                        context,
-                        scope,
-                        base_handle,
-                        receiver_handle,
-                        proxy.target(&self.gc_heap),
-                        key,
-                        hops + 1,
-                    )
-                }
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.continue_ordinary_get_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    receiver_handle,
+                    fallthrough_target,
+                    key,
+                    hops + 1,
+                ),
             };
         }
         if let Some(arr) = base.as_array() {
@@ -1340,7 +1336,7 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
             return match self.invoke_proxy_trap(stack, context, &proxy, "has", trap_args)? {
-                Some(value) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(value) => {
                     let result = value.to_boolean(&self.gc_heap);
                     if !result {
                         let proxy = self
@@ -1374,21 +1370,17 @@ impl Interpreter {
                     }
                     Ok(result)
                 }
-                None => {
-                    let proxy = self
-                        .escape_scoped(base_handle)
-                        .as_proxy()
-                        .ok_or(VmError::TypeMismatch)?;
-                    self.continue_ordinary_has_property_value_scoped(
-                        stack,
-                        context,
-                        scope,
-                        base_handle,
-                        proxy.target(&self.gc_heap),
-                        key,
-                        hops + 1,
-                    )
-                }
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.continue_ordinary_has_property_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    fallthrough_target,
+                    key,
+                    hops + 1,
+                ),
             };
         }
         if let Some(arr) = base.as_array() {

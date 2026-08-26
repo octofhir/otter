@@ -296,10 +296,13 @@ impl Interpreter {
         let statics = read_register(&stack[frame_idx], statics_reg)?
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
-        if let Some(fid) = ctor
-            .as_function()
-            .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        if let Some(closure) = ctor.as_closure(&self.gc_heap) {
+            for key in ["name", "length"] {
+                if crate::object::get_own_descriptor(statics, &self.gc_heap, key).is_some() {
+                    closure.set_metadata_deleted(&mut self.gc_heap, key, true);
+                }
+            }
+        } else if let Some(fid) = ctor.as_function() {
             for key in ["name", "length"] {
                 if crate::object::get_own_descriptor(statics, &self.gc_heap, key).is_some() {
                     self.function_deleted_metadata.insert((fid, key));
@@ -420,15 +423,17 @@ impl Interpreter {
             let r = register_operand(operands.get(4 + i))?;
             bound_args.push(*read_register(&stack[top_idx], r)?);
         }
-        match self.callable_bind_metadata_get(context, &target, "name")? {
-            BindMetadataGet::Value(target_name) => self.continue_bind_function_after_name(
+        // §20.2.3.2 — `length` is read (HasOwnProperty + Get) BEFORE
+        // `name`.
+        match self.callable_bind_metadata_get(context, &target, "length")? {
+            BindMetadataGet::Value(target_length) => self.continue_bind_function_after_length(
                 stack,
                 context,
                 dst,
                 target,
                 bound_this,
                 bound_args,
-                target_name,
+                target_length,
             ),
             BindMetadataGet::Getter(getter) => {
                 self.frame_ensure_cold(&mut stack[top_idx])
@@ -438,8 +443,8 @@ impl Interpreter {
                     target,
                     bound_this,
                     bound_args,
-                    stage: PendingBindStage::Name,
-                    target_name: None,
+                    stage: PendingBindStage::Length,
+                    target_length: None,
                 });
                 self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
             }
@@ -464,7 +469,7 @@ impl Interpreter {
             Err(err) => return Some(Err(err)),
         };
         Some(match state.stage {
-            PendingBindStage::Name => self.continue_bind_function_after_name(
+            PendingBindStage::Length => self.continue_bind_function_after_length(
                 stack,
                 context,
                 dst,
@@ -473,8 +478,8 @@ impl Interpreter {
                 state.bound_args,
                 produced,
             ),
-            PendingBindStage::Length => {
-                let target_name = match state.target_name {
+            PendingBindStage::Name => {
+                let target_length = match state.target_length {
                     Some(value) => value,
                     None => return Some(Err(VmError::InvalidOperand)),
                 };
@@ -484,13 +489,13 @@ impl Interpreter {
                 let mut target = state.target;
                 let mut bound_this = state.bound_this;
                 let mut bound_args = state.bound_args;
-                let mut target_name = target_name;
+                let mut target_length = target_length;
                 let mut produced = produced;
                 let proto = {
                     let target_snapshot = target;
                     let mut holds: Vec<&mut Value> = vec![
                         &mut bound_this,
-                        &mut target_name,
+                        &mut target_length,
                         &mut produced,
                         &mut target,
                     ];
@@ -511,15 +516,15 @@ impl Interpreter {
                     target,
                     bound_this,
                     bound_args,
-                    target_name,
                     produced,
+                    target_length,
                     proto,
                 )
             }
         })
     }
 
-    pub(crate) fn continue_bind_function_after_name(
+    pub(crate) fn continue_bind_function_after_length(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
@@ -527,12 +532,12 @@ impl Interpreter {
         target: Value,
         bound_this: Value,
         bound_args: SmallVec<[Value; 4]>,
-        target_name: Value,
+        target_length: Value,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        match self.callable_bind_metadata_get(context, &target, "length")? {
-            BindMetadataGet::Value(target_length) => {
+        match self.callable_bind_metadata_get(context, &target, "name")? {
+            BindMetadataGet::Value(target_name) => {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_bind_function = None;
                 }
@@ -571,8 +576,8 @@ impl Interpreter {
                     target,
                     bound_this,
                     bound_args,
-                    stage: PendingBindStage::Length,
-                    target_name: Some(target_name),
+                    stage: PendingBindStage::Name,
+                    target_length: Some(target_length),
                 });
                 self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
             }
@@ -694,21 +699,18 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
 
-        // §20.2.3.2 — read `name`, then `length`. Each may be an accessor whose
+        // §10.4.1.3 step 1 — BoundFunctionCreate resolves the target's
+        // [[GetPrototypeOf]] (trap-observable for a Proxy target) FIRST.
+        let target_proto = if target.is_proxy() {
+            self.ordinary_get_prototype_value(stack, context, target, 0)?
+        } else {
+            self.get_prototype_for_op(&target)?
+        };
+        let proto_anchor = self.push_iteration_anchor(target_proto) - 1;
+
+        // §20.2.3.2 — read `length`, then `name`. Each may be an accessor whose
         // getter runs `this = target`; the frame source registers stay live
         // roots, so re-read the target after every reentrant call.
-        let target_name = match self.callable_bind_metadata_get(context, &target, "name")? {
-            BindMetadataGet::Value(value) => value,
-            BindMetadataGet::Getter(getter) => {
-                let receiver = *read_register(&stack[top_idx], callee_reg)?;
-                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
-            }
-        };
-
-        // Anchor the produced name across the length getter and the bound-
-        // function allocation so a moving collection cannot strand it.
-        let name_anchor = self.push_iteration_anchor(target_name) - 1;
-
         let target = *read_register(&stack[top_idx], callee_reg)?;
         let target_length = match self.callable_bind_metadata_get(context, &target, "length")? {
             BindMetadataGet::Value(value) => value,
@@ -718,20 +720,21 @@ impl Interpreter {
             }
         };
 
-        // Anchor the produced length across the prototype trap and the
-        // bound-function allocation, like the name above.
+        // Anchor the produced length across the name getter and the bound-
+        // function allocation so a moving collection cannot strand it.
         let length_anchor = self.push_iteration_anchor(target_length) - 1;
 
-        // §10.4.1.3 step 1 — resolve the target's [[GetPrototypeOf]]
-        // (trap-observable for a Proxy target) before allocation. The
-        // trap can run user code, so the anchored / frame-sourced
-        // values re-read after it.
         let target = *read_register(&stack[top_idx], callee_reg)?;
-        let target_proto = if target.is_proxy() {
-            self.ordinary_get_prototype_value(stack, context, target, 0)?
-        } else {
-            self.get_prototype_for_op(&target)?
+        let target_name = match self.callable_bind_metadata_get(context, &target, "name")? {
+            BindMetadataGet::Value(value) => value,
+            BindMetadataGet::Getter(getter) => {
+                let receiver = *read_register(&stack[top_idx], callee_reg)?;
+                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
+            }
         };
+        let name_anchor = self.push_iteration_anchor(target_name) - 1;
+
+        let target_proto = self.iteration_anchor(proto_anchor);
         let target_name = self.iteration_anchor(name_anchor);
         let target_length = self.iteration_anchor(length_anchor);
         let target = *read_register(&stack[top_idx], callee_reg)?;
@@ -750,7 +753,7 @@ impl Interpreter {
             target_length,
             target_proto,
         );
-        self.pop_iteration_anchors_to(name_anchor);
+        self.pop_iteration_anchors_to(proto_anchor);
         result
     }
 
@@ -871,25 +874,23 @@ impl Interpreter {
                 };
                 roots.set_receiver(receiver);
                 roots.replace_args(bound_args);
-                // §20.2.3.2 / §10.4.1.3 — name and length come from
-                // spec-observable [[Get]]s on the target, so a Proxy get
-                // trap (Function.prototype.bind.call(proxy)) is honoured.
-                let target_name = {
+                // §10.4.1.3 BoundFunctionCreate step 1 runs FIRST: the
+                // bound function's [[Prototype]] is the target's current
+                // [[GetPrototypeOf]] result (trap-observable for a
+                // Proxy target), read before the length/name reads.
+                let target_proto = {
                     let target = roots.target();
-                    let key = VmPropertyKey::String("name");
-                    let own = self.ordinary_get_own_property_descriptor_value(
-                        stack, context, target, &key, 0,
-                    )?;
-                    if own.is_some() {
-                        self.get_property_value_for_call(stack, context, target, "name")?
+                    if target.is_proxy() {
+                        self.ordinary_get_prototype_value(stack, context, target, 0)?
                     } else {
-                        Value::undefined()
+                        self.get_prototype_for_op(&target)?
                     }
                 };
-                roots.set_scratch(0, target_name);
-                // §20.2.3.2 step 5 — the length transfer keys off
-                // HasOwnProperty(Target, "length"): an inherited
-                // `length` (mutated [[Prototype]]) leaves L = 0.
+                roots.set_scratch(0, target_proto);
+                // §20.2.3.2 step 3 — the length transfer keys off
+                // HasOwnProperty(Target, "length") (a trap-observable
+                // [[GetOwnProperty]]); an inherited `length` (mutated
+                // [[Prototype]]) leaves L = 0. The read precedes `name`.
                 let target_length = {
                     let target = roots.target();
                     let key = VmPropertyKey::String("length");
@@ -903,8 +904,15 @@ impl Interpreter {
                     }
                 };
                 roots.set_scratch(1, target_length);
+                // §20.2.3.2 step 4 — targetName is a plain observable
+                // Get (no HasOwnProperty probe); a non-string result
+                // coerces to "" inside the metadata builder.
+                let target_name = {
+                    let target = roots.target();
+                    self.get_property_value_for_call(stack, context, target, "name")?
+                };
                 let metadata = function_metadata::bound_create_metadata_from_values(
-                    &roots.scratch(0),
+                    &target_name,
                     &roots.scratch(1),
                     roots.args_len(),
                     &self.gc_heap,
@@ -913,19 +921,6 @@ impl Interpreter {
                 // bound-function storage boundary. No VM allocation can occur
                 // between taking it from the registered state and handing it
                 // to the constructor, which roots its exact owned parameters.
-                // §10.4.1.3 BoundFunctionCreate step 1 — the bound
-                // function's [[Prototype]] is the target's current
-                // [[GetPrototypeOf]] result (trap-observable for a
-                // Proxy target).
-                let target_proto = {
-                    let target = roots.target();
-                    if target.is_proxy() {
-                        self.ordinary_get_prototype_value(stack, context, target, 0)?
-                    } else {
-                        self.get_prototype_for_op(&target)?
-                    }
-                };
-                roots.set_scratch(0, target_proto);
                 let bound_args: SmallVec<[Value; 4]> = roots.take_args().into_iter().collect();
                 let target = roots.target();
                 let receiver = roots.receiver_value();
@@ -952,12 +947,14 @@ impl Interpreter {
                 let display = {
                     let target = roots.target();
                     let owner_bag = self.callable_bag_for_value(&target);
+                    let owner_deleted = self.callable_deleted_flags_for_value(&target);
                     let mut ctx = function_metadata::FunctionMetadataContext::new(
                         context,
                         &mut self.gc_heap,
                         owner_bag,
                         &self.function_deleted_metadata,
-                    );
+                    )
+                    .with_owner_deleted(owner_deleted);
                     function_metadata::callable_to_string(&mut ctx, &target)
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)
@@ -1347,6 +1344,22 @@ impl Interpreter {
     /// minted from the same source template do NOT share expandos);
     /// bare interned function values fall back to the template-keyed
     /// [`Self::function_user_props`] side table.
+    /// Owner-aware deleted-metadata check: closure instances read their
+    /// body flags, bare template functions the global set.
+    pub(crate) fn ordinary_metadata_deleted(
+        &self,
+        owner: Option<crate::closure::JsClosure>,
+        function_id: u32,
+        metadata_key: &'static str,
+    ) -> bool {
+        match owner {
+            Some(c) => c.metadata_deleted(&self.gc_heap, metadata_key),
+            None => self
+                .function_deleted_metadata
+                .contains(&(function_id, metadata_key)),
+        }
+    }
+
     pub(crate) fn callable_bag_read(
         &self,
         owner: Option<crate::closure::JsClosure>,
@@ -1361,6 +1374,25 @@ impl Interpreter {
     /// Resolve a callable value's own-property bag directly (closure →
     /// per-instance body bag; bare function → template side table).
     /// Returns `None` for non-callables or callables with no expandos.
+    /// Per-closure-instance deleted-metadata flags for a callable
+    /// owner, `None` for bare template functions (global set applies).
+    pub(crate) fn callable_deleted_flags(
+        &self,
+        owner: Option<crate::closure::JsClosure>,
+    ) -> Option<(bool, bool)> {
+        owner.map(|c| {
+            (
+                c.metadata_deleted(&self.gc_heap, "name"),
+                c.metadata_deleted(&self.gc_heap, "length"),
+            )
+        })
+    }
+
+    /// As [`Self::callable_deleted_flags`] resolved from a value.
+    pub(crate) fn callable_deleted_flags_for_value(&self, value: &Value) -> Option<(bool, bool)> {
+        self.callable_deleted_flags(value.as_closure(&self.gc_heap))
+    }
+
     pub(crate) fn callable_bag_for_value(&self, value: &Value) -> Option<JsObject> {
         if let Some(c) = value.as_closure(&self.gc_heap) {
             return c.own_props(&self.gc_heap);
@@ -1485,8 +1517,7 @@ impl Interpreter {
     ) -> Vec<String> {
         let mut keys = Vec::new();
         let has_prototype = context.function_has_prototype_property(function_id);
-        let deleted =
-            |key: &'static str| self.function_deleted_metadata.contains(&(function_id, key));
+        let deleted = |key: &'static str| self.ordinary_metadata_deleted(owner, function_id, key);
         if !deleted("length") {
             keys.push("length".to_string());
         }
@@ -1610,22 +1641,21 @@ impl Interpreter {
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
             return Ok(None);
         };
-        if self
-            .function_deleted_metadata
-            .contains(&(function_id, metadata_key))
-        {
+        if self.ordinary_metadata_deleted(owner, function_id, metadata_key) {
             return Ok(None);
         }
         let Some(context) = context else {
             return Ok(None);
         };
         let owner_bag = self.callable_bag_read(owner, function_id);
+        let owner_deleted = self.callable_deleted_flags(owner);
         let mut ctx = function_metadata::FunctionMetadataContext::new(
             context,
             &mut self.gc_heap,
             owner_bag,
             &self.function_deleted_metadata,
-        );
+        )
+        .with_owner_deleted(owner_deleted);
         let value =
             function_metadata::ordinary_function_intrinsic_property(&mut ctx, function_id, key)?;
         Ok(Some(object::PropertyDescriptor::data(
@@ -1702,8 +1732,13 @@ impl Interpreter {
         let bag = self.function_user_bag(stack, owner, function_id, &roots)?;
         let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
         if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) {
-            self.function_deleted_metadata
-                .remove(&(function_id, metadata_key));
+            match owner {
+                Some(c) => c.set_metadata_deleted(&mut self.gc_heap, metadata_key, false),
+                None => {
+                    self.function_deleted_metadata
+                        .remove(&(function_id, metadata_key));
+                }
+            }
         }
         Ok(ok)
     }
@@ -1722,16 +1757,19 @@ impl Interpreter {
         };
         if let Some(bag) = self.callable_bag_read(owner, function_id)
             && crate::object::get_own_descriptor(bag, &self.gc_heap, key).is_some()
+            && !crate::object::delete(bag, &mut self.gc_heap, key)
         {
-            if !crate::object::delete(bag, &mut self.gc_heap, key) {
-                return false;
-            }
-            self.function_deleted_metadata
-                .insert((function_id, metadata_key));
-            return true;
+            return false;
         }
-        self.function_deleted_metadata
-            .insert((function_id, metadata_key));
+        // A closure instance records the deletion on its own body —
+        // sibling closures of the same template are unaffected.
+        match owner {
+            Some(c) => c.set_metadata_deleted(&mut self.gc_heap, metadata_key, true),
+            None => {
+                self.function_deleted_metadata
+                    .insert((function_id, metadata_key));
+            }
+        }
         true
     }
 
@@ -2346,18 +2384,28 @@ impl Interpreter {
             }
         }
         if name == "name" || name == "length" {
-            let owner_bag = self.callable_bag_read(owner, function_id);
-            let mut ctx = function_metadata::FunctionMetadataContext::new(
-                context,
-                &mut self.gc_heap,
-                owner_bag,
-                &self.function_deleted_metadata,
-            );
-            return function_metadata::ordinary_function_intrinsic_property(
-                &mut ctx,
-                function_id,
-                name,
-            );
+            // A deleted own metadata property falls through to the
+            // ordinary prototype walk — %Function.prototype%'s own
+            // `name`/`length` are themselves deletable and must not
+            // resurrect through the intrinsic table.
+            let deleted = function_metadata::ordinary_function_metadata_key(name)
+                .is_some_and(|key| self.ordinary_metadata_deleted(owner, function_id, key));
+            if !deleted {
+                let owner_bag = self.callable_bag_read(owner, function_id);
+                let owner_deleted = self.callable_deleted_flags(owner);
+                let mut ctx = function_metadata::FunctionMetadataContext::new(
+                    context,
+                    &mut self.gc_heap,
+                    owner_bag,
+                    &self.function_deleted_metadata,
+                )
+                .with_owner_deleted(owner_deleted);
+                return function_metadata::ordinary_function_intrinsic_property(
+                    &mut ctx,
+                    function_id,
+                    name,
+                );
+            }
         }
         // A user-mutated [[Prototype]] replaces the intrinsic chain:
         // continue the ordinary walk from the override.

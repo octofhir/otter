@@ -1089,6 +1089,7 @@ function outer() {
                 false,
                 false,
                 false,
+                false,
             )
             .expect("direct eval compiles")
         };

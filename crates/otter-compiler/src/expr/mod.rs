@@ -212,7 +212,13 @@ pub(crate) fn compile_expr(
             // with the closure right after `MakeClosure`, so the self-name
             // resolves to the *same* object every call (identity and
             // expando properties survive; no per-call re-make).
-            let self_observed = f.id.is_some()
+            let dynamic_fn_no_self = std::mem::take(&mut cx.next_fn_expr_no_self_binding);
+            if dynamic_fn_no_self {
+                // §20.2.1.1 — suppress the in-child self binding too.
+                cx.next_fn_no_self_name = true;
+            }
+            let self_observed = !dynamic_fn_no_self
+                && f.id.is_some()
                 && f.body.as_ref().is_some_and(|body| {
                     capture::body_references_name(Some(&f.params), body, &name)
                         || capture::body_contains_direct_eval(Some(&f.params), body)

@@ -159,6 +159,7 @@ impl Interpreter {
                     in_class_field_initializer: new_target_suppressed,
                     super_property_allowed,
                     super_call_allowed,
+                    function_constructor: false,
                 },
             )?
         } else {
@@ -173,6 +174,7 @@ impl Interpreter {
                     in_class_field_initializer: new_target_suppressed,
                     super_property_allowed,
                     super_call_allowed,
+                    function_constructor: false,
                 },
                 &cell_sources,
                 new_target_suppressed,
@@ -745,7 +747,13 @@ impl Interpreter {
         let params_joined = params.join(",");
         let prefix = kind.source_prefix();
         let source = format!("({prefix} anonymous({params_joined}\n) {{\n{body}\n}})");
-        let module = self.compile_escaped_source(&source, EvalCompileOptions::default())?;
+        let module = self.compile_escaped_source(
+            &source,
+            EvalCompileOptions {
+                function_constructor: true,
+                ..EvalCompileOptions::default()
+            },
+        )?;
         let context = self
             .link_module(module)
             .map_err(|_| VmError::InvalidOperand)?;

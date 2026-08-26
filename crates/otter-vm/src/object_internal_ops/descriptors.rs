@@ -69,7 +69,7 @@ impl Interpreter {
                 "getOwnPropertyDescriptor",
                 trap_args,
             )? {
-                Some(v) if v.is_nullish() => {
+                crate::object_internal_ops::ProxyTrap::Trapped(v) if v.is_nullish() => {
                     let target_desc = self.ordinary_get_own_property_descriptor_value(
                         stack,
                         context,
@@ -84,7 +84,9 @@ impl Interpreter {
                     )?;
                     Ok(None)
                 }
-                Some(v) if v.is_object() || v.is_proxy() => {
+                crate::object_internal_ops::ProxyTrap::Trapped(v)
+                    if v.is_object() || v.is_proxy() =>
+                {
                     // §10.5.5 step 9-ish ToPropertyDescriptor through
                     // ordinary [[Get]]s so a Proxy descriptor object
                     // dispatches its own traps.
@@ -104,15 +106,17 @@ impl Interpreter {
                     )?;
                     Ok(Some(desc))
                 }
-                Some(_) => Err(self.err_type(
+                crate::object_internal_ops::ProxyTrap::Trapped(_) => Err(self.err_type(
                     ("Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
                         .to_string())
                     .into(),
                 )),
-                None => self.ordinary_get_own_property_descriptor_value(
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.ordinary_get_own_property_descriptor_value(
                     stack,
                     context,
-                    proxy.target(&self.gc_heap),
+                    fallthrough_target,
                     key,
                     hops + 1,
                 ),
@@ -445,10 +449,10 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let Some(obj) = target.as_object() else {
-            return Ok(None);
-        };
-        if object::is_extensible(obj, &self.gc_heap) {
+        // §10.5.1 step 8 — IsExtensible(target) is the target's own
+        // internal method: for a Proxy target the `isExtensible` trap
+        // fires (observable, may throw) before any prototype read.
+        if self.is_extensible_value(stack, context, target)? {
             return Ok(None);
         }
         Ok(Some(self.ordinary_get_prototype_value(
@@ -475,7 +479,7 @@ impl Interpreter {
                 "getPrototypeOf",
                 trap_args,
             )? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
                         return Err(self.err_type(
                             ("Proxy getPrototypeOf trap returned non-object".to_string()).into(),
@@ -495,12 +499,11 @@ impl Interpreter {
                     }
                     Ok(result)
                 }
-                None => self.ordinary_get_prototype_value(
-                    stack,
-                    context,
-                    proxy.target(&self.gc_heap),
-                    hops + 1,
-                ),
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => {
+                    self.ordinary_get_prototype_value(stack, context, fallthrough_target, hops + 1)
+                }
             };
         }
         if let Some(intl) = value.as_intl(&self.gc_heap) {
@@ -557,7 +560,7 @@ impl Interpreter {
                 "isExtensible",
                 trap_args,
             )? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let trap = result.to_boolean(&self.gc_heap);
                     let target_ext =
                         self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap))?;
@@ -570,7 +573,9 @@ impl Interpreter {
                     }
                     Ok(trap)
                 }
-                None => self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap)),
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.is_extensible_value(stack, context, &fallthrough_target),
             };
         }
         Ok(self.is_extensible_non_proxy(value))

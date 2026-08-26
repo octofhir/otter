@@ -58,7 +58,7 @@ impl Interpreter {
                 "deleteProperty",
                 trap_args,
             )? {
-                Some(value) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(value) => {
                     let result = value.to_boolean(&self.gc_heap);
                     if !result {
                         return Ok(false);
@@ -87,13 +87,9 @@ impl Interpreter {
                     }
                     Ok(true)
                 }
-                None => self.ordinary_delete_value(
-                    stack,
-                    context,
-                    proxy.target(&self.gc_heap),
-                    key,
-                    hops + 1,
-                ),
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.ordinary_delete_value(stack, context, fallthrough_target, key, hops + 1),
             };
         }
         if let Some(obj) = target.as_object() {
@@ -364,7 +360,7 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value, value, receiver,];
             return match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         return Ok(false);
@@ -403,10 +399,12 @@ impl Interpreter {
                     }
                     Ok(true)
                 }
-                None => self.ordinary_set_data_value(
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.ordinary_set_data_value(
                     stack,
                     context,
-                    proxy.target(&self.gc_heap),
+                    fallthrough_target,
                     key,
                     value,
                     receiver,

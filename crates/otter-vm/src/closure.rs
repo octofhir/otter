@@ -199,6 +199,13 @@ pub struct JsClosureBody {
     /// sibling closure of the same source would share). `None` until
     /// the first own property or `prototype` materialization.
     pub own_props: Option<JsObject>,
+    /// Per-instance deletion of the intrinsic `name` metadata property
+    /// (`delete f.name`). Sibling closures of the same template keep
+    /// their own copies, so the marker cannot live in a table keyed by
+    /// the bytecode function id.
+    pub name_deleted: bool,
+    /// As [`Self::name_deleted`] for `length`.
+    pub length_deleted: bool,
 }
 
 impl otter_gc::SafeTraceable for JsClosureBody {
@@ -306,6 +313,8 @@ impl JsClosureBody {
             spine,
             bound_derived_this,
             own_props: None,
+            name_deleted: false,
+            length_deleted: false,
         }
     }
 
@@ -390,6 +399,29 @@ pub struct JsClosure {
 }
 
 impl JsClosure {
+    /// Per-instance deleted-metadata flag for `name`/`length`.
+    pub(crate) fn metadata_deleted(self, heap: &otter_gc::GcHeap, key: &str) -> bool {
+        heap.read_payload(self.handle(), |body| match key {
+            "name" => body.name_deleted,
+            "length" => body.length_deleted,
+            _ => false,
+        })
+    }
+
+    /// Record (or clear) the per-instance deleted-metadata flag.
+    pub(crate) fn set_metadata_deleted(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        key: &str,
+        deleted: bool,
+    ) {
+        heap.with_payload(self.handle(), |body| match key {
+            "name" => body.name_deleted = deleted,
+            "length" => body.length_deleted = deleted,
+            _ => {}
+        });
+    }
+
     /// Construct from a raw handle + the function id stored inside
     /// it. Mirrors `from_handle` constructors on the other GC
     /// wrappers; callers that already hold both fields skip the

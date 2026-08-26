@@ -402,7 +402,7 @@ impl Interpreter {
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
             return match self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)? {
-                Some(trap_result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(trap_result) => {
                     let trap_keys = self.create_list_from_array_like_property_keys(
                         stack,
                         context,
@@ -410,7 +410,9 @@ impl Interpreter {
                     )?;
                     self.validate_proxy_own_keys(stack, context, &proxy, trap_keys)
                 }
-                None => self.own_property_keys_value(stack, context, &proxy.target(&self.gc_heap)),
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.own_property_keys_value(stack, context, &fallthrough_target),
             };
         }
         // §10.4.5.11 TypedArray [[OwnPropertyKeys]] — integer indices
@@ -924,7 +926,7 @@ impl Interpreter {
                 "setPrototypeOf",
                 trap_args,
             )? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         return Ok(false);
@@ -943,12 +945,11 @@ impl Interpreter {
                     }
                     Ok(true)
                 }
-                None => self.set_prototype_value_proxy_aware(
-                    stack,
-                    context,
-                    &proxy.target(&self.gc_heap),
-                    proto,
-                ),
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => {
+                    self.set_prototype_value_proxy_aware(stack, context, &fallthrough_target, proto)
+                }
             };
         }
         // Class constructor [[SetPrototypeOf]] — record the identity

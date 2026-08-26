@@ -2867,16 +2867,17 @@ impl Interpreter {
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
                 let target = *callee;
                 let pc = stack[top_idx].pc;
-                match self.callable_bind_metadata_get(context, &target, "name")? {
-                    BindMetadataGet::Value(target_name) => self.continue_bind_function_after_name(
-                        stack,
-                        context,
-                        dst,
-                        target,
-                        this_value,
-                        bound_args,
-                        target_name,
-                    ),
+                match self.callable_bind_metadata_get(context, &target, "length")? {
+                    BindMetadataGet::Value(target_length) => self
+                        .continue_bind_function_after_length(
+                            stack,
+                            context,
+                            dst,
+                            target,
+                            this_value,
+                            bound_args,
+                            target_length,
+                        ),
                     BindMetadataGet::Getter(getter) => {
                         self.frame_ensure_cold(&mut stack[top_idx])
                             .pending_bind_function = Some(PendingBindFunction {
@@ -2885,8 +2886,8 @@ impl Interpreter {
                             target,
                             bound_this: this_value,
                             bound_args,
-                            stage: PendingBindStage::Name,
-                            target_name: None,
+                            stage: PendingBindStage::Length,
+                            target_length: None,
                         });
                         self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
                     }
@@ -2906,12 +2907,14 @@ impl Interpreter {
                 }
                 let display = {
                     let owner_bag = self.callable_bag_for_value(callee);
+                    let owner_deleted = self.callable_deleted_flags_for_value(callee);
                     let mut ctx = function_metadata::FunctionMetadataContext::new(
                         context,
                         &mut self.gc_heap,
                         owner_bag,
                         &self.function_deleted_metadata,
-                    );
+                    )
+                    .with_owner_deleted(owner_deleted);
                     function_metadata::callable_to_string(&mut ctx, callee)
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)

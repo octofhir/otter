@@ -36,6 +36,10 @@ pub(crate) struct Compiler {
     /// direct-eval `super` legality reads both off the frame.
     pub(crate) next_fn_has_home: bool,
     pub(crate) next_fn_derived_ctor: bool,
+    /// One-shot: the next NAMED FunctionExpression lowering skips its
+    /// §10.2.11 self-name funcEnv binding — §20.2.1.1
+    /// CreateDynamicFunction's `function anonymous(...)` binds nothing.
+    pub(crate) next_fn_expr_no_self_binding: bool,
     /// One-shot hint set by MethodDefinition lowering (class and
     /// object-literal methods / accessors): the next
     /// `compile_function_full` marks its record `is_method`, so the
@@ -163,6 +167,7 @@ impl Compiler {
             fn_self_immutable_hint: false,
             next_fn_has_home: false,
             next_fn_derived_ctor: false,
+            next_fn_expr_no_self_binding: false,
             next_fn_is_method: false,
             next_fn_static_home: false,
             next_fn_no_self_name: false,

@@ -260,8 +260,9 @@ pub struct PendingBindFunction {
     pub bound_args: SmallVec<[Value; 4]>,
     /// Current metadata getter stage.
     pub stage: PendingBindStage,
-    /// Result of `Get(target, "name")` once available.
-    pub target_name: Option<Value>,
+    /// Result of the first metadata read (`Get(target, "length")`)
+    /// once available.
+    pub target_length: Option<Value>,
 }
 
 /// Metadata stage currently awaited by [`PendingBindFunction`].

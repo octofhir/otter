@@ -140,6 +140,7 @@ pub fn compile_eval_source(
     in_class_field_initializer: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
+    function_constructor: bool,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     // A `super` reference parses cleanly and is rejected by our own
@@ -162,6 +163,7 @@ pub fn compile_eval_source(
                 in_class_field_initializer,
                 super_property_allowed,
                 super_call_allowed,
+                function_constructor,
             )
         },
     ) {
@@ -227,6 +229,7 @@ pub fn compile_eval_source(
                         in_class_field_initializer,
                         super_property_allowed,
                         super_call_allowed,
+                        function_constructor,
                     )
                 },
             )
@@ -368,6 +371,7 @@ fn compile_eval_parts(
     in_class_field_initializer: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
+    function_constructor: bool,
 ) -> Result<BytecodeModule, CompileError> {
     if !super_call_allowed && super_property_allowed && statements_contain_super_call(program.body)
     {
@@ -418,6 +422,7 @@ fn compile_eval_parts(
             new_target_allowed,
             super_property_allowed,
             super_call_allowed,
+            function_constructor,
         )
     }
 }
@@ -480,8 +485,9 @@ pub(crate) fn compile_program_for_eval(
     new_target_allowed: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
+    function_constructor: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode_impl_super(
+    compile_program_with_mode_impl_super_fnctor(
         program,
         source_kind,
         module_specifier,
@@ -491,6 +497,7 @@ pub(crate) fn compile_program_for_eval(
         new_target_allowed,
         super_property_allowed,
         super_call_allowed,
+        function_constructor,
     )
 }
 
@@ -609,6 +616,33 @@ pub(crate) fn compile_program_with_mode_impl_super(
     new_target_allowed: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
+) -> Result<BytecodeModule, CompileError> {
+    compile_program_with_mode_impl_super_fnctor(
+        program,
+        source_kind,
+        module_specifier,
+        force_strict,
+        eval_mode,
+        caller_scope,
+        new_target_allowed,
+        super_property_allowed,
+        super_call_allowed,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_program_with_mode_impl_super_fnctor(
+    program: ProgramParts<'_, '_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+    eval_mode: bool,
+    caller_scope: Option<&[EvalCallerBinding]>,
+    new_target_allowed: bool,
+    super_property_allowed: bool,
+    super_call_allowed: bool,
+    function_constructor: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let source_text = program.source_text;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
@@ -737,6 +771,11 @@ pub(crate) fn compile_program_with_mode_impl_super(
     // introduces into this chunk's own frame at runtime.
     cx.contains_direct_eval = !caller.is_empty();
     cx.eval_new_target_allowed = new_target_allowed;
+    // §20.2.1.1 step 32 — the dynamic function's outer NFE gets no
+    // self-name binding: `anonymous` inside the body resolves free.
+    if function_constructor {
+        cx.next_fn_expr_no_self_binding = true;
+    }
     cx.enter_scope();
 
     if !caller.is_empty() {

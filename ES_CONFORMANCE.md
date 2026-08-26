@@ -1,39 +1,34 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `62f668797e30f154323af16e60316af909ece1b3`
+- **Engine commit:** `7bded8902e1dec3bdb4db7f04cb6d3835dc56328`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-25T20:03:37.853973+00:00
+- **Captured:** 2026-08-26T03:14:23.888449+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 51903 |
-| failed     | 456 |
+| passed     | 52066 |
+| failed     | 293 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.13%
+**Pass rate (excl. skipped):** 99.44%
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
-| intl402/DateTimeFormat/prototype | 180 | 143 | 37 | 79.4% |
 | built-ins/Temporal/ZonedDateTime | 901 | 871 | 30 | 96.7% |
 | built-ins/Temporal/Duration | 540 | 512 | 28 | 94.8% |
-| intl402/Temporal/ZonedDateTime | 583 | 557 | 26 | 95.5% |
-| intl402/NumberFormat/prototype | 179 | 155 | 24 | 86.6% |
 | staging/sm/regress | 106 | 91 | 15 | 85.8% |
-| intl402/Locale/prototype | 107 | 93 | 14 | 86.9% |
 | staging/sm/class | 94 | 80 | 14 | 85.1% |
-| intl402/Temporal/PlainDate | 493 | 481 | 12 | 97.6% |
+| intl402/Temporal/ZonedDateTime | 583 | 572 | 11 | 98.1% |
 | staging/sm/RegExp | 91 | 80 | 11 | 87.9% |
-| intl402/Temporal/PlainDateTime | 483 | 473 | 10 | 97.9% |
-| intl402/Temporal/PlainYearMonth | 327 | 318 | 9 | 97.2% |
+| intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
 | staging/sm/Array | 90 | 81 | 9 | 90.0% |
 | staging/sm/Date | 28 | 19 | 9 | 67.9% |
 | staging/sm/extensions | 64 | 55 | 9 | 85.9% |
@@ -41,37 +36,42 @@
 | staging/sm/Function | 53 | 45 | 8 | 84.9% |
 | staging/sm/expressions | 42 | 34 | 8 | 81.0% |
 | annexB/language/expressions | 26 | 19 | 7 | 73.1% |
-| intl402/Temporal/PlainMonthDay | 90 | 83 | 7 | 92.2% |
 | language/eval-code/direct | 286 | 279 | 7 | 97.6% |
 | staging/sm/TypedArray | 96 | 89 | 7 | 92.7% |
 | built-ins/Temporal/Instant | 465 | 459 | 6 | 98.7% |
 | built-ins/Temporal/PlainDateTime | 773 | 767 | 6 | 99.2% |
 | built-ins/Temporal/PlainTime | 493 | 487 | 6 | 98.8% |
-| intl402/DurationFormat/prototype | 81 | 75 | 6 | 92.6% |
 | staging/sm/Proxy | 24 | 18 | 6 | 75.0% |
 | built-ins/Temporal/PlainMonthDay | 199 | 194 | 5 | 97.5% |
 | built-ins/Temporal/PlainYearMonth | 509 | 504 | 5 | 99.0% |
-| intl402/PluralRules/prototype | 34 | 29 | 5 | 85.3% |
-| intl402/Temporal/Instant | 17 | 12 | 5 | 70.6% |
 | staging/sm/PrivateName | 17 | 13 | 4 | 76.5% |
 | staging/sm/fields | 8 | 4 | 4 | 50.0% |
 | staging/sm/strict | 51 | 47 | 4 | 92.2% |
 | built-ins/Temporal/Now | 66 | 63 | 3 | 95.5% |
 | built-ins/Temporal/PlainDate | 652 | 649 | 3 | 99.5% |
-| intl402/Temporal/PlainTime | 12 | 9 | 3 | 75.0% |
+| intl402/Temporal/PlainMonthDay | 90 | 87 | 3 | 96.7% |
 | staging/sm/Reflect | 17 | 14 | 3 | 82.4% |
 | staging/sm/eval | 20 | 17 | 3 | 85.0% |
 | staging/sm/object | 65 | 62 | 3 | 95.4% |
-| intl402/Array/prototype | 2 | 0 | 2 | 0.0% |
-| intl402/BigInt/prototype | 11 | 9 | 2 | 81.8% |
-| intl402/Date/prototype | 12 | 10 | 2 | 83.3% |
+| intl402/Temporal/PlainDateTime | 483 | 481 | 2 | 99.6% |
+| intl402/Temporal/PlainYearMonth | 327 | 325 | 2 | 99.4% |
 | language/import/import-defer | 103 | 100 | 2 | 98.0% |
 | staging/sm/BigInt | 5 | 3 | 2 | 60.0% |
 | staging/sm/syntax | 11 | 9 | 2 | 81.8% |
 | annexB/language/function-code | 159 | 158 | 1 | 99.4% |
 | built-ins/Temporal/keys.js | 1 | 0 | 1 | 0.0% |
 | built-ins/Temporal/toStringTag | 2 | 1 | 1 | 50.0% |
-| intl402/DateTimeFormat/constructor-options-invalid-explicit-components.js | 1 | 0 | 1 | 0.0% |
+| intl402/Array/prototype | 2 | 1 | 1 | 50.0% |
+| intl402/BigInt/prototype | 11 | 10 | 1 | 90.9% |
+| intl402/DateTimeFormat/intl-legacy-constructed-symbol-on-unwrap.js | 1 | 0 | 1 | 0.0% |
+| intl402/DateTimeFormat/intl-legacy-constructed-symbol.js | 1 | 0 | 1 | 0.0% |
+| intl402/FallbackSymbol/per-realm.js | 1 | 0 | 1 | 0.0% |
+| intl402/Locale/constructor-non-iana-canon.js | 1 | 0 | 1 | 0.0% |
+| intl402/NumberFormat/intl-legacy-constructed-symbol-on-unwrap.js | 1 | 0 | 1 | 0.0% |
+| intl402/NumberFormat/intl-legacy-constructed-symbol.js | 1 | 0 | 1 | 0.0% |
+| intl402/Temporal/Instant | 17 | 16 | 1 | 94.1% |
+| intl402/Temporal/PlainDate | 493 | 492 | 1 | 99.8% |
+| intl402/Temporal/PlainTime | 12 | 11 | 1 | 91.7% |
 
 ## Top failing-test patterns (top 100)
 

@@ -297,7 +297,7 @@ pub fn call(
             // neither an Object nor null, so it is a TypeError just like an
             // explicit non-object/non-null argument.
             let proto = match args.get(1).copied().unwrap_or(Value::undefined()) {
-                v if v.is_object() || v.is_proxy() || v.is_null() => v,
+                v if is_type_object(&v) || v.is_null() => v,
                 _ => return Err(VmError::TypeMismatch),
             };
             let ok = interp.set_prototype_value_proxy_aware(stack, context, &target, &proto)?;

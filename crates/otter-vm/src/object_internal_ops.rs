@@ -133,21 +133,36 @@ fn descriptor_to_lookup(desc: object::PropertyDescriptor) -> object::PropertyLoo
     }
 }
 
+/// Result of a Proxy trap dispatch: either the trap's return value, or
+/// the [[ProxyTarget]] snapshot taken BEFORE the observable trap lookup
+/// (§10.5.* step "Let target be O.[[ProxyTarget]]") — the handler get
+/// can revoke the proxy as a side effect, and the fallthrough must keep
+/// operating on the pre-revocation target.
+pub(crate) enum ProxyTrap {
+    /// The trap ran; its result.
+    Trapped(Value),
+    /// No trap installed — fall through to `target`'s internal method.
+    NoTrap {
+        /// The pre-lookup [[ProxyTarget]] snapshot.
+        target: Value,
+    },
+}
+
 impl Interpreter {
     /// §28.2 — call a Proxy handler trap. When the trap is missing,
-    /// returns `Ok(None)` so the caller can fall through to the
-    /// target's behaviour. When the trap exists, invokes it with
-    /// `(target, ...trap_args)` (per spec each trap takes the
-    /// target as its first explicit argument; subsequent ones come
-    /// from `args`) and returns the result.
-    pub fn invoke_proxy_trap(
+    /// returns [`ProxyTrap::NoTrap`] with the pre-lookup target so the
+    /// caller can fall through to the target's behaviour. When the trap
+    /// exists, invokes it with `(target, ...trap_args)` (per spec each
+    /// trap takes the target as its first explicit argument; subsequent
+    /// ones come from `args`) and returns the result.
+    pub(crate) fn invoke_proxy_trap(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         proxy: &crate::proxy::JsProxy,
         trap: &str,
         args: SmallVec<[Value; 8]>,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<ProxyTrap, VmError> {
         self.with_handle_scope(|interp, scope| {
             let proxy_handle = interp.scoped_value(scope, Value::proxy(*proxy));
             let arg_handles: SmallVec<[Local<'_>; 8]> = args
@@ -162,6 +177,7 @@ impl Interpreter {
             if proxy.is_revoked(&interp.gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
+            let target_handle = interp.scoped_value(scope, proxy.target(&interp.gc_heap));
             let handler_handle = interp.scoped_value(scope, proxy.handler(&interp.gc_heap));
             let trap_key = VmPropertyKey::String(trap);
             let handler = interp.escape_scoped(handler_handle);
@@ -179,7 +195,9 @@ impl Interpreter {
             let trap_handle = interp.scoped_value(scope, trap_value);
             let trap_value = interp.escape_scoped(trap_handle);
             if trap_value.is_nullish() {
-                return Ok(None);
+                return Ok(ProxyTrap::NoTrap {
+                    target: interp.escape_scoped(target_handle),
+                });
             }
             if !interp.is_callable_runtime(&trap_value) {
                 return Err(VmError::TypeMismatch);
@@ -195,7 +213,7 @@ impl Interpreter {
                 interp.escape_scoped(handler_handle),
                 current_args,
             )?;
-            Ok(Some(result))
+            Ok(ProxyTrap::Trapped(result))
         })
     }
 
@@ -489,7 +507,7 @@ impl Interpreter {
                 "preventExtensions",
                 trap_args,
             )? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if ok
                         && self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap))?
@@ -500,7 +518,9 @@ impl Interpreter {
                     }
                     Ok(ok)
                 }
-                None => self.prevent_extensions_value(stack, context, &proxy.target(&self.gc_heap)),
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => self.prevent_extensions_value(stack, context, &fallthrough_target),
             };
         }
         self.prevent_extensions_non_proxy(value)
@@ -806,7 +826,10 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
             let trap_result =
-                self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)?;
+                match self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)? {
+                    ProxyTrap::Trapped(v) => Some(v),
+                    ProxyTrap::NoTrap { .. } => None,
+                };
             let keys = if let Some(arr) = trap_result.and_then(|v| v.as_array()) {
                 crate::array::with_elements(arr, &self.gc_heap, |elements| elements.to_vec())
             } else if let Some(v) = trap_result {

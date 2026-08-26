@@ -149,7 +149,7 @@ impl Interpreter {
                 "defineProperty",
                 trap_args,
             )? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         return Ok(false);
@@ -220,12 +220,14 @@ impl Interpreter {
                     }
                     Ok(true)
                 }
-                None => {
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => {
                     // Trap missing — fall through to target.
                     self.define_own_property_value(
                         stack,
                         context,
-                        &proxy.target(&self.gc_heap),
+                        &fallthrough_target,
                         key,
                         descriptor,
                     )

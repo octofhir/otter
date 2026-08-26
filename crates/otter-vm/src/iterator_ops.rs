@@ -552,6 +552,57 @@ impl Interpreter {
         stack: &mut ActivationStack,
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
+        // §23.1.5.1 ArrayIterator `next` performs Get(array, index): an
+        // element that is not one plain dense value (an accessor, a
+        // sparse slot, a hole answered by the prototype chain) must run
+        // the observable [[Get]] instead of the raw element read the
+        // synchronous fast step performs.
+        enum ArrayObservable {
+            Value(crate::array::JsArray, usize),
+            Entry(crate::array::JsArray, usize),
+        }
+        let observable = self.gc_heap.read_payload(*iter, |state| match state {
+            IteratorState::Array { array, index, .. } => {
+                Some(ArrayObservable::Value(*array, *index))
+            }
+            IteratorState::ArrayEntry { array, index } => {
+                Some(ArrayObservable::Entry(*array, *index))
+            }
+            _ => None,
+        });
+        if let Some(step) = observable {
+            let (array, index, entry) = match step {
+                ArrayObservable::Value(a, i) => (a, i, false),
+                ArrayObservable::Entry(a, i) => (a, i, true),
+            };
+            if index < array::len(array, &self.gc_heap)
+                && array::plain_dense_element(array, &self.gc_heap, index).is_none()
+            {
+                // Advance before the getter runs so a re-entrant `next`
+                // from inside it observes the post-step index.
+                self.gc_heap.with_payload(*iter, |state| match state {
+                    IteratorState::Array { index, .. }
+                    | IteratorState::ArrayEntry { index, .. } => *index += 1,
+                    _ => {}
+                });
+                let value = self.load_property_value(
+                    context,
+                    stack,
+                    Value::array(array),
+                    &index.to_string(),
+                )?;
+                if entry {
+                    let idx_value = Value::number_f64(index as f64);
+                    let pair = self.alloc_runtime_rooted_array_from_values(
+                        [idx_value, value],
+                        &[&value],
+                        &[],
+                    )?;
+                    return Ok((Value::array(pair), false));
+                }
+                return Ok((value, false));
+            }
+        }
         match step_iterator(*iter, &mut self.gc_heap) {
             Ok((value, done)) => Ok((value, done)),
             Err(_) => self.iterator_next_full_slow(context, stack, iter),
@@ -2490,8 +2541,15 @@ impl Interpreter {
         // §22.1.3.36 String[@@iterator], §24.1.5.1 SetIterator,
         // §24.3.5.1 MapIterator, §27.5.1.2 Generator step.
         if let Some(arr) = iterable.as_array() {
-            let elements = array::with_elements(arr, &self.gc_heap, |elements| elements.to_vec());
-            return Ok(elements);
+            // Fast materialisation is valid only for a plain dense array
+            // (no exotic sidecar — accessors, sparse storage, prototype
+            // override — and no holes). Anything else walks the real
+            // §7.4 protocol below so index getters fire, holes resolve
+            // through the prototype, and a replaced `next` is honoured.
+            let len = array::len(arr, &self.gc_heap);
+            if let Some(values) = array::plain_dense_prefix_values(arr, &self.gc_heap, len) {
+                return Ok(values);
+            }
         }
         if let Some(s) = iterable.as_string(&self.gc_heap) {
             return string_iterator_values(s, &mut self.gc_heap);

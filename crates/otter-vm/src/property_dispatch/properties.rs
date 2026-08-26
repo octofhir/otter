@@ -87,16 +87,15 @@ impl Interpreter {
                 // %Function.prototype% walk, whose own `name`=""/
                 // `length`=0 would otherwise shadow the real values.
                 let ctor = c.ctor(&self.gc_heap);
-                let metadata_deleted = ctor
-                    .as_function()
-                    .or_else(|| {
-                        ctor.as_closure(&self.gc_heap)
-                            .map(|cl| cl.cached_function_id)
-                    })
-                    .is_some_and(|fid| {
-                        function_metadata::ordinary_function_metadata_key(name)
-                            .is_some_and(|k| self.function_deleted_metadata.contains(&(fid, k)))
-                    });
+                let metadata_deleted = if let Some(cl) = ctor.as_closure(&self.gc_heap) {
+                    function_metadata::ordinary_function_metadata_key(name)
+                        .is_some_and(|k| cl.metadata_deleted(&self.gc_heap, k))
+                } else if let Some(fid) = ctor.as_function() {
+                    function_metadata::ordinary_function_metadata_key(name)
+                        .is_some_and(|k| self.function_deleted_metadata.contains(&(fid, k)))
+                } else {
+                    false
+                };
                 if (name == "name" || name == "length")
                     && metadata_deleted
                     && object::get_own_descriptor(statics, &self.gc_heap, name).is_none()
@@ -132,12 +131,14 @@ impl Interpreter {
                         || ctor.is_bound_function()
                     {
                         let owner_bag = self.callable_bag_for_value(&ctor);
+                        let owner_deleted = self.callable_deleted_flags_for_value(&ctor);
                         let mut ctx = function_metadata::FunctionMetadataContext::new(
                             context,
                             &mut self.gc_heap,
                             owner_bag,
                             &self.function_deleted_metadata,
-                        );
+                        )
+                        .with_owner_deleted(owner_deleted);
                         function_metadata::callable_intrinsic_property(&mut ctx, &ctor, name)?
                     } else {
                         Value::undefined()

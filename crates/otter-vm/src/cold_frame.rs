@@ -288,7 +288,7 @@ impl ColdFrame {
             for arg in &p.bound_args {
                 arg.trace_value_slots(visitor);
             }
-            if let Some(name) = &p.target_name {
+            if let Some(name) = &p.target_length {
                 name.trace_value_slots(visitor);
             }
         }

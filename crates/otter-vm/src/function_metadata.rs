@@ -42,6 +42,10 @@ pub(crate) struct FunctionMetadataContext<'a> {
     /// the intrinsic `name` / `length` properties.
     owner_bag: Option<JsObject>,
     function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
+    /// Per-closure-instance deleted flags for (`name`, `length`).
+    /// `Some` overrides the template-id-keyed global set — sibling
+    /// closures of one template each carry their own deletions.
+    owner_deleted: Option<(bool, bool)>,
 }
 
 /// Builtin metadata captured when `Function.prototype.bind` creates a wrapper.
@@ -66,7 +70,15 @@ impl<'a> FunctionMetadataContext<'a> {
             gc_heap,
             owner_bag,
             function_deleted_metadata,
+            owner_deleted: None,
         }
+    }
+
+    /// Attach the owning closure instance's deleted-metadata flags.
+    #[must_use]
+    pub(crate) fn with_owner_deleted(mut self, owner_deleted: Option<(bool, bool)>) -> Self {
+        self.owner_deleted = owner_deleted;
+        self
     }
 
     /// Shared borrow of the heap. Use for reader-only paths.
@@ -511,6 +523,12 @@ fn ordinary_function_metadata_deleted(
     let Some(key) = ordinary_function_metadata_key(key) else {
         return false;
     };
+    if let Some((name_deleted, length_deleted)) = ctx.owner_deleted {
+        return match key {
+            "name" => name_deleted,
+            _ => length_deleted,
+        };
+    }
     ctx.function_deleted_metadata.contains(&(function_id, key))
 }
 

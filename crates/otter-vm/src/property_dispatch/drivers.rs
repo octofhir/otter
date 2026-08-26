@@ -756,9 +756,11 @@ impl Interpreter {
                     let top_idx = stack.len() - 1;
                     stack[top_idx].advance_pc()?;
                     match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
-                        Some(_) => {}
-                        None => {
-                            let Some(target) = proxy.target(&self.gc_heap).as_object() else {
+                        crate::object_internal_ops::ProxyTrap::Trapped(_) => {}
+                        crate::object_internal_ops::ProxyTrap::NoTrap {
+                            target: fallthrough_target,
+                        } => {
+                            let Some(target) = fallthrough_target.as_object() else {
                                 return Err(VmError::TypeMismatch);
                             };
                             match &key {
@@ -947,7 +949,7 @@ impl Interpreter {
             ];
             stack[top_idx].advance_pc()?;
             match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
-                Some(result) => {
+                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         self.failed_set_result(
@@ -992,7 +994,9 @@ impl Interpreter {
                         }
                     }
                 }
-                None => {
+                crate::object_internal_ops::ProxyTrap::NoTrap {
+                    target: fallthrough_target,
+                } => {
                     // §10.5.9 step 9 — a missing `set` trap forwards to
                     // `target.[[Set]](P, V, Receiver)` with the PROXY as
                     // Receiver. OrdinarySet's own-property steps then run
@@ -1002,7 +1006,7 @@ impl Interpreter {
                     // every target (ordinary, exotic, or nested proxy)
                     // through the value-level funnel rather than a
                     // receiver-blind fast path.
-                    let target_value = proxy.target(&self.gc_heap);
+                    let target_value = fallthrough_target;
                     if !self.ordinary_set_data_value(
                         stack,
                         context,

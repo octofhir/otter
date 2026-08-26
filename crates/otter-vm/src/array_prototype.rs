@@ -1781,35 +1781,13 @@ impl Interpreter {
         if cap == 0 {
             return Ok(Value::string(JsString::from_str("", self.gc_heap_mut())?));
         }
-        // §23.1.3.16 steps 4-8 visit indices 0..len through `[[Get]]`
-        // only — never `[[HasProperty]]` or `[[OwnPropertyKeys]]`. For a
-        // plain array we may gather just the present own indices (an
-        // absent index joins as `""`, indistinguishable from a `Get`
-        // returning `undefined`) since that walk reads only ordinary
-        // slots. An exotic receiver (Proxy, array-like object, boxed
-        // primitive) must instead `Get` every index so its traps fire
-        // exactly as the spec prescribes and no `ownKeys` / `getPrototypeOf`
-        // trap is invoked.
-        let indices: Vec<usize> = if o.is_array() {
-            let mut set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-            let mut current = o;
-            let mut hops = 0usize;
-            loop {
-                collect_own_indices_below(self, &current, cap, &mut set);
-                if hops >= object::PROTO_CHAIN_HARD_CAP {
-                    break;
-                }
-                let proto = self.get_prototype_for_op(&current)?;
-                if proto.is_null() || !proto.is_object_type() {
-                    break;
-                }
-                current = proto;
-                hops += 1;
-            }
-            set.into_iter().collect()
-        } else {
-            (0..cap).collect()
-        };
+        // §23.1.3.16 steps 4-8 visit EVERY index 0..len through
+        // `[[Get]]` — a pre-collected present-index walk is unsound
+        // because an element's ToString can install prototype indices
+        // mid-join (`Object.prototype[3] = ...` inside a `toString`)
+        // that later Gets must observe. The plain-dense snapshot below
+        // keeps the common case allocation-free.
+        let indices: Vec<usize> = (0..cap).collect();
         let mut parts: Vec<Vec<u16>> = vec![Vec::new(); cap];
         // Snapshot every element handle in ONE payload read before touching the
         // allocator. `Get(O, ToString(k))` interns each index-key string, and

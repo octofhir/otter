@@ -198,7 +198,8 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     let pym = require_plain_year_month(ctx)?;
     let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(
-        pym.compare_iso(&other) == std::cmp::Ordering::Equal,
+        pym.compare_iso(&other) == std::cmp::Ordering::Equal
+            && pym.calendar().identifier() == other.calendar().identifier(),
     ))
 }
 

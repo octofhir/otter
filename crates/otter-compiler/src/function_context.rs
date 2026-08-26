@@ -86,6 +86,14 @@ pub(crate) struct FunctionContext {
     /// global-script bindings that also mirror via `DefineGlobalVar`.
     pub(crate) annex_b_var_storages:
         std::collections::HashMap<String, (Option<crate::scope::BindingStorage>, bool)>,
+    /// Source span starts of block-level function declarations whose
+    /// own path is Annex B eligible — only these sync the var-scope
+    /// binding at their source position (§B.3.3.1 step 1.a.ii.1).
+    pub(crate) annex_b_eligible_spans: std::collections::HashSet<u32>,
+    /// Per-`Op::Eval`-site caller-scope refinements: block-scope
+    /// bindings visible at each direct-eval call site, in emission
+    /// order. Becomes [`otter_bytecode::Function::eval_sites`].
+    pub(crate) eval_sites: Vec<Vec<otter_bytecode::DirectEvalBinding>>,
     /// `true` when an anonymous `export default function/function*` was
     /// already hoisted (compiled + mirrored to `module_env.default`) at
     /// instantiation, so its source-position arm must be a no-op.
@@ -195,6 +203,8 @@ impl FunctionContext {
             pending_label: None,
             hoisted_function_names: HashSet::new(),
             annex_b_var_storages: std::collections::HashMap::new(),
+            annex_b_eligible_spans: std::collections::HashSet::new(),
+            eval_sites: Vec::new(),
             default_function_hoisted: false,
             captured_names: HashSet::new(),
             mapped_argument_names: HashSet::new(),
@@ -381,6 +391,7 @@ impl FunctionContext {
                 initialized: false,
                 fn_self_name: false,
                 type_hint: TypeHint::Unknown,
+                catch_param: false,
             },
         );
         Ok(storage)
@@ -473,6 +484,7 @@ impl FunctionContext {
                 initialized: false,
                 fn_self_name: false,
                 type_hint: TypeHint::Unknown,
+                catch_param: false,
             },
         );
     }
@@ -975,6 +987,7 @@ pub(crate) const VIRTUAL_CAPTURE_BASE: u16 = 0x8000;
 pub(crate) fn finalize_virtual_capture_indices(
     code: &mut otter_bytecode::FunctionCodeBuilder,
     direct_eval_meta: &mut [otter_bytecode::DirectEvalBinding],
+    eval_sites: &mut [Vec<otter_bytecode::DirectEvalBinding>],
     own_count: u16,
 ) {
     let base = VIRTUAL_CAPTURE_BASE as i32;
@@ -1016,7 +1029,10 @@ pub(crate) fn finalize_virtual_capture_indices(
             _ => {}
         }
     }
-    for binding in direct_eval_meta.iter_mut() {
+    for binding in direct_eval_meta
+        .iter_mut()
+        .chain(eval_sites.iter_mut().flat_map(|site| site.iter_mut()))
+    {
         if binding.upvalue >= VIRTUAL_CAPTURE_BASE {
             binding.upvalue = own_count + (binding.upvalue - VIRTUAL_CAPTURE_BASE);
         }

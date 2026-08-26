@@ -103,6 +103,10 @@ impl Interpreter {
             Some(Operand::Imm32(bits)) => bits,
             _ => 0,
         };
+        let site = match operands.get(3) {
+            Some(Operand::Imm32(bits)) => bits as usize,
+            _ => usize::MAX,
+        };
         let forbid_var_arguments = flags & 1 != 0;
         let in_param_init = flags & 2 != 0;
         let new_target_allowed = flags & 4 != 0;
@@ -125,14 +129,19 @@ impl Interpreter {
         // The compiler promoted every caller function-scope binding
         // into a cell and recorded the name → slot table; earlier
         // evals may have extended the frame with more named cells.
-        let (caller_scope, cell_sources) =
-            self.collect_caller_scope(context, &stack[top_idx], in_param_init);
         // §19.2.1.1 `inFunction` — the compiler's flag, not table
         // emptiness: a synthesized constructor may carry no bindings
         // yet still host a field-initializer eval.
         let in_function_caller = context
             .exec_function(stack[top_idx].function_id)
             .is_some_and(|function| function.contains_direct_eval);
+        // Script-top-level evals keep the global variable environment:
+        // the per-site block-binding refinements only apply when the
+        // caller is function code (a script `for (let …)` TDZ cell
+        // must not drag the eval onto the function-caller path).
+        let effective_site = if in_function_caller { site } else { usize::MAX };
+        let (caller_scope, cell_sources) =
+            self.collect_caller_scope(context, &stack[top_idx], in_param_init, effective_site);
         let result = if !in_function_caller && cell_sources.is_empty() {
             // Script-top-level direct eval: the caller variable
             // environment *is* the global environment, which the
@@ -182,6 +191,7 @@ impl Interpreter {
         context: &ExecutionContext,
         frame: &Frame,
         in_param_init: bool,
+        site: usize,
     ) -> (Vec<EvalCallerBinding>, Vec<CallerCellSource>) {
         let mut by_name: std::collections::BTreeMap<String, (EvalCallerBinding, CallerCellSource)> =
             std::collections::BTreeMap::new();
@@ -203,6 +213,7 @@ impl Interpreter {
                             captured: binding.captured,
                             is_const: binding.is_const,
                             fn_self_name: binding.fn_self_name,
+                            inner: false,
                         },
                         CallerCellSource::Upvalue(binding.upvalue),
                     ),
@@ -231,11 +242,37 @@ impl Interpreter {
                                 captured: !snapshot.current,
                                 is_const: false,
                                 fn_self_name: false,
+                                inner: false,
                             },
                             CallerCellSource::EvalEnv(name),
                         ),
                     );
                 }
+            }
+        }
+        // Per-site block-scope refinements shadow both the
+        // function-scope baseline and any eval-environment record —
+        // they sit lexically closer to the eval than either.
+        if let Some(entries) = context
+            .exec_function(frame.function_id)
+            .and_then(|function| function.eval_sites.get(site))
+        {
+            for binding in entries {
+                let name = binding.name.to_string();
+                by_name.insert(
+                    name.clone(),
+                    (
+                        EvalCallerBinding {
+                            name,
+                            lexical: binding.lexical,
+                            captured: binding.captured,
+                            is_const: binding.is_const,
+                            fn_self_name: binding.fn_self_name,
+                            inner: true,
+                        },
+                        CallerCellSource::Upvalue(binding.upvalue),
+                    ),
+                );
             }
         }
         by_name.into_values().unzip()
@@ -281,13 +318,15 @@ impl Interpreter {
         }
         // §19.2.1.3 — only the caller's OWN variable-environment
         // names block adoption; a passthrough CAPTURE of the same
-        // name still receives a fresh caller binding.
+        // name still receives a fresh caller binding, and so does a
+        // block-scope INNER binding (the eval's `var` lands in the
+        // variable environment underneath it — §B.3.5).
         let caller_scope_names: std::collections::HashSet<String> = options
             .caller_scope
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter(|binding| !binding.captured)
+            .filter(|binding| !binding.captured && !binding.inner)
             .map(|binding| binding.name.clone())
             .collect();
         let module = self.compile_escaped_source(&source, options)?;
@@ -388,15 +427,17 @@ impl Interpreter {
         // child, so an adopted binding can never leak across that boundary.
         for (name, cell) in adopted {
             let seq = self.next_eval_binding_seq();
-            if !crate::eval_env::eval_env_insert_current(
+            // §19.2.1.3 step 16.b — an already-present binding (a
+            // prior eval's adoption of the same name past an inner
+            // catch/block shadow) is kept, value and all; only a
+            // genuinely new name inserts.
+            crate::eval_env::eval_env_insert_current(
                 &mut self.gc_heap,
                 entry_eval_env,
                 name,
                 cell,
                 seq,
-            ) {
-                return Err(VmError::InvalidOperand);
-            }
+            );
         }
         let main = context.exec_main();
         let window = self.alloc_reg_window(main.register_count as usize)?;

@@ -1476,7 +1476,7 @@ impl TemplatePlan {
                         opcode: Op::Eval as u8,
                         arg0: u64::from(operands.dst) | (u64::from(operands.src) << 16),
                         arg1: operands.flags as u32 as u64,
-                        arg2: 0,
+                        arg2: operands.site as u32 as u64,
                     }
                 }
                 Op::IsEvalIntrinsic | Op::ToNumber => {

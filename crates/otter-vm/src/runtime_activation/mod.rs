@@ -253,7 +253,7 @@ impl<'a> RuntimeCall<'a> {
     /// Run one synchronous direct eval with the materialized frame as the sole
     /// eval-environment root for the duration of interpreter reentry, then
     /// return ownership to the published native descriptor on every outcome.
-    pub fn eval_op(&mut self, packed_registers: u64, flags: u64) -> Result<(), VmError> {
+    pub fn eval_op(&mut self, packed_registers: u64, flags: u64, site: u64) -> Result<(), VmError> {
         let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
             return Err(VmError::InvalidOperand);
         };
@@ -274,7 +274,8 @@ impl<'a> RuntimeCall<'a> {
 
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = unsafe { self.context.as_ref() };
-        let result = vm.jit_runtime_eval_op(context, stack, frame_index, packed_registers, flags);
+        let result =
+            vm.jit_runtime_eval_op(context, stack, frame_index, packed_registers, flags, site);
 
         let materialized = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
         // SAFETY: the native descriptor stayed published and exclusively

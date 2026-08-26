@@ -499,6 +499,7 @@ impl CodeBlock {
             is_module: false,
             module_url: Box::<str>::from(""),
             direct_eval_bindings: Box::new([]),
+            eval_sites: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
@@ -974,6 +975,9 @@ pub struct CodeBlock {
     /// function-scope binding; on a compiled eval `<main>` it lists
     /// the new var-scoped bindings the body introduced.
     pub(crate) direct_eval_bindings: Box<[ExecDirectEvalBinding]>,
+    /// Per-`Op::Eval`-site caller-scope refinements (block-scope
+    /// bindings visible at each direct-eval site, all `inner`).
+    pub(crate) eval_sites: Box<[Box<[ExecDirectEvalBinding]>]>,
     /// §19.2.1.1 `inFunction` signal for `Op::Eval` — `true` when
     /// this function contains a direct eval call site (the binding
     /// table may still be empty).
@@ -1037,6 +1041,7 @@ impl Clone for CodeBlock {
             is_module: self.is_module,
             module_url: self.module_url.clone(),
             direct_eval_bindings: self.direct_eval_bindings.clone(),
+            eval_sites: self.eval_sites.clone(),
             contains_direct_eval: self.contains_direct_eval,
             code: self.code.clone(),
             overflow_operand_words: self.overflow_operand_words.clone(),
@@ -1166,14 +1171,12 @@ impl CodeBlock {
             direct_eval_bindings: function
                 .direct_eval_bindings
                 .iter()
-                .map(|binding| ExecDirectEvalBinding {
-                    name: binding.name.clone().into_boxed_str(),
-                    upvalue: binding.upvalue,
-                    lexical: binding.lexical,
-                    captured: binding.captured,
-                    is_const: binding.is_const,
-                    fn_self_name: binding.fn_self_name,
-                })
+                .map(exec_direct_eval_binding)
+                .collect(),
+            eval_sites: function
+                .eval_sites
+                .iter()
+                .map(|site| site.iter().map(exec_direct_eval_binding).collect())
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
@@ -1227,6 +1230,22 @@ pub(crate) struct ExecDirectEvalBinding {
     /// an eval-body assignment throws `TypeError` in strict mode only
     /// (§10.2.11, §9.1.1.1.5).
     pub(crate) fn_self_name: bool,
+    /// Block-scope binding between the variable environment and the
+    /// eval site (§19.2.1.3, §B.3.5) — shadows the baseline table and
+    /// eval-environment records; a body `var` never re-binds it.
+    pub(crate) inner: bool,
+}
+
+fn exec_direct_eval_binding(binding: &otter_bytecode::DirectEvalBinding) -> ExecDirectEvalBinding {
+    ExecDirectEvalBinding {
+        name: binding.name.clone().into_boxed_str(),
+        upvalue: binding.upvalue,
+        lexical: binding.lexical,
+        captured: binding.captured,
+        is_const: binding.is_const,
+        fn_self_name: binding.fn_self_name,
+        inner: binding.inner,
+    }
 }
 
 /// Compact mapped-arguments alias entry.

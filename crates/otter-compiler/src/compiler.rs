@@ -100,6 +100,11 @@ pub(crate) struct Compiler {
     /// `<main>` locals. Empty for modules and eval bodies (eval
     /// lexicals are private to the eval, §19.2.1.1).
     pub(crate) script_global_lexicals: std::collections::HashSet<String>,
+    /// Sloppy eval-body `var` / annex-B function names. §19.2.1.3
+    /// CreateMutableBinding(name, true) makes them deletable, so
+    /// `delete name` lowers to [`Op::DeleteDynamic`] instead of the
+    /// declarative-binding `false`.
+    pub(crate) eval_var_names: std::collections::HashSet<String>,
     /// `true` while lowering class instance-field initializers
     /// (which compile into the constructor frame). A direct eval
     /// there may use `new.target` but observes `undefined`
@@ -162,6 +167,7 @@ impl Compiler {
             in_eval: false,
             script_global_vars: std::collections::HashSet::new(),
             script_global_lexicals: std::collections::HashSet::new(),
+            eval_var_names: std::collections::HashSet::new(),
             in_field_initializer: false,
             eval_new_target_allowed: false,
             number_typed_cache: RefCell::new(HashMap::new()),

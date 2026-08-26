@@ -46,6 +46,11 @@ pub(crate) struct BindingInfo {
     /// Advisory: nothing checks it at runtime, so it may only seed
     /// speculation that a guard can undo.
     pub(crate) type_hint: TypeHint,
+    /// `true` for a simple catch-clause parameter. §B.3.5 — a sloppy
+    /// direct eval var-declaring the same name is NOT a SyntaxError
+    /// (unlike other lexical bindings between the variable scope and
+    /// the eval site).
+    pub(crate) catch_param: bool,
 }
 
 /// Where a binding lives in the running frame.

@@ -1964,6 +1964,12 @@ pub struct EvalCallerBinding {
     /// an eval-body assignment throws `TypeError` in strict mode only
     /// (§10.2.11, §9.1.1.1.5).
     pub fn_self_name: bool,
+    /// `true` for a binding declared in a block or catch clause
+    /// lexically between the caller's variable environment and the
+    /// eval site: the body resolves the name here, but a body `var`
+    /// of the same name declares a fresh variable-environment binding
+    /// underneath (§19.2.1.3, §B.3.5).
+    pub inner: bool,
 }
 
 /// Embedder-supplied parse + compile callback used by

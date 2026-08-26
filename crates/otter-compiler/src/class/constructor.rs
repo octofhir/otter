@@ -162,6 +162,7 @@ pub(crate) fn compile_synthetic_constructor(
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
         &mut direct_eval_meta,
+        &mut child.eval_sites,
         child.own_upvalue_count,
     );
     let mut module_mut = module.borrow_mut();
@@ -178,6 +179,7 @@ pub(crate) fn compile_synthetic_constructor(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.inherited_upvalue_count = captures.len() as u16;
     slot.direct_eval_bindings = direct_eval_meta;
+    slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code.finish();
     slot.spans = child.spans;
@@ -356,6 +358,7 @@ pub(crate) fn compile_class_constructor(
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
         &mut direct_eval_meta,
+        &mut child.eval_sites,
         child.own_upvalue_count,
     );
     let mut module_mut = module.borrow_mut();
@@ -373,6 +376,7 @@ pub(crate) fn compile_class_constructor(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.inherited_upvalue_count = captures.len() as u16;
     slot.direct_eval_bindings = direct_eval_meta;
+    slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.contains_direct_eval = contains_direct_eval;
     slot.code = child.code.finish();
     slot.spans = child.spans;

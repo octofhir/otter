@@ -1784,6 +1784,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
                         captured: binding.captured,
                         is_const: binding.is_const,
                         fn_self_name: binding.fn_self_name,
+                        inner: binding.inner,
                     })
                     .collect()
             });

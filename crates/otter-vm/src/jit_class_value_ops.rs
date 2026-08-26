@@ -175,6 +175,7 @@ impl Interpreter {
         frame_index: usize,
         packed_registers: u64,
         flags: u64,
+        site: u64,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
@@ -186,6 +187,7 @@ impl Interpreter {
             Operand::Register(lane(packed_registers, 0)),
             Operand::Register(lane(packed_registers, 1)),
             Operand::Imm32(flags as u32 as i32),
+            Operand::Imm32(site as u32 as i32),
         ];
         self.run_eval_operands(context, stack, operands.as_slice())?;
         stack[frame_index].pc = saved_pc;

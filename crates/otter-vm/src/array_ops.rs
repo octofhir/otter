@@ -615,6 +615,7 @@ mod tests {
                 source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
+                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: vec![Instruction {
                     pc: 0,
@@ -669,6 +670,7 @@ mod tests {
                 source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
+                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: vec![Instruction {
                     pc: 0,

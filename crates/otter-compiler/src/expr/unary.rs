@@ -116,10 +116,31 @@ pub(crate) fn compile_unary(
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            if cx.lookup_binding(&name).is_some() {
+            let block_shadowed = cx
+                .scopes
+                .iter()
+                .skip(1)
+                .any(|scope| scope.bindings.contains_key(&name));
+            if cx.eval_var_names.contains(&name) && !block_shadowed {
+                // §19.2.1.3 — this eval body's own sloppy `var` /
+                // annex-B function binding was adopted into the
+                // caller's eval-environment record as deletable
+                // (CreateMutableBinding(name, true)). A nearer block
+                // lexical shadowing the name keeps the declarative
+                // `false` below instead.
+                let name_idx = cx.intern_string_constant(&name);
+                cx.emit(
+                    Op::DeleteDynamic,
+                    [Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                    span,
+                );
+            } else if cx.lookup_binding(&name).is_some()
+                || cx.script_global_lexicals.contains(&name)
+            {
                 // §9.1.1.1.7 DeleteBinding on a declarative
                 // environment record — bindings created by
-                // declarations are not deletable.
+                // declarations (including the script-level global
+                // lexical environment) are not deletable.
                 cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
             } else if let Some((index, _, eval_depth)) = cx.resolve_capture_with_info(&name) {
                 if eval_depth != 0 {

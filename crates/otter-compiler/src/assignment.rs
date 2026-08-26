@@ -962,7 +962,7 @@ pub(crate) fn assign_to_target(
         }
         AssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
-            store_identifier(cx, &name, value_reg, span)
+            store_identifier_checked(cx, &name, value_reg, span)
         }
         AssignmentTarget::StaticMemberExpression(member) => {
             // `super.X` as a destructuring / for-head target writes
@@ -1126,7 +1126,9 @@ fn assign_prepared_target(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     match target {
-        PreparedAssignmentTarget::Identifier(name) => store_identifier(cx, &name, value_reg, span),
+        PreparedAssignmentTarget::Identifier(name) => {
+            store_identifier_checked(cx, &name, value_reg, span)
+        }
         PreparedAssignmentTarget::StaticMember { obj_reg, name_idx } => {
             let scratch = cx.alloc_scratch();
             cx.emit(
@@ -1356,7 +1358,7 @@ pub(crate) fn assign_object_pattern(
                     Some(default) => apply_default_with_name(cx, val, default, Some(&name), pspan)?,
                     None => val,
                 };
-                store_identifier(cx, &name, final_val, pspan)?;
+                store_identifier_checked(cx, &name, final_val, pspan)?;
                 extracted_keys.push(ExtractedKey::Static(name));
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
@@ -1533,6 +1535,31 @@ pub(crate) fn apply_default_with_name(
 /// Store `value_reg` into the binding (or globalThis) for `name`.
 /// Mirrors the identifier-store branch of `compile_assignment` but
 /// without the compound-op handling.
+/// [`store_identifier`] with the §6.2.5.5 PutValue TDZ check for
+/// destructuring-ASSIGNMENT leaves: a binding still uninitialized at
+/// this compile point (`let y = [y] = []`) raises ReferenceError
+/// before the const / immutable-binding checks. Declaration
+/// initialization paths call [`store_identifier`] directly — their
+/// leaves are legitimately uninitialized.
+pub(crate) fn store_identifier_checked(
+    cx: &mut Compiler,
+    name: &str,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    if let Some(info) = cx.lookup_binding(name)
+        && !info.initialized
+    {
+        let diag_idx = match info.storage {
+            BindingStorage::Register { reg } => reg,
+            BindingStorage::Upvalue { idx } => idx,
+        };
+        cx.emit(Op::TdzError, [Operand::Imm32(i32::from(diag_idx))], span);
+        return Ok(());
+    }
+    store_identifier(cx, name, value_reg, span)
+}
+
 pub(crate) fn store_identifier(
     cx: &mut Compiler,
     name: &str,

@@ -3262,12 +3262,11 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
 /// emit the spec `"Arguments"` builtin tag per §20.1.3.6 step 14.b.
 /// Called from `arguments_object::initialize_{mapped,unmapped}` after
 /// the body's slot table is set up.
-pub fn mark_as_arguments_object(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn mark_as_arguments_object(obj: &mut JsObject, heap: &mut otter_gc::GcHeap) {
+    // The sidecar allocation may move the object; the caller's handle
+    // is updated in place.
+    ensure_exotic(obj, heap).expect("exotic sidecar");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().is_arguments_object = true;
     });
 }
@@ -4095,15 +4094,17 @@ pub fn get_own_symbol_descriptor(
 
 /// Store the internal native `[[Call]]` slot for callable ordinary
 /// objects.
-pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_call_native(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
+    // The sidecar allocation may move both the object and the value;
+    // the caller's handle is updated in place and the value rides the
+    // pending-root list.
+    let mut pending = [native];
+    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    let native = pending[0];
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().call_native = Some(native);
     });
-    record_exotic_write(heap, obj, &native);
+    record_exotic_write(heap, *obj, &native);
 }
 
 /// Read the internal native `[[Call]]` slot.
@@ -4115,16 +4116,18 @@ pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
 /// Store the internal native `[[Construct]]` slot for constructor-shaped
 /// builtin objects. Current builtin constructor objects are callable
 /// too, so this also installs the same callback as `[[Call]]`.
-pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_constructor_native(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
+    // The sidecar allocation may move both the object and the value;
+    // the caller's handle is updated in place and the value rides the
+    // pending-root list.
+    let mut pending = [native];
+    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    let native = pending[0];
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().call_native = Some(native);
         body.exotic_mut().constructor_native = Some(native);
     });
-    record_exotic_write(heap, obj, &native);
+    record_exotic_write(heap, *obj, &native);
 }
 
 /// Read the internal native `[[Construct]]` slot.
@@ -4134,12 +4137,11 @@ pub fn constructor_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Valu
 }
 
 /// Store the `[[BooleanData]]` internal slot for a Boolean wrapper.
-pub fn set_boolean_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_boolean_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+    // The sidecar allocation may move the object; the caller's handle
+    // is updated in place.
+    ensure_exotic(obj, heap).expect("exotic sidecar");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().boolean_data = Some(value);
     });
 }
@@ -4151,12 +4153,11 @@ pub fn boolean_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<bool> {
 }
 
 /// Store the `[[NumberData]]` internal slot for a Number wrapper.
-pub fn set_number_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: NumberValue) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_number_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: NumberValue) {
+    // The sidecar allocation may move the object; the caller's handle
+    // is updated in place.
+    ensure_exotic(obj, heap).expect("exotic sidecar");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().number_data = Some(value);
     });
 }
@@ -4168,14 +4169,19 @@ pub fn number_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<NumberValue
 }
 
 /// Store the `[[StringData]]` internal slot for a String wrapper.
-pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsString) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_string_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: JsString) {
+    // The sidecar allocation may move both the object and the string;
+    // the caller's handle is updated in place and the string rides the
+    // pending-root list.
+    let mut pending = [Value::string(value)];
+    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    let value = pending[0]
+        .as_string(heap)
+        .expect("pending string survives rooting");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().string_data = Some(value);
     });
+    heap.record_write(*obj, &value);
 }
 
 /// Read the `[[StringData]]` internal slot for a String wrapper.
@@ -4185,14 +4191,23 @@ pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
 }
 
 /// Store the `[[SymbolData]]` internal slot for a Symbol wrapper.
-pub fn set_symbol_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: crate::symbol::JsSymbol) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_symbol_data(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    value: crate::symbol::JsSymbol,
+) {
+    // The sidecar allocation may move both the object and the symbol;
+    // the caller's handle is updated in place and the symbol rides the
+    // pending-root list.
+    let mut pending = [Value::symbol(value)];
+    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    let value = pending[0]
+        .as_symbol(heap)
+        .expect("pending symbol survives rooting");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().symbol_data = Some(value);
     });
+    heap.record_write(*obj, &value);
 }
 
 /// Read the `[[SymbolData]]` internal slot for a Symbol wrapper.
@@ -4202,12 +4217,16 @@ pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symb
 }
 
 /// Store the `[[BigIntData]]` internal slot for a BigInt wrapper.
-pub fn set_bigint_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: BigIntValue) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_bigint_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: BigIntValue) {
+    // The sidecar allocation may move both the object and the bigint;
+    // the caller's handle is updated in place and the bigint rides the
+    // pending-root list.
+    let mut pending = [Value::big_int(value)];
+    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    let value = pending[0]
+        .as_big_int()
+        .expect("pending bigint survives rooting");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().bigint_data = Some(value);
     });
 }
@@ -4234,13 +4253,14 @@ pub fn clip_date_value(ms: f64) -> f64 {
 
 /// Store the `[[DateValue]]` internal slot for a Date instance.
 /// Applies §21.4.1.6 TimeClip before writing.
-pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+pub fn set_date_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
+    // The sidecar allocates and may move the heap; the caller's handle
+    // is updated in place so it keeps naming the live object (a copied
+    // local would hand a stale cage offset back to the caller — the
+    // classic recycled-slot brand loss).
+    ensure_exotic(obj, heap).expect("exotic sidecar");
     let clipped = clip_date_value(value);
-    heap.with_payload(obj, |body| {
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().date_data = Some(clipped);
     });
 }
@@ -4255,12 +4275,11 @@ pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
 
 /// Mark an object as carrying the `[[ErrorData]]` internal slot
 /// (§20.5) — set when an error constructor produces the instance.
-pub fn set_error_data(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_error_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap) {
+    // The sidecar allocation may move the object; the caller's handle
+    // is updated in place.
+    ensure_exotic(obj, heap).expect("exotic sidecar");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().error_data = true;
     });
 }
@@ -4368,12 +4387,11 @@ pub fn has_error_stack_frames(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 
 /// Tag an object as carrying the `[[IsRawJSON]]` internal slot
 /// (§25.5.3 `JSON.rawJSON`).
-pub fn set_is_raw_json(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    heap.with_payload(obj, |body| {
+pub fn set_is_raw_json(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+    // The sidecar allocation may move the object; the caller's handle
+    // is updated in place.
+    ensure_exotic(obj, heap).expect("exotic sidecar");
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().is_raw_json = value;
     });
 }

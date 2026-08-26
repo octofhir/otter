@@ -60,7 +60,7 @@ fn pin_string_data_and_aliases(
     };
     let empty_str =
         crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
-    crate::object::set_string_data(prototype, heap, empty_str);
+    crate::object::set_string_data(&mut prototype, heap, empty_str);
 
     if let Some(start_fn) = object::get(prototype, heap, "trimStart") {
         object::set(&mut prototype, heap, "trimLeft", start_fn);
@@ -162,8 +162,8 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             });
         };
         let this = *ctx.this_value();
-        if let Some(obj) = this.as_object() {
-            crate::object::set_string_data(obj, ctx.heap_mut(), string);
+        if let Some(mut obj) = this.as_object() {
+            crate::object::set_string_data(&mut obj, ctx.heap_mut(), string);
             Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {

@@ -503,8 +503,8 @@ fn finish_set(
     // Argument coercion can synchronously re-enter JavaScript and move the
     // receiver. Re-read the exact native-call root instead of retaining the
     // pre-coercion `JsObject` cage offset.
-    let (obj, _) = this_handle(ctx, name)?;
-    object::set_date_data(obj, ctx.heap_mut(), new_ms);
+    let (mut obj, _) = this_handle(ctx, name)?;
+    object::set_date_data(&mut obj, ctx.heap_mut(), new_ms);
     let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
     Ok(Value::number_f64(written))
 }
@@ -518,8 +518,8 @@ fn set_time_impl(
     let _ = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     let ms = read_primary_arg_number(&coerced);
-    let (obj, _) = this_handle(ctx, name)?;
-    object::set_date_data(obj, ctx.heap_mut(), ms);
+    let (mut obj, _) = this_handle(ctx, name)?;
+    object::set_date_data(&mut obj, ctx.heap_mut(), ms);
     let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
     Ok(Value::number_f64(written))
 }
@@ -688,8 +688,8 @@ fn set_year_impl(
     let coerced = coerce_set_args(ctx, name, args)?;
     let y = read_primary_arg_number(&coerced);
     if y.is_nan() {
-        let (obj, _) = this_handle(ctx, name)?;
-        object::set_date_data(obj, ctx.heap_mut(), f64::NAN);
+        let (mut obj, _) = this_handle(ctx, name)?;
+        object::set_date_data(&mut obj, ctx.heap_mut(), f64::NAN);
         return Ok(Value::number_f64(f64::NAN));
     }
     let y_int = y.trunc();

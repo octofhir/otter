@@ -1215,13 +1215,13 @@ impl Interpreter {
         obj: Local<'_>,
         call: Local<'_>,
     ) -> Result<(), VmError> {
-        let object = self
+        let mut object = self
             .handle_arena
             .get(obj.index())
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
         let call = self.handle_arena.get(call.index());
-        crate::object::set_call_native(object, &mut self.gc_heap, call);
+        crate::object::set_call_native(&mut object, &mut self.gc_heap, call);
         Ok(())
     }
 

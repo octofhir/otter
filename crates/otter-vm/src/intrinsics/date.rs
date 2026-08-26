@@ -80,8 +80,8 @@ fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     // §21.4.2.1 — `new Date(...)`. The construct receiver is a
     // freshly allocated JsObject (via OrdinaryCreateFromConstructor
     // on `Date`). Install the `[[DateValue]]` internal slot and return it.
-    if let Some(obj) = ctx.this_value().as_object() {
-        crate::object::set_date_data(obj, ctx.heap_mut(), time);
+    if let Some(mut obj) = ctx.this_value().as_object() {
+        crate::object::set_date_data(&mut obj, ctx.heap_mut(), time);
         return Ok(Value::object(obj));
     }
     Err(NativeError::TypeError {

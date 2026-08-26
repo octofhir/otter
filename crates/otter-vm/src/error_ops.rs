@@ -138,7 +138,7 @@ impl Interpreter {
         if let Some(ref message_gc_value) = message_gc_value {
             extra_roots.push(message_gc_value);
         }
-        let obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra_roots)?;
+        let mut obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra_roots)?;
         // Fetch the prototype only after every allocation in this function:
         // the message-string and object allocs above can each trigger a major
         // GC that relocates the (old-gen) error prototype. The class registry
@@ -148,7 +148,7 @@ impl Interpreter {
         let proto = self.error_classes.prototype(kind);
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         // §20.5.* — mark the `[[ErrorData]]` internal slot.
-        object::set_error_data(obj, &mut self.gc_heap);
+        object::set_error_data(&mut obj, &mut self.gc_heap);
         if let Some(message_gc_value) = message_gc_value {
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,

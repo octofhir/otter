@@ -166,7 +166,7 @@ fn install_function_prototype_callable_and_accessors(
     let mut prototype = prototype_root
         .as_object()
         .expect("Function.prototype root must remain an object");
-    object::set_call_native(prototype, heap, Value::native_function(prototype_call));
+    object::set_call_native(&mut prototype, heap, Value::native_function(prototype_call));
 
     let prototype_length = PropertyDescriptor::data(Value::number_i32(0), false, false, true);
     object::define_own_property_in_place(&mut prototype, heap, "length", prototype_length);

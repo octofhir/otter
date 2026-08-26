@@ -121,7 +121,11 @@ pub(crate) fn compile_unary(
                 .iter()
                 .skip(1)
                 .any(|scope| scope.bindings.contains_key(&name));
-            if cx.eval_var_names.contains(&name) && !block_shadowed {
+            let own_binding = cx.lookup_binding(&name).is_some();
+            if cx.eval_var_names.contains(&name)
+                && !block_shadowed
+                && (cx.stack.len() == 1 || !own_binding)
+            {
                 // §19.2.1.3 — this eval body's own sloppy `var` /
                 // annex-B function binding was adopted into the
                 // caller's eval-environment record as deletable
@@ -195,6 +199,66 @@ pub(crate) fn compile_unary(
             if let Some(done) = with_done {
                 cx.patch_branch_to_here(done);
             }
+            return Ok(dst);
+        }
+        // §13.5.1.2 + §13.3.9 — `delete a?.b` evaluates the chain up
+        // to the final member; a nullish short-circuit anywhere in the
+        // chain yields `true` without a [[Delete]], otherwise the
+        // final property deletes as usual.
+        if let Expression::ChainExpression(chain) = delete_arg {
+            use oxc_ast::ast::ChainElement;
+            let dst = cx.alloc_scratch();
+            let mut exits: Vec<u32> = Vec::new();
+            match &chain.expression {
+                ChainElement::StaticMemberExpression(m)
+                    if !matches!(m.object, Expression::Super(_)) =>
+                {
+                    let obj = crate::chain::compile_chain_object(cx, &m.object, &mut exits)?;
+                    if m.optional {
+                        exits.push(cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj), span));
+                    }
+                    let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                    cx.emit(
+                        Op::DeleteProperty,
+                        vec![
+                            Operand::Register(dst),
+                            Operand::Register(obj),
+                            Operand::ConstIndex(name_idx),
+                        ],
+                        span,
+                    );
+                }
+                ChainElement::ComputedMemberExpression(m)
+                    if !matches!(m.object, Expression::Super(_)) =>
+                {
+                    let obj = crate::chain::compile_chain_object(cx, &m.object, &mut exits)?;
+                    if m.optional {
+                        exits.push(cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj), span));
+                    }
+                    let idx_reg = compile_expr(cx, &m.expression, span)?;
+                    cx.emit(
+                        Op::DeleteElement,
+                        vec![
+                            Operand::Register(dst),
+                            Operand::Register(obj),
+                            Operand::Register(idx_reg),
+                        ],
+                        span,
+                    );
+                }
+                _ => {
+                    // A call step at the top (`delete a?.()`) is a
+                    // non-Reference: evaluate for side effects, `true`.
+                    let _ = compile_expr(cx, delete_arg, span)?;
+                    cx.emit(Op::LoadTrue, [Operand::Register(dst)], span);
+                }
+            }
+            let join = cx.emit_branch_placeholder(Op::Jump, None, span);
+            for pc in exits {
+                cx.patch_branch_to_here(pc);
+            }
+            cx.emit(Op::LoadTrue, [Operand::Register(dst)], span);
+            cx.patch_branch_to_here(join);
             return Ok(dst);
         }
         // §13.5.1.2 — `delete` on a non-Reference returns

@@ -795,6 +795,31 @@ impl Matcher<'_, '_> {
         if at + len > units.len() {
             return None;
         }
+        if self.input.is_code_point_mode() && !backward {
+            // §22.2.2.9 — under `u`/`v` the backreference compares code
+            // POINTS: a captured lone lead surrogate must not match the
+            // lead half of a well-formed pair in the input.
+            let mut i = start;
+            let mut j = at;
+            while i < end {
+                let (ca, wa) = self.decode(i)?;
+                // A pair straddling the capture's end reads as its lone
+                // lead — the capture ends inside the pair.
+                let (ca, wa) = if i + wa > end {
+                    (u32::from(units[i]), 1)
+                } else {
+                    (ca, wa)
+                };
+                let (cb, wb) = self.decode(j)?;
+                let eq = ca == cb || (ignore_case && self.canon(ca) == self.canon(cb));
+                if !eq {
+                    return None;
+                }
+                i += wa;
+                j += wb;
+            }
+            return Some(j);
+        }
         for k in 0..len {
             let a = u32::from(units[start + k]);
             let b = u32::from(units[at + k]);

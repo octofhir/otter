@@ -47,7 +47,7 @@ pub(crate) mod engine {
     /// Compile a pattern (lossy UTF-8 view) under the engine-relevant flags.
     /// `g`/`y`/`d` are spec state above the matcher and are not passed here.
     pub(crate) fn compile(
-        source: &str,
+        pattern_utf16: &[u16],
         ignore_case: bool,
         multiline: bool,
         dot_all: bool,
@@ -61,7 +61,10 @@ pub(crate) mod engine {
             unicode,
             unicode_sets,
         };
-        Regex::with_flags(source, flags).map_err(|e| format!("{e}"))
+        // Compile straight from code units: a lone surrogate in the
+        // pattern is a legal non-`u` literal (§22.2.1) and must not be
+        // smoothed to U+FFFD by a UTF-8 round-trip.
+        Regex::compile_utf16(pattern_utf16, flags).map_err(|e| format!("{e}"))
     }
 
     /// Collect every successful match from `start`, dropping a step-budget
@@ -118,9 +121,9 @@ pub const REGEX_BACKTRACK_BUDGET: u64 = 10_000_000;
 ///   it without bound while the hot-loop fast path stays intact.
 #[derive(Debug, Default)]
 pub(crate) struct RegexCompileCache {
-    /// Keyed by the five engine-relevant flag bits, then pattern source.
+    /// Keyed by the five engine-relevant flag bits, then pattern code units.
     by_flags:
-        std::collections::HashMap<CompileKey, std::collections::HashMap<String, engine::Regex>>,
+        std::collections::HashMap<CompileKey, std::collections::HashMap<Vec<u16>, engine::Regex>>,
 }
 
 /// Engine-relevant flag bits that select a distinct compiled program.
@@ -136,7 +139,7 @@ impl RegexCompileCache {
     /// caching it on a miss.
     pub(crate) fn get_or_compile(
         &mut self,
-        source: &str,
+        pattern_utf16: &[u16],
         ignore_case: bool,
         multiline: bool,
         dot_all: bool,
@@ -147,12 +150,12 @@ impl RegexCompileCache {
         if let Some(hit) = self
             .by_flags
             .get(&key)
-            .and_then(|by_source| by_source.get(source))
+            .and_then(|by_source| by_source.get(pattern_utf16))
         {
             return Ok(hit.clone());
         }
         let regex = engine::compile(
-            source,
+            pattern_utf16,
             ignore_case,
             multiline,
             dot_all,
@@ -170,7 +173,7 @@ impl RegexCompileCache {
         self.by_flags
             .entry(key)
             .or_default()
-            .insert(source.to_owned(), regex.clone());
+            .insert(pattern_utf16.to_vec(), regex.clone());
         Ok(regex)
     }
 }
@@ -367,7 +370,7 @@ impl JsRegExpBody {
     /// alias is never dropped and both isolates own their storage.
     pub(crate) fn rebuild_after_restore(&mut self, pattern_utf16: &[u16], source: &str) {
         let regex = engine::compile(
-            source,
+            pattern_utf16,
             self.flags.ignore_case,
             self.flags.multiline,
             self.flags.dot_all,
@@ -402,15 +405,13 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        // The engine compiles a pattern from a Rust `&str`, so feed it the
-        // lossy UTF-8 reading. JS-only escape sequences (`\u{...}`, `\xNN`,
-        // surrogate pairs) survive the round-trip because they are ASCII at
-        // the byte level.
+        // `.source` keeps a lossy UTF-8 reading for display; the engine
+        // compiles from the raw code units so lone surrogates survive.
         let source = String::from_utf16_lossy(pattern_utf16);
         // `g`, `y`, and `d` are spec-level state above the matcher and are not
         // part of the compiled pattern.
         let regex = engine::compile(
-            &source,
+            pattern_utf16,
             flags.ignore_case,
             flags.multiline,
             flags.dot_all,
@@ -447,7 +448,7 @@ impl JsRegExp {
         let source = String::from_utf16_lossy(pattern_utf16);
         let regex = cache
             .get_or_compile(
-                &source,
+                pattern_utf16,
                 flags.ignore_case,
                 flags.multiline,
                 flags.dot_all,
@@ -484,7 +485,7 @@ impl JsRegExp {
         let flags = RegExpFlags::parse(flag_str)?;
         let source = String::from_utf16_lossy(pattern_utf16);
         let regex = engine::compile(
-            &source,
+            pattern_utf16,
             flags.ignore_case,
             flags.multiline,
             flags.dot_all,

@@ -474,3 +474,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod iu_word_tests {
+    use super::*;
+    #[test]
+    fn iu_class_w_extended() {
+        let f = Flags {
+            ignore_case: true,
+            unicode: true,
+            ..Default::default()
+        };
+        let text: Vec<u16> = "ſ".encode_utf16().collect();
+        for (pat, expect) in [
+            (r"\w", true),
+            (r"\W", false),
+            (r"[\W]", false),
+            (r"[^\W]", true),
+        ] {
+            let units: Vec<u16> = pat.encode_utf16().collect();
+            let re = Regex::compile_utf16(&units, f).unwrap();
+            let m = re
+                .find_from_utf16_with_config(&text, 0, ExecConfig::default())
+                .next()
+                .is_some();
+            assert_eq!(m, expect, "{pat}");
+        }
+    }
+}

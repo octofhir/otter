@@ -1172,6 +1172,13 @@ pub fn parse_calendar_fields(
         if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
             f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
         }
+        // The Chinese and Dangi calendars define no eras: the reads
+        // still fire (they are observable), but §CalendarResolveFields
+        // ignores the values instead of rejecting them.
+        if matches!(calendar.identifier(), "chinese" | "dangi") {
+            f.era = None;
+            f.era_year = None;
+        }
     }
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {
         if v < 1 {
@@ -1226,6 +1233,13 @@ pub fn parse_date_time_fields(
         }
         if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
             cf.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
+        // The Chinese and Dangi calendars define no eras: the reads
+        // still fire (they are observable), but §CalendarResolveFields
+        // ignores the values instead of rejecting them.
+        if matches!(calendar.identifier(), "chinese" | "dangi") {
+            cf.era = None;
+            cf.era_year = None;
         }
     }
     if let Some(v) = read_partial_integer(ctx, target, "hour", class)? {
@@ -1290,6 +1304,13 @@ pub fn parse_year_month_fields(
         }
         if let Some(v) = read_partial_integer(ctx, target, "eraYear", class)? {
             f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
+        // The Chinese and Dangi calendars define no eras: the reads
+        // still fire (they are observable), but §CalendarResolveFields
+        // ignores the values instead of rejecting them.
+        if matches!(calendar.identifier(), "chinese" | "dangi") {
+            f.era = None;
+            f.era_year = None;
         }
     }
     if let Some(v) = read_partial_integer(ctx, target, "month", class)? {

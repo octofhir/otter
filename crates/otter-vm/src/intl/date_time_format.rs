@@ -517,7 +517,7 @@ pub(crate) fn resolve_ctx_with_mode(
         .unwrap_or_else(|| crate::intl::helpers::DEFAULT_LOCALE.to_string());
     // §ToDateTimeOptions step 1 — ToObject: null throws, other primitives
     // box to wrappers whose option reads all yield undefined.
-    let options = crate::intl::helpers::to_object_options(options, CLASS)?;
+    let options = crate::intl::helpers::to_object_options(ctx, options, CLASS)?;
 
     // Read a validated enum option then map it through a parser (the
     // value list already rejects out-of-range values with a RangeError).

@@ -46,6 +46,24 @@ pub fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSu
     let global_root = Value::object(global);
     let intl = NamespaceBuilder::from_spec_with_value_roots(heap, &INTL_SPEC, vec![global_root])?
         .build()?;
+    // §8.1 — the Intl namespace object's [[Prototype]] is
+    // %Object.prototype% (the builder allocates with no prototype link;
+    // the Object constructor is a native function, so its `prototype`
+    // reads through the descriptor table).
+    let object_prototype = crate::object::get(global, heap, "Object")
+        .and_then(|ctor| ctor.as_native_function())
+        .and_then(|ctor| {
+            ctor.own_property_descriptor(heap, "prototype")
+                .ok()
+                .flatten()
+        })
+        .and_then(|descriptor| match descriptor.kind {
+            crate::object::DescriptorKind::Data { value } => value.as_object(),
+            crate::object::DescriptorKind::Accessor { .. } => None,
+        });
+    if let Some(object_prototype) = object_prototype {
+        crate::object::set_prototype(intl, heap, Some(object_prototype));
+    }
     crate::bootstrap::define_global_value(global, heap, "Intl", Value::object(intl));
 
     CollatorIntrinsic::install(heap, global)?;

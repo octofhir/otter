@@ -66,7 +66,7 @@ pub fn resolve_ctx(
         .into_iter()
         .next()
         .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
-    let options = coerce_options_object(options, CLASS)?;
+    let options = coerce_options_object(ctx, options, CLASS)?;
     let range = |m: String| NativeError::RangeError {
         name: CLASS,
         reason: m,

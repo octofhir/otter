@@ -832,8 +832,20 @@ impl<'a> Parser<'a> {
         let (base, negate): (fn() -> CodePointSet, bool) = match c {
             x if x == b'd' as u16 => (digit_set, false),
             x if x == b'D' as u16 => (digit_set, true),
-            x if x == b'w' as u16 => (word_set, false),
-            x if x == b'W' as u16 => (word_set, true),
+            x if x == b'w' as u16 || x == b'W' as u16 => {
+                let negate = x == b'W' as u16;
+                self.pos += 1;
+                // §22.2.2.9 WordCharacters — under `iu`, the basic set
+                // extends with the two code points that case-fold INTO
+                // it (U+017F ſ, U+212A K, tc39/ecma262#525); `\W`
+                // complements the extended set.
+                let mut set = word_set();
+                if self.flags.ignore_case && self.unicode() {
+                    set.insert(0x017F);
+                    set.insert(0x212A);
+                }
+                return Ok(Some((set, negate)));
+            }
             x if x == b's' as u16 => (space_set, false),
             x if x == b'S' as u16 => (space_set, true),
             x if (x == b'p' as u16 || x == b'P' as u16) && self.unicode() => {

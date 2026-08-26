@@ -25,6 +25,26 @@ pub fn make_temporal(
         name: "Temporal",
         reason: "out of memory".to_string(),
     })?;
+    // §GetPrototypeFromConstructor — a subclass `new.target` installs
+    // its `prototype` as the instance [[Prototype]]; a non-object
+    // (or the plain builtin constructor's own prototype) keeps the
+    // per-kind realm default.
+    if ctx.is_construct_call()
+        && let Some(nt) = ctx.new_target().copied()
+        && !nt.is_undefined()
+    {
+        let proto = get_option_value(ctx, nt, "prototype", "Temporal")?;
+        if let Some(proto_obj) = proto.as_object() {
+            let default = ctx
+                .cx
+                .interp
+                .temporal_prototype_object(handle.kind())
+                .map(Value::object);
+            if default != Some(proto) {
+                handle.set_prototype_override(ctx.heap_mut(), proto_obj);
+            }
+        }
+    }
     Ok(Value::temporal(handle))
 }
 

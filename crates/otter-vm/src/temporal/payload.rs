@@ -150,6 +150,10 @@ pub struct TemporalBody {
     /// here, shadowing the prototype accessors. Allocated on first
     /// write; traced like every other GC body field.
     pub expando: Option<crate::object::JsObject>,
+    /// [[Prototype]] override installed by GetPrototypeFromConstructor
+    /// when a subclass constructs the instance (or a later
+    /// SetPrototypeOf). `None` means the per-kind realm prototype.
+    pub prototype_override: Option<crate::object::JsObject>,
 }
 
 /// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`. Packs
@@ -168,6 +172,7 @@ pub fn alloc_temporal(
     heap.alloc_old(TemporalBody {
         payload: Box::new(payload),
         expando: None,
+        prototype_override: None,
     })
 }
 
@@ -277,5 +282,24 @@ impl JsTemporal {
     #[must_use]
     pub fn ptr_eq(self, other: Self) -> bool {
         self.inner == other.inner
+    }
+
+    /// Subclass / SetPrototypeOf [[Prototype]] override, if installed.
+    #[must_use]
+    pub fn prototype_override(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.inner, |body| body.prototype_override)
+    }
+
+    /// Install a [[Prototype]] override (GetPrototypeFromConstructor
+    /// with a subclass `new.target`).
+    pub fn set_prototype_override(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        proto: crate::object::JsObject,
+    ) {
+        heap.with_payload(self.inner, |body| {
+            body.prototype_override = Some(proto);
+        });
+        heap.record_write(self.inner, &proto);
     }
 }

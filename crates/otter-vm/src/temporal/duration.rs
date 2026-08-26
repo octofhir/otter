@@ -194,6 +194,16 @@ fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 /// the same canonical string as `toString`.
 fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
+    // Brand check before any option processing (§ step 1).
+    let is_duration = receiver
+        .as_temporal(ctx.heap())
+        .is_some_and(|t| matches!(t.payload_clone(ctx.heap()), TemporalPayload::Duration(_)));
+    if !is_duration {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "toLocaleString called on a non-Temporal.Duration receiver".to_string(),
+        });
+    }
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
     crate::intl::duration_format::duration_to_locale_string(ctx, receiver, locales, options)

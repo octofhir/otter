@@ -904,8 +904,9 @@ fn validate_temporal_options(
     let Some(kind) = receiver.as_temporal(heap).map(|t| t.payload_clone(heap)) else {
         return Ok(());
     };
+    // `era` is deliberately absent: the per-type operations ignore a lone
+    // era option rather than rejecting it (it cannot form a format alone).
     let has_date = payload.weekday.is_some()
-        || payload.era.is_some()
         || payload.year.is_some()
         || payload.month.is_some()
         || payload.day.is_some()
@@ -959,7 +960,37 @@ pub(crate) fn temporal_to_locale_string(
     locales: Value,
     options: Value,
 ) -> Result<Value, NativeError> {
+    let zoned = receiver
+        .as_temporal(ctx.heap())
+        .map(|t| t.payload_clone(ctx.heap()))
+        .and_then(|payload| match payload {
+            TemporalPayload::ZonedDateTime(zdt) => Some(zdt),
+            _ => None,
+        });
+    // §Temporal.ZonedDateTime.prototype.toLocaleString — the value
+    // carries its own time zone: a `timeZone` option is a TypeError, and
+    // the formatter adopts the value's zone.
+    if zoned.is_some()
+        && let Some(bag) = options.as_object()
+        && crate::object::get(bag, ctx.heap(), "timeZone").is_some_and(|v| !v.is_undefined())
+    {
+        return Err(NativeError::TypeError {
+            name: "toLocaleString",
+            reason: "timeZone option is not allowed when formatting a Temporal.ZonedDateTime"
+                .to_string(),
+        });
+    }
     let mut payload = resolve_ctx(ctx, locales, options)?;
+    if let Some(zdt) = &zoned {
+        // The bare-date default extends to time plus the zone name for a
+        // zoned value; an explicit component/style set stands as given.
+        if wants_temporal_defaults(&payload) && payload.time_zone_name.is_none() {
+            payload.time_zone_name = Some(DtZoneName::Short);
+        }
+        if let Ok(id) = zdt.time_zone().identifier() {
+            payload.time_zone = Some(id);
+        }
+    }
     // Substitute the receiver's type-appropriate components into a
     // bare-date-default formatter — identical to the adjustment
     // `DateTimeFormat.prototype.format` applies to the same receiver, so
@@ -967,11 +998,23 @@ pub(crate) fn temporal_to_locale_string(
     // normalizes the auto-filled date default to the receiver's own
     // component set, so the check sees only user-specified mismatches.
     apply_temporal_defaults(&mut payload, &receiver, ctx.heap());
-    apply_temporal_field_intersection(&mut payload, &receiver, "toLocaleString", ctx.heap())?;
     // §the per-type `toLocaleString` operations reject a resolved option
     // the receiver's fields cannot represent (e.g. a `dateStyle` on a
-    // PlainTime, a `timeStyle` on a PlainDate) with a TypeError.
+    // PlainTime, a `timeStyle` on a PlainDate) with a TypeError — BEFORE
+    // the intersection strips the offending component.
     validate_temporal_options(&payload, &receiver, ctx.heap())?;
+    // §a calendared value formats only through its own calendar (or the
+    // ISO calendar).
+    if let Some(value_calendar) = temporal_calendar_id(&receiver, ctx.heap())
+        && value_calendar != "iso8601"
+        && payload.calendar != value_calendar
+    {
+        return Err(NativeError::RangeError {
+            name: "toLocaleString",
+            reason: "calendar of the Temporal value does not match the formatter".to_string(),
+        });
+    }
+    apply_temporal_field_intersection(&mut payload, &receiver, "toLocaleString", ctx.heap())?;
     let civil = arg_to_civil_zoned(ctx, Some(&receiver), "toLocaleString", &payload)?;
     let formatted = format_components(civil, &payload);
     Ok(Value::string(JsString::from_str(
@@ -1078,7 +1121,8 @@ fn arg_to_civil_inner(
                 zdt.minute(),
                 zdt.second(),
                 subsecond_nanos(zdt.millisecond(), zdt.microsecond(), zdt.nanosecond()),
-            )),
+            )
+            .with_epoch_millis(zdt.epoch_milliseconds())),
             // PlainTime carries no date; render against the Unix-epoch
             // reference date the same way `DateTimeFormat.format` does.
             TemporalPayload::PlainTime(pt) => Ok(Civil::new(

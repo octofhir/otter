@@ -43,10 +43,19 @@ impl BuiltinIntrinsic for Intrinsic {
             vec![global_root, temporal_value],
         )?
         .build()?;
-        let mut temporal = temporal_value
+        let temporal = temporal_value
             .as_object()
             .expect("Temporal namespace stays rooted during bootstrap");
-        object::set(&mut temporal, heap, NOW_SPEC.name, Value::object(now));
+        // §Temporal.Now is an ordinary object; the `Now` property is
+        // {writable, non-enumerable, configurable}. Its
+        // %Object.prototype% link installs in `install_well_knowns`,
+        // after the Object intrinsics exist.
+        object::define_own_property(
+            temporal,
+            heap,
+            NOW_SPEC.name,
+            crate::object::PropertyDescriptor::data(Value::object(now), true, false, true),
+        );
         Ok(())
     }
 
@@ -103,6 +112,23 @@ fn install_temporal_well_knowns(
 
     if let Some(now) = object::get(temporal, heap, "Now").and_then(|v| v.as_object()) {
         install(heap, now, "Temporal.Now")?;
+        // §Temporal.Now is an ordinary object with %Object.prototype%
+        // (the Object constructor is a native function, so its
+        // `prototype` reads through the descriptor table).
+        let object_proto = object::get(global, heap, "Object")
+            .and_then(|ctor| ctor.as_native_function())
+            .and_then(|ctor| {
+                ctor.own_property_descriptor(heap, "prototype")
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|descriptor| match descriptor.kind {
+                crate::object::DescriptorKind::Data { value } => value.as_object(),
+                crate::object::DescriptorKind::Accessor { .. } => None,
+            });
+        if let Some(object_proto) = object_proto {
+            object::set_prototype(now, heap, Some(object_proto));
+        }
     }
 
     crate::temporal::instant::InstantIntrinsic::install_well_knowns(heap, global, well_known)?;

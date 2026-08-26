@@ -925,6 +925,33 @@ impl Interpreter {
                 context, owner, fid, name,
             )?;
 
+            let prototype_in_bag = name == "prototype"
+                && self.callable_bag_read(owner, fid).is_some_and(|bag| {
+                    !matches!(
+                        crate::object::lookup_own(bag, &self.gc_heap, name),
+                        object::PropertyLookup::Absent
+                    )
+                });
+            if name == "prototype"
+                && !prototype_in_bag
+                && context.function_has_prototype_property(fid)
+            {
+                // §10.2.5 OrdinaryFunctionCreate — the implicit
+                // `prototype` slot is {writable, non-enumerable,
+                // non-configurable}. Assigning before the slot
+                // materializes must install those attributes, not the
+                // generic {enumerable, configurable} create-on-set.
+                let bag = self.function_user_bag_with_stack_roots(
+                    stack,
+                    owner,
+                    fid,
+                    &[&receiver, &value],
+                )?;
+                let desc = object::PropertyDescriptor::data(value, true, false, false);
+                crate::object::define_own_property(bag, &mut self.gc_heap, name, desc);
+                stack[top_idx].advance_pc()?;
+                return Ok(());
+            }
             if matches!(name, "name" | "length") {
                 let own = self.ordinary_function_own_property_descriptor(
                     Some(context),

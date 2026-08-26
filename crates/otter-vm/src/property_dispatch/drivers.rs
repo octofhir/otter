@@ -222,6 +222,17 @@ impl Interpreter {
                 }
                 Some(_) => return Ok(false),
                 None => {
+                    // SpiderMonkey-legacy magic `caller` / `arguments`
+                    // on a sloppy ordinary function resolves BEFORE the
+                    // %Function.prototype% poison accessors.
+                    if is_restricted_function_property(name)
+                        && let Some(value) =
+                            self.legacy_restricted_property(stack, context, receiver, name)?
+                    {
+                        write_register(&mut stack[top_idx], dst, value)?;
+                        stack[top_idx].advance_pc()?;
+                        return Ok(true);
+                    }
                     if let Some(object::PropertyDescriptor {
                         kind: object::DescriptorKind::Accessor { getter, .. },
                         ..
@@ -303,6 +314,17 @@ impl Interpreter {
                 false
             };
             if !own_present {
+                // SpiderMonkey-legacy magic `caller` / `arguments` on
+                // a sloppy ordinary function resolves BEFORE the
+                // %Function.prototype% poison accessors.
+                if is_restricted_function_property(name)
+                    && let Some(value) =
+                        self.legacy_restricted_property(stack, context, receiver, name)?
+                {
+                    write_register(&mut stack[top_idx], dst, value)?;
+                    stack[top_idx].advance_pc()?;
+                    return Ok(true);
+                }
                 let proto = self.function_prototype_object()?;
                 if let object::PropertyLookup::Accessor { getter, .. } =
                     object::lookup(proto, &self.gc_heap, name)
@@ -455,6 +477,17 @@ impl Interpreter {
                 }
                 Some(_) => return Ok(false),
                 None => {
+                    // SpiderMonkey-legacy magic `caller` / `arguments`
+                    // on a sloppy ordinary function resolves BEFORE the
+                    // %Function.prototype% poison accessors.
+                    if is_restricted_function_property(key)
+                        && let Some(value) =
+                            self.legacy_restricted_property(stack, context, receiver, key)?
+                    {
+                        write_register(&mut stack[top_idx], dst, value)?;
+                        stack[top_idx].advance_pc()?;
+                        return Ok(true);
+                    }
                     if let Some(object::PropertyDescriptor {
                         kind: object::DescriptorKind::Accessor { getter, .. },
                         ..

@@ -181,7 +181,12 @@ impl Interpreter {
             }
             return Ok(true);
         }
-        if target.is_map() || target.is_set() || target.is_generator() {
+        if target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator()
+        {
             // Only ordinary expando entries are deletable; size and the
             // iterator methods are non-own prototype properties.
             if let Some(bag) = self.collection_expando(&target) {
@@ -611,7 +616,12 @@ impl Interpreter {
                 hops + 1,
             );
         }
-        if target.is_map() || target.is_set() || target.is_generator() {
+        if target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator()
+        {
             // OrdinarySet over the lazy expando: an own writable data
             // slot stores (same receiver) or lands on the receiver; an
             // own accessor invokes its setter; an own miss continues the

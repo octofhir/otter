@@ -372,7 +372,12 @@ impl Interpreter {
                 self.define_own_property_partial(bag, k, descriptor)?
             });
         }
-        if target.is_map() || target.is_set() || target.is_generator() {
+        if target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator()
+        {
             let bag = self.collection_ensure_expando(target)?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)

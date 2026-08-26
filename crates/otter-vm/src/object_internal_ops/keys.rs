@@ -1073,6 +1073,19 @@ impl Interpreter {
             self.set_function_prototype_override(target, Some(*proto));
             return Ok(true);
         }
+        // §10.4.1 bound function exotic objects use OrdinarySetPrototypeOf;
+        // the override rides a body slot every prototype walk consults.
+        if let Some(bound) = target.as_bound_function() {
+            let current = self.get_prototype_for_op(target)?;
+            if abstract_ops::same_value(proto, &current, &self.gc_heap) {
+                return Ok(true);
+            }
+            if abstract_ops::same_value(proto, target, &self.gc_heap) {
+                return Ok(false);
+            }
+            bound.set_prototype_override(&mut self.gc_heap, *proto);
+            return Ok(true);
+        }
         Ok(true)
     }
 }

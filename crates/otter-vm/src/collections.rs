@@ -1224,6 +1224,44 @@ impl WeakCollectionKey {
 pub struct WeakMapBody {
     table: weak_table::WeakTableHandle<weak_table::MapKind>,
     prototype_override: Option<Value>,
+    /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
+    expando: Option<crate::object::JsObject>,
+}
+
+pub(crate) fn weak_map_expando(
+    map: JsWeakMap,
+    heap: &otter_gc::GcHeap,
+) -> Option<crate::object::JsObject> {
+    heap.read_payload(map, |body| body.expando)
+}
+
+pub(crate) fn weak_map_set_expando(
+    map: JsWeakMap,
+    heap: &mut otter_gc::GcHeap,
+    bag: crate::object::JsObject,
+) {
+    heap.with_payload(map, |body| {
+        body.expando = Some(bag);
+    });
+    heap.write_barrier(map, bag);
+}
+
+pub(crate) fn weak_set_expando(
+    set: JsWeakSet,
+    heap: &otter_gc::GcHeap,
+) -> Option<crate::object::JsObject> {
+    heap.read_payload(set, |body| body.expando)
+}
+
+pub(crate) fn weak_set_set_expando(
+    set: JsWeakSet,
+    heap: &mut otter_gc::GcHeap,
+    bag: crate::object::JsObject,
+) {
+    heap.with_payload(set, |body| {
+        body.expando = Some(bag);
+    });
+    heap.write_barrier(set, bag);
 }
 
 fn weak_map_ephemeron_walk(
@@ -1439,6 +1477,8 @@ pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 pub struct WeakSetBody {
     table: weak_table::WeakTableHandle<weak_table::SetKind>,
     prototype_override: Option<Value>,
+    /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
+    expando: Option<crate::object::JsObject>,
 }
 
 fn weak_set_ephemeron_walk(

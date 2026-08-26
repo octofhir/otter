@@ -77,6 +77,11 @@ pub struct BoundFunctionBody {
     pub(crate) length_property: BoundFunctionMetadataProperty,
     /// Ordinary own properties added after bind creation.
     pub(crate) own_properties: JsObject,
+    /// §10.4.1 bound [[Prototype]]: `bind` copies the target's
+    /// [[GetPrototypeOf]] result, and a later `Object.setPrototypeOf`
+    /// lands here. `None` means the %Function.prototype% default; a
+    /// stored `Value::null()` is an explicit null [[Prototype]].
+    pub(crate) prototype_override: Option<Value>,
 }
 
 fn no_extra_roots(_: &mut dyn FnMut(*mut RawGc)) {}
@@ -171,6 +176,7 @@ impl BoundFunction {
                     name_property: BoundFunctionMetadataProperty::Builtin,
                     length_property: BoundFunctionMetadataProperty::Builtin,
                     own_properties,
+                    prototype_override: None,
                 },
                 &mut visit,
             )?,
@@ -197,6 +203,21 @@ impl BoundFunction {
     #[must_use]
     pub fn identity_addr(&self) -> *const () {
         self.inner.as_header_ptr() as *const ()
+    }
+
+    /// The stored [[Prototype]] override, if any (`Value::null()` is
+    /// an explicit null [[Prototype]]).
+    #[must_use]
+    pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
+        heap.read_payload(self.inner, |body| body.prototype_override)
+    }
+
+    /// Store the [[Prototype]] override.
+    pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Value) {
+        heap.with_payload(self.inner, |body| {
+            body.prototype_override = Some(proto);
+        });
+        heap.record_write(self.inner, &proto);
     }
 
     /// Identity comparison.

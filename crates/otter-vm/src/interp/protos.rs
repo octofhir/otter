@@ -334,6 +334,11 @@ impl Interpreter {
             }
             return Ok(intrinsic_or_null(self, value));
         }
+        if let Some(bound) = value.as_bound_function()
+            && let Some(over) = bound.prototype_override(&self.gc_heap)
+        {
+            return Ok(over);
+        }
         if value.is_function()
             || value.is_closure()
             || value.is_bound_function()

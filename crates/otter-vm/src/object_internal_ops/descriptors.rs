@@ -265,7 +265,12 @@ impl Interpreter {
             }
             return Ok(None);
         }
-        if target.is_map() || target.is_set() || target.is_generator() {
+        if target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator()
+        {
             // Ordinary own properties on a Map/Set/Generator live in the
             // lazy expando; size/keys/… are prototype accessors, not own.
             if let Some(bag) = self.collection_expando(&target) {
@@ -631,6 +636,12 @@ impl Interpreter {
         if let Some(s) = value.as_set() {
             return crate::collections::set_expando(s, &self.gc_heap);
         }
+        if let Some(m) = value.as_weak_map() {
+            return crate::collections::weak_map_expando(m, &self.gc_heap);
+        }
+        if let Some(ws) = value.as_weak_set() {
+            return crate::collections::weak_set_expando(ws, &self.gc_heap);
+        }
         if let Some(g) = value.as_generator() {
             return g.expando(&self.gc_heap);
         }
@@ -649,6 +660,12 @@ impl Interpreter {
         }
         if let Some(s) = value.as_set() {
             return crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, s);
+        }
+        if let Some(m) = value.as_weak_map() {
+            return crate::property_dispatch::weak_map_ensure_expando_pub(&mut self.gc_heap, m);
+        }
+        if let Some(ws) = value.as_weak_set() {
+            return crate::property_dispatch::weak_set_ensure_expando_pub(&mut self.gc_heap, ws);
         }
         if let Some(g) = value.as_generator() {
             return crate::property_dispatch::generator_ensure_expando_pub(&mut self.gc_heap, &g);

@@ -1075,6 +1075,7 @@ function outer() {
             captured: true,
             is_const: false,
             fn_self_name: false,
+            inner: false,
         }];
         let compile = |source| {
             compile_eval_source(

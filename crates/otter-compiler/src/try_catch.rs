@@ -152,6 +152,16 @@ pub(crate) fn compile_catch_clause(
                 let storage = cx.declare_captured_binding(&pname, false, span)?;
                 cx.emit_store_storage(exc_reg, storage, span);
                 cx.mark_initialized(&pname);
+                // §B.3.5 — a direct eval below may var-declare this
+                // name without a SyntaxError; the site snapshot reads
+                // the flag off the binding.
+                if let Some(info) = cx
+                    .scopes
+                    .last_mut()
+                    .and_then(|scope| scope.bindings.get_mut(&pname))
+                {
+                    info.catch_param = true;
+                }
             }
             // §14.15 Catch — `catch (pattern) { … }` accepts a
             // BindingPattern. Destructure the exception value into

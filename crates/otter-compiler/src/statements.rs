@@ -568,16 +568,15 @@ pub(crate) fn compile_statement(
                 Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl))
                     if matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Let) =>
                 {
-                    decl.declarations
+                    let mut names: Vec<String> = Vec::new();
+                    for d in &decl.declarations {
+                        crate::hoist::collect_pattern_var_names(&d.id, &mut names);
+                    }
+                    names
                         .iter()
-                        .filter_map(|d| {
-                            let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &d.id else {
-                                return None;
-                            };
-                            match cx.lookup_binding(id.name.as_str())?.storage {
-                                crate::scope::BindingStorage::Upvalue { idx } => Some(idx),
-                                crate::scope::BindingStorage::Register { .. } => None,
-                            }
+                        .filter_map(|name| match cx.lookup_binding(name)?.storage {
+                            crate::scope::BindingStorage::Upvalue { idx } => Some(idx),
+                            crate::scope::BindingStorage::Register { .. } => None,
                         })
                         .collect()
                 }
@@ -694,6 +693,7 @@ pub(crate) fn compile_statement(
                 // (and the global own property for script bodies)
                 // with the block binding's current value.
                 if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name)
+                    && cx.annex_b_eligible_spans.contains(&f.span.start)
                     && let Some(info) = cx.lookup_binding(&name)
                     && var_storage != Some(info.storage)
                 {
@@ -701,6 +701,7 @@ pub(crate) fn compile_statement(
                     cx.emit_load_storage(tmp, info.storage, span);
                     if let Some(var_storage) = var_storage {
                         cx.emit_store_storage(tmp, var_storage, span);
+                        emit_eval_restore_binding(cx, &name, var_storage, span);
                     }
                     if global_mirror {
                         let name_idx = cx.intern_string_constant(&name);
@@ -743,11 +744,14 @@ pub(crate) fn compile_statement(
             // §B.3.2 — `if (x) function f(){}` single-statement
             // declarations sync the var-scope extension exactly like
             // block-level declarations.
-            if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name) {
+            if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name)
+                && cx.annex_b_eligible_spans.contains(&f.span.start)
+            {
                 if let Some(var_storage) = var_storage
                     && var_storage != storage
                 {
                     cx.emit_store_storage(tmp, var_storage, span);
+                    emit_eval_restore_binding(cx, &name, var_storage, span);
                 }
                 if global_mirror {
                     let name_idx = cx.intern_string_constant(&name);
@@ -1276,6 +1280,33 @@ fn emit_per_iteration_copy(cx: &mut Compiler, cells: &[u16], span: (u32, u32)) {
         cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
         cx.emit_store_storage(tmp, storage, span);
     }
+}
+
+/// §9.1.1.1.5 / §B.3.3.3 — inside a sloppy eval body, the block-level
+/// function sync writes through the variable-scope cell AND re-creates
+/// the (deletable, possibly `delete`-d) name in the caller's current
+/// eval-environment record so code outside the eval observes it again.
+fn emit_eval_restore_binding(
+    cx: &mut Compiler,
+    name: &str,
+    var_storage: crate::scope::BindingStorage,
+    span: (u32, u32),
+) {
+    if !cx.eval_var_names.contains(name) {
+        return;
+    }
+    let crate::scope::BindingStorage::Upvalue { idx } = var_storage else {
+        return;
+    };
+    let name_idx = cx.intern_string_constant(name);
+    cx.emit(
+        Op::EvalRestoreBinding,
+        [
+            Operand::ConstIndex(name_idx),
+            Operand::Imm32(i32::from(idx)),
+        ],
+        span,
+    );
 }
 
 pub(crate) fn compile_for_init_decl(

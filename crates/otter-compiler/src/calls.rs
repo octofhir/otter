@@ -571,12 +571,14 @@ pub(crate) fn compile_method_call(
             );
             let dst = cx.alloc_scratch();
             let flags = compute_eval_flags(cx);
+            let site = crate::functions::record_eval_site(cx);
             cx.emit(
                 Op::Eval,
                 [
                     Operand::Register(dst),
                     Operand::Register(src_reg),
                     Operand::Imm32(flags),
+                    Operand::Imm32(site as i32),
                 ],
                 span,
             );
@@ -885,12 +887,14 @@ pub(crate) fn emit_guarded_eval(
     );
     let to_ordinary = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_eval), span);
     // Direct-eval branch.
+    let site = crate::functions::record_eval_site(cx);
     cx.emit(
         Op::Eval,
         [
             Operand::Register(dst),
             Operand::Register(src_reg),
             Operand::Imm32(flags),
+            Operand::Imm32(site as i32),
         ],
         span,
     );

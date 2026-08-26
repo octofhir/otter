@@ -422,6 +422,7 @@ impl Writer {
         self.bool(binding.lexical);
         self.bool(binding.is_const);
         self.bool(binding.fn_self_name);
+        self.bool(binding.inner);
     }
 
     fn mapped_argument_binding(&mut self, binding: &MappedArgumentBinding) {
@@ -499,6 +500,10 @@ impl Writer {
         );
         self.string(&function.module_url);
         self.seq(&function.direct_eval_bindings, Self::direct_eval_binding);
+        self.u32(function.eval_sites.len() as u32);
+        for site in &function.eval_sites {
+            self.seq(site, Self::direct_eval_binding);
+        }
         match function.source_text_range {
             Some(range) => {
                 self.bool(true);
@@ -723,6 +728,7 @@ impl<'a> Reader<'a> {
             lexical: self.bool()?,
             is_const: self.bool()?,
             fn_self_name: self.bool()?,
+            inner: self.bool()?,
         })
     }
 
@@ -795,6 +801,11 @@ impl<'a> Reader<'a> {
         let mapped_argument_bindings = self.seq(Self::mapped_argument_binding)?;
         let module_url = self.string()?;
         let direct_eval_bindings = self.seq(Self::direct_eval_binding)?;
+        let site_count = self.u32()? as usize;
+        let mut eval_sites = Vec::with_capacity(site_count);
+        for _ in 0..site_count {
+            eval_sites.push(self.seq(Self::direct_eval_binding)?);
+        }
         let source_text_range = if self.bool()? {
             Some(self.span()?)
         } else {
@@ -834,6 +845,7 @@ impl<'a> Reader<'a> {
             mapped_argument_bindings,
             module_url,
             direct_eval_bindings,
+            eval_sites,
             contains_direct_eval,
             source_text_range,
             source_text_span,
@@ -911,7 +923,17 @@ mod tests {
                     lexical: true,
                     is_const: false,
                     fn_self_name: false,
+                    inner: false,
                 }],
+                eval_sites: vec![vec![DirectEvalBinding {
+                    captured: false,
+                    name: "z".to_string(),
+                    upvalue: 2,
+                    lexical: true,
+                    is_const: false,
+                    fn_self_name: false,
+                    inner: true,
+                }]],
                 contains_direct_eval: true,
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),

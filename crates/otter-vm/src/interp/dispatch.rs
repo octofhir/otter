@@ -1674,6 +1674,41 @@ impl Interpreter {
                     )?;
                     continue;
                 }
+                // §9.1.1.1.5 — the Annex B.3.3.3 sync re-creates a
+                // deleted sloppy-eval `var` binding in the current
+                // eval-environment record.
+                Op::EvalRestoreBinding => {
+                    let name_idx = instr.const_word(0);
+                    let uv_idx = function.imm32(instr, 1).unwrap_or(0) as usize;
+                    let name = context
+                        .string_constant_str(name_idx)
+                        .ok_or(VmError::InvalidOperand)?
+                        .to_string();
+                    let env = stack[top_idx].eval_env;
+                    if !env.is_null() {
+                        let missing =
+                            crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, &name)
+                                .is_none();
+                        if missing {
+                            let cell = stack[top_idx]
+                                .upvalues
+                                .get(uv_idx)
+                                .copied()
+                                .ok_or(VmError::InvalidOperand)?;
+                            let seq = self.next_eval_binding_seq();
+                            crate::eval_env::eval_env_insert_current(
+                                &mut self.gc_heap,
+                                env,
+                                name,
+                                cell,
+                                seq,
+                            );
+                        }
+                    }
+                    let frame = &mut stack[top_idx];
+                    frame.advance_pc()?;
+                    continue;
+                }
                 // §13.15.2 — snapshot the eval-binding sequence so the
                 // assignment target's reference resolves before the RHS.
                 Op::EvalBindingSeq => {

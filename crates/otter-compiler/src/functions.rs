@@ -224,10 +224,10 @@ pub(crate) fn compile_function_full(
     if let Some(body) = body {
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&body.statements, &mut var_names);
-        // §B.3.3.1 — parameter names (and the arguments object's
-        // implicit binding) block the sloppy block-level function
-        // var-scope extension; everything bound so far is a parameter
-        // or the function self-name.
+        // §B.3.3.1 — parameter names (and "arguments" itself) block
+        // the sloppy block-level function var-scope extension;
+        // everything bound so far is a parameter or the function
+        // self-name.
         let mut annex_blocked: std::collections::HashSet<String> = parent
             .scopes
             .iter()
@@ -297,6 +297,7 @@ pub(crate) fn compile_function_full(
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
         &mut direct_eval_meta,
+        &mut child.eval_sites,
         child.own_upvalue_count,
     );
     let mut module_mut = module.borrow_mut();
@@ -325,6 +326,7 @@ pub(crate) fn compile_function_full(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.inherited_upvalue_count = captures.len() as u16;
     slot.direct_eval_bindings = direct_eval_meta;
+    slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.contains_direct_eval = contains_direct_eval;
     slot.number_hint_sites = child.number_hint_sites;
     let class_hint_sites = child.class_hint_sites;
@@ -339,6 +341,47 @@ pub(crate) fn compile_function_full(
 /// a [`DirectEvalBinding`] table for `Op::Eval`. Called after the body
 /// is compiled (every hoisted declaration has settled) and before the
 /// function scope is exited.
+/// Record one direct-eval call site: snapshot the block-scope
+/// bindings (everything below the function scope) visible at the
+/// current compile point into the function's `eval_sites` table and
+/// return the site index for the `Op::Eval` operand. Innermost
+/// binding wins per name; simple catch parameters carry
+/// `lexical: false` (§B.3.5 exempts them from the eval-`var`
+/// collision SyntaxError).
+pub(crate) fn record_eval_site(cx: &mut Compiler) -> u32 {
+    let mut entries: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for scope in cx.scopes.iter().skip(1).rev() {
+        for (name, info) in &scope.bindings {
+            if name.starts_with("__") {
+                continue;
+            }
+            let BindingStorage::Upvalue { idx } = info.storage else {
+                continue;
+            };
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            entries.push(otter_bytecode::DirectEvalBinding {
+                captured: false,
+                name: name.clone(),
+                upvalue: idx,
+                lexical: !info.catch_param,
+                is_const: info.is_const,
+                fn_self_name: info.fn_self_name,
+                inner: true,
+            });
+        }
+    }
+    // Scope-map iteration is hash-ordered; sort for deterministic
+    // bytecode. Shadowing was already resolved by the innermost-first
+    // `seen` guard.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let site = cx.eval_sites.len() as u32;
+    cx.eval_sites.push(entries);
+    site
+}
+
 pub(crate) fn collect_direct_eval_bindings(
     cx: &Compiler,
     lexical_names: &[(String, bool)],
@@ -361,6 +404,7 @@ pub(crate) fn collect_direct_eval_bindings(
                 lexical: lexical.contains(name.as_str()),
                 is_const: info.is_const,
                 fn_self_name: info.fn_self_name,
+                inner: false,
             }),
             BindingStorage::Register { .. } => None,
         })
@@ -382,6 +426,7 @@ pub(crate) fn collect_direct_eval_bindings(
                 lexical: true,
                 is_const: false,
                 fn_self_name: false,
+                inner: false,
             });
             continue;
         }
@@ -406,6 +451,7 @@ pub(crate) fn collect_direct_eval_bindings(
             lexical: false,
             is_const,
             fn_self_name,
+            inner: false,
         });
     }
     // `bindings` is hash-ordered; sort for deterministic bytecode.
@@ -591,6 +637,7 @@ pub(crate) fn compile_arrow_function(
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
         &mut direct_eval_meta,
+        &mut child.eval_sites,
         child.own_upvalue_count,
     );
     let mut module_mut = module.borrow_mut();
@@ -608,6 +655,7 @@ pub(crate) fn compile_arrow_function(
     slot.inherited_upvalue_count = captures.len() as u16;
     slot.is_arrow = true;
     slot.direct_eval_bindings = direct_eval_meta;
+    slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.contains_direct_eval = contains_direct_eval;
     slot.number_hint_sites = child.number_hint_sites;
     let class_hint_sites = child.class_hint_sites;

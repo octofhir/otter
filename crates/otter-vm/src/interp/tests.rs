@@ -64,6 +64,7 @@ fn test_function(
         source_text_span: None,
         module_url: String::new(),
         direct_eval_bindings: Vec::new(),
+        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: code.into(),
         spans,
@@ -4686,6 +4687,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         source_text_span: None,
         module_url: String::new(),
         direct_eval_bindings: Vec::new(),
+        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![Instruction {
             pc: 0,
@@ -4758,6 +4760,7 @@ fn unwind_throw_lands_in_catch_handler() {
         source_text_span: None,
         module_url: String::new(),
         direct_eval_bindings: Vec::new(),
+        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![Instruction {
             pc: 0,
@@ -5304,6 +5307,7 @@ fn arrow_closure_overrides_call_site_this() {
         source_text_span: None,
         module_url: String::new(),
         direct_eval_bindings: Vec::new(),
+        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![Instruction {
             pc: 0,
@@ -5345,6 +5349,7 @@ fn arrow_closure_overrides_call_site_this() {
         source_text_span: None,
         module_url: String::new(),
         direct_eval_bindings: Vec::new(),
+        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![
             Instruction {

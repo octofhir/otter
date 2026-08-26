@@ -387,8 +387,14 @@ pub(crate) fn pre_declare_block_lexical_bindings(
         // TDZ either way. Holing in place made every iteration's
         // closures share one cell — all observing the last
         // iteration's value.
+        // §19.2.1.3 — a direct eval anywhere in the function reads
+        // and writes block lexicals through upvalue cells too, so a
+        // body containing one promotes every block binding
+        // (`captured_names` on the context carries the eval-driven
+        // promotion set).
+        let captured = captured_names.contains(name) || cx.captured_names.contains(name.as_str());
         if let crate::scope::BindingStorage::Upvalue { idx } =
-            cx.declare_binding_with_capture(name, *is_const, span, captured_names.contains(name))?
+            cx.declare_binding_with_capture(name, *is_const, span, captured)?
         {
             cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
         }
@@ -471,6 +477,9 @@ pub(crate) fn hoist_function_declarations_from(
                     None
                 }
             }
+            // Legacy sloppy `l: function f() {}` — the label chain is
+            // transparent for hoisting (§B.3.2 LabelledFunctionDeclaration).
+            Statement::LabeledStatement(labeled) => hoistable_function(&labeled.body),
             _ => None,
         }
     }
@@ -886,10 +895,12 @@ pub(crate) fn pre_declare_annex_b_functions(
     let mut top_lex: Vec<(String, bool)> = Vec::new();
     hoist_lexical_names(stmts, &mut top_lex);
     blocked.extend(top_lex.into_iter().map(|(name, _)| name));
-    let candidates = crate::annex_b::collect_annex_b_candidates(stmts, &blocked);
+    let (candidates, eligible_spans) =
+        crate::annex_b::collect_annex_b_candidates_spanned(stmts, &blocked);
     if candidates.is_empty() {
         return Ok(());
     }
+    cx.annex_b_eligible_spans.extend(eligible_spans);
     let global_mirror =
         cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror;
     for name in candidates {

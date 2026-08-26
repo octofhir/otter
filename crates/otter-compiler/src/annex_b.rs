@@ -36,12 +36,25 @@ pub(crate) fn collect_annex_b_candidates(
     stmts: &[Statement<'_>],
     blocked: &HashSet<String>,
 ) -> Vec<String> {
+    collect_annex_b_candidates_spanned(stmts, blocked).0
+}
+
+/// Like [`collect_annex_b_candidates`], but also returns the source
+/// span starts of every *eligible* declaration site. A later
+/// same-name declaration whose own path is blocked (a `let` in an
+/// enclosing block, for example) shares the candidate name but must
+/// not sync the var-scope binding at its source position.
+pub(crate) fn collect_annex_b_candidates_spanned(
+    stmts: &[Statement<'_>],
+    blocked: &HashSet<String>,
+) -> (Vec<String>, HashSet<u32>) {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut spans = HashSet::new();
     for stmt in stmts {
-        walk_statement(stmt, blocked, &mut out, &mut seen);
+        walk_statement(stmt, blocked, &mut out, &mut seen, &mut spans);
     }
-    out
+    (out, spans)
 }
 
 /// Names lexically declared directly inside a statement list:
@@ -125,6 +138,7 @@ fn record_function(
     blocked: &HashSet<String>,
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
+    spans: &mut HashSet<u32>,
 ) {
     // §B.3.3 applies to plain functions only — generator / async /
     // async-generator block declarations never receive the extension.
@@ -133,8 +147,11 @@ fn record_function(
     }
     if let Some(id) = &f.id {
         let name = id.name.as_str();
-        if !blocked.contains(name) && seen.insert(name.to_string()) {
-            out.push(name.to_string());
+        if !blocked.contains(name) {
+            spans.insert(f.span.start);
+            if seen.insert(name.to_string()) {
+                out.push(name.to_string());
+            }
         }
     }
 }
@@ -148,18 +165,19 @@ fn walk_block(
     blocked: &HashSet<String>,
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
+    spans: &mut HashSet<u32>,
 ) {
     let mut here_blocked = blocked.clone();
     here_blocked.extend(block_lexical_names(stmts, false));
     for stmt in stmts {
         if let Statement::FunctionDeclaration(f) = stmt {
-            record_function(f, &here_blocked, out, seen);
+            record_function(f, &here_blocked, out, seen, spans);
         }
     }
     let mut nested_blocked = here_blocked;
     nested_blocked.extend(block_lexical_names(stmts, true));
     for stmt in stmts {
-        walk_statement(stmt, &nested_blocked, out, seen);
+        walk_statement(stmt, &nested_blocked, out, seen, spans);
     }
 }
 
@@ -168,15 +186,16 @@ fn walk_statement(
     blocked: &HashSet<String>,
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
+    spans: &mut HashSet<u32>,
 ) {
     match stmt {
-        Statement::BlockStatement(b) => walk_block(&b.body, blocked, out, seen),
+        Statement::BlockStatement(b) => walk_block(&b.body, blocked, out, seen, spans),
         Statement::IfStatement(s) => {
             // §B.3.2 FunctionDeclarations in IfStatement clauses act
             // like single-statement blocks.
-            walk_branch_statement(&s.consequent, blocked, out, seen);
+            walk_branch_statement(&s.consequent, blocked, out, seen, spans);
             if let Some(alt) = &s.alternate {
-                walk_branch_statement(alt, blocked, out, seen);
+                walk_branch_statement(alt, blocked, out, seen, spans);
             }
         }
         Statement::ForStatement(s) => {
@@ -190,28 +209,28 @@ fn walk_statement(
             {
                 extend_with_declaration_names(d, &mut body_blocked);
             }
-            walk_branch_statement(&s.body, &body_blocked, out, seen);
+            walk_branch_statement(&s.body, &body_blocked, out, seen, spans);
         }
         Statement::ForInStatement(s) => {
             let mut body_blocked = blocked.clone();
             extend_with_for_head_names(&s.left, &mut body_blocked);
-            walk_branch_statement(&s.body, &body_blocked, out, seen);
+            walk_branch_statement(&s.body, &body_blocked, out, seen, spans);
         }
         Statement::ForOfStatement(s) => {
             let mut body_blocked = blocked.clone();
             extend_with_for_head_names(&s.left, &mut body_blocked);
-            walk_branch_statement(&s.body, &body_blocked, out, seen);
+            walk_branch_statement(&s.body, &body_blocked, out, seen, spans);
         }
-        Statement::WhileStatement(s) => walk_branch_statement(&s.body, blocked, out, seen),
-        Statement::DoWhileStatement(s) => walk_branch_statement(&s.body, blocked, out, seen),
-        Statement::WithStatement(s) => walk_branch_statement(&s.body, blocked, out, seen),
+        Statement::WhileStatement(s) => walk_branch_statement(&s.body, blocked, out, seen, spans),
+        Statement::DoWhileStatement(s) => walk_branch_statement(&s.body, blocked, out, seen, spans),
+        Statement::WithStatement(s) => walk_branch_statement(&s.body, blocked, out, seen, spans),
         Statement::LabeledStatement(s) => {
             // A labelled function declaration is itself a candidate
             // (legacy LabelledFunction production).
-            walk_branch_statement(&s.body, blocked, out, seen);
+            walk_branch_statement(&s.body, blocked, out, seen, spans);
         }
         Statement::TryStatement(s) => {
-            walk_block(&s.block.body, blocked, out, seen);
+            walk_block(&s.block.body, blocked, out, seen, spans);
             if let Some(handler) = &s.handler {
                 // §B.3.5 — a *simple* catch parameter does not block
                 // the extension (VariableStatements in Catch Blocks);
@@ -227,10 +246,10 @@ fn walk_statement(
                     collect_pattern_leaf_names_all(&param.pattern, &mut names);
                     catch_blocked.extend(names.into_iter().map(|(name, _)| name));
                 }
-                walk_block(&handler.body.body, &catch_blocked, out, seen);
+                walk_block(&handler.body.body, &catch_blocked, out, seen, spans);
             }
             if let Some(finalizer) = &s.finalizer {
-                walk_block(&finalizer.body, blocked, out, seen);
+                walk_block(&finalizer.body, blocked, out, seen, spans);
             }
         }
         Statement::SwitchStatement(s) => {
@@ -244,7 +263,7 @@ fn walk_statement(
             for case in &s.cases {
                 for inner in &case.consequent {
                     if let Statement::FunctionDeclaration(f) = inner {
-                        record_function(f, &here_blocked, out, seen);
+                        record_function(f, &here_blocked, out, seen, spans);
                     }
                 }
             }
@@ -252,7 +271,7 @@ fn walk_statement(
             nested_blocked.extend(all_fn_names);
             for case in &s.cases {
                 for inner in &case.consequent {
-                    walk_statement(inner, &nested_blocked, out, seen);
+                    walk_statement(inner, &nested_blocked, out, seen, spans);
                 }
             }
         }
@@ -267,12 +286,13 @@ fn walk_branch_statement(
     blocked: &HashSet<String>,
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
+    spans: &mut HashSet<u32>,
 ) {
     if let Statement::FunctionDeclaration(f) = stmt {
-        record_function(f, blocked, out, seen);
+        record_function(f, blocked, out, seen, spans);
         return;
     }
-    walk_statement(stmt, blocked, out, seen);
+    walk_statement(stmt, blocked, out, seen, spans);
 }
 
 /// Push every leaf name a lexical `VariableDeclaration` declares.

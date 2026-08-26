@@ -1353,6 +1353,13 @@ pub enum Op {
     /// resolved before the RHS even when the RHS's direct eval shadowed
     /// the name.
     StoreShadowedUpvalueCheckedSnap,
+    /// `EvalRestoreBinding name_const, upvalue_idx` — re-insert
+    /// `name → own cell[upvalue_idx]` into the frame's current
+    /// eval-environment record when the record no longer has the
+    /// name (§9.1.1.1.5 SetMutableBinding auto-creates a deleted
+    /// sloppy-eval `var` binding). Emitted by the Annex B.3.3.3
+    /// block-function sync inside a sloppy eval body.
+    EvalRestoreBinding,
     /// `DeleteShadowedUpvalue dst, name_const, upvalue_idx, eval_depth` —
     /// delete a nearer binding only within the bounded inner eval prefix. If
     /// the name still resolves to the captured declarative binding, leave it
@@ -1540,6 +1547,7 @@ impl Op {
             Op::EvalBindingSeq => "EVAL_BINDING_SEQ",
             Op::LoadShadowedUpvalueSnap => "LOAD_SHADOWED_UPVALUE_SNAP",
             Op::StoreShadowedUpvalueCheckedSnap => "STORE_SHADOWED_UPVALUE_CHECKED_SNAP",
+            Op::EvalRestoreBinding => "EVAL_RESTORE_BINDING",
             Op::DeleteShadowedUpvalue => "DELETE_SHADOWED_UPVALUE",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
@@ -1571,6 +1579,7 @@ impl Op {
             Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => 0,
             Op::EvalBindingSeq => 1,
             Op::LoadShadowedUpvalueSnap | Op::StoreShadowedUpvalueCheckedSnap => 5,
+            Op::EvalRestoreBinding => 2,
             Op::LoadUndefined
             | Op::LoadHole
             | Op::LoadNull
@@ -2077,6 +2086,14 @@ pub struct Function {
     /// frame must adopt so later code observes the bindings).
     #[serde(default)]
     pub direct_eval_bindings: Vec<DirectEvalBinding>,
+    /// Per-`Op::Eval`-site caller-environment refinements. Entry `i`
+    /// holds the block-scope bindings (all `inner: true`) visible at
+    /// the function's `i`-th direct-eval site; the site index rides
+    /// as the opcode's fourth operand. Merged over
+    /// [`Self::direct_eval_bindings`] when the runtime builds the
+    /// caller scope, innermost binding winning per name.
+    #[serde(default)]
+    pub eval_sites: Vec<Vec<DirectEvalBinding>>,
     /// `true` when this function body (including class field
     /// initializers compiled into a constructor) contains a direct
     /// eval call site. `Op::Eval` uses it as the §19.2.1.1
@@ -2191,6 +2208,14 @@ pub struct DirectEvalBinding {
     /// mode (§9.1.1.1.5 SetMutableBinding, immutable binding).
     #[serde(default)]
     pub fn_self_name: bool,
+    /// `true` for a binding declared in a block (or catch clause)
+    /// lexically BETWEEN the caller's variable environment and the
+    /// eval call site. Inner bindings shadow both the function-scope
+    /// baseline and any eval-environment record for name resolution,
+    /// and an eval-body `var` of the same name never re-binds them
+    /// (the var lands in the variable environment underneath).
+    #[serde(default)]
+    pub inner: bool,
 }
 
 /// One argument index aliased to one formal parameter binding.

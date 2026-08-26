@@ -369,6 +369,7 @@ mod tests {
                 source_text_span: None,
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
+                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: Vec::<Instruction>::new().into(),
                 spans: Vec::<SpanEntry>::new(),

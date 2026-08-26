@@ -1014,6 +1014,7 @@ opcode_schema! {
     (Op::EvalBindingSeq, 0xB6),
     (Op::LoadShadowedUpvalueSnap, 0xB7),
     (Op::StoreShadowedUpvalueCheckedSnap, 0xB8),
+    (Op::EvalRestoreBinding, 0xB9),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1187,6 +1188,7 @@ const WRITE_READ_WRITE: &[OperandSpec] = &[W, R, W];
 const WRITE_READ_READ_READ: &[OperandSpec] = &[W, R, R, R];
 const WRITE_FOUR_READS: &[OperandSpec] = &[W, R, R, R, R];
 const WRITE_READ_IMM: &[OperandSpec] = &[W, R, IMM];
+const WRITE_READ_IMM_IMM: &[OperandSpec] = &[W, R, IMM, IMM];
 const CONST_READ_IMM: &[OperandSpec] = &[CONST, R, IMM];
 const CONST_IMM: &[OperandSpec] = &[CONST, IMM];
 const READ_CONST_IMM: &[OperandSpec] = &[R, CONST, IMM];
@@ -1275,6 +1277,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::EvalBindingSeq => OperandShape::Fixed(WRITE),
         Op::LoadShadowedUpvalueSnap => OperandShape::Fixed(&[W, CONST, IMM, IMM, R]),
         Op::StoreShadowedUpvalueCheckedSnap => OperandShape::Fixed(&[R, CONST, IMM, IMM, R]),
+        Op::EvalRestoreBinding => OperandShape::Fixed(CONST_IMM),
         Op::JumpViaFinally => OperandShape::Fixed(JUMP_VIA_FINALLY),
         Op::PopParkedFinally => OperandShape::Fixed(&[IMM]),
         Op::QueueMicrotask => OperandShape::Variadic {
@@ -1330,7 +1333,8 @@ const fn operand_shape(op: Op) -> OperandShape {
         }
         Op::MakeClass => OperandShape::Fixed(WRITE_FOUR_READS),
         Op::CollectRest | Op::CollectArguments => OperandShape::Fixed(WRITE),
-        Op::Eval | Op::Increment => OperandShape::Fixed(WRITE_READ_IMM),
+        Op::Increment => OperandShape::Fixed(WRITE_READ_IMM),
+        Op::Eval => OperandShape::Fixed(WRITE_READ_IMM_IMM),
         Op::DefineGlobalVar => OperandShape::Fixed(CONST_READ),
         Op::NewCollection | Op::NewBuiltinError => OperandShape::Fixed(&[W, CONST, R]),
         Op::ToPrimitive => OperandShape::Fixed(WRITE_READ_CONST),

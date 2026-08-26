@@ -158,6 +158,7 @@ pub(crate) struct EvalOperands {
     pub(crate) dst: u16,
     pub(crate) src: u16,
     pub(crate) flags: i32,
+    pub(crate) site: i32,
 }
 
 /// Schema-derived boxed-value inputs and normal result of one binding access.
@@ -865,6 +866,7 @@ impl BaselinePlan {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                     flags: imm32(operands, 2)?,
+                    site: imm32(operands, 3)?,
                 }),
                 Op::LoadElement => LoweredOperands::ElementLoad(ElementLoadOperands {
                     dst: reg(operands, 0)?,

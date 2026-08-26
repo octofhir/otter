@@ -941,6 +941,7 @@ mod tests {
         Op::GetTemplateObject,
         Op::StoreShadowedUpvalueChecked,
         Op::StoreShadowedUpvalueCheckedSnap,
+        Op::EvalRestoreBinding,
         Op::DeleteShadowedUpvalue,
         Op::EvalBindingSeq,
     ];

@@ -629,7 +629,7 @@ pub(crate) extern "C" fn jit_class_value_op_stub(
         }
         let result = ctx
             .runtime_call()
-            .and_then(|mut call| call.eval_op(arg0, arg1));
+            .and_then(|mut call| call.eval_op(arg0, arg1, arg2));
         return match result {
             Ok(()) => NativeResultStatus::Success as u64,
             Err(err) => {

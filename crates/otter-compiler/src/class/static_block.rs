@@ -72,6 +72,7 @@ pub(crate) fn compile_static_block(
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
         &mut no_eval_meta,
+        &mut child.eval_sites,
         child.own_upvalue_count,
     );
     let mut module_mut = module.borrow_mut();
@@ -85,6 +86,7 @@ pub(crate) fn compile_static_block(
     // without it the eval body runs on the script path and loses the
     // synthesized frame's `this` (= the class).
     slot.contains_direct_eval = child.contains_direct_eval;
+    slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.inherited_upvalue_count = captures.len() as u16;
@@ -153,6 +155,7 @@ pub(crate) fn compile_static_field_initializer(
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
         &mut no_eval_meta,
+        &mut child.eval_sites,
         child.own_upvalue_count,
     );
     let mut module_mut = module.borrow_mut();
@@ -166,6 +169,7 @@ pub(crate) fn compile_static_field_initializer(
     // without it the eval body runs on the script path and loses the
     // synthesized frame's `this` (= the class).
     slot.contains_direct_eval = child.contains_direct_eval;
+    slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.inherited_upvalue_count = captures.len() as u16;

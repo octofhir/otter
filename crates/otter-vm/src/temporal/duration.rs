@@ -192,8 +192,11 @@ fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 /// §sec-temporal.duration.prototype.tolocalestring — brand-checks the
 /// receiver, then (absent the Intl `DurationFormat` data path) renders
 /// the same canonical string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let receiver = *ctx.this_value();
+    let locales = args.first().copied().unwrap_or_else(Value::undefined);
+    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+    crate::intl::duration_format::duration_to_locale_string(ctx, receiver, locales, options)
 }
 
 fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

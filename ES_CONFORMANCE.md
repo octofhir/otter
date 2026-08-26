@@ -1,40 +1,40 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `fa635b37dc20a4e5b233580f4e0914dc305536dc`
+- **Engine commit:** `1099912efd8aa9972d3b7aa4ed6cde07abf5e0bf`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-26T19:36:53.599577+00:00
+- **Captured:** 2026-08-26T21:36:43.655477+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 52234 |
-| failed     | 125 |
+| passed     | 52248 |
+| failed     | 111 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.76%
+**Pass rate (excl. skipped):** 99.79%
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
-| staging/sm/Array | 90 | 81 | 9 | 90.0% |
 | annexB/language/expressions | 26 | 19 | 7 | 73.1% |
-| staging/sm/Function | 53 | 46 | 7 | 86.8% |
 | staging/sm/RegExp | 91 | 84 | 7 | 92.3% |
 | staging/sm/TypedArray | 96 | 89 | 7 | 92.7% |
 | language/eval-code/direct | 286 | 280 | 6 | 97.9% |
-| staging/sm/Proxy | 24 | 18 | 6 | 75.0% |
 | staging/sm/regress | 106 | 100 | 6 | 94.3% |
+| staging/sm/Array | 90 | 85 | 5 | 94.4% |
 | staging/sm/expressions | 42 | 37 | 5 | 88.1% |
+| staging/sm/Function | 53 | 49 | 4 | 92.5% |
 | staging/sm/PrivateName | 17 | 13 | 4 | 76.5% |
 | staging/sm/extensions | 64 | 60 | 4 | 93.8% |
 | staging/sm/strict | 51 | 47 | 4 | 92.2% |
+| staging/sm/Proxy | 24 | 21 | 3 | 87.5% |
 | staging/sm/Reflect | 17 | 14 | 3 | 82.4% |
 | staging/sm/eval | 20 | 17 | 3 | 85.0% |
 | staging/sm/fields | 8 | 5 | 3 | 62.5% |
@@ -45,12 +45,8 @@
 | staging/sm/syntax | 11 | 9 | 2 | 81.8% |
 | intl402/Array/prototype | 2 | 1 | 1 | 50.0% |
 | intl402/BigInt/prototype | 11 | 10 | 1 | 90.9% |
-| intl402/DateTimeFormat/intl-legacy-constructed-symbol-on-unwrap.js | 1 | 0 | 1 | 0.0% |
-| intl402/DateTimeFormat/intl-legacy-constructed-symbol.js | 1 | 0 | 1 | 0.0% |
 | intl402/FallbackSymbol/per-realm.js | 1 | 0 | 1 | 0.0% |
 | intl402/Locale/constructor-non-iana-canon.js | 1 | 0 | 1 | 0.0% |
-| intl402/NumberFormat/intl-legacy-constructed-symbol-on-unwrap.js | 1 | 0 | 1 | 0.0% |
-| intl402/NumberFormat/intl-legacy-constructed-symbol.js | 1 | 0 | 1 | 0.0% |
 | intl402/constructors-string-and-single-element-array.js | 1 | 0 | 1 | 0.0% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
 | language/expressions/tagged-template | 27 | 25 | 1 | 96.2% |
@@ -72,6 +68,10 @@
 | annexB/built-ins/Function | 6 | 6 | 0 | 100.0% |
 | annexB/built-ins/Object | 1 | 1 | 0 | 100.0% |
 | annexB/built-ins/RegExp | 62 | 55 | 0 | 100.0% |
+| annexB/built-ins/String | 111 | 111 | 0 | 100.0% |
+| annexB/built-ins/TypedArrayConstructors | 1 | 1 | 0 | 100.0% |
+| annexB/built-ins/escape | 16 | 16 | 0 | 100.0% |
+| annexB/built-ins/unescape | 19 | 19 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -95,13 +95,9 @@
 | fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-in-prefix-update.js` |
 | fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression.js` |
 | fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/cover-callexpression-and-asyncarrowhead.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/Array/for_of_2.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/Array/for_of_3.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/Array/for_of_4.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from-iterator-close.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from_proxy.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from_realms.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/join-01.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/species.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertio… | `staging/sm/Array/to-length.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/ArrayBuffer/slice-species.js` |
@@ -110,9 +106,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Date/non-iso.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Error/AggregateError.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/arguments-parameter-shadowing.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/bound-length-and-name.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/configurable-length.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/constructor-binding.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Incorrec… | `staging/sm/Function/function-toString-builtin-name.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/invalid-parameter-list.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `staging/sm/Function/strict-arguments.js` |
@@ -122,12 +115,9 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Private met… | `staging/sm/PrivateName/modify-non-extensible.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/PrivateName/names.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/PrivateName/not-iterable.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertio… | `staging/sm/Proxy/getPrototypeOf.js` |
 | fail | strict: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: barewo… | `staging/sm/Proxy/global-receiver.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Proxy/regress-bug950407.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Object.getP… | `staging/sm/Proxy/revoke-as-side-effect.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Proxy/revoked-get-function-realm-typeerror.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Proxy/setPrototypeOf.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: q is n… | `staging/sm/Reflect/apply.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Reflect/construct.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Reflect/set.js` |
@@ -177,4 +167,14 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/regress/regress-634210-4.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/regress/regress-636364.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/regress/regress-665355.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/statements/regress-642975.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/strict/15.3.5.2.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/strict/15.5.5.1.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/strict/8.12.7-2.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: wrong er… | `staging/sm/strict/directive-prologue-01.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/syntax/let-as-label.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/syntax/yield-as-identifier.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `intl402/BigInt/prototype/toLocaleString/de-DE.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `intl402/DateTimeFormat/prototype/formatRange/en-US.js` |
 

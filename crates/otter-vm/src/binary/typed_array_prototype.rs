@@ -581,7 +581,7 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     join_into_string(&t, len, ",", ctx.heap_mut())
 }
 
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // §23.2.3.32 — join each element's `Invoke(element,
     // "toLocaleString")` (not a raw numeric render) with "," so a
     // user-overridden `Number.prototype.toLocaleString` runs and its
@@ -604,7 +604,9 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
         if !ctx.cx.interp.is_callable_runtime(&method) {
             return Err(type_error("element toLocaleString is not callable"));
         }
-        let rendered = ctx.call(method, element, &[])?;
+        // ECMA-402 §18.5.1 — forward the locales and options arguments.
+        let forwarded: Vec<Value> = args.iter().take(2).copied().collect();
+        let rendered = ctx.call(method, element, &forwarded)?;
         let s = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &rendered)
                 .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))

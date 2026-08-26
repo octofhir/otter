@@ -177,7 +177,11 @@ pub fn require_options_object(options: Value, class: &'static str) -> Result<Val
 /// boxes to a wrapper with no relevant own properties, modelled as an
 /// absent bag. Used by `Intl.NumberFormat`, which coerces rather than
 /// rejects primitive options.
-pub fn coerce_options_object(options: Value, class: &'static str) -> Result<Value, NativeError> {
+pub fn coerce_options_object(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    class: &'static str,
+) -> Result<Value, NativeError> {
     if options.is_undefined() {
         return Ok(Value::undefined());
     }
@@ -190,27 +194,26 @@ pub fn coerce_options_object(options: Value, class: &'static str) -> Result<Valu
     if options.is_object_type() || options.as_array().is_some() {
         return Ok(options);
     }
-    Ok(Value::undefined())
+    // ToObject boxes the primitive; the wrapper has no relevant own
+    // properties, but option reads still consult %Object.prototype%, so
+    // an empty ordinary object stands in for it.
+    let bag = ctx.alloc_object().map_err(|_| NativeError::TypeError {
+        name: class,
+        reason: "out of memory".to_string(),
+    })?;
+    Ok(Value::object(bag))
 }
 
 /// `ToObject(options)` per §ToDateTimeOptions step 1 — `undefined` stays
 /// an absent bag, `null` (and nothing else) throws TypeError, an object
 /// passes through, and any other primitive boxes to a wrapper with no
 /// relevant own properties, modelled as an absent bag.
-pub fn to_object_options(options: Value, class: &'static str) -> Result<Value, NativeError> {
-    if options.is_undefined() {
-        return Ok(Value::undefined());
-    }
-    if options.is_null() {
-        return Err(NativeError::TypeError {
-            name: class,
-            reason: "options cannot be null".to_string(),
-        });
-    }
-    if options.is_object_type() || options.as_array().is_some() {
-        return Ok(options);
-    }
-    Ok(Value::undefined())
+pub fn to_object_options(
+    ctx: &mut NativeCtx<'_>,
+    options: Value,
+    class: &'static str,
+) -> Result<Value, NativeError> {
+    coerce_options_object(ctx, options, class)
 }
 
 /// `[[Get]]` on the options bag (firing a getter), treating an absent

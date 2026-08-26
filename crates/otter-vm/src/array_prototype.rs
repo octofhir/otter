@@ -1308,7 +1308,7 @@ impl Interpreter {
                 self.array_join(stack, context, receiver, separator_arg, roots)
             }
             T::ToString => self.array_to_string(stack, context, receiver, roots),
-            T::ToLocaleString => self.array_to_locale_string(stack, context, receiver, roots),
+            T::ToLocaleString => self.array_to_locale_string(stack, context, receiver, args, roots),
             T::Concat => self.array_concat(stack, context, receiver, args, roots),
             T::Sort => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
@@ -1952,6 +1952,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
+        args: &[Value],
         roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         // step 1 — array = ? ToObject(this value).
@@ -2001,8 +2002,11 @@ impl Interpreter {
                     self.err_type(("element's toLocaleString is not callable".to_string()).into())
                 );
             }
+            // ECMA-402 §18.5.1 — the locales and options arguments are
+            // forwarded to each element's toLocaleString.
+            let forwarded: SmallVec<[Value; 8]> = args.iter().take(2).copied().collect();
             let result =
-                self.run_callable_sync_rooted(stack, context, &method, element, SmallVec::new())?;
+                self.run_callable_sync_rooted(stack, context, &method, element, forwarded)?;
             let s = self.coerce_to_string(stack, context, &result)?;
             r.push_str(&s);
         }

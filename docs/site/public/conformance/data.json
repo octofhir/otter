@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "7bded8902e1dec3bdb4db7f04cb6d3835dc56328",
-  "ran_at": "2026-08-26T03:14:23.888449+00:00",
+  "engine_commit": "fa635b37dc20a4e5b233580f4e0914dc305536dc",
+  "ran_at": "2026-08-26T19:36:53.599577+00:00",
   "totals": {
     "total": 53459,
-    "passed": 52066,
-    "failed": 293,
+    "passed": 52234,
+    "failed": 125,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -122,8 +122,8 @@
     },
     "annexB/language/function-code": {
       "total": 159,
-      "passed": 158,
-      "failed": 1,
+      "passed": 159,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16628,8 +16628,8 @@
     },
     "built-ins/Temporal/Duration": {
       "total": 540,
-      "passed": 512,
-      "failed": 28,
+      "passed": 540,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16637,8 +16637,8 @@
     },
     "built-ins/Temporal/Instant": {
       "total": 465,
-      "passed": 459,
-      "failed": 6,
+      "passed": 465,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16646,8 +16646,8 @@
     },
     "built-ins/Temporal/Now": {
       "total": 66,
-      "passed": 63,
-      "failed": 3,
+      "passed": 66,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16655,8 +16655,8 @@
     },
     "built-ins/Temporal/PlainDate": {
       "total": 652,
-      "passed": 649,
-      "failed": 3,
+      "passed": 652,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16664,8 +16664,8 @@
     },
     "built-ins/Temporal/PlainDateTime": {
       "total": 773,
-      "passed": 767,
-      "failed": 6,
+      "passed": 773,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16673,8 +16673,8 @@
     },
     "built-ins/Temporal/PlainMonthDay": {
       "total": 199,
-      "passed": 194,
-      "failed": 5,
+      "passed": 199,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16682,8 +16682,8 @@
     },
     "built-ins/Temporal/PlainTime": {
       "total": 493,
-      "passed": 487,
-      "failed": 6,
+      "passed": 493,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16691,8 +16691,8 @@
     },
     "built-ins/Temporal/PlainYearMonth": {
       "total": 509,
-      "passed": 504,
-      "failed": 5,
+      "passed": 509,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16700,8 +16700,8 @@
     },
     "built-ins/Temporal/ZonedDateTime": {
       "total": 901,
-      "passed": 871,
-      "failed": 30,
+      "passed": 901,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16718,8 +16718,8 @@
     },
     "built-ins/Temporal/keys.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16736,8 +16736,8 @@
     },
     "built-ins/Temporal/toStringTag": {
       "total": 2,
-      "passed": 1,
-      "failed": 1,
+      "passed": 2,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23792,8 +23792,8 @@
     },
     "intl402/Temporal/Instant": {
       "total": 17,
-      "passed": 16,
-      "failed": 1,
+      "passed": 17,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23810,8 +23810,8 @@
     },
     "intl402/Temporal/PlainDate": {
       "total": 493,
-      "passed": 492,
-      "failed": 1,
+      "passed": 493,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23819,8 +23819,8 @@
     },
     "intl402/Temporal/PlainDateTime": {
       "total": 483,
-      "passed": 481,
-      "failed": 2,
+      "passed": 483,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23828,8 +23828,8 @@
     },
     "intl402/Temporal/PlainMonthDay": {
       "total": 90,
-      "passed": 87,
-      "failed": 3,
+      "passed": 90,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23837,8 +23837,8 @@
     },
     "intl402/Temporal/PlainTime": {
       "total": 12,
-      "passed": 11,
-      "failed": 1,
+      "passed": 12,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23846,8 +23846,8 @@
     },
     "intl402/Temporal/PlainYearMonth": {
       "total": 327,
-      "passed": 325,
-      "failed": 2,
+      "passed": 327,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23855,8 +23855,8 @@
     },
     "intl402/Temporal/ZonedDateTime": {
       "total": 583,
-      "passed": 572,
-      "failed": 11,
+      "passed": 583,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -27797,8 +27797,8 @@
     },
     "language/eval-code/direct": {
       "total": 286,
-      "passed": 279,
-      "failed": 7,
+      "passed": 280,
+      "failed": 6,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39929,8 +39929,8 @@
     },
     "staging/sm/Date": {
       "total": 28,
-      "passed": 19,
-      "failed": 9,
+      "passed": 27,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39956,8 +39956,8 @@
     },
     "staging/sm/Function": {
       "total": 53,
-      "passed": 45,
-      "failed": 8,
+      "passed": 46,
+      "failed": 7,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40046,8 +40046,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 80,
-      "failed": 11,
+      "passed": 84,
+      "failed": 7,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40118,8 +40118,8 @@
     },
     "staging/sm/class": {
       "total": 94,
-      "passed": 80,
-      "failed": 14,
+      "passed": 92,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40145,8 +40145,8 @@
     },
     "staging/sm/expressions": {
       "total": 42,
-      "passed": 34,
-      "failed": 8,
+      "passed": 37,
+      "failed": 5,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40154,8 +40154,8 @@
     },
     "staging/sm/extensions": {
       "total": 64,
-      "passed": 55,
-      "failed": 9,
+      "passed": 60,
+      "failed": 4,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40163,8 +40163,8 @@
     },
     "staging/sm/fields": {
       "total": 8,
-      "passed": 4,
-      "failed": 4,
+      "passed": 5,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40190,8 +40190,8 @@
     },
     "staging/sm/lexical-environment": {
       "total": 34,
-      "passed": 25,
-      "failed": 9,
+      "passed": 33,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40235,8 +40235,8 @@
     },
     "staging/sm/regress": {
       "total": 106,
-      "passed": 91,
-      "failed": 15,
+      "passed": 100,
+      "failed": 6,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40308,570 +40308,6 @@
   },
   "failing_tests": [
     {
-      "path": "built-ins/Temporal/Duration/compare/order-of-operations.js",
-      "esid": "sec-temporal.duration.compare",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Duration: relativeTo must be a date, date-time, zoned-date-time, string, or object"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/compare/relativeto-propertybag-infinity-throws-rangeerror.js",
-      "esid": "sec-temporal.duration.compare",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour property cannot be Infinity in relativeTo Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/from/argument-duration-precision-exact-numerical-values.js",
-      "esid": "sec-temporal.duration.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: case where floating point inaccuracy brings total below limit, positive Expected SameValue(«\"PT4512822999407351.799807S\"», «\"PT9007199254740991.975424S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/max.js",
-      "esid": "sec-temporal.duration",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: years result: Expected SameValue(«-1», «4294967295») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/add/argument-duration-precision-exact-numerical-values.js",
-      "esid": "sec-temporal.duration.prototype.add",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: case where floating point inaccuracy brings total below limit, positive: ℝ(𝔽(x)) operation after balancing brings total over limit Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/add/float64-representable-integer.js",
-      "esid": "sec-temporal.duration.prototype.add",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"PT18014398509.481981S\"», «\"PT18014398509.48198S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/add/precision-no-floating-point-loss.js",
-      "esid": "sec-temporal.duration.prototype.add",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration1.add(duration2): days result: Expected SameValue(«1170776270», «104249991374») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/add/result-out-of-range-1.js",
-      "esid": "sec-temporal.duration.prototype.add",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/add/result-out-of-range-3.js",
-      "esid": "sec-temporal.duration.prototype.add",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/calendar-possibly-required.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: rounding a year Duration fails without largest/smallest unit Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/float64-representable-integer.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"PT18014398509.481981S\"», «\"PT18014398509.48198S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/order-of-operations.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Duration: relativeTo must be a date, date-time, zoned-date-time, string, or object"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/precision-exact-in-balance-time-duration.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: BalanceTimeDuration should implement floating-point calculation correctly for largestUnit milliseconds: milliseconds result: Expected SameValue(«-1130026623», «8692288669465520000») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/relativeto-infinity-throws-rangeerror.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour property cannot be Infinity in relativeTo Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/relativeto-largestunit-smallestunit-combinations.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Combination of largestUnit milliseconds and smallestUnit milliseconds, relative to 2000-01-01: milliseconds result: Expected SameValue(«-1720154131», «174373505005») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/throws-if-neither-largestUnit-nor-smallestUnit-is-given.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/round/total-duration-nanoseconds-too-large-with-zoned-datetime.js",
-      "esid": "sec-temporal.duration.prototype.round",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/subtract/argument-duration-precision-exact-numerical-values.js",
-      "esid": "sec-temporal.duration.prototype.subtract",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: case where floating point inaccuracy brings total below limit, positive: ℝ(𝔽(x)) operation after balancing brings total over limit Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/subtract/float64-representable-integer.js",
-      "esid": "sec-temporal.duration.prototype.subtract",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"PT18014398509.481981S\"», «\"PT18014398509.48198S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/subtract/precision-no-floating-point-loss.js",
-      "esid": "sec-temporal.duration.prototype.subtract",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: duration1.subtract(duration2): days result: Expected SameValue(«1170776270», «104249991374») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/subtract/result-out-of-range-1.js",
-      "esid": "sec-temporal.duration.prototype.subtract",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: subtracting the negation of a large duration from the duration is out of bounds: PT9223372036854.775807S Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/subtract/result-out-of-range-3.js",
-      "esid": "sec-temporal.duration.prototype.subtract",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/total/order-of-operations.js",
-      "esid": "sec-temporal.duration.prototype.total",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.Duration: relativeTo must be a date, date-time, zoned-date-time, string, or object"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/total/relativeto-infinity-throws-rangeerror.js",
-      "esid": "sec-temporal.duration.prototype.total",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour property cannot be Infinity in relativeTo Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/total/throws-if-unit-property-missing.js",
-      "esid": "sec-temporal.duration.prototype.total",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/with/argument-invalid-property.js",
-      "esid": "sec-temporal.duration.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Throws TypeError if no property is present Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/prototype/with/argument-singular-properties.js",
-      "esid": "sec-temporal.duration.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Throw TypeError if temporalDurationLike is not valid Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/Duration/subclass.js",
-      "esid": "sec-temporal.duration",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomDuration Expected SameValue(«[object Temporal.Duration]», «[object Temporal.Duration]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Instant/prototype/add/minimum-maximum-instant.js",
-      "esid": "sec-temporal.instant.prototype.add",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Minimum to maximum instant by adding nanoseconds Expected SameValue(«-8630776627963145224193n», «8640000000000000000000n») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Instant/prototype/since/float64-representable-integer.js",
-      "esid": "sec-temporal.instant.prototype.since",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration.p.toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"-PT18446744073.709551616S\"», «\"-PT18446744073.709552616S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Instant/prototype/since/largestunit.js",
-      "esid": "sec-temporal.instant.prototype.since",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: does not include higher units than necessary (largest unit is milliseconds): milliseconds result: Expected SameValue(«-1285518553», «1111111011111») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Instant/prototype/subtract/minimum-maximum-instant.js",
-      "esid": "sec-temporal.instant.prototype.subtract",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«-8630776627963145224192n», «8640000000000000000000n») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Instant/prototype/until/float64-representable-integer.js",
-      "esid": "sec-temporal.instant.prototype.until",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration.p.toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"PT18446744073.709551616S\"», «\"PT18446744073.709552616S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Instant/subclass.js",
-      "esid": "sec-temporal.instant",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomInstant Expected SameValue(«[object Temporal.Instant]», «[object Temporal.Instant]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Now/builtin.js",
-      "esid": "sec-temporal.now",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: prototype Expected SameValue(«null», «[object Object]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/Now/prop-desc.js",
-      "esid": "sec-temporal.now",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Now descriptor should not be enumerable"
-    },
-    {
-      "path": "built-ins/Temporal/Now/toStringTag/string.js",
-      "esid": "sec-temporal-now-@@tostringtag",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: OrdinaryToPrimitive could not convert object to primitive"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/prototype/with/options-wrong-type.js",
-      "esid": "sec-temporal.plaindate.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial date processed before throwing TypeError Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/prototype/with/order-of-operations.js",
-      "esid": "sec-temporal.plaindate.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get fields.calendar, get fields.timeZone, get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf] should have the same contents. argument fields are read before TypeError is thrown for primitive options"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDate/subclass.js",
-      "esid": "sec-temporal.plaindate",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDate Expected SameValue(«[object Temporal.PlainDate]», «[object Temporal.PlainDate]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/since/float64-representable-integer.js",
-      "esid": "sec-temporal.plaindatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration.p.toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"-PT18446744073.709551616S\"», «\"-PT18446744073.709552616S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/until/float64-representable-integer.js",
-      "esid": "sec-temporal.plaindatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration.p.toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"PT18446744073.709551616S\"», «\"PT18446744073.709552616S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/until/units-changed.js",
-      "esid": "sec-temporal.plaindatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: can return lower or higher units (milliseconds): milliseconds result: Expected SameValue(«1557628928», «31622400000») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/with/options-wrong-type.js",
-      "esid": "sec-temporal.plaindatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial datetime processed before throwing TypeError Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/prototype/with/order-of-operations.js",
-      "esid": "sec-temporal.plaindatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get fields.calendar, get fields.timeZone, get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get fields.year, get fields.year.valueOf, call fields.year.valueOf] should have the same contents. argument fields are read before TypeError is thrown for primitive options"
-    },
-    {
-      "path": "built-ins/Temporal/PlainDateTime/subclass.js",
-      "esid": "sec-temporal.plaindatetime",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainDateTime Expected SameValue(«[object Temporal.PlainDateTime]», «[object Temporal.PlainDateTime]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/from/fields-object.js",
-      "esid": "sec-temporal.plainmonthday.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainMonthDay: argument must be a Temporal.PlainMonthDay"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/prototype/toPlainDate/order-of-operations.js",
-      "esid": "sec-temporal.plainmonthday.toplaindate",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf] and expected [get fields.year, get fields.year.valueOf, call fields.year.valueOf] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/prototype/with/options-wrong-type.js",
-      "esid": "sec-temporal.plainmonthday.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial date processed before throwing TypeError Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/prototype/with/order-of-operations.js",
-      "esid": "sec-temporal.plainmonthday.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get fields.calendar, get fields.timeZone, get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf] should have the same contents. argument fields are read before TypeError is thrown for primitive options"
-    },
-    {
-      "path": "built-ins/Temporal/PlainMonthDay/subclass.js",
-      "esid": "sec-temporal.plainmonthday",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainMonthDay Expected SameValue(«[object Temporal.PlainMonthDay]», «[object Temporal.PlainMonthDay]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/compare/exhaustive.js",
-      "esid": "sec-temporal.plaintime.compare",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: millisecond < Expected SameValue(«1», «-1») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/from/order-of-operations.js",
-      "esid": "sec-temporal.plaintime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.overflow, get options.overflow.toString, call options.overflow.toString, get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf] and expected [get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get options.overflow, get options.overflow.toString, call options.overflow.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/prototype/with/order-of-operations.js",
-      "esid": "sec-temporal.plaintime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get options.overflow, get options.overflow.toString, call options.overflow.toString] and expected [get fields.calendar, get fields.timeZone, get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get options.overflow, get options.overflow.toString, call options.overflow.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/prototype/with/plaintimelike-invalid.js",
-      "esid": "sec-temporal.plaintime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/prototype/with/throws-if-time-is-invalid-when-overflow-is-reject.js",
-      "esid": "sec-temporal.plaintime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: temporalTimeLike = {\"hour\":-1} Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/PlainTime/subclass.js",
-      "esid": "sec-temporal.plaintime",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainTime Expected SameValue(«[object Temporal.PlainTime]», «[object Temporal.PlainTime]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/from/argument-plaindate.js",
-      "esid": "sec-temporal.plainyearmonth.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.PlainYearMonth: argument must be a Temporal.PlainYearMonth"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/toPlainDate/order-of-operations.js",
-      "esid": "sec-temporal.plainyearmonth.toplaindate",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf] and expected [get fields.day, get fields.day.valueOf, call fields.day.valueOf] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/with/options-wrong-type.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial date processed before throwing TypeError Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/prototype/with/order-of-operations.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [get fields.calendar, get fields.timeZone, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf] should have the same contents. argument fields are read before TypeError is thrown for primitive options"
-    },
-    {
-      "path": "built-ins/Temporal/PlainYearMonth/subclass.js",
-      "esid": "sec-temporal.plainyearmonth",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomPlainYearMonth Expected SameValue(«[object Temporal.PlainYearMonth]», «[object Temporal.PlainYearMonth]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/argument-convert.js",
-      "esid": "sec-temporal.zoneddatetime",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.ZonedDateTime: epochNanoseconds must be a BigInt"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/compare/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.compare",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get one.calendar, get one.day, get one.day.valueOf, call one.day.valueOf, get one.month, get one.month.valueOf, call one.month.valueOf, get one.monthCode, get one.monthCode.toString, call one.monthCode.toString, get one.year, get one.year.valueOf, call one.year.valueOf, get one.offset, get one.offset.toString, call one.offset.toString, get one.timeZone, get one.hour, get one.hour.valueOf, call one.hour.valueOf, get one.microsecond, get one.microsecond.valueOf, call one.microsecond.valueOf, get one.millisecond, get one.millisecond.valueOf, call one.millisecond.valueOf, get one.minute, get one.minute.valueOf, call one.minute.valueOf, get one.nanosecond, get one.nanosecond.valueOf, call one.nanosecond.valueOf, get one.second, get one.second.valueOf, call one.second.valueOf, get two.calendar, get two.day, get two.day.valueOf, call two.day.valueOf, get two.month, get two.month.valueOf, call two.month.valueOf, get two.monthCode, get two.monthCode.toString, call two.monthCode.toString, get two.year, get two.year.valueOf, call two.year.valueOf, get two.offset, get two.offset.toString, call two.offset.toString, get two.timeZone, get two.hour, get two.hour.valueOf, call two.hour.valueOf, get two.microsecond, get two.microsecond.valueOf, call two.microsecond.valueOf, get two.millisecond, get two.millisecond.valueOf, call two.millisecond.valueOf, get two.minute, get two.minute.valueOf, call two.minute.valueOf, get two.nanosecond, get two.nanosecond.valueOf, call two.nanosecond.valueOf, get two.second, get two.second.valueOf, call two.second.valueOf] and expected [get one.calendar, get one.day, get one.day.valueOf, call one.day.valueOf, get one.hour, get one.hour.valueOf, call one.hour.valueOf, get one.microsecond, get one.microsecond.valueOf, call one.microsecond.valueOf, get one.millisecond, get one.millisecond.valueOf, call one.millisecond.valueOf, get one.minute, get one.minute.valueOf, call one.minute.valueOf, get one.month, get one.month.valueOf, call one.month.valueOf, get one.monthCode, get one.monthCode.toString, call one.monthCode.toString, get one.nanosecond, get one.nanosecond.valueOf, call one.nanosecond.valueOf, get one.offset, get one.offset.toString, call one.offset.toString, get one.second, get one.second.valueOf, call one.second.valueOf, get one.timeZone, get one.year, get one.year.valueOf, call one.year.valueOf, get two.calendar, get two.day, get two.day.valueOf, call two.day.valueOf, get two.hour, get two.hour.valueOf, call two.hour.valueOf, get two.microsecond, get two.microsecond.valueOf, call two.microsecond.valueOf, get two.millisecond, get two.millisecond.valueOf, call two.millisecond.valueOf, get two.minute, get two.minute.valueOf, call two.minute.valueOf, get two.month, get two.month.valueOf, call two.month.valueOf, get two.monthCode, get two.monthCode.toString, call two.monthCode.toString, get two.nanosecond, get two.nanosecond.valueOf, call two.nanosecond.valueOf, get two.offset, get two.offset.toString, call two.offset.toString, get two.second, get two.second.valueOf, call two.second.valueOf, get two.timeZone, get two.year, get two.year.valueOf, call two.year.valueOf] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/from/argument-string-limits.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Not in a valid ISO day range."
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/from/offset-overrides-critical-flag.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/from/offset-string-invalid.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: UTC offset syntax is validated before year type is validated Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/from/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get item.calendar, get item.day, get item.day.valueOf, call item.day.valueOf, get item.month, get item.month.valueOf, call item.month.valueOf, get item.monthCode, get item.monthCode.toString, call item.monthCode.toString, get item.year, get item.year.valueOf, call item.year.valueOf, get item.offset, get item.offset.toString, call item.offset.toString, get item.timeZone, get item.hour, get item.hour.valueOf, call item.hour.valueOf, get item.microsecond, get item.microsecond.valueOf, call item.microsecond.valueOf, get item.millisecond, get item.millisecond.valueOf, call item.millisecond.valueOf, get item.minute, get item.minute.valueOf, call item.minute.valueOf, get item.nanosecond, get item.nanosecond.valueOf, call item.nanosecond.valueOf, get item.second, get item.second.valueOf, call item.second.valueOf, get options.disambiguation, get options.disambiguation.toString, call options.disambiguation.toString, get options.offset, get options.offset.toString, call options.offset.toString, get options.overflow, get options.overflow.toString, call options.overflow.toString] and expected [get item.calendar, get item.day, get item.day.valueOf, call item.day.valueOf, get item.hour, get item.hour.valueOf, call item.hour.valueOf, get item.microsecond, get item.microsecond.valueOf, call item.microsecond.valueOf, get item.millisecond, get item.millisecond.valueOf, call item.millisecond.valueOf, get item.minute, get item.minute.valueOf, call item.minute.valueOf, get item.month, get item.month.valueOf, call item.month.valueOf, get item.monthCode, get item.monthCode.toString, call item.monthCode.toString, get item.nanosecond, get item.nanosecond.valueOf, call item.nanosecond.valueOf, get item.offset, get item.offset.toString, call item.offset.toString, get item.second, get item.second.valueOf, call item.second.valueOf, get item.timeZone, get item.year, get item.year.valueOf, call item.year.valueOf, get options.disambiguation, get options.disambiguation.toString, call options.disambiguation.toString, get options.offset, get options.offset.toString, call options.offset.toString, get options.overflow, get options.overflow.toString, call options.overflow.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/from/zoneddatetime-string.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/equals/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.equals",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get other.calendar, get other.day, get other.day.valueOf, call other.day.valueOf, get other.month, get other.month.valueOf, call other.month.valueOf, get other.monthCode, get other.monthCode.toString, call other.monthCode.toString, get other.year, get other.year.valueOf, call other.year.valueOf, get other.offset, get other.offset.toString, call other.offset.toString, get other.timeZone, get other.hour, get other.hour.valueOf, call other.hour.valueOf, get other.microsecond, get other.microsecond.valueOf, call other.microsecond.valueOf, get other.millisecond, get other.millisecond.valueOf, call other.millisecond.valueOf, get other.minute, get other.minute.valueOf, call other.minute.valueOf, get other.nanosecond, get other.nanosecond.valueOf, call other.nanosecond.valueOf, get other.second, get other.second.valueOf, call other.second.valueOf] and expected [get other.calendar, get other.day, get other.day.valueOf, call other.day.valueOf, get other.hour, get other.hour.valueOf, call other.hour.valueOf, get other.microsecond, get other.microsecond.valueOf, call other.microsecond.valueOf, get other.millisecond, get other.millisecond.valueOf, call other.millisecond.valueOf, get other.minute, get other.minute.valueOf, call other.minute.valueOf, get other.month, get other.month.valueOf, call other.month.valueOf, get other.monthCode, get other.monthCode.toString, call other.monthCode.toString, get other.nanosecond, get other.nanosecond.valueOf, call other.nanosecond.valueOf, get other.offset, get other.offset.toString, call other.offset.toString, get other.second, get other.second.valueOf, call other.second.valueOf, get other.timeZone, get other.year, get other.year.valueOf, call other.year.valueOf] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/direction-undefined.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.gettimezonetransition",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/getTimeZoneTransition/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.gettimezonetransition",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Temporal.ZonedDateTime: getTimeZoneTransition: direction must be a string or options object"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/hoursInDay/get-start-of-day-throws.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.hoursinday",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/hoursInDay/next-day-out-of-range.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.hoursinday",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Next day boundary is out of range Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/since/float64-representable-integer.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration.p.toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"-PT18446744073.709551616S\"», «\"-PT18446744073.709552616S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/since/largestunit.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: does not include higher units than necessary (largest unit is milliseconds): milliseconds result: Expected SameValue(«-1285518553», «1111111011111») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/since/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.since",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get other.calendar, get other.day, get other.day.valueOf, call other.day.valueOf, get other.month, get other.month.valueOf, call other.month.valueOf, get other.monthCode, get other.monthCode.toString, call other.monthCode.toString, get other.year, get other.year.valueOf, call other.year.valueOf, get other.offset, get other.offset.toString, call other.offset.toString, get other.timeZone, get other.hour, get other.hour.valueOf, call other.hour.valueOf, get other.microsecond, get other.microsecond.valueOf, call other.microsecond.valueOf, get other.millisecond, get other.millisecond.valueOf, call other.millisecond.valueOf, get other.minute, get other.minute.valueOf, call other.minute.valueOf, get other.nanosecond, get other.nanosecond.valueOf, call other.nanosecond.valueOf, get other.second, get other.second.valueOf, call other.second.valueOf, get options.largestUnit, get options.largestUnit.toString, call options.largestUnit.toString, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get other.calendar, get other.day, get other.day.valueOf, call other.day.valueOf, get other.hour, get other.hour.valueOf, call other.hour.valueOf, get other.microsecond, get other.microsecond.valueOf, call other.microsecond.valueOf, get other.millisecond, get other.millisecond.valueOf, call other.millisecond.valueOf, get other.minute, get other.minute.valueOf, call other.minute.valueOf, get other.month, get other.month.valueOf, call other.month.valueOf, get other.monthCode, get other.monthCode.toString, call other.monthCode.toString, get other.nanosecond, get other.nanosecond.valueOf, call other.nanosecond.valueOf, get other.offset, get other.offset.toString, call other.offset.toString, get other.second, get other.second.valueOf, call other.second.valueOf, get other.timeZone, get other.year, get other.year.valueOf, call other.year.valueOf, get options.largestUnit, get options.largestUnit.toString, call options.largestUnit.toString, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/until/float64-representable-integer.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration.p.toString() should not use more precise internal representation than the spec prescribes Expected SameValue(«\"PT18446744073.709551616S\"», «\"PT18446744073.709552616S\"») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/until/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.until",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get other.calendar, get other.day, get other.day.valueOf, call other.day.valueOf, get other.month, get other.month.valueOf, call other.month.valueOf, get other.monthCode, get other.monthCode.toString, call other.monthCode.toString, get other.year, get other.year.valueOf, call other.year.valueOf, get other.offset, get other.offset.toString, call other.offset.toString, get other.timeZone, get other.hour, get other.hour.valueOf, call other.hour.valueOf, get other.microsecond, get other.microsecond.valueOf, call other.microsecond.valueOf, get other.millisecond, get other.millisecond.valueOf, call other.millisecond.valueOf, get other.minute, get other.minute.valueOf, call other.minute.valueOf, get other.nanosecond, get other.nanosecond.valueOf, call other.nanosecond.valueOf, get other.second, get other.second.valueOf, call other.second.valueOf, get options.largestUnit, get options.largestUnit.toString, call options.largestUnit.toString, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] and expected [get other.calendar, get other.day, get other.day.valueOf, call other.day.valueOf, get other.hour, get other.hour.valueOf, call other.hour.valueOf, get other.microsecond, get other.microsecond.valueOf, call other.microsecond.valueOf, get other.millisecond, get other.millisecond.valueOf, call other.millisecond.valueOf, get other.minute, get other.minute.valueOf, call other.minute.valueOf, get other.month, get other.month.valueOf, call other.month.valueOf, get other.monthCode, get other.monthCode.toString, call other.monthCode.toString, get other.nanosecond, get other.nanosecond.valueOf, call other.nanosecond.valueOf, get other.offset, get other.offset.toString, call other.offset.toString, get other.second, get other.second.valueOf, call other.second.valueOf, get other.timeZone, get other.year, get other.year.valueOf, call other.year.valueOf, get options.largestUnit, get options.largestUnit.toString, call options.largestUnit.toString, get options.roundingIncrement, get options.roundingIncrement.valueOf, call options.roundingIncrement.valueOf, get options.roundingMode, get options.roundingMode.toString, call options.roundingMode.toString, get options.smallestUnit, get options.smallestUnit.toString, call options.smallestUnit.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/disambiguation-invalid-string.js",
-      "esid": "sec-temporal.zoneddatetime.protoype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/disambiguation-wrong-type.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/invalid-disambiguation.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/invalid-offset.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/minimum-instant-with-one-hour-offset.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/offset-invalid-string.js",
-      "esid": "sec-temporal.zoneddatetime.protoype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/offset-property-invalid-string.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: \"00:00 is not a valid offset string (with use offset option) Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/offset-wrong-type.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: null Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/options-read-before-algorithmic-validation.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get options.overflow, get options.overflow.toString, call options.overflow.toString] and expected [get options.disambiguation, get options.disambiguation.toString, call options.disambiguation.toString, get options.offset, get options.offset.toString, call options.offset.toString, get options.overflow, get options.overflow.toString, call options.overflow.toString] should have the same contents. all options should be read first"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/options-wrong-type.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Partial datetime processed before throwing TypeError Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/prototype/with/order-of-operations.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [get fields.calendar, get fields.timeZone, get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.year, get fields.year.valueOf, call fields.year.valueOf, get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get options.overflow, get options.overflow.toString, call options.overflow.toString] and expected [get fields.calendar, get fields.timeZone, get fields.day, get fields.day.valueOf, call fields.day.valueOf, get fields.hour, get fields.hour.valueOf, call fields.hour.valueOf, get fields.microsecond, get fields.microsecond.valueOf, call fields.microsecond.valueOf, get fields.millisecond, get fields.millisecond.valueOf, call fields.millisecond.valueOf, get fields.minute, get fields.minute.valueOf, call fields.minute.valueOf, get fields.month, get fields.month.valueOf, call fields.month.valueOf, get fields.monthCode, get fields.monthCode.toString, call fields.monthCode.toString, get fields.nanosecond, get fields.nanosecond.valueOf, call fields.nanosecond.valueOf, get fields.offset, get fields.offset.toString, call fields.offset.toString, get fields.second, get fields.second.valueOf, call fields.second.valueOf, get fields.year, get fields.year.valueOf, call fields.year.valueOf, get options.disambiguation, get options.disambiguation.toString, call options.disambiguation.toString, get options.offset, get options.offset.toString, call options.offset.toString, get options.overflow, get options.overflow.toString, call options.overflow.toString] should have the same contents. order of operations"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/subclass.js",
-      "esid": "sec-temporal.zoneddatetime",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Instance of CustomZonedDateTime Expected SameValue(«[object Temporal.ZonedDateTime]», «[object Temporal.ZonedDateTime]») to be true"
-    },
-    {
-      "path": "built-ins/Temporal/ZonedDateTime/timezone-iso-string.js",
-      "esid": "sec-temporal.zoneddatetime.constructor",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: An ISO string is not a valid calendar ID for constructor parameter Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "built-ins/Temporal/keys.js",
-      "esid": "sec-temporal-objects",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Now] and expected [] should have the same contents. "
-    },
-    {
-      "path": "built-ins/Temporal/toStringTag/string.js",
-      "esid": "sec-temporal-@@tostringtag",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: OrdinaryToPrimitive could not convert object to primitive"
-    },
-    {
       "path": "language/eval-code/direct/arrow-fn-body-cntns-arguments-func-decl-arrow-func-declare-arguments-assign-incl-def-param-arrow-arguments.js",
       "esid": "sec-evaldeclarationinstantiation",
       "outcome": "fail",
@@ -40899,12 +40335,6 @@
       "esid": "sec-evaldeclarationinstantiation",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: binding may be deleted Expected a ReferenceError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "language/eval-code/direct/var-env-lower-lex-non-strict.js",
-      "esid": "sec-evaldeclarationinstantiation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
     },
     {
       "path": "language/eval-code/direct/var-env-var-init-local-new-delete.js",
@@ -40984,12 +40414,6 @@
       "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
     },
     {
-      "path": "annexB/language/function-code/block-decl-nested-blocks-with-fun-decl.js",
-      "esid": "sec-web-compat-functiondeclarationinstantiation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2», «1») to be true"
-    },
-    {
       "path": "staging/sm/Array/for_of_2.js",
       "esid": "pending",
       "outcome": "fail",
@@ -41062,54 +40486,6 @@
       "reason": "sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: non-string instance field key]"
     },
     {
-      "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-4-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-5-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
-      "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: setTime: Date.prototype method called on incompatible receiver"
-    },
-    {
       "path": "staging/sm/Date/non-iso.js",
       "esid": "pending",
       "outcome": "fail",
@@ -41144,12 +40520,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"function\"», «\"undefined\"») to be true"
-    },
-    {
-      "path": "staging/sm/Function/function-caller-restrictions.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «null») to be true"
     },
     {
       "path": "staging/sm/Function/function-toString-builtin-name.js",
@@ -41302,30 +40672,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: get RegExp.prototype.hasIndices: this is not a RegExp"
     },
     {
-      "path": "staging/sm/RegExp/unicode-back-reference.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«foo�bar�,�», «null») to be true"
-    },
-    {
-      "path": "staging/sm/RegExp/unicode-class-raw.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [�] and expected [�] should have the same contents. "
-    },
-    {
-      "path": "staging/sm/RegExp/unicode-ignoreCase-escape.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual argument [null] shouldn't be primitive. "
-    },
-    {
-      "path": "staging/sm/RegExp/unicode-raw.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual argument [null] shouldn't be primitive. "
-    },
-    {
       "path": "staging/sm/String/internalUsage.js",
       "esid": "pending",
       "outcome": "fail",
@@ -41380,88 +40726,16 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2143289344», «2139095041») to be true"
     },
     {
-      "path": "staging/sm/class/boundFunctionSubclassing.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/class/derivedConstructorArrowEvalEscape.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: must call super constructor in derived class before accessing 'this' or returning from derived constructor\n    at arrow (staging/sm/class/derivedConstructorArrowEvalEscape.js:6:23)\n    at staging/sm/class/derivedConstructorArrowEvalEscape.js:11:29"
-    },
-    {
-      "path": "staging/sm/class/derivedConstructorArrowEvalEscapeUninitialized.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: must call super constructor in derived class before accessing 'this' or returning from derived constructor\n    at thisArrow (staging/sm/class/derivedConstructorArrowEvalEscapeUninitialized.js:19:25)\n    at staging/sm/class/derivedConstructorArrowEvalEscapeUninitialized.js:36:18"
-    },
-    {
-      "path": "staging/sm/class/derivedConstructorArrowEvalNestedSuperCall.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: unsupported SyntaxError: super() call is not allowed in this eval code at offset 0-7\n    at staging/sm/class/derivedConstructorArrowEvalNestedSuperCall.js:4:14\n    at staging/sm/class/derivedConstructorArrowEvalNestedSuperCall.js:4:9\n    at staging/sm/class/derivedConstructorArrowEvalNestedSuperCall.js:2:1"
-    },
-    {
-      "path": "staging/sm/class/derivedConstructorArrowEvalSuperCall.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: unsupported SyntaxError: super() call is not allowed in this eval code at offset 0-13\n    at staging/sm/class/derivedConstructorArrowEvalSuperCall.js:4:26\n    at staging/sm/class/derivedConstructorArrowEvalSuperCall.js:2:1"
-    },
-    {
-      "path": "staging/sm/class/extendBuiltinConstructors.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot set property 'called' on weakmap\n    at sub (staging/sm/class/extendBuiltinConstructors.js:14:13)\n    at testBuiltinInstance (staging/sm/class/extendBuiltinConstructors.js:18:20)\n    at testBuiltin (staging/sm/class/extendBuiltinConstructors.js:50:5)\n    at staging/sm/class/extendBuiltinConstructors.js:92:1"
-    },
-    {
       "path": "staging/sm/class/fields-static-class-name-binding-eval.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: C is not defined\n    at <eval>\n    at C.<static-field-init> (staging/sm/class/fields-static-class-name-binding-eval.js:5:20)\n    at staging/sm/class/fields-static-class-name-binding-eval.js:5:5"
-    },
-    {
-      "path": "staging/sm/class/fields-static-class-name-binding.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: C is not defined\n    at <eval>\n    at field (staging/sm/class/fields-static-class-name-binding-eval.js:30:26)\n    at staging/sm/class/fields-static-class-name-binding-eval.js:32:20"
     },
     {
       "path": "staging/sm/class/strictExecution.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/class/superCallBadNewTargetPrototype.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/class/superCallProperBase.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "staging/sm/class/superPropChains.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: cannot access binding before initialization\n    at staging/sm/class/superPropChains.js:49:27"
-    },
-    {
-      "path": "staging/sm/class/superPropEvalInsideNested.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/class/superPropOrdering.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: cannot write property of null or undefined super reference\n    at testElemAssign (staging/sm/class/superPropOrdering.js:26:24)\n    at staging/sm/class/superPropOrdering.js:83:1"
     },
     {
       "path": "staging/sm/eval/exhaustive-fun-normalcaller-direct-normalcode.js",
@@ -41494,28 +40768,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type\n    at staging/sm/expressions/ToPropertyKey-symbols.js:63:13\n    at staging/sm/expressions/ToPropertyKey-symbols.js:67:14"
     },
     {
-      "path": "staging/sm/expressions/destructuring-array-lexical.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/expressions/nested-delete-name-in-evalcode.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
       "path": "staging/sm/expressions/object-literal-__proto__.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: computedNull, getter, getter Expected SameValue(«\"object\"», «\"number\"») to be true"
-    },
-    {
-      "path": "staging/sm/expressions/optional-chain.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «undefined») to be true"
     },
     {
       "path": "staging/sm/expressions/short-circuit-compound-assignment-anon-fns.js",
@@ -41533,13 +40789,7 @@
       "path": "staging/sm/extensions/arguments-property-access-in-function.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined\n    at test (staging/sm/extensions/arguments-property-access-in-function.js:9:24)\n    at staging/sm/extensions/arguments-property-access-in-function.js:14:1"
-    },
-    {
-      "path": "staging/sm/extensions/censor-strict-caller.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «null») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «5») to be true"
     },
     {
       "path": "staging/sm/extensions/dataview.js",
@@ -41560,40 +40810,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error.prototype.toString: receiver must be an Object"
     },
     {
-      "path": "staging/sm/extensions/function-caller-skips-eval-frames.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «function nest() { return eval(\"innermost();\"); }») to be true"
-    },
-    {
-      "path": "staging/sm/extensions/function-properties.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «null») to be true"
-    },
-    {
-      "path": "staging/sm/extensions/nested-delete-name-in-evalcode.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/extensions/newer-type-functions-caller-arguments.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected 'arguments' property access to throw on method() {} Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/fields/await-identifier-module-2.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
-      "path": "staging/sm/fields/bug1587574.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ReferenceError but got a SyntaxError"
     },
     {
       "path": "staging/sm/fields/init-order.js",
@@ -41618,54 +40838,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"object\"», «\"function\"») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-eval.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"outer-geval-gwith-gfalsefalseq\"», «\"outer-geval-gwith-gtruefalseq\"») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-label.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: value is not a function\n    at <eval>\n    at expectSloppyPass (staging/sm/lexical-environment/block-scoped-functions-annex-b-label.js:14:3)\n    at staging/sm/lexical-environment/block-scoped-functions-annex-b-label.js:23:1"
-    },
-    {
-      "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-notapplicable.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function x() {3}», «function x() {1}») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/block-scoped-functions-deprecated-redecl.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«3», «4») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/bug-1216623.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«12», «11») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/for-loop.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«10», «0») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/unscopables-proto.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/lexical-environment/var-in-catch-body-annex-b-eval.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"8g\"», «\"42g\"») to be true"
     },
     {
       "path": "staging/sm/misc/future-reserved-words.js",
@@ -41710,64 +40882,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: group assignment with rhs containing holes Expected SameValue(«\"y\"», «undefined») to be true"
     },
     {
-      "path": "staging/sm/regress/regress-577648-1.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: 1 Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-577648-2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error:  Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-584355.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error:  Expected SameValue(«\"function f () { ff (); }\"», «\"undefined\"») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-586482-1.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: ok Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-586482-2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: ok Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-586482-3.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: ok Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-586482-4.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: ok Expected SameValue(«function() { this.f(); }», «undefined») to be true"
-    },
-    {
       "path": "staging/sm/regress/regress-602621.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: function sub-statement must override arguments Expected SameValue(«\"function\"», «\"object\"») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-617405-1.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/regress/regress-617405-2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "staging/sm/regress/regress-634210-4.js",
@@ -41930,132 +41048,6 @@
       "esid": "sec-intl.numberformat",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
-      "path": "intl402/Temporal/Instant/prototype/toLocaleString/hourcycle.js",
-      "esid": "sec-temporal.instant.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "intl402/Temporal/PlainDate/prototype/toLocaleString/dateStyle.js",
-      "esid": "sec-temporal.plaindate.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: dateStyle: long writes month of Ramadan out in full"
-    },
-    {
-      "path": "intl402/Temporal/PlainDateTime/prototype/toLocaleString/dateStyle.js",
-      "esid": "sec-temporal.plaindatetime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: dateStyle: long writes month of Ramadan out in full"
-    },
-    {
-      "path": "intl402/Temporal/PlainDateTime/prototype/toLocaleString/hourcycle.js",
-      "esid": "sec-temporal.plaindatetime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "intl402/Temporal/PlainMonthDay/from/chinese-dangi-leap-month-with-year-from-plaindate-overflow-reject.js",
-      "esid": "sec-temporal.plainmonthday.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: 1898, M01L, 29 should not be valid with reject overflow Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "intl402/Temporal/PlainMonthDay/prototype/toLocaleString/calendar-mismatch.js",
-      "esid": "sec-temporal.plainmonthday.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: calendar mismatch even when instance has the ISO calendar Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js",
-      "esid": "sec-temporal.plainmonthday.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: dateStyle: long writes month of Ramadan out in full"
-    },
-    {
-      "path": "intl402/Temporal/PlainTime/prototype/toLocaleString/hourcycle.js",
-      "esid": "sec-temporal.plaintime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "intl402/Temporal/PlainYearMonth/prototype/toLocaleString/calendar-mismatch.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: calendar mismatch even when instance has the ISO calendar Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js",
-      "esid": "sec-temporal.plainyearmonth.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: dateStyle: long writes month of Ramadan out in full"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/from/argument-string-dst-option-offset-disambiguation-combinations.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/from/argument-string-dst-option-offset.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/from/zoneddatetime-sub-minute-offset.js",
-      "esid": "sec-temporal.zoneddatetime.from",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/toLocaleString/dateStyle.js",
-      "esid": "sec-temporal.plaindate.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: dateStyle: long writes month of Ramadan out in full"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/toLocaleString/hourcycle.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/toLocaleString/offset-time-zones.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/with/disambiguation-undefined.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/with/dst-defaults.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/with/dst-option-offset-disambiguation-combinations.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/with/dst-option-offset.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Temporal.ZonedDateTime: RangeError: Offsets could not be determined without disambiguation"
-    },
-    {
-      "path": "intl402/Temporal/ZonedDateTime/prototype/with/offset-property-sub-minute.js",
-      "esid": "sec-temporal.zoneddatetime.prototype.with",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: accepts HH:MM rounded offset (offset=use) Expected SameValue(«132270000000000n», «132300000000000n») to be true"
     },
     {
       "path": "intl402/constructors-string-and-single-element-array.js",

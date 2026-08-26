@@ -398,28 +398,28 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.68% at
-`bf54a372`, 169 fails, 0 crashes/timeouts. Recent slices: legacy
-fn.caller/fn.arguments magic reads, exotic-sidecar stale-handle fix
-(Date brand loss under heap caps), RegExp UTF-16 pattern pipeline +
-iu word classes + code-point backreferences, optional-chain delete +
-TDZ destructuring leaves, and a Temporal wave (field-read order,
-relativeTo bags, subclass construction, Temporal.Now shape). Latest slice: direct eval now
-sees block-scope bindings (catch parameters, block lexicals) through
-per-`Op::Eval`-site caller tables with §B.3.5-exact var/delete
-composition, plus the staging/sm/lexical-environment family (labeled
-hoisting, annex-B eligibility spans, per-iteration destructured
-for-heads, global-lexical delete) — 11 closed, zero regressions.
-Before that the intl402 wave closed 163 tests: DateTimeFormat on ICU4X
-zone names and ToDateTimeOptions modes (46→11), NumberFormat v3 options
-and exact mathematical values (37→2), PluralRules/DurationFormat/
-intl402-Date green, Locale region-preference data, Temporal
-zone-adopting toLocaleString, calendar checks, eraless calendars.
-Remaining fail mass, largest first: staging/sm (~130, heterogeneous),
-Temporal core calendar/dst edges (~80 — islamic variants, ZonedDateTime
-dst/sub-minute offsets), DateTimeFormat chinese/dangi/japanese rendering
-(~10), annexB parser cluster (7, oxc-level), legacy Intl-constructed
-symbol object model (4).
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.76% at
+`48c301d7`, 125 fails, 0 crashes/timeouts. Latest slices (169→125, zero
+regressions): the Temporal wave went green (6642/6642 — ZonedDateTime
+offset-option string parsing via ParsedZonedDateTime, ToBigInt
+constructor coercion, identifier-only constructor time zones, fallible
+hoursInDay, PlainTime sub-second compare + per-field RegulateTime,
+PYM/PMD from date-bearing instances, %Object.prototype% on the
+namespaces, DateTimeFormat ISO-field civil conversion, h24 midnight,
+zero-offset GMT, PYM/PMD exact-calendar match); dispatch/object-model
+fixes (WeakMap/WeakSet expandos, bound-function [[Prototype]] slot +
+proxy-aware bind, proxy get-trap invariant on class-ctor prototype,
+temporal prototype-walk fallback, derived-this cell reads for escaped
+arrows); and compiler class/eval work (per-evaluation class cells via
+FreshUpvalue, eager super-store base, default-derived-ctor live parent,
+direct eval super() in derived constructors, static-block/-field
+eval-binding tables, HomeObject-gated super legality in eval).
+Remaining fail mass, largest first: staging/sm (~95, heterogeneous —
+Function metadata, RegExp constructor edges, TypedArray cross-realm,
+Proxy/Reflect realm semantics), intl402 DateTimeFormat
+chinese/dangi/era/formatRange rendering (11), annexB parser cluster
+(7, oxc-level), language/eval-code deletable-binding closures (6),
+import-defer (2), legacy Intl-constructed symbol object model (4).
 
 ### C2. Web and Node compatibility
 

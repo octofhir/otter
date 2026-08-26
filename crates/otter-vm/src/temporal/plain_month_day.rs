@@ -60,8 +60,20 @@ fn parse_pmd_arg_with_overflow(
     overflow_opts: Option<&[Value]>,
 ) -> Result<temporal_rs::PlainMonthDay, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
-        let pmd = match t.payload_clone(ctx.heap()) {
-            TemporalPayload::PlainMonthDay(v) => v,
+        // A date-bearing Temporal instance re-resolves through its
+        // calendar slot and slot-backed fields — the spec reads run
+        // the instance's own native getters, so the direct extraction
+        // is unobservable and equivalent.
+        let date = match t.payload_clone(ctx.heap()) {
+            TemporalPayload::PlainMonthDay(pmd) => {
+                if let Some(args) = overflow_opts {
+                    parse_overflow(ctx, args, 1)?;
+                }
+                return Ok(pmd);
+            }
+            TemporalPayload::PlainDate(pd) => pd,
+            TemporalPayload::PlainDateTime(pdt) => pdt.to_plain_date(),
+            TemporalPayload::ZonedDateTime(zdt) => zdt.to_plain_date(),
             _ => {
                 return Err(NativeError::TypeError {
                     name: CLASS,
@@ -69,10 +81,24 @@ fn parse_pmd_arg_with_overflow(
                 });
             }
         };
-        if let Some(args) = overflow_opts {
-            parse_overflow(ctx, args, 1)?;
-        }
-        Ok(pmd)
+        let overflow = match overflow_opts {
+            Some(args) => parse_overflow(ctx, args, 1)?,
+            None => None,
+        };
+        let mut fields = temporal_rs::fields::CalendarFields::new();
+        fields.year = Some(date.year());
+        fields.month_code = Some(date.month_code());
+        fields.day = Some(date.day());
+        fields.era = date
+            .era()
+            .and_then(|e| temporal_rs::TinyAsciiStr::<19>::try_from_str(e.as_str()).ok());
+        fields.era_year = date.era_year();
+        let partial = temporal_rs::partial::PartialDate {
+            calendar_fields: fields,
+            calendar: date.calendar().clone(),
+        };
+        temporal_rs::PlainMonthDay::from_partial(partial, overflow)
+            .map_err(|e| temporal_err(e, CLASS))
     } else if v.is_object_type() {
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
         let fields = parse_calendar_fields(ctx, *v, &calendar, CLASS)?;

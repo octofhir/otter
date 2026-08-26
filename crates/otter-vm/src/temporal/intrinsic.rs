@@ -110,22 +110,26 @@ fn install_temporal_well_knowns(
     };
     install(heap, temporal, "Temporal")?;
 
+    // §Temporal and §Temporal.Now are ordinary objects with
+    // %Object.prototype% (the Object constructor is a native function,
+    // so its `prototype` reads through the descriptor table).
+    let object_proto = object::get(global, heap, "Object")
+        .and_then(|ctor| ctor.as_native_function())
+        .and_then(|ctor| {
+            ctor.own_property_descriptor(heap, "prototype")
+                .ok()
+                .flatten()
+        })
+        .and_then(|descriptor| match descriptor.kind {
+            crate::object::DescriptorKind::Data { value } => value.as_object(),
+            crate::object::DescriptorKind::Accessor { .. } => None,
+        });
+    if let Some(object_proto) = object_proto {
+        object::set_prototype(temporal, heap, Some(object_proto));
+    }
+
     if let Some(now) = object::get(temporal, heap, "Now").and_then(|v| v.as_object()) {
         install(heap, now, "Temporal.Now")?;
-        // §Temporal.Now is an ordinary object with %Object.prototype%
-        // (the Object constructor is a native function, so its
-        // `prototype` reads through the descriptor table).
-        let object_proto = object::get(global, heap, "Object")
-            .and_then(|ctor| ctor.as_native_function())
-            .and_then(|ctor| {
-                ctor.own_property_descriptor(heap, "prototype")
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|descriptor| match descriptor.kind {
-                crate::object::DescriptorKind::Data { value } => value.as_object(),
-                crate::object::DescriptorKind::Accessor { .. } => None,
-            });
         if let Some(object_proto) = object_proto {
             object::set_prototype(now, heap, Some(object_proto));
         }

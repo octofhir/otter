@@ -12,8 +12,8 @@ use crate::temporal::helpers::parse_overflow;
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
-    opt_integer_with_truncation, parse_difference_settings, parse_partial_time,
-    parse_rounding_options, require_construct, require_plain_time, temporal_err,
+    opt_integer_with_truncation, parse_difference_settings, parse_rounding_options,
+    require_construct, require_plain_time, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -77,8 +77,13 @@ fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // Property-bag / instance path: the bag's field reads come FIRST,
     // then GetTemporalOverflowOption fires (observably) — §ToTemporalTime.
     if arg.is_object_type() && arg.as_temporal(ctx.heap()).is_none() {
-        let partial = parse_partial_time(ctx, arg, CLASS)?;
+        let raw = crate::temporal::helpers::parse_partial_time_raw(ctx, arg, CLASS)?;
         let overflow = parse_overflow(ctx, args, 1)?;
+        let partial = crate::temporal::helpers::regulate_partial_time(
+            raw,
+            overflow.unwrap_or(temporal_rs::options::Overflow::Constrain),
+            CLASS,
+        )?;
         let pt = temporal_rs::PlainTime::from_partial(partial, overflow)
             .map_err(|e| temporal_err(e, CLASS))?;
         return make_temporal(ctx, TemporalPayload::PlainTime(pt));
@@ -91,15 +96,20 @@ fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let a = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_plain_time_arg(ctx, &arg_or_undef(args, 1))?;
-    let n = if a == b {
-        0
-    } else if a.hour() < b.hour()
-        || (a.hour() == b.hour() && a.minute() < b.minute())
-        || (a.hour() == b.hour() && a.minute() == b.minute() && a.second() < b.second())
-    {
-        -1
-    } else {
-        1
+    let key = |t: &temporal_rs::PlainTime| {
+        (
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.millisecond(),
+            t.microsecond(),
+            t.nanosecond(),
+        )
+    };
+    let n = match key(&a).cmp(&key(&b)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     };
     Ok(Value::number_i32(n))
 }
@@ -130,7 +140,12 @@ pub(crate) fn parse_plain_time_arg_with_overflow(
             }),
         }
     } else if v.is_object_type() {
-        let partial = parse_partial_time(ctx, *v, CLASS)?;
+        let raw = crate::temporal::helpers::parse_partial_time_raw(ctx, *v, CLASS)?;
+        let partial = crate::temporal::helpers::regulate_partial_time(
+            raw,
+            overflow.unwrap_or(temporal_rs::options::Overflow::Constrain),
+            CLASS,
+        )?;
         temporal_rs::PlainTime::from_partial(partial, overflow).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(ctx.heap()) {
         temporal_rs::PlainTime::from_utf8(s.to_lossy_string(ctx.heap()).as_bytes())
@@ -262,8 +277,16 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "first argument must be an object".to_string(),
         });
     }
+    if arg.as_temporal(ctx.heap()).is_some() {
+        // §RejectTemporalLikeObject — an object with a Temporal
+        // internal slot is not a valid partial-fields bag.
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "with() requires a plain time-like object".to_string(),
+        });
+    }
     crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
-    let partial = parse_partial_time(ctx, arg, CLASS)?;
+    let raw = crate::temporal::helpers::parse_partial_time_raw(ctx, arg, CLASS)?;
     // §GetOptionsObject — runs AFTER the fields object's reads (a
     // primitive options argument still observes every field [[Get]]).
     let options = arg_or_undef(args, 1);
@@ -274,6 +297,11 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         });
     }
     let overflow = parse_overflow(ctx, args, 1)?;
+    let partial = crate::temporal::helpers::regulate_partial_time(
+        raw,
+        overflow.unwrap_or(temporal_rs::options::Overflow::Constrain),
+        CLASS,
+    )?;
     let result = pt
         .with(partial, overflow)
         .map_err(|e| temporal_err(e, CLASS))?;

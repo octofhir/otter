@@ -257,12 +257,10 @@ fn bigint_proto_to_locale_string(
             reason: "this is not a BigInt".to_string(),
         });
     };
-    let value = b
-        .with_inner(ctx.heap(), num_traits::ToPrimitive::to_f64)
-        .unwrap_or(f64::NAN);
+    let text = b.to_decimal_string(ctx.heap());
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
-    crate::intl::number_format::to_locale_string(ctx, value, locales, options)
+    crate::intl::number_format::to_locale_string_exact(ctx, &text, locales, options)
 }
 
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

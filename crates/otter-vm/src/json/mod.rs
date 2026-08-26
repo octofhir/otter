@@ -344,8 +344,8 @@ fn native_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         let obj = scope.bare_object()?;
         scope.set(obj, "rawJSON", raw_value)?;
         let obj_value = scope.raw(obj);
-        let obj_handle = obj_value.as_object().expect("bare object handle");
-        crate::object::set_is_raw_json(obj_handle, scope.context().heap_mut(), true);
+        let mut obj_handle = obj_value.as_object().expect("bare object handle");
+        crate::object::set_is_raw_json(&mut obj_handle, scope.context().heap_mut(), true);
         let obj_handle = scope.raw(obj).as_object().expect("rooted rawJSON object");
         crate::object::freeze(obj_handle, scope.context().heap_mut());
         Ok(scope.finish(obj))

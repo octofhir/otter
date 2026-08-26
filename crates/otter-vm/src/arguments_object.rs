@@ -63,7 +63,7 @@ pub(crate) fn initialize_unmapped(
         scope.add_value(&mut iterator_method);
     }
 
-    object::mark_as_arguments_object(obj, heap);
+    object::mark_as_arguments_object(&mut obj, heap);
     // The shape already names every slot: indices, then `length`, then the
     // `callee` accessor. One shape install plus a flat slab fill replaces a
     // dictionary insert per key.
@@ -130,7 +130,7 @@ pub(crate) fn initialize_mapped(
         }
     }
 
-    object::mark_as_arguments_object(obj, heap);
+    object::mark_as_arguments_object(&mut obj, heap);
     // The shape already names every slot: indices, then `length`, then
     // `callee`. One shape install plus a flat slab fill replaces a dictionary
     // insert per key.

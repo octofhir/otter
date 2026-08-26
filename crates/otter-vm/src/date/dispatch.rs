@@ -60,13 +60,13 @@ pub fn call(
         //   - 2+ args: (year, month, day?, hr?, min?, sec?, ms?).
         M::Construct => {
             let time = construct_time_value(zone, args, heap);
-            let obj = object::alloc_object_with_roots(heap, external_visit).map_err(|err| {
+            let mut obj = object::alloc_object_with_roots(heap, external_visit).map_err(|err| {
                 VmError::OutOfMemory {
                     requested_bytes: err.requested_bytes(),
                     heap_limit_bytes: err.heap_limit_bytes(),
                 }
             })?;
-            object::set_date_data(obj, heap, time);
+            object::set_date_data(&mut obj, heap, time);
             if let Some(proto) = prototype {
                 object::set_prototype(obj, heap, Some(proto));
             }

@@ -2145,10 +2145,10 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
         "getTime",
         Value::number_i32(1),
     );
-    let date =
+    let mut date =
         crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("date object");
     object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
-    object::set_date_data(date, interp.gc_heap_mut(), 0.0);
+    object::set_date_data(&mut date, interp.gc_heap_mut(), 0.0);
 
     let context = interp
         .link_module(module.clone())
@@ -2202,10 +2202,10 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
         "setTime",
         Value::number_i32(1),
     );
-    let date =
+    let mut date =
         crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("date object");
     object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
-    object::set_date_data(date, interp.gc_heap_mut(), 0.0);
+    object::set_date_data(&mut date, interp.gc_heap_mut(), 0.0);
 
     let context = interp
         .link_module(module.clone())
@@ -3267,7 +3267,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("string wrapper");
     object::set_prototype(obj, interp.gc_heap_mut(), Some(proto));
     let data = JsString::from_str("abc", interp.gc_heap_mut()).expect("string data");
-    object::set_string_data(obj, interp.gc_heap_mut(), data);
+    object::set_string_data(&mut obj, interp.gc_heap_mut(), data);
     object::set(
         &mut obj,
         interp.gc_heap_mut(),

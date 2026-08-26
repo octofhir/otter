@@ -151,28 +151,28 @@ fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     // through and return unchanged.
     let v = *value;
     if let Some(b) = v.as_boolean() {
-        return wrap_primitive(ctx, "Boolean", v, |obj, heap| {
-            crate::object::set_boolean_data(obj, heap, b);
+        return wrap_primitive(ctx, "Boolean", v, |mut obj, heap| {
+            crate::object::set_boolean_data(&mut obj, heap, b);
         });
     }
     if let Some(n) = v.as_number() {
-        return wrap_primitive(ctx, "Number", v, |obj, heap| {
-            crate::object::set_number_data(obj, heap, n);
+        return wrap_primitive(ctx, "Number", v, |mut obj, heap| {
+            crate::object::set_number_data(&mut obj, heap, n);
         });
     }
     if let Some(s) = v.as_string(ctx.heap()) {
-        return wrap_primitive(ctx, "String", v, |obj, heap| {
-            crate::object::set_string_data(obj, heap, s);
+        return wrap_primitive(ctx, "String", v, |mut obj, heap| {
+            crate::object::set_string_data(&mut obj, heap, s);
         });
     }
     if let Some(sym) = v.as_symbol(ctx.heap()) {
-        return wrap_primitive(ctx, "Symbol", v, |obj, heap| {
-            crate::object::set_symbol_data(obj, heap, sym);
+        return wrap_primitive(ctx, "Symbol", v, |mut obj, heap| {
+            crate::object::set_symbol_data(&mut obj, heap, sym);
         });
     }
     if let Some(bigint) = v.as_big_int() {
-        return wrap_primitive(ctx, "BigInt", v, |obj, heap| {
-            crate::object::set_bigint_data(obj, heap, bigint);
+        return wrap_primitive(ctx, "BigInt", v, |mut obj, heap| {
+            crate::object::set_bigint_data(&mut obj, heap, bigint);
         });
     }
     Ok(v)

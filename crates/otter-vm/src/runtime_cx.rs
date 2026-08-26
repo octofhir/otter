@@ -3324,14 +3324,14 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         let prototype = self.value(Value::object(prototype));
         let instance = self.bare_object()?;
         self.set_prototype(instance, Some(prototype))?;
-        let object = self
+        let mut object = self
             .raw(instance)
             .as_object()
             .ok_or_else(|| NativeError::TypeError {
                 name: "NativeScope::date",
                 reason: "Date shell is not an ordinary object".to_string(),
             })?;
-        object::set_date_data(object, self.ctx.heap_mut(), milliseconds);
+        object::set_date_data(&mut object, self.ctx.heap_mut(), milliseconds);
         Ok(instance)
     }
 
@@ -3389,14 +3389,14 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         let prototype = self.value(Value::object(prototype));
         let instance = self.bare_object()?;
         self.set_prototype(instance, Some(prototype))?;
-        let object = self
+        let mut object = self
             .raw(instance)
             .as_object()
             .ok_or_else(|| NativeError::TypeError {
                 name: "NativeScope::error",
                 reason: "Error shell is not an ordinary object".to_string(),
             })?;
-        object::set_error_data(object, self.ctx.heap_mut());
+        object::set_error_data(&mut object, self.ctx.heap_mut());
         let message = self.string(message)?;
         self.define(
             instance,

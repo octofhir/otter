@@ -1276,7 +1276,7 @@ impl ErrorClassRegistry {
         error_ctor = error_ctor_root
             .as_object()
             .expect("Error constructor is an object");
-        object::set_constructor_native(error_ctor, gc_heap, native_root);
+        object::set_constructor_native(&mut error_ctor, gc_heap, native_root);
         install_ctor_metadata(&mut error_ctor, "Error", 1, gc_heap)?;
         error_ctor_root = Value::object(error_ctor);
         // §20.5.8.1 `Error.isError(arg)` — IsError(arg): an ordinary
@@ -1541,7 +1541,7 @@ impl ErrorClassRegistry {
             ctor = ctor_root
                 .as_object()
                 .expect("native error constructor is an object");
-            object::set_constructor_native(ctor, gc_heap, native_root);
+            object::set_constructor_native(&mut ctor, gc_heap, native_root);
             install_ctor_metadata(&mut ctor, kind.class_name(), length, gc_heap)?;
             ctor_root = Value::object(ctor);
             entries.push((
@@ -1683,14 +1683,14 @@ impl ErrorClassRegistry {
         // §20.5.* — the instance carries the [[ErrorData]] internal slot.
         // This is non-allocating and reloads the receiver from its canonical
         // Local immediately before the internal write.
-        let object = scope
+        let mut object = scope
             .raw(instance)
             .as_object()
             .ok_or_else(|| NativeError::TypeError {
                 name: "Error",
                 reason: "construct receiver is not an ordinary object".to_string(),
             })?;
-        crate::object::set_error_data(object, scope.context().heap_mut());
+        crate::object::set_error_data(&mut object, scope.context().heap_mut());
         Ok(())
     }
 

@@ -229,7 +229,7 @@ impl FunctionKindPrototypes {
             ctor = ctor_root
                 .as_object()
                 .expect("function-kind constructor stays rooted");
-            object::set_constructor_native(ctor, heap, native_root);
+            object::set_constructor_native(&mut ctor, heap, native_root);
             // §27.3.2 / §27.4.2 / §27.7.2 — the constructor carries
             // `length = 1` and `name = tag`, both non-writable,
             // non-enumerable, configurable. Defined on the carrier

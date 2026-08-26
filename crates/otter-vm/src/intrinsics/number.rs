@@ -64,14 +64,18 @@ fn pin_number_data_and_globals(
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match descriptor.and_then(|d| match d.kind {
+    let mut prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
         None => return Ok(()),
     };
-    crate::object::set_number_data(prototype, heap, crate::number::NumberValue::from_i32(0));
+    crate::object::set_number_data(
+        &mut prototype,
+        heap,
+        crate::number::NumberValue::from_i32(0),
+    );
 
     let global_root = Value::object(global);
     let global_methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
@@ -167,8 +171,8 @@ fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     };
     if ctx.is_construct_call() {
         let this = *ctx.this_value();
-        if let Some(obj) = this.as_object() {
-            crate::object::set_number_data(obj, ctx.heap_mut(), value);
+        if let Some(mut obj) = this.as_object() {
+            crate::object::set_number_data(&mut obj, ctx.heap_mut(), value);
             Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {

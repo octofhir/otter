@@ -577,7 +577,7 @@ fn object_prototype_to_object(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let (proto_name, setter): (&str, fn(JsObject, &mut otter_gc::GcHeap, &Value)) =
+    let (proto_name, setter): (&str, fn(&mut JsObject, &mut otter_gc::GcHeap, &Value)) =
         if this_value.is_nullish() {
             return Err(NativeError::TypeError {
                 name: method_name,
@@ -603,15 +603,15 @@ fn object_prototype_to_object(
         .ok()
         .and_then(|v| v.as_object())
         .or_else(|| ctx.cx.interp.object_prototype_object_opt());
-    let wrapper = ctx.alloc_object_with_roots(&[&this_value], &[])?;
+    let mut wrapper = ctx.alloc_object_with_roots(&[&this_value], &[])?;
     if let Some(proto) = proto {
         crate::object::set_prototype(wrapper, ctx.heap_mut(), Some(proto));
     }
-    setter(wrapper, ctx.heap_mut(), &this_value);
+    setter(&mut wrapper, ctx.heap_mut(), &this_value);
     Ok(Value::object(wrapper))
 }
 
-fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, value: &Value) {
+fn set_primitive_wrapper_data(wrapper: &mut JsObject, heap: &mut otter_gc::GcHeap, value: &Value) {
     if let Some(b) = value.as_boolean() {
         crate::object::set_boolean_data(wrapper, heap, b);
     } else if let Some(n) = value.as_number() {

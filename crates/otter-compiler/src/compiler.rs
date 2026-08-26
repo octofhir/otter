@@ -30,6 +30,12 @@ pub(crate) struct Compiler {
     /// Function declarations leave this false — their name resolves
     /// to the outer mutable var binding.
     pub(crate) fn_self_immutable_hint: bool,
+    /// One-shot hint set by the class-constructor lowering: the next
+    /// `compile_function_full` frame carries a [[HomeObject]] and (when
+    /// paired with `next_fn_derived_ctor`) is a derived constructor —
+    /// direct-eval `super` legality reads both off the frame.
+    pub(crate) next_fn_has_home: bool,
+    pub(crate) next_fn_derived_ctor: bool,
     /// One-shot hint set by MethodDefinition lowering (class and
     /// object-literal methods / accessors): the next
     /// `compile_function_full` marks its record `is_method`, so the
@@ -155,6 +161,8 @@ impl Compiler {
         Self {
             stack: vec![top],
             fn_self_immutable_hint: false,
+            next_fn_has_home: false,
+            next_fn_derived_ctor: false,
             next_fn_is_method: false,
             next_fn_static_home: false,
             next_fn_no_self_name: false,

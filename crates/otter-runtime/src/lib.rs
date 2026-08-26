@@ -1798,6 +1798,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
             options.new_target_allowed,
             options.in_class_field_initializer,
             options.super_property_allowed,
+            options.super_call_allowed,
         )
         .map_err(compile_error_message)
     })

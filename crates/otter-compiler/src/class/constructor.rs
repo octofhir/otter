@@ -91,6 +91,8 @@ pub(crate) fn compile_synthetic_constructor(
         child.captured_names.insert("arguments".to_string());
     }
     child.contains_direct_eval = contains_direct_eval;
+    child.has_home_object = true;
+    child.is_derived_ctor = is_derived;
     parent.push(child);
     parent.enter_scope();
 
@@ -109,11 +111,33 @@ pub(crate) fn compile_synthetic_constructor(
     if is_derived {
         // Default derived ctor is `constructor(...args) {
         // super(...args); }`: materialise the incoming argument
-        // list and construct the captured superclass.
+        // list and construct the superclass. §13.3.7.1
+        // GetSuperConstructor resolves through the class's LIVE
+        // [[GetPrototypeOf]] (a setPrototypeOf between definition and
+        // `new` is observable), so the captured class value's current
+        // prototype is read at call time — same as an explicit
+        // `super()`.
         //
         // # See also
         // - <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
-        let super_ctor = load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?;
+        let super_ctor = if parent
+            .lookup_binding(crate::class::CLASS_SELF_NAME)
+            .is_some()
+            || parent
+                .resolve_capture(crate::class::CLASS_SELF_NAME)
+                .is_some()
+        {
+            let class_reg = load_synthetic_capture(parent, crate::class::CLASS_SELF_NAME, span)?;
+            let proto_reg = parent.alloc_scratch();
+            parent.emit(
+                Op::GetPrototype,
+                [Operand::Register(proto_reg), Operand::Register(class_reg)],
+                span,
+            );
+            proto_reg
+        } else {
+            load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?
+        };
         let args_reg = parent.alloc_scratch();
         parent.emit(Op::CollectRest, [Operand::Register(args_reg)], span);
         let dst = parent.alloc_scratch();
@@ -212,6 +236,8 @@ pub(crate) fn compile_class_constructor(
         // resolves through the class scope) but keep their
         // [[Construct]] slot — they are NOT flagged is_method.
         parent.next_fn_no_self_name = true;
+        parent.next_fn_has_home = true;
+        parent.next_fn_derived_ctor = is_derived;
         let (function_id, captures) =
             compile_function_full(parent, name, params, body, span, is_async, false, true)?;
         if is_derived {
@@ -259,6 +285,8 @@ pub(crate) fn compile_class_constructor(
         child.captured_names.insert("arguments".to_string());
     }
     child.contains_direct_eval = contains_direct_eval;
+    child.has_home_object = true;
+    child.is_derived_ctor = is_derived;
     parent.push(child);
     parent.enter_scope();
 

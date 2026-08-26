@@ -608,18 +608,14 @@ pub(crate) fn bind_for_in_of_head(
             // `for (super.X of ...)` writes through the receiver per
             // §13.3.5.3 + §6.2.5.5 step 6.b, like `super.X = V`.
             if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {
-                let home_reg = crate::class::load_synthetic_capture(
-                    cx,
-                    crate::class::super_home_binding_name(cx),
-                    span,
-                )?;
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 cx.emit(
                     Op::SetSuperProperty,
                     vec![
-                        Operand::Register(home_reg),
+                        Operand::Register(base_reg),
                         Operand::ConstIndex(name_idx),
                         Operand::Register(src_reg),
                     ],
@@ -644,18 +640,14 @@ pub(crate) fn bind_for_in_of_head(
         }
         ForStatementLeft::ComputedMemberExpression(member) => {
             if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {
-                let home_reg = crate::class::load_synthetic_capture(
-                    cx,
-                    crate::class::super_home_binding_name(cx),
-                    span,
-                )?;
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
                 let key_reg = compile_expr(cx, &member.expression, span)?;
+                let base_reg = crate::class::emit_super_base(cx, span)?;
                 cx.emit(
                     Op::SetSuperElement,
                     vec![
-                        Operand::Register(home_reg),
+                        Operand::Register(base_reg),
                         Operand::Register(key_reg),
                         Operand::Register(src_reg),
                     ],

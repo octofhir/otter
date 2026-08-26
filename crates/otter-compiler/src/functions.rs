@@ -27,6 +27,8 @@ pub(crate) fn compile_function_full(
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let is_async_generator = is_async && is_generator;
     let is_method = std::mem::take(&mut parent.next_fn_is_method);
+    let hinted_home = std::mem::take(&mut parent.next_fn_has_home);
+    let hinted_derived_ctor = std::mem::take(&mut parent.next_fn_derived_ctor);
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
     let no_self_name = std::mem::take(&mut parent.next_fn_no_self_name);
     let source_text_span = std::mem::take(&mut parent.next_fn_source_text_span);
@@ -55,6 +57,8 @@ pub(crate) fn compile_function_full(
         .with_strict(function_is_strict)
         .with_module_url(parent.module_url.clone());
     child.super_home_static = static_home;
+    child.has_home_object = is_method || hinted_home;
+    child.is_derived_ctor = hinted_derived_ctor;
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
     // §10.2.11 — every non-arrow function's variable environment
@@ -821,6 +825,7 @@ pub(crate) fn capture_super_bindings_for_eval(cx: &mut Compiler) {
     let _ = cx.resolve_capture(crate::class::SUPER_HOME_NAME);
     let _ = cx.resolve_capture(crate::class::SUPER_STATIC_HOME_NAME);
     let _ = cx.resolve_capture(crate::class::SUPER_CTOR_NAME);
+    let _ = cx.resolve_capture(crate::class::CLASS_SELF_NAME);
 }
 
 /// §10.2.11 / §15.2.1 — it is a Syntax Error if any element of the

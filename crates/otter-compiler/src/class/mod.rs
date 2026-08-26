@@ -112,6 +112,25 @@ pub(crate) fn compile_class(
     result
 }
 
+/// Declare one class-evaluation-scoped captured cell and re-mint it
+/// (`Op::FreshUpvalue`) so each evaluation of the same class source —
+/// e.g. a class expression in a loop body — gets a distinct cell.
+/// Without the re-mint, a later evaluation's store lands in the cell
+/// the earlier evaluation's methods captured (a `super()` chain built
+/// in a loop then collapses into self-recursion).
+fn declare_fresh_class_cell(
+    cx: &mut Compiler,
+    name: &str,
+    is_const: bool,
+    span: (u32, u32),
+) -> Result<crate::scope::BindingStorage, CompileError> {
+    let storage = cx.declare_captured_binding(name, is_const, span)?;
+    if let crate::scope::BindingStorage::Upvalue { idx } = storage {
+        cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
+    }
+    Ok(storage)
+}
+
 fn compile_class_strict(
     cx: &mut Compiler,
     class: &oxc_ast::ast::Class<'_>,
@@ -144,7 +163,7 @@ fn compile_class_strict(
                 node: "ClassDeclaration: private name outside class".to_string(),
                 span,
             })?;
-        let storage = cx.declare_captured_binding(&binding, true, span)?;
+        let storage = declare_fresh_class_cell(cx, &binding, true, span)?;
         let key_reg = emit_private_symbol_key(cx, name, span)?;
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
@@ -181,7 +200,7 @@ fn compile_class_strict(
             cx.scratch = item_mark;
         }
         let arr_binding = format!("__privarr_{private_namespace}");
-        let storage = cx.declare_captured_binding(&arr_binding, true, span)?;
+        let storage = declare_fresh_class_cell(cx, &arr_binding, true, span)?;
         cx.emit_store_storage(arr_reg, storage, span);
         cx.mark_initialized(&arr_binding);
         cx.scratch = scratch_mark;
@@ -207,7 +226,7 @@ fn compile_class_strict(
     });
     let privproto_storage = if has_instance_private_methods {
         let binding = format!("__privbrand_{private_namespace}");
-        let storage = cx.declare_captured_binding(&binding, true, span)?;
+        let storage = declare_fresh_class_cell(cx, &binding, true, span)?;
         let key_reg = emit_private_symbol_key(cx, "brand", span)?;
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
@@ -216,7 +235,7 @@ fn compile_class_strict(
         // method holder (proxy / plain constructor-return override)
         // can still resolve private methods through the brand entry.
         let proto_binding = format!("__privproto_{private_namespace}");
-        let proto_storage = cx.declare_captured_binding(&proto_binding, true, span)?;
+        let proto_storage = declare_fresh_class_cell(cx, &proto_binding, true, span)?;
         Some((proto_binding, proto_storage))
     } else {
         None
@@ -234,7 +253,7 @@ fn compile_class_strict(
     if let Some(name) = class_name
         && class.id.is_some()
     {
-        let storage = cx.declare_captured_binding(name, false, span)?;
+        let storage = declare_fresh_class_cell(cx, name, false, span)?;
         let hole = cx.alloc_scratch();
         cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
         cx.emit_store_storage(hole, storage, span);
@@ -249,10 +268,10 @@ fn compile_class_strict(
     // ahead of the first arbitrary `compile_expr` (the heritage) —
     // otherwise a capture resolved there would collide with these
     // cells. Values are stored once the prototype / parent exist.
-    let home_storage = cx.declare_captured_binding(SUPER_HOME_NAME, true, span)?;
-    let static_home_storage = cx.declare_captured_binding(SUPER_STATIC_HOME_NAME, true, span)?;
+    let home_storage = declare_fresh_class_cell(cx, SUPER_HOME_NAME, true, span)?;
+    let static_home_storage = declare_fresh_class_cell(cx, SUPER_STATIC_HOME_NAME, true, span)?;
     let super_storage = if class.super_class.is_some() {
-        Some(cx.declare_captured_binding(SUPER_CTOR_NAME, true, span)?)
+        Some(declare_fresh_class_cell(cx, SUPER_CTOR_NAME, true, span)?)
     } else {
         None
     };
@@ -261,7 +280,7 @@ fn compile_class_strict(
     // Object.setPrototypeOf between definition and `new`). The cell
     // carries the class value; super() reads its live prototype.
     let class_self_storage = if class.super_class.is_some() {
-        Some(cx.declare_captured_binding(CLASS_SELF_NAME, true, span)?)
+        Some(declare_fresh_class_cell(cx, CLASS_SELF_NAME, true, span)?)
     } else {
         None
     };
@@ -286,7 +305,7 @@ fn compile_class_strict(
         }
         let pspan = (p.span.start, p.span.end);
         let binding = field_key_binding_name(idx);
-        cx.declare_captured_binding(&binding, true, pspan)?;
+        declare_fresh_class_cell(cx, &binding, true, pspan)?;
     }
     let static_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
         .body
@@ -305,7 +324,7 @@ fn compile_class_strict(
         }
         let pspan = (p.span.start, p.span.end);
         let binding = static_field_key_binding_name(idx);
-        cx.declare_captured_binding(&binding, true, pspan)?;
+        declare_fresh_class_cell(cx, &binding, true, pspan)?;
     }
 
     // Evaluate the parent class first so observable side-effects

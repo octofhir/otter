@@ -466,11 +466,11 @@ pub(crate) fn compile_update(
             key_reg: u16,
         },
         SuperStatic {
-            home_reg: u16,
+            base_reg: u16,
             name: &'b str,
         },
         SuperComputed {
-            home_reg: u16,
+            base_reg: u16,
             key_reg: u16,
             _phantom: std::marker::PhantomData<&'c ()>,
         },
@@ -554,6 +554,10 @@ pub(crate) fn compile_update(
             // through the super reference (parent-prototype lookup,
             // `this` receiver).
             let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            // §13.3.5.3 — the base is captured when the reference is
+            // made, before ToNumeric on the old value can run user
+            // code.
+            let base_reg = crate::class::emit_super_base(cx, span)?;
             let name = member.property.name.as_str();
             let name_idx = cx.intern_string_constant(name);
             cx.emit(
@@ -565,7 +569,7 @@ pub(crate) fn compile_update(
                 ],
                 span,
             );
-            UpdateTarget::SuperStatic { home_reg, name }
+            UpdateTarget::SuperStatic { base_reg, name }
         }
         SimpleAssignmentTarget::ComputedMemberExpression(member)
             if matches!(member.object, Expression::Super(_)) =>
@@ -576,6 +580,8 @@ pub(crate) fn compile_update(
             let this_guard = cx.alloc_scratch();
             cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
             let key_reg = compile_expr(cx, &member.expression, span)?;
+            // §13.3.5.3 — base captured after the key evaluates.
+            let base_reg = crate::class::emit_super_base(cx, span)?;
             cx.emit(
                 Op::LoadSuperElement,
                 vec![
@@ -586,7 +592,7 @@ pub(crate) fn compile_update(
                 span,
             );
             UpdateTarget::SuperComputed {
-                home_reg,
+                base_reg,
                 key_reg,
                 _phantom: std::marker::PhantomData,
             }
@@ -756,12 +762,12 @@ pub(crate) fn compile_update(
                 span,
             );
         }
-        UpdateTarget::SuperStatic { home_reg, name } => {
+        UpdateTarget::SuperStatic { base_reg, name } => {
             let name_idx = cx.intern_string_constant(name);
             cx.emit(
                 Op::SetSuperProperty,
                 vec![
-                    Operand::Register(home_reg),
+                    Operand::Register(base_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(next),
                 ],
@@ -769,12 +775,12 @@ pub(crate) fn compile_update(
             );
         }
         UpdateTarget::SuperComputed {
-            home_reg, key_reg, ..
+            base_reg, key_reg, ..
         } => {
             cx.emit(
                 Op::SetSuperElement,
                 vec![
-                    Operand::Register(home_reg),
+                    Operand::Register(base_reg),
                     Operand::Register(key_reg),
                     Operand::Register(next),
                 ],

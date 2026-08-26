@@ -36,6 +36,17 @@ pub(crate) struct FunctionContext {
     /// EvalDeclarationInstantiation `var arguments` early error
     /// (§19.2.1.3) for direct eval call sites inside the body.
     pub(crate) is_arrow: bool,
+    /// The frame carries a [[HomeObject]] — MethodDefinition bodies,
+    /// class constructors, and static blocks. `super.x` inside a
+    /// direct eval is legal only when the innermost non-arrow frame
+    /// has one (§19.2.1.1); a plain function nested in a method does
+    /// not, even though the capture chain could still reach the
+    /// home-object cell.
+    pub(crate) has_home_object: bool,
+    /// The frame is a DERIVED class constructor — `super()` inside a
+    /// direct eval is legal only when the innermost non-arrow frame
+    /// is one (§19.2.1.1 direct-eval SuperCall).
+    pub(crate) is_derived_ctor: bool,
     /// `true` when `super.x` in this context resolves its
     /// [[HomeObject]] through the class STATICS side
     /// (`__class_static_home`): static methods / accessors, static
@@ -192,6 +203,8 @@ impl FunctionContext {
             scopes: Vec::new(),
             is_strict: false,
             is_arrow: false,
+            has_home_object: false,
+            is_derived_ctor: false,
             super_home_static: false,
             in_param_init: false,
             binds_arguments: false,

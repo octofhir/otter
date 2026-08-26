@@ -227,7 +227,13 @@ fn compile_class_strict(
     // reads / writes hit the TDZ, body code (methods, field and
     // static initializers) sees the final class value, and writes
     // throw TypeError (class bodies are strict).
-    if let Some(name) = class_name {
+    // §15.7.14 — only a source-level BindingIdentifier creates the
+    // classBinding; a NamedEvaluation inferred name sets the `name`
+    // property but binds nothing (`let C = class { static f = C }`
+    // still reads the OUTER `C`, hitting its TDZ).
+    if let Some(name) = class_name
+        && class.id.is_some()
+    {
         let storage = cx.declare_captured_binding(name, false, span)?;
         let hole = cx.alloc_scratch();
         cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
@@ -972,6 +978,7 @@ fn compile_class_strict(
         span,
     );
     if let Some(name) = class_name
+        && class.id.is_some()
         && let Some(info) = cx.lookup_in_current_scope(name)
     {
         cx.emit_store_storage(class_reg, info.storage, span);

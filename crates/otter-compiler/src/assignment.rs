@@ -23,8 +23,8 @@ enum PreparedAssignmentTarget {
     // the key are evaluated during the prepare phase so destructuring
     // order-of-operations matches §13.15.5; the store runs through the
     // receiver via `SetSuperProperty` / `SetSuperElement`.
-    SuperProperty { home_reg: u16, name_idx: u32 },
-    SuperElement { home_reg: u16, idx_reg: u16 },
+    SuperProperty { base_reg: u16, name_idx: u32 },
+    SuperElement { base_reg: u16, idx_reg: u16 },
 }
 
 /// `Op::TdzError`'s operand carries the binding's slot index purely for
@@ -67,12 +67,14 @@ pub(crate) fn compile_assignment(
             // the parent prototype and invokes it with `this` as the
             // receiver; absent a setter it writes an own property onto
             // `this`. `Op::SetSuperProperty` performs both.
-            let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
             // §13.3.7.1 step 2 — `GetThisBinding` precedes RHS
             // evaluation so a derived-constructor TDZ ReferenceError
             // fires first.
             let this_guard = cx.alloc_scratch();
             cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            // §13.3.5.3 — the super base is captured when the
+            // reference is made, BEFORE the RHS evaluates.
+            let base_reg = crate::class::emit_super_base(cx, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let new_value = match compound_op {
                 None => compile_expr(cx, &a.right, span)?,
@@ -97,7 +99,7 @@ pub(crate) fn compile_assignment(
             cx.emit(
                 Op::SetSuperProperty,
                 vec![
-                    Operand::Register(home_reg),
+                    Operand::Register(base_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(new_value),
                 ],
@@ -213,6 +215,8 @@ pub(crate) fn compile_assignment(
             let this_guard = cx.alloc_scratch();
             cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
             let idx_reg = compile_expr(cx, &member.expression, span)?;
+            // §13.3.5.3 — base captured after the key, before the RHS.
+            let base_reg = crate::class::emit_super_base(cx, span)?;
             let new_value = match compound_op {
                 None => compile_expr(cx, &a.right, span)?,
                 Some(op) => {
@@ -244,7 +248,7 @@ pub(crate) fn compile_assignment(
             cx.emit(
                 Op::SetSuperElement,
                 vec![
-                    Operand::Register(home_reg),
+                    Operand::Register(base_reg),
                     Operand::Register(idx_reg),
                     Operand::Register(new_value),
                 ],
@@ -969,14 +973,14 @@ pub(crate) fn assign_to_target(
             // through the receiver per §13.3.5.3 + §6.2.5.5 step 6.b,
             // identical to the plain `super.X = V` lowering above.
             if matches!(member.object, Expression::Super(_)) {
-                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 cx.emit(
                     Op::SetSuperProperty,
                     vec![
-                        Operand::Register(home_reg),
+                        Operand::Register(base_reg),
                         Operand::ConstIndex(name_idx),
                         Operand::Register(value_reg),
                     ],
@@ -1003,14 +1007,14 @@ pub(crate) fn assign_to_target(
             // `super[K]` target — receiver-targeted store via
             // `SetSuperElement`, mirroring the `super[K] = V` path.
             if matches!(member.object, Expression::Super(_)) {
-                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
                 let idx_reg = compile_expr(cx, &member.expression, span)?;
+                let base_reg = crate::class::emit_super_base(cx, span)?;
                 cx.emit(
                     Op::SetSuperElement,
                     vec![
-                        Operand::Register(home_reg),
+                        Operand::Register(base_reg),
                         Operand::Register(idx_reg),
                         Operand::Register(value_reg),
                     ],
@@ -1062,12 +1066,12 @@ fn prepare_assignment_target(
         )),
         AssignmentTarget::StaticMemberExpression(member) => {
             if matches!(member.object, Expression::Super(_)) {
-                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 return Ok(Some(PreparedAssignmentTarget::SuperProperty {
-                    home_reg,
+                    base_reg,
                     name_idx,
                 }));
             }
@@ -1080,12 +1084,12 @@ fn prepare_assignment_target(
         }
         AssignmentTarget::ComputedMemberExpression(member) => {
             if matches!(member.object, Expression::Super(_)) {
-                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
                 let idx_reg = compile_expr(cx, &member.expression, span)?;
+                let base_reg = crate::class::emit_super_base(cx, span)?;
                 return Ok(Some(PreparedAssignmentTarget::SuperElement {
-                    home_reg,
+                    base_reg,
                     idx_reg,
                 }));
             }
@@ -1159,11 +1163,11 @@ fn assign_prepared_target(
             cx.emit_store_element(obj_reg, key_reg, value_reg, span);
             Ok(())
         }
-        PreparedAssignmentTarget::SuperProperty { home_reg, name_idx } => {
+        PreparedAssignmentTarget::SuperProperty { base_reg, name_idx } => {
             cx.emit(
                 Op::SetSuperProperty,
                 vec![
-                    Operand::Register(home_reg),
+                    Operand::Register(base_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(value_reg),
                 ],
@@ -1171,11 +1175,11 @@ fn assign_prepared_target(
             );
             Ok(())
         }
-        PreparedAssignmentTarget::SuperElement { home_reg, idx_reg } => {
+        PreparedAssignmentTarget::SuperElement { base_reg, idx_reg } => {
             cx.emit(
                 Op::SetSuperElement,
                 vec![
-                    Operand::Register(home_reg),
+                    Operand::Register(base_reg),
                     Operand::Register(idx_reg),
                     Operand::Register(value_reg),
                 ],

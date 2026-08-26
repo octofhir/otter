@@ -31,6 +31,7 @@ pub(crate) fn compile_static_block(
     // §15.7.4 — `super.x` inside a static block resolves through the
     // statics-side home object.
     child.super_home_static = true;
+    child.has_home_object = true;
     child.contains_direct_eval = crate::capture::program_contains_direct_eval(body);
     parent.push(child);
     parent.enter_scope();
@@ -56,6 +57,18 @@ pub(crate) fn compile_static_block(
     for stmt in body {
         compile_statement(parent, stmt)?;
     }
+    // §19.2.1.3 — a direct eval inside the block resolves the caller
+    // chain's bindings (the inner class-name binding included) through
+    // this frame's eval-binding table.
+    let mut eval_meta: Vec<otter_bytecode::DirectEvalBinding> =
+        if parent.top_mut().contains_direct_eval {
+            capture_lexical_environment_for_eval(parent);
+            capture_private_environment_for_eval(parent);
+            capture_super_bindings_for_eval(parent);
+            collect_direct_eval_bindings(parent, &[])
+        } else {
+            Vec::new()
+        };
     parent.exit_scope();
     parent.emit(Op::ReturnUndefined, vec![], span);
 
@@ -68,10 +81,9 @@ pub(crate) fn compile_static_block(
     }
 
     let captures = child.parent_captures.clone();
-    let mut no_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
-        &mut no_eval_meta,
+        &mut eval_meta,
         &mut child.eval_sites,
         child.own_upvalue_count,
     );
@@ -86,6 +98,7 @@ pub(crate) fn compile_static_block(
     // without it the eval body runs on the script path and loses the
     // synthesized frame's `this` (= the class).
     slot.contains_direct_eval = child.contains_direct_eval;
+    slot.direct_eval_bindings = eval_meta;
     slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
@@ -113,6 +126,7 @@ pub(crate) fn compile_static_field_initializer(
         .with_strict(true)
         .with_module_url(parent.module_url.clone());
     child.super_home_static = true;
+    child.has_home_object = true;
     child.contains_direct_eval = value
         .as_ref()
         .is_some_and(|expr| crate::capture::expression_contains_direct_eval(expr));
@@ -140,6 +154,18 @@ pub(crate) fn compile_static_field_initializer(
         }
         None => parent.emit(Op::ReturnUndefined, vec![], span),
     }
+    // §19.2.1.3 — a direct eval inside the initializer resolves the
+    // caller chain's bindings (the inner class-name binding included)
+    // through this frame's eval-binding table.
+    let mut eval_meta: Vec<otter_bytecode::DirectEvalBinding> =
+        if parent.top_mut().contains_direct_eval {
+            capture_lexical_environment_for_eval(parent);
+            capture_private_environment_for_eval(parent);
+            capture_super_bindings_for_eval(parent);
+            collect_direct_eval_bindings(parent, &[])
+        } else {
+            Vec::new()
+        };
     parent.exit_scope();
 
     let mut child = parent.pop();
@@ -151,10 +177,9 @@ pub(crate) fn compile_static_field_initializer(
     }
 
     let captures = child.parent_captures.clone();
-    let mut no_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
-        &mut no_eval_meta,
+        &mut eval_meta,
         &mut child.eval_sites,
         child.own_upvalue_count,
     );
@@ -169,6 +194,7 @@ pub(crate) fn compile_static_field_initializer(
     // without it the eval body runs on the script path and loses the
     // synthesized frame's `this` (= the class).
     slot.contains_direct_eval = child.contains_direct_eval;
+    slot.direct_eval_bindings = eval_meta;
     slot.eval_sites = std::mem::take(&mut child.eval_sites);
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;

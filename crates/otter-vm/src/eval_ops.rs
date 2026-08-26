@@ -112,6 +112,7 @@ impl Interpreter {
         let new_target_allowed = flags & 4 != 0;
         let new_target_suppressed = flags & 8 != 0;
         let super_property_allowed = flags & 16 != 0;
+        let super_call_allowed = flags & 32 != 0;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
         if let Some(s) = value.as_string(&self.gc_heap) {
@@ -157,6 +158,7 @@ impl Interpreter {
                     new_target_allowed,
                     in_class_field_initializer: new_target_suppressed,
                     super_property_allowed,
+                    super_call_allowed,
                 },
             )?
         } else {
@@ -170,6 +172,7 @@ impl Interpreter {
                     new_target_allowed,
                     in_class_field_initializer: new_target_suppressed,
                     super_property_allowed,
+                    super_call_allowed,
                 },
                 &cell_sources,
                 new_target_suppressed,

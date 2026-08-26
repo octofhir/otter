@@ -176,7 +176,24 @@ pub(crate) fn compile_super_computed_method_call(
     Ok(dst)
 }
 
-/// load. Resolves to a register holding the looked-up value.
+/// Resolve the super-store base — the home object's live
+/// [[GetPrototypeOf]] — into a register. §13.3.5.3
+/// MakeSuperPropertyReference reads the base when the reference is
+/// made (before the RHS evaluates), so every `super.X = V` lowering
+/// materialises it eagerly and hands the base to the store op.
+pub(crate) fn emit_super_base(cx: &mut Compiler, span: (u32, u32)) -> Result<u16, CompileError> {
+    let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
+    let base = cx.alloc_scratch();
+    cx.emit(
+        Op::GetPrototype,
+        [Operand::Register(base), Operand::Register(home_reg)],
+        span,
+    );
+    Ok(base)
+}
+
+/// Compile a bare `super.name` value load. Resolves to a register
+/// holding the looked-up value.
 ///
 /// Unlike [`load_super_method`] (used by the call path, where `this`
 /// is supplied separately at the call site), a bare `super.name`

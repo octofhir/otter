@@ -139,6 +139,7 @@ pub fn compile_eval_source(
     new_target_allowed: bool,
     in_class_field_initializer: bool,
     super_property_allowed: bool,
+    super_call_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     // A `super` reference parses cleanly and is rejected by our own
@@ -160,6 +161,7 @@ pub fn compile_eval_source(
                 new_target_allowed,
                 in_class_field_initializer,
                 super_property_allowed,
+                super_call_allowed,
             )
         },
     ) {
@@ -168,7 +170,8 @@ pub fn compile_eval_source(
     };
     match direct {
         Err(CompileError::Syntax { ref messages, .. })
-            if (super_property_allowed && messages.iter().any(|m| m.contains("super")))
+            if ((super_property_allowed || super_call_allowed)
+                && messages.iter().any(|m| m.contains("super")))
                 || (new_target_allowed && messages.iter().any(|m| m.contains("new.target"))) =>
         {
             // §19.2.1.1 — `super` references and `new.target` are legal
@@ -182,13 +185,25 @@ pub fn compile_eval_source(
             // extracted statements are compiled with the original eval
             // flags, so runtime binding of `super` / `new.target`
             // resolves against the real caller.
-            let wrapped = format!("({{ __otter_eval__() {{\n{source}\n}} }});");
+            // A `super()` call only parses inside a derived-class
+            // constructor, so a super-call-capable eval re-parses in
+            // that shape; everything else uses the concise-method
+            // wrapper (which supplies a [[HomeObject]] for `super.x`).
+            let wrapped = if super_call_allowed {
+                format!("(class extends Object {{ constructor() {{\n{source}\n}} }});")
+            } else {
+                format!("({{ __otter_eval__() {{\n{source}\n}} }});")
+            };
             otter_syntax::with_program_goal(
                 &wrapped,
                 kind,
                 otter_syntax::SourceGoal::Script,
                 |program| {
-                    let body = extract_wrapped_eval_body(program)?;
+                    let body = if super_call_allowed {
+                        extract_wrapped_eval_ctor_body(program)?
+                    } else {
+                        extract_wrapped_eval_body(program)?
+                    };
                     if statements_contain_top_level_return(&body.statements) {
                         return Err(CompileError::Unsupported {
                             node: "SyntaxError: return is not allowed in eval code".to_string(),
@@ -211,6 +226,7 @@ pub fn compile_eval_source(
                         new_target_allowed,
                         in_class_field_initializer,
                         super_property_allowed,
+                        super_call_allowed,
                     )
                 },
             )
@@ -218,6 +234,32 @@ pub fn compile_eval_source(
         }
         other => other,
     }
+}
+
+/// Locate the synthetic derived-ctor wrapper's body:
+/// `(class extends Object { constructor() { ... } });`.
+fn extract_wrapped_eval_ctor_body<'a, 'b>(
+    program: &'b Program<'a>,
+) -> Result<&'b oxc_ast::ast::FunctionBody<'a>, CompileError> {
+    use oxc_ast::ast::{ClassElement, Expression, Statement};
+    let err = || CompileError::Unsupported {
+        node: "internal: eval super-wrapper shape mismatch".to_string(),
+        span: (program.span.start, program.span.end),
+    };
+    let Some(Statement::ExpressionStatement(es)) = program.body.first() else {
+        return Err(err());
+    };
+    let mut expr = &es.expression;
+    while let Expression::ParenthesizedExpression(p) = expr {
+        expr = &p.expression;
+    }
+    let Expression::ClassExpression(class) = expr else {
+        return Err(err());
+    };
+    let Some(ClassElement::MethodDefinition(ctor)) = class.body.body.first() else {
+        return Err(err());
+    };
+    ctor.value.body.as_deref().ok_or_else(err)
 }
 
 /// Locate the synthetic wrapper's method body:
@@ -325,8 +367,10 @@ fn compile_eval_parts(
     new_target_allowed: bool,
     in_class_field_initializer: bool,
     super_property_allowed: bool,
+    super_call_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    if super_property_allowed && statements_contain_super_call(program.body) {
+    if !super_call_allowed && super_property_allowed && statements_contain_super_call(program.body)
+    {
         return Err(CompileError::Unsupported {
             node: "SyntaxError: super() call is not allowed in this eval code".to_string(),
             span: program.span,
@@ -373,6 +417,7 @@ fn compile_eval_parts(
             caller_scope,
             new_target_allowed,
             super_property_allowed,
+            super_call_allowed,
         )
     }
 }
@@ -434,6 +479,7 @@ pub(crate) fn compile_program_for_eval(
     caller_scope: Option<&[EvalCallerBinding]>,
     new_target_allowed: bool,
     super_property_allowed: bool,
+    super_call_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     compile_program_with_mode_impl_super(
         program,
@@ -444,6 +490,7 @@ pub(crate) fn compile_program_for_eval(
         caller_scope,
         new_target_allowed,
         super_property_allowed,
+        super_call_allowed,
     )
 }
 
@@ -547,6 +594,7 @@ pub(crate) fn compile_program_with_mode_impl(
         caller_scope,
         new_target_allowed,
         false,
+        false,
     )
 }
 
@@ -560,6 +608,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
     caller_scope: Option<&[EvalCallerBinding]>,
     new_target_allowed: bool,
     super_property_allowed: bool,
+    super_call_allowed: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let source_text = program.source_text;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
@@ -577,7 +626,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
     strict_validation::validate_strict_mode_early_errors(
         program.body,
         force_strict || program.strict_directive,
-        super_property_allowed,
+        super_property_allowed || super_call_allowed,
     )?;
     if !new_target_allowed {
         strict_validation::validate_script_new_target_early_errors(program.body)?;
@@ -676,6 +725,11 @@ pub(crate) fn compile_program_with_mode_impl_super(
     }
     top.own_upvalue_count = caller_slot_count;
 
+    // §19.2.1.1 — a nested direct eval inside this eval body inherits
+    // the caller's `super` legality: the eval main frame stands in for
+    // the method / derived-constructor frame the outer eval ran in.
+    top.has_home_object = super_property_allowed;
+    top.is_derived_ctor = super_call_allowed;
     let mut cx = Compiler::new(top);
     cx.suppress_global_mirror = eval_mode && (main_is_strict || !caller.is_empty());
     cx.in_eval = eval_mode;

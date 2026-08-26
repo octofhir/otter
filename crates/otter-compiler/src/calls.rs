@@ -811,17 +811,46 @@ pub(crate) fn compute_eval_flags(cx: &mut Compiler) -> i32 {
     let new_target_allowed = cx.eval_new_target_allowed
         || cx.in_field_initializer
         || cx.stack.iter().skip(1).any(|frame| !frame.is_arrow);
+    // §19.2.1.1 — `super.x` in eval is legal only when the innermost
+    // non-arrow enclosing function carries a [[HomeObject]] (method,
+    // class constructor, static block). A plain function nested in a
+    // method is opaque even though the capture chain could still reach
+    // the home cell.
+    let home_frame = cx
+        .stack
+        .iter()
+        .rev()
+        .find(|frame| !frame.is_arrow)
+        .is_some_and(|frame| frame.has_home_object);
     let super_allowed = cx.in_field_initializer
-        || cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
-        || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some()
-        || cx
-            .resolve_capture(crate::class::SUPER_STATIC_HOME_NAME)
-            .is_some();
+        || (home_frame
+            && (cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
+                || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some()
+                || cx
+                    .resolve_capture(crate::class::SUPER_STATIC_HOME_NAME)
+                    .is_some()));
+    // §19.2.1.1 — `super()` in eval is legal only when the innermost
+    // non-arrow enclosing function is a derived class constructor —
+    // and never in a field initializer (§15.7.1 ClassElementName
+    // Contains SuperCall is a Syntax Error even though initializers
+    // compile into the constructor frame).
+    let super_call_allowed = !cx.in_field_initializer
+        && cx
+            .stack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_arrow)
+            .is_some_and(|frame| frame.is_derived_ctor)
+        && (cx.lookup_binding(crate::class::SUPER_CTOR_NAME).is_some()
+            || cx.resolve_capture(crate::class::SUPER_CTOR_NAME).is_some()
+            || cx.lookup_binding(crate::class::CLASS_SELF_NAME).is_some()
+            || cx.resolve_capture(crate::class::CLASS_SELF_NAME).is_some());
     i32::from(forbid_var_arguments)
         | (i32::from(cx.in_param_init) << 1)
         | (i32::from(new_target_allowed) << 2)
         | (i32::from(cx.in_field_initializer) << 3)
         | (i32::from(super_allowed) << 4)
+        | (i32::from(super_call_allowed) << 5)
 }
 
 /// `true` for a syntactic non-spread `eval(...)` site whose callee name

@@ -1887,6 +1887,10 @@ pub struct EvalCompileOptions {
     /// [[HomeObject]] (method / field initializer), making
     /// `super.x` legal in the eval body.
     pub super_property_allowed: bool,
+    /// §19.2.1.1 — the direct-eval call site sits (through arrows)
+    /// inside a derived class constructor, making `super()` legal in
+    /// the eval body.
+    pub super_call_allowed: bool,
 }
 
 /// Where an error's captured stack points, resolved against the source the

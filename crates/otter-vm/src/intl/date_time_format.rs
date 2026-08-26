@@ -1004,15 +1004,23 @@ pub(crate) fn temporal_to_locale_string(
     // the intersection strips the offending component.
     validate_temporal_options(&payload, &receiver, ctx.heap())?;
     // §a calendared value formats only through its own calendar (or the
-    // ISO calendar).
-    if let Some(value_calendar) = temporal_calendar_id(&receiver, ctx.heap())
-        && value_calendar != "iso8601"
-        && payload.calendar != value_calendar
-    {
-        return Err(NativeError::RangeError {
-            name: "toLocaleString",
-            reason: "calendar of the Temporal value does not match the formatter".to_string(),
-        });
+    // ISO calendar) — except a PlainYearMonth / PlainMonthDay, whose
+    // reference-year/-day rendering depends on the calendar, so even an
+    // ISO instance must match the formatter's calendar exactly.
+    if let Some(value_calendar) = temporal_calendar_id(&receiver, ctx.heap()) {
+        let is_ym_md = matches!(
+            receiver.as_temporal(ctx.heap()).map(|t| t.kind()),
+            Some(
+                crate::temporal::TemporalKind::PlainYearMonth
+                    | crate::temporal::TemporalKind::PlainMonthDay
+            )
+        );
+        if payload.calendar != value_calendar && (is_ym_md || value_calendar != "iso8601") {
+            return Err(NativeError::RangeError {
+                name: "toLocaleString",
+                reason: "calendar of the Temporal value does not match the formatter".to_string(),
+            });
+        }
     }
     apply_temporal_field_intersection(&mut payload, &receiver, "toLocaleString", ctx.heap())?;
     let civil = arg_to_civil_zoned(ctx, Some(&receiver), "toLocaleString", &payload)?;
@@ -1094,16 +1102,22 @@ fn arg_to_civil_inner(
 ) -> Result<Civil, NativeError> {
     if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
         match t.payload_clone(ctx.heap()) {
+            // Civil carries ISO fields — the formatter re-projects them
+            // into its own calendar, so a non-ISO value must contribute
+            // its ISO date, not its calendar-relative fields.
             TemporalPayload::PlainDateTime(pdt) => Ok(Civil::new(
-                pdt.year(),
-                pdt.month(),
-                pdt.day(),
+                pdt.iso_year(),
+                pdt.iso_month(),
+                pdt.iso_day(),
                 pdt.hour(),
                 pdt.minute(),
                 pdt.second(),
                 subsecond_nanos(pdt.millisecond(), pdt.microsecond(), pdt.nanosecond()),
             )),
-            TemporalPayload::PlainDate(pd) => Ok(Civil::new(pd.year(), pd.month(), pd.day(), 0, 0, 0, 0)),
+            TemporalPayload::PlainDate(pd) => {
+                let iso = epoch_millis_to_civil((pd.epoch_ns_for_utc().as_i128() / 1_000_000) as i64);
+                Ok(Civil::new(iso.year, iso.month, iso.day, 0, 0, 0, 0))
+            }
             // §FormatDateTime rejects a ZonedDateTime through
             // `DateTimeFormat.prototype.format` (the formatter cannot
             // reconcile its own time zone with the value's); only the
@@ -1113,16 +1127,19 @@ fn arg_to_civil_inner(
                 name,
                 reason: "Temporal.ZonedDateTime is not supported by DateTimeFormat; use its toLocaleString".to_string(),
             }),
-            TemporalPayload::ZonedDateTime(zdt) => Ok(Civil::new(
-                zdt.year(),
-                zdt.month(),
-                zdt.day(),
-                zdt.hour(),
-                zdt.minute(),
-                zdt.second(),
-                subsecond_nanos(zdt.millisecond(), zdt.microsecond(), zdt.nanosecond()),
-            )
-            .with_epoch_millis(zdt.epoch_milliseconds())),
+            TemporalPayload::ZonedDateTime(zdt) => {
+                let pdt = zdt.to_plain_date_time();
+                Ok(Civil::new(
+                    pdt.iso_year(),
+                    pdt.iso_month(),
+                    pdt.iso_day(),
+                    zdt.hour(),
+                    zdt.minute(),
+                    zdt.second(),
+                    subsecond_nanos(zdt.millisecond(), zdt.microsecond(), zdt.nanosecond()),
+                )
+                .with_epoch_millis(zdt.epoch_milliseconds()))
+            }
             // PlainTime carries no date; render against the Unix-epoch
             // reference date the same way `DateTimeFormat.format` does.
             TemporalPayload::PlainTime(pt) => Ok(Civil::new(
@@ -1134,18 +1151,13 @@ fn arg_to_civil_inner(
                 pt.second(),
                 subsecond_nanos(pt.millisecond(), pt.microsecond(), pt.nanosecond()),
             )),
-            TemporalPayload::PlainYearMonth(pym) => Ok(Civil::new(pym.year(), pym.month(), 1, 0, 0, 0, 0)),
+            TemporalPayload::PlainYearMonth(pym) => {
+                let iso = epoch_millis_to_civil((pym.epoch_ns_for_utc().as_i128() / 1_000_000) as i64);
+                Ok(Civil::new(iso.year, iso.month, iso.day, 0, 0, 0, 0))
+            }
             TemporalPayload::PlainMonthDay(pmd) => {
-                // MonthCode is `M01`..`M12`; the ISO reference year 1972
-                // is the standard anchor for a bare month/day.
-                let month = pmd
-                    .month_code()
-                    .as_str()
-                    .trim_start_matches('M')
-                    .trim_end_matches('L')
-                    .parse::<u8>()
-                    .unwrap_or(1);
-                Ok(Civil::new(1972, month, pmd.day(), 0, 0, 0, 0))
+                let iso = epoch_millis_to_civil((pmd.epoch_ns_for_utc().as_i128() / 1_000_000) as i64);
+                Ok(Civil::new(iso.year, iso.month, iso.day, 0, 0, 0, 0))
             }
             TemporalPayload::Instant(inst) => {
                 Ok(epoch_millis_to_civil_for_payload(
@@ -1695,6 +1707,8 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
             let mut formatted = formatter.format(&zdt).to_string();
             localize_fraction_separator(&mut formatted, payload);
             pad_two_digit_hour(&mut formatted, payload);
+            apply_h24_midnight(&mut formatted, civil.hour, payload);
+            strip_zero_offset_gmt(&mut formatted);
             normalize_day_period_separator(&mut formatted, payload);
             substitute_flexible_day_period(&mut formatted, civil, payload);
             return Some(formatted);
@@ -1705,6 +1719,8 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         let mut formatted = formatter.format(&time).to_string();
         localize_fraction_separator(&mut formatted, payload);
         pad_two_digit_hour(&mut formatted, payload);
+        apply_h24_midnight(&mut formatted, civil.hour, payload);
+        strip_zero_offset_gmt(&mut formatted);
         normalize_day_period_separator(&mut formatted, payload);
         substitute_flexible_day_period(&mut formatted, civil, payload);
         append_time_zone_text(&mut formatted, payload);
@@ -1727,6 +1743,8 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         let mut formatted = formatter.format(&zdt).to_string();
         localize_fraction_separator(&mut formatted, payload);
         pad_two_digit_hour(&mut formatted, payload);
+        apply_h24_midnight(&mut formatted, civil.hour, payload);
+        strip_zero_offset_gmt(&mut formatted);
         normalize_day_period_separator(&mut formatted, payload);
         substitute_flexible_day_period(&mut formatted, civil, payload);
         shorten_short_style_year(&mut formatted, civil, payload);
@@ -1741,6 +1759,8 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     let mut formatted = formatter.format(&dt).to_string();
     localize_fraction_separator(&mut formatted, payload);
     pad_two_digit_hour(&mut formatted, payload);
+    apply_h24_midnight(&mut formatted, civil.hour, payload);
+    strip_zero_offset_gmt(&mut formatted);
     normalize_day_period_separator(&mut formatted, payload);
     substitute_flexible_day_period(&mut formatted, civil, payload);
     shorten_short_style_year(&mut formatted, civil, payload);
@@ -1949,6 +1969,19 @@ fn icu_zone_info(
     )
 }
 
+/// CLDR renders a zero offset in the short localized-GMT format as the
+/// bare "GMT"; icu4x's offset fallback emits "GMT+0", so the zero
+/// suffix is stripped after the fact.
+fn strip_zero_offset_gmt(formatted: &mut String) {
+    if let Some(pos) = formatted.find("GMT+0") {
+        let after = pos + 5;
+        let next = formatted.as_bytes().get(after);
+        if next.is_none_or(|b| !b.is_ascii_digit() && *b != b':') {
+            formatted.replace_range(pos + 3..after, "");
+        }
+    }
+}
+
 fn time_zone_display_name(payload: &DateTimeFormatPayload) -> Option<String> {
     payload.time_zone_name?;
     let zone = payload.time_zone.as_deref().unwrap_or("UTC");
@@ -2125,6 +2158,33 @@ fn shorten_short_style_year_parts(
             *text = two;
             break;
         }
+    }
+}
+
+/// The h24 cycle renders midnight as hour 24 — icu4x models no h24
+/// keyword (it formats through h23), so the midnight hour field is
+/// patched after the fact: the first "00"/"0" digit run that starts a
+/// time field (followed by `:`, preceded by nothing, a space, or any
+/// non-digit separator) becomes "24".
+fn apply_h24_midnight(formatted: &mut String, hour: u8, payload: &DateTimeFormatPayload) {
+    if !matches!(payload.hour_cycle, Some(DtHourCycle::H24)) || hour != 0 {
+        return;
+    }
+    let bytes = formatted.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'0' {
+            let start_ok = i == 0 || (!bytes[i - 1].is_ascii_digit() && bytes[i - 1] != b':');
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'0' {
+                j += 1;
+            }
+            if start_ok && j < bytes.len() && bytes[j] == b':' {
+                formatted.replace_range(i..j, "24");
+                return;
+            }
+        }
+        i += 1;
     }
 }
 

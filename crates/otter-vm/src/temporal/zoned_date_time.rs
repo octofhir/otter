@@ -29,12 +29,7 @@ const CLASS: &str = "Temporal.ZonedDateTime";
 
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
-    let Some(bi) = arg_or_undef(args, 0).as_big_int() else {
-        return Err(NativeError::TypeError {
-            name: CLASS,
-            reason: "epochNanoseconds must be a BigInt".to_string(),
-        });
-    };
+    let bi = crate::temporal::helpers::to_big_int_field(ctx, &arg_or_undef(args, 0), CLASS)?;
     let nanos = bi
         .with_inner(ctx.heap(), |big| big.to_i128())
         .ok_or_else(|| NativeError::RangeError {
@@ -48,8 +43,11 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         });
     };
     let tz_text = tz_str.to_lossy_string(ctx.heap());
-    let time_zone =
-        temporal_rs::TimeZone::try_from_str(&tz_text).map_err(|e| temporal_err(e, CLASS))?;
+    // §Temporal.ZonedDateTime constructor takes a bare time zone
+    // identifier only — an ISO string with a bracketed annotation is
+    // a RangeError here (unlike ToTemporalTimeZoneIdentifier callers).
+    let time_zone = temporal_rs::TimeZone::try_from_identifier_str(&tz_text)
+        .map_err(|e| temporal_err(e, CLASS))?;
     let calendar = arg_to_calendar(args, 2, ctx.heap(), CLASS)?;
     let zdt = temporal_rs::ZonedDateTime::try_new(nanos, time_zone, calendar)
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -110,14 +108,9 @@ pub(crate) fn parse_zdt_arg_with_options(
         // each via a getter/Proxy-aware [[Get]]. `timeZone` is
         // required.
         let calendar = read_calendar_field(ctx, *v, CLASS)?;
-        let (fields, offset_str, tz_v) =
+        let (fields, offset, tz_v) =
             crate::temporal::helpers::parse_relative_fields(ctx, *v, &calendar, CLASS)?;
         let calendar_fields = fields.calendar_fields;
-        let offset = offset_str
-            .map(|s| {
-                temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))
-            })
-            .transpose()?;
         if tz_v.is_undefined() {
             return Err(NativeError::TypeError {
                 name: CLASS,
@@ -147,17 +140,16 @@ pub(crate) fn parse_zdt_arg_with_options(
         let text = s.to_lossy_string(ctx.heap());
         // §ToTemporalZonedDateTime parses the string before reading the
         // options, so an ISO-invalid string rejects before any option is
-        // observed. Validate the parse first, then read the options and
-        // produce the final result with them applied.
-        temporal_rs::ZonedDateTime::from_utf8(
-            text.as_bytes(),
-            temporal_rs::options::Disambiguation::Compatible,
-            temporal_rs::options::OffsetDisambiguation::Reject,
-        )
-        .map_err(|e| temporal_err(e, CLASS))?;
+        // observed — but the offset/disambiguation interpretation runs
+        // only after the options are read, so a zone-mismatched offset
+        // must not reject here when `offset: "use"/"prefer"/"ignore"`
+        // would accept it.
+        let parsed =
+            temporal_rs::parsed_intermediates::ParsedZonedDateTime::from_utf8(text.as_bytes())
+                .map_err(|e| temporal_err(e, CLASS))?;
         let (_, disambiguation, offset_option) = read_zdt_options(ctx, options_args)?;
-        return temporal_rs::ZonedDateTime::from_utf8(
-            text.as_bytes(),
+        return temporal_rs::ZonedDateTime::from_parsed(
+            parsed,
             disambiguation.unwrap_or(temporal_rs::options::Disambiguation::Compatible),
             offset_option.unwrap_or(temporal_rs::options::OffsetDisambiguation::Reject),
         )
@@ -457,13 +449,8 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     }
     crate::temporal::helpers::reject_temporal_like_keys(ctx, arg, CLASS)?;
     let calendar = zdt.calendar().clone();
-    let (dt_fields, offset_str) =
+    let (dt_fields, offset) =
         crate::temporal::helpers::parse_zoned_with_fields(ctx, arg, &calendar, CLASS)?;
-    let offset = offset_str
-        .map(|s| {
-            temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS))
-        })
-        .transpose()?;
     let fields = temporal_rs::fields::ZonedDateTimeFields {
         calendar_fields: dt_fields.calendar_fields,
         time: dt_fields.time,
@@ -547,8 +534,8 @@ fn impl_get_time_zone_transition(
     // coerced to a string (observable getter + toString).
     let dir_str = if let Some(s) = param.as_string(ctx.heap()) {
         s.to_lossy_string(ctx.heap())
-    } else if let Some(obj) = param.as_object() {
-        read_option_string(ctx, Value::object(obj), "direction", CLASS)?.ok_or_else(|| {
+    } else if param.is_object_type() {
+        read_option_string(ctx, param, "direction", CLASS)?.ok_or_else(|| {
             NativeError::RangeError {
                 name: CLASS,
                 reason: "getTimeZoneTransition: `direction` option is required".to_string(),
@@ -620,9 +607,12 @@ zoned_date_time_getter!(get_days_in_month, zdt => Value::number_i32(zdt.days_in_
 zoned_date_time_getter!(get_days_in_year, zdt => Value::number_i32(zdt.days_in_year() as i32));
 zoned_date_time_getter!(get_months_in_year, zdt => Value::number_i32(zdt.months_in_year() as i32));
 zoned_date_time_getter!(get_in_leap_year, zdt => Value::boolean(zdt.in_leap_year()));
-zoned_date_time_getter!(get_hours_in_day, zdt => zdt
-    .hours_in_day()
-    .map_or(Value::undefined(), Value::number_f64));
+fn get_hours_in_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let zdt = require_zoned_date_time(ctx)?;
+    zdt.hours_in_day()
+        .map(Value::number_f64)
+        .map_err(|e| temporal_err(e, CLASS))
+}
 zoned_date_time_getter!(get_epoch_milliseconds, zdt => Value::number_f64(zdt.epoch_milliseconds() as f64));
 zoned_date_time_getter!(get_offset_nanoseconds, zdt => Value::number_f64(zdt.offset_nanoseconds() as f64));
 // `era`/`eraYear` route through the calendar-aware `PlainDate`

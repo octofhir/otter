@@ -446,9 +446,7 @@ fn parse_relative_to_value(
             .with_timezone(Some(tz));
         partial.calendar = calendar;
         if let Some(o) = offset {
-            let parsed = temporal_rs::UtcOffset::from_utf8(o.as_bytes())
-                .map_err(|e| temporal_err(e, CLASS))?;
-            partial = partial.with_offset(parsed);
+            partial = partial.with_offset(o);
         }
         let zdt = temporal_rs::ZonedDateTime::from_partial(
             partial,

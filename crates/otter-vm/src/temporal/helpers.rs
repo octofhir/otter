@@ -117,6 +117,27 @@ pub fn to_number_field(
     Ok(crate::number::parse::to_number_value(value, ctx.heap()))
 }
 
+/// §7.1.13 ToBigInt on a Temporal field: a Boolean converts, a String
+/// parses via StringToBigInt, an object runs ToPrimitive(number)
+/// observably, and a Number / Symbol / undefined is a TypeError.
+pub fn to_big_int_field(
+    ctx: &mut NativeCtx<'_>,
+    value: &Value,
+    class: &'static str,
+) -> Result<crate::bigint::BigIntValue, NativeError> {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: class,
+            reason: "missing execution context".to_string(),
+        })?;
+    let computed = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_big_int_or_throw(interp, stack, &exec, value)
+    });
+    computed.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))
+}
+
 pub fn to_integer_with_truncation(
     ctx: &mut NativeCtx<'_>,
     value: &Value,
@@ -1006,31 +1027,80 @@ pub fn parse_rounding_options(
     Ok(options)
 }
 
+/// A time property bag read with full-integer values preserved, so
+/// §RegulateTime can apply `overflow` after the options are read.
+#[derive(Default, Clone, Copy)]
+pub struct RawPartialTime {
+    pub hour: Option<i64>,
+    pub minute: Option<i64>,
+    pub second: Option<i64>,
+    pub millisecond: Option<i64>,
+    pub microsecond: Option<i64>,
+    pub nanosecond: Option<i64>,
+}
+
+/// §ToTemporalTimeRecord field reads (alphabetical, observable), with
+/// values kept as raw integers for a later [`regulate_partial_time`].
+pub fn parse_partial_time_raw(
+    ctx: &mut NativeCtx<'_>,
+    target: Value,
+    class: &'static str,
+) -> Result<RawPartialTime, NativeError> {
+    // Alphabetical read order is observable — each read fires before
+    // the next field's [[Get]].
+    let hour = read_partial_integer(ctx, target, "hour", class)?;
+    let microsecond = read_partial_integer(ctx, target, "microsecond", class)?;
+    let millisecond = read_partial_integer(ctx, target, "millisecond", class)?;
+    let minute = read_partial_integer(ctx, target, "minute", class)?;
+    let nanosecond = read_partial_integer(ctx, target, "nanosecond", class)?;
+    let second = read_partial_integer(ctx, target, "second", class)?;
+    Ok(RawPartialTime {
+        hour,
+        minute,
+        second,
+        millisecond,
+        microsecond,
+        nanosecond,
+    })
+}
+
+/// §RegulateTime applied per field: `Reject` throws a `RangeError` on
+/// any out-of-bounds component, `Constrain` clamps into the valid time
+/// range.
+pub fn regulate_partial_time(
+    raw: RawPartialTime,
+    overflow: temporal_rs::options::Overflow,
+    class: &'static str,
+) -> Result<temporal_rs::partial::PartialTime, NativeError> {
+    let reject = matches!(overflow, temporal_rs::options::Overflow::Reject);
+    let field = |v: Option<i64>, max: i64, name: &str| -> Result<Option<u16>, NativeError> {
+        match v {
+            None => Ok(None),
+            Some(n) if (0..=max).contains(&n) => Ok(Some(n as u16)),
+            Some(n) if reject => Err(NativeError::RangeError {
+                name: class,
+                reason: format!("{name} {n} out of range with overflow \"reject\""),
+            }),
+            Some(n) => Ok(Some(n.clamp(0, max) as u16)),
+        }
+    };
+    Ok(temporal_rs::partial::PartialTime {
+        hour: field(raw.hour, 23, "hour")?.map(|v| v as u8),
+        minute: field(raw.minute, 59, "minute")?.map(|v| v as u8),
+        second: field(raw.second, 59, "second")?.map(|v| v as u8),
+        millisecond: field(raw.millisecond, 999, "millisecond")?,
+        microsecond: field(raw.microsecond, 999, "microsecond")?,
+        nanosecond: field(raw.nanosecond, 999, "nanosecond")?,
+    })
+}
+
 pub fn parse_partial_time(
     ctx: &mut NativeCtx<'_>,
     target: Value,
     class: &'static str,
 ) -> Result<temporal_rs::partial::PartialTime, NativeError> {
-    let mut t = temporal_rs::partial::PartialTime::default();
-    if let Some(v) = read_partial_integer(ctx, target, "hour", class)? {
-        t.hour = Some(v.clamp(0, u8::MAX as i64) as u8);
-    }
-    if let Some(v) = read_partial_integer(ctx, target, "microsecond", class)? {
-        t.microsecond = Some(v.clamp(0, u16::MAX as i64) as u16);
-    }
-    if let Some(v) = read_partial_integer(ctx, target, "millisecond", class)? {
-        t.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
-    }
-    if let Some(v) = read_partial_integer(ctx, target, "minute", class)? {
-        t.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
-    }
-    if let Some(v) = read_partial_integer(ctx, target, "nanosecond", class)? {
-        t.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
-    }
-    if let Some(v) = read_partial_integer(ctx, target, "second", class)? {
-        t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
-    }
-    Ok(t)
+    let raw = parse_partial_time_raw(ctx, target, class)?;
+    regulate_partial_time(raw, temporal_rs::options::Overflow::Constrain, class)
 }
 
 /// True when no recognised calendar field was present on a `with()`
@@ -1313,14 +1383,21 @@ pub fn parse_date_time_fields(
 /// §ToRelativeTemporalObject property-bag read: the date-time keys plus
 /// `offset` and `timeZone`, ALL in one alphabetical pass (…nanosecond,
 /// offset, second, timeZone, year), each via a getter/Proxy-aware
-/// [[Get]]. Returns the fields together with the raw `offset` string
+/// [[Get]]. Returns the fields together with the parsed `offset`
 /// and the raw `timeZone` value (`undefined` when absent).
 pub fn parse_relative_fields(
     ctx: &mut NativeCtx<'_>,
     target: Value,
     calendar: &temporal_rs::Calendar,
     class: &'static str,
-) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>, Value), NativeError> {
+) -> Result<
+    (
+        temporal_rs::fields::DateTimeFields,
+        Option<temporal_rs::UtcOffset>,
+        Value,
+    ),
+    NativeError,
+> {
     parse_zoned_bag_fields(ctx, target, calendar, class, true)
 }
 
@@ -1332,7 +1409,13 @@ pub fn parse_zoned_with_fields(
     target: Value,
     calendar: &temporal_rs::Calendar,
     class: &'static str,
-) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>), NativeError> {
+) -> Result<
+    (
+        temporal_rs::fields::DateTimeFields,
+        Option<temporal_rs::UtcOffset>,
+    ),
+    NativeError,
+> {
     let (fields, offset, _) = parse_zoned_bag_fields(ctx, target, calendar, class, false)?;
     Ok((fields, offset))
 }
@@ -1343,7 +1426,14 @@ fn parse_zoned_bag_fields(
     calendar: &temporal_rs::Calendar,
     class: &'static str,
     include_time_zone: bool,
-) -> Result<(temporal_rs::fields::DateTimeFields, Option<String>, Value), NativeError> {
+) -> Result<
+    (
+        temporal_rs::fields::DateTimeFields,
+        Option<temporal_rs::UtcOffset>,
+        Value,
+    ),
+    NativeError,
+> {
     let has_eras = !calendar.is_iso();
     let mut cf = temporal_rs::fields::CalendarFields::default();
     let mut time = temporal_rs::partial::PartialTime::default();
@@ -1401,7 +1491,13 @@ fn parse_zoned_bag_fields(
     if let Some(v) = read_partial_integer(ctx, target, "nanosecond", class)? {
         time.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
     }
-    let offset = read_required_string(ctx, target, "offset", class)?;
+    // §ToOffsetString runs at read time: the syntax is validated here,
+    // before any later field (`second`, `timeZone`, `year`) is read.
+    let offset = read_required_string(ctx, target, "offset", class)?
+        .map(|s| {
+            temporal_rs::UtcOffset::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, class))
+        })
+        .transpose()?;
     if let Some(v) = read_partial_integer(ctx, target, "second", class)? {
         time.second = Some(v.clamp(0, u8::MAX as i64) as u8);
     }

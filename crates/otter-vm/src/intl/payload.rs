@@ -246,12 +246,29 @@ pub struct PluralRulesPayload {
     pub locale: String,
     /// `type` option (`"cardinal"` / `"ordinal"`).
     pub kind: String,
+    /// `notation` option.
+    pub notation: String,
+    /// `compactDisplay` option (reported only for compact notation).
+    pub compact_display: String,
     /// `minimumIntegerDigits`.
     pub minimum_integer_digits: u8,
     /// `minimumFractionDigits`.
     pub minimum_fraction_digits: u8,
     /// `maximumFractionDigits`.
     pub maximum_fraction_digits: u8,
+    /// `minimumSignificantDigits` — `Some` selects significant-digit
+    /// rounding.
+    pub minimum_significant_digits: Option<u8>,
+    /// `maximumSignificantDigits`.
+    pub maximum_significant_digits: Option<u8>,
+    /// `roundingIncrement`.
+    pub rounding_increment: u16,
+    /// `roundingMode`.
+    pub rounding_mode: String,
+    /// `roundingPriority`.
+    pub rounding_priority: String,
+    /// `trailingZeroDisplay`.
+    pub trailing_zero_display: String,
 }
 
 /// Resolved option bag for `Intl.RelativeTimeFormat`.

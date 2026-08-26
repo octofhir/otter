@@ -114,10 +114,11 @@ icu_normalizer = { version = "2.1", features = ["compiled_data"] }
 icu_decimal  = { version = "2.1", features = ["compiled_data"] }
 icu_datetime = { version = "2.1", features = ["compiled_data"] }
 icu_time     = { version = "2.1", features = ["compiled_data"] }
+icu_plurals  = { version = "2.1", features = ["compiled_data", "unstable"] }
 icu_locale   = { version = "2.1", features = ["compiled_data"] }
 icu_list     = { version = "2.2", features = ["compiled_data"] }
 icu_experimental = { version = "0.5", features = ["compiled_data"] }
-fixed_decimal = "0.7"
+fixed_decimal = { version = "0.7", features = ["ryu"] }
 writeable     = "0.6"
 unicode-segmentation = "1.12"
 

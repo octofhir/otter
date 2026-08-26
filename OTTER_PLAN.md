@@ -398,8 +398,16 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.76% at
-`48c301d7`, 125 fails, 0 crashes/timeouts. Latest slices (169→125, zero
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.79% at
+`f8115ad8`, 111 fails, 0 crashes/timeouts. Follow-up slice (125→111):
+legacy Intl-constructed chaining on service-instance receivers +
+proxy-observable unwrap; per-closure-instance name/length deletion with
+real %Function.prototype% fallback; spec-ordered bind reads (proto,
+length, name — Proxy traps observe exactly those); dynamic Function
+without a self-name binding; proxy trap dispatch snapshots the target
+before the handler lookup (revoke-as-side-effect), getPrototypeOf
+invariant runs the target's isExtensible trap; array iteration and
+join take the observable [[Get]] for anything but plain dense elements. Latest slices (169→125, zero
 regressions): the Temporal wave went green (6642/6642 — ZonedDateTime
 offset-option string parsing via ParsedZonedDateTime, ToBigInt
 constructor coercion, identifier-only constructor time zones, fallible

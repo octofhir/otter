@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "fa635b37dc20a4e5b233580f4e0914dc305536dc",
-  "ran_at": "2026-08-26T19:36:53.599577+00:00",
+  "engine_commit": "1099912efd8aa9972d3b7aa4ed6cde07abf5e0bf",
+  "ran_at": "2026-08-26T21:36:43.655477+00:00",
   "totals": {
     "total": 53459,
-    "passed": 52234,
-    "failed": 125,
+    "passed": 52248,
+    "failed": 111,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -21506,8 +21506,8 @@
     },
     "intl402/DateTimeFormat/intl-legacy-constructed-symbol-on-unwrap.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21524,8 +21524,8 @@
     },
     "intl402/DateTimeFormat/intl-legacy-constructed-symbol.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23288,8 +23288,8 @@
     },
     "intl402/NumberFormat/intl-legacy-constructed-symbol-on-unwrap.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23306,8 +23306,8 @@
     },
     "intl402/NumberFormat/intl-legacy-constructed-symbol.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39866,8 +39866,8 @@
     },
     "staging/sm/Array": {
       "total": 90,
-      "passed": 81,
-      "failed": 9,
+      "passed": 85,
+      "failed": 5,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39956,8 +39956,8 @@
     },
     "staging/sm/Function": {
       "total": 53,
-      "passed": 46,
-      "failed": 7,
+      "passed": 49,
+      "failed": 4,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40028,8 +40028,8 @@
     },
     "staging/sm/Proxy": {
       "total": 24,
-      "passed": 18,
-      "failed": 6,
+      "passed": 21,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40414,24 +40414,6 @@
       "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
     },
     {
-      "path": "staging/sm/Array/for_of_2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined (reading 'property')\n    at fun (staging/sm/Array/for_of_2.js:17:13)\n    at doIter (staging/sm/Array/for_of_2.js:11:16)\n    at TestChangeArrayIteratorNext (staging/sm/Array/for_of_2.js:51:16)\n    at staging/sm/Array/for_of_2.js:56:1"
-    },
-    {
-      "path": "staging/sm/Array/for_of_3.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined (reading 'property')\n    at fun (staging/sm/Array/for_of_3.js:17:13)\n    at doIter (staging/sm/Array/for_of_3.js:11:16)\n    at TestIncreaseArrayLength (staging/sm/Array/for_of_3.js:53:16)\n    at staging/sm/Array/for_of_3.js:58:1"
-    },
-    {
-      "path": "staging/sm/Array/for_of_4.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined (reading 'property')\n    at fun (staging/sm/Array/for_of_4.js:17:13)\n    at doIter (staging/sm/Array/for_of_4.js:11:16)\n    at TestDecreaseArrayLength (staging/sm/Array/for_of_4.js:53:16)\n    at staging/sm/Array/for_of_4.js:62:1"
-    },
-    {
       "path": "staging/sm/Array/from-iterator-close.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40448,12 +40430,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/Array/join-01.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"0funky\"», «\"0funkyfnord\"») to be true"
     },
     {
       "path": "staging/sm/Array/species.js",
@@ -40502,24 +40478,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
-    },
-    {
-      "path": "staging/sm/Function/bound-length-and-name.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"name\"», «\"length\"») to be true"
-    },
-    {
-      "path": "staging/sm/Function/configurable-length.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «undefined») to be true"
-    },
-    {
-      "path": "staging/sm/Function/constructor-binding.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"function\"», «\"undefined\"») to be true"
     },
     {
       "path": "staging/sm/Function/function-toString-builtin-name.js",
@@ -40576,12 +40534,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«1», «0») to be true"
     },
     {
-      "path": "staging/sm/Proxy/getPrototypeOf.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertion failed: expected exception, no exception thrown"
-    },
-    {
       "path": "staging/sm/Proxy/global-receiver.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40594,22 +40546,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object ArrayBuffer]», «[object Object]») to be true"
     },
     {
-      "path": "staging/sm/Proxy/revoke-as-side-effect.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Object.getPrototypeOf: type mismatch: this operation does not accept a value of this type"
-    },
-    {
       "path": "staging/sm/Proxy/revoked-get-function-realm-typeerror.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/Proxy/setPrototypeOf.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«TypeError: Reflect: type mismatch», «3.14») to be true"
     },
     {
       "path": "staging/sm/Reflect/apply.js",
@@ -40960,18 +40900,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"8.878.000.000%\"», «\"8.878.000.000 %\"») to be true"
     },
     {
-      "path": "intl402/DateTimeFormat/intl-legacy-constructed-symbol-on-unwrap.js",
-      "esid": "sec-unwrapdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: resolvedOptions: intrinsic called on a non-Intl.DateTimeFormat receiver"
-    },
-    {
-      "path": "intl402/DateTimeFormat/intl-legacy-constructed-symbol.js",
-      "esid": "sec-intl.datetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
-    },
-    {
       "path": "intl402/DateTimeFormat/prototype/formatRange/en-US.js",
       "esid": "sec-partitiondatetimerangepattern",
       "outcome": "fail",
@@ -41036,18 +40964,6 @@
       "esid": "sec-intl.locale",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Locale: invalid language tag"
-    },
-    {
-      "path": "intl402/NumberFormat/intl-legacy-constructed-symbol-on-unwrap.js",
-      "esid": "sec-unwrapnumberformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: resolvedOptions: intrinsic called on a non-Intl.NumberFormat receiver"
-    },
-    {
-      "path": "intl402/NumberFormat/intl-legacy-constructed-symbol.js",
-      "esid": "sec-intl.numberformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected true but got false"
     },
     {
       "path": "intl402/constructors-string-and-single-element-array.js",

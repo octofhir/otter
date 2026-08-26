@@ -2041,6 +2041,173 @@ impl Interpreter {
         self.function_property_get_with_receiver(stack, context, owner, function_id, None, name)
     }
 
+    /// SpiderMonkey-legacy magic `fn.caller` / `fn.arguments` read.
+    /// `Some(value)` for an eligible sloppy ordinary function
+    /// receiver (a live stack walk / arguments snapshot); `None`
+    /// falls through to the poisoned %Function.prototype% accessors.
+    pub(crate) fn legacy_restricted_property(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        receiver: Value,
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        let fid = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
+        let Some(fid) = fid else {
+            return Ok(None);
+        };
+        if !self.legacy_function_metadata_eligible(context, fid) {
+            return Ok(None);
+        }
+        match name {
+            "caller" => Ok(Some(self.legacy_caller_value(context, stack, receiver))),
+            "arguments" => self
+                .legacy_arguments_value(stack, context, receiver)
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// SpiderMonkey-legacy `fn.caller` / `fn.arguments` eligibility:
+    /// only sloppy ordinary functions (not arrows, methods,
+    /// generators, async functions) get the magic values; every other
+    /// shape falls through to the poisoned %ThrowTypeError%
+    /// accessors on %Function.prototype%.
+    fn legacy_function_metadata_eligible(
+        &self,
+        context: &ExecutionContext,
+        function_id: u32,
+    ) -> bool {
+        !context.function_is_strict(function_id)
+            && !context.function_is_arrow(function_id)
+            && context
+                .function(function_id)
+                .is_some_and(|f| !f.is_generator && !f.is_async && !f.is_method)
+    }
+
+    /// SpiderMonkey-legacy `fn.caller`: the function value of the
+    /// nearest frame below `callee`'s innermost activation whose
+    /// function is ordinary script code. `<main>` / eval-chunk /
+    /// module frames are looked through (legacy `caller` sees past
+    /// eval boundaries); strict, generator, and async callers are
+    /// censored to `null`; no live activation yields `null`.
+    fn legacy_caller_value(
+        &self,
+        context: &ExecutionContext,
+        stack: &ActivationStack,
+        callee: Value,
+    ) -> Value {
+        let mut found = false;
+        for frame in stack.iter().rev() {
+            if !found {
+                found = frame.self_value == callee;
+                continue;
+            }
+            let Some(function) = context.exec_function(frame.function_id) else {
+                continue;
+            };
+            let is_main = context
+                .function(frame.function_id)
+                .is_none_or(|f| f.name == "<main>");
+            if function.is_module || is_main {
+                continue;
+            }
+            if context.function_is_strict(frame.function_id)
+                || context
+                    .function(frame.function_id)
+                    .is_none_or(|f| f.is_generator || f.is_async)
+            {
+                return Value::null();
+            }
+            return frame.self_value;
+        }
+        Value::null()
+    }
+
+    /// SpiderMonkey-legacy `fn.arguments`: a fresh snapshot object of
+    /// the innermost live activation's arguments (`null` when the
+    /// function is not executing). Exact when the frame captured its
+    /// incoming argv (`needs_arguments` bodies); otherwise
+    /// reconstructed from the parameter registers.
+    fn legacy_arguments_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        callee: Value,
+    ) -> Result<Value, VmError> {
+        let mut args: Option<Vec<Value>> = None;
+        for frame in stack.iter().rev() {
+            if frame.self_value != callee {
+                continue;
+            }
+            if let Some(cold) = self.frame_cold(frame)
+                && !cold.incoming_args.is_empty()
+            {
+                args = Some(cold.incoming_args.to_vec());
+                break;
+            }
+            let param_count = context
+                .exec_function(frame.function_id)
+                .map(|f| f.param_count as usize)
+                .unwrap_or(0);
+            let mut collected = Vec::with_capacity(param_count);
+            for reg in 0..param_count {
+                collected.push(
+                    crate::read_register(frame, reg as u16)
+                        .copied()
+                        .unwrap_or_else(|_| Value::undefined()),
+                );
+            }
+            args = Some(collected);
+            break;
+        }
+        let Some(mut args) = args else {
+            return Ok(Value::null());
+        };
+        let mut callee_root = callee;
+        let roots: Vec<&Value> = Vec::new();
+        let _ = roots;
+        let mut extra: Vec<&Value> = Vec::with_capacity(args.len() + 1);
+        extra.push(&callee_root);
+        for value in &args {
+            extra.push(value);
+        }
+        let obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra)?;
+        drop(extra);
+        // The object handle and argument values stay valid: the
+        // property defines below only allocate property storage, and
+        // each define re-reads its value from the rooted vec slot.
+        let mut obj = obj;
+        {
+            let mut scope = otter_gc::RootScope::new(&mut self.gc_heap);
+            // SAFETY: locals declared above the scope, stable until drop.
+            unsafe {
+                scope.add_object(&mut obj);
+                scope.add_value(&mut callee_root);
+                scope.add_value_vec(&mut args);
+            }
+            for (index, value) in args.iter().enumerate() {
+                let desc = crate::object::PropertyDescriptor::data(*value, true, true, true);
+                crate::object::define_own_property(
+                    obj,
+                    &mut self.gc_heap,
+                    index.to_string().as_str(),
+                    desc,
+                );
+            }
+            let length = Value::number(crate::NumberValue::from_i32(args.len() as i32));
+            let desc = crate::object::PropertyDescriptor::data(length, true, false, true);
+            crate::object::define_own_property(obj, &mut self.gc_heap, "length", desc);
+            let desc = crate::object::PropertyDescriptor::data(callee_root, true, false, true);
+            crate::object::define_own_property(obj, &mut self.gc_heap, "callee", desc);
+        }
+        Ok(Value::object(obj))
+    }
+
     fn function_property_get_non_prototype(
         &mut self,
         stack: &mut ActivationStack,
@@ -2053,6 +2220,14 @@ impl Interpreter {
             && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
         {
             return Ok(v);
+        }
+        if crate::interp::helpers::is_restricted_function_property(name) {
+            let receiver = owner
+                .map(Value::closure)
+                .unwrap_or_else(|| Value::function(function_id));
+            if let Some(value) = self.legacy_restricted_property(stack, context, receiver, name)? {
+                return Ok(value);
+            }
         }
         if name == "name" || name == "length" {
             let owner_bag = self.callable_bag_read(owner, function_id);

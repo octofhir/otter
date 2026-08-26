@@ -157,7 +157,7 @@ fn throw_restricted_function_property(
         && !exec.function_is_arrow(fid)
         && exec
             .function(fid)
-            .is_some_and(|f| !f.is_generator && !f.is_async)
+            .is_some_and(|f| !f.is_generator && !f.is_async && !f.is_method)
     {
         return Ok(Value::undefined());
     }

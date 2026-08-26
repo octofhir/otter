@@ -208,8 +208,10 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
+    // §3.5.14 — equal ISO dates with different calendars are not equal.
     Ok(Value::boolean(
-        pd.compare_iso(&other) == std::cmp::Ordering::Equal,
+        pd.compare_iso(&other) == std::cmp::Ordering::Equal
+            && pd.calendar().identifier() == other.calendar().identifier(),
     ))
 }
 

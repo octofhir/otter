@@ -1131,6 +1131,15 @@ pub fn read_calendar_field(
     // un-annotated ISO string yields the ISO8601 calendar).
     let id = s.to_lossy_string(heap);
     use core::str::FromStr;
+    // The bare "islamic" and "islamic-rgsa" identifiers are Intl-only
+    // fallbacks: Temporal rejects them rather than silently aliasing
+    // another Hijri variant.
+    if id.eq_ignore_ascii_case("islamic") || id.eq_ignore_ascii_case("islamic-rgsa") {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("calendar {id:?} is not supported by Temporal"),
+        });
+    }
     temporal_rs::Calendar::from_str(&id).map_err(|_| NativeError::RangeError {
         name: class,
         reason: format!("invalid calendar identifier: {id:?}"),

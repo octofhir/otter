@@ -101,34 +101,34 @@ pub fn partial_from_object(
     // minutes, months, nanoseconds, seconds, weeks, years).
     let mut partial = temporal_rs::partial::PartialDuration::empty();
     if let Some(v) = optional_field(ctx, target, "days")? {
-        partial = partial.with_days(v);
+        partial = partial.with_days(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "hours")? {
-        partial = partial.with_hours(v);
+        partial = partial.with_hours(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "microseconds")? {
         partial = partial.with_microseconds(v as i128);
     }
     if let Some(v) = optional_field(ctx, target, "milliseconds")? {
-        partial = partial.with_milliseconds(v);
+        partial = partial.with_milliseconds(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "minutes")? {
-        partial = partial.with_minutes(v);
+        partial = partial.with_minutes(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "months")? {
-        partial = partial.with_months(v);
+        partial = partial.with_months(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "nanoseconds")? {
         partial = partial.with_nanoseconds(v as i128);
     }
     if let Some(v) = optional_field(ctx, target, "seconds")? {
-        partial = partial.with_seconds(v);
+        partial = partial.with_seconds(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "weeks")? {
-        partial = partial.with_weeks(v);
+        partial = partial.with_weeks(v as i64);
     }
     if let Some(v) = optional_field(ctx, target, "years")? {
-        partial = partial.with_years(v);
+        partial = partial.with_years(v as i64);
     }
     temporal_rs::Duration::from_partial_duration(partial)
         .map_err(|e| crate::temporal::helpers::temporal_err(e, CLASS))
@@ -138,7 +138,7 @@ fn optional_field(
     ctx: &mut NativeCtx<'_>,
     target: Value,
     name: &str,
-) -> Result<Option<i64>, NativeError> {
+) -> Result<Option<f64>, NativeError> {
     // Getter/Proxy-aware [[Get]] so a duration-like property bag with
     // accessors or a Proxy is read observably.
     let v = crate::temporal::helpers::get_option_value(ctx, target, name, CLASS)?;
@@ -149,7 +149,7 @@ fn optional_field(
     // ToIntegerIfIntegral: ToNumber (observable valueOf), reject NaN
     // / Infinity / a non-integral value with RangeError.
     let n = crate::temporal::helpers::to_integer_if_integral(ctx, &v, CLASS, name)?;
-    Ok(Some(n as i64))
+    Ok(Some(n))
 }
 
 #[must_use]
@@ -158,15 +158,17 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
         TemporalPayload::Duration(v) => v,
         _ => return Value::undefined(),
     };
+    // Every field is a JS Number: i64-backed components can exceed
+    // i32 (seconds up to ~2^53), so go through f64 uniformly.
     match name {
-        "years" => Value::number_i32(d.years() as i32),
-        "months" => Value::number_i32(d.months() as i32),
-        "weeks" => Value::number_i32(d.weeks() as i32),
-        "days" => Value::number_i32(d.days() as i32),
-        "hours" => Value::number_i32(d.hours() as i32),
-        "minutes" => Value::number_i32(d.minutes() as i32),
-        "seconds" => Value::number_i32(d.seconds() as i32),
-        "milliseconds" => Value::number_i32(d.milliseconds() as i32),
+        "years" => Value::number_f64(d.years() as f64),
+        "months" => Value::number_f64(d.months() as f64),
+        "weeks" => Value::number_f64(d.weeks() as f64),
+        "days" => Value::number_f64(d.days() as f64),
+        "hours" => Value::number_f64(d.hours() as f64),
+        "minutes" => Value::number_f64(d.minutes() as f64),
+        "seconds" => Value::number_f64(d.seconds() as f64),
+        "milliseconds" => Value::number_f64(d.milliseconds() as f64),
         "microseconds" => Value::number_f64(d.microseconds() as f64),
         "nanoseconds" => Value::number_f64(d.nanoseconds() as f64),
         "sign" => Value::number_i32(d.sign() as i32),
@@ -219,6 +221,7 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     let lhs = require_duration(ctx)?;
     let rhs = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = lhs.add(&rhs).map_err(|e| temporal_err(e, CLASS))?;
+    let result = fp_normalize(&result).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
@@ -226,7 +229,29 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let lhs = require_duration(ctx)?;
     let rhs = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = lhs.subtract(&rhs).map_err(|e| temporal_err(e, CLASS))?;
+    let result = fp_normalize(&result).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
+/// §7.5.14 AddDurations — the result record holds float64-representable
+/// integers: every field re-rounds through ℝ(𝔽(v)), so a later
+/// toString / compare never observes more precision than a JS Number
+/// can carry.
+pub(crate) fn fp_normalize(
+    d: &temporal_rs::Duration,
+) -> temporal_rs::TemporalResult<temporal_rs::Duration> {
+    temporal_rs::Duration::new(
+        d.years(),
+        d.months(),
+        d.weeks(),
+        d.days(),
+        d.hours(),
+        d.minutes(),
+        d.seconds(),
+        d.milliseconds(),
+        (d.microseconds() as f64) as i128,
+        (d.nanoseconds() as f64) as i128,
+    )
 }
 
 fn impl_negated(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -299,11 +324,11 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     };
     let mut any_field = false;
     if let Some(v) = optional_field(ctx, arg, "days")? {
-        p.days = Some(v);
+        p.days = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "hours")? {
-        p.hours = Some(v);
+        p.hours = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "microseconds")? {
@@ -311,15 +336,15 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "milliseconds")? {
-        p.milliseconds = Some(v);
+        p.milliseconds = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "minutes")? {
-        p.minutes = Some(v);
+        p.minutes = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "months")? {
-        p.months = Some(v);
+        p.months = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "nanoseconds")? {
@@ -327,15 +352,15 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "seconds")? {
-        p.seconds = Some(v);
+        p.seconds = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "weeks")? {
-        p.weeks = Some(v);
+        p.weeks = Some(v as i64);
         any_field = true;
     }
     if let Some(v) = optional_field(ctx, arg, "years")? {
-        p.years = Some(v);
+        p.years = Some(v as i64);
         any_field = true;
     }
     // §7.5.16 ToTemporalPartialDurationRecord step 22 — a bag with no
@@ -529,6 +554,7 @@ fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let result = dur
         .round(options, relative_to)
         .map_err(|e| temporal_err(e, CLASS))?;
+    let result = fp_normalize(&result).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 

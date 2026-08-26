@@ -288,6 +288,8 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let result = pdt
         .until(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
+    let result =
+        crate::temporal::duration::fp_normalize(&result).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
@@ -298,6 +300,8 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let result = pdt
         .since(&other, settings)
         .map_err(|e| temporal_err(e, CLASS))?;
+    let result =
+        crate::temporal::duration::fp_normalize(&result).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 

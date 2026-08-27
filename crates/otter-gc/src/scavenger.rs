@@ -403,6 +403,9 @@ unsafe fn verify_child_slot(
          slot={slot:p} region={region} parent_offset={parent_offset:#x} \
          parent_size={parent_size} parent_tag={parent_tag}{parent_dump}"
     );
+    if std::env::var_os("OTTER_GC_VERIFY_BT").is_some() {
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
 }
 
 unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {

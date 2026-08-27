@@ -399,7 +399,14 @@ a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
 Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.79% at
-`f8115ad8`, 111 fails, 0 crashes/timeouts. Follow-up slice (125→111):
+`556e6b1c`, 111 fails, 0 crashes/timeouts — failing set identical to the
+`f8115ad8` run; the GC-soundness wave in between (define paths take
+`&mut JsObject`, descriptor payloads anchored across expando/shape
+allocations, flatten and keyed promise combinators re-read every handle
+after allocating steps) is stress-only: under `OTTER_GC_STRESS=1` the
+Object, defineProperty/defineProperties, Promise, flat/flatMap, Reflect,
+Proxy, Iterator, Set, Array.from, and RegExp.prototype suites all pass
+with zero crashes. Follow-up slice (125→111):
 legacy Intl-constructed chaining on service-instance receivers +
 proxy-observable unwrap; per-closure-instance name/length deletion with
 real %Function.prototype% fallback; spec-ordered bind reads (proto,

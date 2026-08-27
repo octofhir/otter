@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "57db48021cff50bcce9a2f7435ad6d152214c7b1",
-  "ran_at": "2026-08-27T19:50:07.396684+00:00",
+  "engine_commit": "022bc4aa4f66a98b2877f622d21c70075b8f0c14",
+  "ran_at": "2026-08-27T21:26:59.369214+00:00",
   "totals": {
     "total": 53459,
-    "passed": 52249,
-    "failed": 110,
+    "passed": 52260,
+    "failed": 99,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -22316,8 +22316,8 @@
     },
     "intl402/FallbackSymbol/per-realm.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39866,8 +39866,8 @@
     },
     "staging/sm/Array": {
       "total": 90,
-      "passed": 85,
-      "failed": 5,
+      "passed": 86,
+      "failed": 4,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39974,8 +39974,8 @@
     },
     "staging/sm/JSON": {
       "total": 39,
-      "passed": 38,
-      "failed": 1,
+      "passed": 39,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40028,8 +40028,8 @@
     },
     "staging/sm/Proxy": {
       "total": 24,
-      "passed": 21,
-      "failed": 3,
+      "passed": 22,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40037,8 +40037,8 @@
     },
     "staging/sm/Reflect": {
       "total": 17,
-      "passed": 14,
-      "failed": 3,
+      "passed": 15,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40046,8 +40046,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 84,
-      "failed": 7,
+      "passed": 85,
+      "failed": 6,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40082,8 +40082,8 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 89,
-      "failed": 7,
+      "passed": 91,
+      "failed": 5,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40226,8 +40226,8 @@
     },
     "staging/sm/object": {
       "total": 65,
-      "passed": 62,
-      "failed": 3,
+      "passed": 63,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40235,8 +40235,8 @@
     },
     "staging/sm/regress": {
       "total": 106,
-      "passed": 100,
-      "failed": 6,
+      "passed": 101,
+      "failed": 5,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40262,8 +40262,8 @@
     },
     "staging/sm/syntax": {
       "total": 11,
-      "passed": 9,
-      "failed": 2,
+      "passed": 10,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40420,12 +40420,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected [\"get\", Symbol(Symbol.iterator) as #2, \"get\", ref #2] to be structurally equal to [\"get\", Symbol(Symbol.iterator), \"get\", \"length\", \"get\", \"0\", \"get\", \"length\", \"get\", \"1\", \"get\", \"length\", \"get\", \"2\", \"get\", \"length\"]. "
     },
     {
-      "path": "staging/sm/Array/from_realms.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
       "path": "staging/sm/Array/species.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40492,12 +40486,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [17] and expected [arguments[0] = 17] should have the same contents. "
     },
     {
-      "path": "staging/sm/JSON/parse-with-source.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: TypeError should come from the other realm. Expected a TypeError but got a different error constructor with the same name"
-    },
-    {
       "path": "staging/sm/Math/atanh-approx.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40540,18 +40528,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object ArrayBuffer]», «[object Object]») to be true"
     },
     {
-      "path": "staging/sm/Proxy/revoked-get-function-realm-typeerror.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/Reflect/apply.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: q is not defined\n    at q (staging/sm/Reflect/apply.js:2:22)\n    at staging/sm/Reflect/apply.js:72:18"
-    },
-    {
       "path": "staging/sm/Reflect/construct.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40561,7 +40537,7 @@
       "path": "staging/sm/Reflect/set.js",
       "esid": "pending",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object Object]», «undefined») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Proxy defineProperty trap added a non-configurable property absent on the target"
     },
     {
       "path": "staging/sm/RegExp/constructor-constructor.js",
@@ -40600,12 +40576,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "staging/sm/RegExp/prototype-different-global.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: get RegExp.prototype.hasIndices: this is not a RegExp"
-    },
-    {
       "path": "staging/sm/String/internalUsage.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40630,22 +40600,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/TypedArray/from_realms.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
       "path": "staging/sm/TypedArray/iterator-next-with-detached.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined\n    at staging/sm/TypedArray/iterator-next-with-detached.js:50:5"
-    },
-    {
-      "path": "staging/sm/TypedArray/of.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/TypedArray/set-wrapped.js",
@@ -40798,12 +40756,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: toString: Cannot read properties of unknown (reading 'property')"
     },
     {
-      "path": "staging/sm/object/setPrototypeOf-cross-realm-cycle.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a different error constructor with the same name"
-    },
-    {
       "path": "staging/sm/regress/regress-1383630.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40826,12 +40778,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined\n    at staging/sm/regress/regress-634210-4.js:14:18"
-    },
-    {
-      "path": "staging/sm/regress/regress-636364.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object Object]», «[object Object]») to be true"
     },
     {
       "path": "staging/sm/regress/regress-665355.js",
@@ -40874,12 +40820,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpected token\n    at staging/sm/syntax/let-as-label.js:3:1"
-    },
-    {
-      "path": "staging/sm/syntax/yield-as-identifier.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError but got a different error constructor with the same name"
     },
     {
       "path": "intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js",
@@ -40946,12 +40886,6 @@
       "esid": "sec-intl.datetimeformat.prototype.formattoparts",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-civil eras (AD,AD) should be unique Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "intl402/FallbackSymbol/per-realm.js",
-      "esid": "intl-object",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: %Intl%.[[FallbackSymbol]] should be different per-realm Expected SameValue(«Symbol(IntlLegacyConstructedSymbol)», «Symbol(IntlLegacyConstructedSymbol)») to be false"
     },
     {
       "path": "intl402/Locale/constructor-non-iana-canon.js",

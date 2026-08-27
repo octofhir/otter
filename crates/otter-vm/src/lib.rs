@@ -389,6 +389,9 @@ pub(crate) struct RealmState {
         std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
     >,
     pub(crate) rejection_tracker: crate::promise_rejection::RejectionTracker,
+    /// Per-realm `%Intl%.[[FallbackSymbol]]` — a fresh Symbol per realm per
+    /// ECMA-402; parked here while the realm is inactive.
+    pub(crate) intl_fallback_symbol: Option<crate::symbol::JsSymbol>,
 }
 
 impl RealmState {
@@ -414,6 +417,9 @@ impl RealmState {
         }
         for value in self.template_objects.values() {
             value.trace_value_slots(visitor);
+        }
+        if let Some(symbol) = &self.intl_fallback_symbol {
+            symbol.trace_value_slots(visitor);
         }
         for object in self
             .module_environments

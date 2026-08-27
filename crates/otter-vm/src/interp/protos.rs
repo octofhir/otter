@@ -670,7 +670,9 @@ impl Interpreter {
             return Ok(this_value);
         }
         match this_value {
-            v if v.is_undefined() || v.is_null() => Ok(Value::object(self.global_this)),
+            v if v.is_undefined() || v.is_null() => {
+                Ok(Value::object(self.global_this_for_function(function.id)))
+            }
             other => self.box_sloppy_this_primitive_runtime_rooted(other, slice_roots),
         }
     }
@@ -689,7 +691,7 @@ impl Interpreter {
             return Ok(this_value);
         }
         if this_value.is_undefined() || this_value.is_null() {
-            Ok(Value::object(self.global_this))
+            Ok(Value::object(self.global_this_for_function(function.id)))
         } else {
             self.box_sloppy_this_primitive_stack_rooted(stack, this_value, slice_roots)
         }

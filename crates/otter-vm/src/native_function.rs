@@ -548,6 +548,13 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| body.realm_global)
     }
 
+    /// The own-property metadata bag (name/length plus user-defined own
+    /// properties). Realm bootstrap walks it to stamp nested callables.
+    #[must_use]
+    pub(crate) fn own_properties_bag(&self, heap: &otter_gc::GcHeap) -> JsObject {
+        heap.read_payload(self.inner, |body| body.own_properties)
+    }
+
     /// Current `[[Prototype]]` override, if set.
     #[must_use]
     pub fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {

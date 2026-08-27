@@ -186,14 +186,35 @@ pub(crate) fn native_new_target_prototype(
             };
             value.map(|value| scope.value(value))
         };
-        let Some(proto) = proto else {
-            return Ok(None);
-        };
-        let proto = scope.finish(proto);
-        Ok(proto
-            .is_object_type()
-            .then_some(proto)
-            .or_else(|| proto.is_proxy().then_some(proto)))
+        let resolved = proto.and_then(|proto| {
+            let raw = scope.raw(proto);
+            (raw.is_object_type() || raw.is_proxy()).then_some(proto)
+        });
+        if resolved.is_none() {
+            // §10.1.13 OrdinaryCreateFromConstructor step 3 falls back to
+            // GetFunctionRealm(newTarget)'s intrinsic — and §7.3.25 throws
+            // for a revoked proxy constructor before any realm resolves.
+            let mut current = scope.raw(new_target);
+            loop {
+                if let Some(proxy) = current.as_proxy() {
+                    if proxy.is_revoked(scope.context().heap()) {
+                        return Err(NativeError::TypeError {
+                            name,
+                            reason: "cannot get the function realm of a revoked proxy".to_string(),
+                        });
+                    }
+                    current = proxy.target(scope.context().heap());
+                    continue;
+                }
+                if let Some(bound) = current.as_bound_function() {
+                    let (target, _, _) = bound.parts(scope.context().heap());
+                    current = target;
+                    continue;
+                }
+                break;
+            }
+        }
+        Ok(resolved.map(|proto| scope.finish(proto)))
     })
 }
 

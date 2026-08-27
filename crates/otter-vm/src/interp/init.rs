@@ -424,6 +424,10 @@ impl Interpreter {
     }
 
     fn swap_active_realm_state(&mut self, state: &mut RealmState) {
+        // The realm's scalar identity travels with its state, so a parked
+        // previously-active realm keeps its own id (the default realm parks
+        // as id 0) and a later switch can find it by identity.
+        std::mem::swap(&mut self.active_realm_id, &mut state.id);
         std::mem::swap(&mut self.global_this, &mut state.global_this);
         std::mem::swap(&mut self.error_classes, &mut state.error_classes);
         std::mem::swap(&mut self.realm_intrinsics, &mut state.realm_intrinsics);
@@ -478,6 +482,10 @@ impl Interpreter {
             &mut state.module_resolved_exports,
         );
         std::mem::swap(&mut self.rejection_tracker, &mut state.rejection_tracker);
+        std::mem::swap(
+            &mut self.intl_fallback_symbol,
+            &mut state.intl_fallback_symbol,
+        );
         let swap_root = |cell: &crate::gc_trace::RootCell<Option<JsObject>>,
                          slot: &mut Option<JsObject>| {
             let current = cell.get();
@@ -557,6 +565,7 @@ impl Interpreter {
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
             rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
+            intl_fallback_symbol: None,
         });
         let result = self.initialize_realm_state(state_index);
         if result.is_err() {
@@ -663,7 +672,70 @@ impl Interpreter {
         let global_this = self.extra_realms[state_index].global_this;
         self.tag_array_realm_natives(global_this);
         self.tag_iterator_realm_natives(global_this);
+        self.tag_realm_native_graph(global_this);
         Ok(())
+    }
+
+    /// Stamp every native callable reachable from a freshly built realm's
+    /// global with that realm's global. A cross-realm invocation then runs
+    /// under the callee's realm, so its errors, intrinsics, and species
+    /// lookups resolve there. Runs once per `createRealm`; the walk is
+    /// bounded by the realm's bootstrap surface.
+    fn tag_realm_native_graph(&mut self, global: JsObject) {
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut queue: Vec<Value> = vec![Value::object(global)];
+        let mut push_descriptor = |queue: &mut Vec<Value>, kind: object::DescriptorKind| match kind
+        {
+            object::DescriptorKind::Data { value } => queue.push(value),
+            object::DescriptorKind::Accessor { getter, setter } => {
+                if let Some(getter) = getter {
+                    queue.push(getter);
+                }
+                if let Some(setter) = setter {
+                    queue.push(setter);
+                }
+            }
+        };
+        while let Some(value) = queue.pop() {
+            let Some(raw) = value.as_raw_gc() else {
+                continue;
+            };
+            if !seen.insert(raw.0) {
+                continue;
+            }
+            if let Some(native) = value.as_native_function() {
+                native.set_realm_global(&mut self.gc_heap, Some(global));
+                queue.push(Value::object(native.own_properties_bag(&self.gc_heap)));
+                continue;
+            }
+            if let Some(class) = value.as_class_constructor() {
+                self.tag_native_value_realm(class.ctor(&self.gc_heap), global);
+                queue.push(Value::object(class.statics(&self.gc_heap)));
+                continue;
+            }
+            let Some(obj) = value.as_object() else {
+                continue;
+            };
+            let (string_keys, symbol_keys) = object::with_properties(obj, &self.gc_heap, |p| {
+                (
+                    p.keys().map(str::to_string).collect::<Vec<_>>(),
+                    p.symbol_keys().collect::<Vec<_>>(),
+                )
+            });
+            for key in string_keys {
+                if let Some(desc) = object::get_own_descriptor(obj, &self.gc_heap, &key) {
+                    push_descriptor(&mut queue, desc.kind);
+                }
+            }
+            for sym in symbol_keys {
+                if let Some(desc) = object::get_own_symbol_descriptor(obj, &self.gc_heap, sym) {
+                    push_descriptor(&mut queue, desc.kind);
+                }
+            }
+            if let Some(proto) = object::prototype_value(obj, &self.gc_heap) {
+                queue.push(proto);
+            }
+        }
     }
 
     /// Finish a host realm's native error hierarchy through the interpreter's
@@ -1027,26 +1099,100 @@ impl Interpreter {
         else {
             return Err(self.err_type(("unknown host realm global".to_string()).into()));
         };
-        // `ExtraRoots` stores a type-erased pointer to the parked realm while
-        // the target realm is active. Keep that source in a `Box`: a plain
-        // stack local may be moved between call frames after registration,
-        // leaving the collector to rewrite an obsolete copy of its slots.
-        let mut realm = Box::new(self.extra_realms.remove(index));
-        self.swap_active_realm_state(&mut realm);
-        let previous_realm_id = self.active_realm_id;
-        self.active_realm_id = realm.id;
+        // Swap the target realm in and park the previously active realm in
+        // the vacated vector slot (with its id — `swap_active_realm_state`
+        // carries the identity with the state). The parked realm stays a
+        // traced root through `extra_realms`, and a nested switch — an
+        // extra-realm frame calling a default-realm builtin — finds it
+        // through this same entry point.
+        let previous_id = self.active_realm_id;
         let was_extra = self.active_realm_is_extra;
-        self.active_realm_is_extra = true;
-        let realm_roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(realm.as_ref()));
+        let mut incoming = Box::new(self.extra_realms.remove(index));
+        self.swap_active_realm_state(&mut incoming);
+        self.active_realm_is_extra = self.active_realm_id != 0;
+        self.extra_realms.insert(index, *incoming);
         let result = body(self);
-        drop(realm_roots_guard);
-        self.swap_active_realm_state(&mut realm);
-        self.active_realm_id = previous_realm_id;
+        let back_index = self
+            .extra_realms
+            .iter()
+            .position(|realm| realm.id == previous_id)
+            .expect("parked previous realm stays registered for the switch's extent");
+        let mut back = Box::new(self.extra_realms.remove(back_index));
+        self.swap_active_realm_state(&mut back);
         self.active_realm_is_extra = was_extra;
-        self.extra_realms.insert(index, *realm);
+        self.extra_realms.insert(back_index, *back);
         result
+    }
+
+    /// The realm a bytecode frame's globals resolve in, when it differs from
+    /// the active realm. `None` on the overwhelmingly common same-realm path;
+    /// an unregistered function belongs to the default realm.
+    #[inline]
+    pub(crate) fn foreign_function_realm(&self, function_id: u32) -> Option<u32> {
+        if self.extra_realms.is_empty() && self.active_realm_id == 0 {
+            return None;
+        }
+        let realm_id = self
+            .function_realm_ids
+            .get(&function_id)
+            .copied()
+            .unwrap_or(0);
+        (realm_id != self.active_realm_id).then_some(realm_id)
+    }
+
+    /// The global object a bytecode function's realm exposes — its own
+    /// realm's global when it differs from the active one, otherwise the
+    /// active global.
+    #[inline]
+    pub(crate) fn global_this_for_function(&self, function_id: u32) -> JsObject {
+        match self.foreign_function_realm(function_id) {
+            Some(realm_id) => self
+                .extra_realms
+                .iter()
+                .find(|realm| realm.id == realm_id)
+                .map_or(self.global_this, |realm| realm.global_this),
+            None => self.global_this,
+        }
+    }
+
+    /// Stamp a freshly allocated typed array with the active realm's
+    /// per-kind `%TypedArray.prototype%` when a non-default realm is
+    /// active; a bare view resolves to the default realm's prototype.
+    pub(crate) fn register_typed_array_realm_proto(&mut self, view: crate::binary::JsTypedArray) {
+        if !self.active_realm_is_extra {
+            return;
+        }
+        let name = view.kind().name();
+        let Some(proto) = object::get(self.global_this, &self.gc_heap, name).and_then(|ctor| {
+            match ctor.as_native_function() {
+                Some(native) => self.native_data_property(native, "prototype"),
+                None => ctor
+                    .as_object()
+                    .and_then(|obj| object::get(obj, &self.gc_heap, "prototype")),
+            }
+        }) else {
+            return;
+        };
+        view.set_custom_proto(&mut self.gc_heap, proto);
+    }
+
+    /// The realm global a native call must run under: the native's stamped
+    /// realm, or the parked default realm when an extra realm is active and
+    /// the native carries no stamp (default-realm builtins are unstamped).
+    pub(crate) fn native_target_realm_global(
+        &self,
+        native: &crate::NativeFunction,
+    ) -> Option<JsObject> {
+        if let Some(global) = native.realm_global(&self.gc_heap) {
+            return Some(global);
+        }
+        if !self.active_realm_is_extra {
+            return None;
+        }
+        self.extra_realms
+            .iter()
+            .find(|realm| realm.id == 0)
+            .map(|realm| realm.global_this)
     }
 
     /// Run `body` with a stable realm identity active. Bytecode function

@@ -355,6 +355,7 @@ pub(crate) fn typed_array_from_values_with_roots(
     })?;
     let view = JsTypedArray::new(interp.gc_heap_mut(), new_buf, kind, 0, values.len())
         .map_err(oom_to_vm)?;
+    interp.register_typed_array_realm_proto(view);
     let mut encoded = vec![0u8; byte_len];
     for (i, value) in values.iter().enumerate() {
         kind.write(interp.gc_heap_mut(), &mut encoded, i * bpe, value);
@@ -389,6 +390,7 @@ fn new_zeroed_typed_array_with_roots(
         )
     })?;
     let view = JsTypedArray::new(interp.gc_heap_mut(), new_buf, kind, 0, len).map_err(oom_to_vm)?;
+    interp.register_typed_array_realm_proto(view);
     Ok(Value::typed_array(view))
 }
 
@@ -471,6 +473,7 @@ fn construct_typed_array_with_roots(
         };
         let view = JsTypedArray::new(interp.gc_heap_mut(), buf, kind, byte_offset, length)
             .map_err(oom_to_vm)?;
+        interp.register_typed_array_realm_proto(view);
         // §23.2.5.1 — absent length over a length-resizable buffer (a
         // resizable ArrayBuffer or a growable SharedArrayBuffer) makes
         // [[ArrayLength]] AUTO (length-tracking).

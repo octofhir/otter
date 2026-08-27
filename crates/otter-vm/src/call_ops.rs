@@ -1481,6 +1481,24 @@ impl Interpreter {
         used_object_prototype_fallback: bool,
         args: &[Value],
     ) -> Result<Value, VmError> {
+        // A cross-realm `new` runs under the constructor's realm, exactly
+        // like the call path: intrinsics and default prototypes resolve
+        // there.
+        if let Some(global) = self.native_target_realm_global(&native)
+            && global != self.global_this
+        {
+            return self.with_host_realm_global(global, |interp| {
+                interp.invoke_native_construct_rooted(
+                    stack,
+                    context,
+                    native,
+                    this_value,
+                    new_target,
+                    used_object_prototype_fallback,
+                    args,
+                )
+            });
+        }
         let call = native.call_target(&self.gc_heap);
         let call_info = NativeCallInfo::construct_with_receiver(
             *this_value,
@@ -1948,7 +1966,7 @@ impl Interpreter {
                 return Ok(false);
             }
             self.record_runtime_native_call();
-            let realm_global = native.realm_global(&self.gc_heap);
+            let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
                 stack,
@@ -1969,7 +1987,7 @@ impl Interpreter {
                 return Ok(false);
             }
             self.record_runtime_native_call();
-            let realm_global = native.realm_global(&self.gc_heap);
+            let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
                 stack,
@@ -2234,7 +2252,7 @@ impl Interpreter {
         {
             let call = native.call_target(&self.gc_heap);
             self.record_runtime_native_call();
-            let realm_global = native.realm_global(&self.gc_heap);
+            let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
                 stack,
@@ -2264,7 +2282,7 @@ impl Interpreter {
                 return Ok(());
             }
             self.record_runtime_native_call();
-            let realm_global = native.realm_global(&self.gc_heap);
+            let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
                 stack,
@@ -3419,7 +3437,7 @@ impl Interpreter {
         {
             let call = native.call_target(&self.gc_heap);
             self.record_runtime_native_call();
-            let realm_global = native.realm_global(&self.gc_heap);
+            let realm_global = self.native_target_realm_global(&native);
             let current = roots.current.get();
             let receiver = roots.receiver.get();
             let args = roots.take_args();
@@ -3444,7 +3462,7 @@ impl Interpreter {
                     .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
             }
             self.record_runtime_native_call();
-            let realm_global = native.realm_global(&self.gc_heap);
+            let realm_global = self.native_target_realm_global(native);
             let current = roots.current.get();
             let receiver = roots.receiver.get();
             let args = roots.take_args();

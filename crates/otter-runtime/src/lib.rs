@@ -4212,7 +4212,7 @@ impl Runtime {
         value: otter_vm::Value,
         tag: &str,
     ) -> Result<(), OtterError> {
-        let Some(obj) = value.as_object() else {
+        let Some(mut obj) = value.as_object() else {
             return Ok(());
         };
         let tag_value = otter_vm::JsString::from_str(tag, self.interp.gc_heap_mut())
@@ -4223,7 +4223,7 @@ impl Runtime {
             .well_known_symbols()
             .get(otter_vm::symbol::WellKnown::ToStringTag);
         otter_vm::object::define_own_symbol_property_partial(
-            obj,
+            &mut obj,
             self.interp.gc_heap_mut(),
             tag_sym,
             otter_vm::object::PartialPropertyDescriptor {

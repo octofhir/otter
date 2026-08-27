@@ -1786,10 +1786,17 @@ impl Interpreter {
         iter: IteratorHandle,
     ) {
         let open = self.zip_open_inputs(iter);
+        // The saved completion value lives through every user `return`
+        // call inside close-all — anchor it on the traced root stack; a
+        // raw local would go stale under a moving collection and come
+        // back as whatever object later reused the slot.
         let saved = self.take_pending_uncaught_throw();
+        let anchor = saved.map(|value| self.push_iteration_anchor(value) - 1);
         let _ = self.iterator_zip_close_all(stack, context, open, false);
         let _ = self.take_pending_uncaught_throw();
-        if let Some(value) = saved {
+        if let Some(base) = anchor {
+            let value = self.iteration_anchor(base);
+            self.pop_iteration_anchors_to(base);
             self.set_pending_uncaught_throw(value);
         }
     }
@@ -1803,6 +1810,11 @@ impl Interpreter {
     /// every `return` still runs but none of them can win. A losing
     /// throw is also lifted off the interpreter, or its value would
     /// overwrite the winner's on the way out.
+    ///
+    /// Every value held across the user `return` calls — the incoming
+    /// completion, the open-input list, and the first losing throw —
+    /// rides the traced iteration-anchor stack; raw locals go stale
+    /// under a moving collection.
     fn iterator_zip_close_all(
         &mut self,
         stack: &mut ActivationStack,
@@ -1815,23 +1827,42 @@ impl Interpreter {
         } else {
             None
         };
+        let base = self.push_iteration_anchor(incoming.unwrap_or_else(Value::undefined)) - 1;
+        let have_incoming = incoming.is_some();
+        let open_len = open.len();
+        for entry in &open {
+            self.push_iteration_anchor(*entry);
+        }
+        let thrown_slot = self.push_iteration_anchor(Value::undefined()) - 1;
+        let mut have_thrown = false;
         let mut outcome = Ok(());
-        let mut thrown: Option<Value> = None;
-        for entry in open.into_iter().rev() {
+        for i in (0..open_len).rev() {
+            let entry = self.iteration_anchor(base + 1 + i);
             if entry.is_null() || entry.is_undefined() {
                 continue;
             }
             let closed = self.iterator_close_value_sync(stack, context, entry);
             if !throwing && outcome.is_ok() {
-                if closed.is_err() {
-                    thrown = self.take_pending_uncaught_throw();
+                if closed.is_err()
+                    && let Some(value) = self.take_pending_uncaught_throw()
+                {
+                    self.set_iteration_anchor(thrown_slot, value);
+                    have_thrown = true;
                 }
                 outcome = closed;
             } else {
                 let _ = self.take_pending_uncaught_throw();
             }
         }
-        if let Some(value) = incoming.or(thrown) {
+        let winner = if have_incoming {
+            Some(self.iteration_anchor(base))
+        } else if have_thrown {
+            Some(self.iteration_anchor(thrown_slot))
+        } else {
+            None
+        };
+        self.pop_iteration_anchors_to(base);
+        if let Some(value) = winner {
             self.set_pending_uncaught_throw(value);
         }
         outcome

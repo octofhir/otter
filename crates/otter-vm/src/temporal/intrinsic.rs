@@ -87,11 +87,11 @@ fn install_temporal_well_knowns(
     let tag_sym = well_known.get(WellKnown::ToStringTag);
 
     let install =
-        |heap: &mut otter_gc::GcHeap, obj: JsObject, tag: &str| -> Result<(), JsSurfaceError> {
+        |heap: &mut otter_gc::GcHeap, mut obj: JsObject, tag: &str| -> Result<(), JsSurfaceError> {
             let value = crate::string::JsString::from_str(tag, heap)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
             object::define_own_symbol_property_partial(
-                obj,
+                &mut obj,
                 heap,
                 tag_sym,
                 PartialPropertyDescriptor {

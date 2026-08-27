@@ -177,7 +177,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
         ("WeakMap", None, None),
         ("WeakSet", None, None),
     ] {
-        let Some(prototype) = ctor_prototype(global, heap, ctor_name) else {
+        let Some(mut prototype) = ctor_prototype(global, heap, ctor_name) else {
             continue;
         };
         // §24.1.3.12 / §24.2.3.11 — `@@iterator` aliases `entries`
@@ -188,7 +188,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
             && let Some(method_value) = object::get(prototype, heap, method_name)
         {
             object::define_own_symbol_property_partial(
-                prototype,
+                &mut prototype,
                 heap,
                 iterator_sym,
                 PartialPropertyDescriptor {
@@ -209,7 +209,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
             && let Some(values_value) = object::get(prototype, heap, "values")
         {
             object::define_own_property_partial(
-                prototype,
+                &mut prototype,
                 heap,
                 "keys",
                 PartialPropertyDescriptor {
@@ -1257,25 +1257,47 @@ pub(crate) fn is_set_method_name(name: &str) -> bool {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.union>
 fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.union")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.union")?;
-    let context = execution_context(ctx, "Set.prototype.union")?;
-    // §24.2.4.uniON steps 4-5 — GetKeysIterator (which reads the
-    // `next` method, an observable access whose getter may mutate `this`)
-    // runs BEFORE `this`'s [[SetData]] is copied into the result, so the
-    // copy reflects any such mutation.
-    let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.union")?;
-    let mut result = ctx.alloc_set().map_err(|_| oom("Set.prototype.union"))?;
-    for value in collections::set_values(this, ctx.heap()) {
-        ctx.set_add(&mut result, value)
-            .map_err(|_| oom("Set.prototype.union"))?;
-    }
-    while let Some(value) = set_record_next_key(ctx, &context, &mut keys, "Set.prototype.union")? {
-        ctx.set_add(&mut result, normalize_set_key(value))
-            .map_err(|_| oom("Set.prototype.union"))?;
-    }
-    Ok(Value::set(result))
+    const NAME: &str = "Set.prototype.union";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let context = execution_context(ctx, NAME)?;
+        // §24.2.4.union steps 4-5 — GetKeysIterator (which reads the
+        // `next` method, an observable access whose getter may mutate
+        // `this`) runs BEFORE `this`'s [[SetData]] is copied into the
+        // result, so the copy reflects any such mutation.
+        let mut keys = set_record_keys(ctx, &context, &other_rec, NAME)?;
+        let result_slot = {
+            let result = ctx.alloc_set().map_err(|_| oom(NAME))?;
+            push_anchored(ctx, Value::set(result))
+        };
+        let this = anchored_set(ctx, base, NAME)?;
+        let this_values_base = {
+            let values = collections::set_values(this, ctx.heap());
+            let mut first = None;
+            let len = values.len();
+            for v in values {
+                let slot = push_anchored(ctx, v);
+                first.get_or_insert(slot);
+            }
+            (first.unwrap_or(0), len)
+        };
+        for i in 0..this_values_base.1 {
+            let value = anchored(ctx, this_values_base.0 + i);
+            let mut result = anchored_set(ctx, result_slot, NAME)?;
+            ctx.set_add(&mut result, value).map_err(|_| oom(NAME))?;
+        }
+        while let Some(value) = set_record_next_key(ctx, &context, &mut keys, NAME)? {
+            let mut result = anchored_set(ctx, result_slot, NAME)?;
+            ctx.set_add(&mut result, normalize_set_key(value))
+                .map_err(|_| oom(NAME))?;
+        }
+        Ok(anchored(ctx, result_slot))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 /// §24.2.4.5 `Set.prototype.intersection`.
@@ -1283,40 +1305,55 @@ fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.intersection>
 fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.intersection")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.intersection")?;
-    let mut result = ctx
-        .alloc_set()
-        .map_err(|_| oom("Set.prototype.intersection"))?;
-    let context = execution_context(ctx, "Set.prototype.intersection")?;
-    let this_size = collections::set_len(this, ctx.heap()) as f64;
-    if this_size <= other_rec.size() {
-        let mut index = 0;
-        while index < collections::set_raw_len(this, ctx.heap()) {
-            let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+    const NAME: &str = "Set.prototype.intersection";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let result_slot = {
+            let result = ctx.alloc_set().map_err(|_| oom(NAME))?;
+            push_anchored(ctx, Value::set(result))
+        };
+        let context = execution_context(ctx, NAME)?;
+        let this = anchored_set(ctx, base, NAME)?;
+        let this_size = collections::set_len(this, ctx.heap()) as f64;
+        if this_size <= other_rec.size() {
+            let mut index = 0;
+            loop {
+                let this = anchored_set(ctx, base, NAME)?;
+                if index >= collections::set_raw_len(this, ctx.heap()) {
+                    break;
+                }
+                let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+                    index += 1;
+                    continue;
+                };
                 index += 1;
-                continue;
-            };
-            index += 1;
-            if set_record_has(ctx, &other_rec, &value)? {
-                ctx.set_add(&mut result, value)
-                    .map_err(|_| oom("Set.prototype.intersection"))?;
+                let value_slot = push_anchored(ctx, value);
+                let has = set_record_has(ctx, &other_rec, &value);
+                let value = anchored(ctx, value_slot);
+                ctx.cx.interp.pop_iteration_anchors_to(value_slot);
+                if has? {
+                    let mut result = anchored_set(ctx, result_slot, NAME)?;
+                    ctx.set_add(&mut result, value).map_err(|_| oom(NAME))?;
+                }
+            }
+        } else {
+            let mut keys = set_record_keys(ctx, &context, &other_rec, NAME)?;
+            while let Some(value) = set_record_next_key(ctx, &context, &mut keys, NAME)? {
+                let value = normalize_set_key(value);
+                let this = anchored_set(ctx, base, NAME)?;
+                if collections::set_has(this, ctx.heap(), &value) {
+                    let mut result = anchored_set(ctx, result_slot, NAME)?;
+                    ctx.set_add(&mut result, value).map_err(|_| oom(NAME))?;
+                }
             }
         }
-    } else {
-        let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.intersection")?;
-        while let Some(value) =
-            set_record_next_key(ctx, &context, &mut keys, "Set.prototype.intersection")?
-        {
-            let value = normalize_set_key(value);
-            if collections::set_has(this, ctx.heap(), &value) {
-                ctx.set_add(&mut result, value)
-                    .map_err(|_| oom("Set.prototype.intersection"))?;
-            }
-        }
-    }
-    Ok(Value::set(result))
+        Ok(anchored(ctx, result_slot))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 /// §24.2.4.4 `Set.prototype.difference`.
@@ -1324,33 +1361,53 @@ fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.difference>
 fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.difference")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.difference")?;
-    let mut result = ctx
-        .alloc_set()
-        .map_err(|_| oom("Set.prototype.difference"))?;
-    let this_values = collections::set_values(this, ctx.heap());
-    for value in &this_values {
-        ctx.set_add(&mut result, *value)
-            .map_err(|_| oom("Set.prototype.difference"))?;
-    }
-    let context = execution_context(ctx, "Set.prototype.difference")?;
-    if (this_values.len() as f64) <= other_rec.size() {
-        for value in this_values {
-            if set_record_has(ctx, &other_rec, &value)? {
-                collections::set_delete(result, ctx.heap_mut(), &value);
+    const NAME: &str = "Set.prototype.difference";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let result_slot = {
+            let result = ctx.alloc_set().map_err(|_| oom(NAME))?;
+            push_anchored(ctx, Value::set(result))
+        };
+        let this = anchored_set(ctx, base, NAME)?;
+        let (values_base, values_len) = {
+            let values = collections::set_values(this, ctx.heap());
+            let len = values.len();
+            let mut first = None;
+            for v in values {
+                let slot = push_anchored(ctx, v);
+                first.get_or_insert(slot);
+            }
+            (first.unwrap_or(0), len)
+        };
+        for i in 0..values_len {
+            let value = anchored(ctx, values_base + i);
+            let mut result = anchored_set(ctx, result_slot, NAME)?;
+            ctx.set_add(&mut result, value).map_err(|_| oom(NAME))?;
+        }
+        let context = execution_context(ctx, NAME)?;
+        if (values_len as f64) <= other_rec.size() {
+            for i in 0..values_len {
+                let value = anchored(ctx, values_base + i);
+                if set_record_has(ctx, &other_rec, &value)? {
+                    let value = anchored(ctx, values_base + i);
+                    let result = anchored_set(ctx, result_slot, NAME)?;
+                    collections::set_delete(result, ctx.heap_mut(), &value);
+                }
+            }
+        } else {
+            let mut keys = set_record_keys(ctx, &context, &other_rec, NAME)?;
+            while let Some(value) = set_record_next_key(ctx, &context, &mut keys, NAME)? {
+                let result = anchored_set(ctx, result_slot, NAME)?;
+                collections::set_delete(result, ctx.heap_mut(), &normalize_set_key(value));
             }
         }
-    } else {
-        let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.difference")?;
-        while let Some(value) =
-            set_record_next_key(ctx, &context, &mut keys, "Set.prototype.difference")?
-        {
-            collections::set_delete(result, ctx.heap_mut(), &normalize_set_key(value));
-        }
-    }
-    Ok(Value::set(result))
+        Ok(anchored(ctx, result_slot))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 /// §24.2.4.6 `Set.prototype.symmetricDifference`.
@@ -1361,44 +1418,56 @@ fn set_proto_symmetric_difference(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.symmetricDifference")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.symmetricDifference")?;
-    let context = execution_context(ctx, "Set.prototype.symmetricDifference")?;
-    // §24.2.4.symmetricDifference steps 4-5 — GetKeysIterator (reading the
-    // iterator's `next`, an observable access) runs BEFORE `this`'s
-    // [[SetData]] is copied into the result.
-    let mut keys = set_record_keys(
-        ctx,
-        &context,
-        &other_rec,
-        "Set.prototype.symmetricDifference",
-    )?;
-    let mut result = ctx
-        .alloc_set()
-        .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
-    for value in collections::set_values(this, ctx.heap()) {
-        ctx.set_add(&mut result, value)
-            .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
-    }
-    while let Some(value) = set_record_next_key(
-        ctx,
-        &context,
-        &mut keys,
-        "Set.prototype.symmetricDifference",
-    )? {
-        let value = normalize_set_key(value);
-        let already_in_result = collections::set_has(result, ctx.heap(), &value);
-        if collections::set_has(this, ctx.heap(), &value) {
-            if already_in_result {
-                collections::set_delete(result, ctx.heap_mut(), &value);
+    const NAME: &str = "Set.prototype.symmetricDifference";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let context = execution_context(ctx, NAME)?;
+        // §24.2.4.symmetricDifference steps 4-5 — GetKeysIterator
+        // (reading the iterator's `next`, an observable access) runs
+        // BEFORE `this`'s [[SetData]] is copied into the result.
+        let mut keys = set_record_keys(ctx, &context, &other_rec, NAME)?;
+        let result_slot = {
+            let result = ctx.alloc_set().map_err(|_| oom(NAME))?;
+            push_anchored(ctx, Value::set(result))
+        };
+        let this = anchored_set(ctx, base, NAME)?;
+        let (values_base, values_len) = {
+            let values = collections::set_values(this, ctx.heap());
+            let len = values.len();
+            let mut first = None;
+            for v in values {
+                let slot = push_anchored(ctx, v);
+                first.get_or_insert(slot);
             }
-        } else if !already_in_result {
-            ctx.set_add(&mut result, value)
-                .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
+            (first.unwrap_or(0), len)
+        };
+        for i in 0..values_len {
+            let value = anchored(ctx, values_base + i);
+            let mut result = anchored_set(ctx, result_slot, NAME)?;
+            ctx.set_add(&mut result, value).map_err(|_| oom(NAME))?;
         }
-    }
-    Ok(Value::set(result))
+        while let Some(value) = set_record_next_key(ctx, &context, &mut keys, NAME)? {
+            let value = normalize_set_key(value);
+            let result = anchored_set(ctx, result_slot, NAME)?;
+            let already_in_result = collections::set_has(result, ctx.heap(), &value);
+            let this = anchored_set(ctx, base, NAME)?;
+            if collections::set_has(this, ctx.heap(), &value) {
+                if already_in_result {
+                    let result = anchored_set(ctx, result_slot, NAME)?;
+                    collections::set_delete(result, ctx.heap_mut(), &value);
+                }
+            } else if !already_in_result {
+                let mut result = anchored_set(ctx, result_slot, NAME)?;
+                ctx.set_add(&mut result, value).map_err(|_| oom(NAME))?;
+            }
+        }
+        Ok(anchored(ctx, result_slot))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 /// §24.2.4.10 `Set.prototype.isSubsetOf`.
@@ -1406,24 +1475,35 @@ fn set_proto_symmetric_difference(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.issubsetof>
 fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.isSubsetOf")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.isSubsetOf")?;
-    if (collections::set_len(this, ctx.heap()) as f64) > other_rec.size() {
-        return Ok(Value::boolean(false));
-    }
-    let mut index = 0;
-    while index < collections::set_raw_len(this, ctx.heap()) {
-        let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
-            index += 1;
-            continue;
-        };
-        index += 1;
-        if !set_record_has(ctx, &other_rec, &value)? {
+    const NAME: &str = "Set.prototype.isSubsetOf";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let this = anchored_set(ctx, base, NAME)?;
+        if (collections::set_len(this, ctx.heap()) as f64) > other_rec.size() {
             return Ok(Value::boolean(false));
         }
-    }
-    Ok(Value::boolean(true))
+        let mut index = 0;
+        loop {
+            let this = anchored_set(ctx, base, NAME)?;
+            if index >= collections::set_raw_len(this, ctx.heap()) {
+                break;
+            }
+            let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+                index += 1;
+                continue;
+            };
+            index += 1;
+            if !set_record_has(ctx, &other_rec, &value)? {
+                return Ok(Value::boolean(false));
+            }
+        }
+        Ok(Value::boolean(true))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 /// §24.2.4.11 `Set.prototype.isSupersetOf`.
@@ -1431,24 +1511,30 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.issupersetof>
 fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.isSupersetOf")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.isSupersetOf")?;
-    if (collections::set_len(this, ctx.heap()) as f64) < other_rec.size() {
-        return Ok(Value::boolean(false));
-    }
-    let context = execution_context(ctx, "Set.prototype.isSupersetOf")?;
-    let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.isSupersetOf")?;
-    while let Some(value) =
-        set_record_next_key(ctx, &context, &mut keys, "Set.prototype.isSupersetOf")?
-    {
-        let value = normalize_set_key(value);
-        if !collections::set_has(this, ctx.heap(), &value) {
-            set_record_close(ctx, &context, &mut keys, "Set.prototype.isSupersetOf")?;
+    const NAME: &str = "Set.prototype.isSupersetOf";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let this = anchored_set(ctx, base, NAME)?;
+        if (collections::set_len(this, ctx.heap()) as f64) < other_rec.size() {
             return Ok(Value::boolean(false));
         }
-    }
-    Ok(Value::boolean(true))
+        let context = execution_context(ctx, NAME)?;
+        let mut keys = set_record_keys(ctx, &context, &other_rec, NAME)?;
+        while let Some(value) = set_record_next_key(ctx, &context, &mut keys, NAME)? {
+            let value = normalize_set_key(value);
+            let this = anchored_set(ctx, base, NAME)?;
+            if !collections::set_has(this, ctx.heap(), &value) {
+                set_record_close(ctx, &context, &mut keys, NAME)?;
+                return Ok(Value::boolean(false));
+            }
+        }
+        Ok(Value::boolean(true))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 /// §24.2.4.9 `Set.prototype.isDisjointFrom`.
@@ -1459,35 +1545,45 @@ fn set_proto_is_disjoint_from(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this = receiver_set(ctx, "Set.prototype.isDisjointFrom")?;
-    let other = args.first().cloned().unwrap_or(Value::undefined());
-    let other_rec = get_set_record(ctx, other, "Set.prototype.isDisjointFrom")?;
-    let context = execution_context(ctx, "Set.prototype.isDisjointFrom")?;
-    if (collections::set_len(this, ctx.heap()) as f64) <= other_rec.size() {
-        let mut index = 0;
-        while index < collections::set_raw_len(this, ctx.heap()) {
-            let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+    const NAME: &str = "Set.prototype.isDisjointFrom";
+    let this = receiver_set(ctx, NAME)?;
+    let base = push_anchored(ctx, Value::set(this));
+    let outcome = (|ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        let other = args.first().cloned().unwrap_or(Value::undefined());
+        let other_rec = get_set_record(ctx, other, NAME)?;
+        let context = execution_context(ctx, NAME)?;
+        let this = anchored_set(ctx, base, NAME)?;
+        if (collections::set_len(this, ctx.heap()) as f64) <= other_rec.size() {
+            let mut index = 0;
+            loop {
+                let this = anchored_set(ctx, base, NAME)?;
+                if index >= collections::set_raw_len(this, ctx.heap()) {
+                    break;
+                }
+                let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+                    index += 1;
+                    continue;
+                };
                 index += 1;
-                continue;
-            };
-            index += 1;
-            if set_record_has(ctx, &other_rec, &value)? {
-                return Ok(Value::boolean(false));
+                if set_record_has(ctx, &other_rec, &value)? {
+                    return Ok(Value::boolean(false));
+                }
+            }
+        } else {
+            let mut keys = set_record_keys(ctx, &context, &other_rec, NAME)?;
+            while let Some(value) = set_record_next_key(ctx, &context, &mut keys, NAME)? {
+                let value = normalize_set_key(value);
+                let this = anchored_set(ctx, base, NAME)?;
+                if collections::set_has(this, ctx.heap(), &value) {
+                    set_record_close(ctx, &context, &mut keys, NAME)?;
+                    return Ok(Value::boolean(false));
+                }
             }
         }
-    } else {
-        let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.isDisjointFrom")?;
-        while let Some(value) =
-            set_record_next_key(ctx, &context, &mut keys, "Set.prototype.isDisjointFrom")?
-        {
-            let value = normalize_set_key(value);
-            if collections::set_has(this, ctx.heap(), &value) {
-                set_record_close(ctx, &context, &mut keys, "Set.prototype.isDisjointFrom")?;
-                return Ok(Value::boolean(false));
-            }
-        }
-    }
-    Ok(Value::boolean(true))
+        Ok(Value::boolean(true))
+    })(ctx);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    outcome
 }
 
 fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1698,20 +1794,30 @@ impl MapIterKind {
 }
 
 #[derive(Clone)]
+/// GC-safe handle bundle for one ECMA-262 SetRecord. Every GC value is
+/// held as a traced iteration-anchor SLOT, never a raw local: the record
+/// lives across arbitrary user calls (`has`, `keys`, iterator `next`),
+/// each of which can move the heap. The creating method owns the anchor
+/// range and pops it when the operation finishes.
 enum SetRecord {
     Set {
-        set: crate::JsSet,
+        /// Anchor slot holding the `Value::set`.
+        slot: usize,
         size: f64,
     },
     Map {
-        map: crate::JsMap,
+        /// Anchor slot holding the `Value::map`.
+        slot: usize,
         size: f64,
     },
     Dynamic {
-        set: Value,
+        /// Anchor slot holding the set-like object.
+        set_slot: usize,
         size: f64,
-        has: Value,
-        keys: Value,
+        /// Anchor slot holding the `has` callable.
+        has_slot: usize,
+        /// Anchor slot holding the `keys` callable.
+        keys_slot: usize,
     },
 }
 
@@ -1723,18 +1829,49 @@ impl SetRecord {
     }
 }
 
+/// GC-safe key-iterator state — like [`SetRecord`], every GC value rides
+/// an anchor slot so user `next` calls cannot strand it.
 enum SetRecordKeys {
     Snapshot {
-        values: Vec<Value>,
+        /// First anchor slot of the snapshotted values.
+        base: usize,
+        len: usize,
         index: usize,
     },
     Generator {
-        handle: crate::generator::JsGenerator,
+        /// Anchor slot holding the `Value::generator`.
+        slot: usize,
     },
     Dynamic {
-        iterator: Value,
-        next_method: Value,
+        /// Anchor slot holding the iterator object.
+        iterator_slot: usize,
+        /// Anchor slot holding its `next` method.
+        next_slot: usize,
     },
+}
+
+/// Read one anchor slot back (a moving collection rewrites it in place).
+fn anchored(ctx: &NativeCtx<'_>, slot: usize) -> Value {
+    ctx.cx.interp.iteration_anchor(slot)
+}
+
+/// Push one value onto the traced anchor stack, returning its slot.
+fn push_anchored(ctx: &mut NativeCtx<'_>, value: Value) -> usize {
+    ctx.cx.interp.push_iteration_anchor(value) - 1
+}
+
+/// The Set receiver, re-derived from its anchor slot.
+fn anchored_set(
+    ctx: &NativeCtx<'_>,
+    slot: usize,
+    name: &'static str,
+) -> Result<crate::JsSet, NativeError> {
+    anchored(ctx, slot)
+        .as_set()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "set receiver did not survive".to_string(),
+        })
 }
 
 fn make_map_iterator(
@@ -1767,16 +1904,14 @@ fn get_set_record(
     name: &'static str,
 ) -> Result<SetRecord, NativeError> {
     if let Some(set) = other.as_set() {
-        return Ok(SetRecord::Set {
-            set,
-            size: collections::set_len(set, ctx.heap()) as f64,
-        });
+        let size = collections::set_len(set, ctx.heap()) as f64;
+        let slot = push_anchored(ctx, other);
+        return Ok(SetRecord::Set { slot, size });
     }
     if let Some(map) = other.as_map() {
-        return Ok(SetRecord::Map {
-            map,
-            size: collections::map_len(map, ctx.heap()) as f64,
-        });
+        let size = collections::map_len(map, ctx.heap()) as f64;
+        let slot = push_anchored(ctx, other);
+        return Ok(SetRecord::Map { slot, size });
     }
     let value = other;
     {
@@ -1788,6 +1923,11 @@ fn get_set_record(
                 });
             }
             let context = execution_context(ctx, name)?;
+            // Every read below is an observable Get that can run user
+            // code — the set-like object and both methods go straight
+            // into anchor slots and are re-read from them.
+            let set_slot = push_anchored(ctx, value);
+            let value = anchored(ctx, set_slot);
             let raw_size = read_property(ctx, &context, &value, "size", name)?;
             let size = to_number_runtime(ctx, &context, &raw_size, name)?;
             if size.is_nan() {
@@ -1796,6 +1936,7 @@ fn get_set_record(
                     reason: "set-like size is NaN".to_string(),
                 });
             }
+            let value = anchored(ctx, set_slot);
             let has = read_property(ctx, &context, &value, "has", name)?;
             if !ctx.interp_mut().is_callable_runtime(&has) {
                 return Err(NativeError::TypeError {
@@ -1803,6 +1944,8 @@ fn get_set_record(
                     reason: "set-like has is not callable".to_string(),
                 });
             }
+            let has_slot = push_anchored(ctx, has);
+            let value = anchored(ctx, set_slot);
             let keys = read_property(ctx, &context, &value, "keys", name)?;
             if !ctx.interp_mut().is_callable_runtime(&keys) {
                 return Err(NativeError::TypeError {
@@ -1810,11 +1953,12 @@ fn get_set_record(
                     reason: "set-like keys is not callable".to_string(),
                 });
             }
+            let keys_slot = push_anchored(ctx, keys);
             Ok(SetRecord::Dynamic {
-                set: value,
+                set_slot,
                 size,
-                has,
-                keys,
+                has_slot,
+                keys_slot,
             })
         }
     }
@@ -1826,15 +1970,37 @@ fn set_record_has(
     value: &Value,
 ) -> Result<bool, NativeError> {
     match record {
-        SetRecord::Set { set, .. } => Ok(collections::set_has(*set, ctx.heap(), value)),
-        SetRecord::Map { map, .. } => Ok(collections::map_has(*map, ctx.heap(), value)),
-        SetRecord::Dynamic { set, has, .. } => ctx.scope(|mut scope| {
-            let set = scope.value(*set);
-            let has = scope.value(*has);
-            let value = scope.value(*value);
-            let result = scope.call(has, set, &[value])?;
-            Ok(scope.raw(result).to_boolean(scope.context().heap()))
-        }),
+        SetRecord::Set { slot, .. } => {
+            let set = anchored(ctx, *slot)
+                .as_set()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "Set",
+                    reason: "set record did not survive".to_string(),
+                })?;
+            Ok(collections::set_has(set, ctx.heap(), value))
+        }
+        SetRecord::Map { slot, .. } => {
+            let map = anchored(ctx, *slot)
+                .as_map()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "Set",
+                    reason: "map record did not survive".to_string(),
+                })?;
+            Ok(collections::map_has(map, ctx.heap(), value))
+        }
+        SetRecord::Dynamic {
+            set_slot, has_slot, ..
+        } => {
+            let set_value = anchored(ctx, *set_slot);
+            let has_value = anchored(ctx, *has_slot);
+            ctx.scope(|mut scope| {
+                let set = scope.value(set_value);
+                let has = scope.value(has_value);
+                let value = scope.value(*value);
+                let result = scope.call(has, set, &[value])?;
+                Ok(scope.raw(result).to_boolean(scope.context().heap()))
+            })
+        }
     }
 }
 
@@ -1844,22 +2010,57 @@ fn set_record_keys(
     record: &SetRecord,
     name: &'static str,
 ) -> Result<SetRecordKeys, NativeError> {
-    match record {
-        SetRecord::Set { set, .. } => Ok(SetRecordKeys::Snapshot {
-            values: collections::set_values(*set, ctx.heap()),
+    // Snapshot values go straight onto the anchor stack: the walk below
+    // interleaves user calls and allocations with reads, and a raw
+    // `Vec<Value>` would go stale under a moving collection.
+    let snapshot = |ctx: &mut NativeCtx<'_>, values: Vec<Value>| {
+        let len = values.len();
+        let mut base = None;
+        for v in values {
+            let slot = push_anchored(ctx, v);
+            base.get_or_insert(slot);
+        }
+        SetRecordKeys::Snapshot {
+            base: base.unwrap_or(0),
+            len,
             index: 0,
-        }),
-        SetRecord::Map { map, .. } => Ok(SetRecordKeys::Snapshot {
-            values: collections::map_entries(*map, ctx.heap())
+        }
+    };
+    match record {
+        SetRecord::Set { slot, .. } => {
+            let set = anchored(ctx, *slot)
+                .as_set()
+                .ok_or_else(|| NativeError::TypeError {
+                    name,
+                    reason: "set record did not survive".to_string(),
+                })?;
+            let values = collections::set_values(set, ctx.heap());
+            Ok(snapshot(ctx, values))
+        }
+        SetRecord::Map { slot, .. } => {
+            let map = anchored(ctx, *slot)
+                .as_map()
+                .ok_or_else(|| NativeError::TypeError {
+                    name,
+                    reason: "map record did not survive".to_string(),
+                })?;
+            let values: Vec<Value> = collections::map_entries(map, ctx.heap())
                 .into_iter()
                 .map(|(key, _)| key)
-                .collect(),
-            index: 0,
-        }),
-        SetRecord::Dynamic { set, keys, .. } => {
-            let iterator = ctx.call(*keys, *set, &[])?;
-            if let Some(handle) = iterator.as_generator() {
-                return Ok(SetRecordKeys::Generator { handle });
+                .collect();
+            Ok(snapshot(ctx, values))
+        }
+        SetRecord::Dynamic {
+            set_slot,
+            keys_slot,
+            ..
+        } => {
+            let keys = anchored(ctx, *keys_slot);
+            let set = anchored(ctx, *set_slot);
+            let iterator = ctx.call(keys, set, &[])?;
+            if iterator.as_generator().is_some() {
+                let slot = push_anchored(ctx, iterator);
+                return Ok(SetRecordKeys::Generator { slot });
             }
             if iterator.is_iterator() {
                 let values = ctx.with_turn_parts(|interp, stack| {
@@ -1867,7 +2068,7 @@ fn set_record_keys(
                         .iterator_to_list_sync(context, stack, &iterator)
                         .map_err(|err| vm_to_native(interp, err, name))
                 })?;
-                return Ok(SetRecordKeys::Snapshot { values, index: 0 });
+                return Ok(snapshot(ctx, values));
             }
             // §24.2.1.2 GetKeysIterator returns the value of `keys()`
             // *as* the iterator: the set methods step it through
@@ -1879,6 +2080,8 @@ fn set_record_keys(
                     reason: "set-like keys did not return an object".to_string(),
                 });
             }
+            let iterator_slot = push_anchored(ctx, iterator);
+            let iterator = anchored(ctx, iterator_slot);
             let next_method = read_property(ctx, context, &iterator, "next", name)?;
             if !ctx.interp_mut().is_callable_runtime(&next_method) {
                 return Err(NativeError::TypeError {
@@ -1886,9 +2089,10 @@ fn set_record_keys(
                     reason: "set-like keys iterator next is not callable".to_string(),
                 });
             }
+            let next_slot = push_anchored(ctx, next_method);
             Ok(SetRecordKeys::Dynamic {
-                iterator,
-                next_method,
+                iterator_slot,
+                next_slot,
             })
         }
     }
@@ -1901,14 +2105,22 @@ fn set_record_next_key(
     name: &'static str,
 ) -> Result<Option<Value>, NativeError> {
     match keys {
-        SetRecordKeys::Snapshot { values, index } => {
-            let Some(value) = values.get(*index).cloned() else {
+        SetRecordKeys::Snapshot { base, len, index } => {
+            if *index >= *len {
                 return Ok(None);
-            };
+            }
+            let value = anchored(ctx, *base + *index);
             *index += 1;
             Ok(Some(value))
         }
-        SetRecordKeys::Generator { handle } => {
+        SetRecordKeys::Generator { slot } => {
+            let handle =
+                &anchored(ctx, *slot)
+                    .as_generator()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name,
+                        reason: "keys generator did not survive".to_string(),
+                    })?;
             let result = ctx.with_turn_parts(|interp, stack| {
                 interp
                     .resume_generator(
@@ -1936,13 +2148,17 @@ fn set_record_next_key(
             ))
         }
         SetRecordKeys::Dynamic {
-            iterator,
-            next_method,
-        } => ctx.with_turn_parts(|interp, stack| {
-            interp
-                .iterator_step_sync(stack, context, iterator, next_method)
-                .map_err(|err| vm_to_native(interp, err, name))
-        }),
+            iterator_slot,
+            next_slot,
+        } => {
+            let iterator = anchored(ctx, *iterator_slot);
+            let next_method = anchored(ctx, *next_slot);
+            ctx.with_turn_parts(|interp, stack| {
+                interp
+                    .iterator_step_sync(stack, context, &iterator, &next_method)
+                    .map_err(|err| vm_to_native(interp, err, name))
+            })
+        }
     }
 }
 
@@ -1952,10 +2168,11 @@ fn set_record_close(
     keys: &mut SetRecordKeys,
     name: &'static str,
 ) -> Result<(), NativeError> {
-    if let SetRecordKeys::Dynamic { iterator, .. } = keys {
+    if let SetRecordKeys::Dynamic { iterator_slot, .. } = keys {
+        let iterator = anchored(ctx, *iterator_slot);
         ctx.with_turn_parts(|interp, stack| {
             interp
-                .iterator_close_sync(stack, context, iterator)
+                .iterator_close_sync(stack, context, &iterator)
                 .map_err(|err| vm_to_native(interp, err, name))
         })?;
     }

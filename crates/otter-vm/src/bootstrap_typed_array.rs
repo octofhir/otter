@@ -161,7 +161,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // `undefined` for non-TypedArray receivers. Per-kind
     // prototypes inherit the accessor; per-instance access walks
     // up to %TypedArray%.prototype and triggers the getter.
-    if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
+    if let Some(mut abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
         // §23.2.3.34 — %TypedArray%.prototype.toString is the SAME
         // function object as %Array.prototype.toString%.
         let array_to_string = object::get(global, heap, "Array")
@@ -200,7 +200,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         object::define_own_symbol_property_partial(
-            abstract_proto,
+            &mut abstract_proto,
             heap,
             tag_sym,
             PartialPropertyDescriptor {
@@ -213,12 +213,12 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     }
 
     // Install `%TypedArray%.prototype[@@iterator] = values`.
-    if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap)
+    if let Some(mut abstract_proto) = get_abstract_typed_array_prototype(global, heap)
         && let Some(values_value) = object::get(abstract_proto, heap, "values")
     {
         let iterator_sym = well_known.get(WellKnown::Iterator);
         object::define_own_symbol_property_partial(
-            abstract_proto,
+            &mut abstract_proto,
             heap,
             iterator_sym,
             PartialPropertyDescriptor {

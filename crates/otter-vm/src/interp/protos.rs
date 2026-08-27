@@ -30,25 +30,6 @@ impl Interpreter {
         }
     }
 
-    /// Side-table key for exotics whose payloads are genuinely outside
-    /// the GC heap (`Rc`/`Arc` backed), so their addresses are stable.
-    /// GC-backed exotics (buffers, views, typed arrays) must NEVER key
-    /// this table: a moving collection changes their address, orphaning
-    /// the entry and — worse — bequeathing it to whatever object later
-    /// reuses the address. Those types carry the override in their
-    /// bodies instead.
-    pub(crate) fn non_gc_exotic_prototype_override_key(
-        value: &Value,
-        heap: &otter_gc::GcHeap,
-    ) -> Option<usize> {
-        // `Intl` payloads are `Rc`-backed, so their identity address is
-        // stable. Iterators are ordinary GC bodies and move, which is why
-        // their side state lives in the weak tables below instead.
-        value
-            .as_intl(heap)
-            .map(|intl| intl.identity_addr() as usize)
-    }
-
     /// Side state for iterator exotics lives in weak tables keyed by the
     /// iterator itself: the entry follows the body across a collection,
     /// and it disappears with it rather than being inherited by whatever
@@ -129,16 +110,13 @@ impl Interpreter {
             }
             return;
         }
-        let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
-            return;
-        };
-        match proto {
-            Some(proto) => {
-                self.non_gc_exotic_prototype_overrides.insert(key, proto);
-            }
-            None => {
-                self.non_gc_exotic_prototype_overrides.remove(&key);
-            }
+        // Intl bodies carry the override in a traced body slot — their
+        // handle is a cage offset that moves under relocation, so an
+        // address-keyed side table would go stale.
+        if let Some(intl) = value.as_intl(&self.gc_heap)
+            && let Some(proto) = proto
+        {
+            intl.set_prototype_override(&mut self.gc_heap, proto);
         }
     }
 
@@ -156,8 +134,9 @@ impl Interpreter {
             let table = self.iterator_prototype_overrides;
             return self.iterator_side_lookup(table, &key);
         }
-        let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
-        self.non_gc_exotic_prototype_overrides.get(&key).cloned()
+        value
+            .as_intl(&self.gc_heap)
+            .and_then(|intl| intl.prototype_override(&self.gc_heap))
     }
 
     pub(crate) fn non_gc_exotic_user_props(&self, value: &Value) -> Option<JsObject> {
@@ -167,8 +146,9 @@ impl Interpreter {
                 .iterator_side_lookup(table, &key)
                 .and_then(|value| value.as_object());
         }
-        let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
-        self.non_gc_exotic_user_props.get(&key).copied()
+        value
+            .as_intl(&self.gc_heap)
+            .and_then(|intl| intl.user_props(&self.gc_heap))
     }
 
     pub(crate) fn ensure_non_gc_exotic_user_props(
@@ -191,18 +171,23 @@ impl Interpreter {
             stored?;
             return Ok(Some(bag));
         }
-        let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
+        let Some(intl) = value.as_intl(&self.gc_heap) else {
             return Ok(None);
         };
-        if let Some(existing) = self.non_gc_exotic_user_props.get(&key) {
-            return Ok(Some(*existing));
+        if let Some(existing) = intl.user_props(&self.gc_heap) {
+            return Ok(Some(existing));
         }
         let receiver = *value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             receiver.trace_value_slots(visitor);
         };
         let bag = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
-        self.non_gc_exotic_user_props.insert(key, bag);
+        // Re-derive the handle after the allocation: the intl body may
+        // have moved, but `receiver` was traced across it.
+        let intl = receiver
+            .as_intl(&self.gc_heap)
+            .expect("intl receiver survives the bag allocation");
+        intl.set_user_props(&mut self.gc_heap, bag);
         Ok(Some(bag))
     }
 

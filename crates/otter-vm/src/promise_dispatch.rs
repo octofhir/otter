@@ -2076,6 +2076,10 @@ fn static_all_keyed_generic(
                 KeyedVariant::All => cap_handles.reject,
                 KeyedVariant::AllSettled => {
                     let live_cap = cap_handles.current(interp, context.clone());
+                    // The fulfill element function above allocated; re-read
+                    // both arrays from their scope handles.
+                    let values_raw = interp.escape_scoped(slots_handle);
+                    let keys_raw = interp.escape_scoped(keys_handle);
                     let on_reject = keyed_element_function(
                         interp,
                         slots.clone(),
@@ -2187,15 +2191,19 @@ fn keyed_element_function(
         1,
         smallvec![cap.promise, cap.resolve, cap.reject, values, keys],
         move |ctx, args, captures| {
-            let cap = capability_from_captures(captures, &cap);
-            let values = capture_array(captures[3]);
-            let keys = capture_array(captures[4]);
+            // The record build and the slot fill both allocate; the captures
+            // slab is a traced root the collector rewrites in place, so every
+            // handle is re-read from it after each allocating step.
             let payload = args.first().cloned().unwrap_or(Value::undefined());
             let value = match variant {
                 KeyedVariant::All => payload,
                 KeyedVariant::AllSettled => build_settled_record(fulfilled, payload, ctx)?,
             };
+            let values = capture_array(captures[3]);
             if fill_slot(&slots, ctx.heap_mut(), values, index, value) {
+                let cap = capability_from_captures(captures, &cap);
+                let values = capture_array(captures[3]);
+                let keys = capture_array(captures[4]);
                 resolve_keyed_slots_native(ctx, &cap, values, keys, name)?;
             }
             Ok(Value::undefined())
@@ -2218,17 +2226,23 @@ fn settled_element_function(
         1,
         smallvec![cap.promise, cap.resolve, cap.reject, values],
         move |ctx, args, captures| {
-            let cap = capability_from_captures(captures, &cap);
-            let values = capture_array(captures[3]);
+            // The record build, the slot fill, and the result-array build all
+            // allocate; the captures slab is a traced root the collector
+            // rewrites in place, so every handle is re-read from it after
+            // each allocating step. The capability values stay alive through
+            // the slab, so the array build needs no extra roots.
             let payload = args.first().cloned().unwrap_or(Value::undefined());
             let record = build_settled_record(fulfilled, payload, ctx)?;
+            let values = capture_array(captures[3]);
             if fill_slot(&slots, ctx.heap_mut(), values, index, record) {
+                let values = capture_array(captures[3]);
                 let collected = collect_values(ctx.heap(), values);
                 let arr = ctx.array_from_elements_with_roots(
                     collected.iter().cloned(),
-                    &[&cap.promise, &cap.resolve, &cap.reject],
+                    &[],
                     &[collected.as_slice()],
                 )?;
+                let cap = capability_from_captures(captures, &cap);
                 call_capability_resolve_native(ctx, &cap, Value::array(arr))?;
             }
             Ok(Value::undefined())

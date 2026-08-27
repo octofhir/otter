@@ -526,7 +526,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 global: ::otter_vm::__macro_support::JsObject,
                 well_known: &::otter_vm::__macro_support::symbol::WellKnownSymbols,
             ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
-                let ::core::option::Option::Some(namespace) =
+                let ::core::option::Option::Some(mut namespace) =
                     ::otter_vm::__macro_support::object::get(global, heap, #name)
                         .and_then(|v| v.as_object())
                 else {
@@ -536,7 +536,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 let value = ::otter_vm::__macro_support::string::JsString::from_str(#tag, heap)
                     .map_err(|_| ::otter_vm::__macro_support::JsSurfaceError::OutOfMemory)?;
                 ::otter_vm::__macro_support::object::define_own_symbol_property_partial(
-                    namespace,
+                    &mut namespace,
                     heap,
                     tag_sym,
                     ::otter_vm::__macro_support::object::PartialPropertyDescriptor {

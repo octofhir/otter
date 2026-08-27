@@ -17,6 +17,39 @@ use crate::{
 use smallvec::SmallVec;
 
 impl Interpreter {
+    /// Run an allocating step (typically a lazy expando-bag ensure) with the
+    /// descriptor's payload values parked on the iteration-anchor stack, and
+    /// hand back the step's result together with the relocated descriptor.
+    /// A raw descriptor held across the allocation would carry pre-move
+    /// handles into the define that follows.
+    pub(crate) fn with_descriptor_anchored<T>(
+        &mut self,
+        descriptor: object::PartialPropertyDescriptor,
+        step: impl FnOnce(&mut Self) -> Result<T, VmError>,
+    ) -> Result<(T, object::PartialPropertyDescriptor), VmError> {
+        let mut descriptor = descriptor;
+        let slots = [
+            descriptor.value.map(|v| self.push_iteration_anchor(v) - 1),
+            descriptor.get.map(|v| self.push_iteration_anchor(v) - 1),
+            descriptor.set.map(|v| self.push_iteration_anchor(v) - 1),
+        ];
+        let base = slots.iter().flatten().min().copied();
+        let outcome = step(self);
+        if let Some(slot) = slots[0] {
+            descriptor.value = Some(self.iteration_anchor(slot));
+        }
+        if let Some(slot) = slots[1] {
+            descriptor.get = Some(self.iteration_anchor(slot));
+        }
+        if let Some(slot) = slots[2] {
+            descriptor.set = Some(self.iteration_anchor(slot));
+        }
+        if let Some(base) = base {
+            self.pop_iteration_anchors_to(base);
+        }
+        Ok((outcome?, descriptor))
+    }
+
     pub(crate) fn define_own_property_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -234,7 +267,7 @@ impl Interpreter {
                 }
             };
         }
-        if let Some(obj) = target.as_object() {
+        if let Some(mut obj) = target.as_object() {
             if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
                 && !object::deferred_namespace_is_populated(obj, &self.gc_heap)
                 && Self::deferred_key_is_symbol_like(key)
@@ -246,7 +279,12 @@ impl Interpreter {
                 return Ok(false);
             }
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(obj, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut obj,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 if let Some(current) = self.string_object_exotic_descriptor(obj, key)? {
                     return Ok(is_compatible_partial_descriptor(
@@ -258,7 +296,7 @@ impl Interpreter {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(obj, k, descriptor)?
+                self.define_own_property_partial(&mut obj, k, descriptor)?
             });
         }
         if let Some(native) = target.as_native_function() {
@@ -272,10 +310,10 @@ impl Interpreter {
             });
         }
         if let Some(class) = target.as_class_constructor() {
-            let statics = class.statics(&self.gc_heap);
+            let mut statics = class.statics(&self.gc_heap);
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
-                    statics,
+                    &mut statics,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
@@ -284,7 +322,7 @@ impl Interpreter {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(statics, k, descriptor)?
+                self.define_own_property_partial(&mut statics, k, descriptor)?
             });
         }
         let fid = target.as_function().or_else(|| {
@@ -295,9 +333,11 @@ impl Interpreter {
         if let Some(function_id) = fid {
             let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
-                let bag = self.function_user_bag(stack, owner, function_id, &[])?;
+                let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                    this.function_user_bag(stack, owner, function_id, &[])
+                })?;
                 return Ok(object::define_own_symbol_property_partial(
-                    bag,
+                    &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
@@ -363,15 +403,21 @@ impl Interpreter {
                 regexp.set_last_index_writable(&mut self.gc_heap, updated.writable());
                 return Ok(true);
             }
-            let bag =
-                crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, &regexp)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::regexp_ensure_expando_pub(&mut this.gc_heap, &regexp)
+            })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)?
             });
         }
         if target.is_map()
@@ -380,43 +426,62 @@ impl Interpreter {
             || target.is_weak_set()
             || target.is_generator()
         {
-            let bag = self.collection_ensure_expando(target)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                this.collection_ensure_expando(target)
+            })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)?
             });
         }
         if let Some(promise) = target.as_promise() {
             // Promise instances are ordinary objects whose user-defined
             // properties (e.g. a shadowing `then` accessor the combinator
             // resolve path observes) live on a lazily-allocated expando.
-            let bag =
-                crate::property_dispatch::promise_ensure_expando_pub(&mut self.gc_heap, &promise)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::promise_ensure_expando_pub(&mut this.gc_heap, &promise)
+            })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)?
             });
         }
         if let Some(dv) = target.as_data_view() {
             // §25.3 — a `DataView` is an ordinary extensible object;
             // `Object.defineProperty(dv, …)` installs onto the expando.
-            let bag =
-                crate::property_dispatch::data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::data_view_ensure_expando_pub(&mut this.gc_heap, &dv)
+            })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)?
             });
         }
         if let Some(t) = target.as_temporal(&self.gc_heap) {
@@ -424,27 +489,42 @@ impl Interpreter {
             // own property (commonly an accessor shadowing a prototype
             // getter in the spec's conversion-fast-path tests) lands on
             // the lazy expando bag.
-            let bag = crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::temporal_ensure_expando_pub(&mut this.gc_heap, &t)
+            })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)?
             });
         }
         if target.is_intl() || target.is_iterator() {
-            let Some(bag) = self.ensure_non_gc_exotic_user_props(target)? else {
+            let (bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                this.ensure_non_gc_exotic_user_props(target)
+            })?;
+            let Some(mut bag) = bag else {
                 return Ok(false);
             };
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)?
             });
         }
         if let Some(arr) = target.as_array() {
@@ -478,14 +558,24 @@ impl Interpreter {
                 // length raises `RangeError` ahead of the configurable /
                 // enumerable / writable checks.
                 let new_len = if let Some(v) = descriptor.value {
-                    let number_for_uint =
-                        crate::coerce::to_number_or_throw(self, stack, context, &v)?;
-                    let new_len = crate::number::bitwise::to_uint32(number_for_uint);
-                    let number_len = crate::coerce::to_number_or_throw(self, stack, context, &v)?;
-                    if (new_len as f64) != number_len.as_f64() {
-                        return Err(self.err_range(("Invalid array length".to_string()).into()));
-                    }
-                    Some(new_len as usize)
+                    // Both coercions can run user code; the candidate value
+                    // rides an anchor slot so the second read is not stale.
+                    let v_slot = self.push_iteration_anchor(v) - 1;
+                    let outcome = (|this: &mut Self| {
+                        let v = this.iteration_anchor(v_slot);
+                        let number_for_uint =
+                            crate::coerce::to_number_or_throw(this, stack, context, &v)?;
+                        let new_len = crate::number::bitwise::to_uint32(number_for_uint);
+                        let v = this.iteration_anchor(v_slot);
+                        let number_len =
+                            crate::coerce::to_number_or_throw(this, stack, context, &v)?;
+                        if (new_len as f64) != number_len.as_f64() {
+                            return Err(this.err_range(("Invalid array length".to_string()).into()));
+                        }
+                        Ok(new_len as usize)
+                    })(self);
+                    self.pop_iteration_anchors_to(v_slot);
+                    Some(outcome?)
                 } else {
                     None
                 };
@@ -547,12 +637,11 @@ impl Interpreter {
             // enumerable, configurable data property; any other key is
             // an ordinary define on the typed array's expando bag.
             if let VmPropertyKey::Symbol(sym) = key {
-                let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
-                    &mut self.gc_heap,
-                    &t,
-                )?;
+                let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                    crate::property_dispatch::typed_array_ensure_expando_pub(&mut this.gc_heap, &t)
+                })?;
                 return Ok(object::define_own_symbol_property_partial(
-                    bag,
+                    &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
@@ -585,41 +674,44 @@ impl Interpreter {
                 }
                 return Ok(true);
             }
-            let bag =
-                crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
-            return self.define_own_property_partial(bag, name, descriptor);
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::typed_array_ensure_expando_pub(&mut this.gc_heap, &t)
+            })?;
+            return self.define_own_property_partial(&mut bag, name, descriptor);
         }
         // ArrayBuffer / SharedArrayBuffer and DataView are ordinary
         // objects (no exotic [[DefineOwnProperty]]); own properties live
         // on a lazily-allocated expando bag, mirroring the set/get path.
         if let Some(b) = target.as_array_buffer() {
-            let bag =
-                crate::property_dispatch::array_buffer_ensure_expando_pub(&mut self.gc_heap, &b)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::array_buffer_ensure_expando_pub(&mut this.gc_heap, &b)
+            })?;
             return match key {
                 VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
-                    bag,
+                    &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
                 )),
                 _ => match key.string_name() {
-                    Some(name) => self.define_own_property_partial(bag, name, descriptor),
+                    Some(name) => self.define_own_property_partial(&mut bag, name, descriptor),
                     None => Ok(false),
                 },
             };
         }
         if let Some(dv) = target.as_data_view() {
-            let bag =
-                crate::property_dispatch::data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
+            let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                crate::property_dispatch::data_view_ensure_expando_pub(&mut this.gc_heap, &dv)
+            })?;
             return match key {
                 VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
-                    bag,
+                    &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
                 )),
                 _ => match key.string_name() {
-                    Some(name) => self.define_own_property_partial(bag, name, descriptor),
+                    Some(name) => self.define_own_property_partial(&mut bag, name, descriptor),
                     None => Ok(false),
                 },
             };

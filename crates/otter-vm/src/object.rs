@@ -5273,33 +5273,33 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) 
 /// `[[DefineOwnProperty]]`: missing fields preserve the existing value,
 /// missing-and-new defaults to spec defaults (§10.1.6.3 step 5).
 pub fn define_own_property_partial(
-    obj: JsObject,
+    obj_ref: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
     // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
-    let mut obj = obj;
+    // borrow below. This may move the receiver; every relocation below is
+    // reflected back through `obj_ref` so the caller's handle stays live.
     let mut descriptor = descriptor;
     {
         let descriptor_slot = &mut descriptor;
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
         };
-        ensure_exotic_with_roots(&mut obj, heap, &mut roots).expect("exotic sidecar");
+        ensure_exotic_with_roots(obj_ref, heap, &mut roots).expect("exotic sidecar");
     }
     let completed = descriptor.complete_for_new_property();
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
-    let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
-    let slot_metas = slot_metas_for_shape_transition(heap, obj, existing_offset);
-    let append_index = heap.read_payload(obj, |body| body_property_count(heap, body));
+    let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
+    let dictionary_keys = dictionary_keys_for_shape_transition(heap, *obj_ref, existing_offset);
+    let slot_metas = slot_metas_for_shape_transition(heap, *obj_ref, existing_offset);
+    let append_index = heap.read_payload(*obj_ref, |body| body_property_count(heap, body));
     // §10.1.6.3 ValidateAndApplyPropertyDescriptor runs outside the
     // mutable body borrow so the BigInt-BigInt SameValue arm can
     // read both bodies through `heap`. Distinct GC handles holding
     // the same numeric value must compare equal per spec.
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
+        let existing = heap.read_payload(*obj_ref, |body| body.slot_data(heap, offset as usize));
         match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -5308,13 +5308,13 @@ pub fn define_own_property_partial(
         None
     };
     // Lower the slot to its flat `(meta, value)` form before taking the body
-    // borrow: an accessor allocates its cell here (rooting `obj`), so the
-    // mutation closure never allocates.
+    // borrow: an accessor allocates its cell here (rooting the receiver), so
+    // the mutation closure never allocates.
     let slot_source = match merged_for_existing {
         Some(merged) => merged,
         None => SlotData::from_descriptor(completed),
     };
-    let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
+    let (meta, stored) = match slot_source.into_flat(heap, obj_ref) {
         Ok(parts) => parts,
         Err(_) => return false,
     };
@@ -5323,10 +5323,10 @@ pub fn define_own_property_partial(
     // its attributes from the hidden class. Materialization allocates, so keep
     // the flattened direct value rooted while it runs.
     if existing_offset.is_some() {
-        materialize_slots_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored));
+        materialize_slots_with_pending_values(obj_ref, heap, std::slice::from_mut(&mut stored));
     }
     if reserve_slot_capacity(
-        &mut obj,
+        obj_ref,
         heap,
         append_index + 1,
         std::slice::from_mut(&mut stored),
@@ -5336,7 +5336,7 @@ pub fn define_own_property_partial(
         return false;
     }
     let Ok(slot_meta_table) = slot_meta_table_for_install(
-        &mut obj,
+        obj_ref,
         heap,
         &slot_metas,
         append_index + 1,
@@ -5346,7 +5346,7 @@ pub fn define_own_property_partial(
     };
     let dict_table = if existing_offset.is_none() {
         let Ok(table) = dict_keys_table_for_install(
-            &mut obj,
+            obj_ref,
             heap,
             &dictionary_keys,
             key,
@@ -5358,7 +5358,7 @@ pub fn define_own_property_partial(
     } else {
         None
     };
-    let success = heap.with_payload(obj, |body| {
+    let success = heap.with_payload(*obj_ref, |body| {
         if let Some(offset) = existing_offset {
             body.set_slot(offset as usize, meta, stored, None);
             true
@@ -5379,7 +5379,7 @@ pub fn define_own_property_partial(
             true
         }
     });
-    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+    let sidecar = heap.read_payload(*obj_ref, |body| body.exotic.get());
     if let Some(table) = slot_meta_table {
         heap.record_write(sidecar, &table);
     }
@@ -5392,24 +5392,23 @@ pub fn define_own_property_partial(
         if descriptor.value.is_some() && !meta.is_accessor {
             descriptor.value = Some(stored);
         }
-        apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
-        record_slot_write(heap, obj, stored);
+        apply_mapped_arguments_partial_define(*obj_ref, heap, key, descriptor, existing_offset);
+        record_slot_write(heap, *obj_ref, stored);
     }
     success
 }
 
 pub(crate) fn define_own_property_partial_with_shape(
-    obj: JsObject,
+    obj_ref: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
     next_shape: ShapeHandle,
 ) -> bool {
-    let mut obj = obj;
     let completed = descriptor.complete_for_new_property();
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
     let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
+        let existing = heap.read_payload(*obj_ref, |body| body.slot_data(heap, offset as usize));
         match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
             Some(merged) => Some(merged),
             None => return false,
@@ -5421,7 +5420,7 @@ pub(crate) fn define_own_property_partial_with_shape(
         Some(merged) => merged,
         None => SlotData::from_descriptor(completed),
     };
-    let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
+    let (meta, stored) = match slot_source.into_flat(heap, obj_ref) {
         Ok(parts) => parts,
         Err(_) => return false,
     };
@@ -5429,7 +5428,7 @@ pub(crate) fn define_own_property_partial_with_shape(
     let append_index = shape_body::shape_property_count(heap, next_shape) as usize - 1;
     let mut stored = stored;
     if reserve_slot_capacity(
-        &mut obj,
+        obj_ref,
         heap,
         append_index + 1,
         std::slice::from_mut(&mut stored),
@@ -5438,7 +5437,7 @@ pub(crate) fn define_own_property_partial_with_shape(
     {
         return false;
     }
-    let success = heap.with_payload(obj, |body| {
+    let success = heap.with_payload(*obj_ref, |body| {
         if let Some(offset) = existing_offset {
             // Redefine: `next_shape` is the attribute-encoding class that
             // records this slot's new flags/kind (computed by the caller).
@@ -5455,12 +5454,12 @@ pub(crate) fn define_own_property_partial_with_shape(
         }
     });
     if success {
-        apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
-        record_slot_write(heap, obj, stored);
-        record_exotic_write(heap, obj, &next_shape);
+        apply_mapped_arguments_partial_define(*obj_ref, heap, key, descriptor, existing_offset);
+        record_slot_write(heap, *obj_ref, stored);
+        record_exotic_write(heap, *obj_ref, &next_shape);
         #[cfg(debug_assertions)]
         if existing_offset.is_none() {
-            debug_assert_appended_shape_slot(obj, heap);
+            debug_assert_appended_shape_slot(*obj_ref, heap);
         }
     }
     success
@@ -5468,24 +5467,25 @@ pub(crate) fn define_own_property_partial_with_shape(
 
 /// Field-presence-aware §10.1.6.3 for symbol-keyed properties.
 pub fn define_own_symbol_property_partial(
-    obj: JsObject,
+    obj_ref: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: JsSymbol,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
     // The sidecar and the symbol table allocate, so both are reserved
-    // here, outside the payload borrow below. This may move `obj`,
-    // which is why the local is `mut`; the descriptor's values are
-    // rooted across the reservation.
-    let mut obj = obj;
+    // here, outside the payload borrow below. This may move the receiver;
+    // the relocation is reflected back through `obj_ref` so the caller's
+    // handle stays live. The descriptor's values are rooted across the
+    // reservation.
     let mut descriptor = descriptor;
     {
         let descriptor_slot = &mut descriptor;
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
         };
-        reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
+        reserve_symbol_prop_capacity(obj_ref, heap, &mut roots).expect("symbol prop table");
     }
+    let obj = *obj_ref;
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
     let existing_pos_and_slot = heap.read_payload(obj, |body| {
@@ -6774,7 +6774,7 @@ mod tests {
     #[test]
     fn runtime_define_property_advances_shape() {
         let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         let descriptor = PartialPropertyDescriptor {
@@ -6787,7 +6787,7 @@ mod tests {
 
         assert!(
             interp
-                .define_own_property_partial(o, "answer", descriptor)
+                .define_own_property_partial(&mut o, "answer", descriptor)
                 .expect("define")
         );
 
@@ -6933,7 +6933,7 @@ mod tests {
     #[test]
     fn raw_define_property_partial_invalidates_shape_for_new_property() {
         let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
@@ -6946,7 +6946,7 @@ mod tests {
         };
 
         assert!(define_own_property_partial(
-            o,
+            &mut o,
             interp.gc_heap_mut(),
             "x",
             descriptor,

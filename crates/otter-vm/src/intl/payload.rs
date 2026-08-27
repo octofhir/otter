@@ -465,14 +465,23 @@ pub const INTL_BODY_TYPE_TAG: u8 = 0x28;
 
 /// GC body holding an Intl value's [`IntlPayload`].
 ///
-/// ICU formatter / collator state holds no GC references; the derive
-/// emits an empty `trace_slots_safe` body.
+/// ICU formatter / collator state holds no GC references; only the
+/// prototype-override and user-props slots below are traced.
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = INTL_BODY_TYPE_TAG)]
 pub struct IntlBody {
     /// Variant-typed Intl payload.
     #[pelt(skip)]
     pub payload: IntlPayload,
+    /// Subclass / SetPrototypeOf [[Prototype]] override. `None` means
+    /// the per-kind realm prototype. Lives in the body (not an
+    /// address-keyed side table) because the handle is a cage offset
+    /// that moves under relocation.
+    pub prototype_override: Option<crate::Value>,
+    /// Ordinary own properties installed via defineProperty /
+    /// assignment, shadowing the prototype accessors. `None` until the
+    /// first own property.
+    pub user_props: Option<crate::object::JsObject>,
 }
 
 /// 4-byte compressed GC handle to an [`IntlBody`]. `Copy`. Packs
@@ -488,7 +497,11 @@ pub fn alloc_intl(
     heap: &mut otter_gc::GcHeap,
     payload: IntlPayload,
 ) -> Result<IntlHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(IntlBody { payload })
+    heap.alloc_old(IntlBody {
+        payload,
+        prototype_override: None,
+        user_props: None,
+    })
 }
 
 /// Heap handle for [`crate::Value::Intl`].
@@ -551,6 +564,34 @@ impl JsIntl {
     #[must_use]
     pub fn kind(self) -> IntlKind {
         self.kind
+    }
+
+    /// Subclass / SetPrototypeOf [[Prototype]] override, if installed.
+    #[must_use]
+    pub fn prototype_override(self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
+        heap.read_payload(self.inner, |body| body.prototype_override)
+    }
+
+    /// Install a [[Prototype]] override.
+    pub fn set_prototype_override(self, heap: &mut otter_gc::GcHeap, proto: crate::Value) {
+        heap.with_payload(self.inner, |body| {
+            body.prototype_override = Some(proto);
+        });
+        heap.record_write(self.inner, &proto);
+    }
+
+    /// The ordinary own-property bag, if one was ever materialised.
+    #[must_use]
+    pub fn user_props(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.inner, |body| body.user_props)
+    }
+
+    /// Install the ordinary own-property bag.
+    pub fn set_user_props(self, heap: &mut otter_gc::GcHeap, bag: crate::object::JsObject) {
+        heap.with_payload(self.inner, |body| {
+            body.user_props = Some(bag);
+        });
+        heap.record_write(self.inner, &bag);
     }
 
     /// Raw GC handle — used by tracing and write barriers.

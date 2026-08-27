@@ -1400,12 +1400,10 @@ pub struct Interpreter {
     /// than GC-managed. Values stored here are traced from the
     /// interpreter root set, which keeps subclass prototypes safe
     /// without embedding untraced `Value` slots in non-GC bodies.
-    non_gc_exotic_prototype_overrides: std::collections::HashMap<usize, Value>,
     /// Per-instance own-property bags for object-shaped exotics whose
     /// payloads are not GC-managed objects yet. `Intl.*` instances are
     /// ordinary objects for user-visible own properties even though
     /// their internal slots live in compact non-object payloads.
-    non_gc_exotic_user_props: std::collections::HashMap<usize, JsObject>,
     /// Subclass `[[Prototype]]` stamped on an iterator at construction,
     /// keyed weakly by the iterator: an iterator body moves, so its
     /// address is not an identity, and an entry that outlived its

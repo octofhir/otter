@@ -950,7 +950,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     } else {
                         ::core::option::Option::None
                     };
-                    let ::core::option::Option::Some(prototype) = prototype else {
+                    let ::core::option::Option::Some(mut prototype) = prototype else {
                         return ::core::result::Result::Ok(());
                     };
                     let tag_sym =
@@ -958,7 +958,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     let value = ::otter_vm::__macro_support::string::JsString::from_str(#tag, heap)
                         .map_err(|_| ::otter_vm::__macro_support::JsSurfaceError::OutOfMemory)?;
                     ::otter_vm::__macro_support::object::define_own_symbol_property_partial(
-                        prototype,
+                        &mut prototype,
                         heap,
                         tag_sym,
                         ::otter_vm::__macro_support::object::PartialPropertyDescriptor {

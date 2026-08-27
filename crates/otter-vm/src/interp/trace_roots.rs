@@ -163,14 +163,6 @@ impl Interpreter {
         }
     }
 
-    /// Iterator over non-GC exotic prototype override values.
-    /// Used by the GC root walker because the side table can retain
-    /// subclass prototype objects for `ArrayBuffer`, `DataView`, and
-    /// `TypedArray` instances.
-    pub fn non_gc_exotic_prototype_overrides_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.non_gc_exotic_prototype_overrides.values()
-    }
-
     /// The weak side tables holding iterator prototype overrides and own
     /// properties. The tables themselves are roots; their entries stay
     /// weak through the ephemeron registry.
@@ -186,11 +178,6 @@ impl Interpreter {
                 visitor(slot);
             }
         }
-    }
-
-    /// Own-property bags for non-GC exotic payloads.
-    pub fn non_gc_exotic_user_props_for_trace(&self) -> impl Iterator<Item = &JsObject> {
-        self.non_gc_exotic_user_props.values()
     }
 
     /// Borrow the GC-managed shape side tables for root tracing.

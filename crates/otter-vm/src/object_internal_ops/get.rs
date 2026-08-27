@@ -1658,18 +1658,30 @@ impl Interpreter {
         // every Object target, not only Proxy targets. The rest of the
         // proxy preflight is Proxy-specific.
         if matches!(method, M::DefineProperty) && target.is_object_type() {
-            let key = self.evaluate_to_property_key(
-                stack,
-                context,
-                args.get(1).unwrap_or(&Value::undefined()),
-            )?;
-            let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
-            let descriptor = self.evaluate_to_property_descriptor(stack, context, &attributes)?;
-            let ok = self.define_own_property_value(stack, context, target, &key, descriptor)?;
-            if !ok {
-                return Err(self.err_type(("Cannot define property".to_string()).into()));
-            }
-            return Ok(Some(*target));
+            // Key coercion, descriptor evaluation, and the define itself can
+            // all allocate (or run user code); the args slice is an untraced
+            // copy, so the receiver rides an anchor slot and is re-read after
+            // each step.
+            let target_slot = self.push_iteration_anchor(*target) - 1;
+            let outcome = (|this: &mut Self| {
+                let key = this.evaluate_to_property_key(
+                    stack,
+                    context,
+                    args.get(1).unwrap_or(&Value::undefined()),
+                )?;
+                let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
+                let descriptor =
+                    this.evaluate_to_property_descriptor(stack, context, &attributes)?;
+                let target = this.iteration_anchor(target_slot);
+                let ok =
+                    this.define_own_property_value(stack, context, &target, &key, descriptor)?;
+                if !ok {
+                    return Err(this.err_type(("Cannot define property".to_string()).into()));
+                }
+                Ok(Some(this.iteration_anchor(target_slot)))
+            })(self);
+            self.pop_iteration_anchors_to(target_slot);
+            return outcome;
         }
         // Module Namespace Exotic Objects (§10.4.6) define their own
         // [[DefineOwnProperty]] / [[OwnPropertyKeys]], so integrity
@@ -1782,20 +1794,30 @@ impl Interpreter {
             // §20.1.2.4 Object.defineProperty(O, P, Attributes) —
             // handled in the pre-Proxy block above.
             M::DefineProperty => {
-                let key = self.evaluate_to_property_key(
-                    stack,
-                    context,
-                    args.get(1).unwrap_or(&Value::undefined()),
-                )?;
-                let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
-                let descriptor =
-                    self.evaluate_to_property_descriptor(stack, context, &attributes)?;
-                let ok =
-                    self.define_own_property_value(stack, context, target, &key, descriptor)?;
-                if !ok {
-                    return Err(self.err_type(("Object.defineProperty failed".to_string()).into()));
-                }
-                Ok(Some(*target))
+                // Same anchoring as the pre-Proxy block: every step below can
+                // allocate, and the args slice is an untraced copy.
+                let target_slot = self.push_iteration_anchor(*target) - 1;
+                let outcome = (|this: &mut Self| {
+                    let key = this.evaluate_to_property_key(
+                        stack,
+                        context,
+                        args.get(1).unwrap_or(&Value::undefined()),
+                    )?;
+                    let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
+                    let descriptor =
+                        this.evaluate_to_property_descriptor(stack, context, &attributes)?;
+                    let target = this.iteration_anchor(target_slot);
+                    let ok =
+                        this.define_own_property_value(stack, context, &target, &key, descriptor)?;
+                    if !ok {
+                        return Err(
+                            this.err_type(("Object.defineProperty failed".to_string()).into())
+                        );
+                    }
+                    Ok(Some(this.iteration_anchor(target_slot)))
+                })(self);
+                self.pop_iteration_anchors_to(target_slot);
+                outcome
             }
             // §20.1.2.10 Object.getOwnPropertyNames(O) — full string
             // key set (enumerable + non-enumerable) for Proxy targets,

@@ -366,7 +366,7 @@ impl Interpreter {
         // since it was first read (class construction, the static-prototype
         // re-seat) may have relocated it, and walking a stale shape here is a
         // use-after-move. The register slot is forwarded by the collector.
-        let prototype = read_register(&stack[frame_idx], proto_reg)?
+        let mut prototype = read_register(&stack[frame_idx], proto_reg)?
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
         // §15.7.10 steps 17/20 — the compiler reserves `prototype.constructor`
@@ -387,7 +387,8 @@ impl Interpreter {
                 },
             );
         if placeholder_pending {
-            let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
+            let _ =
+                self.define_own_property_partial(&mut prototype, "constructor", constructor_desc)?;
         }
         let frame = &mut stack[frame_idx];
         frame.advance_pc()?;
@@ -1713,34 +1714,57 @@ impl Interpreter {
                 descriptor
             }
         };
-        let mut roots = Vec::with_capacity(3);
-        let desc_obj_root = desc_obj.map(Value::object);
-        if let Some(value) = &desc_obj_root {
-            roots.push(value);
-        }
-        match &descriptor.kind {
-            object::DescriptorKind::Data { value } => roots.push(value),
-            object::DescriptorKind::Accessor { getter, setter } => {
-                if let Some(getter) = getter {
-                    roots.push(getter);
-                }
-                if let Some(setter) = setter {
-                    roots.push(setter);
+        // The bag allocation and the define below can move every carried
+        // value, and a shared reference into a stack local is not a root the
+        // collector can rewrite. The owner closure and the descriptor's
+        // payload values ride iteration-anchor slots and are re-read after
+        // each allocating step.
+        let owner_slot =
+            self.push_iteration_anchor(owner.map(Value::closure).unwrap_or(Value::undefined())) - 1;
+        let base = owner_slot;
+        let (value_slot, getter_slot, setter_slot) = match &descriptor.kind {
+            object::DescriptorKind::Data { value } => {
+                (Some(self.push_iteration_anchor(*value) - 1), None, None)
+            }
+            object::DescriptorKind::Accessor { getter, setter } => (
+                None,
+                getter.as_ref().map(|g| self.push_iteration_anchor(*g) - 1),
+                setter.as_ref().map(|s| self.push_iteration_anchor(*s) - 1),
+            ),
+        };
+        let flags = descriptor.flags;
+        let outcome = (|this: &mut Self| {
+            let mut bag = this.function_user_bag(stack, owner, function_id, &[])?;
+            let kind = match (value_slot, getter_slot, setter_slot) {
+                (Some(value_slot), _, _) => object::DescriptorKind::Data {
+                    value: this.iteration_anchor(value_slot),
+                },
+                (None, getter_slot, setter_slot) => object::DescriptorKind::Accessor {
+                    getter: getter_slot.map(|slot| this.iteration_anchor(slot)),
+                    setter: setter_slot.map(|slot| this.iteration_anchor(slot)),
+                },
+            };
+            let descriptor = object::PropertyDescriptor { kind, flags };
+            let ok = crate::object::define_own_property_in_place(
+                &mut bag,
+                &mut this.gc_heap,
+                key,
+                descriptor,
+            );
+            if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key)
+            {
+                match this.iteration_anchor(owner_slot).as_closure(&this.gc_heap) {
+                    Some(c) => c.set_metadata_deleted(&mut this.gc_heap, metadata_key, false),
+                    None => {
+                        this.function_deleted_metadata
+                            .remove(&(function_id, metadata_key));
+                    }
                 }
             }
-        }
-        let bag = self.function_user_bag(stack, owner, function_id, &roots)?;
-        let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
-        if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) {
-            match owner {
-                Some(c) => c.set_metadata_deleted(&mut self.gc_heap, metadata_key, false),
-                None => {
-                    self.function_deleted_metadata
-                        .remove(&(function_id, metadata_key));
-                }
-            }
-        }
-        Ok(ok)
+            Ok(ok)
+        })(self);
+        self.pop_iteration_anchors_to(base);
+        outcome
     }
 
     pub(crate) fn ordinary_function_delete_own_property(
@@ -1961,9 +1985,10 @@ impl Interpreter {
                         {
                             return Err(VmError::TypeMismatch);
                         }
-                        let bag = self.function_user_bag(stack, owner, function_id, &[&target])?;
+                        let mut bag =
+                            self.function_user_bag(stack, owner, function_id, &[&target])?;
                         crate::object::define_own_symbol_property_partial(
-                            bag,
+                            &mut bag,
                             &mut self.gc_heap,
                             *sym,
                             descriptor,
@@ -2499,7 +2524,7 @@ impl Interpreter {
         }
 
         let bag_root = Value::object(bag);
-        let proto = self.alloc_stack_rooted_object_with_extra_roots(
+        let mut proto = self.alloc_stack_rooted_object_with_extra_roots(
             stack,
             &[&function_root, &constructor_value, &bag_root],
         )?;
@@ -2571,7 +2596,8 @@ impl Interpreter {
                 configurable: Some(true),
                 ..Default::default()
             };
-            let _ = self.define_own_property_partial(proto, "constructor", constructor_desc)?;
+            let _ =
+                self.define_own_property_partial(&mut proto, "constructor", constructor_desc)?;
         }
         // Re-acquire the (possibly relocated) prototype through the function's
         // bag, which the collector forwarded; the bare `proto` handle may be
@@ -2588,7 +2614,7 @@ impl Interpreter {
         context: &ExecutionContext,
         function_id: u32,
         proto: JsObject,
-        parent: JsObject,
+        mut parent: JsObject,
     ) -> Result<(), VmError> {
         if let Some(iterator_proto) = self
             .constructor_prototype_value("Iterator")
@@ -2606,7 +2632,7 @@ impl Interpreter {
             .well_known_symbols()
             .get(symbol::WellKnown::ToStringTag);
         object::define_own_symbol_property_partial(
-            parent,
+            &mut parent,
             &mut self.gc_heap,
             tag_sym,
             object::PartialPropertyDescriptor {

@@ -159,11 +159,11 @@ impl FunctionKindPrototypes {
                 JsString::from_str_with_roots(tag, heap, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
             };
-            let proto = proto_root
+            let mut proto = proto_root
                 .as_object()
                 .expect("function-kind prototype stays rooted after tag allocation");
             object::define_own_symbol_property_partial(
-                proto,
+                &mut proto,
                 heap,
                 tag_sym_root,
                 object::PartialPropertyDescriptor {
@@ -495,11 +495,11 @@ impl Interpreter {
             let Ok(tag_string) = JsString::from_str(tag, &mut self.gc_heap) else {
                 continue;
             };
-            let shared = shared_value
+            let mut shared = shared_value
                 .as_object()
                 .expect("shared generator prototype stays rooted");
             object::define_own_symbol_property_partial(
-                shared,
+                &mut shared,
                 &mut self.gc_heap,
                 tag_sym,
                 object::PartialPropertyDescriptor {
@@ -576,9 +576,9 @@ impl Interpreter {
             .ok()?,
         );
         let async_iter_sym = self.well_known_symbols.get(WellKnown::AsyncIterator);
-        let proto = proto_root.as_object()?;
+        let mut proto = proto_root.as_object()?;
         object::define_own_symbol_property_partial(
-            proto,
+            &mut proto,
             &mut self.gc_heap,
             async_iter_sym,
             object::PartialPropertyDescriptor {

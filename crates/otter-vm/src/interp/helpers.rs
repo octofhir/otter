@@ -461,7 +461,7 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     } else {
         None
     };
-    let Some(prototype) = prototype else {
+    let Some(mut prototype) = prototype else {
         return Ok(());
     };
     let global_root = Value::object(global);
@@ -476,7 +476,7 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     .map_err(|_| crate::js_surface::JsSurfaceError::OutOfMemory)?;
     let sym = well_known.get(symbol::WellKnown::Iterator);
     crate::object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         sym,
         crate::object::PartialPropertyDescriptor {

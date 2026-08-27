@@ -52,13 +52,13 @@ pub fn install_date_well_knowns_post_bootstrap(
     } else {
         None
     };
-    let Some(prototype) = prototype else {
+    let Some(mut prototype) = prototype else {
         return Ok(());
     };
 
     if let Some(to_utc_string) = object::get(prototype, heap, "toUTCString") {
         object::define_own_property_partial(
-            prototype,
+            &mut prototype,
             heap,
             "toGMTString",
             PartialPropertyDescriptor {
@@ -85,7 +85,7 @@ pub fn install_date_well_knowns_post_bootstrap(
 
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         to_primitive_sym,
         PartialPropertyDescriptor {

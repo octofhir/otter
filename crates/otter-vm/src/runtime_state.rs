@@ -184,13 +184,6 @@ impl<'a> RuntimeState<'a> {
         }
         interp.trace_iterator_prototypes(visitor);
         interp.trace_function_kind_roots(visitor);
-        // 6b) Prototype overrides for non-GC exotic payloads.
-        for value in interp.non_gc_exotic_prototype_overrides_for_trace() {
-            value.trace_value_slots(visitor);
-        }
-        for obj in interp.non_gc_exotic_user_props_for_trace() {
-            obj.trace_gc_roots(visitor);
-        }
         interp.trace_iterator_side_tables(visitor);
         // 7) GC-managed hidden-class root/key/transition side tables.
         if include_shape_runtime {

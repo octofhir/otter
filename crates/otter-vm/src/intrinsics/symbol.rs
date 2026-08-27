@@ -302,7 +302,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     let proto_desc = symbol_ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match proto_desc.and_then(|d| match d.kind {
+    let mut prototype = match proto_desc.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
@@ -352,14 +352,14 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         }
     });
     for ns_name in ["Math", "JSON", "Reflect", "Atomics"] {
-        if let Some(ns) = object::get(global, heap, ns_name).and_then(|v| v.as_object()) {
+        if let Some(mut ns) = object::get(global, heap, ns_name).and_then(|v| v.as_object()) {
             if let Some(proto) = object_proto {
                 object::set_prototype(ns, heap, Some(proto));
             }
             let tag = crate::string::JsString::from_str(ns_name, heap)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
             object::define_own_symbol_property_partial(
-                ns,
+                &mut ns,
                 heap,
                 to_string_tag_sym,
                 crate::object::PartialPropertyDescriptor {
@@ -376,7 +376,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     let symbol_tag = crate::string::JsString::from_str("Symbol", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         to_string_tag_sym,
         crate::object::PartialPropertyDescriptor {
@@ -466,9 +466,9 @@ fn install_constructor_species_accessor(
                 ..Default::default()
             },
         )
-    } else if let Some(obj) = ctor_value.as_object() {
+    } else if let Some(mut obj) = ctor_value.as_object() {
         crate::object::define_own_symbol_property_partial(
-            obj,
+            &mut obj,
             heap,
             species_sym,
             crate::object::PartialPropertyDescriptor {

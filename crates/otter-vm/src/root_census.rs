@@ -292,22 +292,6 @@ impl Interpreter {
             count(|v| self.trace_function_kind_roots(v)),
         );
         push(
-            "non_gc_exotic_prototype_overrides",
-            count(|v| {
-                for value in self.non_gc_exotic_prototype_overrides_for_trace() {
-                    value.trace_value_slots(v);
-                }
-            }),
-        );
-        push(
-            "non_gc_exotic_user_props",
-            count(|v| {
-                for obj in self.non_gc_exotic_user_props_for_trace() {
-                    obj.trace_gc_roots(v);
-                }
-            }),
-        );
-        push(
             "shape_runtime",
             count(|v| self.shape_runtime_for_trace().trace_roots(v)),
         );

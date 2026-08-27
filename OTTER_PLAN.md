@@ -399,14 +399,21 @@ a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
 Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.79% at
-`556e6b1c`, 111 fails, 0 crashes/timeouts — failing set identical to the
-`f8115ad8` run; the GC-soundness wave in between (define paths take
-`&mut JsObject`, descriptor payloads anchored across expando/shape
-allocations, flatten and keyed promise combinators re-read every handle
-after allocating steps) is stress-only: under `OTTER_GC_STRESS=1` the
-Object, defineProperty/defineProperties, Promise, flat/flatMap, Reflect,
-Proxy, Iterator, Set, Array.from, and RegExp.prototype suites all pass
-with zero crashes. Follow-up slice (125→111):
+`bb4fb148`, 110 fails, 0 crashes/timeouts (one fix vs the 111-fail set,
+zero regressions). Two GC-soundness waves sit between this and
+`f8115ad8`: define paths take `&mut JsObject` with descriptor payloads
+anchored across expando/shape allocations, flatten and keyed promise
+combinators re-read every handle after allocating steps; then the
+remembered-set holes closed — TypedArray/DataView expando setters and
+parked generator frames record their write barriers, expando allocators
+re-derive their receivers, async-generator resume arguments ride anchor
+slots, and array exotics keep a chronological non-index key record (the
+for-in fix). Under `OTTER_GC_STRESS=1` the Object, defineProperty /
+defineProperties, Promise, flat/flatMap, Reflect, Proxy, Iterator,
+Set/Map/WeakMap/WeakSet, Array.from, Array.prototype, RegExp.prototype,
+TypedArray, ArrayBuffer/SharedArrayBuffer/DataView, class, and
+async-generator suites all pass with zero crashes. Follow-up slice
+(125→111):
 legacy Intl-constructed chaining on service-instance receivers +
 proxy-observable unwrap; per-closure-instance name/length deletion with
 real %Function.prototype% fallback; spec-ordered bind reads (proto,

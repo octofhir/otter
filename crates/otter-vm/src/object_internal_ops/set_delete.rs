@@ -251,104 +251,147 @@ impl Interpreter {
         // `true` regardless. With a foreign receiver, an invalid
         // index returns `true` without any write; a valid one falls
         // through to ordinary receiver semantics.
-        if let Some(t) = target.as_typed_array(&self.gc_heap) {
-            match key {
-                VmPropertyKey::Symbol(sym) => {
-                    let bag = crate::property_dispatch::typed_array_ensure_expando(self, &t)?;
-                    return Ok(object::set_symbol(bag, &mut self.gc_heap, *sym, value));
-                }
-                _ => {
-                    let name = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling")
-                        .to_string();
-                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(&name)
-                    {
-                        let same_receiver = receiver
-                            .as_typed_array(&self.gc_heap)
-                            .is_some_and(|r| r == t);
-                        if same_receiver {
-                            let coerced =
-                                self.typed_array_coerce_element(stack, context, t.kind(), value)?;
-                            if let Some(idx) = crate::property_dispatch::typed_array_valid_index(
-                                &t,
-                                &self.gc_heap,
-                                n,
-                            ) {
-                                t.set(&mut self.gc_heap, idx, &coerced);
-                            }
-                            return Ok(true);
-                        }
-                        if crate::property_dispatch::typed_array_valid_index(&t, &self.gc_heap, n)
-                            .is_none()
+        if target.as_typed_array(&self.gc_heap).is_some() {
+            // The lazy expando ensure allocates, so the incoming value,
+            // receiver, and target ride anchor slots and are re-read after
+            // every ensure.
+            let value_slot = self.push_iteration_anchor(value) - 1;
+            let base = value_slot;
+            let receiver_slot = self.push_iteration_anchor(receiver) - 1;
+            let target_slot = self.push_iteration_anchor(target) - 1;
+            let outcome = (|this: &mut Self| -> Result<bool, VmError> {
+                let anchored_ta = |this: &Self| {
+                    this.iteration_anchor(target_slot)
+                        .as_typed_array(&this.gc_heap)
+                        .expect("target stays a typed array across the anchored steps")
+                };
+                match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        let t = anchored_ta(this);
+                        let bag = crate::property_dispatch::typed_array_ensure_expando(this, &t)?;
+                        let value = this.iteration_anchor(value_slot);
+                        Ok(object::set_symbol(bag, &mut this.gc_heap, *sym, value))
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling")
+                            .to_string();
+                        let t = anchored_ta(this);
+                        if let Some(n) =
+                            crate::property_dispatch::canonical_numeric_index_string(&name)
                         {
-                            return Ok(true);
-                        }
-                        // Valid target index + foreign receiver —
-                        // §10.1.9.2 receiver phase (GetOwnProperty +
-                        // DefineOwnProperty on the receiver, never its
-                        // [[Set]]).
-                        return self
-                            .ordinary_set_on_receiver(stack, context, key, value, &receiver);
-                    }
-                    let mut bag = crate::property_dispatch::typed_array_ensure_expando(self, &t)?;
-                    // OrdinarySet on the expando: an own non-writable
-                    // data property rejects, an own accessor invokes
-                    // its setter (receiver = the typed array), and a
-                    // fresh key requires the bag to be extensible.
-                    let same_receiver = receiver
-                        .as_typed_array(&self.gc_heap)
-                        .is_some_and(|r| r == t);
-                    match object::lookup_own(bag, &self.gc_heap, &name) {
-                        object::PropertyLookup::Data { flags, .. } => {
-                            if !flags.writable() {
-                                return Ok(false);
+                            let receiver = this.iteration_anchor(receiver_slot);
+                            let same_receiver = receiver
+                                .as_typed_array(&this.gc_heap)
+                                .is_some_and(|r| r == t);
+                            if same_receiver {
+                                let value = this.iteration_anchor(value_slot);
+                                let coerced = this.typed_array_coerce_element(
+                                    stack,
+                                    context,
+                                    t.kind(),
+                                    value,
+                                )?;
+                                let t = anchored_ta(this);
+                                if let Some(idx) = crate::property_dispatch::typed_array_valid_index(
+                                    &t,
+                                    &this.gc_heap,
+                                    n,
+                                ) {
+                                    t.set(&mut this.gc_heap, idx, &coerced);
+                                }
+                                return Ok(true);
                             }
-                            if !same_receiver {
-                                // §10.1.9.2 — own writable data on the
-                                // chain: the write lands on the
-                                // RECEIVER, never the holder.
-                                return self.ordinary_set_on_receiver(
-                                    stack, context, key, value, &receiver,
-                                );
+                            if crate::property_dispatch::typed_array_valid_index(
+                                &t,
+                                &this.gc_heap,
+                                n,
+                            )
+                            .is_none()
+                            {
+                                return Ok(true);
                             }
-                            object::set(&mut bag, &mut self.gc_heap, &name, value);
-                            return Ok(true);
+                            // Valid target index + foreign receiver —
+                            // §10.1.9.2 receiver phase (GetOwnProperty +
+                            // DefineOwnProperty on the receiver, never its
+                            // [[Set]]).
+                            let value = this.iteration_anchor(value_slot);
+                            let receiver = this.iteration_anchor(receiver_slot);
+                            return this
+                                .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                         }
-                        object::PropertyLookup::Accessor { setter, .. } => {
-                            let Some(setter) = setter else {
-                                return Ok(false);
-                            };
-                            let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                            self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
-                            return Ok(true);
-                        }
-                        object::PropertyLookup::Absent => {
-                            // §10.1.9 step 2 — own miss continues the
-                            // walk through the typed array's
-                            // [[Prototype]] (a setter on
-                            // %TypedArray.prototype% must fire); only
-                            // a fully-absent chain defines on the
-                            // receiver.
-                            let parent = self.get_prototype_for_op(&target)?;
-                            if parent.is_null() || parent.is_undefined() {
-                                return self.ordinary_set_on_receiver(
-                                    stack, context, key, value, &receiver,
-                                );
+                        let mut bag =
+                            crate::property_dispatch::typed_array_ensure_expando(this, &t)?;
+                        // OrdinarySet on the expando: an own non-writable
+                        // data property rejects, an own accessor invokes
+                        // its setter (receiver = the typed array), and a
+                        // fresh key requires the bag to be extensible.
+                        let t = anchored_ta(this);
+                        let receiver = this.iteration_anchor(receiver_slot);
+                        let same_receiver = receiver
+                            .as_typed_array(&this.gc_heap)
+                            .is_some_and(|r| r == t);
+                        match object::lookup_own(bag, &this.gc_heap, &name) {
+                            object::PropertyLookup::Data { flags, .. } => {
+                                if !flags.writable() {
+                                    return Ok(false);
+                                }
+                                let value = this.iteration_anchor(value_slot);
+                                if !same_receiver {
+                                    // §10.1.9.2 — own writable data on the
+                                    // chain: the write lands on the
+                                    // RECEIVER, never the holder.
+                                    return this.ordinary_set_on_receiver(
+                                        stack, context, key, value, &receiver,
+                                    );
+                                }
+                                object::set(&mut bag, &mut this.gc_heap, &name, value);
+                                Ok(true)
                             }
-                            return self.ordinary_set_data_value(
-                                stack,
-                                context,
-                                parent,
-                                key,
-                                value,
-                                receiver,
-                                hops + 1,
-                            );
+                            object::PropertyLookup::Accessor { setter, .. } => {
+                                let Some(setter) = setter else {
+                                    return Ok(false);
+                                };
+                                let value = this.iteration_anchor(value_slot);
+                                let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                                this.run_callable_sync_rooted(
+                                    stack, context, &setter, receiver, argv,
+                                )?;
+                                Ok(true)
+                            }
+                            object::PropertyLookup::Absent => {
+                                // §10.1.9 step 2 — own miss continues the
+                                // walk through the typed array's
+                                // [[Prototype]] (a setter on
+                                // %TypedArray.prototype% must fire); only
+                                // a fully-absent chain defines on the
+                                // receiver.
+                                let target = this.iteration_anchor(target_slot);
+                                let parent = this.get_prototype_for_op(&target)?;
+                                let value = this.iteration_anchor(value_slot);
+                                let receiver = this.iteration_anchor(receiver_slot);
+                                if parent.is_null() || parent.is_undefined() {
+                                    return this.ordinary_set_on_receiver(
+                                        stack, context, key, value, &receiver,
+                                    );
+                                }
+                                this.ordinary_set_data_value(
+                                    stack,
+                                    context,
+                                    parent,
+                                    key,
+                                    value,
+                                    receiver,
+                                    hops + 1,
+                                )
+                            }
                         }
                     }
                 }
-            }
+            })(self);
+            self.pop_iteration_anchors_to(base);
+            return outcome;
         }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {

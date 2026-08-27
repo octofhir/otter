@@ -366,6 +366,11 @@ pub(crate) struct ArrayExoticSlots {
     /// chronological creation order per §10.1.11 — e.g. a RegExp match
     /// result reports `index`, `input`, `groups` in that fixed order.
     named_properties: Option<IndexMap<String, Value>>,
+    /// Chronological creation order of non-index string keys across BOTH
+    /// `named_properties` and named `accessors`. §10.1.11 enumerates own
+    /// string keys in creation order, and a key redefined between the data
+    /// and accessor tables must keep its original position.
+    named_key_order: Option<Vec<String>>,
     /// Accessor descriptors installed via
     /// `Object.defineProperty` on the array. Keyed by string key
     /// (covers both indexed and named keys). `(getter, setter)` —
@@ -2200,6 +2205,7 @@ pub fn set_named_property(
             .named_properties
             .get_or_insert_with(IndexMap::new);
         map.insert(key.to_string(), value);
+        note_named_key_order(body, key);
         body.mark_dirty();
     });
     record_exotic_array_write(heap, arr, &barrier_value);
@@ -2269,6 +2275,7 @@ pub(crate) fn define_named_data_property(
             .named_properties
             .get_or_insert_with(IndexMap::new);
         map.insert(key.to_string(), value);
+        note_named_key_order(body, key);
         body.mark_dirty();
     });
     record_exotic_array_write(heap, arr, &barrier_value);
@@ -2374,6 +2381,9 @@ pub fn set_accessor(
             .accessors
             .get_or_insert_with(IndexMap::new);
         map.insert(key.to_string(), (getter, setter));
+        if crate::object::array_index_property_name(key).is_none() {
+            note_named_key_order(body, key);
+        }
         // Hide the underlying dense / sparse / named data slot so
         // subsequent ordinary reads see the accessor instead of the
         // previous data value.
@@ -2434,6 +2444,7 @@ pub fn delete_accessor(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &str) -> 
             .and_then(|exotic| exotic.accessors.as_mut())
             .is_some_and(|m| m.shift_remove(key).is_some());
         if removed {
+            drop_named_key_order_if_absent(body, key);
             body.mark_dirty();
         }
         removed
@@ -2505,9 +2516,47 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
                 exotic.property_flags = None;
             }
         }
+        drop_named_key_order_if_absent(body, key);
         body.mark_dirty();
         true
     })
+}
+
+/// Append `key` to the non-index string-key creation-order record when it is
+/// not already present.
+fn note_named_key_order(body: &mut ArrayBody, key: &str) {
+    let order = body
+        .exotic_mut()
+        .named_key_order
+        .get_or_insert_with(Vec::new);
+    if !order.iter().any(|existing| existing == key) {
+        order.push(key.to_string());
+    }
+}
+
+/// Remove `key` from the creation-order record once it is gone from both the
+/// named data table and the accessor table.
+fn drop_named_key_order_if_absent(body: &mut ArrayBody, key: &str) {
+    let Some(exotic) = body.exotic_opt_mut() else {
+        return;
+    };
+    let still_present = exotic
+        .named_properties
+        .as_ref()
+        .is_some_and(|m| m.contains_key(key))
+        || exotic
+            .accessors
+            .as_ref()
+            .is_some_and(|m| m.contains_key(key));
+    if still_present {
+        return;
+    }
+    if let Some(order) = exotic.named_key_order.as_mut() {
+        order.retain(|existing| existing != key);
+        if order.is_empty() {
+            exotic.named_key_order = None;
+        }
+    }
 }
 
 /// Own array-index keys plus non-index string keys in array own-key order.
@@ -2529,9 +2578,28 @@ pub(crate) fn own_index_and_string_keys(
         if let Some(sparse) = body.sparse_elements() {
             indices.extend(sparse.keys().copied());
         }
+        // Non-index string keys enumerate in chronological creation order
+        // across the data and accessor tables (§10.1.11); the shared order
+        // record is authoritative, with a defensive sweep for any key the
+        // record missed.
         let mut string_keys = Vec::new();
+        let present = |body: &ArrayBody, key: &str| {
+            body.named_properties().is_some_and(|m| m.contains_key(key))
+                || body.accessors().is_some_and(|m| m.contains_key(key))
+        };
+        if let Some(order) = body.exotic().and_then(|e| e.named_key_order.as_ref()) {
+            for key in order {
+                if present(body, key) {
+                    string_keys.push(key.clone());
+                }
+            }
+        }
         if let Some(named) = body.named_properties() {
-            string_keys.extend(named.keys().cloned());
+            for key in named.keys() {
+                if !string_keys.iter().any(|existing| existing == key) {
+                    string_keys.push(key.clone());
+                }
+            }
         }
         if let Some(accessors) = body.accessors() {
             for key in accessors.keys() {

@@ -1288,6 +1288,29 @@ impl Interpreter {
         args: &[Value],
         roots: &[&[Value]],
     ) -> Result<Value, VmError> {
+        // A primitive receiver is boxed up front: every arm below copies
+        // argument Values out of `args`, and boxing allocates — a copy taken
+        // before the box would carry a pre-move handle into the method. The
+        // receiver and arguments ride anchor slots across the box and are
+        // re-read afterwards.
+        if !receiver.is_object_type() {
+            let base = self.push_iteration_anchor(receiver) - 1;
+            for arg in args {
+                self.push_iteration_anchor(*arg);
+            }
+            let boxed = self.box_sloppy_this_primitive_runtime_rooted(receiver, roots);
+            let outcome = match boxed {
+                Ok(boxed) => {
+                    let args_now: SmallVec<[Value; 8]> = (0..args.len())
+                        .map(|i| self.iteration_anchor(base + 1 + i))
+                        .collect();
+                    self.array_live_method_dispatch(stack, context, tag, boxed, &args_now, roots)
+                }
+                Err(err) => Err(err),
+            };
+            self.pop_iteration_anchors_to(base);
+            return outcome;
+        }
         use ArrayMethodTag as T;
         match tag {
             T::IndexOf | T::LastIndexOf | T::Includes => {

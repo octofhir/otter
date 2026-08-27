@@ -1968,60 +1968,72 @@ impl Interpreter {
         };
         match method {
             M::DefineProperty => {
-                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
-                let desc_obj = args
-                    .get(2)
-                    .and_then(|v| v.as_object())
-                    .ok_or(VmError::TypeMismatch)?;
-                let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
-                let completed = descriptor.complete_for_new_property();
-                let ok = match (function_id, &key) {
-                    (Some(function_id), VmPropertyKey::Symbol(sym)) => {
-                        if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                // Key coercion, descriptor coercion, and the define below all
+                // allocate; the args slice can be an untraced copy on the
+                // operands-dispatch path, so the receiver rides an anchor slot.
+                let target_slot = self.push_iteration_anchor(target) - 1;
+                let outcome = (|this: &mut Self| -> Result<Option<Value>, VmError> {
+                    let key = Self::coerce_vm_property_key(args.get(1), &this.gc_heap)?;
+                    let desc_obj = args
+                        .get(2)
+                        .and_then(|v| v.as_object())
+                        .ok_or(VmError::TypeMismatch)?;
+                    let descriptor =
+                        object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)?;
+                    let completed = descriptor.complete_for_new_property();
+                    // The coercions above may have moved the receiver; the
+                    // closure handle is re-derived from the anchor.
+                    let owner = this.iteration_anchor(target_slot).as_closure(&this.gc_heap);
+                    let ok = match (function_id, &key) {
+                        (Some(function_id), VmPropertyKey::Symbol(sym)) => {
+                            if !this.ordinary_function_has_own_symbol_property_for_extensibility(
+                                owner,
+                                function_id,
+                                *sym,
+                            ) && !this.ordinary_function_is_extensible(function_id)
+                            {
+                                return Err(VmError::TypeMismatch);
+                            }
+                            let mut bag = this.function_user_bag(stack, owner, function_id, &[])?;
+                            crate::object::define_own_symbol_property_partial(
+                                &mut bag,
+                                &mut this.gc_heap,
+                                *sym,
+                                descriptor,
+                            )
+                        }
+                        (Some(function_id), _) => this.ordinary_function_define_own_property(
+                            stack,
+                            context,
                             owner,
                             function_id,
-                            *sym,
-                        ) && !self.ordinary_function_is_extensible(function_id)
-                        {
-                            return Err(VmError::TypeMismatch);
-                        }
-                        let mut bag =
-                            self.function_user_bag(stack, owner, function_id, &[&target])?;
-                        crate::object::define_own_symbol_property_partial(
-                            &mut bag,
-                            &mut self.gc_heap,
-                            *sym,
-                            descriptor,
-                        )
-                    }
-                    (Some(function_id), _) => self.ordinary_function_define_own_property(
-                        stack,
-                        context,
-                        owner,
-                        function_id,
-                        key.string_name()
-                            .expect("non-symbol key has string spelling"),
-                        Some(desc_obj),
-                        completed,
-                    )?,
-                    (None, VmPropertyKey::Symbol(_)) => false,
-                    (None, _) => {
-                        let Some(bound) = target.as_bound_function() else {
-                            return Ok(None);
-                        };
-                        function_metadata::bound_define_own_property(
-                            &bound,
-                            &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
+                            Some(desc_obj),
                             completed,
-                        )
+                        )?,
+                        (None, VmPropertyKey::Symbol(_)) => false,
+                        (None, _) => {
+                            let target = this.iteration_anchor(target_slot);
+                            let Some(bound) = target.as_bound_function() else {
+                                return Ok(None);
+                            };
+                            function_metadata::bound_define_own_property(
+                                &bound,
+                                &mut this.gc_heap,
+                                key.string_name()
+                                    .expect("non-symbol key has string spelling"),
+                                completed,
+                            )
+                        }
+                    };
+                    if !ok {
+                        return Err(VmError::TypeMismatch);
                     }
-                };
-                if !ok {
-                    return Err(VmError::TypeMismatch);
-                }
-                Ok(Some(target))
+                    Ok(Some(this.iteration_anchor(target_slot)))
+                })(self);
+                self.pop_iteration_anchors_to(target_slot);
+                outcome
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;

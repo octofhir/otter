@@ -231,7 +231,9 @@ impl JsDataView {
 
     /// Install / replace the lazy expando bag.
     pub fn set_expando(self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        let barrier = crate::Value::object(expando);
         heap.with_payload(self.handle, |body| body.expando = Some(expando));
+        heap.record_write(self.handle, &barrier);
     }
 
     /// Identity comparison via GC handle offset.

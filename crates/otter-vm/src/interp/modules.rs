@@ -206,49 +206,67 @@ impl Interpreter {
         let Some(gate) = promises.last().copied() else {
             return Ok(());
         };
-        let url = namespace_url;
-        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "dynamicImportInitFulfilled",
-            SmallVec::new(),
-            &mut |_visitor| {},
-            move |ncx, _args, _captures| {
-                let interp = ncx.interp_mut();
-                let namespace = interp
-                    .get_or_create_module_namespace(&url)
-                    .map(Value::object)
-                    .unwrap_or_else(Value::undefined);
-                let _ = interp.settle_dynamic_import(token, Ok(namespace));
-                Ok(Value::undefined())
-            },
-        )?;
-        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "dynamicImportInitRejected",
-            SmallVec::new(),
-            &mut |visitor| on_fulfilled.trace_value_slots(visitor),
-            move |ncx, args, _captures| {
-                let reason = args.first().copied().unwrap_or_else(Value::undefined);
-                let _ = ncx.interp_mut().settle_dynamic_import(token, Err(reason));
-                Ok(Value::undefined())
-            },
-        )?;
-        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected], &[])?;
-        let async_context = self.async_context();
-        let outcome = crate::JsPromise::perform_then_with_context(
-            &gate,
-            &mut self.gc_heap,
-            Some(on_fulfilled),
-            Some(on_rejected),
-            capability,
-            Some(context.clone()),
-            async_context,
-        );
-        if let Some(job) = outcome.immediate_job {
-            self.microtasks.enqueue(job);
-        }
-        Ok(())
+        // The gate and both reaction handlers move under the allocations
+        // below; each rides an iteration-anchor slot and is re-read before
+        // the reaction registers.
+        let gate_slot = self.push_iteration_anchor(Value::promise(gate)) - 1;
+        let outcome = (|this: &mut Self| -> Result<(), VmError> {
+            let url = namespace_url;
+            let on_fulfilled =
+                crate::native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut this.gc_heap,
+                    "dynamicImportInitFulfilled",
+                    SmallVec::new(),
+                    &mut |_visitor| {},
+                    move |ncx, _args, _captures| {
+                        let interp = ncx.interp_mut();
+                        let namespace = interp
+                            .get_or_create_module_namespace(&url)
+                            .map(Value::object)
+                            .unwrap_or_else(Value::undefined);
+                        let _ = interp.settle_dynamic_import(token, Ok(namespace));
+                        Ok(Value::undefined())
+                    },
+                )?;
+            let fulfilled_slot = this.push_iteration_anchor(on_fulfilled) - 1;
+            let on_rejected =
+                crate::native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut this.gc_heap,
+                    "dynamicImportInitRejected",
+                    SmallVec::new(),
+                    &mut |_visitor| {},
+                    move |ncx, args, _captures| {
+                        let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                        let _ = ncx.interp_mut().settle_dynamic_import(token, Err(reason));
+                        Ok(Value::undefined())
+                    },
+                )?;
+            let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
+            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_runtime_rooted(this, &[], &[])?;
+            let gate = this
+                .iteration_anchor(gate_slot)
+                .as_promise()
+                .expect("anchored dynamic-import gate survives reaction allocation");
+            let on_fulfilled = this.iteration_anchor(fulfilled_slot);
+            let on_rejected = this.iteration_anchor(rejected_slot);
+            let async_context = this.async_context();
+            let outcome = crate::JsPromise::perform_then_with_context(
+                &gate,
+                &mut this.gc_heap,
+                Some(on_fulfilled),
+                Some(on_rejected),
+                capability,
+                Some(context.clone()),
+                async_context,
+            );
+            if let Some(job) = outcome.immediate_job {
+                this.microtasks.enqueue(job);
+            }
+            Ok(())
+        })(self);
+        self.pop_iteration_anchors_to(gate_slot);
+        outcome
     }
 }
 

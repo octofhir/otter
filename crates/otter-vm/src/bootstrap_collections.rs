@@ -663,10 +663,7 @@ fn add_entries_lazy<'s>(
         };
         let next_h = scope.value(next);
 
-        let call_args = {
-            let iterator = scope.raw(iterator_h);
-            build_adder_args(scope, context, next_h, kind, Some(&iterator))?
-        };
+        let call_args = build_adder_args(scope, context, next_h, kind, Some(iterator_h))?;
 
         let call_result = {
             let target = scope.raw(target_h);
@@ -701,16 +698,19 @@ fn build_adder_args<'s>(
     context: &crate::ExecutionContext,
     next_h: Local<'s>,
     kind: CollectionKind,
-    iterator_for_close: Option<&Value>,
+    iterator_for_close: Option<Local<'s>>,
 ) -> Result<SmallVec<[Value; 8]>, NativeError> {
     if !kind.is_pair() {
         return Ok(smallvec::smallvec![scope.raw(next_h)]);
     }
     let ctor_name = kind.name();
     if !value_is_object_like(&scope.raw(next_h)) {
-        if let Some(iterator) = iterator_for_close {
+        if let Some(iterator_h) = iterator_for_close {
+            // Re-read the iterator from its parked handle: any earlier
+            // observable step may have moved it.
+            let iterator = scope.raw(iterator_h);
             let _ = scope.with_turn_parts(|interp, stack| {
-                interp.iterator_close_sync(stack, context, iterator)
+                interp.iterator_close_sync(stack, context, &iterator)
             });
         }
         return Err(NativeError::TypeError {
@@ -721,10 +721,12 @@ fn build_adder_args<'s>(
     let key = match read_indexed_property(scope, context, next_h, "0") {
         Ok(v) => v,
         Err(err) => {
-            if let Some(iterator) = iterator_for_close {
+            if let Some(iterator_h) = iterator_for_close {
                 let original_throw = scope.context().interp_mut().take_pending_uncaught_throw();
+                // The failed [[Get]] ran user code; re-read the iterator.
+                let iterator = scope.raw(iterator_h);
                 let _ = scope.with_turn_parts(|interp, stack| {
-                    interp.iterator_close_sync(stack, context, iterator)
+                    interp.iterator_close_sync(stack, context, &iterator)
                 });
                 if let Some(value) = original_throw {
                     scope
@@ -742,10 +744,12 @@ fn build_adder_args<'s>(
     let value = match read_indexed_property(scope, context, next_h, "1") {
         Ok(v) => v,
         Err(err) => {
-            if let Some(iterator) = iterator_for_close {
+            if let Some(iterator_h) = iterator_for_close {
                 let original_throw = scope.context().interp_mut().take_pending_uncaught_throw();
+                // The failed [[Get]] ran user code; re-read the iterator.
+                let iterator = scope.raw(iterator_h);
                 let _ = scope.with_turn_parts(|interp, stack| {
-                    interp.iterator_close_sync(stack, context, iterator)
+                    interp.iterator_close_sync(stack, context, &iterator)
                 });
                 if let Some(value) = original_throw {
                     scope

@@ -226,9 +226,30 @@ impl Interpreter {
         if is_async_gen {
             // §27.6.3 — async-generator method calls always
             // return a Promise. Queue the request; only a
-            // suspended generator resumes immediately.
-            let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .capability_stack_rooted(self, stack, &[&recv_value], &[])?;
+            // suspended generator resumes immediately. The capability
+            // allocation below can move the request's argument, so it
+            // rides an anchor slot and the kind is rebuilt afterwards.
+            let arg_slot = match &kind {
+                GeneratorResumeKind::Next(v)
+                | GeneratorResumeKind::Return(v)
+                | GeneratorResumeKind::Throw(v) => self.push_iteration_anchor(*v) - 1,
+            };
+            let cap = match promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_stack_rooted(self, stack, &[&recv_value], &[])
+            {
+                Ok(cap) => cap,
+                Err(err) => {
+                    self.pop_iteration_anchors_to(arg_slot);
+                    return Err(err.into());
+                }
+            };
+            let arg = self.iteration_anchor(arg_slot);
+            self.pop_iteration_anchors_to(arg_slot);
+            let kind = match kind {
+                GeneratorResumeKind::Next(_) => GeneratorResumeKind::Next(arg),
+                GeneratorResumeKind::Return(_) => GeneratorResumeKind::Return(arg),
+                GeneratorResumeKind::Throw(_) => GeneratorResumeKind::Throw(arg),
+            };
             let promise = cap.promise;
 
             // §27.6.3.3 AsyncGeneratorEnqueue — every request queues; the

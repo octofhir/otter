@@ -135,6 +135,29 @@ fn trace_parked_frame_state(field: &Option<Box<ParkedFrameState>>, visitor: &mut
     }
 }
 
+/// Record every old→young edge a parked frame (and its detached cold state)
+/// carries into the generator body. Until the body is next traced by a full
+/// collection, a scavenge sees the parked registers only through the
+/// remembered set; without these barriers a young referent of a suspended
+/// frame is collected out from under the resume.
+pub(crate) fn record_parked_frame_writes<T: ?Sized>(
+    heap: &mut otter_gc::GcHeap,
+    parent: otter_gc::Gc<T>,
+    frame: &ParkedFrameState,
+    cold: Option<&crate::cold_frame::ColdFrame>,
+) {
+    let mut visit = |slot: *mut otter_gc::raw::RawGc| {
+        // SAFETY: the trace hands pointers into the live frame snapshot; the
+        // slot is only read to record its edge, never rewritten.
+        let raw = unsafe { *slot };
+        heap.record_write_edge(parent, raw);
+    };
+    frame.trace_slots(&mut visit);
+    if let Some(cold) = cold {
+        cold.trace_cold_slots(&mut visit);
+    }
+}
+
 fn trace_generator_cold(
     field: &Option<Box<crate::cold_frame::ColdFrame>>,
     visitor: &mut SlotVisitor<'_>,
@@ -351,6 +374,7 @@ impl JsGenerator {
         yielded: crate::Value,
     ) {
         let barrier_value = yielded;
+        record_parked_frame_writes(heap, self.inner, &frame, cold.as_deref());
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.cold = cold;
@@ -375,6 +399,7 @@ impl JsGenerator {
         yielded: crate::Value,
     ) {
         let barrier_value = yielded;
+        record_parked_frame_writes(heap, self.inner, &frame, cold.as_deref());
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.cold = cold;
@@ -418,6 +443,7 @@ impl JsGenerator {
         frame: ParkedFrameState,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
     ) {
+        record_parked_frame_writes(heap, self.inner, &frame, cold.as_deref());
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.cold = cold;
@@ -547,10 +573,30 @@ pub fn alloc_parked_frame(
     frame: ParkedFrameState,
     cold: Option<Box<crate::cold_frame::ColdFrame>>,
 ) -> Result<ParkedFrame, otter_gc::OutOfMemory> {
-    heap.alloc_old(ParkedFrameBody {
+    let parked = heap.alloc_old(ParkedFrameBody {
         frame: Some(Box::new(frame)),
         cold,
-    })
+    })?;
+    // The body lands straight in old space, so a scavenge sees the parked
+    // snapshot only through the remembered set: record every edge it carries.
+    let mut edges: Vec<otter_gc::raw::RawGc> = Vec::new();
+    heap.read_payload(parked, |body| {
+        let mut visit = |slot: *mut otter_gc::raw::RawGc| {
+            // SAFETY: the trace hands pointers into the live snapshot; the
+            // slot is only read to collect its edge.
+            edges.push(unsafe { *slot });
+        };
+        if let Some(frame) = body.frame.as_deref() {
+            frame.trace_slots(&mut visit);
+        }
+        if let Some(cold) = body.cold.as_deref() {
+            cold.trace_cold_slots(&mut visit);
+        }
+    });
+    for raw in edges {
+        heap.record_write_edge(parked, raw);
+    }
+    Ok(parked)
 }
 
 /// Take a parked frame along with its detached cold record. Returns

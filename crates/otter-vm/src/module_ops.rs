@@ -712,72 +712,75 @@ impl Interpreter {
         url_arc: std::sync::Arc<str>,
         init: crate::promise::JsPromiseHandle,
     ) -> Result<(), VmError> {
-        // The gate moves under the reaction-handler and capability
-        // allocations below; keep it rooted through them and read the
-        // current handle back before registering the reaction, so the
-        // reaction lands on the live gate rather than its vacated slot.
-        let init_value = Value::promise(init);
-        let fulfilled_url = url_arc.clone();
-        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "AsyncModuleExecutionFulfilled",
-            SmallVec::new(),
-            &mut |visitor| init_value.trace_value_slots(visitor),
-            move |ncx, _args, _captures| {
-                if let Some(reaction_context) = ncx.execution_context().cloned() {
-                    ncx.with_turn_parts(|interp, stack| {
-                        interp.async_module_execution_fulfilled(
-                            stack,
-                            &reaction_context,
-                            &fulfilled_url,
-                        );
-                    });
-                }
-                Ok(Value::undefined())
-            },
-        )
-        .map_err(VmError::from)?;
-        let rejected_url = url_arc;
-        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "AsyncModuleExecutionRejected",
-            SmallVec::new(),
-            &mut |visitor| {
-                on_fulfilled.trace_value_slots(visitor);
-                init_value.trace_value_slots(visitor);
-            },
-            move |ncx, args, _captures| {
-                let reason = args.first().copied().unwrap_or_else(Value::undefined);
-                ncx.interp_mut()
-                    .async_module_execution_rejected(&rejected_url, reason);
-                Ok(Value::undefined())
-            },
-        )
-        .map_err(VmError::from)?;
-        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(
-                self,
-                stack,
-                &[&on_fulfilled, &on_rejected, &init_value],
-                &[],
-            )?;
-        let init = init_value
-            .as_promise()
-            .expect("rooted async-module gate survives reaction allocation");
-        let async_context = self.async_context();
-        let outcome = crate::JsPromise::perform_then_with_context(
-            &init,
-            &mut self.gc_heap,
-            Some(on_fulfilled),
-            Some(on_rejected),
-            capability,
-            Some(context.clone()),
-            async_context,
-        );
-        if let Some(job) = outcome.immediate_job {
-            self.microtasks.enqueue(job);
-        }
-        Ok(())
+        // The gate and both reaction handlers move under the allocations
+        // below; every one rides an iteration-anchor slot and is re-read
+        // before the reaction registers, so it lands on the live gate
+        // rather than its vacated slot.
+        let init_slot = self.push_iteration_anchor(Value::promise(init)) - 1;
+        let outcome = (|this: &mut Self| -> Result<(), VmError> {
+            let fulfilled_url = url_arc.clone();
+            let on_fulfilled =
+                crate::native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut this.gc_heap,
+                    "AsyncModuleExecutionFulfilled",
+                    SmallVec::new(),
+                    &mut |_visitor| {},
+                    move |ncx, _args, _captures| {
+                        if let Some(reaction_context) = ncx.execution_context().cloned() {
+                            ncx.with_turn_parts(|interp, stack| {
+                                interp.async_module_execution_fulfilled(
+                                    stack,
+                                    &reaction_context,
+                                    &fulfilled_url,
+                                );
+                            });
+                        }
+                        Ok(Value::undefined())
+                    },
+                )
+                .map_err(VmError::from)?;
+            let fulfilled_slot = this.push_iteration_anchor(on_fulfilled) - 1;
+            let rejected_url = url_arc.clone();
+            let on_rejected =
+                crate::native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut this.gc_heap,
+                    "AsyncModuleExecutionRejected",
+                    SmallVec::new(),
+                    &mut |_visitor| {},
+                    move |ncx, args, _captures| {
+                        let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                        ncx.interp_mut()
+                            .async_module_execution_rejected(&rejected_url, reason);
+                        Ok(Value::undefined())
+                    },
+                )
+                .map_err(VmError::from)?;
+            let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
+            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_stack_rooted(this, stack, &[], &[])?;
+            let init = this
+                .iteration_anchor(init_slot)
+                .as_promise()
+                .expect("anchored async-module gate survives reaction allocation");
+            let on_fulfilled = this.iteration_anchor(fulfilled_slot);
+            let on_rejected = this.iteration_anchor(rejected_slot);
+            let async_context = this.async_context();
+            let outcome = crate::JsPromise::perform_then_with_context(
+                &init,
+                &mut this.gc_heap,
+                Some(on_fulfilled),
+                Some(on_rejected),
+                capability,
+                Some(context.clone()),
+                async_context,
+            );
+            if let Some(job) = outcome.immediate_job {
+                this.microtasks.enqueue(job);
+            }
+            Ok(())
+        })(self);
+        self.pop_iteration_anchors_to(init_slot);
+        outcome
     }
 
     /// §16.2.1.9.4 AsyncModuleExecutionFulfilled: settle the module's

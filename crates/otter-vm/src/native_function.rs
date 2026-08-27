@@ -1157,8 +1157,8 @@ impl NativeFunction {
         key: crate::symbol::JsSymbol,
         descriptor: crate::object::PartialPropertyDescriptor,
     ) -> bool {
-        let obj = heap.read_payload(self.inner, |body| body.own_properties);
-        crate::object::define_own_symbol_property_partial(obj, heap, key, descriptor)
+        let mut obj = heap.read_payload(self.inner, |body| body.own_properties);
+        crate::object::define_own_symbol_property_partial(&mut obj, heap, key, descriptor)
     }
 
     /// Delete a configurable own metadata property.

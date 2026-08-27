@@ -48,13 +48,13 @@ pub fn install_namespace_well_knowns(
     global: JsObject,
     well_known: &WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
-    let Some(intl) = object::get(global, heap, "Intl").and_then(|v| v.as_object()) else {
+    let Some(mut intl) = object::get(global, heap, "Intl").and_then(|v| v.as_object()) else {
         return Ok(());
     };
     let tag =
         crate::string::JsString::from_str("Intl", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
-        intl,
+        &mut intl,
         heap,
         well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {

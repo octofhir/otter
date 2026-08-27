@@ -352,11 +352,11 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
-    let prototype = prototype_root
+    let mut prototype = prototype_root
         .as_object()
         .expect("RegExp.prototype remains rooted during symbol bootstrap");
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         match_sym,
         crate::object::PartialPropertyDescriptor {
@@ -368,7 +368,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         },
     );
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         search_sym,
         crate::object::PartialPropertyDescriptor {
@@ -380,7 +380,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         },
     );
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         replace_sym,
         crate::object::PartialPropertyDescriptor {
@@ -392,7 +392,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         },
     );
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         split_sym,
         crate::object::PartialPropertyDescriptor {
@@ -404,7 +404,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         },
     );
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         match_all_sym,
         crate::object::PartialPropertyDescriptor {

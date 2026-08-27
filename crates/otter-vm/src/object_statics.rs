@@ -1072,7 +1072,7 @@ fn define_accessor_helper(
         return Ok(Value::undefined());
     }
 
-    let Some(target) = this_value.as_object() else {
+    let Some(mut target) = this_value.as_object() else {
         // §7.1.18 ToObject — primitives wrap. The accessor lands on
         // the transient wrapper which is discarded once the call
         // returns, mirroring V8/JSC.
@@ -1080,11 +1080,14 @@ fn define_accessor_helper(
     };
     let ok = match key {
         PropertyKey::String(name) => {
-            crate::object::define_own_property_partial(target, ctx.heap_mut(), &name, desc)
+            crate::object::define_own_property_partial(&mut target, ctx.heap_mut(), &name, desc)
         }
-        PropertyKey::Symbol(sym) => {
-            crate::object::define_own_symbol_property_partial(target, ctx.heap_mut(), sym, desc)
-        }
+        PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
+            &mut target,
+            ctx.heap_mut(),
+            sym,
+            desc,
+        ),
     };
     if !ok {
         return Err(NativeError::TypeError {
@@ -1512,7 +1515,7 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let obj = rooted_object(gc_heap, &[&proto], &[args])?;
+            let mut obj = rooted_object(gc_heap, &[&proto], &[args])?;
             if !crate::object::set_prototype_value(obj, gc_heap, proto_value) {
                 return Err(VmError::TypeMismatch);
             }
@@ -1529,7 +1532,9 @@ pub fn call(
                 for (key, desc_value) in entries {
                     let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
                     let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
-                    if !crate::object::define_own_property_partial(obj, gc_heap, &key, descriptor) {
+                    if !crate::object::define_own_property_partial(
+                        &mut obj, gc_heap, &key, descriptor,
+                    ) {
                         return Err(VmError::TypeMismatch);
                     }
                 }
@@ -1543,30 +1548,16 @@ pub fn call(
             let desc_obj = expect_object(args.get(2))?;
             let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
             let first = args.first();
-            if let Some(target) = first.and_then(|v| v.as_object()) {
-                let ok = match &key {
-                    PropertyKey::String(key) => {
-                        crate::object::define_own_property_partial(target, gc_heap, key, descriptor)
-                    }
-                    PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
-                        target, gc_heap, *sym, descriptor,
-                    ),
-                };
-                if !ok {
-                    let msg = format!("Cannot define property '{}'", key.label(gc_heap));
-                    return Err(interp.err_type(msg.into()));
-                }
-                Ok(Value::object(target))
-            } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
+            if let Some(mut target) = first.and_then(|v| v.as_object()) {
                 let ok = match &key {
                     PropertyKey::String(key) => crate::object::define_own_property_partial(
-                        class.statics(gc_heap),
+                        &mut target,
                         gc_heap,
                         key,
                         descriptor,
                     ),
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
-                        class.statics(gc_heap),
+                        &mut target,
                         gc_heap,
                         *sym,
                         descriptor,
@@ -1576,6 +1567,33 @@ pub fn call(
                     let msg = format!("Cannot define property '{}'", key.label(gc_heap));
                     return Err(interp.err_type(msg.into()));
                 }
+                Ok(Value::object(target))
+            } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
+                let mut statics = class.statics(gc_heap);
+                let ok = match &key {
+                    PropertyKey::String(key) => crate::object::define_own_property_partial(
+                        &mut statics,
+                        gc_heap,
+                        key,
+                        descriptor,
+                    ),
+                    PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
+                        &mut statics,
+                        gc_heap,
+                        *sym,
+                        descriptor,
+                    ),
+                };
+                if !ok {
+                    let msg = format!("Cannot define property '{}'", key.label(gc_heap));
+                    return Err(interp.err_type(msg.into()));
+                }
+                // The define may have moved the receiver; the args slot is a
+                // traced root the collector rewrites, so re-read the handle.
+                let class = args
+                    .first()
+                    .and_then(|v| v.as_class_constructor())
+                    .expect("receiver stays a class constructor across the define");
                 Ok(Value::class_constructor(class))
             } else if let Some(native) = first.and_then(|v| v.as_native_function()) {
                 let ok = match &key {
@@ -1612,14 +1630,21 @@ pub fn call(
                         let msg = format!("Cannot define property '{}'", key.label(gc_heap));
                         return Err(interp.err_type(msg.into()));
                     }
-                    let bag = crate::property_dispatch::regexp_ensure_expando_pub(gc_heap, &r)?;
+                    let (mut bag, descriptor) =
+                        interp.with_descriptor_anchored(descriptor, |this| {
+                            crate::property_dispatch::regexp_ensure_expando_pub(
+                                this.gc_heap_for_cx_mut(),
+                                &r,
+                            )
+                        })?;
+                    let gc_heap = interp.gc_heap_for_cx_mut();
                     let ok = match &key {
-                        PropertyKey::String(k) => {
-                            crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
-                        }
+                        PropertyKey::String(k) => crate::object::define_own_property_partial(
+                            &mut bag, gc_heap, k, descriptor,
+                        ),
                         PropertyKey::Symbol(sym) => {
                             crate::object::define_own_symbol_property_partial(
-                                bag, gc_heap, *sym, descriptor,
+                                &mut bag, gc_heap, *sym, descriptor,
                             )
                         }
                     };
@@ -1627,23 +1652,42 @@ pub fn call(
                         let msg = format!("Cannot define property '{}'", key.label(gc_heap));
                         return Err(interp.err_type(msg.into()));
                     }
+                    // Re-read from the traced args slot: the define may have
+                    // moved the receiver.
+                    let r = args
+                        .first()
+                        .and_then(|v| v.as_regexp())
+                        .expect("receiver stays a regexp across the define");
                     Ok(Value::regexp(r))
                 }
             } else if let Some(p) = first.and_then(|v| v.as_promise()) {
                 // Promise instances also expose lazy expando.
-                let bag = crate::property_dispatch::promise_ensure_expando_pub(gc_heap, &p)?;
+                let (mut bag, descriptor) =
+                    interp.with_descriptor_anchored(descriptor, |this| {
+                        crate::property_dispatch::promise_ensure_expando_pub(
+                            this.gc_heap_for_cx_mut(),
+                            &p,
+                        )
+                    })?;
+                let gc_heap = interp.gc_heap_for_cx_mut();
                 let ok = match &key {
                     PropertyKey::String(k) => {
-                        crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
+                        crate::object::define_own_property_partial(&mut bag, gc_heap, k, descriptor)
                     }
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
-                        bag, gc_heap, *sym, descriptor,
+                        &mut bag, gc_heap, *sym, descriptor,
                     ),
                 };
                 if !ok {
                     let msg = format!("Cannot define property '{}'", key.label(gc_heap));
                     return Err(interp.err_type(msg.into()));
                 }
+                // Re-read from the traced args slot: the define may have moved
+                // the receiver.
+                let p = args
+                    .first()
+                    .and_then(|v| v.as_promise())
+                    .expect("receiver stays a promise across the define");
                 Ok(Value::promise(p))
             } else if let Some(t) = first.and_then(|v| v.as_typed_array(gc_heap)) {
                 // §10.4.5.3 IntegerIndexedExoticObject [[DefineOwnProperty]].
@@ -1675,11 +1719,16 @@ pub fn call(
                                 t.set(gc_heap, idx, &coerced);
                             }
                         } else {
-                            let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
-                                gc_heap, &t,
-                            )?;
+                            let (mut bag, descriptor) =
+                                interp.with_descriptor_anchored(descriptor, |this| {
+                                    crate::property_dispatch::typed_array_ensure_expando_pub(
+                                        this.gc_heap_for_cx_mut(),
+                                        &t,
+                                    )
+                                })?;
+                            let gc_heap = interp.gc_heap_for_cx_mut();
                             if !crate::object::define_own_property_partial(
-                                bag, gc_heap, k, descriptor,
+                                &mut bag, gc_heap, k, descriptor,
                             ) {
                                 let msg =
                                     format!("Cannot define property '{}'", key.label(gc_heap));
@@ -1688,16 +1737,29 @@ pub fn call(
                         }
                     }
                     PropertyKey::Symbol(sym) => {
-                        let bag =
-                            crate::property_dispatch::typed_array_ensure_expando_pub(gc_heap, &t)?;
+                        let (mut bag, descriptor) =
+                            interp.with_descriptor_anchored(descriptor, |this| {
+                                crate::property_dispatch::typed_array_ensure_expando_pub(
+                                    this.gc_heap_for_cx_mut(),
+                                    &t,
+                                )
+                            })?;
+                        let gc_heap = interp.gc_heap_for_cx_mut();
                         if !crate::object::define_own_symbol_property_partial(
-                            bag, gc_heap, *sym, descriptor,
+                            &mut bag, gc_heap, *sym, descriptor,
                         ) {
                             let msg = format!("Cannot define property '{}'", key.label(gc_heap));
                             return Err(interp.err_type(msg.into()));
                         }
                     }
                 }
+                // Re-read from the traced args slot: the define may have moved
+                // the receiver.
+                let heap = interp.gc_heap_for_cx_mut();
+                let t = args
+                    .first()
+                    .and_then(|v| v.as_typed_array(heap))
+                    .expect("receiver stays a typed array across the define");
                 Ok(Value::typed_array(t))
             } else {
                 Err(interp.err_type(
@@ -1708,7 +1770,7 @@ pub fn call(
         // §20.1.2.5 Object.defineProperties(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.defineproperties>
         M::DefineProperties => {
-            let target = expect_object(args.first())?;
+            let mut target = expect_object(args.first())?;
             let props = expect_object(args.get(1))?;
             // Walk enumerable own keys of `props`. Each value is a
             // descriptor object that we coerce + apply.
@@ -1721,7 +1783,12 @@ pub fn call(
             for (key, desc_value) in entries {
                 let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
                 let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
-                if !crate::object::define_own_property_partial(target, gc_heap, &key, descriptor) {
+                if !crate::object::define_own_property_partial(
+                    &mut target,
+                    gc_heap,
+                    &key,
+                    descriptor,
+                ) {
                     return Err(VmError::TypeMismatch);
                 }
             }

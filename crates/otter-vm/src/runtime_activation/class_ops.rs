@@ -135,7 +135,7 @@ impl RuntimeCall<'_> {
                     configurable: Some(true),
                     ..Default::default()
                 };
-                let prototype_object = self
+                let mut prototype_object = self
                     .read(prototype)?
                     .as_object()
                     .ok_or(VmError::TypeMismatch)?;
@@ -144,7 +144,7 @@ impl RuntimeCall<'_> {
                         .is_none_or(Value::is_undefined);
                 if placeholder_pending {
                     let _ = vm.define_own_property_partial(
-                        prototype_object,
+                        &mut prototype_object,
                         "constructor",
                         constructor_descriptor,
                     )?;

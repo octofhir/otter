@@ -627,7 +627,7 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
     let object::DescriptorKind::Data { value } = descriptor.kind else {
         return Ok(());
     };
-    let Some(prototype) = value.as_object() else {
+    let Some(mut prototype) = value.as_object() else {
         return Ok(());
     };
     let global_root = Value::object(global);
@@ -642,7 +642,7 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let values_value = Value::native_function(values_fn);
     object::define_own_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         "values",
         PartialPropertyDescriptor {
@@ -654,7 +654,7 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
         },
     );
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         well_known.get(WellKnown::Iterator),
         PartialPropertyDescriptor {
@@ -677,7 +677,7 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
 /// configurable.
 fn install_array_unscopables(
     heap: &mut otter_gc::GcHeap,
-    prototype: object::JsObject,
+    mut prototype: object::JsObject,
     well_known: &WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
     const UNSCOPABLES: &[&str] = &[
@@ -699,13 +699,13 @@ fn install_array_unscopables(
         "values",
     ];
     let prototype_root = Value::object(prototype);
-    let list =
+    let mut list =
         crate::intrinsics::shared::alloc_object_with_value_roots_pub(heap, &[&prototype_root])
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_prototype(list, heap, None);
     for name in UNSCOPABLES {
         object::define_own_property_partial(
-            list,
+            &mut list,
             heap,
             name,
             PartialPropertyDescriptor {
@@ -718,7 +718,7 @@ fn install_array_unscopables(
         );
     }
     object::define_own_symbol_property_partial(
-        prototype,
+        &mut prototype,
         heap,
         well_known.get(WellKnown::Unscopables),
         PartialPropertyDescriptor {
@@ -1563,11 +1563,24 @@ impl Interpreter {
                 n.trunc() as i64
             }
         };
-        let a = self.array_species_create(stack, context, o, 0, roots)?;
-        let anchor_base = self.push_iteration_anchor(a) - 1;
-        self.push_iteration_anchor(o);
+        // The species create runs a user constructor: `o` rides an anchor
+        // slot across it and is re-read before the flatten.
+        let o_slot = self.push_iteration_anchor(o) - 1;
+        let created = self.array_species_create(stack, context, o, 0, roots);
+        let o = self.iteration_anchor(o_slot);
+        let a = match created {
+            Ok(a) => a,
+            Err(err) => {
+                self.pop_iteration_anchors_to(o_slot);
+                return Err(err);
+            }
+        };
+        let a_slot = self.push_iteration_anchor(a) - 1;
         let result = self.flatten_into_array(stack, context, a, o, source_len, 0, depth, None);
-        self.pop_iteration_anchors_to(anchor_base);
+        // The flatten allocates; re-read the result array from its anchor
+        // before popping so the returned handle is current.
+        let a = self.iteration_anchor(a_slot);
+        self.pop_iteration_anchors_to(o_slot);
         result?;
         Ok(a)
     }
@@ -1618,53 +1631,90 @@ impl Interpreter {
         // 2^53 - 1: a CreateDataPropertyOrThrow target index past the
         // safe-integer limit is a §23.1.3.13.1 step 4.c.ii TypeError.
         const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-        let mut target_index = start;
-        for source_index in 0..source_len {
-            let key = format_index_key(source_index as f64);
-            if !self.array_method_has_property(stack, context, source, &key)? {
-                continue;
-            }
-            let mut element = self.array_method_get_property(stack, context, source, &key)?;
-            let anchor_base = self.push_iteration_anchor(element) - 1;
-            if let Some((mapper_fn, map_this)) = mapper {
-                let cb_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![element, Value::number_f64(source_index as f64), source,];
-                element =
-                    self.run_callable_sync_rooted(stack, context, &mapper_fn, map_this, cb_args)?;
-                self.push_iteration_anchor(element);
-            }
-            if depth > 0 && self.is_array_spec(&element)? {
-                let element_len = length_of_array_like(self, stack, context, &element)?
-                    .min(MAX_ARRAY_LIKE_PROBE_LEN);
-                target_index = self.flatten_into_array(
-                    stack,
-                    context,
-                    target,
-                    element,
-                    element_len,
-                    target_index,
-                    depth - 1,
-                    None,
-                )?;
-            } else {
-                if target_index as f64 >= MAX_SAFE_INTEGER {
-                    self.pop_iteration_anchors_to(anchor_base);
-                    return Err(self.err_type(
-                        ("flatten target index exceeds maximum safe integer".to_string()).into(),
-                    ));
+        // Every iteration runs observable operations (HasProperty / Get /
+        // the mapper / CreateDataPropertyOrThrow) that can allocate or run
+        // user code, so the target, source, mapper pair, and current element
+        // all ride anchor slots and are re-read before each use.
+        let target_slot = self.push_iteration_anchor(target) - 1;
+        let base = target_slot;
+        let source_slot = self.push_iteration_anchor(source) - 1;
+        let mapper_slots = mapper.map(|(mapper_fn, map_this)| {
+            (
+                self.push_iteration_anchor(mapper_fn) - 1,
+                self.push_iteration_anchor(map_this) - 1,
+            )
+        });
+        let outcome = (|this: &mut Self| -> Result<usize, VmError> {
+            let mut target_index = start;
+            for source_index in 0..source_len {
+                let key = format_index_key(source_index as f64);
+                let source = this.iteration_anchor(source_slot);
+                if !this.array_method_has_property(stack, context, source, &key)? {
+                    continue;
                 }
-                self.create_data_property_or_throw(
-                    stack,
-                    context,
-                    target,
-                    &format_index_key(target_index as f64),
-                    element,
-                )?;
-                target_index += 1;
+                let source = this.iteration_anchor(source_slot);
+                let element = this.array_method_get_property(stack, context, source, &key)?;
+                let element_slot = this.push_iteration_anchor(element) - 1;
+                let step = (|this: &mut Self| -> Result<(), VmError> {
+                    if let Some((mapper_fn_slot, map_this_slot)) = mapper_slots {
+                        let mapper_fn = this.iteration_anchor(mapper_fn_slot);
+                        let map_this = this.iteration_anchor(map_this_slot);
+                        let element = this.iteration_anchor(element_slot);
+                        let source = this.iteration_anchor(source_slot);
+                        let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                            element,
+                            Value::number_f64(source_index as f64),
+                            source,
+                        ];
+                        let mapped = this.run_callable_sync_rooted(
+                            stack, context, &mapper_fn, map_this, cb_args,
+                        )?;
+                        this.set_iteration_anchor(element_slot, mapped);
+                    }
+                    let element = this.iteration_anchor(element_slot);
+                    if depth > 0 && this.is_array_spec(&element)? {
+                        let element = this.iteration_anchor(element_slot);
+                        let element_len = length_of_array_like(this, stack, context, &element)?
+                            .min(MAX_ARRAY_LIKE_PROBE_LEN);
+                        let target = this.iteration_anchor(target_slot);
+                        let element = this.iteration_anchor(element_slot);
+                        target_index = this.flatten_into_array(
+                            stack,
+                            context,
+                            target,
+                            element,
+                            element_len,
+                            target_index,
+                            depth - 1,
+                            None,
+                        )?;
+                    } else {
+                        if target_index as f64 >= MAX_SAFE_INTEGER {
+                            return Err(this.err_type(
+                                ("flatten target index exceeds maximum safe integer".to_string())
+                                    .into(),
+                            ));
+                        }
+                        let target = this.iteration_anchor(target_slot);
+                        let element = this.iteration_anchor(element_slot);
+                        this.create_data_property_or_throw(
+                            stack,
+                            context,
+                            target,
+                            &format_index_key(target_index as f64),
+                            element,
+                        )?;
+                        target_index += 1;
+                    }
+                    Ok(())
+                })(this);
+                this.pop_iteration_anchors_to(element_slot);
+                step?;
             }
-            self.pop_iteration_anchors_to(anchor_base);
-        }
-        Ok(target_index)
+            Ok(target_index)
+        })(self);
+        self.pop_iteration_anchors_to(base);
+        outcome
     }
 
     /// §23.1.3.6 / §23.1.3.20 / §23.1.3.32 live Array iterator creation.
@@ -4324,6 +4374,9 @@ pub(crate) fn array_callback_native_dispatch(
                 1,
                 Some((callback, this_arg)),
             );
+            // The flatten allocates; re-read the result array from its
+            // anchor before popping so the returned handle is current.
+            let target = interp.iteration_anchor(anchor_base);
             interp.pop_iteration_anchors_to(anchor_base);
             result.map_err(|err| {
                 crate::native_function::vm_to_native_error(interp, err, "flatMap")

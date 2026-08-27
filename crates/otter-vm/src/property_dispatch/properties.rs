@@ -866,11 +866,15 @@ impl Interpreter {
                         None
                     } else {
                         let bag = regexp_ensure_expando(self, &r, &receiver)?;
+                        // The expando ensure allocates; the stored value is
+                        // re-read from its traced register slot.
+                        let value = *read_register(&stack[top_idx], src)?;
                         self.ordinary_set_data_property(bag, name, value)?;
                         None
                     }
                 } else {
                     let bag = regexp_ensure_expando(self, &r, &receiver)?;
+                    let value = *read_register(&stack[top_idx], src)?;
                     if !self.ordinary_set_data_property(bag, name, value)? {
                         self.failed_set_result(
                             strict,
@@ -1366,6 +1370,9 @@ impl Interpreter {
             None
         };
         if let Some(target) = target {
+            // Branches above may have allocated (lazy expando bags); the
+            // stored value is re-read from its traced register slot.
+            let value = *read_register(&stack[top_idx], src)?;
             self.set_property(target, name, value)?;
         }
         stack[top_idx].advance_pc()?;

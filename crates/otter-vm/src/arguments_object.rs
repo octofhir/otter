@@ -82,7 +82,7 @@ pub(crate) fn initialize_unmapped(
     object::initialize_shaped_data_slots(obj, heap, &slab);
     if let Some(symbol) = iterator_symbol {
         object::define_own_symbol_property_partial(
-            obj,
+            &mut obj,
             heap,
             symbol,
             PartialPropertyDescriptor {
@@ -142,7 +142,7 @@ pub(crate) fn initialize_mapped(
     object::initialize_shaped_data_slots(obj, heap, &slab);
     if let Some(symbol) = iterator_symbol {
         object::define_own_symbol_property_partial(
-            obj,
+            &mut obj,
             heap,
             symbol,
             PartialPropertyDescriptor {

@@ -307,7 +307,7 @@ impl Interpreter {
             ..Default::default()
         };
         if !object::define_own_property_partial(
-            self.global_this,
+            &mut self.global_this,
             &mut self.gc_heap,
             name,
             descriptor,
@@ -362,7 +362,7 @@ impl Interpreter {
             // §9.1.1.4.15/16 CanDeclareGlobalVar — a non-extensible
             // global object cannot accept the new binding.
             if !object::define_own_property_partial(
-                self.global_this,
+                &mut self.global_this,
                 &mut self.gc_heap,
                 name,
                 descriptor,
@@ -421,7 +421,7 @@ impl Interpreter {
                 ..Default::default()
             };
             if !object::define_own_property_partial(
-                self.global_this,
+                &mut self.global_this,
                 &mut self.gc_heap,
                 name,
                 descriptor,

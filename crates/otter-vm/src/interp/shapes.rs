@@ -250,20 +250,23 @@ impl Interpreter {
     /// GC-managed hidden class when a new own property is created.
     pub(crate) fn define_own_property_partial(
         &mut self,
-        mut obj: object::JsObject,
+        obj_ref: &mut object::JsObject,
         key: &str,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
         let completed = descriptor.complete_for_new_property();
-        let shape = object::shape(obj, &self.gc_heap);
-        // Append a brand-new own property: extend the transition chain.
-        if self.should_add_property(obj, key)
+        let shape = object::shape(*obj_ref, &self.gc_heap);
+        // Append a brand-new own property: extend the transition chain. The
+        // shape-child computation allocates, so the descriptor's payload
+        // values ride anchor slots across it.
+        if self.should_add_property(*obj_ref, key)
             && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES
         {
-            let next_shape =
-                self.shape_child_rooting_object_descriptor(shape, key, &mut obj, &completed)?;
+            let (next_shape, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+                this.shape_child_rooting_object_descriptor(shape, key, obj_ref, &completed)
+            })?;
             return Ok(object::define_own_property_partial_with_shape(
-                obj,
+                obj_ref,
                 &mut self.gc_heap,
                 key,
                 descriptor,
@@ -275,29 +278,24 @@ impl Interpreter {
         // instead of flagging a per-object override.
         if !shape.is_null()
             && let Some((flags, is_accessor, offset)) =
-                object::redefine_merged_attrs(obj, &self.gc_heap, key, &descriptor)
+                object::redefine_merged_attrs(*obj_ref, &self.gc_heap, key, &descriptor)
         {
             let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
             if let Some(slot) = ordered.get_mut(offset as usize) {
                 slot.1 = flags;
                 slot.2 = is_accessor;
             }
-            let redefine_shape = {
-                let mut root_descriptor = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    if let Some(value) = descriptor.value.as_ref() {
-                        value.trace_value_slots(visitor);
-                    }
-                    if let Some(getter) = descriptor.get.as_ref() {
-                        getter.trace_value_slots(visitor);
-                    }
-                    if let Some(setter) = descriptor.set.as_ref() {
-                        setter.trace_value_slots(visitor);
-                    }
-                };
-                self.rebuild_shape_from_slots(&mut obj, &ordered, &mut root_descriptor)?
-            };
+            // The shape rebuild allocates; the descriptor's payload values
+            // ride anchor slots (a trace through shared references into the
+            // stack-local descriptor is not a root the collector can
+            // rewrite).
+            let (redefine_shape, descriptor) =
+                self.with_descriptor_anchored(descriptor, |this| {
+                    let mut no_extra_roots = |_: &mut dyn FnMut(*mut RawGc)| {};
+                    this.rebuild_shape_from_slots(obj_ref, &ordered, &mut no_extra_roots)
+                })?;
             return Ok(object::define_own_property_partial_with_shape(
-                obj,
+                obj_ref,
                 &mut self.gc_heap,
                 key,
                 descriptor,
@@ -305,7 +303,7 @@ impl Interpreter {
             ));
         }
         Ok(object::define_own_property_partial(
-            obj,
+            obj_ref,
             &mut self.gc_heap,
             key,
             descriptor,

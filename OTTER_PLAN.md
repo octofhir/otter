@@ -398,9 +398,16 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.79% at
-`bb4fb148`, 110 fails, 0 crashes/timeouts (one fix vs the 111-fail set,
-zero regressions). Two GC-soundness waves sit between this and
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.81% at
+`f81fcffc`, 99 fails, 0 crashes/timeouts (twelve fixes vs the 111-fail
+set, zero regressions). The realm-faithful cross-realm wave closed the
+whole realm cluster — nested parked-realm switching with identity
+travelling in the swap, full native stamping at createRealm, foreign
+bytecode frames resolving globals and sloppy this in their own realm,
+per-realm Intl [[FallbackSymbol]], typed-array and array realm
+prototypes, and the revoked-proxy GetFunctionRealm throw — plus
+Reflect.apply, TypedArray.of, JSON parse-with-source and two staging
+tests riding the same semantics. Two GC-soundness waves sit between this and
 `f8115ad8`: define paths take `&mut JsObject` with descriptor payloads
 anchored across expando/shape allocations, flatten and keyed promise
 combinators re-read every handle after allocating steps; then the

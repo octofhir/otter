@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "c618f1cd237ac9a3c74e0e6c600388a2178f4f95",
-  "ran_at": "2026-08-27T10:37:01.673856+00:00",
+  "engine_commit": "e0b90908e7fa89b3901a603e844a42a4025235c2",
+  "ran_at": "2026-08-27T18:03:12.269378+00:00",
   "totals": {
     "total": 53459,
-    "passed": 52248,
-    "failed": 111,
+    "passed": 52249,
+    "failed": 110,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -38435,8 +38435,8 @@
     },
     "language/statements/for-in": {
       "total": 119,
-      "passed": 118,
-      "failed": 1,
+      "passed": 119,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40364,12 +40364,6 @@
       "esid": "sec-IsModuleSCCEvaluated",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [B, A-before-await, Middle-before-nsD.z, Middle-after-nsD.z, resolve-blocker, C, A-after-await, D] and expected [B, A-before-await, resolve-blocker, A-after-await, Middle-before-nsD.z, D, Middle-after-nsD.z, C] should have the same contents. "
-    },
-    {
-      "path": "language/statements/for-in/order-after-define-property.js",
-      "esid": "sec-enumerate-object-properties",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [b, a] and expected [a, b] should have the same contents. "
     },
     {
       "path": "annexB/language/expressions/assignmenttargettype/callexpression-as-for-in-lhs.js",

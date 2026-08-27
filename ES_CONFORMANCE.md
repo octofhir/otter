@@ -1,16 +1,16 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `c618f1cd237ac9a3c74e0e6c600388a2178f4f95`
+- **Engine commit:** `e0b90908e7fa89b3901a603e844a42a4025235c2`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-27T10:37:01.673856+00:00
+- **Captured:** 2026-08-27T18:03:12.269378+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 52248 |
-| failed     | 111 |
+| passed     | 52249 |
+| failed     | 110 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
@@ -50,7 +50,6 @@
 | intl402/constructors-string-and-single-element-array.js | 1 | 0 | 1 | 0.0% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
 | language/expressions/tagged-template | 27 | 25 | 1 | 96.2% |
-| language/statements/for-in | 119 | 118 | 1 | 99.2% |
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
 | staging/sm/Date | 28 | 27 | 1 | 96.4% |
 | staging/sm/Error | 3 | 2 | 1 | 66.7% |
@@ -72,6 +71,7 @@
 | annexB/built-ins/TypedArrayConstructors | 1 | 1 | 0 | 100.0% |
 | annexB/built-ins/escape | 16 | 16 | 0 | 100.0% |
 | annexB/built-ins/unescape | 19 | 19 | 0 | 100.0% |
+| annexB/language/comments | 8 | 8 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -87,7 +87,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: a is n… | `language/expressions/tagged-template/cache-eval-inner-function.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Static and dynam… | `language/import/import-defer/deferred-namespace-object/identity.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [B, A-bef… | `language/import/import-defer/evaluation-top-level-await/async-cycle-dependency-of-deferred-module/main.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `language/statements/for-in/order-after-define-property.js` |
 | fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-as-for-in-lhs.js` |
 | fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-as-for-of-lhs.js` |
 | fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-in-compound-assignment.js` |
@@ -177,4 +176,5 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `intl402/BigInt/prototype/toLocaleString/de-DE.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `intl402/DateTimeFormat/prototype/formatRange/en-US.js` |
+| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month co… | `intl402/DateTimeFormat/prototype/formatRangeToParts/chinese-calendar-dates.js` |
 

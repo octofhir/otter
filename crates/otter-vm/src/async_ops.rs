@@ -117,27 +117,39 @@ impl Interpreter {
         // before the frame parks.
         let async_context = self.async_context();
         let promise = self.await_promise_resolve(context, stack, awaited)?;
-        let promise_value = Value::promise(promise);
-        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
-        let mut parked = stack.pop().expect("top frame existed");
-        let detached_cold = self.frame_detach_cold(&mut parked);
-        let parked = self.park_active_frame(parked);
-        let parked =
-            crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold)?;
-        let outcome = promise.perform_async_resume_then_with_context(
-            &mut self.gc_heap,
-            parked,
-            dst,
-            capability,
-            None,
-            Some(context.clone()),
-            async_context,
-        );
-        if let Some(job) = outcome.immediate_job {
-            self.microtasks.enqueue(job);
-        }
-        Ok(())
+        // The capability and parked-frame allocations below move the awaited
+        // promise; it rides an anchor slot and is re-read before the resume
+        // reactions register, so they land on the live promise rather than
+        // its vacated slot.
+        let promise_slot = self.push_iteration_anchor(Value::promise(promise)) - 1;
+        let outcome = (|this: &mut Self| -> Result<(), VmError> {
+            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_stack_rooted(this, stack, &[], &[])?;
+            let mut parked = stack.pop().expect("top frame existed");
+            let detached_cold = this.frame_detach_cold(&mut parked);
+            let parked = this.park_active_frame(parked);
+            let parked =
+                crate::generator::alloc_parked_frame(&mut this.gc_heap, parked, detached_cold)?;
+            let promise = this
+                .iteration_anchor(promise_slot)
+                .as_promise()
+                .expect("anchored awaited promise survives the park allocations");
+            let outcome = promise.perform_async_resume_then_with_context(
+                &mut this.gc_heap,
+                parked,
+                dst,
+                capability,
+                None,
+                Some(context.clone()),
+                async_context,
+            );
+            if let Some(job) = outcome.immediate_job {
+                this.microtasks.enqueue(job);
+            }
+            Ok(())
+        })(self);
+        self.pop_iteration_anchors_to(promise_slot);
+        outcome
     }
 
     /// §27.6.3 — `Op::Await` inside an async-generator body. Parks
@@ -159,14 +171,34 @@ impl Interpreter {
         // before the frame parks.
         let async_context = self.async_context();
         let promise = self.await_promise_resolve(context, stack, awaited)?;
-        let promise_value = Value::promise(promise);
-        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
+        // Same anchoring as the regular-await path: the park allocations
+        // below move the awaited promise.
+        let promise_slot = self.push_iteration_anchor(Value::promise(promise)) - 1;
+        let capability = match promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_stack_rooted(self, stack, &[], &[])
+        {
+            Ok(capability) => capability,
+            Err(err) => {
+                self.pop_iteration_anchors_to(promise_slot);
+                return Err(err.into());
+            }
+        };
         let mut parked = stack.pop().expect("top frame existed");
         let detached_cold = self.frame_detach_cold(&mut parked);
         let parked = self.park_active_frame(parked);
         let parked =
-            crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold)?;
+            match crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    self.pop_iteration_anchors_to(promise_slot);
+                    return Err(err.into());
+                }
+            };
+        let promise = self
+            .iteration_anchor(promise_slot)
+            .as_promise()
+            .expect("anchored awaited promise survives the park allocations");
+        self.pop_iteration_anchors_to(promise_slot);
         let outcome = promise.perform_async_resume_then_with_context(
             &mut self.gc_heap,
             parked,

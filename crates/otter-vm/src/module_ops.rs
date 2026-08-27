@@ -1082,66 +1082,89 @@ impl Interpreter {
         init: crate::promise::JsPromiseHandle,
         namespace_url: std::sync::Arc<str>,
     ) -> Result<(), VmError> {
-        let downstream_value = Value::promise(downstream);
-        let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "dynamicImportModuleFulfilled",
-            smallvec::smallvec![downstream_value],
-            &mut |visitor| downstream_value.trace_value_slots(visitor),
-            move |ncx, _args, captures| {
-                let interp = ncx.interp_mut();
-                if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
-                    let namespace = interp
-                        .module_env(&namespace_url)
-                        .map(Value::object)
-                        .unwrap_or_else(Value::undefined);
-                    let jobs =
-                        crate::JsPromise::fulfill(&downstream, &mut interp.gc_heap, namespace);
-                    for j in jobs.jobs {
-                        interp.microtasks.enqueue(j);
-                    }
-                }
-                Ok(Value::undefined())
-            },
-        )
-        .map_err(VmError::from)?;
-        let on_rejected = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            "dynamicImportModuleRejected",
-            smallvec::smallvec![downstream_value],
-            &mut |visitor| {
-                downstream_value.trace_value_slots(visitor);
-                on_fulfilled.trace_value_slots(visitor);
-            },
-            move |ncx, args, captures| {
-                let interp = ncx.interp_mut();
-                if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
-                    let reason = args.first().copied().unwrap_or_else(Value::undefined);
-                    let jobs = crate::JsPromise::reject(&downstream, &mut interp.gc_heap, reason);
-                    for j in jobs.jobs {
-                        interp.microtasks.enqueue(j);
-                    }
-                }
-                Ok(Value::undefined())
-            },
-        )
-        .map_err(VmError::from)?;
-        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(self, stack, &[&on_fulfilled, &on_rejected], &[])?;
-        let async_context = self.async_context();
-        let outcome = crate::JsPromise::perform_then_with_context(
-            &init,
-            &mut self.gc_heap,
-            Some(on_fulfilled),
-            Some(on_rejected),
-            capability,
-            Some(context.clone()),
-            async_context,
-        );
-        if let Some(job) = outcome.immediate_job {
-            self.microtasks.enqueue(job);
-        }
-        Ok(())
+        // The gate and both reaction handlers move under the allocations
+        // below; each rides an iteration-anchor slot and is re-read before
+        // the reaction registers. The downstream promise travels in the
+        // handlers' traced captures.
+        let init_slot = self.push_iteration_anchor(Value::promise(init)) - 1;
+        let downstream_slot = self.push_iteration_anchor(Value::promise(downstream)) - 1;
+        let outcome = (|this: &mut Self| -> Result<(), VmError> {
+            let downstream_value = this.iteration_anchor(downstream_slot);
+            let fulfilled_url = namespace_url.clone();
+            let on_fulfilled =
+                crate::native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut this.gc_heap,
+                    "dynamicImportModuleFulfilled",
+                    smallvec::smallvec![downstream_value],
+                    &mut |_visitor| {},
+                    move |ncx, _args, captures| {
+                        let interp = ncx.interp_mut();
+                        if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
+                            let namespace = interp
+                                .module_env(&fulfilled_url)
+                                .map(Value::object)
+                                .unwrap_or_else(Value::undefined);
+                            let jobs = crate::JsPromise::fulfill(
+                                &downstream,
+                                &mut interp.gc_heap,
+                                namespace,
+                            );
+                            for j in jobs.jobs {
+                                interp.microtasks.enqueue(j);
+                            }
+                        }
+                        Ok(Value::undefined())
+                    },
+                )
+                .map_err(VmError::from)?;
+            let fulfilled_slot = this.push_iteration_anchor(on_fulfilled) - 1;
+            let downstream_value = this.iteration_anchor(downstream_slot);
+            let on_rejected =
+                crate::native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut this.gc_heap,
+                    "dynamicImportModuleRejected",
+                    smallvec::smallvec![downstream_value],
+                    &mut |_visitor| {},
+                    move |ncx, args, captures| {
+                        let interp = ncx.interp_mut();
+                        if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
+                            let reason = args.first().copied().unwrap_or_else(Value::undefined);
+                            let jobs =
+                                crate::JsPromise::reject(&downstream, &mut interp.gc_heap, reason);
+                            for j in jobs.jobs {
+                                interp.microtasks.enqueue(j);
+                            }
+                        }
+                        Ok(Value::undefined())
+                    },
+                )
+                .map_err(VmError::from)?;
+            let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
+            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_stack_rooted(this, stack, &[], &[])?;
+            let init = this
+                .iteration_anchor(init_slot)
+                .as_promise()
+                .expect("anchored module-evaluation gate survives reaction allocation");
+            let on_fulfilled = this.iteration_anchor(fulfilled_slot);
+            let on_rejected = this.iteration_anchor(rejected_slot);
+            let async_context = this.async_context();
+            let outcome = crate::JsPromise::perform_then_with_context(
+                &init,
+                &mut this.gc_heap,
+                Some(on_fulfilled),
+                Some(on_rejected),
+                capability,
+                Some(context.clone()),
+                async_context,
+            );
+            if let Some(job) = outcome.immediate_job {
+                this.microtasks.enqueue(job);
+            }
+            Ok(())
+        })(self);
+        self.pop_iteration_anchors_to(init_slot);
+        outcome
     }
 
     /// Build a module's `import.meta` object with its `url` property.

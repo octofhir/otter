@@ -46,7 +46,18 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
     ) -> Result<(), VmError> {
-        write_register(frame, dst, Value::object(self.global_this))?;
+        // A frame compiled in another realm sees that realm's global
+        // (§9.1.1.4.11 GetThisBinding); the parked realm keeps it in
+        // `extra_realms` while inactive.
+        let global = match self.foreign_function_realm(frame.function_id) {
+            Some(realm_id) => self
+                .extra_realms
+                .iter()
+                .find(|realm| realm.id == realm_id)
+                .map_or(self.global_this, |realm| realm.global_this),
+            None => self.global_this,
+        };
+        write_register(frame, dst, Value::object(global))?;
         frame.advance_pc()?;
         Ok(())
     }
@@ -100,6 +111,13 @@ impl Interpreter {
         function_id: u32,
         name_idx: u32,
     ) -> Result<Value, VmError> {
+        // A frame compiled in another realm resolves its globals there —
+        // §9.1.1.4 global environment records are per-realm.
+        if let Some(realm_id) = self.foreign_function_realm(function_id) {
+            return self.with_host_realm_id(realm_id, |interp| {
+                interp.load_global_or_throw_value(stack, context, function_id, name_idx)
+            });
+        }
         // A previously-resolved lexical cell for this load site reads directly,
         // skipping the name-string hash and const-table lookup. The cell is
         // permanent once bound, so the only per-read check is the TDZ hole.
@@ -217,6 +235,11 @@ impl Interpreter {
         function_id: u32,
         name_idx: u32,
     ) -> Result<Value, VmError> {
+        if let Some(realm_id) = self.foreign_function_realm(function_id) {
+            return self.with_host_realm_id(realm_id, |interp| {
+                interp.load_global_or_undefined_value(context, stack, function_id, name_idx)
+            });
+        }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -863,6 +886,18 @@ impl Interpreter {
         name_idx: u32,
         existed: bool,
     ) -> Result<(), VmError> {
+        if let Some(realm_id) = self.foreign_function_realm(function_id) {
+            return self.with_host_realm_id(realm_id, |interp| {
+                interp.store_global_checked_value(
+                    context,
+                    stack,
+                    function_id,
+                    value,
+                    name_idx,
+                    existed,
+                )
+            });
+        }
         if !existed {
             let name = context
                 .string_constant_str_for_function(function_id, name_idx)
@@ -923,6 +958,18 @@ impl Interpreter {
         name_idx: u32,
         strict: bool,
     ) -> Result<(), VmError> {
+        if let Some(realm_id) = self.foreign_function_realm(function_id) {
+            return self.with_host_realm_id(realm_id, |interp| {
+                interp.store_global_binding_value(
+                    context,
+                    stack,
+                    function_id,
+                    value,
+                    name_idx,
+                    strict,
+                )
+            });
+        }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;

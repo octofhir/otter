@@ -107,6 +107,7 @@ impl Interpreter {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         let arr = array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)?;
+        self.register_array_prototype_override(arr);
         let arr =
             initialize_array_length_with_roots(arr, &mut self.gc_heap, len, &mut external_visit)?;
         Ok(Value::array(arr))

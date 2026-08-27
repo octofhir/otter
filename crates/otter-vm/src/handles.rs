@@ -769,6 +769,7 @@ impl Interpreter {
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let array = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(VmError::from)?;
+        self.register_array_prototype_override(array);
         // Park before growing so the handle survives any allocation the length
         // reservation drives; then resolve the (possibly relocated) handle from
         // the arena to set the length.

@@ -3399,6 +3399,7 @@ impl Interpreter {
         };
         let arr = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))?;
+        self.register_array_prototype_override(arr);
         crate::array::set_length(arr, &mut self.gc_heap, length)
             .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))?;
         Ok(Value::array(arr))

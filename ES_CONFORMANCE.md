@@ -1,16 +1,16 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `470eab23b52efc7e3e2e10802284d78cf47f885e`
+- **Engine commit:** `8b52630ef061a720b2348a9facbd9bdf4fd2f3f4`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-28T19:59:46.084587+00:00
+- **Captured:** 2026-08-28T20:40:21.645409+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52420 |
-| failed     | 55 |
+| passed     | 52423 |
+| failed     | 52 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
@@ -26,13 +26,12 @@
 | staging/sm/TypedArray | 96 | 91 | 5 | 94.8% |
 | staging/sm/regress | 106 | 101 | 5 | 95.3% |
 | staging/sm/RegExp | 91 | 87 | 4 | 95.6% |
-| staging/sm/expressions | 42 | 38 | 4 | 90.5% |
 | staging/sm/Array | 90 | 87 | 3 | 96.7% |
+| staging/sm/expressions | 42 | 39 | 3 | 92.9% |
 | staging/sm/Function | 53 | 51 | 2 | 96.2% |
 | staging/sm/Proxy | 24 | 22 | 2 | 91.7% |
 | staging/sm/Reflect | 17 | 15 | 2 | 88.2% |
 | staging/sm/extensions | 64 | 62 | 2 | 96.9% |
-| staging/sm/object | 65 | 63 | 2 | 96.9% |
 | language/eval-code/direct | 286 | 285 | 1 | 99.7% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
@@ -72,6 +71,7 @@
 | built-ins/AbstractModuleSource/throw-from-constructor.js | 1 | 0 | 0 | 0.0% |
 | built-ins/AggregateError/cause-property.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/errors-iterabletolist-failures.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/errors-iterabletolist.js | 1 | 1 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -113,7 +113,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/TypedArray/set-wrapped.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/TypedArray/slice-bitwise-same.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: numeric … | `staging/sm/expressions/11.1.5-01.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: computed… | `staging/sm/expressions/object-literal-__proto__.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/expressions/short-circuit-compound-assignment-anon-fns.js` |
 | fail | sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Su… | `staging/sm/expressions/short-circuit-compound-assignment.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/arguments-property-access-in-function.js` |
@@ -122,8 +121,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/misc/future-reserved-words.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should… | `staging/sm/module/await-restricted-nested.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/object/defineProperties-order.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: toString: C… | `staging/sm/object/duplProps.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: proxy ca… | `staging/sm/regress/regress-1383630.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: group as… | `staging/sm/regress/regress-469625-02.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: function… | `staging/sm/regress/regress-602621.js` |

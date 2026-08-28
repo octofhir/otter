@@ -399,8 +399,16 @@ a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
 Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.90% at
-`470eab23`, 55 fails, 0 crashes/timeouts (three fixes vs the 58-fail
-set, zero regressions): the parameter-expression body variable
+`8b52630e`, 52 fails, 0 crashes/timeouts (three fixes vs the 55-fail
+set, zero regressions). The literal-redefinition slice closed a real
+shape-cache corruption: a duplicate object-literal key whose data member
+landed on an earlier accessor took the lenient shape store, leaving the
+hidden class claiming an accessor over a data cell and poisoning the
+shape-id-keyed lookup caches for later literals (the
+allocation-order-dependent __proto__/duplProps failures); it now runs
+the descriptor redefinition. Object.defineProperties / Object.create
+interleave the per-key enumerable probe with that key's [[Get]] for
+observable sources. The previous slice (55-fail baseline at `470eab23`): the parameter-expression body variable
 environment (§10.2.11 step 28 shadow bindings initialized from the
 parameter cells), error-class registry constructor stamping plus
 VmIntrinsic realm switching on the spread/invoke routes, the

@@ -5998,11 +5998,16 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
             {
                 slot.flags = slot.flags.with_configurable(false);
             }
-            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
                 // SAFETY: a non-null handle names a live table.
                 .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
                 .iter_mut()
             {
+                // §6.2.12 — Private Name carriers are not properties;
+                // SetIntegrityLevel never touches them.
+                if key.is_private_name() {
+                    continue;
+                }
                 slot.flags = slot.flags.with_configurable(false);
             }
         }
@@ -6032,11 +6037,15 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
             {
                 slot.flags = slot.flags.with_configurable(false);
             }
-            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
                 // SAFETY: a non-null handle names a live table.
                 .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
                 .iter_mut()
             {
+                // §6.2.12 — Private Name carriers are not properties.
+                if key.is_private_name() {
+                    continue;
+                }
                 slot.flags = slot.flags.with_configurable(false);
             }
         }
@@ -6069,11 +6078,15 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
                     slot.flags = slot.flags.with_writable(false);
                 }
             }
-            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
                 // SAFETY: a non-null handle names a live table.
                 .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
                 .iter_mut()
             {
+                // §6.2.12 — Private Name carriers are not properties.
+                if key.is_private_name() {
+                    continue;
+                }
                 slot.flags = slot.flags.with_configurable(false);
                 if slot.kind.is_data() {
                     slot.flags = slot.flags.with_writable(false);
@@ -6112,11 +6125,15 @@ pub(crate) fn freeze_with_shape(
                     slot.flags = slot.flags.with_writable(false);
                 }
             }
-            for (_, slot) in symbol_props_body_of(exotic.symbol_props)
+            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
                 // SAFETY: a non-null handle names a live table.
                 .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
                 .iter_mut()
             {
+                // §6.2.12 — Private Name carriers are not properties.
+                if key.is_private_name() {
+                    continue;
+                }
                 slot.flags = slot.flags.with_configurable(false);
                 if slot.kind.is_data() {
                     slot.flags = slot.flags.with_writable(false);

@@ -1772,7 +1772,22 @@ impl Interpreter {
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
+        has_prototype_property: bool,
     ) -> bool {
+        // §10.2.4 — an ordinary function's implicit `prototype` slot is
+        // writable but non-configurable: [[Delete]] refuses it unless a
+        // user bag entry (materialized by defineProperty) shadows the
+        // virtual slot, in which case the bag's own flags decide.
+        if key == "prototype"
+            && has_prototype_property
+            && self
+                .callable_bag_read(owner, function_id)
+                .is_none_or(|bag| {
+                    crate::object::get_own_descriptor(bag, &self.gc_heap, key).is_none()
+                })
+        {
+            return false;
+        }
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
             return self
                 .callable_bag_read(owner, function_id)

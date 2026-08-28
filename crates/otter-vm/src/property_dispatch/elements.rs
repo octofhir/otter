@@ -15,7 +15,7 @@ use super::{canonical_numeric_index_string, typed_array_valid_index};
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, binary, collections_prototype, descriptor_value, read_register, regexp_prototype,
+    abstract_ops, binary, collections_prototype, descriptor_value, read_register,
     rooting::RootScopeExt, symbol, write_register,
 };
 
@@ -428,22 +428,20 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(r) = recv.as_regexp() {
+        } else if recv.as_regexp().is_some() {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                // Computed string-key on RegExp.
+                // Computed string-key on RegExp: the ordinary [[Get]]
+                // funnel owns expando, `lastIndex`, the prototype
+                // override (cross-realm literals), and the observable
+                // `%RegExp.prototype%` accessors — identical to the
+                // static-key path.
                 let name = key.to_lossy_string(&self.gc_heap);
-                if let Some(bag) = r.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get(bag, &self.gc_heap, &name)
-                {
-                    value
-                } else {
-                    let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, &name);
-                    if direct.is_undefined() {
-                        self.load_from_constructor_prototype(
-                            stack, context, "RegExp", &recv, &name,
-                        )?
-                    } else {
-                        direct
+                let key = VmPropertyKey::OwnedString(name);
+                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {

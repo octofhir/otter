@@ -2136,11 +2136,22 @@ pub fn delete_symbol_property(
 #[must_use]
 pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symbol::JsSymbol> {
     heap.read_payload(arr, |body| {
-        let mut keys: Vec<crate::symbol::JsSymbol> = body
-            .symbol_properties()
-            .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| *k).collect());
+        // §6.2.12 — Private Name carriers (a constructor-return
+        // override can brand an array) are not properties.
+        let mut keys: Vec<crate::symbol::JsSymbol> =
+            body.symbol_properties().map_or_else(Vec::new, |t| {
+                t.iter()
+                    .map(|(k, _)| *k)
+                    .filter(|k| !k.is_private_name())
+                    .collect()
+            });
         if let Some(accessors) = body.symbol_accessors() {
-            keys.extend(accessors.iter().map(|(k, _)| *k));
+            keys.extend(
+                accessors
+                    .iter()
+                    .map(|(k, _)| *k)
+                    .filter(|k| !k.is_private_name()),
+            );
         }
         keys
     })

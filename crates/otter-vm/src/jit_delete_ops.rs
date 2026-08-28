@@ -76,6 +76,7 @@ impl Interpreter {
                 ];
                 if !self.drive_delete_property_proxy(stack, context, &ops)? {
                     self.run_delete_property_reg(
+                        context,
                         &mut stack[frame_index],
                         dst,
                         obj_reg,
@@ -105,7 +106,9 @@ impl Interpreter {
                 ];
                 if !self.drive_delete_element_proxy(stack, context, &ops)? {
                     self.run_delete_element_regs(
-                        &mut stack[frame_index],
+                        context,
+                        stack,
+                        frame_index,
                         dst,
                         obj_reg,
                         idx_reg,

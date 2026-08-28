@@ -853,6 +853,7 @@ impl Interpreter {
             flags,
         )
         .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
+        self.register_regexp_realm_proto(regex);
         Ok(Value::regexp(regex))
     }
 

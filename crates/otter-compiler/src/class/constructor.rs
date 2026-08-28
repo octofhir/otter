@@ -305,6 +305,17 @@ pub(crate) fn compile_class_constructor(
         ..Default::default()
     });
 
+    // §15.7.10 InitializeInstanceElements — a base class runs field
+    // initialisers from [[Construct]] BEFORE the constructor body's
+    // FunctionDeclarationInstantiation binds the parameters: a
+    // throwing initialiser wins over a throwing parameter default,
+    // and initialisers never observe the constructor's own parameter
+    // bindings. Derived classes run them right after the top-level
+    // `super(...)` call returns, so `this` is already allocated.
+    if !is_derived {
+        emit_instance_field_inits(parent, instance_fields)?;
+    }
+
     predeclare_formal_parameters(parent, params, false, span)?;
     for (ordinal, param) in params.items.iter().enumerate() {
         compile_formal_parameter(
@@ -324,14 +335,6 @@ pub(crate) fn compile_class_constructor(
     // the §15.7.14 class-scope binding (an upvalue capture), so the
     // constructor body observes the full class value rather than a
     // bare re-made closure of itself.
-
-    // §15.7.10 InitializeInstanceElements — base classes run field
-    // initialisers immediately (before the user body); derived
-    // classes run them right after the user-written `super(...)`
-    // call returns, so `this` is already allocated.
-    if !is_derived {
-        emit_instance_field_inits(parent, instance_fields)?;
-    }
 
     if let Some(body) = body {
         let mut var_names: Vec<String> = Vec::new();
@@ -485,7 +488,17 @@ fn emit_instance_field_inits_inner(
                     Some(id.name.as_str().to_string())
                 }
                 oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
-                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                    Some(crate::class::number_literal_property_name(lit.value))
+                }
+                oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
+                    crate::expr::literal::bigint_literal_property_name(lit)
+                }
+                // §15.7.10 NamedEvaluation with a private name: the
+                // description keeps the `#` sigil.
+                oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
+                    Some(format!("#{}", pid.name.as_str()))
+                }
                 _ => None,
             }
         };
@@ -533,7 +546,22 @@ fn emit_instance_field_inits_inner(
         let key_str = match &p.key {
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
             oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
-            oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
+            oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                crate::class::number_literal_property_name(lit.value)
+            }
+            oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
+                // §13.2.5.5 — a BigInt key becomes ToString(BigInt)
+                // (always decimal, base-independent).
+                match crate::expr::literal::bigint_literal_property_name(lit) {
+                    Some(name) => name,
+                    None => {
+                        return Err(CompileError::Unsupported {
+                            node: "ClassDeclaration: invalid BigInt field key".to_string(),
+                            span: pspan,
+                        });
+                    }
+                }
+            }
             oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
                 let key_reg = load_private_key_for_field(cx, pid.name.as_str(), pspan)?;
                 // §7.3.28 PrivateFieldAdd — re-initializing the same

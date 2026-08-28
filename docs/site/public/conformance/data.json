@@ -1,11 +1,11 @@
 {
  "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
- "engine_commit": "470eab23b52efc7e3e2e10802284d78cf47f885e",
- "ran_at": "2026-08-28T19:59:46.084587+00:00",
+ "engine_commit": "8b52630ef061a720b2348a9facbd9bdf4fd2f3f4",
+ "ran_at": "2026-08-28T20:40:21.645409+00:00",
  "totals": {
   "total": 53575,
-  "passed": 52420,
-  "failed": 55,
+  "passed": 52423,
+  "failed": 52,
   "skipped": 1100,
   "crashed": 0,
   "timed_out": 0,
@@ -41189,8 +41189,8 @@
   },
   "staging/sm/expressions": {
    "total": 42,
-   "passed": 38,
-   "failed": 4,
+   "passed": 39,
+   "failed": 3,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41270,8 +41270,8 @@
   },
   "staging/sm/object": {
    "total": 65,
-   "passed": 63,
-   "failed": 2,
+   "passed": 65,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41566,12 +41566,6 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: numeric index stringified correctly Expected SameValue(\u00abfalse\u00bb, \u00abtrue\u00bb) to be true"
   },
   {
-   "path": "staging/sm/expressions/object-literal-__proto__.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: computedNull, getter, getter Expected SameValue(\u00ab\"object\"\u00bb, \u00ab\"number\"\u00bb) to be true"
-  },
-  {
    "path": "staging/sm/expressions/short-circuit-compound-assignment-anon-fns.js",
    "esid": "pending",
    "outcome": "fail",
@@ -41618,18 +41612,6 @@
    "esid": "pending",
    "outcome": "fail",
    "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-  },
-  {
-   "path": "staging/sm/object/defineProperties-order.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab\"ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get\"\u00bb, \u00ab\"ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get\"\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/object/duplProps.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: toString: Cannot read properties of unknown (reading 'property')"
   },
   {
    "path": "staging/sm/regress/regress-1383630.js",

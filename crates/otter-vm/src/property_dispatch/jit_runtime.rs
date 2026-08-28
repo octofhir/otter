@@ -536,7 +536,15 @@ impl Interpreter {
         if let Some(code_block) = context.exec_function(function_id) {
             self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
         }
-        self.store_element_values(stack, context, function_id, receiver, key_value, value)
+        self.store_element_values(
+            stack,
+            context,
+            function_id,
+            receiver,
+            key_value,
+            value,
+            false,
+        )
     }
 
     /// Complete computed `[[Set]]` from copied, representation-independent
@@ -551,6 +559,7 @@ impl Interpreter {
         mut receiver: Value,
         mut key_value: Value,
         mut value: Value,
+        force_strict: bool,
     ) -> Result<(), VmError> {
         // Complete the dense-array miss without allocating a property key.
         // Existing slots need only the write barrier; plain holes are also
@@ -572,7 +581,7 @@ impl Interpreter {
             return Ok(());
         }
         let mut property_key = Value::undefined();
-        let strict = context.function_is_strict(function_id);
+        let strict = force_strict || context.function_is_strict(function_id);
 
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: all four locals are declared before `roots` and remain live

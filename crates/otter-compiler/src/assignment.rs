@@ -139,8 +139,9 @@ pub(crate) fn compile_assignment(
         };
         let store_scratch = cx.alloc_scratch();
         crate::type_hints::mark_class_receiver(cx, &member.object);
+        let store_op = cx.store_property_op();
         cx.emit(
-            Op::StoreProperty,
+            store_op,
             vec![
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_idx),
@@ -350,12 +351,16 @@ pub(crate) fn compile_assignment(
     // access. The lexical pre-pass declares the name (uninitialized) at
     // block entry, so the miss is observable statically.
     let local_info = cx.lookup_binding(&name);
+    // §19.2.1.3 — a deletable eval-introduced var must store through
+    // the dynamic eval-environment ops; the static cell would survive
+    // a `delete` of the binding.
+    let eval_var_dynamic = cx.eval_var_dynamic_reference(&name);
     let binding_uninitialized =
         matches!(local_info, Some(info) if !info.is_const && !info.initialized);
     // Capture resolution also recovers declaration mutability. The cell itself
     // stores only the moving value, so a shadowed post-RHS store carries this
     // metadata in its schema-owned fallback immediate.
-    let captured = if local_info.is_none() {
+    let captured = if local_info.is_none() && !eval_var_dynamic {
         cx.resolve_capture_with_info(&name)
     } else {
         None
@@ -428,6 +433,7 @@ pub(crate) fn compile_assignment(
         return Ok(dst);
     }
     let storage = match local_info {
+        Some(_) if eval_var_dynamic => None,
         Some(info) if info.is_const => {
             // §13.15.2 PutValue on an immutable binding is a runtime
             // TypeError, not an early error: the RHS still evaluates
@@ -459,7 +465,7 @@ pub(crate) fn compile_assignment(
             cx.emit(Op::EvalBindingSeq, [Operand::Register(snap)], span);
             snap
         });
-    let dynamic = storage.is_none() && cx.any_enclosing_leaking_direct_eval();
+    let dynamic = storage.is_none() && (eval_var_dynamic || cx.any_enclosing_leaking_direct_eval());
     // §6.2.5.6 — a strict assignment to an unresolvable identifier
     // throws off the reference resolved BEFORE the RHS runs: snapshot
     // the global binding's existence now so a RHS side effect that
@@ -991,8 +997,9 @@ pub(crate) fn assign_to_target(
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let scratch = cx.alloc_scratch();
+            let store_op = cx.store_property_op();
             cx.emit(
-                Op::StoreProperty,
+                store_op,
                 vec![
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -1135,8 +1142,9 @@ fn assign_prepared_target(
         }
         PreparedAssignmentTarget::StaticMember { obj_reg, name_idx } => {
             let scratch = cx.alloc_scratch();
+            let store_op = cx.store_property_op();
             cx.emit(
-                Op::StoreProperty,
+                store_op,
                 vec![
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -1574,6 +1582,23 @@ pub(crate) fn store_identifier(
     // destructuring/logical assignment leaves. Own bindings are statically
     // authoritative; cross-function captures retain their declaration
     // metadata and may be shadowed by a live eval environment.
+    // §19.2.1.3 — a deletable eval-introduced var stores through the
+    // eval-environment record (falling back to the sloppy global
+    // write once the binding was deleted).
+    if cx.eval_var_dynamic_reference(name) {
+        let name_idx = cx.intern_string_constant(name);
+        let strict = i32::from(cx.is_strict);
+        cx.emit(
+            Op::StoreDynamic,
+            [
+                Operand::Register(value_reg),
+                Operand::ConstIndex(name_idx),
+                Operand::Imm32(strict),
+            ],
+            span,
+        );
+        return Ok(());
+    }
     if let Some(info) = cx.lookup_binding(name) {
         if info.fn_self_name {
             if cx.is_strict {

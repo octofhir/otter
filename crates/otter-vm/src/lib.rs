@@ -1872,6 +1872,14 @@ pub struct EvalCompileOptions {
     /// each name to that slot. `None` for indirect eval and for
     /// direct eval at script top level (global environment).
     pub caller_scope: Option<Vec<EvalCallerBinding>>,
+    /// §19.2.1.3 step 16.a — `true` for a direct eval whose caller
+    /// variable environment is the GLOBAL environment (a script-
+    /// top-level call site). `caller_scope` then carries only the
+    /// block-scope refinements lexically between the global
+    /// environment and the eval site: the body resolves those names
+    /// through the spliced cells, while its var-scoped declarations
+    /// still land on the global object as deletable bindings.
+    pub global_var_env: bool,
     /// `true` to compile the source as *script global code*
     /// (§16.1.7 GlobalDeclarationInstantiation — non-configurable
     /// global var bindings) instead of eval code. Used by host hooks
@@ -1983,6 +1991,12 @@ pub struct EvalCallerBinding {
     /// of the same name declares a fresh variable-environment binding
     /// underneath (§19.2.1.3, §B.3.5).
     pub inner: bool,
+    /// `true` for a binding a previous sloppy eval introduced into the
+    /// caller's variable environment (§19.2.1.3 CreateMutableBinding
+    /// with deletable = true): the eval body keeps routing the name
+    /// through the dynamic eval-environment ops so a `delete` stays
+    /// observable.
+    pub deletable: bool,
 }
 
 /// Embedder-supplied parse + compile callback used by

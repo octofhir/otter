@@ -1143,7 +1143,7 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
                     let operands = function.operand_view(instr);
-                    if self.drive_store_property(stack, context, operands)? {
+                    if self.drive_store_property(stack, context, operands, false)? {
                         continue;
                     }
                     let obj_reg = instr.reg(0);
@@ -1152,7 +1152,64 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    self.run_store_property_reg(context, &mut *stack, top_idx, obj_reg, key, src)?;
+                    self.run_store_property_reg(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        obj_reg,
+                        key,
+                        src,
+                        false,
+                    )?;
+                    continue;
+                }
+                // §15.7.1 — class heritage / computed-key stores keep
+                // strict PutValue semantics inside a sloppy frame.
+                Op::StorePropertyStrict => {
+                    let operands = function.operand_view(instr);
+                    if self.drive_store_property(stack, context, operands, true)? {
+                        continue;
+                    }
+                    let obj_reg = instr.reg(0);
+                    let name_idx = instr.const_word(1);
+                    let src = instr.reg(2);
+                    let key = context
+                        .property_atom(name_idx)
+                        .ok_or_else(|| VmError::InvalidOperand)?;
+                    self.run_store_property_reg(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        obj_reg,
+                        key,
+                        src,
+                        true,
+                    )?;
+                    continue;
+                }
+                Op::StoreElementStrict => {
+                    let recv_reg = instr.reg(0);
+                    let idx_reg = instr.reg(1);
+                    let src_reg = instr.reg(2);
+                    let (function_id, receiver, key, value) = {
+                        let frame = ActiveFrameRef::materialized(&stack[top_idx]);
+                        (
+                            frame.function_id(),
+                            frame.read(recv_reg)?,
+                            frame.read(idx_reg)?,
+                            frame.read(src_reg)?,
+                        )
+                    };
+                    self.store_element_values(
+                        stack,
+                        context,
+                        function_id,
+                        receiver,
+                        key,
+                        value,
+                        true,
+                    )?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::StoreElement => {
@@ -1184,7 +1241,15 @@ impl Interpreter {
                             frame.read(src_reg)?,
                         )
                     };
-                    self.store_element_values(stack, context, function_id, receiver, key, value)?;
+                    self.store_element_values(
+                        stack,
+                        context,
+                        function_id,
+                        receiver,
+                        key,
+                        value,
+                        false,
+                    )?;
                     // The synchronous helper completed the full effect (or
                     // threw), so publish exactly one resume increment.
                     stack[top_idx].advance_pc()?;

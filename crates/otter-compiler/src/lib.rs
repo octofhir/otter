@@ -1076,6 +1076,7 @@ function outer() {
             is_const: false,
             fn_self_name: false,
             inner: false,
+            deletable: false,
         }];
         let compile = |source| {
             compile_eval_source(
@@ -1085,6 +1086,7 @@ function outer() {
                 false,
                 false,
                 Some(&caller),
+                false,
                 true,
                 false,
                 false,

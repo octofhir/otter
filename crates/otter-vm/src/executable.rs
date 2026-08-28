@@ -1077,7 +1077,10 @@ impl CodeBlock {
                     // `CallMethodValue` shares the load-IC table: a prototype
                     // method is a data slot on the prototype, so its resolution
                     // is cached by receiver shape exactly like a `LoadProperty`.
-                    Op::LoadProperty | Op::StoreProperty | Op::CallMethodValue => {
+                    Op::LoadProperty
+                    | Op::StoreProperty
+                    | Op::StorePropertyStrict
+                    | Op::CallMethodValue => {
                         let site = *next_property_ic_site;
                         *next_property_ic_site = next_property_ic_site
                             .checked_add(1)
@@ -1234,6 +1237,13 @@ pub(crate) struct ExecDirectEvalBinding {
     /// eval site (§19.2.1.3, §B.3.5) — shadows the baseline table and
     /// eval-environment records; a body `var` never re-binds it.
     pub(crate) inner: bool,
+    /// Formal-parameter binding (or the implicit `arguments` object):
+    /// part of the function environment a parameter-initializer eval
+    /// already sees; body var/function bindings are not (§10.2.11).
+    pub(crate) param: bool,
+    /// Deletable eval-introduced caller binding (§19.2.1.3
+    /// CreateMutableBinding with deletable = true).
+    pub(crate) deletable: bool,
 }
 
 fn exec_direct_eval_binding(binding: &otter_bytecode::DirectEvalBinding) -> ExecDirectEvalBinding {
@@ -1245,6 +1255,8 @@ fn exec_direct_eval_binding(binding: &otter_bytecode::DirectEvalBinding) -> Exec
         is_const: binding.is_const,
         fn_self_name: binding.fn_self_name,
         inner: binding.inner,
+        param: binding.param,
+        deletable: binding.deletable,
     }
 }
 

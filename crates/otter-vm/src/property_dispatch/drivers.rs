@@ -631,9 +631,10 @@ impl Interpreter {
         &self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        force_strict: bool,
         message: impl Into<Box<str>>,
     ) -> Result<bool, VmError> {
-        if Self::current_frame_is_strict(stack, context) {
+        if force_strict || Self::current_frame_is_strict(stack, context) {
             return Err(self.err_type(message.into()));
         }
         let top_idx = stack.len() - 1;
@@ -884,6 +885,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
+        force_strict: bool,
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
         let name_idx = const_operand(operands.get(1))?;
@@ -896,7 +898,9 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let value = *read_register(&stack[top_idx], src_reg)?;
-        let strict = Self::current_frame_is_strict(stack, context);
+        // §15.7.1 — Op::StorePropertyStrict forces strict PutValue
+        // failure semantics for class parts lowered into sloppy frames.
+        let strict = force_strict || Self::current_frame_is_strict(stack, context);
         if let Some(obj) = receiver.as_object()
             && object::supports_fast_property_ic(obj, &self.gc_heap)
         {
@@ -1151,6 +1155,7 @@ impl Interpreter {
                 return self.finish_failed_set(
                     stack,
                     context,
+                    force_strict,
                     format!("Cannot assign to read-only property '{name}' of class"),
                 );
             }
@@ -1172,6 +1177,7 @@ impl Interpreter {
                         return self.finish_failed_set(
                             stack,
                             context,
+                            force_strict,
                             format!("Cannot assign to read-only property '{name}' of function"),
                         );
                     }
@@ -1227,6 +1233,7 @@ impl Interpreter {
                     return self.finish_failed_set(
                         stack,
                         context,
+                        force_strict,
                         format!("Cannot assign to property '{name}'"),
                     );
                 }
@@ -1264,6 +1271,7 @@ impl Interpreter {
                         return self.finish_failed_set(
                             stack,
                             context,
+                            force_strict,
                             format!("Cannot assign to property '{name}'"),
                         );
                     }
@@ -1314,6 +1322,7 @@ impl Interpreter {
                     return self.finish_failed_set(
                         stack,
                         context,
+                        force_strict,
                         format!("Cannot assign to accessor property '{name}' without a setter"),
                     );
                 }
@@ -1326,6 +1335,7 @@ impl Interpreter {
             object::SetOutcome::Reject { .. } => self.finish_failed_set(
                 stack,
                 context,
+                force_strict,
                 format!("Cannot assign to property '{name}'"),
             ),
         }

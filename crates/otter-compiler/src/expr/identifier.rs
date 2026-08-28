@@ -216,6 +216,20 @@ pub(crate) fn compile_identifier_without_with(
         );
         return Ok(dst);
     }
+    // §19.2.1.3 — this eval chunk's own deletable var binding: read
+    // through the eval-environment record so a `delete` of the name
+    // (from this body or a nested eval) makes later reads throw
+    // instead of serving the orphaned static cell.
+    if cx.eval_var_dynamic_reference(name) {
+        let dst = cx.alloc_scratch();
+        let name_idx = cx.intern_string_constant(name);
+        cx.emit(
+            Op::LoadDynamic,
+            [Operand::Register(dst), Operand::ConstIndex(name_idx)],
+            span,
+        );
+        return Ok(dst);
+    }
     if let Some(info) = cx.lookup_binding(name) {
         let dst = cx.alloc_scratch();
         if info.initialized {

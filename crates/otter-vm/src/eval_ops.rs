@@ -136,13 +136,13 @@ impl Interpreter {
         let in_function_caller = context
             .exec_function(stack[top_idx].function_id)
             .is_some_and(|function| function.contains_direct_eval);
-        // Script-top-level evals keep the global variable environment:
-        // the per-site block-binding refinements only apply when the
-        // caller is function code (a script `for (let …)` TDZ cell
-        // must not drag the eval onto the function-caller path).
-        let effective_site = if in_function_caller { site } else { usize::MAX };
+        // A script-top-level eval keeps the global variable
+        // environment, but the per-site block-binding refinements
+        // still apply: §19.2.1.1 gives the body the caller's lexical
+        // environment as heritage, so a `for (let …)` / block `let`
+        // cell around the call site is visible inside the body.
         let (caller_scope, cell_sources) =
-            self.collect_caller_scope(context, &stack[top_idx], in_param_init, effective_site);
+            self.collect_caller_scope(context, &stack[top_idx], in_param_init, site);
         let result = if !in_function_caller && cell_sources.is_empty() {
             // Script-top-level direct eval: the caller variable
             // environment *is* the global environment, which the
@@ -154,6 +154,7 @@ impl Interpreter {
                     force_strict,
                     forbid_var_arguments,
                     caller_scope: None,
+                    global_var_env: false,
                     script_goal: false,
                     new_target_allowed,
                     in_class_field_initializer: new_target_suppressed,
@@ -169,6 +170,7 @@ impl Interpreter {
                     force_strict,
                     forbid_var_arguments,
                     caller_scope: Some(caller_scope),
+                    global_var_env: !in_function_caller,
                     script_goal: false,
                     new_target_allowed,
                     in_class_field_initializer: new_target_suppressed,
@@ -202,10 +204,17 @@ impl Interpreter {
             std::collections::BTreeMap::new();
         if let Some(function) = context.exec_function(frame.function_id) {
             for binding in function.direct_eval_bindings.iter() {
-                // §10.2.11 — body lexical bindings don't exist yet
-                // while parameter initializers run; an eval there
-                // neither sees them nor collides with them.
-                if in_param_init && binding.lexical {
+                // §10.2.11 — while parameter initializers run, only
+                // the function environment exists: formal parameters,
+                // captured passthroughs from enclosing scopes, and
+                // the self-name binding. Body lexical AND body
+                // var/function bindings don't exist yet; an eval
+                // there neither sees them nor collides with them
+                // (its own `var` adopts a fresh funcEnv binding).
+                if in_param_init
+                    && (binding.lexical
+                        || (!binding.param && !binding.captured && !binding.fn_self_name))
+                {
                     continue;
                 }
                 let name = binding.name.to_string();
@@ -219,6 +228,7 @@ impl Interpreter {
                             is_const: binding.is_const,
                             fn_self_name: binding.fn_self_name,
                             inner: false,
+                            deletable: binding.deletable,
                         },
                         CallerCellSource::Upvalue(binding.upvalue),
                     ),
@@ -248,6 +258,7 @@ impl Interpreter {
                                 is_const: false,
                                 fn_self_name: false,
                                 inner: false,
+                                deletable: true,
                             },
                             CallerCellSource::EvalEnv(name),
                         ),
@@ -274,6 +285,7 @@ impl Interpreter {
                             is_const: binding.is_const,
                             fn_self_name: binding.fn_self_name,
                             inner: true,
+                            deletable: binding.deletable,
                         },
                         CallerCellSource::Upvalue(binding.upvalue),
                     ),

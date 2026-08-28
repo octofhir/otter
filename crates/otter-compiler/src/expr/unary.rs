@@ -294,13 +294,18 @@ pub(crate) fn compile_unary(
         && let Expression::Identifier(id) = typeof_arg
     {
         let name = id.name.as_str();
-        if cx.lookup_binding(name).is_none()
-            && find_module_import_binding(cx, name).is_none()
-            && cx.resolve_capture(name).is_none()
-            && !is_builtin_error_class_name(name)
-            && name != "NaN"
-            && name != "Infinity"
-            && name != "undefined"
+        // §19.2.1.3 — `typeof` of a deletable eval-introduced var goes
+        // through the dynamic probe so a deleted binding yields
+        // "undefined" instead of the orphaned static cell's value.
+        let eval_var_dynamic = cx.eval_var_dynamic_reference(name);
+        if eval_var_dynamic
+            || (cx.lookup_binding(name).is_none()
+                && find_module_import_binding(cx, name).is_none()
+                && cx.resolve_capture(name).is_none()
+                && !is_builtin_error_class_name(name)
+                && name != "NaN"
+                && name != "Infinity"
+                && name != "undefined")
         {
             let value_reg = cx.alloc_scratch();
             // §9.1.1.2.1 — an enclosing `with` environment shadows the
@@ -320,7 +325,7 @@ pub(crate) fn compile_unary(
             let name_idx = cx.intern_string_constant(name);
             // An eval-introduced frame binding shadows the global
             // fallback inside a function with a direct eval.
-            let op = if cx.any_enclosing_leaking_direct_eval() {
+            let op = if eval_var_dynamic || cx.any_enclosing_leaking_direct_eval() {
                 Op::TypeofDynamic
             } else {
                 Op::LoadGlobalOrUndefined
@@ -486,8 +491,15 @@ pub(crate) fn compile_update(
                 let throws = info.is_const || cx.is_strict;
                 return finish_immutable_update(cx, &name, old, u, span, throws);
             }
-            let local = cx.lookup_binding(&name);
-            let capture = if local.is_none() {
+            // §19.2.1.3 — a deletable eval-introduced var updates
+            // through the dynamic eval-environment ops.
+            let eval_var_dynamic = cx.eval_var_dynamic_reference(&name);
+            let local = if eval_var_dynamic {
+                None
+            } else {
+                cx.lookup_binding(&name)
+            };
+            let capture = if local.is_none() && !eval_var_dynamic {
                 cx.resolve_capture_with_info(&name)
             } else {
                 None
@@ -525,7 +537,7 @@ pub(crate) fn compile_update(
                     // environment (realm-wide lexicals first); a
                     // missing binding is a ReferenceError.
                     let name_idx = cx.intern_string_constant(&name);
-                    let op = if cx.any_enclosing_leaking_direct_eval() {
+                    let op = if eval_var_dynamic || cx.any_enclosing_leaking_direct_eval() {
                         Op::LoadDynamic
                     } else {
                         Op::LoadGlobalOrThrow
@@ -711,7 +723,9 @@ pub(crate) fn compile_update(
                 Some(s) => cx.emit_store_storage(next, s, span),
                 None => {
                     let name_idx = cx.intern_string_constant(&name);
-                    let op = if cx.any_enclosing_leaking_direct_eval() {
+                    let op = if cx.eval_var_dynamic_reference(&name)
+                        || cx.any_enclosing_leaking_direct_eval()
+                    {
                         Op::StoreDynamic
                     } else {
                         Op::StoreGlobalBinding
@@ -735,8 +749,9 @@ pub(crate) fn compile_update(
         UpdateTarget::StaticMember { obj_reg, name } => {
             let name_idx = cx.intern_string_constant(name);
             let scratch = cx.alloc_scratch();
+            let store_op = cx.store_property_op();
             cx.emit(
-                Op::StoreProperty,
+                store_op,
                 vec![
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),

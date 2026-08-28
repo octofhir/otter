@@ -423,6 +423,8 @@ impl Writer {
         self.bool(binding.is_const);
         self.bool(binding.fn_self_name);
         self.bool(binding.inner);
+        self.bool(binding.param);
+        self.bool(binding.deletable);
     }
 
     fn mapped_argument_binding(&mut self, binding: &MappedArgumentBinding) {
@@ -729,6 +731,8 @@ impl<'a> Reader<'a> {
             is_const: self.bool()?,
             fn_self_name: self.bool()?,
             inner: self.bool()?,
+            param: self.bool()?,
+            deletable: self.bool()?,
         })
     }
 
@@ -924,6 +928,8 @@ mod tests {
                     is_const: false,
                     fn_self_name: false,
                     inner: false,
+                    param: false,
+                    deletable: false,
                 }],
                 eval_sites: vec![vec![DirectEvalBinding {
                     captured: false,
@@ -933,6 +939,8 @@ mod tests {
                     is_const: false,
                     fn_self_name: false,
                     inner: true,
+                    param: false,
+                    deletable: false,
                 }]],
                 contains_direct_eval: true,
                 source_text_range: Some((0, 18)),

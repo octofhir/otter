@@ -1015,6 +1015,8 @@ opcode_schema! {
     (Op::LoadShadowedUpvalueSnap, 0xB7),
     (Op::StoreShadowedUpvalueCheckedSnap, 0xB8),
     (Op::EvalRestoreBinding, 0xB9),
+    (Op::StorePropertyStrict, 0xBA),
+    (Op::StoreElementStrict, 0xBB),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1251,6 +1253,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::NewObject => OperandShape::Fixed(WRITE),
         Op::LoadProperty | Op::DeleteProperty => OperandShape::Fixed(WRITE_READ_CONST),
         Op::StoreProperty => OperandShape::Fixed(READ_CONST_READ_WRITE),
+        Op::StorePropertyStrict => OperandShape::Fixed(READ_CONST_READ_WRITE),
         Op::GetPrototype | Op::ArrayLength | Op::GetIterator | Op::GetAsyncIterator => {
             OperandShape::Fixed(WRITE_READ)
         }
@@ -1260,6 +1263,7 @@ const fn operand_shape(op: Op) -> OperandShape {
             OperandShape::Fixed(WRITE_READ_READ)
         }
         Op::StoreElement => OperandShape::Fixed(READ_READ_READ),
+        Op::StoreElementStrict => OperandShape::Fixed(READ_READ_READ),
         Op::IteratorNext => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::IteratorClose
         | Op::IteratorCloseStart
@@ -1636,12 +1640,16 @@ const fn feedback(op: Op) -> FeedbackKind {
         | Op::LessEq
         | Op::GreaterThan
         | Op::GreaterEq => FeedbackKind::Arithmetic,
-        Op::LoadProperty | Op::StoreProperty | Op::HasProperty | Op::DeleteProperty => {
-            FeedbackKind::Property
-        }
-        Op::LoadElement | Op::StoreElement | Op::DeleteElement | Op::ArrayLength => {
-            FeedbackKind::Element
-        }
+        Op::LoadProperty
+        | Op::StoreProperty
+        | Op::StorePropertyStrict
+        | Op::HasProperty
+        | Op::DeleteProperty => FeedbackKind::Property,
+        Op::LoadElement
+        | Op::StoreElement
+        | Op::StoreElementStrict
+        | Op::DeleteElement
+        | Op::ArrayLength => FeedbackKind::Element,
         Op::Call
         | Op::CallWithThis
         | Op::CallMethodValue

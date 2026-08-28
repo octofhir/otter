@@ -190,6 +190,7 @@ pub(crate) fn compile_function_full(
     // arguments object. Skip if a formal named `arguments` exists.
     if needs_arguments && parent.lookup_binding("arguments").is_none() {
         let storage = parent.declare_binding("arguments", false, span)?;
+        parent.mark_param("arguments");
         let tmp = parent.alloc_scratch();
         parent.emit(Op::CollectArguments, [Operand::Register(tmp)], span);
         parent.emit_store_storage(tmp, storage, span);
@@ -374,6 +375,8 @@ pub(crate) fn record_eval_site(cx: &mut Compiler) -> u32 {
                 is_const: info.is_const,
                 fn_self_name: info.fn_self_name,
                 inner: true,
+                param: false,
+                deletable: false,
             });
         }
     }
@@ -409,14 +412,25 @@ pub(crate) fn collect_direct_eval_bindings(
                 is_const: info.is_const,
                 fn_self_name: info.fn_self_name,
                 inner: false,
+                param: info.param,
+                deletable: cx.eval_var_dynamic_reference(name),
             }),
             BindingStorage::Register { .. } => None,
         })
         .collect();
+    // An own function-scope binding shadows any same-named
+    // passthrough capture for the eval body — emitting both would let
+    // hash-ordered table consumers resolve the name to the OUTER cell
+    // and break §19.2.1.3 caller-var re-binding.
+    let own_names: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.name.clone()).collect();
     // Captured private-name / brand cells (class scope) ride along
     // so a direct eval can resolve `obj.#name` (§19.2.1.1
     // PrivateEnvironment inheritance).
     for (name, idx) in cx.captured_uv.iter() {
+        if own_names.contains(name) {
+            continue;
+        }
         let synthetic = name.starts_with("__privsym_")
             || name.starts_with("__privbrand_")
             || name == crate::class::SUPER_HOME_NAME
@@ -431,6 +445,8 @@ pub(crate) fn collect_direct_eval_bindings(
                 is_const: false,
                 fn_self_name: false,
                 inner: false,
+                param: true,
+                deletable: false,
             });
             continue;
         }
@@ -456,6 +472,8 @@ pub(crate) fn collect_direct_eval_bindings(
             is_const,
             fn_self_name,
             inner: false,
+            param: false,
+            deletable: cx.eval_var_dynamic_reference(name),
         });
     }
     // `bindings` is hash-ordered; sort for deterministic bytecode.

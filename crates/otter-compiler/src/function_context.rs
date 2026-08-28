@@ -165,6 +165,11 @@ pub(crate) struct FunctionContext {
     /// hand the eval body its caller variable environment
     /// (§19.2.1.3 EvalDeclarationInstantiation).
     pub(crate) contains_direct_eval: bool,
+    /// §15.7.1 — a class definition's heritage / computed-key
+    /// expressions are being lowered inline into this (sloppy)
+    /// function frame: property stores emitted here must carry
+    /// strict PutValue failure semantics via the `*Strict` opcodes.
+    pub(crate) strict_class_parts: bool,
     /// §8.4 / §14 — the script / eval `<main>` completion-value
     /// register (spec `V`). Expression statements store into it as
     /// they evaluate; composite statements reset it to `undefined`
@@ -231,6 +236,7 @@ impl FunctionContext {
             scratch_peak: 0,
             next_with_env_id: 0,
             contains_direct_eval: false,
+            strict_class_parts: false,
             completion_reg: None,
             completion_suppressed: false,
             finally_body_depth: 0,
@@ -405,6 +411,7 @@ impl FunctionContext {
                 fn_self_name: false,
                 type_hint: TypeHint::Unknown,
                 catch_param: false,
+                param: false,
             },
         );
         Ok(storage)
@@ -498,8 +505,23 @@ impl FunctionContext {
                 fn_self_name: false,
                 type_hint: TypeHint::Unknown,
                 catch_param: false,
+                param: false,
             },
         );
+    }
+
+    /// Flag the current-scope binding of `name` as a formal-parameter
+    /// binding (§10.2.11 function environment) so a direct eval inside
+    /// a parameter initializer may resolve it while body-var bindings
+    /// stay invisible there.
+    pub(crate) fn mark_param(&mut self, name: &str) {
+        if let Some(info) = self
+            .scopes
+            .last_mut()
+            .and_then(|scope| scope.bindings.get_mut(name))
+        {
+            info.param = true;
+        }
     }
 
     /// Attach a static type hint to the innermost binding of `name`.
@@ -904,8 +926,9 @@ impl FunctionContext {
     ) {
         let name_const = self.intern_string_constant(name);
         let scratch = self.alloc_scratch();
+        let op = self.store_property_op();
         self.emit(
-            Op::StoreProperty,
+            op,
             vec![
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_const),
@@ -916,6 +939,26 @@ impl FunctionContext {
         );
     }
 
+    /// §15.7.1 — the property-store opcode for PutValue emission at
+    /// the current compile point: the `Strict` variant while class
+    /// heritage / computed keys lower into a sloppy frame.
+    pub(crate) fn store_property_op(&self) -> Op {
+        if self.strict_class_parts {
+            Op::StorePropertyStrict
+        } else {
+            Op::StoreProperty
+        }
+    }
+
+    /// Element counterpart of [`Self::store_property_op`].
+    pub(crate) fn store_element_op(&self) -> Op {
+        if self.strict_class_parts {
+            Op::StoreElementStrict
+        } else {
+            Op::StoreElement
+        }
+    }
+
     /// Emit `Op::StoreElement obj_reg, key_reg, src_reg`.
     pub(crate) fn emit_store_element(
         &mut self,
@@ -924,8 +967,9 @@ impl FunctionContext {
         src: u16,
         span: (u32, u32),
     ) {
+        let op = self.store_element_op();
         self.emit(
-            Op::StoreElement,
+            op,
             vec![
                 Operand::Register(obj_reg),
                 Operand::Register(key_reg),

@@ -1,11 +1,11 @@
 {
  "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
- "engine_commit": "dc1e9e2bffa761f5b30d7f0ff3fa4d81152d8fe3",
- "ran_at": "2026-08-28T15:51:16.350366+00:00",
+ "engine_commit": "bfc317b9b12a9d46ff4b39b0cfdb9f7304e9ac63",
+ "ran_at": "2026-08-28T17:43:22.995823+00:00",
  "totals": {
   "total": 53575,
-  "passed": 52389,
-  "failed": 86,
+  "passed": 52402,
+  "failed": 73,
   "skipped": 1100,
   "crashed": 0,
   "timed_out": 0,
@@ -113,8 +113,8 @@
   },
   "annexB/language/expressions": {
    "total": 26,
-   "passed": 19,
-   "failed": 7,
+   "passed": 26,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -22001,8 +22001,8 @@
   },
   "intl402/Array/prototype": {
    "total": 2,
-   "passed": 1,
-   "failed": 1,
+   "passed": 2,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -22010,8 +22010,8 @@
   },
   "intl402/BigInt/prototype": {
    "total": 11,
-   "passed": 10,
-   "failed": 1,
+   "passed": 11,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -23477,8 +23477,8 @@
   },
   "intl402/Locale/constructor-non-iana-canon.js": {
    "total": 1,
-   "passed": 0,
-   "failed": 1,
+   "passed": 1,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -24917,8 +24917,8 @@
   },
   "intl402/constructors-string-and-single-element-array.js": {
    "total": 1,
-   "passed": 0,
-   "failed": 1,
+   "passed": 1,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -34925,8 +34925,8 @@
   },
   "language/import/import-defer": {
    "total": 103,
-   "passed": 100,
-   "failed": 2,
+   "passed": 102,
+   "failed": 0,
    "skipped": 1,
    "crashed": 0,
    "timed_out": 0,
@@ -41352,60 +41352,6 @@
  },
  "failing_tests": [
   {
-   "path": "annexB/language/expressions/assignmenttargettype/callexpression-as-for-in-lhs.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "annexB/language/expressions/assignmenttargettype/callexpression-as-for-of-lhs.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "annexB/language/expressions/assignmenttargettype/callexpression-in-compound-assignment.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "annexB/language/expressions/assignmenttargettype/callexpression-in-postfix-update.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "annexB/language/expressions/assignmenttargettype/callexpression-in-prefix-update.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "annexB/language/expressions/assignmenttargettype/callexpression.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "annexB/language/expressions/assignmenttargettype/cover-callexpression-and-asyncarrowhead.js",
-   "esid": "sec-runtime-errors-for-function-call-assignment-targets",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression]"
-  },
-  {
-   "path": "intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js",
-   "esid": "sup-array.prototype.tolocalestring",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [] and expected [undefined, undefined] should have the same contents. must invoke element toLocaleString with expected arguments when provided no arguments"
-  },
-  {
-   "path": "intl402/BigInt/prototype/toLocaleString/de-DE.js",
-   "esid": "sec-bigint.prototype.tolocalestring",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab\"8.878.000.000%\"\u00bb, \u00ab\"8.878.000.000\u00a0%\"\u00bb) to be true"
-  },
-  {
    "path": "intl402/DateTimeFormat/prototype/formatRange/en-US.js",
    "esid": "sec-partitiondatetimerangepattern",
    "outcome": "fail",
@@ -41460,17 +41406,6 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-civil eras (AD,AD) should be unique Expected SameValue(\u00ab1\u00bb, \u00ab2\u00bb) to be true"
   },
   {
-   "path": "intl402/Locale/constructor-non-iana-canon.js",
-   "esid": "sec-intl.locale",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Locale: invalid language tag"
-  },
-  {
-   "path": "intl402/constructors-string-and-single-element-array.js",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Array.prototype callback: invalid operand (Testing with NumberFormat.)"
-  },
-  {
    "path": "language/eval-code/direct/global-env-rec-with.js",
    "outcome": "fail",
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct eval"
@@ -41479,18 +41414,6 @@
    "path": "language/expressions/call/11.2.3-3_3.js",
    "outcome": "fail",
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalled Expected SameValue(\u00abtrue\u00bb, \u00abfalse\u00bb) to be true"
-  },
-  {
-   "path": "language/import/import-defer/deferred-namespace-object/identity.js",
-   "esid": "sec-getmodulenamespace",
-   "outcome": "fail",
-   "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Static and dynamic deferred import of the same module gives the same object Expected SameValue(\u00ab[object Deferred Module]\u00bb, \u00ab[object Deferred Module]\u00bb) to be true"
-  },
-  {
-   "path": "language/import/import-defer/evaluation-top-level-await/async-cycle-dependency-of-deferred-module/main.js",
-   "esid": "sec-IsModuleSCCEvaluated",
-   "outcome": "fail",
-   "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [B, A-before-await, Middle-before-nsD.z, Middle-after-nsD.z, resolve-blocker, C, A-after-await, D] and expected [B, A-before-await, resolve-blocker, A-after-await, Middle-before-nsD.z, D, Middle-after-nsD.z, C] should have the same contents. "
   },
   {
    "path": "staging/sm/Array/from-iterator-close.js",

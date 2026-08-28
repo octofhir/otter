@@ -1,29 +1,28 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `dc1e9e2bffa761f5b30d7f0ff3fa4d81152d8fe3`
+- **Engine commit:** `bfc317b9b12a9d46ff4b39b0cfdb9f7304e9ac63`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-28T15:51:16.350366+00:00
+- **Captured:** 2026-08-28T17:43:22.995823+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52389 |
-| failed     | 86 |
+| passed     | 52402 |
+| failed     | 73 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.84%
+**Pass rate (excl. skipped):** 99.86%
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
-| annexB/language/expressions | 26 | 19 | 7 | 73.1% |
 | staging/sm/RegExp | 91 | 85 | 6 | 93.4% |
 | staging/sm/TypedArray | 96 | 91 | 5 | 94.8% |
 | staging/sm/expressions | 42 | 37 | 5 | 88.1% |
@@ -34,15 +33,10 @@
 | staging/sm/strict | 51 | 47 | 4 | 92.2% |
 | staging/sm/Function | 53 | 50 | 3 | 94.3% |
 | staging/sm/fields | 8 | 5 | 3 | 62.5% |
-| language/import/import-defer | 103 | 100 | 2 | 98.0% |
 | staging/sm/BigInt | 5 | 3 | 2 | 60.0% |
 | staging/sm/Proxy | 24 | 22 | 2 | 91.7% |
 | staging/sm/Reflect | 17 | 15 | 2 | 88.2% |
 | staging/sm/object | 65 | 63 | 2 | 96.9% |
-| intl402/Array/prototype | 2 | 1 | 1 | 50.0% |
-| intl402/BigInt/prototype | 11 | 10 | 1 | 90.9% |
-| intl402/Locale/constructor-non-iana-canon.js | 1 | 0 | 1 | 0.0% |
-| intl402/constructors-string-and-single-element-array.js | 1 | 0 | 1 | 0.0% |
 | language/eval-code/direct | 286 | 285 | 1 | 99.7% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
@@ -67,25 +61,22 @@
 | annexB/built-ins/unescape | 19 | 19 | 0 | 100.0% |
 | annexB/language/comments | 8 | 8 | 0 | 100.0% |
 | annexB/language/eval-code | 469 | 469 | 0 | 100.0% |
+| annexB/language/expressions | 26 | 26 | 0 | 100.0% |
 | annexB/language/function-code | 159 | 159 | 0 | 100.0% |
 | annexB/language/global-code | 153 | 153 | 0 | 100.0% |
 | annexB/language/literals | 8 | 8 | 0 | 100.0% |
 | annexB/language/statements | 22 | 22 | 0 | 100.0% |
 | built-ins/AbstractModuleSource/length.js | 1 | 0 | 0 | 0.0% |
+| built-ins/AbstractModuleSource/name.js | 1 | 0 | 0 | 0.0% |
+| built-ins/AbstractModuleSource/proto.js | 1 | 0 | 0 | 0.0% |
+| built-ins/AbstractModuleSource/prototype | 3 | 0 | 0 | 0.0% |
+| built-ins/AbstractModuleSource/prototype.js | 1 | 0 | 0 | 0.0% |
+| built-ins/AbstractModuleSource/throw-from-constructor.js | 1 | 0 | 0 | 0.0% |
 
 ## Top failing-test patterns (top 100)
 
 | Outcome | Reason (truncated) | Path |
 |---|---|---|
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-as-for-in-lhs.js` |
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-as-for-of-lhs.js` |
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-in-compound-assignment.js` |
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-in-postfix-update.js` |
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression-in-prefix-update.js` |
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/callexpression.js` |
-| fail | sloppy: compile: codes=[SYNTAX_ERROR] messages=[Cannot assign to this expression… | `annexB/language/expressions/assignmenttargettype/cover-callexpression-and-asyncarrowhead.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [… | `intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `intl402/BigInt/prototype/toLocaleString/de-DE.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `intl402/DateTimeFormat/prototype/formatRange/en-US.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month co… | `intl402/DateTimeFormat/prototype/formatRangeToParts/chinese-calendar-dates.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month co… | `intl402/DateTimeFormat/prototype/formatRangeToParts/dangi-calendar-dates.js` |
@@ -95,12 +86,8 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: date = 2… | `intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month co… | `intl402/DateTimeFormat/prototype/formatToParts/dangi-calendar-dates.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-… | `intl402/DateTimeFormat/prototype/formatToParts/era.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: Locale: in… | `intl402/Locale/constructor-non-iana-canon.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Array.proto… | `intl402/constructors-string-and-single-element-array.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct e… | `language/eval-code/direct/global-env-rec-with.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalle… | `language/expressions/call/11.2.3-3_3.js` |
-| fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Static and dynam… | `language/import/import-defer/deferred-namespace-object/identity.js` |
-| fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [B, A-bef… | `language/import/import-defer/evaluation-top-level-await/async-cycle-dependency-of-deferred-module/main.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from-iterator-close.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from_proxy.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/species.js` |

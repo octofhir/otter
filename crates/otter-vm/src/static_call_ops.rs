@@ -484,7 +484,16 @@ impl Interpreter {
                 let props_handle = interp.scoped_value(scope, props_owned);
                 let props_now = interp.escape_scoped(props_handle);
                 let keys = own_enumerable_keys_for_define(interp, stack, context, &props_now)?;
-                for key in keys {
+                for (key, needs_enumerable_check) in keys {
+                    if needs_enumerable_check {
+                        let props_now = interp.escape_scoped(props_handle);
+                        let desc = interp.ordinary_get_own_property_descriptor_value(
+                            stack, context, props_now, &key, 0,
+                        )?;
+                        if !desc.is_some_and(|desc| desc.enumerable()) {
+                            continue;
+                        }
+                    }
                     let props_now = interp.escape_scoped(props_handle);
                     let outcome =
                         interp.ordinary_get_value(stack, context, props_now, props_now, &key, 0)?;
@@ -574,7 +583,19 @@ impl Interpreter {
             let props_handle = interp.scoped_value(scope, props_value);
             let props_now = interp.escape_scoped(props_handle);
             let keys = own_enumerable_keys_for_define(interp, stack, context, &props_now)?;
-            for key in keys {
+            for (key, needs_enumerable_check) in keys {
+                // §20.1.2.3.1 step 5 — the per-key [[GetOwnProperty]]
+                // enumerable filter runs right before this key's [[Get]]
+                // (observable proxy trap order).
+                if needs_enumerable_check {
+                    let props_now = interp.escape_scoped(props_handle);
+                    let desc = interp.ordinary_get_own_property_descriptor_value(
+                        stack, context, props_now, &key, 0,
+                    )?;
+                    if !desc.is_some_and(|desc| desc.enumerable()) {
+                        continue;
+                    }
+                }
                 // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
                 // and step 5 — `ToPropertyDescriptor(descObj)` reads the
                 // accessor / data fields off the resolved value. Thread
@@ -1626,12 +1647,17 @@ impl Interpreter {
 /// / `Object.create`. Includes accessor-shaped own keys so the
 /// caller can `Get` the descriptor value through the spec's
 /// accessor-aware path.
+/// Own keys of a `defineProperties` / `Object.create` source, paired
+/// with `needs_enumerable_check`: `true` when the caller must run the
+/// per-key observable [[GetOwnProperty]] enumerable filter itself
+/// (observable sources — proxies and other trap-bearing objects);
+/// `false` when the key list is already the enumerable set.
 fn own_enumerable_keys_for_define(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     props: &Value,
-) -> Result<Vec<VmPropertyKey<'static>>, VmError> {
+) -> Result<Vec<(VmPropertyKey<'static>, bool)>, VmError> {
     if props.is_nullish() {
         return Err(VmError::TypeMismatch);
     }
@@ -1644,12 +1670,11 @@ fn own_enumerable_keys_for_define(
         || props.is_regexp()
         || props.is_proxy()
     {
-        // The per-key descriptor probe can allocate (proxy traps,
-        // exotic own-property paths), moving the props source and the
-        // key values still queued in `keys`. Park them all in the
-        // handle arena and re-read from the rooted slots per use.
+        // §20.1.2.3.1 step 3 — [[OwnPropertyKeys]] only; the per-key
+        // [[GetOwnProperty]] enumerable check runs INTERLEAVED with the
+        // per-key [[Get]] in the caller's loop (observable trap order:
+        // ownKeys, then getOwnPropertyDescriptor + get per key).
         return interp.with_handle_scope(|interp, scope| {
-            let props_handle = interp.scoped_value(scope, *props);
             let keys = interp.own_property_keys_value(stack, context, props)?;
             let key_handles: Vec<_> = keys
                 .into_iter()
@@ -1659,17 +1684,7 @@ fn own_enumerable_keys_for_define(
             for key_handle in key_handles {
                 let key = interp.escape_scoped(key_handle);
                 let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())?;
-                let props_now = interp.escape_scoped(props_handle);
-                let key = interp.escape_scoped(key_handle);
-                let desc = interp.get_own_property_descriptor_for_value(
-                    stack,
-                    context,
-                    props_now,
-                    Some(&key),
-                )?;
-                if desc.is_some_and(|desc| desc.enumerable()) {
-                    out.push(vm_key);
-                }
+                out.push((vm_key, true));
             }
             Ok(out)
         });
@@ -1686,12 +1701,15 @@ fn own_enumerable_keys_for_define(
                 out.push(key);
             }
         }
-        return Ok(out.into_iter().map(VmPropertyKey::OwnedString).collect());
+        return Ok(out
+            .into_iter()
+            .map(|key| (VmPropertyKey::OwnedString(key), false))
+            .collect());
     }
     if let Some(s) = props.as_string(interp.gc_heap()) {
         let units = s.to_utf16_vec(interp.gc_heap());
         return Ok((0..units.len())
-            .map(|i| VmPropertyKey::OwnedString(i.to_string()))
+            .map(|i| (VmPropertyKey::OwnedString(i.to_string()), false))
             .collect());
     }
     Ok(Vec::new())

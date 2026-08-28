@@ -1,16 +1,16 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `022bc4aa4f66a98b2877f622d21c70075b8f0c14`
+- **Engine commit:** `29072709df37419123007eed0e4914ed93147b49`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-27T21:26:59.369214+00:00
+- **Captured:** 2026-08-27T23:04:06.162287+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53459 |
-| passed     | 52260 |
-| failed     | 99 |
+| passed     | 52262 |
+| failed     | 97 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
@@ -40,7 +40,6 @@
 | staging/sm/BigInt | 5 | 3 | 2 | 60.0% |
 | staging/sm/Proxy | 24 | 22 | 2 | 91.7% |
 | staging/sm/Reflect | 17 | 15 | 2 | 88.2% |
-| staging/sm/class | 94 | 92 | 2 | 97.9% |
 | staging/sm/object | 65 | 63 | 2 | 96.9% |
 | intl402/Array/prototype | 2 | 1 | 1 | 50.0% |
 | intl402/BigInt/prototype | 11 | 10 | 1 | 90.9% |
@@ -54,7 +53,7 @@
 | staging/sm/Math | 30 | 29 | 1 | 96.7% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
 | staging/sm/Symbol | 30 | 29 | 1 | 96.7% |
-| staging/sm/global | 16 | 15 | 1 | 93.8% |
+| staging/sm/class | 94 | 93 | 1 | 98.9% |
 | staging/sm/lexical-environment | 34 | 33 | 1 | 97.1% |
 | staging/sm/misc | 18 | 17 | 1 | 94.4% |
 | staging/sm/module | 5 | 4 | 1 | 80.0% |
@@ -72,6 +71,7 @@
 | annexB/language/comments | 8 | 8 | 0 | 100.0% |
 | annexB/language/eval-code | 469 | 469 | 0 | 100.0% |
 | annexB/language/function-code | 159 | 159 | 0 | 100.0% |
+| annexB/language/global-code | 153 | 153 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -129,7 +129,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/TypedArray/iterator-next-with-detached.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/TypedArray/set-wrapped.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/TypedArray/slice-bitwise-same.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: C is n… | `staging/sm/class/fields-static-class-name-binding-eval.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/class/strictExecution.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/eval/exhaustive-fun-normalcaller-direct-normalcode.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: argume… | `staging/sm/eval/redeclared-arguments-in-param-expression-eval.js` |
@@ -146,7 +145,6 @@
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should… | `staging/sm/fields/await-identifier-module-2.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/fields/init-order.js` |
 | fail | sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Cl… | `staging/sm/fields/numeric-fields.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/global/eval-02.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/misc/future-reserved-words.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should… | `staging/sm/module/await-restricted-nested.js` |

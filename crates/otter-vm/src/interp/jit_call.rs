@@ -772,7 +772,13 @@ impl Interpreter {
         }
         self.jit_runtime_stats.optimized_entries =
             self.jit_runtime_stats.optimized_entries.saturating_add(1);
-        let activation = VmRuntimeActivation::new(self, stack, context, top_idx);
+        // The activation context must be the chunk owning the entered frame:
+        // a synchronous re-entry (Array callback, comparator) passes the
+        // CALLER's ambient chunk, and runtime stubs decode published pcs and
+        // constant indices through the activation — a foreign chunk's tables
+        // resolve the same function id to a different function.
+        let resolved = context.for_function(fid)?;
+        let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
         if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
             self.note_jit_optimized_bail(fid, resume_pc);

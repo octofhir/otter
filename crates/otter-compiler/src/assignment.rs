@@ -56,6 +56,9 @@ pub(crate) fn compile_assignment(
         return compile_logical_assignment(cx, a, span);
     }
     if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
+        if is_invalid_assignment_target_member(member) {
+            return compile_invalid_assignment_target(cx, &member.object, span);
+        }
         // §13.3.5.3 MakeSuperPropertyReference + §6.2.4.5 PutValue
         // step 6.b — `super.X = V` writes through the receiver
         // (`this`), not the parent prototype, so the foundation
@@ -732,6 +735,14 @@ pub(crate) fn compile_logical_assignment(
             )
         }
         AssignmentTarget::StaticMemberExpression(m) => {
+            // §13.15.1 — logical assignment is outside the web-compat
+            // exemption (the parser retry refuses it; defense in depth).
+            if is_invalid_assignment_target_member(m) {
+                return Err(CompileError::Unsupported {
+                    node: "SyntaxError: Invalid left-hand side in assignment".to_string(),
+                    span,
+                });
+            }
             let obj_reg = compile_expr(cx, &m.object, span)?;
             let name_idx = cx.intern_string_constant(m.property.name.as_str());
             let load = cx.alloc_scratch();
@@ -975,6 +986,14 @@ pub(crate) fn assign_to_target(
             store_identifier_checked(cx, &name, value_reg, span)
         }
         AssignmentTarget::StaticMemberExpression(member) => {
+            // §13.15.1 — the web-compat call-target exemption never
+            // applies inside a destructuring pattern: early SyntaxError.
+            if is_invalid_assignment_target_member(member) {
+                return Err(CompileError::Unsupported {
+                    node: "SyntaxError: Invalid destructuring assignment target".to_string(),
+                    span,
+                });
+            }
             // `super.X` as a destructuring / for-head target writes
             // through the receiver per §13.3.5.3 + §6.2.5.5 step 6.b,
             // identical to the plain `super.X = V` lowering above.
@@ -1072,6 +1091,14 @@ fn prepare_assignment_target(
             PreparedAssignmentTarget::Identifier(id.name.as_str().to_string()),
         )),
         AssignmentTarget::StaticMemberExpression(member) => {
+            // §13.15.1 — a destructuring pattern position: the
+            // web-compat call-target exemption is an early SyntaxError.
+            if is_invalid_assignment_target_member(member) {
+                return Err(CompileError::Unsupported {
+                    node: "SyntaxError: Invalid destructuring assignment target".to_string(),
+                    span,
+                });
+            }
             if matches!(member.object, Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
                 cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
@@ -1712,6 +1739,55 @@ pub(crate) fn emit_reference_error(cx: &mut Compiler, name: &str, span: (u32, u3
     let result = cx.alloc_scratch();
     cx.emit(Op::LoadUndefined, [Operand::Register(result)], span);
     result
+}
+
+/// §13.15.1 web-compat — a sloppy CallExpression assignment target
+/// (rewritten by the parser retry to a member store on
+/// [`otter_syntax::INVALID_ASSIGNMENT_TARGET_PROPERTY`]): evaluate the
+/// call for its side effects, then throw ReferenceError before any RHS
+/// or old-value work. Strict code keeps the early SyntaxError.
+pub(crate) fn compile_invalid_assignment_target(
+    cx: &mut Compiler,
+    object: &Expression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    if cx.is_strict {
+        return Err(CompileError::Unsupported {
+            node: "SyntaxError: Invalid left-hand side in assignment".to_string(),
+            span,
+        });
+    }
+    let _ = compile_expr(cx, object, span)?;
+    let message_reg = cx.alloc_scratch();
+    let message = cx.intern_string_constant("Invalid left-hand side in assignment");
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = cx.alloc_scratch();
+    let kind = cx.intern_string_constant("ReferenceError");
+    cx.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    let result = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(result)], span);
+    Ok(result)
+}
+
+/// `true` when a static-member assignment target is the parser's
+/// rewritten web-compat call-target form.
+pub(crate) fn is_invalid_assignment_target_member(
+    member: &oxc_ast::ast::StaticMemberExpression<'_>,
+) -> bool {
+    member.property.name.as_str() == otter_syntax::INVALID_ASSIGNMENT_TARGET_PROPERTY
 }
 
 /// Map a compound `AssignmentOperator` to the bytecode binop used

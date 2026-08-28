@@ -2054,8 +2054,12 @@ impl Interpreter {
                 );
             }
             // ECMA-402 §18.5.1 — the locales and options arguments are
-            // forwarded to each element's toLocaleString.
-            let forwarded: SmallVec<[Value; 8]> = args.iter().take(2).copied().collect();
+            // forwarded to each element's toLocaleString, always as two
+            // arguments (absent ones read as undefined).
+            let forwarded: SmallVec<[Value; 8]> = smallvec::smallvec![
+                args.first().copied().unwrap_or(Value::undefined()),
+                args.get(1).copied().unwrap_or(Value::undefined()),
+            ];
             let result =
                 self.run_callable_sync_rooted(stack, context, &method, element, forwarded)?;
             let s = self.coerce_to_string(stack, context, &result)?;

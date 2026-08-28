@@ -621,7 +621,10 @@ pub(crate) fn format_exact(
     };
     let sign = sign_prefix(sign_kind);
     Some(match payload.style.as_str() {
-        "percent" => format!("{sign}{core}%"),
+        "percent" => {
+            let (prefix, suffix) = percent_affixes(payload);
+            format!("{sign}{prefix}{core}{suffix}")
+        }
         "currency" => {
             let body_probe = currency_string(1.0, payload);
             let probe_core = format_decimal(1.0, payload);
@@ -1206,9 +1209,68 @@ fn partition_number_inner(n: f64, payload: &NumberFormatPayload) -> Vec<(&'stati
         );
     }
     if payload.style == "percent" {
-        parts.push(("percentSign", "%".to_string()));
+        let (prefix, suffix) = percent_affixes(payload);
+        if !prefix.is_empty() {
+            let mut idx = usize::from(!parts.is_empty() && parts[0].0 == "minusSign");
+            if let Some(rest) = prefix.strip_prefix('%') {
+                parts.insert(idx, ("percentSign", "%".to_string()));
+                idx += 1;
+                if !rest.is_empty() {
+                    parts.insert(idx, ("literal", rest.to_string()));
+                }
+            } else {
+                parts.insert(idx, ("literal", prefix));
+            }
+        }
+        match suffix.strip_prefix('%') {
+            Some(rest) => {
+                parts.push(("percentSign", "%".to_string()));
+                if !rest.is_empty() {
+                    parts.push(("literal", rest.to_string()));
+                }
+            }
+            None if suffix.is_empty() => {}
+            None => {
+                if let Some(stripped) = suffix.strip_suffix('%') {
+                    if !stripped.is_empty() {
+                        parts.push(("literal", stripped.to_string()));
+                    }
+                    parts.push(("percentSign", "%".to_string()));
+                } else {
+                    parts.push(("literal", suffix));
+                }
+            }
+        }
     }
     parts
+}
+
+/// CLDR percent affixes for `locale`: the literal text before and after
+/// the number in the locale's percent pattern (de-DE separates the sign
+/// with U+00A0: `"1 %"`; en-US abuts it: `"1%"`). Probes ICU4X's
+/// [`icu_experimental::dimension::percent::formatter::PercentFormatter`]
+/// with the value 1 and splits around the formatted digit; a probe
+/// failure falls back to the abutting en shape.
+fn percent_affixes(payload: &NumberFormatPayload) -> (String, String) {
+    let fallback = (String::new(), "%".to_string());
+    let Ok(locale) =
+        Locale::from_str(&icu_locale_string(payload)).or_else(|_| Locale::from_str(DEFAULT_LOCALE))
+    else {
+        return fallback;
+    };
+    let Ok(formatter) = icu_experimental::dimension::percent::formatter::PercentFormatter::try_new(
+        (&locale).into(),
+        Default::default(),
+    ) else {
+        return fallback;
+    };
+    let probe = Decimal::from(1u32);
+    let body = writeable::Writeable::write_to_string(&formatter.format(&probe)).into_owned();
+    let digit_len = "1".len();
+    match body.find('1') {
+        Some(idx) => (body[..idx].to_string(), body[idx + digit_len..].to_string()),
+        None => fallback,
+    }
 }
 
 /// Split a formatted unsigned decimal core (`"1,234.50"`) into
@@ -1533,7 +1595,8 @@ fn format_number_inner(n: f64, payload: &NumberFormatPayload) -> String {
         };
         let core = render_scientific(base, payload, payload.notation == "engineering");
         if payload.style == "percent" {
-            format!("{core}%")
+            let (prefix, suffix) = percent_affixes(payload);
+            format!("{prefix}{core}{suffix}")
         } else {
             core
         }
@@ -1557,8 +1620,9 @@ fn format_number_inner(n: f64, payload: &NumberFormatPayload) -> String {
                 full
             }
             "percent" => {
+                let (prefix, suffix) = percent_affixes(payload);
                 format!(
-                    "{}%",
+                    "{prefix}{}{suffix}",
                     format_decimal_signed(n.abs() * 100.0, is_neg, payload)
                 )
             }

@@ -610,6 +610,11 @@ pub(crate) fn compile_update(
             }
         }
         SimpleAssignmentTarget::StaticMemberExpression(member) => {
+            if crate::assignment::is_invalid_assignment_target_member(member) {
+                let reg =
+                    crate::assignment::compile_invalid_assignment_target(cx, &member.object, span)?;
+                return Ok(reg);
+            }
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name = member.property.name.as_str();
             cx.emit_load_property(old, obj_reg, name, span);

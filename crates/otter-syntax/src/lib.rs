@@ -14,10 +14,14 @@
 //!   parser diagnostics.
 //!
 //! # Invariants
-//! - We never re-emit JS source and re-parse. The OXC AST is
-//!   walked in place by `otter-compiler`.
+//! - We never re-emit JS source and re-parse, with one exception: a
+//!   sloppy Script-goal CallExpression assignment target (web-compat
+//!   §13.15.1 host exemption) is a fatal OXC parse error, so the
+//!   source is retried once per site with the target rewritten to a
+//!   member store on [`INVALID_ASSIGNMENT_TARGET_PROPERTY`], which
+//!   `otter-compiler` lowers to the runtime ReferenceError.
 //! - All `Span` values returned through this crate point into the
-//!   original source string supplied by the caller.
+//!   source string the callback's `Program` was parsed from.
 //!
 //! # See also
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
@@ -229,18 +233,143 @@ fn with_program_goal_after_parse<R, T>(
     after_parse: impl FnOnce() -> T,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<(R, T), SyntaxError> {
-    let allocator = Allocator::default();
-    let parser =
-        Parser::new(&allocator, source, kind.to_oxc_with_goal(goal)).with_options(ParseOptions {
-            parse_regular_expression: true,
-            ..Default::default()
-        });
-    let ret = parser.parse();
-    let parse_metadata = after_parse();
-    if !ret.diagnostics.is_empty() {
+    let mut patched: Option<String> = None;
+    let mut attempts = 0usize;
+    loop {
+        let src = patched.as_deref().unwrap_or(source);
+        let allocator = Allocator::default();
+        let parser =
+            Parser::new(&allocator, src, kind.to_oxc_with_goal(goal)).with_options(ParseOptions {
+                parse_regular_expression: true,
+                ..Default::default()
+            });
+        let ret = parser.parse();
+        if ret.diagnostics.is_empty() {
+            let parse_metadata = after_parse();
+            return Ok((f(&ret.program), parse_metadata));
+        }
+        // §13.15.1 web-compat host exemption — a sloppy Script-goal
+        // CallExpression assignment target is a RUNTIME ReferenceError,
+        // but OXC reports it as a fatal parse error with no AST. Retry
+        // with the call target rewritten to a member store on the
+        // synthetic property; the compiler lowers that member to
+        // "evaluate the call, then throw ReferenceError" (and back to
+        // the early SyntaxError in strict code). One site per retry —
+        // the parser stops at the first fatal error.
+        if goal == SourceGoal::Script
+            && attempts < MAX_CALL_TARGET_PATCHES
+            && let Some(next) = patch_call_assignment_target(src, kind, &ret.diagnostics)
+        {
+            patched = Some(next);
+            attempts += 1;
+            continue;
+        }
+        let _ = after_parse();
         return Err(SyntaxError::from_oxc(&ret.diagnostics));
     }
-    Ok((f(&ret.program), parse_metadata))
+}
+
+/// Synthetic member name the web-compat retry writes over a sloppy
+/// CallExpression assignment target. `otter-compiler` recognizes it in
+/// every assignment-target position and lowers "evaluate the call, then
+/// throw ReferenceError" (strict code keeps the early SyntaxError).
+pub const INVALID_ASSIGNMENT_TARGET_PROPERTY: &str = "__otter_invalid_assignment_target__";
+
+/// Retry bound for [`patch_call_assignment_target`] — each fatal parse
+/// reveals at most one further call-target site.
+const MAX_CALL_TARGET_PATCHES: usize = 32;
+
+/// When the first fatal diagnostic is OXC's invalid-assignment error and
+/// its span is a plain CallExpression (§13.15.1 web-compat shape — not an
+/// optional chain, not a primary expression), return the source with that
+/// span rewritten to `(<call>).__otter_invalid_assignment_target__`.
+fn patch_call_assignment_target(
+    source: &str,
+    kind: SourceKind,
+    diagnostics: &[oxc_diagnostics::OxcDiagnostic],
+) -> Option<String> {
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.to_string() == "Cannot assign to this expression")?;
+    let label = diagnostic.labels.as_slice().first()?;
+    let start = label.offset() as usize;
+    let end = start.checked_add(label.len() as usize)?;
+    let target = source.get(start..end)?;
+    if !snippet_is_plain_call(target, kind) {
+        return None;
+    }
+    // §13.15.1 — the web-compat exemption covers plain and compound
+    // assignment, updates, and for-in/of heads, but NOT logical
+    // assignment: `f() &&= v` stays an early SyntaxError.
+    if next_operator_is_logical_assignment(&source[end..]) {
+        return None;
+    }
+    let mut next = String::with_capacity(source.len() + target.len() + 48);
+    next.push_str(&source[..start]);
+    next.push('(');
+    next.push_str(target);
+    next.push_str(").");
+    next.push_str(INVALID_ASSIGNMENT_TARGET_PROPERTY);
+    next.push_str(&source[end..]);
+    Some(next)
+}
+
+/// `true` when the source following an assignment target begins —
+/// after whitespace and comments — with a logical-assignment operator
+/// (`&&=`, `||=`, `??=`), which the §13.15.1 web-compat exemption does
+/// not cover. A token-level peek, not a parse: only trivia is skipped.
+fn next_operator_is_logical_assignment(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C => i += 1,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => match rest[i + 2..].find("*/") {
+                Some(close) => i += 2 + close + 2,
+                None => return false,
+            },
+            // The diagnostic span excludes wrapping parentheses:
+            // `(f()) &&= 1` reports only `f()`. Closing parens are
+            // part of the same target, so step over them.
+            b')' => i += 1,
+            _ => break,
+        }
+    }
+    let tail = &rest[i.min(rest.len())..];
+    tail.starts_with("&&=") || tail.starts_with("||=") || tail.starts_with("??=")
+}
+
+/// `true` when `snippet` parses on its own as exactly one expression
+/// statement whose expression — modulo parentheses — is a plain (non-
+/// optional-chain) CallExpression.
+fn snippet_is_plain_call(snippet: &str, kind: SourceKind) -> bool {
+    let allocator = Allocator::default();
+    let parser = Parser::new(
+        &allocator,
+        snippet,
+        kind.to_oxc_with_goal(SourceGoal::Script),
+    )
+    .with_options(ParseOptions {
+        parse_regular_expression: true,
+        ..Default::default()
+    });
+    let ret = parser.parse();
+    if !ret.diagnostics.is_empty() || ret.program.body.len() != 1 {
+        return false;
+    }
+    let oxc_ast::ast::Statement::ExpressionStatement(stmt) = &ret.program.body[0] else {
+        return false;
+    };
+    let mut expr = &stmt.expression;
+    while let oxc_ast::ast::Expression::ParenthesizedExpression(paren) = expr {
+        expr = &paren.expression;
+    }
+    matches!(expr, oxc_ast::ast::Expression::CallExpression(call) if !call.optional)
 }
 
 #[cfg(test)]

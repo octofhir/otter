@@ -398,9 +398,18 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.86% at
-`bfc317b9`, 73 fails, 0 crashes/timeouts (thirteen fixes vs the 86-fail
-set, zero regressions). That slice lands the §13.15.1 web-compat
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.89% at
+`4cc29e4b`, 58 fails, 0 crashes/timeouts (fifteen fixes vs the 73-fail
+set, zero regressions). The class/private/delete slice: numeric and
+BigInt field keys with NamedEvaluation for private initializers,
+base-class field initialisers running before parameter binding, Private
+Name carriers invisible to the ordinary MOP (own-keys surfaces, seal /
+freeze cores) while staying writable on sealed objects, [[Delete]]
+refusing an ordinary function's implicit prototype and boxing primitive
+receivers with ToPropertyKey coercion of computed keys, strict-throwing
+String-exotic stores, symbol-keyed super assignment, and RegExp reading
+[[OriginalSource]]/[[OriginalFlags]] internal slots plus extra-realm
+literal prototype stamping and ordinary-funnel computed gets. That slice lands the §13.15.1 web-compat
 CallExpression assignment-target semantics end to end (parser retry with
 a synthetic member rewrite, runtime ReferenceError after the call
 evaluates, logical assignment / destructuring / strict kept as early

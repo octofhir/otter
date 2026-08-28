@@ -1,54 +1,53 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `bfc317b9b12a9d46ff4b39b0cfdb9f7304e9ac63`
+- **Engine commit:** `4cc29e4b169965a2685d5e735fdb1fb0e0f54442`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-28T17:43:22.995823+00:00
+- **Captured:** 2026-08-28T18:58:26.332906+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52402 |
-| failed     | 73 |
+| passed     | 52417 |
+| failed     | 58 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.86%
+**Pass rate (excl. skipped):** 99.89%
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
-| staging/sm/RegExp | 91 | 85 | 6 | 93.4% |
 | staging/sm/TypedArray | 96 | 91 | 5 | 94.8% |
-| staging/sm/expressions | 42 | 37 | 5 | 88.1% |
 | staging/sm/regress | 106 | 101 | 5 | 95.3% |
 | staging/sm/Array | 90 | 86 | 4 | 95.6% |
-| staging/sm/PrivateName | 17 | 13 | 4 | 76.5% |
-| staging/sm/extensions | 64 | 60 | 4 | 93.8% |
-| staging/sm/strict | 51 | 47 | 4 | 92.2% |
+| staging/sm/RegExp | 91 | 87 | 4 | 95.6% |
+| staging/sm/expressions | 42 | 38 | 4 | 90.5% |
 | staging/sm/Function | 53 | 50 | 3 | 94.3% |
-| staging/sm/fields | 8 | 5 | 3 | 62.5% |
-| staging/sm/BigInt | 5 | 3 | 2 | 60.0% |
 | staging/sm/Proxy | 24 | 22 | 2 | 91.7% |
 | staging/sm/Reflect | 17 | 15 | 2 | 88.2% |
+| staging/sm/extensions | 64 | 62 | 2 | 96.9% |
 | staging/sm/object | 65 | 63 | 2 | 96.9% |
 | language/eval-code/direct | 286 | 285 | 1 | 99.7% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
+| staging/sm/BigInt | 5 | 4 | 1 | 80.0% |
 | staging/sm/Date | 28 | 27 | 1 | 96.4% |
 | staging/sm/Error | 3 | 2 | 1 | 66.7% |
 | staging/sm/Math | 30 | 29 | 1 | 96.7% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
 | staging/sm/Symbol | 30 | 29 | 1 | 96.7% |
+| staging/sm/fields | 8 | 7 | 1 | 87.5% |
 | staging/sm/lexical-environment | 34 | 33 | 1 | 97.1% |
 | staging/sm/misc | 18 | 17 | 1 | 94.4% |
 | staging/sm/module | 5 | 4 | 1 | 80.0% |
 | staging/sm/statements | 17 | 16 | 1 | 94.1% |
+| staging/sm/strict | 51 | 50 | 1 | 98.0% |
 | staging/sm/syntax | 11 | 10 | 1 | 90.9% |
 | annexB/built-ins/Array | 1 | 1 | 0 | 100.0% |
 | annexB/built-ins/Date | 24 | 24 | 0 | 100.0% |
@@ -72,6 +71,7 @@
 | built-ins/AbstractModuleSource/prototype | 3 | 0 | 0 | 0.0% |
 | built-ins/AbstractModuleSource/prototype.js | 1 | 0 | 0 | 0.0% |
 | built-ins/AbstractModuleSource/throw-from-constructor.js | 1 | 0 | 0 | 0.0% |
+| built-ins/AggregateError/cause-property.js | 1 | 1 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -94,24 +94,17 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertio… | `staging/sm/Array/to-length.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/ArrayBuffer/slice-species.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/BigInt/Number-conversion-rounding.js` |
-| fail | sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Cl… | `staging/sm/BigInt/property-name.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Date/non-iso.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Error/AggregateError.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/arguments-parameter-shadowing.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Incorrec… | `staging/sm/Function/function-toString-builtin-name.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/invalid-parameter-list.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Error: got -6.99823708… | `staging/sm/Math/atanh-approx.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/PrivateName/constructor-args.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Private met… | `staging/sm/PrivateName/modify-non-extensible.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/PrivateName/names.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/PrivateName/not-iterable.js` |
 | fail | strict: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: barewo… | `staging/sm/Proxy/global-receiver.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Proxy/regress-bug950407.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Reflect/construct.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Pr… | `staging/sm/Reflect/set.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/constructor-constructor.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/constructor-ordering.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/constructor-regexp.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/ignoreCase-multiple.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/ignoreCase-non-latin1-to-latin1.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/lastIndex-match-or-replace.js` |
@@ -123,17 +116,12 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/TypedArray/set-wrapped.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/TypedArray/slice-bitwise-same.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: numeric … | `staging/sm/expressions/11.1.5-01.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismat… | `staging/sm/expressions/ToPropertyKey-symbols.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: computed… | `staging/sm/expressions/object-literal-__proto__.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/expressions/short-circuit-compound-assignment-anon-fns.js` |
 | fail | sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Su… | `staging/sm/expressions/short-circuit-compound-assignment.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/arguments-property-access-in-function.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/dataview.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: get __proto… | `staging/sm/extensions/destructuring-for-inof-__proto__.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error.proto… | `staging/sm/extensions/error-tostring-function.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should… | `staging/sm/fields/await-identifier-module-2.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/fields/init-order.js` |
-| fail | sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Cl… | `staging/sm/fields/numeric-fields.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/misc/future-reserved-words.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should… | `staging/sm/module/await-restricted-nested.js` |
@@ -145,9 +133,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/regress/regress-634210-4.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/regress/regress-665355.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/statements/regress-642975.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/strict/15.3.5.2.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/strict/15.5.5.1.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/strict/8.12.7-2.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: wrong er… | `staging/sm/strict/directive-prologue-01.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/syntax/let-as-label.js` |
 

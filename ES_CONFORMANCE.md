@@ -1,22 +1,22 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `4cc29e4b169965a2685d5e735fdb1fb0e0f54442`
+- **Engine commit:** `470eab23b52efc7e3e2e10802284d78cf47f885e`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-28T18:58:26.332906+00:00
+- **Captured:** 2026-08-28T19:59:46.084587+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52417 |
-| failed     | 58 |
+| passed     | 52420 |
+| failed     | 55 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.89%
+**Pass rate (excl. skipped):** 99.90%
 
 ## Top failing sections (top 50)
 
@@ -25,10 +25,10 @@
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
 | staging/sm/TypedArray | 96 | 91 | 5 | 94.8% |
 | staging/sm/regress | 106 | 101 | 5 | 95.3% |
-| staging/sm/Array | 90 | 86 | 4 | 95.6% |
 | staging/sm/RegExp | 91 | 87 | 4 | 95.6% |
 | staging/sm/expressions | 42 | 38 | 4 | 90.5% |
-| staging/sm/Function | 53 | 50 | 3 | 94.3% |
+| staging/sm/Array | 90 | 87 | 3 | 96.7% |
+| staging/sm/Function | 53 | 51 | 2 | 96.2% |
 | staging/sm/Proxy | 24 | 22 | 2 | 91.7% |
 | staging/sm/Reflect | 17 | 15 | 2 | 88.2% |
 | staging/sm/extensions | 64 | 62 | 2 | 96.9% |
@@ -38,7 +38,6 @@
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
 | staging/sm/BigInt | 5 | 4 | 1 | 80.0% |
 | staging/sm/Date | 28 | 27 | 1 | 96.4% |
-| staging/sm/Error | 3 | 2 | 1 | 66.7% |
 | staging/sm/Math | 30 | 29 | 1 | 96.7% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
 | staging/sm/Symbol | 30 | 29 | 1 | 96.7% |
@@ -72,6 +71,7 @@
 | built-ins/AbstractModuleSource/prototype.js | 1 | 0 | 0 | 0.0% |
 | built-ins/AbstractModuleSource/throw-from-constructor.js | 1 | 0 | 0 | 0.0% |
 | built-ins/AggregateError/cause-property.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/errors-iterabletolist-failures.js | 1 | 1 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -90,13 +90,10 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalle… | `language/expressions/call/11.2.3-3_3.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from-iterator-close.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/from_proxy.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Array/species.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertio… | `staging/sm/Array/to-length.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/ArrayBuffer/slice-species.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/BigInt/Number-conversion-rounding.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Date/non-iso.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Error/AggregateError.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/arguments-parameter-shadowing.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Incorrec… | `staging/sm/Function/function-toString-builtin-name.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Function/invalid-parameter-list.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Error: got -6.99823708… | `staging/sm/Math/atanh-approx.js` |

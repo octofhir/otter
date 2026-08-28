@@ -398,9 +398,14 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.89% at
-`4cc29e4b`, 58 fails, 0 crashes/timeouts (fifteen fixes vs the 73-fail
-set, zero regressions). The class/private/delete slice: numeric and
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.90% at
+`470eab23`, 55 fails, 0 crashes/timeouts (three fixes vs the 58-fail
+set, zero regressions): the parameter-expression body variable
+environment (§10.2.11 step 28 shadow bindings initialized from the
+parameter cells), error-class registry constructor stamping plus
+VmIntrinsic realm switching on the spread/invoke routes, the
+array-receiver prototype-override fallback, and the §7.3.22
+cross-realm %Array% species default. The class/private/delete slice: numeric and
 BigInt field keys with NamedEvaluation for private initializers,
 base-class field initialisers running before parameter binding, Private
 Name carriers invisible to the ordinary MOP (own-keys surfaces, seal /

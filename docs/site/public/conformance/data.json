@@ -1,11 +1,11 @@
 {
  "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
- "engine_commit": "4cc29e4b169965a2685d5e735fdb1fb0e0f54442",
- "ran_at": "2026-08-28T18:58:26.332906+00:00",
+ "engine_commit": "470eab23b52efc7e3e2e10802284d78cf47f885e",
+ "ran_at": "2026-08-28T19:59:46.084587+00:00",
  "totals": {
   "total": 53575,
-  "passed": 52417,
-  "failed": 58,
+  "passed": 52420,
+  "failed": 55,
   "skipped": 1100,
   "crashed": 0,
   "timed_out": 0,
@@ -40910,8 +40910,8 @@
   },
   "staging/sm/Array": {
    "total": 90,
-   "passed": 86,
-   "failed": 4,
+   "passed": 87,
+   "failed": 3,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -40982,8 +40982,8 @@
   },
   "staging/sm/Error": {
    "total": 3,
-   "passed": 2,
-   "failed": 1,
+   "passed": 3,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41000,8 +41000,8 @@
   },
   "staging/sm/Function": {
    "total": 53,
-   "passed": 50,
-   "failed": 3,
+   "passed": 51,
+   "failed": 2,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41428,12 +41428,6 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected [\"get\", Symbol(Symbol.iterator) as #2, \"get\", ref #2] to be structurally equal to [\"get\", Symbol(Symbol.iterator), \"get\", \"length\", \"get\", \"0\", \"get\", \"length\", \"get\", \"1\", \"get\", \"length\", \"get\", \"2\", \"get\", \"length\"]. "
   },
   {
-   "path": "staging/sm/Array/species.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abfunction Array() { [native code] }\u00bb, \u00abfunction Array() { [native code] }\u00bb) to be true"
-  },
-  {
    "path": "staging/sm/Array/to-length.js",
    "esid": "pending",
    "outcome": "fail",
@@ -41456,18 +41450,6 @@
    "esid": "pending",
    "outcome": "fail",
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abNaN\u00bb, \u00ab857845150000\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/Error/AggregateError.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abfalse\u00bb, \u00abtrue\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/Function/arguments-parameter-shadowing.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abtrue\u00bb, \u00abfalse\u00bb) to be true"
   },
   {
    "path": "staging/sm/Function/function-toString-builtin-name.js",

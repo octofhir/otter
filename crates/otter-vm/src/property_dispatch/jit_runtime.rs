@@ -457,7 +457,30 @@ impl Interpreter {
                             .string_name()
                             .expect("non-symbol key has string spelling")
                             .to_string();
-                        interp.set_property(obj, &name, value)?;
+                        // A duplicate key over an earlier accessor member is a
+                        // full REDEFINITION (§13.2.5.5 CreateDataPropertyOrThrow):
+                        // the slot's kind flips to data and the hidden class is
+                        // rebuilt. The lenient shape store would write the value
+                        // into the accessor cell and leave the class claiming an
+                        // accessor — poisoning the shared transition/lookup
+                        // caches for every same-shaped literal.
+                        let existing_accessor = matches!(
+                            object::lookup_own(obj, &interp.gc_heap, &name),
+                            object::PropertyLookup::Accessor { .. }
+                        );
+                        if existing_accessor {
+                            let descriptor = object::PartialPropertyDescriptor {
+                                value: Some(value),
+                                writable: Some(true),
+                                enumerable: Some(true),
+                                configurable: Some(true),
+                                ..Default::default()
+                            };
+                            let mut obj_ref = obj;
+                            interp.define_own_property_partial(&mut obj_ref, &name, descriptor)?;
+                        } else {
+                            interp.set_property(obj, &name, value)?;
+                        }
                     }
                 }
             } else {

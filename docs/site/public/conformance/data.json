@@ -1,11 +1,11 @@
 {
  "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
- "engine_commit": "bfc317b9b12a9d46ff4b39b0cfdb9f7304e9ac63",
- "ran_at": "2026-08-28T17:43:22.995823+00:00",
+ "engine_commit": "4cc29e4b169965a2685d5e735fdb1fb0e0f54442",
+ "ran_at": "2026-08-28T18:58:26.332906+00:00",
  "totals": {
   "total": 53575,
-  "passed": 52402,
-  "failed": 73,
+  "passed": 52417,
+  "failed": 58,
   "skipped": 1100,
   "crashed": 0,
   "timed_out": 0,
@@ -40946,8 +40946,8 @@
   },
   "staging/sm/BigInt": {
    "total": 5,
-   "passed": 3,
-   "failed": 2,
+   "passed": 4,
+   "failed": 1,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41054,8 +41054,8 @@
   },
   "staging/sm/PrivateName": {
    "total": 17,
-   "passed": 13,
-   "failed": 4,
+   "passed": 17,
+   "failed": 0,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41090,8 +41090,8 @@
   },
   "staging/sm/RegExp": {
    "total": 91,
-   "passed": 85,
-   "failed": 6,
+   "passed": 87,
+   "failed": 4,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41189,8 +41189,8 @@
   },
   "staging/sm/expressions": {
    "total": 42,
-   "passed": 37,
-   "failed": 5,
+   "passed": 38,
+   "failed": 4,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41198,8 +41198,8 @@
   },
   "staging/sm/extensions": {
    "total": 64,
-   "passed": 60,
-   "failed": 4,
+   "passed": 62,
+   "failed": 2,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41207,8 +41207,8 @@
   },
   "staging/sm/fields": {
    "total": 8,
-   "passed": 5,
-   "failed": 3,
+   "passed": 7,
+   "failed": 1,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41297,8 +41297,8 @@
   },
   "staging/sm/strict": {
    "total": 51,
-   "passed": 47,
-   "failed": 4,
+   "passed": 50,
+   "failed": 1,
    "skipped": 0,
    "crashed": 0,
    "timed_out": 0,
@@ -41452,12 +41452,6 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab170141183460469231731687303715884105727n\u00bb, \u00ab179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368n\u00bb) to be true"
   },
   {
-   "path": "staging/sm/BigInt/property-name.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: non-string instance field key]"
-  },
-  {
    "path": "staging/sm/Date/non-iso.js",
    "esid": "pending",
    "outcome": "fail",
@@ -41494,30 +41488,6 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Error: got -6.998237084679375, expected a number near -6.998237084679027 (relative error: 392)\n    at fail (test262-harness.js:301:19)\n    at assertNear (test262-harness.js:373:17)\n    at staging/sm/Math/atanh-approx.js:273:5"
   },
   {
-   "path": "staging/sm/PrivateName/constructor-args.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read private member from an object whose class did not declare it\n    at A (staging/sm/PrivateName/constructor-args.js:4:21)\n    at staging/sm/PrivateName/constructor-args.js:9:9"
-  },
-  {
-   "path": "staging/sm/PrivateName/modify-non-extensible.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Private method is not writable\n    at inca (staging/sm/PrivateName/modify-non-extensible.js:21:5)\n    at staging/sm/PrivateName/modify-non-extensible.js:39:1"
-  },
-  {
-   "path": "staging/sm/PrivateName/names.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab\"\"\u00bb, \u00ab\"#instance\"\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/PrivateName/not-iterable.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab1\u00bb, \u00ab0\u00bb) to be true"
-  },
-  {
    "path": "staging/sm/Proxy/global-receiver.js",
    "esid": "pending",
    "outcome": "fail",
@@ -41542,22 +41512,10 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Proxy defineProperty trap added a non-configurable property absent on the target"
   },
   {
-   "path": "staging/sm/RegExp/constructor-constructor.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abtrue\u00bb, \u00abfalse\u00bb) to be true"
-  },
-  {
    "path": "staging/sm/RegExp/constructor-ordering.js",
    "esid": "pending",
    "outcome": "fail",
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab\"b\"\u00bb, \u00ab\"a\"\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/RegExp/constructor-regexp.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab\"bar\"\u00bb, \u00ab\"foo\"\u00bb) to be true"
   },
   {
    "path": "staging/sm/RegExp/ignoreCase-multiple.js",
@@ -41626,12 +41584,6 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: numeric index stringified correctly Expected SameValue(\u00abfalse\u00bb, \u00abtrue\u00bb) to be true"
   },
   {
-   "path": "staging/sm/expressions/ToPropertyKey-symbols.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: type mismatch: this operation does not accept a value of this type\n    at staging/sm/expressions/ToPropertyKey-symbols.js:63:13\n    at staging/sm/expressions/ToPropertyKey-symbols.js:67:14"
-  },
-  {
    "path": "staging/sm/expressions/object-literal-__proto__.js",
    "esid": "pending",
    "outcome": "fail",
@@ -41662,34 +41614,10 @@
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a different error constructor with the same name"
   },
   {
-   "path": "staging/sm/extensions/destructuring-for-inof-__proto__.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: get __proto__: type mismatch: this operation does not accept a value of this type"
-  },
-  {
-   "path": "staging/sm/extensions/error-tostring-function.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Error.prototype.toString: receiver must be an Object"
-  },
-  {
    "path": "staging/sm/fields/await-identifier-module-2.js",
    "esid": "pending",
    "outcome": "fail",
    "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-  },
-  {
-   "path": "staging/sm/fields/init-order.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab20\u00bb, \u00ab10\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/fields/numeric-fields.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: non-string instance field key]"
   },
   {
    "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",
@@ -41756,24 +41684,6 @@
    "esid": "pending",
    "outcome": "fail",
    "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00ab\"\"\u00bb, \u00ab\"y\"\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/strict/15.3.5.2.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abfalse\u00bb, \u00abtrue\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/strict/15.5.5.1.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abfalse\u00bb, \u00abtrue\u00bb) to be true"
-  },
-  {
-   "path": "staging/sm/strict/8.12.7-2.js",
-   "esid": "pending",
-   "outcome": "fail",
-   "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(\u00abfalse\u00bb, \u00abtrue\u00bb) to be true"
   },
   {
    "path": "staging/sm/strict/directive-prologue-01.js",

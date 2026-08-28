@@ -399,8 +399,12 @@ a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
 Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.81% at
-`f81fcffc`, 99 fails, 0 crashes/timeouts (twelve fixes vs the 111-fail
-set, zero regressions). The realm-faithful cross-realm wave closed the
+`d75e1097`, 97 fails, 0 crashes/timeouts (fourteen fixes vs the 111-fail
+set, zero regressions). The eval slice on top of the realm wave promotes
+every own name to a cell when a direct eval appears in the body or any
+nested function, and lowers a shadowed bare `eval(...)` through the
+runtime IsEvalIntrinsic guard so a parameter or var holding %eval% is a
+direct eval per §13.3.6.1. The realm-faithful cross-realm wave closed the
 whole realm cluster — nested parked-realm switching with identity
 travelling in the swap, full native stamping at createRealm, foreign
 bytecode frames resolving globals and sloppy this in their own realm,

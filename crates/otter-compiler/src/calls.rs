@@ -522,10 +522,14 @@ pub(crate) fn compile_method_call(
     // <https://tc39.es/ecma262/#sec-eval-x>
     if let Expression::Identifier(id) = callee
         && id.name.as_str() == "eval"
-        && cx.binding_position("eval").is_none()
-        && find_module_import_binding(cx, "eval").is_none()
     {
-        if has_spread {
+        // §13.3.6.1 — a bare `eval(...)` call is a direct eval whenever the
+        // resolved value is %eval%, even through a local binding or `with`
+        // object; the guarded lowering decides at runtime. The spread form
+        // keeps the static unshadowed requirement.
+        let statically_unshadowed = cx.binding_position("eval").is_none()
+            && find_module_import_binding(cx, "eval").is_none();
+        if has_spread && statically_unshadowed {
             // Spread form: drain every argument into an array per
             // ArgumentListEvaluation, then take element 0 as the eval
             // text. The rare spread `eval(...)` keeps the unconditional
@@ -584,7 +588,9 @@ pub(crate) fn compile_method_call(
             );
             return Ok(dst);
         }
-        return emit_guarded_eval(cx, call, callee, span, false);
+        if !has_spread {
+            return emit_guarded_eval(cx, call, callee, span, false);
+        }
     }
     // §19.2 global function bare-identifier calls like
     // `parseInt(...)` / `isNaN(x)` / `encodeURIComponent(s)` flow

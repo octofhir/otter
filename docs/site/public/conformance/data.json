@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "022bc4aa4f66a98b2877f622d21c70075b8f0c14",
-  "ran_at": "2026-08-27T21:26:59.369214+00:00",
+  "engine_commit": "29072709df37419123007eed0e4914ed93147b49",
+  "ran_at": "2026-08-27T23:04:06.162287+00:00",
   "totals": {
     "total": 53459,
-    "passed": 52260,
-    "failed": 99,
+    "passed": 52262,
+    "failed": 97,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -40118,8 +40118,8 @@
     },
     "staging/sm/class": {
       "total": 94,
-      "passed": 92,
-      "failed": 2,
+      "passed": 93,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40181,8 +40181,8 @@
     },
     "staging/sm/global": {
       "total": 16,
-      "passed": 15,
-      "failed": 1,
+      "passed": 16,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40618,12 +40618,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2143289344», «2139095041») to be true"
     },
     {
-      "path": "staging/sm/class/fields-static-class-name-binding-eval.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: C is not defined\n    at <eval>\n    at field (staging/sm/class/fields-static-class-name-binding-eval.js:30:26)\n    at staging/sm/class/fields-static-class-name-binding-eval.js:32:20"
-    },
-    {
       "path": "staging/sm/class/strictExecution.js",
       "esid": "pending",
       "outcome": "fail",
@@ -40718,12 +40712,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: ClassDeclaration: non-string instance field key]"
-    },
-    {
-      "path": "staging/sm/global/eval-02.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«10», «2») to be true"
     },
     {
       "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",

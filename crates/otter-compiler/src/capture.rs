@@ -47,6 +47,11 @@ pub fn analyze_function(
     let mut inner = InnerRefCollector::default();
     inner.visit_function_body(body);
 
+    if inner.nested_direct_eval {
+        // §19.2.1.3 — a direct eval inside a nested function can read any
+        // visible outer binding; promote every own name to a cell.
+        return own.names;
+    }
     own.names.intersection(&inner.refs).cloned().collect()
 }
 
@@ -61,6 +66,9 @@ pub fn analyze_arrow(arrow: &ArrowFunctionExpression<'_>) -> HashSet<String> {
     let mut inner = InnerRefCollector::default();
     inner.visit_function_body(&arrow.body);
 
+    if inner.nested_direct_eval {
+        return own.names;
+    }
     own.names.intersection(&inner.refs).cloned().collect()
 }
 
@@ -245,6 +253,9 @@ pub fn analyze_module(stmts: &[Statement<'_>]) -> HashSet<String> {
     for stmt in stmts {
         inner.visit_statement(stmt);
     }
+    if inner.nested_direct_eval {
+        return own.names;
+    }
     own.names.intersection(&inner.refs).cloned().collect()
 }
 
@@ -255,21 +266,21 @@ pub fn analyze_module(stmts: &[Statement<'_>]) -> HashSet<String> {
 /// must not force an unrelated earlier `{ const x }` block binding into an
 /// upvalue cell.
 #[must_use]
-pub fn nested_function_refs_in_statements(stmts: &[Statement<'_>]) -> HashSet<String> {
+pub fn nested_function_refs_in_statements(stmts: &[Statement<'_>]) -> (HashSet<String>, bool) {
     let mut inner = InnerRefCollector::default();
     for stmt in stmts {
         inner.visit_statement(stmt);
     }
-    inner.refs
+    (inner.refs, inner.nested_direct_eval)
 }
 
 #[must_use]
-pub fn nested_function_refs_in_statement_refs(stmts: &[&Statement<'_>]) -> HashSet<String> {
+pub fn nested_function_refs_in_statement_refs(stmts: &[&Statement<'_>]) -> (HashSet<String>, bool) {
     let mut inner = InnerRefCollector::default();
     for stmt in stmts {
         inner.visit_statement(stmt);
     }
-    inner.refs
+    (inner.refs, inner.nested_direct_eval)
 }
 
 /// Walks a function body and collects names declared in it (params,
@@ -488,6 +499,10 @@ struct InnerRefCollector {
     nested_depth: u32,
     /// Own-name sets of the nested functions currently on the walk stack.
     bound: Vec<HashSet<String>>,
+    /// A nested function contains a direct `eval(...)` call: every visible
+    /// outer lexical binding is then reachable from that eval, so capture
+    /// analysis must promote all of them rather than only the named refs.
+    nested_direct_eval: bool,
 }
 
 /// Collects every identifier reference in a function body at any
@@ -505,6 +520,17 @@ impl<'a> Visit<'a> for AnyRefCollector {
 }
 
 impl<'a> Visit<'a> for InnerRefCollector {
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        // Any direct eval — in this body or in a nested function — can read
+        // every visible lexical binding, so the whole own-name set promotes.
+        if callee_is_direct_eval(&it.callee)
+            && !self.bound.iter().any(|scope| scope.contains("eval"))
+        {
+            self.nested_direct_eval = true;
+        }
+        walk::walk_call_expression(self, it);
+    }
+
     fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         let own = nested_function_own_names(Some(&it.params), it.body.as_deref(), false);
         self.bound.push(own);

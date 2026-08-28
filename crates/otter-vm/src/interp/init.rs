@@ -715,6 +715,15 @@ impl Interpreter {
             let Some(obj) = value.as_object() else {
                 continue;
             };
+            // An error-class registry constructor is a plain object with
+            // its callable embedded as a host slot, not a property — stamp
+            // that native too, or a cross-realm `new g.AggregateError(...)`
+            // runs under the caller's realm.
+            if let Some(ctor_native) = object::constructor_native(obj, &self.gc_heap)
+                .and_then(|value| value.as_native_function())
+            {
+                ctor_native.set_realm_global(&mut self.gc_heap, Some(global));
+            }
             let (string_keys, symbol_keys) = object::with_properties(obj, &self.gc_heap, |p| {
                 (
                     p.keys().map(str::to_string).collect::<Vec<_>>(),

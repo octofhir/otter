@@ -3374,8 +3374,51 @@ impl Interpreter {
         }
         let default_ctor = crate::object::get(self.global_this, &self.gc_heap, "Array")
             .ok_or_else(|| self.err_type(("%Array% intrinsic is missing".to_string()).into()))?;
-        let constructor =
-            self.species_constructor_value(stack, context, &original, &default_ctor)?;
+        // §7.3.22 steps 5-6 — C = Get(original, "constructor"); when C
+        // IS another realm's %Array% constructor it counts as the
+        // default (the @@species read is skipped) and the result array
+        // is created in the CURRENT realm. An explicit @@species value
+        // is honoured verbatim even when it names a foreign %Array%.
+        let c = self.get_property_value_for_call(stack, context, original, "constructor")?;
+        if let Some(native) = c.as_native_function()
+            && let Some(realm_global) = native.realm_global(&self.gc_heap)
+            && realm_global != self.global_this
+            && crate::object::get(realm_global, &self.gc_heap, "Array")
+                .is_some_and(|other| crate::abstract_ops::same_value(&other, &c, &self.gc_heap))
+        {
+            return self.array_create_with_length(original, length, roots);
+        }
+        let constructor = if c.is_undefined() {
+            default_ctor
+        } else if !c.is_object_type() {
+            return Err(self.err_type(("constructor property is not an object".to_string()).into()));
+        } else {
+            let species_sym = self
+                .well_known_symbols()
+                .get(crate::symbol::WellKnown::Species);
+            let s = match self.ordinary_get_value(
+                stack,
+                context,
+                c,
+                c,
+                &crate::VmPropertyKey::Symbol(species_sym),
+                0,
+            )? {
+                crate::VmGetOutcome::Value(value) => value,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync_rooted(stack, context, &getter, c, SmallVec::new())?
+                }
+            };
+            if s.is_nullish() {
+                default_ctor
+            } else if crate::abstract_ops::is_constructor(&s, context, &self.gc_heap) {
+                s
+            } else {
+                return Err(
+                    self.err_type(("Symbol.species value is not a constructor".to_string()).into())
+                );
+            }
+        };
         if crate::abstract_ops::same_value(&constructor, &default_ctor, &self.gc_heap) {
             return self.array_create_with_length(original, length, roots);
         }

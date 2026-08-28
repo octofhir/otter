@@ -240,6 +240,24 @@ pub(crate) fn compile_function_full(
             .collect();
         annex_blocked.insert("arguments".to_string());
         pre_declare_annex_b_functions(parent, &body.statements, &annex_blocked, span)?;
+        // §10.2.11 step 28 — with parameter expressions the body owns
+        // a separate variable environment: a body `var` whose name is
+        // already a parameter-environment binding (a formal, the
+        // implicit `arguments`, the self-name) declares a FRESH
+        // binding initialized from that binding's current value.
+        // Closures made in parameter defaults keep the parameter
+        // cell; body code and body closures resolve the shadow.
+        let param_shadowed: Vec<String> = if formal_parameters_contain_expression(params) {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            var_names
+                .iter()
+                .filter(|name| seen.insert(name.as_str()))
+                .filter(|name| parent.lookup_binding(name).is_some())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         pre_declare_var_bindings(parent, &var_names, span)?;
         // Pre-declare lexical bindings (TDZ) so hoisted nested
         // functions can capture forward references.
@@ -252,11 +270,27 @@ pub(crate) fn compile_function_full(
         // means calls placed textually above the declaration
         // resolve correctly.
         hoist_function_declarations(parent, &body.statements)?;
+        if !param_shadowed.is_empty() {
+            parent.enter_scope();
+            for name in &param_shadowed {
+                let Some(info) = parent.lookup_binding(name) else {
+                    continue;
+                };
+                let tmp = parent.alloc_scratch();
+                parent.emit_load_storage(tmp, info.storage, span);
+                let storage = parent.declare_binding(name, false, span)?;
+                parent.emit_store_storage(tmp, storage, span);
+                parent.mark_initialized(name);
+            }
+        }
         if is_generator {
             parent.emit(Op::GeneratorStart, vec![], span);
         }
         for stmt in &body.statements {
             compile_statement(parent, stmt)?;
+        }
+        if !param_shadowed.is_empty() {
+            parent.exit_scope();
         }
         if contains_direct_eval {
             capture_lexical_environment_for_eval(parent);

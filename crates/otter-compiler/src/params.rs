@@ -225,6 +225,49 @@ pub(crate) fn bind_simple_formal_parameter(
     Ok(())
 }
 
+/// §15.1.2 ContainsExpression of the formal parameter list: `true`
+/// when any parameter carries a default initializer or a computed
+/// pattern key — the shapes that give the function body its own
+/// variable environment (§10.2.11 step 28).
+pub(crate) fn formal_parameters_contain_expression(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+) -> bool {
+    fn pattern_contains_expression(pattern: &oxc_ast::ast::BindingPattern<'_>) -> bool {
+        use oxc_ast::ast::BindingPattern;
+        match pattern {
+            BindingPattern::BindingIdentifier(_) => false,
+            BindingPattern::AssignmentPattern(_) => true,
+            BindingPattern::ArrayPattern(arr) => {
+                arr.elements
+                    .iter()
+                    .flatten()
+                    .any(pattern_contains_expression)
+                    || arr
+                        .rest
+                        .as_ref()
+                        .is_some_and(|rest| pattern_contains_expression(&rest.argument))
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                obj.properties
+                    .iter()
+                    .any(|prop| prop.computed || pattern_contains_expression(&prop.value))
+                    || obj
+                        .rest
+                        .as_ref()
+                        .is_some_and(|rest| pattern_contains_expression(&rest.argument))
+            }
+        }
+    }
+    params
+        .items
+        .iter()
+        .any(|param| param.initializer.is_some() || pattern_contains_expression(&param.pattern))
+        || params
+            .rest
+            .as_ref()
+            .is_some_and(|rest| pattern_contains_expression(&rest.rest.argument))
+}
+
 pub(crate) fn formal_parameters_are_simple(params: &oxc_ast::ast::FormalParameters<'_>) -> bool {
     params.rest.is_none()
         && params.items.iter().all(|param| {

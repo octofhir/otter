@@ -605,6 +605,11 @@ pub(crate) fn bind_for_in_of_head(
             assign_object_pattern(cx, obj, src_reg, span)
         }
         ForStatementLeft::StaticMemberExpression(member) => {
+            if crate::assignment::is_invalid_assignment_target_member(member) {
+                let _ =
+                    crate::assignment::compile_invalid_assignment_target(cx, &member.object, span)?;
+                return Ok(());
+            }
             // `for (super.X of ...)` writes through the receiver per
             // §13.3.5.3 + §6.2.5.5 step 6.b, like `super.X = V`.
             if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {

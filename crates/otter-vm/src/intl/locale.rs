@@ -208,7 +208,20 @@ pub(crate) fn locale_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
         coerce_tag(ctx, tag_arg)?
     };
 
-    let mut loc = Locale::try_from_str(&tag_str).map_err(|_| range_err("invalid language tag"))?;
+    // A 5-8-alpha language subtag parses through the `und` substitution;
+    // the long subtag is restored on the rendered canonical string, and
+    // maximize / minimize treat such locales as fixed points (CLDR
+    // likely-subtags data has no entries for them).
+    let long_language = split_long_language(&tag_str);
+    let mut loc = match Locale::try_from_str(&tag_str) {
+        Ok(loc) => loc,
+        Err(_) => match &long_language {
+            Some((_, patched)) => {
+                Locale::try_from_str(patched).map_err(|_| range_err("invalid language tag"))?
+            }
+            None => return Err(range_err("invalid language tag")),
+        },
+    };
 
     // §ApplyOptionsToTag canonicalizes the base tag *before* the option
     // overrides are applied; the final result is canonicalized again
@@ -221,7 +234,17 @@ pub(crate) fn locale_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     }
 
     canonicalize(&mut loc);
-    let canonical = loc.to_string();
+    let mut canonical = loc.to_string();
+    // Restore the long language subtag unless an option override
+    // replaced the `und` placeholder with a real language.
+    if let Some((lang, _)) = long_language
+        && loc.id.language.is_unknown()
+    {
+        canonical = match canonical.strip_prefix("und") {
+            Some(rest) => format!("{lang}{rest}"),
+            None => canonical,
+        };
+    }
     make_locale(ctx, canonical)
 }
 
@@ -426,8 +449,27 @@ fn require_locale(ctx: &NativeCtx<'_>) -> Result<LocalePayload, NativeError> {
     }
 }
 
+/// UTS35 `unicode_language_subtag` also admits 5-8 alpha subtags
+/// ("posix"), which icu_locale's `Language` (2-3 alpha) rejects. Split
+/// such a tag into the long language subtag and an ICU-parseable body
+/// with the language swapped for `und`. `None` for every other shape.
+fn split_long_language(tag: &str) -> Option<(String, String)> {
+    let first = tag.split('-').next().unwrap_or("");
+    if (5..=8).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_alphabetic()) {
+        let rest = &tag[first.len()..];
+        Some((first.to_ascii_lowercase(), format!("und{rest}")))
+    } else {
+        None
+    }
+}
+
 fn parse_payload(payload: &LocalePayload) -> Locale {
-    Locale::try_from_str(&payload.locale).unwrap_or(Locale::UNKNOWN)
+    match Locale::try_from_str(&payload.locale) {
+        Ok(loc) => loc,
+        Err(_) => split_long_language(&payload.locale)
+            .and_then(|(_, patched)| Locale::try_from_str(&patched).ok())
+            .unwrap_or(Locale::UNKNOWN),
+    }
 }
 
 fn keyword_str(loc: &Locale, key: &str) -> Option<String> {
@@ -454,7 +496,13 @@ pub(crate) fn get_base_name(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
 }
 
 pub(crate) fn get_language(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
-    let loc = parse_payload(&require_locale(ctx)?);
+    let payload = require_locale(ctx)?;
+    // A 5-8-alpha language subtag lives outside the ICU model; report
+    // the stored subtag rather than the `und` placeholder.
+    if let Some((lang, _)) = split_long_language(&payload.locale) {
+        return str_value(ctx, &lang);
+    }
+    let loc = parse_payload(&payload);
     let lang = loc.id.language.to_string();
     str_value(ctx, &lang)
 }
@@ -906,7 +954,12 @@ fn is_rtl_script(s: &str) -> bool {
 }
 
 pub(crate) fn maximize(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
-    let mut loc = parse_payload(&require_locale(ctx)?);
+    let payload = require_locale(ctx)?;
+    if split_long_language(&payload.locale).is_some() {
+        let tag = payload.locale.clone();
+        return make_locale(ctx, tag);
+    }
+    let mut loc = parse_payload(&payload);
     let expander = LocaleExpander::new_extended();
     expander.maximize(&mut loc.id);
     canonicalize(&mut loc);
@@ -914,7 +967,12 @@ pub(crate) fn maximize(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, N
 }
 
 pub(crate) fn minimize(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
-    let mut loc = parse_payload(&require_locale(ctx)?);
+    let payload = require_locale(ctx)?;
+    if split_long_language(&payload.locale).is_some() {
+        let tag = payload.locale.clone();
+        return make_locale(ctx, tag);
+    }
+    let mut loc = parse_payload(&payload);
     let expander = LocaleExpander::new_extended();
     expander.minimize(&mut loc.id);
     canonicalize(&mut loc);

@@ -536,7 +536,23 @@ impl Interpreter {
         }
         seen.push(target.to_string());
         match self.module_record_status(target) {
-            ModuleStatus::Evaluating | ModuleStatus::Evaluated => return,
+            ModuleStatus::Evaluating => return,
+            ModuleStatus::Evaluated => {
+                // A member of a still-settling async cycle reports
+                // EVALUATED while its [[CycleRoot]] is EVALUATING-ASYNC.
+                // The deferred import must then wait on that root: gather
+                // it as the async dependency standing in for the SCC.
+                if let Some(root) = self
+                    .module_record(target)
+                    .and_then(|record| record.cycle_root.clone())
+                    && *root != *target
+                    && self.module_record_status(&root) == ModuleStatus::EvaluatingAsync
+                    && !result.iter().any(|r| **r == *root)
+                {
+                    result.push(root.to_string());
+                }
+                return;
+            }
             ModuleStatus::EvaluatingAsync | ModuleStatus::New => {}
         }
         let has_tla = context

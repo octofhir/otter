@@ -3523,9 +3523,14 @@ impl Interpreter {
         // A callback with no bound `new.target` / derived-`this` cell / captured
         // eval environment needs no pooled cold record, so its per-element frame
         // is a flat register window the prepared fast path can recycle in place.
+        // A body with OWN upvalue cells (a captured local, a catch parameter)
+        // is excluded: the recycled frame splices only the closure's parent
+        // captures, so the own leading cells would be missing and every
+        // compiled upvalue access would resolve one slot off.
         let fast_reuse = root.bound_new_target.is_none()
             && root.bound_derived_this.is_none()
-            && root.eval_env.is_none();
+            && root.eval_env.is_none()
+            && function.own_upvalue_count == 0;
         if self.enter_sync_reentry().is_ok() {
             let root_index = self.lean_callback_roots.len();
             let function_id = root.function_id;

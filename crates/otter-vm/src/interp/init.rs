@@ -684,8 +684,7 @@ impl Interpreter {
     fn tag_realm_native_graph(&mut self, global: JsObject) {
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut queue: Vec<Value> = vec![Value::object(global)];
-        let push_descriptor = |queue: &mut Vec<Value>, kind: object::DescriptorKind| match kind
-        {
+        let push_descriptor = |queue: &mut Vec<Value>, kind: object::DescriptorKind| match kind {
             object::DescriptorKind::Data { value } => queue.push(value),
             object::DescriptorKind::Accessor { getter, setter } => {
                 if let Some(getter) = getter {

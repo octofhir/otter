@@ -97,12 +97,26 @@ pub(crate) fn compile_import(
             // it uses the same host dynamic-import promise path as
             // import().
             let specifier = lit.value.as_str().to_string();
+            // Resolve to the canonical target URL so the runtime's
+            // per-target deferred-namespace registry hands back the
+            // SAME object a static `import defer` of this module
+            // produced (import-defer: one namespace per module).
+            let deferred_target =
+                (is_defer_phase && cx.module_state.is_some() && imp.options.is_none())
+                    .then(|| {
+                        crate::module_state::module_specifier_target(
+                            cx,
+                            &crate::ImportRequest::plain(specifier.clone()),
+                        )
+                    })
+                    .flatten();
             let spec_const = cx.intern_string_constant(&specifier);
-            if is_defer_phase && cx.module_state.is_some() && imp.options.is_none() {
+            if let Some(target) = deferred_target {
+                let target_const = cx.intern_string_constant(&target);
                 let ns_dst = cx.alloc_scratch();
                 cx.emit(
                     Op::ImportNamespaceDeferred,
-                    [Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
+                    [Operand::Register(ns_dst), Operand::ConstIndex(target_const)],
                     span,
                 );
                 let promise_dst = cx.alloc_scratch();

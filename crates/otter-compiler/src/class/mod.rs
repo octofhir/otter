@@ -107,8 +107,14 @@ pub(crate) fn compile_class(
     // static-element evaluation lowered into this frame.
     let saved_strict = cx.is_strict;
     cx.is_strict = true;
+    // §15.7.1 — while heritage / computed keys lower inline into a
+    // sloppy frame, property stores must carry strict PutValue
+    // failure semantics (the frame's own function stays sloppy).
+    let saved_class_parts = cx.strict_class_parts;
+    cx.strict_class_parts = saved_class_parts || !saved_strict;
     let result = compile_class_strict(cx, class, class_name, span);
     cx.top_mut().is_strict = saved_strict;
+    cx.top_mut().strict_class_parts = saved_class_parts;
     result
 }
 

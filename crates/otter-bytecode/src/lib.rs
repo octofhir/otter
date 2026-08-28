@@ -552,6 +552,12 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinaryset>
     StoreProperty,
+    /// [`Op::StoreProperty`] with strict-mode PutValue failure
+    /// semantics forced regardless of the executing function's own
+    /// strictness. §15.7.1 — class heritage and computed-key
+    /// expressions are strict code even when lowered inline into a
+    /// sloppy function's frame.
+    StorePropertyStrict,
     /// `r<dst> = delete r<obj>.<name>` (boolean result).
     /// Operands: `dst, obj, name_const`.
     DeleteProperty,
@@ -572,6 +578,9 @@ pub enum Op {
     LoadElement,
     /// `r<arr>[r<idx>] = r<src>`. Operands: `arr, idx, src`.
     StoreElement,
+    /// [`Op::StoreElement`] with strict-mode PutValue failure
+    /// semantics forced (§15.7.1 — see [`Op::StorePropertyStrict`]).
+    StoreElementStrict,
     /// `r<dst> = r<arr>.length`. Operands: `dst, arr`.
     ArrayLength,
     /// `r<dst> = (r<lhs> in r<rhs>)`. Operands:
@@ -1475,12 +1484,14 @@ impl Op {
             Op::NewObject => "NEW_OBJECT",
             Op::LoadProperty => "LOAD_PROPERTY",
             Op::StoreProperty => "STORE_PROPERTY",
+            Op::StorePropertyStrict => "STORE_PROPERTY_STRICT",
             Op::DeleteProperty => "DELETE_PROPERTY",
             Op::GetPrototype => "GET_PROTOTYPE",
             Op::SetPrototype => "SET_PROTOTYPE",
             Op::NewArray => "NEW_ARRAY",
             Op::LoadElement => "LOAD_ELEMENT",
             Op::StoreElement => "STORE_ELEMENT",
+            Op::StoreElementStrict => "STORE_ELEMENT_STRICT",
             Op::ArrayLength => "ARRAY_LENGTH",
             Op::Instanceof => "INSTANCEOF",
             Op::ImportNamespace => "IMPORT_NAMESPACE",
@@ -1723,14 +1734,14 @@ impl Op {
             Op::GlobalBindingExists => 2,
             Op::StoreGlobalChecked => 3,
             // dst, name_const, src, scratch_dst.
-            Op::StoreProperty => 4,
+            Op::StoreProperty | Op::StorePropertyStrict => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The
             // dispatcher reads the count and walks the trailing
             // operands.
             Op::NewArray => 2,
             Op::LoadElement | Op::DeleteElement => 3,
             // recv, key, src.
-            Op::StoreElement => 3,
+            Op::StoreElement | Op::StoreElementStrict => 3,
             Op::CallMethodValue => 4,    // dst, recv, name_const, argc
             Op::ForInKeys => 2,          // dst, obj
             Op::CopyDataProperties => 2, // target, src
@@ -1830,7 +1841,7 @@ impl Op {
             Op::NewCollection | Op::NewBuiltinError => pos == 1,
             Op::SetFunctionName => pos == 2,
             // [reg, name_const, src_reg, scratch_dst]
-            Op::StoreProperty => pos == 1,
+            Op::StoreProperty | Op::StorePropertyStrict => pos == 1,
             // [reg, function_const, count, parent_idxs...]
             Op::MakeClosure => pos == 1,
             // [reg, recv, name_const, argc, args...]
@@ -2216,6 +2227,23 @@ pub struct DirectEvalBinding {
     /// (the var lands in the variable environment underneath).
     #[serde(default)]
     pub inner: bool,
+    /// `true` for a formal-parameter binding (or an ordinary
+    /// function's implicit `arguments` object binding): part of the
+    /// function environment the parameter initializers already see. A
+    /// direct eval running inside a parameter initializer resolves
+    /// only these (plus captured passthroughs and the self-name);
+    /// body var/function bindings do not exist yet at that point
+    /// (§10.2.11 step 28 — the body gets its own variable
+    /// environment when parameter expressions are present).
+    #[serde(default)]
+    pub param: bool,
+    /// `true` for a binding a sloppy eval introduced into its caller's
+    /// variable environment (§19.2.1.3 CreateMutableBinding with
+    /// deletable = true): reads, writes, and `delete` of the name must
+    /// go through the dynamic eval-environment ops so a later `delete`
+    /// is observable through every alias.
+    #[serde(default)]
+    pub deletable: bool,
 }
 
 /// One argument index aliased to one formal parameter binding.

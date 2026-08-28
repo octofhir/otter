@@ -51,6 +51,11 @@ pub(crate) struct BindingInfo {
     /// (unlike other lexical bindings between the variable scope and
     /// the eval site).
     pub(crate) catch_param: bool,
+    /// `true` for a formal-parameter binding (or the implicit
+    /// `arguments` object binding): part of the function environment
+    /// that already exists while parameter initializers run, so a
+    /// direct eval there may resolve it (§10.2.11).
+    pub(crate) param: bool,
 }
 
 /// Where a binding lives in the running frame.

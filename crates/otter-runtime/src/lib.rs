@@ -1785,6 +1785,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
                         is_const: binding.is_const,
                         fn_self_name: binding.fn_self_name,
                         inner: binding.inner,
+                        deletable: binding.deletable,
                     })
                     .collect()
             });
@@ -1795,6 +1796,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
             options.force_strict,
             options.forbid_var_arguments,
             caller_scope.as_deref(),
+            options.global_var_env,
             options.new_target_allowed,
             options.in_class_field_initializer,
             options.super_property_allowed,

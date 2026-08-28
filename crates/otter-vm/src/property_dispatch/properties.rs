@@ -779,11 +779,14 @@ impl Interpreter {
         obj_reg: u16,
         key: AtomizedPropertyKey<'_>,
         src: u16,
+        force_strict: bool,
     ) -> Result<(), VmError> {
         let name = key.name();
         let frame = &stack[top_idx];
         let value = *read_register(frame, src)?;
-        let strict = context.function_is_strict(frame.function_id);
+        // §15.7.1 — Op::StorePropertyStrict: class heritage / computed
+        // keys are strict code even inside a sloppy function's frame.
+        let strict = force_strict || context.function_is_strict(frame.function_id);
         let receiver = *read_register(frame, obj_reg)?;
         if let Some(o) = receiver.as_object()
             && object::deferred_namespace_target(o, &self.gc_heap).is_some()

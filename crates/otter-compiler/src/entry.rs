@@ -108,6 +108,12 @@ pub struct EvalCallerBinding {
     /// for catch parameters, which also skip the var-collision
     /// SyntaxError via `lexical: false`).
     pub inner: bool,
+    /// `true` for a binding a previous sloppy eval introduced into the
+    /// caller's variable environment (§19.2.1.3 CreateMutableBinding
+    /// with deletable = true). The chunk routes such names through the
+    /// dynamic eval-environment ops so a `delete` from any alias is
+    /// observable everywhere.
+    pub deletable: bool,
 }
 
 /// Compile an `eval` / `new Function` body. Differs from script
@@ -136,6 +142,7 @@ pub fn compile_eval_source(
     force_strict: bool,
     forbid_var_arguments: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+    global_var_env: bool,
     new_target_allowed: bool,
     in_class_field_initializer: bool,
     super_property_allowed: bool,
@@ -159,6 +166,7 @@ pub fn compile_eval_source(
                 force_strict,
                 forbid_var_arguments,
                 caller_scope,
+                global_var_env,
                 new_target_allowed,
                 in_class_field_initializer,
                 super_property_allowed,
@@ -225,6 +233,7 @@ pub fn compile_eval_source(
                         force_strict,
                         forbid_var_arguments,
                         caller_scope,
+                        global_var_env,
                         new_target_allowed,
                         in_class_field_initializer,
                         super_property_allowed,
@@ -367,6 +376,7 @@ fn compile_eval_parts(
     force_strict: bool,
     forbid_var_arguments: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+    global_var_env: bool,
     new_target_allowed: bool,
     in_class_field_initializer: bool,
     super_property_allowed: bool,
@@ -419,6 +429,7 @@ fn compile_eval_parts(
             module_specifier,
             force_strict,
             caller_scope,
+            global_var_env,
             new_target_allowed,
             super_property_allowed,
             super_call_allowed,
@@ -482,6 +493,7 @@ pub(crate) fn compile_program_for_eval(
     module_specifier: &str,
     force_strict: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+    global_var_env: bool,
     new_target_allowed: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
@@ -494,6 +506,7 @@ pub(crate) fn compile_program_for_eval(
         force_strict,
         true,
         caller_scope,
+        global_var_env,
         new_target_allowed,
         super_property_allowed,
         super_call_allowed,
@@ -624,6 +637,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
         force_strict,
         eval_mode,
         caller_scope,
+        false,
         new_target_allowed,
         super_property_allowed,
         super_call_allowed,
@@ -639,6 +653,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     force_strict: bool,
     eval_mode: bool,
     caller_scope: Option<&[EvalCallerBinding]>,
+    global_var_env: bool,
     new_target_allowed: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
@@ -728,12 +743,16 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
             .filter(|b| !b.captured)
             .map(|b| b.name.as_str())
             .collect();
-        for name in body_var_names {
-            // §19.2.1.3 HasVarDeclaration — only the caller's OWN
-            // variable-environment bindings are re-bound; a name the
-            // caller merely CAPTURES gets a fresh cell here.
-            if !caller_reusable.contains(name.as_str()) {
-                top.captured_names.insert(name);
+        // §19.2.1.3 step 16.a — a global-caller eval's var-scoped
+        // names bind on the global object, never in eval-local cells.
+        if !global_var_env {
+            for name in body_var_names {
+                // §19.2.1.3 HasVarDeclaration — only the caller's OWN
+                // variable-environment bindings are re-bound; a name the
+                // caller merely CAPTURES gets a fresh cell here.
+                if !caller_reusable.contains(name.as_str()) {
+                    top.captured_names.insert(name);
+                }
             }
         }
     }
@@ -750,12 +769,27 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
             }
         }
     }
-    if !caller.is_empty() && capture::program_contains_direct_eval(program.body) {
+    // §19.2.1.1 — a strict top-level eval owns a private variable
+    // environment; a nested direct eval must splice its cells just
+    // like a function caller's, so the same promotion applies.
+    let strict_top_eval = eval_mode && main_is_strict && caller.is_empty();
+    if (!caller.is_empty() || strict_top_eval)
+        && capture::program_contains_direct_eval(program.body)
+    {
         // A nested direct eval sees this chunk's scope as *its*
         // caller environment — promote every body-level binding to a
-        // cell so the inner chunk can splice them.
-        top.captured_names
-            .extend(capture::all_program_names(program.body));
+        // cell so the inner chunk can splice them. A sloppy
+        // global-caller chunk's var-scoped names live on the global
+        // object instead, and the nested eval reaches them there.
+        let mut names = capture::all_program_names(program.body);
+        if global_var_env && !main_is_strict {
+            let mut var_names: Vec<String> = Vec::new();
+            hoist_var_names(program.body, &mut var_names);
+            for name in &var_names {
+                names.remove(name);
+            }
+        }
+        top.captured_names.extend(names);
     }
     top.own_upvalue_count = caller_slot_count;
 
@@ -765,7 +799,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     top.has_home_object = super_property_allowed;
     top.is_derived_ctor = super_call_allowed;
     let mut cx = Compiler::new(top);
-    cx.suppress_global_mirror = eval_mode && (main_is_strict || !caller.is_empty());
+    cx.suppress_global_mirror =
+        eval_mode && (main_is_strict || (!caller.is_empty() && !global_var_env));
     cx.in_eval = eval_mode;
     // Unresolved names may hit bindings a nested direct eval
     // introduces into this chunk's own frame at runtime.
@@ -816,6 +851,12 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
             if shadowed.contains(&binding.name) {
                 continue;
             }
+            // §19.2.1.3 — a caller binding a previous sloppy eval
+            // introduced stays deletable through this chunk: route its
+            // reads / writes / `delete` through the dynamic ops.
+            if binding.deletable {
+                cx.eval_var_names.insert(binding.name.clone());
+            }
             cx.scopes[0].bindings.insert(
                 binding.name.clone(),
                 BindingInfo {
@@ -825,6 +866,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                     fn_self_name: binding.fn_self_name,
                     type_hint: TypeHint::Unknown,
                     catch_param: false,
+                    param: false,
                 },
             );
         }
@@ -864,15 +906,40 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     let program_span = program.span;
     let mut top_level_vars: Vec<String> = Vec::new();
     hoist_var_names(program.body, &mut top_level_vars);
-    let global_var_bindings = !eval_mode || (caller.is_empty() && !main_is_strict);
+    let global_var_bindings =
+        !eval_mode || ((caller.is_empty() || global_var_env) && !main_is_strict);
     if eval_mode && !global_var_bindings && !main_is_strict {
-        // §19.2.1.3 — sloppy eval `var` bindings are deletable.
-        cx.eval_var_names.extend(top_level_vars.iter().cloned());
-        cx.eval_var_names
-            .extend(crate::annex_b::collect_annex_b_candidates(
-                program.body,
-                &HashSet::new(),
-            ));
+        // §19.2.1.3 step 16.b — only names WITHOUT a pre-existing
+        // caller variable-environment binding create fresh deletable
+        // bindings; a name that re-binds the caller's own var keeps
+        // the caller's non-deletable cell.
+        let caller_owned: HashSet<&str> = caller
+            .iter()
+            .filter(|b| !b.captured && !b.inner && !b.lexical)
+            .map(|b| b.name.as_str())
+            .collect();
+        cx.eval_var_names.extend(
+            top_level_vars
+                .iter()
+                .filter(|name| !caller_owned.contains(name.as_str()))
+                .cloned(),
+        );
+        // §B.3.3.3 — a block-level function whose name collides with a
+        // top-level lexical declaration is skipped by the annex-B
+        // var-hoisting (the early-error exemption does not apply), so
+        // the name never becomes an eval var binding.
+        let lexical_blocked: HashSet<String> = {
+            let mut names: Vec<(String, bool)> = Vec::new();
+            hoist_lexical_names(program.body, &mut names);
+            names.into_iter().map(|(name, _)| name).collect()
+        };
+        cx.eval_var_names.extend(
+            crate::annex_b::collect_annex_b_candidates(program.body, &HashSet::new())
+                .into_iter()
+                .filter(|name| {
+                    !caller_owned.contains(name.as_str()) && !lexical_blocked.contains(name)
+                }),
+        );
     }
     if global_var_bindings {
         cx.script_global_vars = top_level_vars.iter().cloned().collect();
@@ -923,7 +990,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     // assigns the catch binding), so the fresh cell lives behind a
     // synthetic name and is re-exported for adoption under the real
     // one.
-    if !main_is_strict {
+    if !main_is_strict && !global_var_bindings {
         let caller_inner: HashSet<&str> = caller
             .iter()
             .filter(|b| b.inner)
@@ -1045,7 +1112,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     // doubles as the caller environment for a nested direct eval
     // running from this chunk's frame.
     let mut eval_new_bindings: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
-    if !caller.is_empty() {
+    if !caller.is_empty() || strict_top_eval {
         let mut body_var_names = top_level_vars
             .iter()
             .map(String::as_str)
@@ -1086,6 +1153,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                             is_const: false,
                             fn_self_name: false,
                             inner: false,
+                            param: false,
+                            deletable: cx.eval_var_names.contains(real),
                         });
                         continue;
                     }
@@ -1116,6 +1185,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                         is_const: info.is_const,
                         fn_self_name: info.fn_self_name,
                         inner: false,
+                        param: false,
+                        deletable: cx.eval_var_names.contains(name.as_str()),
                     });
                 }
             }
@@ -1139,8 +1210,11 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
         m.functions[0].own_upvalue_count = cx.own_upvalue_count;
         m.functions[0].direct_eval_bindings = eval_new_bindings;
         // §19.2.1.1 — a nested direct eval from this chunk inherits
-        // the in-function signal from the chunk's own caller.
-        m.functions[0].contains_direct_eval = !caller.is_empty();
+        // the in-function signal from the chunk's own caller. A
+        // global-caller chunk keeps the script-top-level shape: a
+        // nested eval's variable environment is still the global one.
+        m.functions[0].contains_direct_eval = (!caller.is_empty() && !global_var_env)
+            || (strict_top_eval && !m.functions[0].direct_eval_bindings.is_empty());
         let mut code = std::mem::take(&mut cx.code);
         let mut main_eval_sites = std::mem::take(&mut cx.eval_sites);
         crate::function_context::finalize_virtual_capture_indices(
@@ -1627,6 +1701,7 @@ pub fn compile_module_program(
                 fn_self_name: false,
                 type_hint: TypeHint::Unknown,
                 catch_param: false,
+                param: false,
             },
         );
         cx.scopes[0].bindings.insert(
@@ -1638,6 +1713,7 @@ pub fn compile_module_program(
                 fn_self_name: false,
                 type_hint: TypeHint::Unknown,
                 catch_param: false,
+                param: false,
             },
         );
         for uv in &record_uvs {
@@ -1650,6 +1726,7 @@ pub fn compile_module_program(
                     fn_self_name: false,
                     type_hint: TypeHint::Unknown,
                     catch_param: false,
+                    param: false,
                 },
             );
         }

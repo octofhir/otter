@@ -235,6 +235,28 @@ impl Compiler {
             .any(|frame| frame.contains_direct_eval && !frame.is_strict)
     }
 
+    /// `true` when `name` resolves to one of THIS eval chunk's own
+    /// deletable var-scoped bindings (§19.2.1.3 CreateMutableBinding
+    /// with deletable = true): the innermost static declaration across
+    /// the whole compile stack is the eval `<main>`'s function scope.
+    /// Reads and writes of such a name must go through the dynamic
+    /// eval-environment ops so a later `delete` is observable — the
+    /// static cell would keep serving the value after the binding is
+    /// gone.
+    pub(crate) fn eval_var_dynamic_reference(&self, name: &str) -> bool {
+        if !self.eval_var_names.contains(name) {
+            return false;
+        }
+        for (frame_idx, frame) in self.stack.iter().enumerate().rev() {
+            for (scope_idx, scope) in frame.scopes.iter().enumerate().rev() {
+                if scope.bindings.contains_key(name) {
+                    return frame_idx == 0 && scope_idx == 0;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn current_private_namespace(&self) -> Option<u32> {
         self.private_namespaces.last().copied()
     }

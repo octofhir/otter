@@ -626,8 +626,9 @@ pub(crate) fn bind_for_in_of_head(
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let name_idx = cx.intern_string_constant(member.property.name.as_str());
             let scratch = cx.alloc_scratch();
+            let store_op = cx.store_property_op();
             cx.emit(
-                Op::StoreProperty,
+                store_op,
                 vec![
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),

@@ -189,6 +189,7 @@ pub(crate) fn predeclare_formal_parameters(
         } else {
             parent.declare_binding(&name, false, span)?;
         }
+        parent.mark_param(&name);
     }
     Ok(())
 }
@@ -208,7 +209,9 @@ pub(crate) fn bind_simple_formal_parameter(
             None => parent.declare_binding(name, false, span)?,
         }
     } else {
-        parent.declare_binding(name, false, span)?
+        let storage = parent.declare_binding(name, false, span)?;
+        parent.mark_param(name);
+        storage
     };
     let aliases_incoming_register = matches!(
         storage,

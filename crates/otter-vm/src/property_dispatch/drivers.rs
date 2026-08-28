@@ -1215,6 +1215,20 @@ impl Interpreter {
         } else {
             return Ok(false);
         };
+        // §10.4.3 String exotic object — own index slots and `length`
+        // are non-writable; the write rejects before the ordinary
+        // resolve (throwing under strict PutValue).
+        if let Some(desc) =
+            self.string_object_exotic_descriptor(obj, &VmPropertyKey::String(name))?
+            && !desc.writable()
+        {
+            return self.finish_failed_set(
+                stack,
+                context,
+                force_strict,
+                format!("Cannot assign to read-only property '{name}' of string"),
+            );
+        }
         let outcome = crate::object::resolve_set_atomized(obj, &self.gc_heap, atomized_key);
         match outcome {
             // §10.1.9.2 step 2 — an exotic prototype owns [[Set]]:

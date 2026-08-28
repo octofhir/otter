@@ -591,7 +591,41 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             }
         }
 
-        let pattern_source = if pattern_is_regexp {
+        // §22.2.3.1 step 5 — a pattern with a [[RegExpMatcher]] slot
+        // hands over its [[OriginalSource]] / [[OriginalFlags]]
+        // directly: own `source` / `flags` accessors installed on the
+        // instance are NOT consulted. Only a plain IsRegExp object
+        // (Symbol.match) reads the observable properties (step 6).
+        let internal = scope.raw(pattern).as_regexp().map(|r| {
+            let heap = scope.context().heap();
+            let source_units = r.pattern_utf16(heap);
+            let f = r.flags(heap);
+            let mut letters = String::with_capacity(8);
+            for (on, letter) in [
+                (f.has_indices, 'd'),
+                (f.global, 'g'),
+                (f.ignore_case, 'i'),
+                (f.multiline, 'm'),
+                (f.dot_all, 's'),
+                (f.unicode, 'u'),
+                (f.unicode_sets, 'v'),
+                (f.sticky, 'y'),
+            ] {
+                if on {
+                    letters.push(letter);
+                }
+            }
+            (source_units, letters)
+        });
+        let pattern_source = if let Some((source_units, _)) = &internal {
+            let source =
+                crate::JsString::from_utf16_units(source_units, scope.context().heap_mut())
+                    .map_err(|_| NativeError::TypeError {
+                        name: "RegExp",
+                        reason: "out of memory".to_string(),
+                    })?;
+            scope.value(Value::string(source))
+        } else if pattern_is_regexp {
             let pattern_value = scope.raw(pattern);
             let source = crate::regexp_prototype::get_property_runtime(
                 scope.context(),
@@ -603,18 +637,30 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         } else {
             pattern
         };
-        let flags_value = if pattern_is_regexp && scope.is_undefined(flags) {
-            let pattern_value = scope.raw(pattern);
-            let flags = crate::regexp_prototype::get_property_runtime(
-                scope.context(),
-                &pattern_value,
-                "flags",
-                "RegExp",
-            )?;
-            scope.value(flags)
-        } else {
-            flags
-        };
+        let flags_value =
+            if scope.is_undefined(flags) && internal.is_some() {
+                let letters = internal
+                    .as_ref()
+                    .map(|(_, letters)| letters.clone())
+                    .unwrap_or_default();
+                let flags = crate::JsString::from_str(&letters, scope.context().heap_mut())
+                    .map_err(|_| NativeError::TypeError {
+                        name: "RegExp",
+                        reason: "out of memory".to_string(),
+                    })?;
+                scope.value(Value::string(flags))
+            } else if pattern_is_regexp && scope.is_undefined(flags) {
+                let pattern_value = scope.raw(pattern);
+                let flags = crate::regexp_prototype::get_property_runtime(
+                    scope.context(),
+                    &pattern_value,
+                    "flags",
+                    "RegExp",
+                )?;
+                scope.value(flags)
+            } else {
+                flags
+            };
 
         // Coercing flags can run arbitrary JS after source coercion. Keep the
         // source string as a Local and copy its units only after both ladders

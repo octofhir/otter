@@ -2405,7 +2405,12 @@ pub fn call(
             }
             let target = expect_object(args.first())?;
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
-                p.symbol_keys().map(Value::symbol).collect()
+                // §6.2.12 — Private Name carriers are not properties;
+                // they never surface through the ordinary MOP.
+                p.symbol_keys()
+                    .filter(|k| !k.is_private_name())
+                    .map(Value::symbol)
+                    .collect()
             });
             let target_root = Value::object(target);
             Ok(Value::array(rooted_array_from_elements(

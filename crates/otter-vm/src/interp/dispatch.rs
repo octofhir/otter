@@ -1318,7 +1318,7 @@ impl Interpreter {
                         )?;
                     }
                     let frame = &mut stack[top_idx];
-                    self.run_delete_property_reg(frame, dst, obj_reg, key, strict)?;
+                    self.run_delete_property_reg(context, frame, dst, obj_reg, key, strict)?;
                     continue;
                 }
                 Op::DeleteElement => {
@@ -1344,8 +1344,9 @@ impl Interpreter {
                             !symbol_like,
                         )?;
                     }
-                    let frame = &mut stack[top_idx];
-                    self.run_delete_element_regs(frame, dst, obj_reg, idx_reg, strict)?;
+                    self.run_delete_element_regs(
+                        context, stack, top_idx, dst, obj_reg, idx_reg, strict,
+                    )?;
                     continue;
                 }
                 // §28.2.4.1 / .2 Proxy.[[GetPrototypeOf]] /

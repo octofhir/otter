@@ -235,6 +235,7 @@ impl Interpreter {
 
     pub(crate) fn run_delete_property_reg(
         &mut self,
+        context: &crate::ExecutionContext,
         frame: &mut Frame,
         dst: u16,
         obj_reg: u16,
@@ -278,7 +279,7 @@ impl Interpreter {
                 })
             {
                 let owner = class.ctor(&self.gc_heap).as_closure(&self.gc_heap);
-                self.ordinary_function_delete_own_property(owner, function_id, name)
+                self.ordinary_function_delete_own_property(owner, function_id, name, false)
             } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
                 native.delete_own_property(&mut self.gc_heap, name)
             } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
@@ -292,7 +293,8 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         }) {
             let owner = receiver.as_closure(&self.gc_heap);
-            self.ordinary_function_delete_own_property(owner, function_id, name)
+            let has_prototype = context.function_has_prototype_property(function_id);
+            self.ordinary_function_delete_own_property(owner, function_id, name, has_prototype)
         } else if let Some(native) = receiver.as_native_function() {
             native.delete_own_property(&mut self.gc_heap, name)
         } else if let Some(bound) = receiver.as_bound_function() {
@@ -347,6 +349,25 @@ impl Interpreter {
             } else {
                 true
             }
+        } else if let Some(s) = receiver.as_string(&self.gc_heap) {
+            // §13.5.1.2 — ToObject boxes the primitive; the fresh
+            // wrapper's own index slots and `length` are
+            // non-configurable (`false`, TypeError in strict mode),
+            // everything else deletes vacuously off the discarded
+            // wrapper.
+            let own = name == "length"
+                || name
+                    .parse::<u32>()
+                    .is_ok_and(|index| index < s.len() && index.to_string() == name);
+            !own
+        } else if receiver.is_number()
+            || receiver.is_boolean()
+            || receiver.is_big_int()
+            || receiver.is_symbol()
+        {
+            // §13.5.1.2 — a fresh primitive wrapper has no own
+            // configurable-relevant slots; the delete is vacuous.
+            true
         } else {
             return Err(self.err_type(
                 (format!(
@@ -383,14 +404,30 @@ impl Interpreter {
 
     pub(crate) fn run_delete_element_regs(
         &mut self,
-        frame: &mut Frame,
+        context: &crate::ExecutionContext,
+        stack: &mut crate::activation_stack::ActivationStack,
+        top_idx: usize,
         dst: u16,
         obj_reg: u16,
         idx_reg: u16,
         strict: bool,
     ) -> Result<(), VmError> {
-        let receiver = *read_register(frame, obj_reg)?;
-        let idx = *read_register(frame, idx_reg)?;
+        let mut idx = *read_register(&stack[top_idx], idx_reg)?;
+        if !crate::abstract_ops::is_primitive(&idx) {
+            // §13.5.1.2 — ToPropertyKey runs the key's coercion (a
+            // user `toString`) before the [[Delete]]; the receiver is
+            // re-read from its traced register afterwards.
+            let key = self.to_property_key_sync(stack, context, idx)?;
+            idx = match key {
+                crate::VmPropertyKey::Symbol(sym) => Value::symbol(sym),
+                other => {
+                    let name = other.string_name().map(str::to_string).unwrap_or_default();
+                    Value::string(crate::JsString::from_str(&name, &mut self.gc_heap)?)
+                }
+            };
+        }
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let frame = &mut stack[top_idx];
         let removed = if let Some(obj) = receiver.as_object() {
             // §10.4.6.10 [[Delete]] — a Module Namespace Exotic Object
             // refuses to delete an exported string key (incl. integer
@@ -460,7 +497,7 @@ impl Interpreter {
                     })
                 {
                     let owner = class.ctor(&self.gc_heap).as_closure(&self.gc_heap);
-                    self.ordinary_function_delete_own_property(owner, function_id, &name)
+                    self.ordinary_function_delete_own_property(owner, function_id, &name, false)
                 } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
                     native.delete_own_property(&mut self.gc_heap, &name)
                 } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
@@ -485,7 +522,8 @@ impl Interpreter {
             if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 let owner = receiver.as_closure(&self.gc_heap);
-                self.ordinary_function_delete_own_property(owner, function_id, &name)
+                let has_prototype = context.function_has_prototype_property(function_id);
+                self.ordinary_function_delete_own_property(owner, function_id, &name, has_prototype)
             } else {
                 return Err(VmError::TypeMismatch);
             }
@@ -686,10 +724,54 @@ impl Interpreter {
             },
             SuperReadKey::Computed(raw) => {
                 let coerced = self.coerce_property_key_value(stack, context, raw)?;
-                if coerced.as_symbol(&self.gc_heap).is_some() {
-                    // Symbol-keyed super writes are not yet exercised
-                    // by the conformance subset; reject explicitly.
-                    return Err(VmError::TypeMismatch);
+                if let Some(sym) = coerced.as_symbol(&self.gc_heap) {
+                    // §6.2.5.5 step 6.b with a symbol key: a setter on
+                    // the super base runs with the frame's `this`;
+                    // otherwise the data write lands on the receiver.
+                    let outcome = match base.as_object() {
+                        Some(obj) => crate::object::resolve_symbol_set(obj, &self.gc_heap, sym),
+                        None => object::SetOutcome::AssignData,
+                    };
+                    match outcome {
+                        object::SetOutcome::InvokeSetter { setter } => {
+                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                            args.push(value);
+                            self.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &setter,
+                                actual_this,
+                                args,
+                            )?;
+                        }
+                        object::SetOutcome::Reject { .. } => {
+                            self.failed_set_result(
+                                strict,
+                                "Cannot assign to read-only symbol property".to_string(),
+                            )?;
+                        }
+                        object::SetOutcome::AssignData
+                        | object::SetOutcome::ExoticParent { .. } => {
+                            let target = if let Some(this_obj) = actual_this.as_object() {
+                                Some(this_obj)
+                            } else {
+                                actual_this
+                                    .as_class_constructor()
+                                    .map(|c| c.statics(&self.gc_heap))
+                            };
+                            let Some(target) = target else {
+                                return Err(VmError::TypeMismatch);
+                            };
+                            if !crate::object::set_symbol(target, &mut self.gc_heap, sym, value) {
+                                self.failed_set_result(
+                                    strict,
+                                    "Cannot assign to read-only symbol property".to_string(),
+                                )?;
+                            }
+                        }
+                    }
+                    stack[top_idx].advance_pc()?;
+                    return Ok(());
                 } else if let Some(s) = coerced.as_string(&self.gc_heap) {
                     s.to_lossy_string(&self.gc_heap)
                 } else if let Some(n) = coerced.as_number() {

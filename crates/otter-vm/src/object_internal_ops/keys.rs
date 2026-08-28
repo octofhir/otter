@@ -388,7 +388,10 @@ impl Interpreter {
             // it; `target` is rewritten in place by the rooted visitor.
             let obj = target.as_object().ok_or(VmError::InvalidOperand)?;
             let symbols: Vec<Value> = object::with_properties(obj, &self.gc_heap, |p| {
-                p.symbol_keys().map(Value::symbol).collect()
+                p.symbol_keys()
+                    .filter(|k| !k.is_private_name())
+                    .map(Value::symbol)
+                    .collect()
             });
             keys.extend(symbols);
             return Ok(keys);
@@ -440,7 +443,10 @@ impl Interpreter {
                     object::with_properties(bag, &self.gc_heap, |p| {
                         (
                             p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::symbol).collect(),
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect(),
                         )
                     });
                 self.push_own_key_strings(
@@ -470,7 +476,10 @@ impl Interpreter {
                 object::with_properties(obj, &self.gc_heap, |p| {
                     (
                         p.keys().map(str::to_string).collect(),
-                        p.symbol_keys().map(Value::symbol).collect(),
+                        p.symbol_keys()
+                            .filter(|k| !k.is_private_name())
+                            .map(Value::symbol)
+                            .collect(),
                     )
                 });
             if is_string_exotic {
@@ -593,7 +602,10 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             let statics = class.statics(&self.gc_heap);
             let symbols: Vec<Value> = object::with_properties(statics, &self.gc_heap, |p| {
-                p.symbol_keys().map(Value::symbol).collect()
+                p.symbol_keys()
+                    .filter(|k| !k.is_private_name())
+                    .map(Value::symbol)
+                    .collect()
             });
             keys.extend(symbols);
             return Ok(keys);
@@ -608,7 +620,10 @@ impl Interpreter {
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (
                             p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::symbol).collect(),
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect(),
                         )
                     });
                 for key in strings {
@@ -627,7 +642,10 @@ impl Interpreter {
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (
                             p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::symbol).collect(),
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect(),
                         )
                     });
                 for key in strings {
@@ -646,7 +664,10 @@ impl Interpreter {
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (
                             p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::symbol).collect(),
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect(),
                         )
                     });
                 for key in strings {
@@ -665,7 +686,10 @@ impl Interpreter {
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (
                             p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::symbol).collect(),
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect(),
                         )
                     });
                 for key in strings {
@@ -685,7 +709,10 @@ impl Interpreter {
                     object::with_properties(bag, &self.gc_heap, |p| {
                         (
                             p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::symbol).collect(),
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect(),
                         )
                     });
                 for key in strings {

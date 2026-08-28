@@ -1845,7 +1845,10 @@ impl Interpreter {
                 {
                     match bag {
                         Some(bag) => crate::object::with_properties(bag, &self.gc_heap, |p| {
-                            p.symbol_keys().map(Value::symbol).collect()
+                            p.symbol_keys()
+                                .filter(|k| !k.is_private_name())
+                                .map(Value::symbol)
+                                .collect()
                         }),
                         None => Vec::new(),
                     }

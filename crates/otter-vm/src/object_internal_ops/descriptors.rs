@@ -515,6 +515,12 @@ impl Interpreter {
         if value.is_object_type() {
             return self.get_prototype_for_op(&value);
         }
+        // §B.2.2.1.1 step 1 — ToObject(this value): a primitive
+        // receiver reports its wrapper's [[Prototype]] without
+        // allocating the wrapper.
+        if !value.is_nullish() {
+            return self.get_prototype_for_op(&value);
+        }
         Err(VmError::TypeMismatch)
     }
 

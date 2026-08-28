@@ -628,7 +628,9 @@ impl ErrorClassRegistry {
         ) -> Result<Value, NativeError> {
             let receiver = *ctx.this_value();
             // §20.5.3.4 step 2 — Type(O) is not Object → TypeError.
-            if !receiver.is_object() {
+            // Every object-typed value qualifies (functions, arrays,
+            // proxies), not only plain objects.
+            if !receiver.is_object_type() {
                 return Err(NativeError::TypeError {
                     name: "Error.prototype.toString",
                     reason: "receiver must be an Object".to_string(),

@@ -123,18 +123,8 @@ impl Interpreter {
         if let Some(function_id) = fid {
             let owner = target.as_closure(&self.gc_heap);
             return Ok(if let Some(key) = key.string_name() {
-                if key == "prototype"
-                    && context.function_has_prototype_property(function_id)
-                    && self
-                        .callable_bag_read(owner, function_id)
-                        .is_none_or(|bag| {
-                            object::get_own_descriptor(bag, &self.gc_heap, key).is_none()
-                        })
-                {
-                    false
-                } else {
-                    self.ordinary_function_delete_own_property(owner, function_id, key)
-                }
+                let has_prototype = context.function_has_prototype_property(function_id);
+                self.ordinary_function_delete_own_property(owner, function_id, key, has_prototype)
             } else if let VmPropertyKey::Symbol(sym) = key {
                 self.callable_bag_read(owner, function_id)
                     .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, *sym))

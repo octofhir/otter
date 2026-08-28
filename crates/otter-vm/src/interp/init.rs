@@ -1175,6 +1175,27 @@ impl Interpreter {
         view.set_custom_proto(&mut self.gc_heap, proto);
     }
 
+    /// A regexp literal materialized while an extra realm is active
+    /// resolves its prototype chain through THAT realm's
+    /// `%RegExp.prototype%` — same policy as the typed-array and
+    /// array realm hooks.
+    pub(crate) fn register_regexp_realm_proto(&mut self, regex: crate::regexp::JsRegExp) {
+        if !self.active_realm_is_extra {
+            return;
+        }
+        let Some(proto) = object::get(self.global_this, &self.gc_heap, "RegExp").and_then(|ctor| {
+            match ctor.as_native_function() {
+                Some(native) => self.native_data_property(native, "prototype"),
+                None => ctor
+                    .as_object()
+                    .and_then(|obj| object::get(obj, &self.gc_heap, "prototype")),
+            }
+        }) else {
+            return;
+        };
+        regex.set_prototype_override(&mut self.gc_heap, Some(proto));
+    }
+
     /// The realm global a native call must run under: the native's stamped
     /// realm, or the parked default realm when an extra realm is active and
     /// the native carries no stamp (default-realm builtins are unstamped).

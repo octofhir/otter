@@ -1189,7 +1189,7 @@ fn compile_class_strict(
     Ok(class_reg)
 }
 
-fn number_literal_property_name(value: f64) -> String {
+pub(crate) fn number_literal_property_name(value: f64) -> String {
     if value == 0.0 {
         return "0".to_string();
     }

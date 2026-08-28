@@ -398,9 +398,24 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.84% at
-`dc1e9e2b`, 86 fails, 0 crashes/timeouts (eleven fixes vs the 97-fail set,
-zero regressions). The direct-eval cluster is closed: a script-top-level
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.86% at
+`bfc317b9`, 73 fails, 0 crashes/timeouts (thirteen fixes vs the 86-fail
+set, zero regressions). That slice lands the §13.15.1 web-compat
+CallExpression assignment-target semantics end to end (parser retry with
+a synthetic member rewrite, runtime ReferenceError after the call
+evaluates, logical assignment / destructuring / strict kept as early
+SyntaxError), closes import-defer (canonical per-module deferred
+namespace identity across static and dynamic imports; gathering follows
+an EVALUATED cycle member to its still-settling async cycle root), fixes
+two real engine bugs surfaced by intl402 — the lean Array-callback fast
+path recycled frames without a callback's own upvalue cells (catch
+parameter ⇒ every compiled upvalue access one slot off), and the
+optimizing tier entered with the CALLER's ambient chunk so runtime stubs
+decoded published pcs against a foreign constant pool — and takes
+NumberFormat percent affixes from ICU4X (de-DE `89 %`, tr `%89`),
+forwards Array.prototype.toLocaleString arguments per ECMA-402, and
+accepts 5-8-alpha language subtags in Intl.Locale. The previous slice
+closed the direct-eval cluster (86-fail baseline at `dc1e9e2b`). The direct-eval cluster is closed: a script-top-level
 direct eval receives the caller's lexical-environment heritage (block and
 for-let cells spliced per call site) while its vars still land on the
 global object as deletable bindings; a strict top-level eval publishes

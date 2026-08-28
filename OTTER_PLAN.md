@@ -398,9 +398,25 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.81% at
-`d75e1097`, 97 fails, 0 crashes/timeouts (fourteen fixes vs the 111-fail
-set, zero regressions). The eval slice on top of the realm wave promotes
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.84% at
+`dc1e9e2b`, 86 fails, 0 crashes/timeouts (eleven fixes vs the 97-fail set,
+zero regressions). The direct-eval cluster is closed: a script-top-level
+direct eval receives the caller's lexical-environment heritage (block and
+for-let cells spliced per call site) while its vars still land on the
+global object as deletable bindings; a strict top-level eval publishes
+its private variable-environment cells to nested evals; a
+parameter-initializer eval resolves only the function environment that
+exists at that point (formals, captured passthroughs, self-name), so
+`var arguments` in an arrow parameter default adopts into the arrow's
+funcEnv; deletable eval-introduced vars route reads, writes, typeof,
+updates, and deletes through the dynamic eval-environment ops —
+transitively across nested evals via the caller table's deletable bit —
+and an own function-scope binding shadows a same-named passthrough
+capture in the eval caller table; class heritage and computed keys
+lowered into a sloppy frame carry strict PutValue semantics through
+`Op::StorePropertyStrict` / `Op::StoreElementStrict`. Only
+`global-env-rec-with` (eval under `with` reading the with-object) remains
+from the cluster. The previous slice promotes
 every own name to a cell when a direct eval appears in the body or any
 nested function, and lowers a shadowed bare `eval(...)` through the
 runtime IsEvalIntrinsic guard so a parameter or var holding %eval% is a

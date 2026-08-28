@@ -2270,13 +2270,32 @@ impl Interpreter {
         if let Some(native) = current.as_native_function() {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                let result = self.run_vm_intrinsic_sync_rooted(
-                    stack,
-                    context,
-                    intrinsic,
-                    effective_this,
-                    effective_args,
-                )?;
+                // A cross-realm intrinsic (a stamped extra-realm builtin)
+                // runs under its own realm, same as the boxed-native path
+                // below — species lookups and fresh intrinsics resolve
+                // there.
+                let realm_global = self.native_target_realm_global(&native);
+                let result = if let Some(global) = realm_global
+                    && global != self.global_this
+                {
+                    self.with_host_realm_global(global, |interp| {
+                        interp.run_vm_intrinsic_sync_rooted(
+                            stack,
+                            context,
+                            intrinsic,
+                            effective_this,
+                            effective_args,
+                        )
+                    })?
+                } else {
+                    self.run_vm_intrinsic_sync_rooted(
+                        stack,
+                        context,
+                        intrinsic,
+                        effective_this,
+                        effective_args,
+                    )?
+                };
                 let top_idx = stack.len() - 1;
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
@@ -3458,6 +3477,17 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 let receiver = roots.receiver.get();
                 let args = roots.take_args();
+                // A stamped cross-realm intrinsic runs under its own
+                // realm, same as the boxed-native path below.
+                let realm_global = self.native_target_realm_global(native);
+                if let Some(global) = realm_global
+                    && global != self.global_this
+                {
+                    return self.with_host_realm_global(global, |interp| {
+                        interp
+                            .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args)
+                    });
+                }
                 return self
                     .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
             }

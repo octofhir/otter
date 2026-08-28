@@ -999,7 +999,9 @@ impl Interpreter {
     /// this before the canonical constructor-name walk, or subclass
     /// instance methods become invisible.
     pub(crate) fn collection_prototype_override_value(&self, receiver: &Value) -> Option<Value> {
-        if let Some(map) = receiver.as_map() {
+        if let Some(arr) = receiver.as_array() {
+            crate::array::prototype_override(arr, &self.gc_heap)
+        } else if let Some(map) = receiver.as_map() {
             crate::collections::map_prototype_override(map, &self.gc_heap)
         } else if let Some(set) = receiver.as_set() {
             crate::collections::set_prototype_override(set, &self.gc_heap)

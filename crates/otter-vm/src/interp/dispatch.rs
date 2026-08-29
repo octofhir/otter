@@ -2182,8 +2182,7 @@ impl Interpreter {
                 Op::GlobalBindingExists => {
                     let dst = instr.reg(0);
                     let name_idx = const_operand(function.operand(instr, 1))?;
-                    let frame = &mut stack[top_idx];
-                    self.run_global_binding_exists_reg(context, frame, dst, name_idx)?;
+                    self.run_global_binding_exists_reg(context, stack, top_idx, dst, name_idx)?;
                     continue;
                 }
                 Op::StoreGlobalChecked => {

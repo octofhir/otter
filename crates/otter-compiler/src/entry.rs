@@ -673,6 +673,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     // does not flag on its own (legacy octal / non-octal-decimal
     // integer literals, etc.).
     strict_validation::validate_strict_mode_early_errors(
+        program.directives,
         program.body,
         force_strict || program.strict_directive,
         super_property_allowed || super_call_allowed,
@@ -1316,7 +1317,12 @@ pub fn compile_module_program(
 ) -> Result<BytecodeModule, CompileError> {
     // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
     // always strict mode code (§10.2.10).
-    strict_validation::validate_strict_mode_early_errors(&program.body, true, false)?;
+    strict_validation::validate_strict_mode_early_errors(
+        &program.directives,
+        &program.body,
+        true,
+        false,
+    )?;
     // §14.2.1 / §14.12.1 block-level lexical early errors; module
     // code is always strict so no Annex B exemption applies.
     strict_validation::validate_block_early_errors(&program.body, true)?;

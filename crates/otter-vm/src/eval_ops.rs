@@ -758,6 +758,20 @@ impl Interpreter {
         };
         let params_joined = params.join(",");
         let prefix = kind.source_prefix();
+        // §20.2.1.1.1 steps 20-21 — the parameter text and the body text
+        // are each parsed on their own before the assembled source is.
+        // Without that, a parameter list that swallows the generated
+        // `) {` (an unterminated comment, an open template literal, a
+        // nested `function (`) assembles into a program that parses,
+        // and the caller smuggles source past the parameter list.
+        let probe_options = EvalCompileOptions {
+            function_constructor: true,
+            ..EvalCompileOptions::default()
+        };
+        let params_probe = format!("({prefix} anonymous({params_joined}\n) {{\n\n}})");
+        self.compile_escaped_source(&params_probe, probe_options.clone())?;
+        let body_probe = format!("({prefix} anonymous(\n) {{\n{body}\n}})");
+        self.compile_escaped_source(&body_probe, probe_options)?;
         let source = format!("({prefix} anonymous({params_joined}\n) {{\n{body}\n}})");
         let module = self.compile_escaped_source(
             &source,

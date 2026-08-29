@@ -826,11 +826,14 @@ impl Interpreter {
     pub(crate) fn run_global_binding_exists_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        top_idx: usize,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
-        let exists = self.global_binding_exists_value(context, frame.function_id, name_idx)?;
+        let function_id = stack[top_idx].function_id;
+        let exists = self.global_binding_exists_value(stack, context, function_id, name_idx)?;
+        let frame = &mut stack[top_idx];
         crate::write_register(frame, dst, exists)?;
         frame.advance_pc()?;
         Ok(())
@@ -838,6 +841,7 @@ impl Interpreter {
 
     pub(crate) fn global_binding_exists_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         name_idx: u32,
@@ -845,9 +849,17 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let exists = self.global_lexicals.contains_key(name)
+        if self.global_lexicals.contains_key(name)
             || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
-            || crate::object::get(self.global_this, &self.gc_heap, name).is_some();
+        {
+            return Ok(Value::boolean(true));
+        }
+        // §9.1.1.4.1 HasBinding is HasProperty(globalObject, N), so a
+        // proxy standing in as the global's prototype answers through
+        // its `has` trap — the non-reentrant chain walk cannot.
+        let receiver = Value::object(self.global_this);
+        let key = VmPropertyKey::String(name);
+        let exists = self.ordinary_has_property_value(stack, context, receiver, &key, 0)?;
         Ok(Value::boolean(exists))
     }
 
@@ -987,16 +999,19 @@ impl Interpreter {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
             return Ok(());
         }
+        let receiver = Value::object(self.global_this);
+        let key = VmPropertyKey::String(name);
         // §9.1.1.4.18 object-record SetMutableBinding — strict mode
-        // rejects writes to a binding that does not exist.
+        // rejects writes to a binding that does not exist. Existence is
+        // §9.1.1.4.1 HasBinding, i.e. HasProperty on the global object,
+        // so a proxy standing in as its prototype answers through the
+        // `has` trap.
         if strict
             && object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_none()
-            && crate::object::get(self.global_this, &self.gc_heap, name).is_none()
+            && !self.ordinary_has_property_value(stack, context, receiver, &key, 0)?
         {
             return Err(self.err_undefined_ident((name.to_string()).into()));
         }
-        let receiver = Value::object(self.global_this);
-        let key = VmPropertyKey::String(name);
         if !self.ordinary_set_data_value(stack, context, receiver, &key, value, receiver, 0)?
             && strict
         {

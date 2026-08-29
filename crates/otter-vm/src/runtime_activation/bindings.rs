@@ -101,7 +101,7 @@ impl RuntimeCall<'_> {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                vm.global_binding_exists_value(context, function_id, name_idx)
+                vm.global_binding_exists_value(stack, context, function_id, name_idx)
             }
             BindingSemantics::Read(BindingRead::Upvalue { index, .. }) => {
                 let index = self

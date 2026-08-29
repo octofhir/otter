@@ -169,7 +169,8 @@ impl Interpreter {
             value if value == Op::GlobalBindingExists as u8 => {
                 self.run_global_binding_exists_reg(
                     context,
-                    &mut stack[frame_index],
+                    stack,
+                    frame_index,
                     arg0 as u16,
                     arg1 as u32,
                 )?;

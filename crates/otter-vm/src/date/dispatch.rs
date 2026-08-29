@@ -221,8 +221,16 @@ fn parse_date(zone: &mut crate::date::LocalTimeZone, input: &str) -> f64 {
         return ms;
     }
     // Date portion: YYYY-MM-DD (year may be ±YYYYYY).
+    //
+    // §21.4.3.2 — a `T` separator selects the Date Time String Format
+    // exactly: every field is fixed-width and the only offsets are `Z`
+    // and `±HH:MM`. A space separator instead selects the
+    // implementation-defined W3C NOTE-datetime reading every engine
+    // accepts, where fields may be one or two digits and the offset may
+    // also be `±HH` or `±HHMM`.
     let (date_part, rest) = split_at_first(s, &['T', ' ']);
-    let (year, month, day) = match parse_date_components(date_part) {
+    let iso_strict = date_part.len() < s.len() && s.as_bytes()[date_part.len()] == b'T';
+    let (year, month, day) = match parse_date_components(date_part, iso_strict) {
         Some(v) => v,
         None => return f64::NAN,
     };
@@ -238,6 +246,9 @@ fn parse_date(zone: &mut crate::date::LocalTimeZone, input: &str) -> f64 {
         if parts.len() < 2 {
             return f64::NAN;
         }
+        if iso_strict && (!is_fixed_digits(parts[0], 2) || !is_fixed_digits(parts[1], 2)) {
+            return f64::NAN;
+        }
         hour = parts[0].parse::<f64>().unwrap_or(f64::NAN);
         minute = parts[1].parse::<f64>().unwrap_or(f64::NAN);
         if let Some(sec_part) = parts.get(2) {
@@ -246,6 +257,12 @@ fn parse_date(zone: &mut crate::date::LocalTimeZone, input: &str) -> f64 {
                 Some((s, f)) => (s, Some(f)),
                 None => (*sec_part, None),
             };
+            if iso_strict
+                && (!is_fixed_digits(sec_body, 2)
+                    || frac.is_some_and(|f| f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit())))
+            {
+                return f64::NAN;
+            }
             second = sec_body.parse::<f64>().unwrap_or(f64::NAN);
             if let Some(f) = frac {
                 let truncated: String = f.chars().take(3).collect();
@@ -253,7 +270,7 @@ fn parse_date(zone: &mut crate::date::LocalTimeZone, input: &str) -> f64 {
             }
         }
         if let Some(offset_str) = offset {
-            offset_minutes = match parse_offset(offset_str) {
+            offset_minutes = match parse_offset(offset_str, iso_strict) {
                 Some(m) => m,
                 None => return f64::NAN,
             };
@@ -310,7 +327,7 @@ fn parse_gmt_offset(s: &str) -> Option<i64> {
     if body.is_empty() {
         return Some(0);
     }
-    parse_offset(body)
+    parse_offset(body, false)
 }
 
 fn split_at_first<'a>(s: &'a str, seps: &[char]) -> (&'a str, Option<&'a str>) {
@@ -338,7 +355,7 @@ fn split_offset(time: &str) -> (&str, Option<&str>) {
     (time, None)
 }
 
-fn parse_offset(s: &str) -> Option<i64> {
+fn parse_offset(s: &str, iso_strict: bool) -> Option<i64> {
     if s == "Z" || s == "+00:00" || s == "-00:00" {
         return Some(0);
     }
@@ -349,12 +366,23 @@ fn parse_offset(s: &str) -> Option<i64> {
     };
     let (h, m) = match body.split_once(':') {
         Some((h, m)) => (h, m),
+        // `±HHMM` and a bare `±HH` belong to the lenient reading only.
+        None if iso_strict => return None,
         None if body.len() == 4 => (&body[..2], &body[2..]),
+        None if body.len() == 2 => (body, "00"),
         _ => return None,
     };
+    if iso_strict && (!is_fixed_digits(h, 2) || !is_fixed_digits(m, 2)) {
+        return None;
+    }
     let hours: i64 = h.parse().ok()?;
     let minutes: i64 = m.parse().ok()?;
     Some(sign * (hours * 60 + minutes))
+}
+
+/// `true` when `s` is exactly `width` ASCII digits.
+fn is_fixed_digits(s: &str, width: usize) -> bool {
+    s.len() == width && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn has_explicit_zero_offset(rest: Option<&str>) -> bool {
@@ -364,7 +392,7 @@ fn has_explicit_zero_offset(rest: Option<&str>) -> bool {
     time.ends_with('Z') || time.ends_with("+00:00") || time.ends_with("-00:00")
 }
 
-fn parse_date_components(input: &str) -> Option<(f64, f64, f64)> {
+fn parse_date_components(input: &str, iso_strict: bool) -> Option<(f64, f64, f64)> {
     // `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`.
     let (year_part, rest) = if input.starts_with(['+', '-']) {
         if input.len() < 7 {
@@ -389,5 +417,21 @@ fn parse_date_components(input: &str) -> Option<(f64, f64, f64)> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
     let day: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    if iso_strict {
+        let year_digits = year_part.strip_prefix(['+', '-']).unwrap_or(year_part);
+        let year_width = if year_part.len() == year_digits.len() {
+            4
+        } else {
+            6
+        };
+        if !is_fixed_digits(year_digits, year_width) {
+            return None;
+        }
+        for field in &parts {
+            if !is_fixed_digits(field, 2) {
+                return None;
+            }
+        }
+    }
     Some((year, month, day))
 }

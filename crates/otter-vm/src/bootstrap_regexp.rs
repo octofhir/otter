@@ -662,6 +662,16 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                 flags
             };
 
+        // §22.2.4.1 step 7 — RegExpAlloc(newTarget) reads
+        // `newTarget.prototype` AFTER the pattern's internal slots (or a
+        // duck-typed pattern's `source` / `flags` gets) and BEFORE
+        // RegExpInitialize coerces either to a string. Park the
+        // prototype in the handle arena; it is stamped on the compiled
+        // RegExp once the coercions and the compile are done.
+        let new_target_prototype =
+            crate::bootstrap::native_new_target_prototype(scope.context(), "RegExp")?
+                .map(|prototype| scope.value(prototype));
+
         // Coercing flags can run arbitrary JS after source coercion. Keep the
         // source string as a Local and copy its units only after both ladders
         // complete.
@@ -716,13 +726,7 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             .map_err(regexp_error_to_syntax_error)?;
         let re = scope.value(Value::regexp(re));
 
-        // `GetPrototypeFromConstructor(newTarget, ...)` is observable for a
-        // Proxy new.target. Root the freshly compiled RegExp before entering
-        // that lookup and resolve both handles again afterwards.
-        if let Some(prototype) =
-            crate::bootstrap::native_new_target_prototype(scope.context(), "RegExp")?
-        {
-            let prototype = scope.value(prototype);
+        if let Some(prototype) = new_target_prototype {
             let re_value = scope.raw(re);
             let re_handle = re_value.as_regexp().ok_or_else(|| oom("RegExp"))?;
             let prototype = scope.raw(prototype);

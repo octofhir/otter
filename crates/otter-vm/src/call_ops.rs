@@ -3199,6 +3199,14 @@ impl Interpreter {
             "GeneratorFunction",
             "AsyncFunction",
             "AsyncGeneratorFunction",
+            // §22.2.4.1 RegExp and §26.1.* WeakRef /
+            // FinalizationRegistry allocate their own exotic result and
+            // resolve `new.target.prototype` themselves. Pre-allocating
+            // an ordinary receiver here would read that property a
+            // second time, and the getter is observable.
+            "RegExp",
+            "WeakRef",
+            "FinalizationRegistry",
         ]
         .iter()
         .any(|expected| native.name(&self.gc_heap).eq_str(expected, &self.gc_heap))

@@ -120,6 +120,60 @@ impl Interpreter {
         }
     }
 
+    /// Install a user-requested `[[Prototype]]` on an exotic whose
+    /// prototype link rides a body slot rather than an `ObjectBody`.
+    ///
+    /// Returns `false` when the value's kind owns no such slot, which
+    /// leaves `[[SetPrototypeOf]]` to the caller's other branches.
+    pub(crate) fn set_exotic_prototype_override(&mut self, value: &Value, proto: Value) -> bool {
+        if value.is_array_buffer()
+            || value.is_data_view()
+            || value.is_typed_array()
+            || value.is_iterator()
+            || value.as_intl(&self.gc_heap).is_some()
+        {
+            self.set_non_gc_exotic_prototype_override(value, Some(proto));
+            return true;
+        }
+        if let Some(map) = value.as_map() {
+            crate::collections::set_map_prototype_override(map, &mut self.gc_heap, Some(proto));
+            return true;
+        }
+        if let Some(set) = value.as_set() {
+            crate::collections::set_set_prototype_override(set, &mut self.gc_heap, Some(proto));
+            return true;
+        }
+        if let Some(map) = value.as_weak_map() {
+            crate::collections::set_weak_map_prototype_override(
+                map,
+                &mut self.gc_heap,
+                Some(proto),
+            );
+            return true;
+        }
+        if let Some(set) = value.as_weak_set() {
+            crate::collections::set_weak_set_prototype_override(
+                set,
+                &mut self.gc_heap,
+                Some(proto),
+            );
+            return true;
+        }
+        if let Some(generator) = value.as_generator() {
+            generator.set_prototype_override(&mut self.gc_heap, Some(proto));
+            return true;
+        }
+        if let Some(promise) = value.as_promise() {
+            promise.set_prototype_override(&mut self.gc_heap, Some(proto));
+            return true;
+        }
+        if let Some(regexp) = value.as_regexp() {
+            regexp.set_prototype_override(&mut self.gc_heap, Some(proto));
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn non_gc_exotic_prototype_override(&self, value: &Value) -> Option<Value> {
         if let Some(buffer) = value.as_array_buffer() {
             return buffer.custom_proto(&self.gc_heap);
@@ -335,12 +389,12 @@ impl Interpreter {
             // shared code space so proto-chain walks (`instanceof`,
             // `Reflect.getPrototypeOf`) see the same graph as
             // property reads — else `%Function.prototype%`.
-            if let Some(function_id) = value.as_function().or_else(|| {
-                value
-                    .as_closure(&self.gc_heap)
-                    .map(|c| c.cached_function_id)
-            }) {
-                if let Some(over) = self.function_prototype_overrides.get(&function_id).copied() {
+            let owner = value.as_closure(&self.gc_heap);
+            if let Some(function_id) = value
+                .as_function()
+                .or_else(|| owner.map(|c| c.cached_function_id))
+            {
+                if let Some(over) = self.ordinary_function_prototype_override(owner, function_id) {
                     return Ok(over);
                 }
                 if let Some(chunk) = self.code_space.chunk_for(function_id)

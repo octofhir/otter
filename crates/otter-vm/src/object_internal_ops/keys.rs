@@ -1050,13 +1050,6 @@ impl Interpreter {
             }
             return Ok(changed);
         }
-        // §10.1.2 — TypedArrays accept ordinary [[SetPrototypeOf]];
-        // the override rides a dedicated body slot consulted by every
-        // prototype-chain walk.
-        if let Some(t) = target.as_typed_array(&self.gc_heap) {
-            t.set_custom_proto(&mut self.gc_heap, *proto);
-            return Ok(true);
-        }
         if let Some(arr) = target.as_array() {
             let current_proto = self.get_prototype_for_op(target)?;
             if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
@@ -1079,20 +1072,20 @@ impl Interpreter {
             return Ok(true);
         }
         // §10.1.2 OrdinarySetPrototypeOf for interned functions and
-        // closures — the override rides the per-template side table
-        // every prototype walk consults (a stored `null` means an
-        // explicit null [[Prototype]], distinct from "no override").
-        let fid = target.as_function().or_else(|| {
-            target
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        });
+        // closures — the override rides the closure instance's body, or
+        // the interned-template side table for a bare function value
+        // (a stored `null` means an explicit null [[Prototype]],
+        // distinct from "no override").
+        let owner = target.as_closure(&self.gc_heap);
+        let fid = target
+            .as_function()
+            .or_else(|| owner.map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let current = self.get_prototype_for_op(target)?;
             if abstract_ops::same_value(proto, &current, &self.gc_heap) {
                 return Ok(true);
             }
-            if !self.ordinary_function_is_extensible(function_id) {
+            if !self.ordinary_function_is_extensible(owner, function_id) {
                 return Ok(false);
             }
             if abstract_ops::same_value(proto, target, &self.gc_heap) {
@@ -1112,6 +1105,43 @@ impl Interpreter {
                 return Ok(false);
             }
             bound.set_prototype_override(&mut self.gc_heap, *proto);
+            return Ok(true);
+        }
+        // §10.1.2 OrdinarySetPrototypeOf for the remaining exotics —
+        // TypedArray / ArrayBuffer / DataView / Map / Set / WeakMap /
+        // WeakSet / RegExp / Promise / generator / iterator / Intl.
+        // Their [[Prototype]] rides a body slot rather than an
+        // `ObjectBody`, but the algorithm is the ordinary one: the
+        // no-op case succeeds, a non-extensible object refuses, and a
+        // chain that would run back into the target refuses.
+        let current = self.get_prototype_for_op(target)?;
+        if abstract_ops::same_value(proto, &current, &self.gc_heap) {
+            return Ok(true);
+        }
+        if !self.is_extensible_value(stack, context, target)? {
+            return Ok(false);
+        }
+        let mut p = *proto;
+        let mut hops = 0;
+        loop {
+            if p.is_null() {
+                break;
+            }
+            if abstract_ops::same_value(&p, target, &self.gc_heap) {
+                return Ok(false);
+            }
+            let Some(candidate) = p.as_object() else {
+                // Non-ordinary prototype links short-circuit per
+                // §10.1.2 step 8.c.i.
+                break;
+            };
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            hops += 1;
+            p = object::prototype_value(candidate, &self.gc_heap).unwrap_or(Value::null());
+        }
+        if self.set_exotic_prototype_override(target, *proto) {
             return Ok(true);
         }
         Ok(true)

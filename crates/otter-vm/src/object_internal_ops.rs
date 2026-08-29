@@ -575,13 +575,12 @@ impl Interpreter {
             object::prevent_extensions(statics, &mut self.gc_heap);
             return Ok(true);
         }
-        let fid = value.as_function().or_else(|| {
-            value
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        });
+        let owner = value.as_closure(&self.gc_heap);
+        let fid = value
+            .as_function()
+            .or_else(|| owner.map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
-            self.ordinary_function_prevent_extensions(function_id);
+            self.ordinary_function_prevent_extensions(owner, function_id);
             return Ok(true);
         }
         if let Some(regexp) = value.as_regexp() {

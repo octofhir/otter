@@ -1447,20 +1447,36 @@ impl Interpreter {
 
     /// §10.1.3 / §10.1.4 ordinary function `[[Extensible]]`.
     ///
-    /// Function objects store user expandos in an interpreter side
-    /// table, so their per-instance extensibility flag lives next
-    /// to that table rather than in a materialised ordinary object
-    /// bag.
+    /// A closure is a distinct function object per evaluation of its
+    /// definition, so its flag lives in the closure body. Interned
+    /// `Value::function` templates own no body and keep theirs in the
+    /// interpreter side table next to their expando bag.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-isextensible>
     /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-preventextensions>
-    pub(crate) fn ordinary_function_is_extensible(&self, function_id: u32) -> bool {
-        !self.function_non_extensible.contains(&function_id)
+    pub(crate) fn ordinary_function_is_extensible(
+        &self,
+        owner: Option<crate::closure::JsClosure>,
+        function_id: u32,
+    ) -> bool {
+        match owner {
+            Some(closure) => closure.is_extensible(&self.gc_heap),
+            None => !self.function_non_extensible.contains(&function_id),
+        }
     }
 
-    pub(crate) fn ordinary_function_prevent_extensions(&mut self, function_id: u32) {
-        self.function_non_extensible.insert(function_id);
+    pub(crate) fn ordinary_function_prevent_extensions(
+        &mut self,
+        owner: Option<crate::closure::JsClosure>,
+        function_id: u32,
+    ) {
+        match owner {
+            Some(closure) => closure.prevent_extensions(&mut self.gc_heap),
+            None => {
+                self.function_non_extensible.insert(function_id);
+            }
+        }
     }
 
     pub(crate) fn ordinary_function_has_own_string_property_for_extensibility(
@@ -1708,7 +1724,9 @@ impl Interpreter {
                             .function_deleted_metadata
                             .contains(&(function_id, "prototype"))
                 });
-                if !has_virtual_prototype && !self.ordinary_function_is_extensible(function_id) {
+                if !has_virtual_prototype
+                    && !self.ordinary_function_is_extensible(owner, function_id)
+                {
                     return Ok(false);
                 }
                 descriptor
@@ -2005,7 +2023,7 @@ impl Interpreter {
                                 owner,
                                 function_id,
                                 *sym,
-                            ) && !this.ordinary_function_is_extensible(function_id)
+                            ) && !this.ordinary_function_is_extensible(owner, function_id)
                             {
                                 return Err(VmError::TypeMismatch);
                             }
@@ -2136,27 +2154,25 @@ impl Interpreter {
             // dispatcher. This mirrors §10.1.3/§10.1.4 for the
             // side-table-backed function shape.
             M::IsExtensible => {
-                let function_id = target.as_function().or_else(|| {
-                    target
-                        .as_closure(&self.gc_heap)
-                        .map(|c| c.cached_function_id)
-                });
+                let owner = target.as_closure(&self.gc_heap);
+                let function_id = target
+                    .as_function()
+                    .or_else(|| owner.map(|c| c.cached_function_id));
                 match function_id {
                     Some(function_id) => Ok(Some(Value::boolean(
-                        self.ordinary_function_is_extensible(function_id),
+                        self.ordinary_function_is_extensible(owner, function_id),
                     ))),
                     None => Ok(None),
                 }
             }
             M::PreventExtensions => {
-                let function_id = target.as_function().or_else(|| {
-                    target
-                        .as_closure(&self.gc_heap)
-                        .map(|c| c.cached_function_id)
-                });
+                let owner = target.as_closure(&self.gc_heap);
+                let function_id = target
+                    .as_function()
+                    .or_else(|| owner.map(|c| c.cached_function_id));
                 match function_id {
                     Some(function_id) => {
-                        self.ordinary_function_prevent_extensions(function_id);
+                        self.ordinary_function_prevent_extensions(owner, function_id);
                         Ok(Some(target))
                     }
                     None => Ok(None),
@@ -2461,7 +2477,7 @@ impl Interpreter {
         }
         // A user-mutated [[Prototype]] replaces the intrinsic chain:
         // continue the ordinary walk from the override.
-        if let Some(over) = self.function_prototype_overrides.get(&function_id).copied() {
+        if let Some(over) = self.ordinary_function_prototype_override(owner, function_id) {
             if over.is_null() {
                 return Ok(Value::undefined());
             }

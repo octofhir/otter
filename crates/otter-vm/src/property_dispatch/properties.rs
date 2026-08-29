@@ -15,8 +15,8 @@ use smallvec::SmallVec;
 use otter_gc::raw::RawGc;
 
 use super::{
-    MetadataProtoSet, array_buffer_ensure_expando_pub, canonical_numeric_index_string,
-    data_view_ensure_expando_pub, regexp_ensure_expando, typed_array_valid_index,
+    MetadataProtoSet, canonical_numeric_index_string, regexp_ensure_expando,
+    typed_array_valid_index,
 };
 use crate::activation_stack::ActivationStack;
 use crate::{
@@ -1081,7 +1081,7 @@ impl Interpreter {
                         }
                     },
                 }
-            } else if !has_own && !self.ordinary_function_is_extensible(fid) {
+            } else if !has_own && !self.ordinary_function_is_extensible(owner, fid) {
                 self.failed_set_result(
                     strict,
                     format!("Cannot add property '{name}' to non-extensible function"),
@@ -1276,14 +1276,22 @@ impl Interpreter {
                 bag
             };
             Some(bag)
-        } else if let Some(b) = receiver.as_array_buffer() {
-            // §25.1 / §25.2 — ArrayBuffer and SharedArrayBuffer are
-            // ordinary objects; own properties (e.g. a species
-            // `constructor` override) land in the lazy expando bag.
-            Some(array_buffer_ensure_expando_pub(&mut self.gc_heap, &b)?)
-        } else if let Some(dv) = receiver.as_data_view() {
-            // §25.3 — ordinary own properties land in the lazy expando.
-            Some(data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?)
+        } else if receiver.is_array_buffer() || receiver.is_data_view() {
+            // §25.1 / §25.2 / §25.3 — ArrayBuffer, SharedArrayBuffer and
+            // DataView are ordinary objects: §10.1.9 OrdinarySet walks
+            // the prototype chain first (an inherited accessor such as
+            // the §B.2.2.1 `__proto__` setter intercepts the write),
+            // then defines into the lazy expando bag.
+            let vm_key = VmPropertyKey::OwnedString(name.to_string());
+            if !self
+                .ordinary_set_data_value(stack, context, receiver, &vm_key, value, receiver, 0)?
+            {
+                self.failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{name}'"),
+                )?;
+            }
+            None
         } else if receiver.is_temporal() {
             // §10.1.9 OrdinarySet — own expando first, then the
             // prototype chain (a getter-only accessor like `year`

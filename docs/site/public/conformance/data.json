@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "fb29f6ab6851075450af3a7c242780f3f4905e02",
-  "ran_at": "2026-08-29T21:19:07.883685+00:00",
+  "engine_commit": "8b46a9d97b7b71aa31afa007d40f9da185836fbe",
+  "ran_at": "2026-08-29T23:07:43.541981+00:00",
   "totals": {
     "total": 53575,
-    "passed": 52425,
-    "failed": 50,
+    "passed": 52439,
+    "failed": 36,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -40973,8 +40973,8 @@
     },
     "staging/sm/Date": {
       "total": 28,
-      "passed": 27,
-      "failed": 1,
+      "passed": 28,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41000,8 +41000,8 @@
     },
     "staging/sm/Function": {
       "total": 53,
-      "passed": 51,
-      "failed": 2,
+      "passed": 53,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41072,8 +41072,8 @@
     },
     "staging/sm/Proxy": {
       "total": 24,
-      "passed": 22,
-      "failed": 2,
+      "passed": 24,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41090,8 +41090,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 87,
-      "failed": 4,
+      "passed": 88,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41189,8 +41189,8 @@
     },
     "staging/sm/expressions": {
       "total": 42,
-      "passed": 39,
-      "failed": 3,
+      "passed": 41,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41207,8 +41207,8 @@
     },
     "staging/sm/fields": {
       "total": 8,
-      "passed": 7,
-      "failed": 1,
+      "passed": 8,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41261,8 +41261,8 @@
     },
     "staging/sm/module": {
       "total": 5,
-      "passed": 4,
-      "failed": 1,
+      "passed": 5,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41279,8 +41279,8 @@
     },
     "staging/sm/regress": {
       "total": 106,
-      "passed": 101,
-      "failed": 5,
+      "passed": 104,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41297,8 +41297,8 @@
     },
     "staging/sm/strict": {
       "total": 51,
-      "passed": 50,
-      "failed": 1,
+      "passed": 51,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41446,52 +41446,16 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«170141183460469231731687303715884105727n», «179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368n») to be true"
     },
     {
-      "path": "staging/sm/Date/non-iso.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«NaN», «857845150000») to be true"
-    },
-    {
-      "path": "staging/sm/Function/function-toString-builtin-name.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Incorrect match for [Symbol.split] Expected SameValue(«undefined», «\"[Symbol.split]\"») to be true"
-    },
-    {
-      "path": "staging/sm/Function/invalid-parameter-list.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/Math/atanh-approx.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Error: got -6.998237084679375, expected a number near -6.998237084679027 (relative error: 392)\n    at fail (test262-harness.js:301:19)\n    at assertNear (test262-harness.js:373:17)\n    at staging/sm/Math/atanh-approx.js:273:5"
     },
     {
-      "path": "staging/sm/Proxy/global-receiver.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "strict: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: bareword is not defined\n    at staging/sm/Proxy/global-receiver.js:33:1"
-    },
-    {
-      "path": "staging/sm/Proxy/regress-bug950407.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«[object ArrayBuffer]», «[object Object]») to be true"
-    },
-    {
       "path": "staging/sm/Reflect/construct.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«», «[object Object]») to be true"
-    },
-    {
-      "path": "staging/sm/RegExp/constructor-ordering.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"b\"», «\"a\"») to be true"
     },
     {
       "path": "staging/sm/RegExp/ignoreCase-multiple.js",
@@ -41554,18 +41518,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: numeric index stringified correctly Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/expressions/short-circuit-compound-assignment-anon-fns.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"a\"», «\"\"») to be true"
-    },
-    {
-      "path": "staging/sm/expressions/short-circuit-compound-assignment.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: compile: codes=[FEATURE_NOT_IN_SLICE] messages=[unsupported AST node: Super: bare `super` outside call or member expression]"
-    },
-    {
       "path": "staging/sm/extensions/arguments-property-access-in-function.js",
       "esid": "pending",
       "outcome": "fail",
@@ -41576,12 +41528,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a different error constructor with the same name"
-    },
-    {
-      "path": "staging/sm/fields/await-identifier-module-2.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
     },
     {
       "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",
@@ -41596,22 +41542,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpected token\n    at testNormalAndStrict (staging/sm/misc/future-reserved-words.js:27:1)\n    at testWord (staging/sm/misc/future-reserved-words.js:59:3)\n    at staging/sm/misc/future-reserved-words.js:111:1"
     },
     {
-      "path": "staging/sm/module/await-restricted-nested.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: Test262: This statement should not be evaluated."
-    },
-    {
       "path": "staging/sm/regress/regress-1383630.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: proxy can't report a different 'enumerable' from target when target is not configurable Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/regress/regress-469625-02.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: group assignment with rhs containing holes Expected SameValue(«\"y\"», «undefined») to be true"
     },
     {
       "path": "staging/sm/regress/regress-602621.js",
@@ -41620,28 +41554,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: function sub-statement must override arguments Expected SameValue(«\"function\"», «\"object\"») to be true"
     },
     {
-      "path": "staging/sm/regress/regress-634210-4.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined\n    at staging/sm/regress/regress-634210-4.js:14:18"
-    },
-    {
-      "path": "staging/sm/regress/regress-665355.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
       "path": "staging/sm/statements/regress-642975.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"\"», «\"y\"») to be true"
-    },
-    {
-      "path": "staging/sm/strict/directive-prologue-01.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: wrong error for octal-escape before strict directive in eval Expected a SyntaxError to be thrown but no exception was thrown at all"
     },
     {
       "path": "staging/sm/syntax/let-as-label.js",

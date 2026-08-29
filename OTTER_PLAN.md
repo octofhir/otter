@@ -398,14 +398,32 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.90% at
-`21b9c7dc`, 50 fails, 0 crashes/timeouts (two fixes vs the 52-fail set,
-zero regressions). The integrity/descriptor slice: Object.isSealed /
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.93% at
+`0cd4aa90`, 36 fails, 0 crashes/timeouts (fourteen fixes vs the 50-fail
+set, zero regressions). The object-identity slice moved per-instance
+function-object state out of the template-keyed side tables:
+[[Extensible]] and the [[Prototype]] override for a closure ride the
+closure body, so Object.seal / setPrototypeOf on one instance no longer
+seals every sibling of the same definition. [[SetPrototypeOf]] runs
+§10.1.2 for the body-slot exotics (ArrayBuffer, DataView, collections,
+RegExp, Promise, generators, iterators, Intl) instead of silently
+succeeding, ArrayBuffer / DataView stores go through OrdinarySet so an
+inherited accessor intercepts them, and the %TypedArray%.prototype named
+accessors stop answering off a base reached as somebody else's
+prototype. Op::IteratorNext routes a non-plain array element through the
+observable [[Get]], so a hole the prototype chain answers survives
+for-of, spread and destructuring. RegExp resolves new.target.prototype
+at its §22.2.4.1 step 7 position (and exactly once), the global
+environment record answers HasBinding through the proxy `has` trap,
+Date.parse separates the ISO-strict `T` reading from the lenient
+space-separated one, CreateDynamicFunction parses the parameter and body
+texts separately, and the strict directive prologue plus module-code
+`await` early errors land in the compiler's validator. The integrity
+slice before it (50-fail baseline at `21b9c7dc`): Object.isSealed /
 isFrozen walk symbol-keyed own slots (Private Name carriers stay
 excluded per §6.2.12), and §10.5.6 step 16 treats settingConfigFalse as
-set only for an EXPLICIT [[Configurable]]: false, so Reflect.set's
-partial receiver descriptor no longer trips the proxy invariant. The
-previous slice (52-fail baseline at `8b52630e`) closed a real
+set only for an EXPLICIT [[Configurable]]: false. The slice before that
+(52-fail baseline at `8b52630e`) closed a real
 shape-cache corruption: a duplicate object-literal key whose data member
 landed on an earlier accessor took the lenient shape store, leaving the
 hidden class claiming an accessor over a data cell and poisoning the

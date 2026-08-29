@@ -4625,7 +4625,15 @@ pub fn is_sealed(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
         if body.extensible {
             return false;
         }
-        (0..body_property_count(heap, body)).all(|i| !body.slot_attrs(heap, i).0.configurable())
+        if !(0..body_property_count(heap, body)).all(|i| !body.slot_attrs(heap, i).0.configurable())
+        {
+            return false;
+        }
+        // §7.3.16 — symbol-keyed own properties count too (Private
+        // Name carriers are not properties).
+        body.symbol_props()
+            .iter()
+            .all(|(key, slot)| key.is_private_name() || !slot.flags.configurable())
     })
 }
 
@@ -4650,7 +4658,12 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
                 return false;
             }
         }
-        true
+        // §7.3.16 — symbol-keyed own properties count too (Private
+        // Name carriers are not properties).
+        body.symbol_props().iter().all(|(key, slot)| {
+            key.is_private_name()
+                || (!slot.flags.configurable() && (!slot.kind.is_data() || !slot.flags.writable()))
+        })
     })
 }
 

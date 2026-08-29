@@ -195,13 +195,12 @@ impl Interpreter {
                         0,
                     )?;
                     let extensible = self.is_extensible_value(stack, context, &target_value)?;
-                    let setting_config_false = matches!(descriptor.configurable, Some(false))
-                        || (descriptor.configurable.is_none() && !descriptor.is_generic() && {
-                            // Defaults when adding (current undefined):
-                            // configurable=false. The non-generic clause
-                            // only matters when target_desc is None.
-                            target_desc.is_none()
-                        });
+                    // §10.5.6 step 16 — settingConfigFalse is true only
+                    // when the descriptor EXPLICITLY carries
+                    // [[Configurable]]: false; an absent field never
+                    // counts (Reflect.set's receiver-define passes
+                    // partial descriptors).
+                    let setting_config_false = matches!(descriptor.configurable, Some(false));
                     match target_desc.as_ref() {
                         None => {
                             if !extensible {

@@ -399,8 +399,13 @@ a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
 Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.90% at
-`8b52630e`, 52 fails, 0 crashes/timeouts (three fixes vs the 55-fail
-set, zero regressions). The literal-redefinition slice closed a real
+`21b9c7dc`, 50 fails, 0 crashes/timeouts (two fixes vs the 52-fail set,
+zero regressions). The integrity/descriptor slice: Object.isSealed /
+isFrozen walk symbol-keyed own slots (Private Name carriers stay
+excluded per §6.2.12), and §10.5.6 step 16 treats settingConfigFalse as
+set only for an EXPLICIT [[Configurable]]: false, so Reflect.set's
+partial receiver descriptor no longer trips the proxy invariant. The
+previous slice (52-fail baseline at `8b52630e`) closed a real
 shape-cache corruption: a duplicate object-literal key whose data member
 landed on an earlier accessor took the lenient shape store, leaving the
 hidden class claiming an accessor over a data cell and poisoning the

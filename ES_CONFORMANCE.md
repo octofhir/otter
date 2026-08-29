@@ -1,16 +1,16 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `8b52630ef061a720b2348a9facbd9bdf4fd2f3f4`
+- **Engine commit:** `fb29f6ab6851075450af3a7c242780f3f4905e02`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-28T20:40:21.645409+00:00
+- **Captured:** 2026-08-29T21:19:07.883685+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52423 |
-| failed     | 52 |
+| passed     | 52425 |
+| failed     | 50 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
@@ -30,7 +30,6 @@
 | staging/sm/expressions | 42 | 39 | 3 | 92.9% |
 | staging/sm/Function | 53 | 51 | 2 | 96.2% |
 | staging/sm/Proxy | 24 | 22 | 2 | 91.7% |
-| staging/sm/Reflect | 17 | 15 | 2 | 88.2% |
 | staging/sm/extensions | 64 | 62 | 2 | 96.9% |
 | language/eval-code/direct | 286 | 285 | 1 | 99.7% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
@@ -38,8 +37,8 @@
 | staging/sm/BigInt | 5 | 4 | 1 | 80.0% |
 | staging/sm/Date | 28 | 27 | 1 | 96.4% |
 | staging/sm/Math | 30 | 29 | 1 | 96.7% |
+| staging/sm/Reflect | 17 | 16 | 1 | 94.1% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
-| staging/sm/Symbol | 30 | 29 | 1 | 96.7% |
 | staging/sm/fields | 8 | 7 | 1 | 87.5% |
 | staging/sm/lexical-environment | 34 | 33 | 1 | 97.1% |
 | staging/sm/misc | 18 | 17 | 1 | 94.4% |
@@ -72,6 +71,7 @@
 | built-ins/AggregateError/cause-property.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/errors-iterabletolist-failures.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/errors-iterabletolist.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/is-a-constructor.js | 1 | 1 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -100,13 +100,11 @@
 | fail | strict: runtime: TypeError (UNCAUGHT) uncaught exception: ReferenceError: barewo… | `staging/sm/Proxy/global-receiver.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Proxy/regress-bug950407.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Reflect/construct.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Reflect: Pr… | `staging/sm/Reflect/set.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/constructor-ordering.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/ignoreCase-multiple.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/ignoreCase-non-latin1-to-latin1.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/lastIndex-match-or-replace.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/String/internalUsage.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/Symbol/property-reflection.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/TypedArray/constructor-buffer-sequence.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/TypedArray/from_constructor.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read… | `staging/sm/TypedArray/iterator-next-with-detached.js` |

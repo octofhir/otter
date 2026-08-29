@@ -2798,6 +2798,61 @@ impl Interpreter {
                     .as_typed_array(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)?
                     .kind();
+                let source_kind = interp
+                    .escape_scoped(source_handle)
+                    .as_typed_array(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?
+                    .kind();
+                if source_kind == target_kind {
+                    // §23.2.3.27 step 15.e — a same-type transfer copies
+                    // BYTES. Going through Get/Set would round every
+                    // element through a JS Number, which canonicalises a
+                    // non-canonical NaN and loses its bit pattern.
+                    let source = interp
+                        .escape_scoped(source_handle)
+                        .as_typed_array(&interp.gc_heap)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let target = interp
+                        .escape_scoped(result_handle)
+                        .as_typed_array(&interp.gc_heap)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let bpe = source_kind.bytes_per_element();
+                    let src_start = source.byte_offset(&interp.gc_heap) + base * bpe;
+                    let dst_start = target.byte_offset(&interp.gc_heap);
+                    let src_buffer = source.buffer(&interp.gc_heap);
+                    let dst_buffer = target.buffer(&interp.gc_heap);
+                    // A species constructor can hand back a view over a
+                    // shrunk (or the very same) buffer, so the span is
+                    // clamped to what both sides still hold.
+                    let src_avail = src_buffer
+                        .with_bytes(&interp.gc_heap, |b| b.len())
+                        .saturating_sub(src_start);
+                    let dst_avail = dst_buffer
+                        .with_bytes(&interp.gc_heap, |b| b.len())
+                        .saturating_sub(dst_start);
+                    let span = (copy_count * bpe).min(src_avail).min(dst_avail);
+                    if span > 0 {
+                        if src_buffer == dst_buffer {
+                            // Source and target share storage: copy byte by
+                            // byte in ascending index order, exactly as the
+                            // spec's GetValueFromBuffer / SetValueInBuffer
+                            // loop does, so an overlap propagates.
+                            dst_buffer.with_bytes_mut(&mut interp.gc_heap, |d| {
+                                for i in 0..span {
+                                    d[dst_start + i] = d[src_start + i];
+                                }
+                            });
+                        } else {
+                            let bytes: Vec<u8> = src_buffer.with_bytes(&interp.gc_heap, |b| {
+                                b[src_start..src_start + span].to_vec()
+                            });
+                            dst_buffer.with_bytes_mut(&mut interp.gc_heap, |d| {
+                                d[dst_start..dst_start + span].copy_from_slice(&bytes);
+                            });
+                        }
+                    }
+                    return Ok(interp.escape_scoped(result_handle));
+                }
                 let element_handle = interp.scoped_value(scope, Value::undefined());
                 for n in 0..copy_count {
                     let source = interp

@@ -291,8 +291,16 @@ impl Interpreter {
                     )?;
                     let target_anchor = interp.push_iteration_anchor(target) - 1;
                     let items = interp.iteration_anchor(anchor_base);
-                    let (iterator, next_method) =
-                        interp.get_iterator_sync(stack, context, &items)?;
+                    // §23.1.2.1 step 5.a — GetIteratorFromMethod with the
+                    // `usingIterator` GetMethod already performed above;
+                    // re-reading @@iterator would be a second observable
+                    // get on the source.
+                    let (iterator, next_method) = interp.get_iterator_from_method_sync(
+                        stack,
+                        context,
+                        &items,
+                        &iterator_method,
+                    )?;
                     let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
                     let next_method_anchor = interp.push_iteration_anchor(next_method) - 1;
                     let mut k = 0usize;
@@ -468,6 +476,14 @@ impl Interpreter {
             }
             self.run_construct_sync_rooted(stack, context, constructor, *constructor, ctor_args)
         } else {
+            // §23.1.2.1 step 6.b — the non-constructor branch is
+            // `ArrayCreate(len)`, which rejects a length past 2^32 - 1
+            // before a single element is read.
+            if let Some(len) = len
+                && len > u32::MAX as usize
+            {
+                return Err(self.err_range(("Invalid array length".to_string()).into()));
+            }
             Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
                 Vec::new(),
                 &[],

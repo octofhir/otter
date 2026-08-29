@@ -153,13 +153,21 @@ pub(crate) fn compile_object_literal(
                 // <https://tc39.es/ecma262/#sec-object-initializer>
                 let static_key_str = if p.computed {
                     None
+                } else if let oxc_ast::ast::PropertyKey::NumericLiteral(lit) = &p.key {
+                    // §13.2.5.5 — a numeric LiteralPropertyName is
+                    // `ToString(ToNumber(literal))`. Only the plain
+                    // integer spelling is settled here; every other value
+                    // (fractional, past the integer range, non-finite)
+                    // takes the computed-key path so the runtime's
+                    // §7.1.19 ToPropertyKey owns the formatting and the
+                    // engine keeps ONE Number-to-String implementation.
+                    crate::synthetic::numeric_literal_to_property_key(lit.value)
                 } else {
                     Some(match &p.key {
                         oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                             id.name.as_str().to_string()
                         }
                         oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
-                        oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
                         oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
                             match crate::expr::literal::bigint_literal_property_name(lit) {
                                 Some(name) => name,
@@ -297,7 +305,10 @@ pub(crate) fn compile_object_literal(
                     );
                     continue;
                 }
-                if p.computed {
+                // A numeric literal key with no settled integer spelling
+                // has `static_key_str == None`: it lowers like a computed
+                // key so the runtime's ToPropertyKey formats the number.
+                if p.computed || static_key_str.is_none() {
                     let key_reg =
                         match &p.key {
                             oxc_ast::ast::PropertyKey::StaticIdentifier(_)

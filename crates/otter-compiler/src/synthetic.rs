@@ -78,14 +78,20 @@ pub(crate) fn decode_lone_surrogate_string(value: &str) -> Vec<u16> {
     out
 }
 
-/// Format a `NumericLiteral`'s value as a property key per
-/// §6.1.7.1 ToString(Number). Integer values produce the bare
-/// integer string ("1" not "1.0"); other finite numbers go
-/// through Rust's default f64 formatter.
-pub(crate) fn numeric_literal_to_property_key(n: f64) -> String {
-    if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e21 {
-        format!("{}", n as i64)
-    } else {
-        format!("{n}")
+/// The settled property-key spelling of a `NumericLiteral` per
+/// §6.1.6.1.13 `Number::toString`: the bare integer string ("1", not
+/// "1.0") for an integral value inside the exactly-representable range.
+///
+/// `None` for everything else — a fractional value, a magnitude past
+/// the integer range, `Infinity`, `NaN`. Those keys are lowered through
+/// the computed-key path instead, where the runtime's §7.1.19
+/// ToPropertyKey formats the number, so the engine keeps exactly one
+/// Number-to-String implementation.
+pub(crate) fn numeric_literal_to_property_key(n: f64) -> Option<String> {
+    const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+    if n.is_finite() && n.fract() == 0.0 && n.abs() <= EXACT_INTEGER_LIMIT {
+        // `-0` stringifies as "0" (§6.1.6.1.13 step 2).
+        return Some(format!("{}", n as i64));
     }
+    None
 }

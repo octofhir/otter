@@ -54,6 +54,7 @@ use crate::CompileError;
 /// `force_strict` lets direct-eval callers inherit the caller's
 /// strictness without rewriting the source.
 pub fn validate_strict_mode_early_errors(
+    directives: &[oxc_ast::ast::Directive<'_>],
     body: &[oxc_ast::ast::Statement<'_>],
     source_strict: bool,
     super_allowed: bool,
@@ -64,6 +65,7 @@ pub fn validate_strict_mode_early_errors(
         next_function_super_allowed: None,
         diagnostics: Vec::new(),
     };
+    visitor.check_directive_prologue(directives, source_strict);
     for stmt in body {
         visitor.visit_statement(stmt);
     }
@@ -132,6 +134,11 @@ pub fn validate_module_early_errors(program: &Program<'_>) -> Result<(), Compile
     };
     new_target.visit_program(program);
 
+    let mut await_identifiers = ModuleAwaitIdentifierValidator {
+        diagnostics: &mut diagnostics,
+    };
+    await_identifiers.visit_program(program);
+
     if diagnostics.is_empty() {
         return Ok(());
     }
@@ -152,6 +159,42 @@ struct StrictValidator {
 impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
+    }
+
+    /// §12.9.4.1 — a Directive Prologue whose code is strict (an
+    /// inherited strictness or its own `"use strict"`) may not contain
+    /// a StringLiteral with a LegacyOctalEscapeSequence or a
+    /// NonOctalDecimalEscapeSequence. The `"use strict"` directive
+    /// makes the WHOLE prologue strict, including the literals ahead
+    /// of it, which is the case the parser cannot decide on its own.
+    fn check_directive_prologue(
+        &mut self,
+        directives: &[oxc_ast::ast::Directive<'_>],
+        outer_strict: bool,
+    ) {
+        let prologue_strict = outer_strict
+            || directives
+                .iter()
+                .any(|d| d.directive.as_str() == "use strict");
+        if !prologue_strict {
+            return;
+        }
+        for directive in directives {
+            let Some(span) = legacy_escape_span(directive.directive.as_str(), directive.span)
+            else {
+                continue;
+            };
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_DIRECTIVE_LEGACY_ESCAPE".to_string(),
+                message: "SyntaxError: octal escape sequences are not allowed in strict mode (§12.9.4.1)"
+                    .to_string(),
+                range: Some((span.start, span.end)),
+                help: Some(
+                    "write the character with an \\x or \\u escape, or drop the use-strict directive"
+                        .to_string(),
+                ),
+            });
+        }
     }
 
     fn super_allowed(&self) -> bool {
@@ -483,6 +526,30 @@ impl StrictValidator {
     }
 }
 
+/// `Some(span)` when the raw text of a string literal contains a
+/// LegacyOctalEscapeSequence (`\1` … `\7`, `\0` followed by a decimal
+/// digit) or a NonOctalDecimalEscapeSequence (`\8`, `\9`).
+fn legacy_escape_span(raw: &str, span: Span) -> Option<Span> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let Some(&next) = bytes.get(i + 1) else {
+            break;
+        };
+        match next {
+            b'1'..=b'9' => return Some(span),
+            b'0' if matches!(bytes.get(i + 2), Some(b'0'..=b'9')) => return Some(span),
+            _ => {}
+        }
+        i += 2;
+    }
+    None
+}
+
 fn flag_module_declaration_name_errors(
     program: &Program<'_>,
     diagnostics: &mut Vec<SyntaxDiagnostic>,
@@ -668,6 +735,43 @@ impl<'a> Visit<'a> for ModuleLabelValidator<'_> {
 
 struct ModuleNewTargetValidator<'d> {
     diagnostics: &'d mut Vec<SyntaxDiagnostic>,
+}
+
+/// §16.2.1.2 — `await` is a reserved word throughout module code, so it
+/// can never appear as an identifier, a binding name, or a label, not
+/// even inside a non-async function or a class field initializer where
+/// the parser is otherwise free to read it as one.
+struct ModuleAwaitIdentifierValidator<'d> {
+    diagnostics: &'d mut Vec<SyntaxDiagnostic>,
+}
+
+impl ModuleAwaitIdentifierValidator<'_> {
+    fn flag(&mut self, name: &str, span: Span) {
+        if name != "await" {
+            return;
+        }
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "MODULE_AWAIT_IDENTIFIER".to_string(),
+            message: "SyntaxError: `await` is a reserved word in module code (§16.2.1.2)"
+                .to_string(),
+            range: Some((span.start, span.end)),
+            help: Some("rename the binding — module code cannot use `await` as a name".to_string()),
+        });
+    }
+}
+
+impl<'a> Visit<'a> for ModuleAwaitIdentifierValidator<'_> {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        self.flag(it.name.as_str(), it.span);
+    }
+
+    fn visit_binding_identifier(&mut self, it: &oxc_ast::ast::BindingIdentifier<'a>) {
+        self.flag(it.name.as_str(), it.span);
+    }
+
+    fn visit_label_identifier(&mut self, it: &oxc_ast::ast::LabelIdentifier<'a>) {
+        self.flag(it.name.as_str(), it.span);
+    }
 }
 
 struct ScriptNewTargetValidator<'d> {
@@ -1097,6 +1201,10 @@ impl<'a> Visit<'a> for StrictValidator {
             });
         }
         let inner_strict = self.is_strict() || body_strict;
+        if let Some(body) = it.body.as_deref() {
+            let outer_strict = self.is_strict();
+            self.check_directive_prologue(&body.directives, outer_strict);
+        }
         self.strict_stack.push(inner_strict);
         self.super_stack.push(function_super_allowed);
         walk::walk_function(self, it, flags);

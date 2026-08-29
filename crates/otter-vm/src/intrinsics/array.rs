@@ -120,6 +120,21 @@ fn apply_array_new_target_prototype(
             })?
             .map(|descriptor| descriptor_value(&descriptor))
             .filter(|value| value.is_object_type() || value.is_proxy())
+    } else if new_target.is_function()
+        || new_target.is_closure()
+        || new_target.is_bound_function()
+        || new_target.is_proxy()
+    {
+        // §10.1.13 OrdinaryCreateFromConstructor over an ordinary
+        // script function (`Reflect.construct(Array, [], f)`): the
+        // `prototype` read is the ordinary observable one.
+        Some(crate::regexp_prototype::get_property_runtime(
+            ctx,
+            &new_target,
+            "prototype",
+            "Array",
+        )?)
+        .filter(|value| value.is_object_type() || value.is_proxy())
     } else {
         None
     };

@@ -36,8 +36,8 @@ use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
     JsPromise, JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
     VmPropertyKey, array, generator::AsyncGeneratorState, is_callable,
-    operand_decode::register_operand, promise::PromiseCapability, read_register, step_iterator,
-    symbol, write_register,
+    iterator_state::ArrayIterKind, operand_decode::register_operand, promise::PromiseCapability,
+    read_register, step_iterator, symbol, write_register,
 };
 
 fn string_iterator_values(s: JsString, heap: &mut otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
@@ -570,6 +570,21 @@ impl Interpreter {
             }
             _ => None,
         });
+        // §23.1.5.1 over a generic array-like (an `arguments` object, a
+        // Proxy, anything with a `length`): every step re-reads `length`
+        // and the element through the observable [[Get]], so an accessor
+        // or a proxy trap runs and its abrupt completion propagates.
+        let array_like = self.gc_heap.read_payload(*iter, |state| match state {
+            IteratorState::ArrayLike {
+                object,
+                index,
+                kind,
+            } => Some((*object, *index, *kind)),
+            _ => None,
+        });
+        if let Some((object, index, kind)) = array_like {
+            return self.array_like_iterator_step(stack, context, iter, object, index, kind);
+        }
         if let Some(step) = observable {
             let (array, index, entry) = match step {
                 ArrayObservable::Value(a, i) => (a, i, false),
@@ -607,6 +622,56 @@ impl Interpreter {
             Ok((value, done)) => Ok((value, done)),
             Err(_) => self.iterator_next_full_slow(context, stack, iter),
         }
+    }
+
+    /// One §23.1.5.1 CreateArrayIterator step over a generic array-like.
+    ///
+    /// The receiver is anchored across every observable read: both the
+    /// `length` coercion and the element [[Get]] can run user code and
+    /// move the heap.
+    fn array_like_iterator_step(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iter: &IteratorHandle,
+        object: Value,
+        index: usize,
+        kind: ArrayIterKind,
+    ) -> Result<(Value, bool), VmError> {
+        let anchor = self.push_iteration_anchor(object) - 1;
+        let result = (|interp: &mut Self| -> Result<(Value, bool), VmError> {
+            let receiver = interp.iteration_anchor(anchor);
+            let length = interp.load_property_value(context, stack, receiver, "length")?;
+            let len = crate::coerce::to_length_or_throw(interp, stack, context, &length)?;
+            if index >= len {
+                interp.gc_heap.with_payload(*iter, |state| state.exhaust());
+                return Ok((Value::undefined(), true));
+            }
+            // Advance before the element read so a re-entrant `next`
+            // from inside a getter observes the post-step index.
+            interp.gc_heap.with_payload(*iter, |state| {
+                if let IteratorState::ArrayLike { index, .. } = state {
+                    *index += 1;
+                }
+            });
+            let index_value = Value::number_f64(index as f64);
+            if matches!(kind, ArrayIterKind::Key) {
+                return Ok((index_value, false));
+            }
+            let receiver = interp.iteration_anchor(anchor);
+            let value = interp.load_property_value(context, stack, receiver, &index.to_string())?;
+            if matches!(kind, ArrayIterKind::Entry) {
+                let pair = interp.alloc_runtime_rooted_array_from_values(
+                    [index_value, value],
+                    &[&value],
+                    &[],
+                )?;
+                return Ok((Value::array(pair), false));
+            }
+            Ok((value, false))
+        })(self);
+        self.pop_iteration_anchors_to(anchor);
+        result
     }
 
     fn iterator_next_full_slow(
@@ -2157,6 +2222,25 @@ impl Interpreter {
                     )?
                 }
             };
+            interp.get_iterator_from_method_sync(stack, context, &iterable, &method)
+        })(self);
+        self.pop_iteration_anchors_to(anchor_base);
+        result
+    }
+
+    /// §7.4.3 GetIteratorFromMethod — the caller already performed
+    /// `GetMethod(obj, @@iterator)`, which the spec runs exactly once.
+    pub(crate) fn get_iterator_from_method_sync(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iterable: &Value,
+        method: &Value,
+    ) -> Result<(Value, Value), VmError> {
+        let iterable_anchor = self.push_iteration_anchor(*iterable) - 1;
+        let anchor_base = iterable_anchor;
+        let result = (|interp: &mut Self| -> Result<(Value, Value), VmError> {
+            let method = *method;
             if method.is_undefined() || method.is_null() || !interp.is_callable_runtime(&method) {
                 return Err(interp.err_type(("iterator method is not callable".to_string()).into()));
             }
@@ -3684,6 +3768,7 @@ impl Interpreter {
                     | IteratorState::Concat { .. }
                     | IteratorState::Zip { .. }
                     | IteratorState::RegExpString { .. }
+                    | IteratorState::ArrayLike { .. }
             )
         });
         if needs_full_step {

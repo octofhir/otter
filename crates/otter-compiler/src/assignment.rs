@@ -1511,8 +1511,22 @@ pub(crate) fn assign_object_pattern(
                     let key_str = match &p.name {
                         PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
                         PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                        // A numeric key with no settled integer spelling
+                        // is rejected here rather than mis-stringified;
+                        // `is_static_property_key` keeps such a pattern
+                        // on the computed-key path.
                         PropertyKey::NumericLiteral(lit) => {
-                            numeric_literal_to_property_key(lit.value)
+                            match numeric_literal_to_property_key(lit.value) {
+                                Some(key) => key,
+                                None => {
+                                    return Err(CompileError::Unsupported {
+                                        node: "ObjectAssignmentTarget: numeric key outside the \
+                                               settled integer range"
+                                            .to_string(),
+                                        span: pspan,
+                                    });
+                                }
+                            }
                         }
                         PropertyKey::BigIntLiteral(lit) => lit
                             .raw

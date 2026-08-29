@@ -335,12 +335,11 @@ pub(crate) fn destructure_object_inner(
                 }
                 oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
-                    // §6.1.7.1 ToString(Number) — match runtime
-                    // semantics so e.g. `1` and `1.0` both key as
-                    // "1". Foundation defers to Rust f64 → string
-                    // for the integer cases (NumericLiteral parses
-                    // the source form).
-                    Some(numeric_literal_to_property_key(lit.value))
+                    // §6.1.6.1.13 ToString(Number) — `1` and `1.0` both
+                    // key as "1". A value with no settled integer
+                    // spelling falls through to the computed-key path,
+                    // where the runtime formats it.
+                    numeric_literal_to_property_key(lit.value)
                 }
                 oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
                     // BigInt literal in property key: ToString

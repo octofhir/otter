@@ -67,7 +67,7 @@ globalThis.$DONE = function $DONE(reason) {
 pub const D262_HOST_PREAMBLE: &str = r#"
 var $262 = (function () {
     var IsHTMLDDA = __otter_is_htmldda;
-    return {
+    var api = {
         global: globalThis,
         gc: function () { /* engine gc is automatic */ },
         detachArrayBuffer: function (buf) {
@@ -80,9 +80,7 @@ var $262 = (function () {
             // (16.1.7 GlobalDeclarationInstantiation semantics).
             return __otter_eval_script(String(source));
         },
-        createRealm: function () {
-            return __otter_create_realm();
-        },
+        createRealm: null,
         IsHTMLDDA: IsHTMLDDA,
         agent: {
             // §262.agent — slice 19c wires these through native
@@ -117,6 +115,21 @@ var $262 = (function () {
             timeouts: { short: 200, medium: 1000, long: 4000, huge: 10000 }
         }
     };
+    // INTERPRETING.md — `createRealm` defines this API on the NEW
+    // realm's global object and returns that realm's `$262`. The
+    // native builds the realm plus its own `global` / `evalScript`;
+    // the realm-agnostic members are shared from here.
+    api.createRealm = function () {
+        var child = __otter_create_realm();
+        child.gc = api.gc;
+        child.detachArrayBuffer = api.detachArrayBuffer;
+        child.createRealm = api.createRealm;
+        child.IsHTMLDDA = api.IsHTMLDDA;
+        child.agent = api.agent;
+        child.global.$262 = child;
+        return child;
+    };
+    return api;
 })();
 // Test262's `atomicsHelper.js` aliases `$262.agent.setTimeout` to the
 // host global. Otter's product timer global requires a runtime timer

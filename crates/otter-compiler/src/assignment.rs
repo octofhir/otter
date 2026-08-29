@@ -666,6 +666,10 @@ pub(crate) fn compile_logical_assignment(
     enum LogicalTarget {
         Ident {
             name: String,
+            /// §13.15.2 NamedEvaluation applies only to a DIRECT
+            /// IdentifierReference target — a parenthesized cover
+            /// (`(x) ||= fn`) must not name the function.
+            direct_identifier: bool,
             /// Pre-RHS eval-binding snapshot for a capture a direct eval
             /// may shadow (§13.15.2 — the reference resolves once).
             eval_snapshot: Option<u16>,
@@ -729,6 +733,7 @@ pub(crate) fn compile_logical_assignment(
             (
                 LogicalTarget::Ident {
                     name,
+                    direct_identifier: id.span.start == a.span.start,
                     eval_snapshot,
                 },
                 load,
@@ -743,46 +748,93 @@ pub(crate) fn compile_logical_assignment(
                     span,
                 });
             }
-            let obj_reg = compile_expr(cx, &m.object, span)?;
-            let name_idx = cx.intern_string_constant(m.property.name.as_str());
-            let load = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadProperty,
-                vec![
-                    Operand::Register(load),
-                    Operand::Register(obj_reg),
-                    Operand::ConstIndex(name_idx),
-                ],
-                span,
-            );
-            (
-                LogicalTarget::Prepared(PreparedAssignmentTarget::StaticMember {
-                    obj_reg,
-                    name_idx,
-                }),
-                load,
-            )
+            // §13.3.5.3 MakeSuperPropertyReference — the reference is
+            // made once, before the short-circuit read: `GetThisBinding`
+            // then `GetSuperBase`. The read walks the parent prototype;
+            // the store goes through the receiver (§6.2.5.5 step 6.b).
+            if matches!(m.object, Expression::Super(_)) {
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let base_reg = crate::class::emit_super_base(cx, span)?;
+                let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                let load = compile_super_member_load(cx, m.property.name.as_str(), span)?;
+                (
+                    LogicalTarget::Prepared(PreparedAssignmentTarget::SuperProperty {
+                        base_reg,
+                        name_idx,
+                    }),
+                    load,
+                )
+            } else {
+                let obj_reg = compile_expr(cx, &m.object, span)?;
+                let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                let load = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadProperty,
+                    vec![
+                        Operand::Register(load),
+                        Operand::Register(obj_reg),
+                        Operand::ConstIndex(name_idx),
+                    ],
+                    span,
+                );
+                (
+                    LogicalTarget::Prepared(PreparedAssignmentTarget::StaticMember {
+                        obj_reg,
+                        name_idx,
+                    }),
+                    load,
+                )
+            }
         }
         AssignmentTarget::ComputedMemberExpression(m) => {
-            let obj_reg = compile_expr(cx, &m.object, span)?;
-            let key_reg = compile_expr(cx, &m.expression, span)?;
-            let load = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadElement,
-                vec![
-                    Operand::Register(load),
-                    Operand::Register(obj_reg),
-                    Operand::Register(key_reg),
-                ],
-                span,
-            );
-            (
-                LogicalTarget::Prepared(PreparedAssignmentTarget::ComputedMember {
-                    obj_reg,
-                    key_reg,
-                }),
-                load,
-            )
+            // §13.3.5.3 — `GetThisBinding`, then the key expression,
+            // then `GetSuperBase`; the short-circuit read walks the
+            // parent prototype via the home object.
+            if matches!(m.object, Expression::Super(_)) {
+                let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
+                let this_guard = cx.alloc_scratch();
+                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                let idx_reg = compile_expr(cx, &m.expression, span)?;
+                let base_reg = crate::class::emit_super_base(cx, span)?;
+                let load = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadSuperElement,
+                    vec![
+                        Operand::Register(load),
+                        Operand::Register(home_reg),
+                        Operand::Register(idx_reg),
+                    ],
+                    span,
+                );
+                (
+                    LogicalTarget::Prepared(PreparedAssignmentTarget::SuperElement {
+                        base_reg,
+                        idx_reg,
+                    }),
+                    load,
+                )
+            } else {
+                let obj_reg = compile_expr(cx, &m.object, span)?;
+                let key_reg = compile_expr(cx, &m.expression, span)?;
+                let load = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadElement,
+                    vec![
+                        Operand::Register(load),
+                        Operand::Register(obj_reg),
+                        Operand::Register(key_reg),
+                    ],
+                    span,
+                );
+                (
+                    LogicalTarget::Prepared(PreparedAssignmentTarget::ComputedMember {
+                        obj_reg,
+                        key_reg,
+                    }),
+                    load,
+                )
+            }
         }
         AssignmentTarget::PrivateFieldExpression(m) => {
             let obj_reg = compile_expr(cx, &m.object, span)?;
@@ -899,15 +951,20 @@ pub(crate) fn compile_logical_assignment(
     // performs NamedEvaluation; member targets store through the
     // ALREADY-EVALUATED Reference.
     let new_value = match &target {
-        LogicalTarget::Ident { name, .. } => {
-            crate::expr::compile_expr_with_inferred_name(cx, &a.right, name, span)?
+        LogicalTarget::Ident {
+            name,
+            direct_identifier: true,
+            ..
+        } => crate::expr::compile_expr_with_inferred_name(cx, &a.right, name, span)?,
+        LogicalTarget::Ident { .. } | LogicalTarget::Prepared(_) => {
+            compile_expr(cx, &a.right, span)?
         }
-        LogicalTarget::Prepared(_) => compile_expr(cx, &a.right, span)?,
     };
     match target {
         LogicalTarget::Ident {
             name,
             eval_snapshot,
+            ..
         } => {
             // §13.15.2 PutValue on a function-expression self-name
             // binding is immutable: the RHS has already evaluated, then

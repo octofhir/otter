@@ -3693,39 +3693,23 @@ impl Interpreter {
             stack[top_idx].advance_pc()?;
             return Ok(true);
         }
-        // §23.1.5.1 ArrayIterator `next` performs Get(array, index) —
-        // an element backed by an accessor must run its getter through
-        // the interpreter (and propagate its abrupt completion); the
-        // synchronous fast path below reads raw element storage only.
+        // §23.1.5.1 ArrayIterator `next` performs Get(array, index).
+        // Anything that is not one plain dense element — an accessor, a
+        // sparse slot, a hole the prototype chain answers — must run the
+        // observable [[Get]] through the interpreter; the synchronous
+        // fast path below reads raw element storage only.
         let array_step = self.gc_heap.read_payload(*iter_rc, |state| match state {
-            IteratorState::Array { array, index, .. } => Some((*array, *index)),
+            IteratorState::Array { array, index, .. }
+            | IteratorState::ArrayEntry { array, index } => Some((*array, *index)),
             _ => None,
         });
         if let Some((array, index)) = array_step
-            && crate::array::has_accessors(array, &self.gc_heap)
             && index < crate::array::len(array, &self.gc_heap)
-            && let Some((getter, _)) =
-                crate::array::get_accessor(array, &self.gc_heap, &index.to_string())
+            && crate::array::plain_dense_element(array, &self.gc_heap, index).is_none()
         {
-            // Advance before the getter runs so a re-entrant `next`
-            // from inside it observes the post-step index.
-            self.gc_heap.with_payload(*iter_rc, |state| {
-                if let IteratorState::Array { index, .. } = state {
-                    *index += 1;
-                }
-            });
-            let value = match getter {
-                Some(g) => self.run_callable_sync_rooted(
-                    stack,
-                    context,
-                    &g,
-                    Value::array(array),
-                    SmallVec::new(),
-                )?,
-                None => Value::undefined(),
-            };
+            let (value, done) = self.iterator_next_full(context, stack, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
-            write_register(&mut stack[top_idx], done_dst, Value::boolean(false))?;
+            write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
             stack[top_idx].advance_pc()?;
             return Ok(true);
         }

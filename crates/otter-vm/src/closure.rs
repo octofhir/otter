@@ -206,6 +206,15 @@ pub struct JsClosureBody {
     pub name_deleted: bool,
     /// As [`Self::name_deleted`] for `length`.
     pub length_deleted: bool,
+    /// §10.1.4 `[[Extensible]]` for this closure instance. Sibling
+    /// closures of the same bytecode template are distinct function
+    /// objects, so `Object.preventExtensions(f)` must not seal them.
+    pub non_extensible: bool,
+    /// §10.1.2 `[[Prototype]]` override installed by
+    /// `Object.setPrototypeOf` / `f.__proto__ = p`. `None` means the
+    /// closure still walks the realm's `%Function.prototype%`; a
+    /// stored `Value::null()` is an explicit null prototype.
+    pub proto_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for JsClosureBody {
@@ -233,6 +242,7 @@ impl otter_gc::SafeTraceable for JsClosureBody {
         self.bound_derived_this.pelt_trace(visitor);
         self.call_header.eval_env.pelt_trace(visitor);
         self.own_props.pelt_trace(visitor);
+        self.proto_override.pelt_trace(visitor);
     }
 }
 
@@ -315,6 +325,8 @@ impl JsClosureBody {
             own_props: None,
             name_deleted: false,
             length_deleted: false,
+            non_extensible: false,
+            proto_override: None,
         }
     }
 
@@ -516,6 +528,48 @@ impl JsClosure {
     pub fn set_own_props(self, heap: &mut GcHeap, bag: JsObject) {
         heap.with_payload(self.handle, |body| body.own_props = Some(bag));
         heap.write_barrier(self.handle, bag);
+    }
+
+    /// §10.1.3 `[[IsExtensible]]` for this closure instance.
+    #[must_use]
+    pub fn is_extensible(self, heap: &GcHeap) -> bool {
+        !heap.read_payload(self.handle, |body| body.non_extensible)
+    }
+
+    /// §10.1.4 `[[PreventExtensions]]` for this closure instance.
+    pub fn prevent_extensions(self, heap: &mut GcHeap) {
+        heap.with_payload(self.handle, |body| body.non_extensible = true);
+    }
+
+    /// The `[[Prototype]]` override installed on this closure instance,
+    /// if any. See [`JsClosureBody::proto_override`].
+    #[must_use]
+    pub fn proto_override(self, heap: &GcHeap) -> Option<Value> {
+        heap.read_payload(self.handle, |body| body.proto_override)
+    }
+
+    /// Drop the per-instance `[[Prototype]]` override, restoring the
+    /// intrinsic `%Function.prototype%` walk.
+    pub fn clear_proto_override(self, heap: &mut GcHeap) {
+        heap.with_payload(self.handle, |body| body.proto_override = None);
+    }
+
+    /// Install the per-instance `[[Prototype]]` override. The body lives
+    /// in old space and the new prototype may be younger, so every heap
+    /// slot the value carries is recorded in the remembered set.
+    pub fn set_proto_override(self, heap: &mut GcHeap, proto: Value) {
+        use crate::pelt::PeltField as _;
+
+        heap.with_payload(self.handle, |body| body.proto_override = Some(proto));
+        let mut child = proto;
+        let handle = self.handle;
+        let mut visit = |slot: *mut RawGc| {
+            // SAFETY: `pelt_trace` hands out pointers into the local copy
+            // of the value; the slot is read to record its edge only.
+            let raw = unsafe { *slot };
+            heap.record_write_edge(handle, raw);
+        };
+        child.pelt_trace(&mut visit);
     }
 
     /// Number of captured upvalue cells. Reads the body once.

@@ -937,10 +937,10 @@ pub fn native_prototype_proto_set(
     }
     let proto_value = args.first().cloned().unwrap_or(Value::undefined());
     // §B.2.2.1.2 step 2 — only Object / Null proto values are
-    // honoured; everything else returns undefined without
-    // mutating. Proxy-as-prototype is admissible via the broader
-    // value lattice.
-    if !(proto_value.is_object() || proto_value.is_null() || proto_value.is_proxy()) {
+    // honoured; everything else returns undefined without mutating.
+    // "Object" is the whole lattice: proxies and the exotics whose
+    // payloads are not `ObjectBody`-backed are objects too.
+    if !(proto_value.is_object_type() || proto_value.is_null()) {
         return Ok(Value::undefined());
     }
     // §B.2.2.1.2 step 3 — non-object receivers silently no-op.

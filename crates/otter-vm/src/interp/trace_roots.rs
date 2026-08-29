@@ -120,18 +120,37 @@ impl Interpreter {
     }
 
     pub(crate) fn set_function_prototype_override(&mut self, value: &Value, proto: Option<Value>) {
-        let function_id = value.as_function().or_else(|| {
-            value
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.cached_function_id)
-        });
-        let Some(function_id) = function_id else {
+        // A closure is one function object per evaluation of its
+        // definition: the override belongs in that instance's body, not
+        // in a table keyed by the shared bytecode template id.
+        if let Some(closure) = value.as_closure(&self.gc_heap) {
+            match proto {
+                Some(proto) => closure.set_proto_override(&mut self.gc_heap, proto),
+                None => closure.clear_proto_override(&mut self.gc_heap),
+            }
+            return;
+        }
+        let Some(function_id) = value.as_function() else {
             return;
         };
         if let Some(proto) = proto {
             self.function_prototype_overrides.insert(function_id, proto);
         } else {
             self.function_prototype_overrides.remove(&function_id);
+        }
+    }
+
+    /// The `[[Prototype]]` override for an ordinary function value, read
+    /// from the closure instance when there is one and from the interned
+    /// template table otherwise.
+    pub(crate) fn ordinary_function_prototype_override(
+        &self,
+        owner: Option<crate::closure::JsClosure>,
+        function_id: u32,
+    ) -> Option<Value> {
+        match owner {
+            Some(closure) => closure.proto_override(&self.gc_heap),
+            None => self.function_prototype_overrides.get(&function_id).copied(),
         }
     }
 

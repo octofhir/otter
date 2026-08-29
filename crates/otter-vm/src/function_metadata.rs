@@ -303,19 +303,13 @@ pub(crate) fn bound_delete_own_property(
     })
 }
 
-/// `true` when `name` is a syntactically valid `IdentifierName`
-/// (§12.7) usable in the `NativeFunction` grammar's optional name slot.
-/// Internal display placeholders (`<anonymous>`, `<arrow>`), computed /
-/// symbol method names (`[Symbol.iterator]`), and `bound `-prefixed
-/// names contain characters that are not `IdentifierPart`, so they must
-/// be omitted rather than emitted into an otherwise-parseable native
-/// function source.
 /// `true` for the compiler's internal anonymous-callable display
 /// placeholders, whose observable `name` property is the empty string.
 fn is_anon_name_placeholder(name: &str) -> bool {
     matches!(name, "<anonymous>" | "<arrow>" | "<class>")
 }
 
+/// `true` when `name` is a syntactically valid `IdentifierName` (§12.7).
 fn is_identifier_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -325,12 +319,30 @@ fn is_identifier_name(name: &str) -> bool {
     chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
 }
 
+/// `true` when `name` fits the §20.2.3.5 `NativeFunction` grammar's
+/// optional `NativeFunctionAccessor PropertyName` slot: a bare
+/// `IdentifierName`, an accessor form (`get flags` / `set __proto__`),
+/// or a computed / symbol-derived name (`[Symbol.split]`). Internal
+/// display placeholders and `bound `-prefixed names do not, so they are
+/// omitted rather than emitted into an otherwise-unparseable source.
+fn is_native_function_name(name: &str) -> bool {
+    let property_name = name
+        .strip_prefix("get ")
+        .or_else(|| name.strip_prefix("set "))
+        .unwrap_or(name);
+    if is_identifier_name(property_name) {
+        return true;
+    }
+    property_name.len() > 2 && property_name.starts_with('[') && property_name.ends_with(']')
+}
+
 /// Render a callable's `Function.prototype.toString` value (§20.2.3.5).
 /// A user function / class carries its verbatim [[SourceText]], so its
 /// definition source is returned exactly. Native functions, bound
 /// functions, and any synthesized callable without source fall back to
 /// the `NativeFunction` form; the optional name is emitted only when it
-/// is a valid `IdentifierName`, keeping the result parseable.
+/// fits the grammar's `NativeFunctionAccessor PropertyName` slot,
+/// keeping the result parseable.
 #[must_use]
 pub(crate) fn callable_to_string(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> String {
     // A class binding is a class-constructor wrapper; its [[SourceText]]
@@ -348,7 +360,7 @@ pub(crate) fn callable_to_string(ctx: &mut FunctionMetadataContext<'_>, callee: 
         return source.to_string();
     }
     let display = callable_name(ctx, callee).unwrap_or_default();
-    if is_identifier_name(&display) {
+    if is_native_function_name(&display) {
         format!("function {display}() {{ [native code] }}")
     } else {
         "function () { [native code] }".to_string()

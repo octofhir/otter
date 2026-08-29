@@ -612,13 +612,12 @@ impl Interpreter {
         if let Some(class) = value.as_class_constructor() {
             return object::is_extensible(class.statics(&self.gc_heap), &self.gc_heap);
         }
-        let fid = value.as_function().or_else(|| {
-            value
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        });
+        let owner = value.as_closure(&self.gc_heap);
+        let fid = value
+            .as_function()
+            .or_else(|| owner.map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
-            return self.ordinary_function_is_extensible(function_id);
+            return self.ordinary_function_is_extensible(owner, function_id);
         }
         if let Some(regexp) = value.as_regexp() {
             return regexp.is_extensible(&self.gc_heap);

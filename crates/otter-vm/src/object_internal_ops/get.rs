@@ -244,7 +244,7 @@ impl Interpreter {
             // Object.setPrototypeOf) replaces the intrinsic chain: after
             // the own properties miss, continue the ordinary walk from
             // the override instead of %Function.prototype%.
-            let proto_override = self.function_prototype_overrides.get(&function_id).copied();
+            let proto_override = self.ordinary_function_prototype_override(owner, function_id);
             let own_lookup = match key {
                 VmPropertyKey::Symbol(sym) => self
                     .callable_bag_read(owner, function_id)
@@ -679,8 +679,20 @@ impl Interpreter {
                     object::PropertyLookup::Absent => {}
                 }
             }
+            // §23.2.3 — the named `%TypedArray%.prototype` accessors read
+            // the RECEIVER's internal slots. Answering them off `base`
+            // is only valid while the receiver still is this typed
+            // array; reached as somebody else's prototype, the walk has
+            // to find the real accessor so it throws on a receiver with
+            // no [[ViewedArrayBuffer]].
+            let receiver_is_base = abstract_ops::same_value(
+                &self.escape_scoped(receiver_handle),
+                &base,
+                &self.gc_heap,
+            );
             let direct = match key {
                 VmPropertyKey::Symbol(_) => Value::undefined(),
+                _ if !receiver_is_base => Value::undefined(),
                 _ => {
                     let key = key
                         .string_name()

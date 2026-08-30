@@ -68,7 +68,9 @@ pub(crate) enum Intrinsic {
     FunctionPrototype,
     /// `%Array.prototype%`.
     ArrayPrototype,
-    /// `%Promise.prototype%`.
+    /// `%Promise.prototype%`. Read through
+    /// [`Intrinsic::from_constructor_name`] like the rest of the
+    /// constructor-named slots.
     PromisePrototype,
     /// `%RegExp.prototype%`. Needed so the flag accessors (§22.2.6.x
     /// step 3a) can return `undefined` instead of throwing when invoked
@@ -91,6 +93,52 @@ pub(crate) enum Intrinsic {
     /// `%Set.prototype%`, for the same direct dispatch of
     /// `set.add/has/delete`.
     SetPrototype,
+    /// `%Boolean.prototype%`.
+    BooleanPrototype,
+    /// `%Symbol.prototype%`.
+    SymbolPrototype,
+    /// `%BigInt.prototype%`.
+    BigIntPrototype,
+    /// `%WeakMap.prototype%`.
+    WeakMapPrototype,
+    /// `%WeakSet.prototype%`.
+    WeakSetPrototype,
+    /// `%WeakRef.prototype%`.
+    WeakRefPrototype,
+    /// `%FinalizationRegistry.prototype%`.
+    FinalizationRegistryPrototype,
+    /// `%ArrayBuffer.prototype%`.
+    ArrayBufferPrototype,
+    /// `%SharedArrayBuffer.prototype%`.
+    SharedArrayBufferPrototype,
+    /// `%DataView.prototype%`.
+    DataViewPrototype,
+    /// `%Iterator.prototype%`.
+    IteratorPrototype,
+    /// `%Int8Array.prototype%`.
+    Int8ArrayPrototype,
+    /// `%Uint8Array.prototype%`.
+    Uint8ArrayPrototype,
+    /// `%Uint8ClampedArray.prototype%`.
+    Uint8ClampedArrayPrototype,
+    /// `%Int16Array.prototype%`.
+    Int16ArrayPrototype,
+    /// `%Uint16Array.prototype%`.
+    Uint16ArrayPrototype,
+    /// `%Int32Array.prototype%`.
+    Int32ArrayPrototype,
+    /// `%Uint32Array.prototype%`.
+    Uint32ArrayPrototype,
+    /// `%Float16Array.prototype%`.
+    Float16ArrayPrototype,
+    /// `%Float32Array.prototype%`.
+    Float32ArrayPrototype,
+    /// `%Float64Array.prototype%`.
+    Float64ArrayPrototype,
+    /// `%BigInt64Array.prototype%`.
+    BigInt64ArrayPrototype,
+    /// `%BigUint64Array.prototype%`.
+    BigUint64ArrayPrototype,
 }
 
 impl Intrinsic {
@@ -106,10 +154,33 @@ impl Intrinsic {
         Self::NumberPrototype,
         Self::MapPrototype,
         Self::SetPrototype,
+        Self::BooleanPrototype,
+        Self::SymbolPrototype,
+        Self::BigIntPrototype,
+        Self::WeakMapPrototype,
+        Self::WeakSetPrototype,
+        Self::WeakRefPrototype,
+        Self::FinalizationRegistryPrototype,
+        Self::ArrayBufferPrototype,
+        Self::SharedArrayBufferPrototype,
+        Self::DataViewPrototype,
+        Self::IteratorPrototype,
+        Self::Int8ArrayPrototype,
+        Self::Uint8ArrayPrototype,
+        Self::Uint8ClampedArrayPrototype,
+        Self::Int16ArrayPrototype,
+        Self::Uint16ArrayPrototype,
+        Self::Int32ArrayPrototype,
+        Self::Uint32ArrayPrototype,
+        Self::Float16ArrayPrototype,
+        Self::Float32ArrayPrototype,
+        Self::Float64ArrayPrototype,
+        Self::BigInt64ArrayPrototype,
+        Self::BigUint64ArrayPrototype,
     ];
 
     /// Number of slots.
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 33;
 
     /// Global constructor whose `.prototype` fills this slot.
     const fn constructor_name(self) -> &'static str {
@@ -124,7 +195,41 @@ impl Intrinsic {
             Self::NumberPrototype => "Number",
             Self::MapPrototype => "Map",
             Self::SetPrototype => "Set",
+            Self::BooleanPrototype => "Boolean",
+            Self::SymbolPrototype => "Symbol",
+            Self::BigIntPrototype => "BigInt",
+            Self::WeakMapPrototype => "WeakMap",
+            Self::WeakSetPrototype => "WeakSet",
+            Self::WeakRefPrototype => "WeakRef",
+            Self::FinalizationRegistryPrototype => "FinalizationRegistry",
+            Self::ArrayBufferPrototype => "ArrayBuffer",
+            Self::SharedArrayBufferPrototype => "SharedArrayBuffer",
+            Self::DataViewPrototype => "DataView",
+            Self::IteratorPrototype => "Iterator",
+            Self::Int8ArrayPrototype => "Int8Array",
+            Self::Uint8ArrayPrototype => "Uint8Array",
+            Self::Uint8ClampedArrayPrototype => "Uint8ClampedArray",
+            Self::Int16ArrayPrototype => "Int16Array",
+            Self::Uint16ArrayPrototype => "Uint16Array",
+            Self::Int32ArrayPrototype => "Int32Array",
+            Self::Uint32ArrayPrototype => "Uint32Array",
+            Self::Float16ArrayPrototype => "Float16Array",
+            Self::Float32ArrayPrototype => "Float32Array",
+            Self::Float64ArrayPrototype => "Float64Array",
+            Self::BigInt64ArrayPrototype => "BigInt64Array",
+            Self::BigUint64ArrayPrototype => "BigUint64Array",
         }
+    }
+
+    /// The slot whose `.prototype` a global constructor name fills, if
+    /// the registry caches one. Lets every
+    /// `OrdinaryCreateFromConstructor`-style lookup read the realm's
+    /// intrinsic instead of the mutable global binding, which user code
+    /// can replace.
+    pub(crate) fn from_constructor_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|slot| slot.constructor_name() == name)
     }
 }
 
@@ -165,7 +270,6 @@ intrinsic_accessors! {
     object_prototype => ObjectPrototype,
     function_prototype => FunctionPrototype,
     array_prototype => ArrayPrototype,
-    promise_prototype => PromisePrototype,
     regexp_prototype => RegExpPrototype,
     date_prototype => DatePrototype,
     string_prototype => StringPrototype,
@@ -254,7 +358,7 @@ mod tests {
         );
         assert!(slots.array_prototype().is_some(), "Array.prototype cached");
         assert!(
-            slots.promise_prototype().is_some(),
+            slots.get(Intrinsic::PromisePrototype).is_some(),
             "Promise.prototype cached"
         );
     }
@@ -310,7 +414,10 @@ mod tests {
         let object_slot = interp.realm_intrinsics().object_prototype().unwrap();
         let function_slot = interp.realm_intrinsics().function_prototype().unwrap();
         let array_slot = interp.realm_intrinsics().array_prototype().unwrap();
-        let promise_slot = interp.realm_intrinsics().promise_prototype().unwrap();
+        let promise_slot = interp
+            .realm_intrinsics()
+            .get(Intrinsic::PromisePrototype)
+            .unwrap();
         assert_eq!(
             object_slot,
             resolve_prototype(global, &mut interp.gc_heap, "Object").unwrap(),

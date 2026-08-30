@@ -453,21 +453,13 @@ impl Interpreter {
         &mut self,
         constructor_name: &str,
     ) -> Result<Value, VmError> {
-        // Fast path: typed slot for well-known intrinsics. Avoids the
-        // global → ctor → prototype double-lookup that fires on every
-        // `OrdinaryCreateFromConstructor` style allocation.
-        let cached = match constructor_name {
-            "Object" => self.realm_intrinsics.object_prototype(),
-            "Function" => self.realm_intrinsics.function_prototype(),
-            "Array" => self.realm_intrinsics.array_prototype(),
-            "Promise" => self.realm_intrinsics.promise_prototype(),
-            "RegExp" => self.realm_intrinsics.regexp_prototype(),
-            "String" => self.realm_intrinsics.string_prototype(),
-            "Number" => self.realm_intrinsics.number_prototype(),
-            "Map" => self.realm_intrinsics.map_prototype(),
-            "Set" => self.realm_intrinsics.set_prototype(),
-            _ => None,
-        };
+        // The realm's own intrinsic, not `globalThis[name].prototype`:
+        // replacing a global constructor must not change the prototype
+        // an internal allocation stamps on a new object. The lookup also
+        // avoids the global → ctor → prototype double-walk that fires on
+        // every `OrdinaryCreateFromConstructor` style allocation.
+        let cached = crate::realm_intrinsics::Intrinsic::from_constructor_name(constructor_name)
+            .and_then(|slot| self.realm_intrinsics.get(slot));
         if let Some(proto) = cached {
             return Ok(Value::object(proto));
         }

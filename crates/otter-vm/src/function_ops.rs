@@ -2695,12 +2695,8 @@ impl Interpreter {
         constructor_name: &str,
         name: &str,
     ) -> Option<Value> {
-        let cached = match constructor_name {
-            "Object" => self.realm_intrinsics.object_prototype(),
-            "Function" => self.realm_intrinsics.function_prototype(),
-            "Array" => self.realm_intrinsics.array_prototype(),
-            _ => None,
-        };
+        let cached = crate::realm_intrinsics::Intrinsic::from_constructor_name(constructor_name)
+            .and_then(|slot| self.realm_intrinsics.get(slot));
         if let Some(prototype_obj) = cached {
             return crate::object::get(prototype_obj, &self.gc_heap, name);
         }

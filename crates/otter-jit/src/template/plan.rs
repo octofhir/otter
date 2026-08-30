@@ -698,6 +698,19 @@ impl TemplatePlan {
         let mut register_operands: Vec<u16> = Vec::new();
         let mut index_operands: Vec<u32> = Vec::new();
         let mut osr_only = false;
+        // §14.15.3 — a `return` inside a `try` whose region owns a
+        // `finally` must run that finally before the frame completes.
+        // Generated code returns straight through its epilogue, so such
+        // a return takes the exact side exit at its own PC and the
+        // interpreter owns the completion.
+        let finally_protected: Vec<(u32, u32)> = view
+            .code_block
+            .control_flow()
+            .exception_regions()
+            .iter()
+            .filter(|region| region.finally_pc.is_some())
+            .map(|region| (region.enter_pc, region.end_pc))
+            .collect();
         for (meta, lowered) in view.instructions.iter().zip(&lowering.instructions) {
             let pc = lowered.instruction_pc;
             // The immediate-right binary operators carry no tier opcode: expand
@@ -1710,6 +1723,14 @@ impl TemplatePlan {
                         src: operands.src,
                         hint: operands.hint,
                     }
+                }
+                Op::Return | Op::ReturnValue | Op::ReturnUndefined
+                    if finally_protected
+                        .iter()
+                        .any(|(enter, end)| pc > *enter && pc <= *end) =>
+                {
+                    osr_only = true;
+                    TemplateOp::UnsupportedBail
                 }
                 Op::Return | Op::ReturnValue => TemplateOp::Return {
                     src: lowered.source_operands()?.src,

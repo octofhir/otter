@@ -551,7 +551,36 @@ fn impl_acosh(args: &[NumberValue]) -> NumberValue {
     unary(args, f64::acosh)
 }
 fn impl_atanh(args: &[NumberValue]) -> NumberValue {
-    unary(args, f64::atanh)
+    unary(args, atanh)
+}
+
+/// §21.3.2.7 `Math.atanh` with fdlibm's argument reduction.
+///
+/// `f64::atanh` evaluates `0.5 * ln_1p(2x / (1 - x))` on the signed
+/// argument, so a negative `x` near `-1` computes `ln_1p` of a value
+/// near `-1` and loses most of its significand. Reducing to `|x|`
+/// first keeps the ratio large exactly where the cancellation would
+/// otherwise happen, then the sign is restored.
+fn atanh(x: f64) -> f64 {
+    let t = x.abs();
+    if t.is_nan() || t > 1.0 {
+        return f64::NAN;
+    }
+    if t == 1.0 {
+        return f64::INFINITY.copysign(x);
+    }
+    // Below 2^-28 the series is `x` to the last bit, and this also
+    // carries the sign of a zero through unchanged.
+    if t < 2.0_f64.powi(-28) {
+        return x;
+    }
+    let magnitude = if t < 0.5 {
+        let two_t = t + t;
+        0.5 * (two_t + two_t * t / (1.0 - t)).ln_1p()
+    } else {
+        0.5 * ((t + t) / (1.0 - t)).ln_1p()
+    };
+    magnitude.copysign(x)
 }
 fn impl_cbrt(args: &[NumberValue]) -> NumberValue {
     unary(args, f64::cbrt)

@@ -320,9 +320,24 @@ depth (asserted at depth 4096), the one analysis that is not linear carries an
 explicit transition budget, and the decoder bounds every allocation by the
 remaining input length.
 
-Still open for B1: agreement tests that run one verified artifact through the
-interpreter and each JIT tier and compare observable results, which belongs
-with the artifact-level differential work in B2.
+Artifact-level agreement is covered by
+`crates/otter-jit/tests/artifact_agreement.rs`: one verified artifact is run on
+the interpreter and on the JIT with the OSR threshold lowered so the loop body
+is compiled, and the two outcomes must match. Building the artifact directly
+reaches shapes no compiler emits, which is the point — `otter-difftest`
+compares tiers from JavaScript source and can only exercise what the compiler
+chooses to produce.
+
+That distinction paid immediately. The suite found an open defect: an artifact
+whose sole terminator is `Throw` — a hot loop with no `Return` anywhere —
+completes on the interpreter and never leaves the loop in compiled code, so the
+process spins. The case is `#[ignore]`d with the reason recorded and its JIT
+observation bounded by a worker-thread timeout, so running it reports a typed
+disagreement instead of hanging. No source-level function ends this way, which
+is exactly why only an artifact-level consumer test reaches it. Fixing it is the
+next B1 slice; `finally` reached through tier-up stays covered from source by
+the difftest corpus, because emitting a correct finally by hand means
+reproducing the compiler's parked-completion protocol.
 
 ### B2. Fuzzing and differential checks
 

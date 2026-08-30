@@ -79,6 +79,7 @@ verifier-gate:
     cargo test --release -p otter-bytecode
     cargo test --release -p otter-vm --lib code_space
     cargo test --release -p otter-vm --test snapshot_boundary
+    cargo test --release -p otter-jit --test artifact_agreement
 
 # Iteration gate: fmt, clippy, vm/jit/bytecode tests, difftest across tiers,
 # kernel ledger. Deliberately excludes test262 — that is the closing gate,

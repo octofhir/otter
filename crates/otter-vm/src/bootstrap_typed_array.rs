@@ -854,6 +854,22 @@ fn ta_ctor_dispatch(
         let mut rooted_args: SmallVec<[Local<'_>; 4]> =
             args.iter().map(|value| scope.value(*value)).collect();
 
+        // §23.2.5.1 steps 5 and 6.b.i — with no arguments, or with an
+        // Object first argument, AllocateTypedArray runs FIRST, so
+        // `new.target.prototype` is read before any other observable
+        // step (the byteOffset / length coercions, the detached-buffer
+        // check, the iterator drain). Only the numeric-length overload
+        // (step 6.c) runs ToIndex before allocating.
+        let allocate_before_arguments = rooted_args
+            .first()
+            .copied()
+            .is_none_or(|value| scope.raw(value).is_object_type());
+        let early_proto = if allocate_before_arguments {
+            resolve_typed_array_new_target_proto(&mut scope, kind)?
+        } else {
+            None
+        };
+
         // §23.2.5.1 — any Object source other than an ArrayBuffer or a
         // TypedArray initializes from @@iterator / array-like reads. Keep the
         // source, iterator methods, yielded values, and conversions in this
@@ -908,7 +924,8 @@ fn ta_ctor_dispatch(
                     vm_to_native(scope.context().interp_mut(), error, typed_array_name(kind))
                 })?;
                 let value = scope.value(value);
-                let value = apply_typed_array_new_target_proto(&mut scope, kind, value)?;
+                let value =
+                    apply_typed_array_new_target_proto(&mut scope, kind, value, early_proto)?;
                 return Ok(scope.finish(value));
             }
         }
@@ -923,6 +940,24 @@ fn ta_ctor_dispatch(
             && let Some(exec) = exec.as_ref()
         {
             for idx in 1..=2 {
+                if idx == 2 {
+                    // §23.2.5.1.5 step 3 — the `offset modulo elementSize`
+                    // RangeError is observed BEFORE `ToIndex(length)`, so
+                    // the length argument's coercion must not run first.
+                    if let Some(offset) = rooted_args.get(1).copied()
+                        && let Some(index) =
+                            crate::binary::to_index(&scope.raw(offset), scope.context().heap())
+                        && !(index as usize).is_multiple_of(kind.bytes_per_element())
+                    {
+                        return Err(NativeError::RangeError {
+                            name: typed_array_name(kind),
+                            reason: format!(
+                                "start offset must be a multiple of {}",
+                                kind.bytes_per_element()
+                            ),
+                        });
+                    }
+                }
                 let Some(value) = rooted_args.get(idx).copied() else {
                     continue;
                 };
@@ -980,24 +1015,45 @@ fn ta_ctor_dispatch(
         let value = scope.value(value);
         // §10.1.13 GetPrototypeFromConstructor — derived `super()`
         // construction forwards `new.target`.
-        let value = apply_typed_array_new_target_proto(&mut scope, kind, value)?;
+        let value = apply_typed_array_new_target_proto(&mut scope, kind, value, early_proto)?;
         Ok(scope.finish(value))
     })
+}
+
+/// §10.1.13 GetPrototypeFromConstructor for a TypedArray allocation.
+///
+/// `None` when `new.target` is the intrinsic constructor itself — the
+/// allocation already carries the kind's own prototype, so no override
+/// is stored.
+fn resolve_typed_array_new_target_proto<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    kind: TypedArrayKind,
+) -> Result<Option<Local<'scope>>, NativeError> {
+    if scope
+        .context()
+        .new_target()
+        .is_some_and(|target| target.is_native_function())
+    {
+        return Ok(None);
+    }
+    Ok(
+        crate::bootstrap::native_new_target_prototype(scope.context(), typed_array_name(kind))?
+            .map(|proto| scope.value(proto)),
+    )
 }
 
 fn apply_typed_array_new_target_proto<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     kind: TypedArrayKind,
     value: Local<'scope>,
+    early_proto: Option<Local<'scope>>,
 ) -> Result<Local<'scope>, NativeError> {
-    let needs_proto_override = !scope
-        .context()
-        .new_target()
-        .is_some_and(|target| target.is_native_function());
-    if needs_proto_override
-        && let Some(proto) =
-            crate::bootstrap::native_new_target_prototype(scope.context(), typed_array_name(kind))?
-    {
+    let proto = match early_proto {
+        Some(proto) => Some(proto),
+        None => resolve_typed_array_new_target_proto(scope, kind)?,
+    };
+    if let Some(proto) = proto {
+        let proto = scope.raw(proto);
         let current = scope.raw(value);
         scope
             .context()

@@ -408,13 +408,12 @@ fn construct_typed_array_with_roots(
         return new_zeroed_typed_array_with_roots(kind, 0, interp, external_visit);
     }
     if let Some(buf) = first.as_array_buffer() {
-        if buf.is_detached(interp.gc_heap()) {
-            return Err(VmError::TypeMismatch);
-        }
-        // §23.2.5.1 InitializeTypedArrayFromArrayBuffer: byteOffset
-        // coercion and alignment / bounds failures are RangeErrors
-        // (TypeError only for the Symbol/BigInt ToNumber failures that
-        // `to_index_error` distinguishes).
+        // §23.2.5.1.5 InitializeTypedArrayFromArrayBuffer, in order:
+        // ToIndex(byteOffset), the alignment RangeError, ToIndex(length),
+        // and only then the detached-buffer TypeError. Alignment and
+        // bounds failures are RangeErrors (TypeError is reserved for the
+        // Symbol / BigInt ToNumber failures `to_index_error`
+        // distinguishes).
         let byte_offset = match args.get(1) {
             None => 0u64,
             Some(v) if v.is_undefined() => 0u64,
@@ -426,13 +425,24 @@ fn construct_typed_array_with_roots(
                 interp.err_range((format!("start offset must be a multiple of {bpe}")).into())
             );
         }
+        let requested_length: Option<usize> = match args.get(2) {
+            None => None,
+            Some(v) if v.is_undefined() => None,
+            Some(v) => Some(
+                to_index(v, interp.gc_heap_mut())
+                    .ok_or_else(|| to_index_error(interp, v, "length"))? as usize,
+            ),
+        };
+        if buf.is_detached(interp.gc_heap()) {
+            return Err(VmError::TypeMismatch);
+        }
         let buf_len = buf.byte_length(interp.gc_heap());
         if byte_offset > buf_len {
             return Err(interp.err_range(
                 ("start offset is outside the bounds of the buffer".to_string()).into(),
             ));
         }
-        let length = match args.get(2) {
+        let length = match requested_length {
             None => {
                 let remaining = buf_len - byte_offset;
                 // §23.2.5.1 — the multiple-of-elementSize requirement
@@ -447,24 +457,7 @@ fn construct_typed_array_with_roots(
                 }
                 remaining / bpe
             }
-            Some(v) if v.is_undefined() => {
-                let remaining = buf_len - byte_offset;
-                // §23.2.5.1 — the multiple-of-elementSize requirement
-                // applies only to fixed-length buffers; a resizable
-                // buffer with auto length is length-tracking and simply
-                // floors (bytesAvailable / elementSize).
-                if !buf.is_resizable(interp.gc_heap()) && !remaining.is_multiple_of(bpe) {
-                    return Err(interp.err_range(
-                        (format!("buffer length minus the offset must be a multiple of {bpe}"))
-                            .into(),
-                    ));
-                }
-                remaining / bpe
-            }
-            Some(v) => {
-                let n = to_index(v, interp.gc_heap_mut())
-                    .ok_or_else(|| to_index_error(interp, v, "length"))?
-                    as usize;
+            Some(n) => {
                 if byte_offset + n * bpe > buf_len {
                     return Err(interp.err_range(("invalid typed array length".to_string()).into()));
                 }
@@ -477,8 +470,7 @@ fn construct_typed_array_with_roots(
         // §23.2.5.1 — absent length over a length-resizable buffer (a
         // resizable ArrayBuffer or a growable SharedArrayBuffer) makes
         // [[ArrayLength]] AUTO (length-tracking).
-        let length_absent = args.get(2).is_none() || args.get(2).is_some_and(|v| v.is_undefined());
-        if length_absent
+        if requested_length.is_none()
             && (buf.is_resizable(interp.gc_heap()) || buf.is_growable(interp.gc_heap()))
         {
             view.set_length_tracking(interp.gc_heap_mut());

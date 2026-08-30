@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "8b46a9d97b7b71aa31afa007d40f9da185836fbe",
-  "ran_at": "2026-08-29T23:07:43.541981+00:00",
+  "engine_commit": "41a8ce212b80b552087b8aa2e5ac430c4c00b6da",
+  "ran_at": "2026-08-30T01:02:13.650397+00:00",
   "totals": {
     "total": 53575,
-    "passed": 52439,
-    "failed": 36,
+    "passed": 52453,
+    "failed": 22,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -40910,8 +40910,8 @@
     },
     "staging/sm/Array": {
       "total": 90,
-      "passed": 87,
-      "failed": 3,
+      "passed": 90,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40946,8 +40946,8 @@
     },
     "staging/sm/BigInt": {
       "total": 5,
-      "passed": 4,
-      "failed": 1,
+      "passed": 5,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41036,8 +41036,8 @@
     },
     "staging/sm/Math": {
       "total": 30,
-      "passed": 29,
-      "failed": 1,
+      "passed": 30,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41081,8 +41081,8 @@
     },
     "staging/sm/Reflect": {
       "total": 17,
-      "passed": 16,
-      "failed": 1,
+      "passed": 17,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41090,8 +41090,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 88,
-      "failed": 3,
+      "passed": 90,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41126,8 +41126,8 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 91,
-      "failed": 5,
+      "passed": 95,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41189,8 +41189,8 @@
     },
     "staging/sm/expressions": {
       "total": 42,
-      "passed": 41,
-      "failed": 1,
+      "passed": 42,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41279,8 +41279,8 @@
     },
     "staging/sm/regress": {
       "total": 106,
-      "passed": 104,
-      "failed": 2,
+      "passed": 105,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41416,58 +41416,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalled Expected SameValue(«true», «false») to be true"
     },
     {
-      "path": "staging/sm/Array/from-iterator-close.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"return getter throws\"», «\"defineProperty throws\"») to be true"
-    },
-    {
-      "path": "staging/sm/Array/from_proxy.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected [\"get\", Symbol(Symbol.iterator) as #2, \"get\", ref #2] to be structurally equal to [\"get\", Symbol(Symbol.iterator), \"get\", \"length\", \"get\", \"0\", \"get\", \"length\", \"get\", \"1\", \"get\", \"length\", \"get\", \"2\", \"get\", \"length\"]. "
-    },
-    {
-      "path": "staging/sm/Array/to-length.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assertion failed: expected exception, no exception thrown"
-    },
-    {
       "path": "staging/sm/ArrayBuffer/slice-species.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function ArrayBuffer() { [native code] }», «function ArrayBuffer() { [native code] }») to be true"
-    },
-    {
-      "path": "staging/sm/BigInt/Number-conversion-rounding.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«170141183460469231731687303715884105727n», «179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368n») to be true"
-    },
-    {
-      "path": "staging/sm/Math/atanh-approx.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Error: got -6.998237084679375, expected a number near -6.998237084679027 (relative error: 392)\n    at fail (test262-harness.js:301:19)\n    at assertNear (test262-harness.js:373:17)\n    at staging/sm/Math/atanh-approx.js:273:5"
-    },
-    {
-      "path": "staging/sm/Reflect/construct.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«», «[object Object]») to be true"
-    },
-    {
-      "path": "staging/sm/RegExp/ignoreCase-multiple.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/RegExp/ignoreCase-non-latin1-to-latin1.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/RegExp/lastIndex-match-or-replace.js",
@@ -41482,40 +41434,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/TypedArray/constructor-buffer-sequence.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ExpectedError but got a Error"
-    },
-    {
       "path": "staging/sm/TypedArray/from_constructor.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/TypedArray/iterator-next-with-detached.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined\n    at staging/sm/TypedArray/iterator-next-with-detached.js:50:5"
-    },
-    {
-      "path": "staging/sm/TypedArray/set-wrapped.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read properties of undefined\n    at staging/sm/TypedArray/set-wrapped.js:37:5"
-    },
-    {
-      "path": "staging/sm/TypedArray/slice-bitwise-same.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2143289344», «2139095041») to be true"
-    },
-    {
-      "path": "staging/sm/expressions/11.1.5-01.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: numeric index stringified correctly Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "staging/sm/extensions/arguments-property-access-in-function.js",
@@ -41540,12 +41462,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpected token\n    at testNormalAndStrict (staging/sm/misc/future-reserved-words.js:27:1)\n    at testWord (staging/sm/misc/future-reserved-words.js:59:3)\n    at staging/sm/misc/future-reserved-words.js:111:1"
-    },
-    {
-      "path": "staging/sm/regress/regress-1383630.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: proxy can't report a different 'enumerable' from target when target is not configurable Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "staging/sm/regress/regress-602621.js",

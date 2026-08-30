@@ -398,9 +398,29 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.93% at
-`0cd4aa90`, 36 fails, 0 crashes/timeouts (fourteen fixes vs the 50-fail
-set, zero regressions). The object-identity slice moved per-instance
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.96% at
+`3654f3d8`, 22 fails, 0 crashes/timeouts (fourteen fixes vs the 36-fail
+set, zero regressions). The spec-ordering slice moved every remaining
+observable step into its §-numbered position: the TypedArray constructor
+allocates (and reads `new.target.prototype`) before the byteOffset /
+length coercions and the detached check, and the alignment RangeError
+precedes ToIndex(length); Array.from performs GetMethod(@@iterator) once
+and its non-constructor branch is ArrayCreate(len); §7.4.9 IteratorClose
+run on an abrupt completion restores the caller's pending throw instead
+of letting a `return` getter's own throw replace it. Alongside that:
+non-unicode `i` canonicalizes through the Unicode uppercase mapping
+(§22.2.2.9) rather than an ASCII fold; the proxy
+getOwnPropertyDescriptor trap runs IsCompatiblePropertyDescriptor;
+`%TypedArray%.prototype.slice` copies bytes for a same-type transfer so
+a non-canonical NaN survives; a generic array-like iterator re-reads
+`length` and each element through the observable [[Get]]; a numeric
+literal property key with no settled integer spelling is formatted by
+the runtime's ToPropertyKey; NumberToBigInt reads the IEEE-754
+significand instead of saturating at `i128`; `Math.atanh` reduces to
+`|x|` first; `find` / `findIndex` keep a dense prefix over a pathological
+`length`; and the conformance harness defines `$262` on a created
+realm's global. The object-identity slice before it (36-fail baseline at
+`0cd4aa90`) moved per-instance
 function-object state out of the template-keyed side tables:
 [[Extensible]] and the [[Prototype]] override for a closure ride the
 closure body, so Object.seal / setPrototypeOf on one instance no longer

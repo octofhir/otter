@@ -398,9 +398,17 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.96% at
-`68ee255d`, 19 fails, 0 crashes/timeouts (three fixes vs the 22-fail
-set, zero regressions). The tier/realm slice closed a silent
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.97% at
+`bbcc1066`, 18 fails, 0 crashes/timeouts (one fix vs the 19-fail set,
+zero regressions). §13.3.6.1 reads the callee before the arguments, so a
+method call whose arguments can run user code loads the callee into its
+own register first; the fused method-call opcode stays for an argument
+list that cannot be ordered against that read. That split only became
+affordable because `Op::CallWithThis` — `obj[k](…)`, private method
+calls, and now these — had no call feedback slot at all and could never
+resolve a direct callee, leaving it 6.4x slower than the fused path; it
+is now a first-class call site with the generated direct-call edge. The
+tier/realm slice before it (19-fail baseline at `68ee255d`) closed a silent
 `finally` drop: generated template code returns through its own
 epilogue, so a `return` inside a `try` whose region owns a `finally`
 completed the frame without running it once the function was warm

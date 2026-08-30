@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "41a8ce212b80b552087b8aa2e5ac430c4c00b6da",
-  "ran_at": "2026-08-30T01:02:13.650397+00:00",
+  "engine_commit": "3e0072b9e57e2bdfd2a2f33e45ad4bf129d9fe96",
+  "ran_at": "2026-08-30T09:07:01.781115+00:00",
   "totals": {
     "total": 53575,
-    "passed": 52453,
-    "failed": 22,
+    "passed": 52456,
+    "failed": 19,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -41090,8 +41090,8 @@
     },
     "staging/sm/RegExp": {
       "total": 91,
-      "passed": 90,
-      "failed": 1,
+      "passed": 91,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41126,8 +41126,8 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 95,
-      "failed": 1,
+      "passed": 96,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41198,8 +41198,8 @@
     },
     "staging/sm/extensions": {
       "total": 64,
-      "passed": 62,
-      "failed": 2,
+      "passed": 63,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41422,19 +41422,7 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function ArrayBuffer() { [native code] }», «function ArrayBuffer() { [native code] }») to be true"
     },
     {
-      "path": "staging/sm/RegExp/lastIndex-match-or-replace.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/String/internalUsage.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/TypedArray/from_constructor.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
@@ -41444,12 +41432,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «5») to be true"
-    },
-    {
-      "path": "staging/sm/extensions/dataview.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError but got a different error constructor with the same name"
     },
     {
       "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",

@@ -1,16 +1,16 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `41a8ce212b80b552087b8aa2e5ac430c4c00b6da`
+- **Engine commit:** `3e0072b9e57e2bdfd2a2f33e45ad4bf129d9fe96`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-30T01:02:13.650397+00:00
+- **Captured:** 2026-08-30T09:07:01.781115+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52453 |
-| failed     | 22 |
+| passed     | 52456 |
+| failed     | 19 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
@@ -23,13 +23,11 @@
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
-| staging/sm/extensions | 64 | 62 | 2 | 96.9% |
 | language/eval-code/direct | 286 | 285 | 1 | 99.7% |
 | language/expressions/call | 92 | 90 | 1 | 98.9% |
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
-| staging/sm/RegExp | 91 | 90 | 1 | 98.9% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
-| staging/sm/TypedArray | 96 | 95 | 1 | 99.0% |
+| staging/sm/extensions | 64 | 63 | 1 | 98.4% |
 | staging/sm/lexical-environment | 34 | 33 | 1 | 97.1% |
 | staging/sm/misc | 18 | 17 | 1 | 94.4% |
 | staging/sm/regress | 106 | 105 | 1 | 99.1% |
@@ -72,6 +70,8 @@
 | built-ins/AggregateError/newtarget-proto-custom.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/newtarget-proto-fallback.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/newtarget-proto.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/order-of-args-evaluation.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/prop-desc.js | 1 | 1 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -89,11 +89,8 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct e… | `language/eval-code/direct/global-env-rec-with.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalle… | `language/expressions/call/11.2.3-3_3.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/ArrayBuffer/slice-species.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/RegExp/lastIndex-match-or-replace.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/String/internalUsage.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/TypedArray/from_constructor.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/arguments-property-access-in-function.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/dataview.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/misc/future-reserved-words.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: function… | `staging/sm/regress/regress-602621.js` |

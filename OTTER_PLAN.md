@@ -399,8 +399,20 @@ a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
 Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.96% at
-`3654f3d8`, 22 fails, 0 crashes/timeouts (fourteen fixes vs the 36-fail
-set, zero regressions). The spec-ordering slice moved every remaining
+`68ee255d`, 19 fails, 0 crashes/timeouts (three fixes vs the 22-fail
+set, zero regressions). The tier/realm slice closed a silent
+`finally` drop: generated template code returns through its own
+epilogue, so a `return` inside a `try` whose region owns a `finally`
+completed the frame without running it once the function was warm
+enough to tier up. Those returns now take the exact side exit, and the
+difftest corpus carries a case that reaches the tier-up threshold. Two
+prototype-resolution holes went with it: every constructor-named
+intrinsic prototype has a `RealmIntrinsics` slot, so replacing a global
+constructor no longer changes what an internal allocation stamps on a
+new object; and a body-slot exotic (ArrayBuffer, DataView, collections,
+Promise, iterators) is stamped with its creating realm's intrinsic, so
+it keeps that realm's methods and error classes after it crosses back.
+The spec-ordering slice before it (22-fail baseline at `3654f3d8`) moved every remaining
 observable step into its §-numbered position: the TypedArray constructor
 allocates (and reads `new.target.prototype`) before the byteOffset /
 length coercions and the detached check, and the alignment RangeError

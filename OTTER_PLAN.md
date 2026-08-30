@@ -70,7 +70,7 @@ claim.
 |---|---|---:|---|---|---|
 | H1 | Security | P0 | complete | none | every HTTP redirect hop and cached final alias is authorized |
 | H2 | Isolation | P0 | complete | R1 | bounded, capability-aware Workers with deterministic shutdown |
-| B1 | Bytecode | P0 | active | none | mandatory panic-free verifier before any bytecode executes |
+| B1 | Bytecode | P0 | complete | none | mandatory panic-free verifier before any bytecode executes |
 | R1 | Resources | P0 | active | none | one aggregate runtime budget and typed exhaustion errors |
 | R2 | Resources | P1 | active | R1 | bound code, source, module, queue, worker, and external memory |
 | E1 | Embedding | P1 | started by H1 | none | one reusable capability evaluator for all host surfaces |
@@ -297,15 +297,34 @@ verifier, its adversarial corpus, and the code-space / snapshot admission
 tests run under `just verifier-gate` and inside `scripts/gate.sh`.
 
 The corpus (`crates/otter-bytecode/tests/adversarial.rs`) drives seed modules
-spanning the control-flow, closure, constant, and metadata domains through
-single- and multi-byte flips, every truncation prefix, insertions, appended
-bytes, and tampered `u32` counts, plus structural mutations of the decoded
-module. Two properties are asserted on every artifact: the decoder never
+through single- and multi-byte flips, every truncation prefix, insertions,
+appended bytes, and tampered `u32` counts, plus structural mutations of the
+decoded module. The seeds span every opcode family that carries a verification
+domain of its own: control flow and handler nesting, closures and the capture
+spine, constants and metadata, the variadic call / construct / spread sites
+whose argument count rides in the instruction, the iteration protocol around a
+back edge, the suspension points of generator, async, and async-generator
+bodies, class construction with private names and `super` accessors, and module
+linkage with its `module_resolutions` and `module_inits` tables. Each family
+also carries a structural mutation, and each is rejected by the check that
+belongs to it — a closure capture-count mismatch, a call argument outside the
+register window, a back edge leaving the function, a suspension target outside
+the function table, a private name pointing at a number, a module-init function
+id past the table end. Two properties are asserted on every artifact: the decoder never
 panics, and it never returns a carrier its own verifier would reject. The
 corpus is deterministic — a fixed xorshift, no system entropy — so a failure
 reproduces byte for byte. Its teeth are demonstrated rather than assumed: a
 deliberately weakened constant-index bound and an injected panic on the
 metadata path are both caught by the sweeps.
+
+The two mutation layers reach different depths, and the split is measured
+rather than assumed. Byte flips reach the semantic checks in bulk — the
+closure verifier runs 1843 times across one single-byte sweep — but they
+almost never perturb an operand VALUE in place: the wordcode layout is tight,
+so a flip inside an operand word desynchronizes the instruction stream and is
+rejected by the decoder before the value is read. Byte mutation is therefore a
+panic-freedom and decode-consistency instrument, and the structural mutations
+are what exercise the value domains each semantic check owns.
 
 Two of the original bullets resolve differently than written. Register
 verification is index-domain only, and that is sufficient rather than

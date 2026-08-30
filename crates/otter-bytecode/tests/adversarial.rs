@@ -7,7 +7,9 @@
 //!
 //! # Contents
 //! - [`seed_corpus`] — modules spanning the opcode families with distinct
-//!   verification domains (control flow, closures, constants, metadata).
+//!   verification domains: control flow, closures, constants, metadata,
+//!   variadic call and construct sites, the iteration protocol, suspension
+//!   points, classes and private names, and module linkage.
 //! - Byte mutations — single- and two-byte flips, truncation, insertion, and
 //!   tampering with the leading counts a decoder sizes allocations from.
 //! - Structural mutations — decoded fields moved out of their legal domain,
@@ -23,8 +25,8 @@
 use otter_bytecode::binary::{ModuleDecodeError, decode_module, encode_module};
 use otter_bytecode::wordcode::FunctionCodeBuilder;
 use otter_bytecode::{
-    ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant, Function, NO_HANDLER_OFFSET, Op,
-    Operand, SourceKind, SpanEntry, TemplateSite,
+    ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant, Function, ModuleInit,
+    ModuleResolution, NO_HANDLER_OFFSET, Op, Operand, SourceKind, SpanEntry, TemplateSite,
 };
 
 /// Deterministic 64-bit xorshift. The corpus must reproduce byte for byte
@@ -204,6 +206,612 @@ fn seed_rich() -> BytecodeModule {
     }
 }
 
+/// Call, construct, and closure-construction sites: the variadic operand
+/// shapes whose argument count rides in the instruction, and the two opcodes
+/// that name another function in the module table.
+fn seed_calls() -> BytecodeModule {
+    let mut callee = FunctionCodeBuilder::new();
+    callee.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    callee.push(Op::Return, &[Operand::Register(0)]);
+
+    let mut captured = FunctionCodeBuilder::new();
+    captured.push(Op::LoadUpvalue, &[Operand::Register(0), Operand::Imm32(0)]);
+    captured.push(Op::Return, &[Operand::Register(0)]);
+
+    let mut tail = FunctionCodeBuilder::new();
+    tail.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    tail.push(
+        Op::TailCall,
+        &[
+            Operand::Register(1),
+            Operand::Register(0),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ],
+    );
+    tail.push(Op::ReturnUndefined, &[]);
+
+    let mut main = FunctionCodeBuilder::new();
+    main.push(Op::FreshUpvalue, &[Operand::Imm32(0)]);
+    main.push(
+        Op::MakeFunction,
+        &[Operand::Register(0), Operand::ConstIndex(0)],
+    );
+    main.push(
+        Op::MakeClosure,
+        &[
+            Operand::Register(1),
+            Operand::ConstIndex(1),
+            Operand::ConstIndex(1),
+            Operand::Imm32(0),
+        ],
+    );
+    main.push(Op::NewObject, &[Operand::Register(2)]);
+    main.push(
+        Op::Call,
+        &[
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::ConstIndex(1),
+            Operand::Register(2),
+        ],
+    );
+    main.push(
+        Op::CallWithThis,
+        &[
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::Register(2),
+            Operand::ConstIndex(1),
+            Operand::Register(2),
+        ],
+    );
+    main.push(
+        Op::CallMethodValue,
+        &[
+            Operand::Register(3),
+            Operand::Register(2),
+            Operand::ConstIndex(2),
+            Operand::ConstIndex(1),
+            Operand::Register(2),
+        ],
+    );
+    main.push(
+        Op::New,
+        &[
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::ConstIndex(0),
+        ],
+    );
+    main.push(
+        Op::CallSpread,
+        &[
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::Register(2),
+            Operand::Register(2),
+        ],
+    );
+    main.push(
+        Op::NewSpread,
+        &[
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::Register(2),
+        ],
+    );
+    main.push(Op::Return, &[Operand::Register(3)]);
+
+    BytecodeModule {
+        module: "file:///calls.js".to_string(),
+        template_sites: Vec::new(),
+        source_kind: SourceKind::JavaScript,
+        functions: vec![
+            Function {
+                id: 0,
+                name: "<main>".to_string(),
+                locals: 4,
+                own_upvalue_count: 1,
+                code: main.finish(),
+                module_url: "file:///calls.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 1,
+                name: "callee".to_string(),
+                locals: 1,
+                param_count: 1,
+                length: 1,
+                code: callee.finish(),
+                module_url: "file:///calls.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 2,
+                name: "captured".to_string(),
+                locals: 1,
+                inherited_upvalue_count: 1,
+                code: captured.finish(),
+                module_url: "file:///calls.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 3,
+                name: "tail".to_string(),
+                locals: 2,
+                code: tail.finish(),
+                module_url: "file:///calls.js".to_string(),
+                ..Default::default()
+            },
+        ],
+        function_source: None,
+        constants: vec![
+            Constant::FunctionId { index: 1 },
+            Constant::FunctionId { index: 2 },
+            Constant::String {
+                utf16: "method".encode_utf16().collect(),
+            },
+        ],
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
+    }
+}
+
+/// The iteration protocol: a `for…of` spine plus the close sequence and the
+/// async-iterator entry points, driven around a back edge so the control-flow
+/// analysis sees a loop rather than a straight line.
+fn seed_iterators() -> BytecodeModule {
+    let mut code = FunctionCodeBuilder::new();
+    code.push(Op::NewObject, &[Operand::Register(0)]);
+    code.push(
+        Op::GetIterator,
+        &[Operand::Register(1), Operand::Register(0)],
+    );
+    let head = code.next_pc();
+    code.push(
+        Op::IteratorNext,
+        &[
+            Operand::Register(2),
+            Operand::Register(3),
+            Operand::Register(1),
+        ],
+    );
+    code.push(Op::CheckIteratorResult, &[Operand::Register(2)]);
+    let exit = code.push(Op::JumpIfTrue, &[Operand::Imm32(0), Operand::Register(3)]);
+    let back = code.push(Op::Jump, &[Operand::Imm32(0)]);
+    let after = code.next_pc();
+    code.push(Op::IteratorCloseStart, &[Operand::Register(1)]);
+    code.push(Op::IteratorClose, &[Operand::Register(1)]);
+    code.push(Op::IteratorCloseEnd, &[Operand::Register(1)]);
+    code.push(
+        Op::GetAsyncIterator,
+        &[Operand::Register(4), Operand::Register(0)],
+    );
+    code.push(
+        Op::AsyncIteratorReturn,
+        &[
+            Operand::Register(5),
+            Operand::Register(6),
+            Operand::Register(4),
+        ],
+    );
+    code.push(Op::ForInKeys, &[Operand::Register(7), Operand::Register(0)]);
+    code.push(Op::Return, &[Operand::Register(2)]);
+    set_offset(&mut code, exit, 0, after);
+    set_offset(&mut code, back, 0, head);
+
+    BytecodeModule {
+        module: "file:///iterators.js".to_string(),
+        template_sites: Vec::new(),
+        source_kind: SourceKind::JavaScript,
+        functions: vec![Function {
+            id: 0,
+            name: "<main>".to_string(),
+            locals: 8,
+            code: code.finish(),
+            module_url: "file:///iterators.js".to_string(),
+            ..Default::default()
+        }],
+        function_source: None,
+        constants: Vec::new(),
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
+    }
+}
+
+/// Suspension points. Generator, async, and async-generator bodies carry the
+/// opcodes whose successor shape is a resumption rather than a plain
+/// fallthrough, and the flags that decide how a frame parks.
+fn seed_suspensions() -> BytecodeModule {
+    let mut generator = FunctionCodeBuilder::new();
+    generator.push(Op::GeneratorStart, &[]);
+    generator.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    generator.push(Op::Yield, &[Operand::Register(1), Operand::Register(0)]);
+    generator.push(
+        Op::YieldDelegate,
+        &[
+            Operand::Register(1),
+            Operand::Register(2),
+            Operand::Register(0),
+        ],
+    );
+    generator.push(Op::ReturnUndefined, &[]);
+
+    let mut asynchronous = FunctionCodeBuilder::new();
+    asynchronous.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    asynchronous.push(Op::Await, &[Operand::Register(1), Operand::Register(0)]);
+    asynchronous.push(Op::Return, &[Operand::Register(1)]);
+
+    let mut async_generator = FunctionCodeBuilder::new();
+    async_generator.push(Op::GeneratorStart, &[]);
+    async_generator.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    async_generator.push(Op::Await, &[Operand::Register(1), Operand::Register(0)]);
+    async_generator.push(Op::Yield, &[Operand::Register(2), Operand::Register(1)]);
+    async_generator.push(Op::ReturnUndefined, &[]);
+
+    let mut main = FunctionCodeBuilder::new();
+    main.push(
+        Op::MakeFunction,
+        &[Operand::Register(0), Operand::ConstIndex(0)],
+    );
+    main.push(
+        Op::MakeFunction,
+        &[Operand::Register(1), Operand::ConstIndex(1)],
+    );
+    main.push(
+        Op::MakeFunction,
+        &[Operand::Register(2), Operand::ConstIndex(2)],
+    );
+    main.push(
+        Op::Call,
+        &[
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::ConstIndex(0),
+        ],
+    );
+    main.push(Op::Return, &[Operand::Register(3)]);
+
+    BytecodeModule {
+        module: "file:///suspensions.js".to_string(),
+        template_sites: Vec::new(),
+        source_kind: SourceKind::JavaScript,
+        functions: vec![
+            Function {
+                id: 0,
+                name: "<main>".to_string(),
+                locals: 4,
+                code: main.finish(),
+                module_url: "file:///suspensions.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 1,
+                name: "gen".to_string(),
+                locals: 3,
+                is_generator: true,
+                code: generator.finish(),
+                module_url: "file:///suspensions.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 2,
+                name: "asyncFn".to_string(),
+                locals: 2,
+                is_async: true,
+                code: asynchronous.finish(),
+                module_url: "file:///suspensions.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 3,
+                name: "asyncGen".to_string(),
+                locals: 3,
+                is_async: true,
+                is_generator: true,
+                is_async_generator: true,
+                code: async_generator.finish(),
+                module_url: "file:///suspensions.js".to_string(),
+                ..Default::default()
+            },
+        ],
+        function_source: None,
+        constants: vec![
+            Constant::FunctionId { index: 1 },
+            Constant::FunctionId { index: 2 },
+            Constant::FunctionId { index: 3 },
+        ],
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
+    }
+}
+
+/// Class construction, private names, and the `super` accessors — the
+/// opcodes whose operands mix a private-name register, a class body, and a
+/// derived constructor's deferred `this` binding.
+fn seed_classes() -> BytecodeModule {
+    let mut constructor = FunctionCodeBuilder::new();
+    constructor.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    constructor.push(
+        Op::SuperConstruct,
+        &[
+            Operand::Register(1),
+            Operand::Register(0),
+            Operand::ConstIndex(0),
+        ],
+    );
+    constructor.push(Op::BindThisValue, &[Operand::Register(1)]);
+    constructor.push(
+        Op::LoadSuperProperty,
+        &[
+            Operand::Register(2),
+            Operand::Register(1),
+            Operand::ConstIndex(0),
+        ],
+    );
+    constructor.push(
+        Op::SetSuperProperty,
+        &[
+            Operand::Register(1),
+            Operand::ConstIndex(0),
+            Operand::Register(2),
+        ],
+    );
+    constructor.push(
+        Op::LoadSuperElement,
+        &[
+            Operand::Register(3),
+            Operand::Register(1),
+            Operand::Register(2),
+        ],
+    );
+    constructor.push(
+        Op::SetSuperElement,
+        &[
+            Operand::Register(1),
+            Operand::Register(2),
+            Operand::Register(3),
+        ],
+    );
+    constructor.push(
+        Op::SuperConstructSpread,
+        &[
+            Operand::Register(4),
+            Operand::Register(0),
+            Operand::Register(0),
+        ],
+    );
+    constructor.push(Op::ReturnUndefined, &[]);
+
+    let mut method = FunctionCodeBuilder::new();
+    method.push(Op::LoadThis, &[Operand::Register(0)]);
+    method.push(Op::Return, &[Operand::Register(0)]);
+
+    let mut main = FunctionCodeBuilder::new();
+    main.push(
+        Op::NewPrivateName,
+        &[Operand::Register(0), Operand::ConstIndex(0)],
+    );
+    main.push(Op::NewObject, &[Operand::Register(1)]);
+    main.push(
+        Op::MakeFunction,
+        &[Operand::Register(2), Operand::ConstIndex(1)],
+    );
+    main.push(
+        Op::MakeFunction,
+        &[Operand::Register(3), Operand::ConstIndex(2)],
+    );
+    main.push(
+        Op::MakeClass,
+        &[
+            Operand::Register(4),
+            Operand::Register(2),
+            Operand::Register(3),
+            Operand::Register(1),
+            Operand::Register(1),
+        ],
+    );
+    main.push(Op::ClassCheck, &[Operand::Imm32(0), Operand::Register(4)]);
+    main.push(
+        Op::PrivateSet,
+        &[
+            Operand::Register(1),
+            Operand::Register(0),
+            Operand::Register(4),
+        ],
+    );
+    main.push(
+        Op::PrivateGet,
+        &[
+            Operand::Register(5),
+            Operand::Register(1),
+            Operand::Register(0),
+        ],
+    );
+    main.push(
+        Op::PrivateBrandCheck,
+        &[Operand::Register(1), Operand::Register(0)],
+    );
+    main.push(
+        Op::SetFunctionName,
+        &[
+            Operand::Register(2),
+            Operand::Register(1),
+            Operand::ConstIndex(0),
+        ],
+    );
+    main.push(
+        Op::DefineDataProperty,
+        &[
+            Operand::Register(1),
+            Operand::Register(0),
+            Operand::Register(5),
+        ],
+    );
+    main.push(Op::Return, &[Operand::Register(5)]);
+
+    BytecodeModule {
+        module: "file:///classes.js".to_string(),
+        template_sites: Vec::new(),
+        source_kind: SourceKind::JavaScript,
+        functions: vec![
+            Function {
+                id: 0,
+                name: "<main>".to_string(),
+                locals: 6,
+                code: main.finish(),
+                module_url: "file:///classes.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 1,
+                name: "C".to_string(),
+                locals: 5,
+                is_strict: true,
+                is_derived_constructor: true,
+                code: constructor.finish(),
+                module_url: "file:///classes.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 2,
+                name: "m".to_string(),
+                locals: 1,
+                is_strict: true,
+                is_method: true,
+                code: method.finish(),
+                module_url: "file:///classes.js".to_string(),
+                ..Default::default()
+            },
+        ],
+        function_source: None,
+        constants: vec![
+            Constant::String {
+                utf16: "#field".encode_utf16().collect(),
+            },
+            Constant::FunctionId { index: 1 },
+            Constant::FunctionId { index: 2 },
+        ],
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
+    }
+}
+
+/// Module linkage: the instruction family that names another module by URL,
+/// plus the linker tables (`module_resolutions`, `module_inits`) whose
+/// function ids are a verification domain of their own.
+fn seed_modules() -> BytecodeModule {
+    let mut module_init = FunctionCodeBuilder::new();
+    module_init.push(Op::LoadUndefined, &[Operand::Register(0)]);
+    module_init.push(Op::ReturnUndefined, &[]);
+
+    let mut entry = FunctionCodeBuilder::new();
+    entry.push(
+        Op::EvaluateModule,
+        &[Operand::Register(0), Operand::ConstIndex(0)],
+    );
+    entry.push(Op::MarkModuleEvaluated, &[Operand::ConstIndex(0)]);
+    entry.push(
+        Op::ImportNamespace,
+        &[Operand::Register(1), Operand::ConstIndex(0)],
+    );
+    entry.push(
+        Op::ImportNamespaceDeferred,
+        &[Operand::Register(2), Operand::ConstIndex(0)],
+    );
+    entry.push(
+        Op::ModuleNamespaceObject,
+        &[Operand::Register(3), Operand::ConstIndex(0)],
+    );
+    entry.push(
+        Op::LoadImportBinding,
+        &[
+            Operand::Register(4),
+            Operand::ConstIndex(0),
+            Operand::ConstIndex(1),
+        ],
+    );
+    entry.push(Op::NewObject, &[Operand::Register(5)]);
+    entry.push(
+        Op::ImportNamespaceDynamic,
+        &[
+            Operand::Register(6),
+            Operand::Register(5),
+            Operand::Register(5),
+        ],
+    );
+    entry.push(
+        Op::ImportMetaResolve,
+        &[Operand::Register(7), Operand::Register(5)],
+    );
+    entry.push(
+        Op::StarReexport,
+        &[Operand::Register(5), Operand::Register(3)],
+    );
+    entry.push(Op::Return, &[Operand::Register(4)]);
+
+    BytecodeModule {
+        module: "file:///entry.js".to_string(),
+        template_sites: Vec::new(),
+        source_kind: SourceKind::JavaScript,
+        functions: vec![
+            Function {
+                id: 0,
+                name: "<entry>".to_string(),
+                locals: 8,
+                code: entry.finish(),
+                module_url: "file:///entry.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 1,
+                name: "<module-init>".to_string(),
+                locals: 1,
+                param_count: 2,
+                is_module: true,
+                is_strict: true,
+                code: module_init.finish(),
+                module_url: "file:///dep.js".to_string(),
+                ..Default::default()
+            },
+        ],
+        function_source: None,
+        constants: vec![
+            Constant::String {
+                utf16: "file:///dep.js".encode_utf16().collect(),
+            },
+            Constant::String {
+                utf16: "name".encode_utf16().collect(),
+            },
+        ],
+        module_resolutions: vec![
+            ModuleResolution {
+                referrer: "file:///entry.js".to_string(),
+                specifier: "./dep.js".to_string(),
+                attr_type: None,
+                target: "file:///dep.js".to_string(),
+                deferred: false,
+                dynamic: false,
+                synthetic: false,
+            },
+            ModuleResolution {
+                referrer: "file:///entry.js".to_string(),
+                specifier: "./dep.js".to_string(),
+                attr_type: Some("json".to_string()),
+                target: "file:///dep.js".to_string(),
+                deferred: true,
+                dynamic: true,
+                synthetic: true,
+            },
+        ],
+        module_inits: vec![ModuleInit {
+            url: "file:///dep.js".to_string(),
+            function_id: 1,
+        }],
+    }
+}
+
 /// Rewrite one control-flow operand so it lands on `target`.
 ///
 /// Wordcode targets are relative to the instruction AFTER the one carrying
@@ -222,6 +830,11 @@ fn seed_corpus() -> Vec<(&'static str, BytecodeModule)> {
         ("minimal", seed_minimal()),
         ("handlers", seed_handlers()),
         ("rich", seed_rich()),
+        ("calls", seed_calls()),
+        ("iterators", seed_iterators()),
+        ("suspensions", seed_suspensions()),
+        ("classes", seed_classes()),
+        ("modules", seed_modules()),
     ]
 }
 
@@ -396,6 +1009,51 @@ fn structural_mutations_are_typed_rejections() {
         module.functions[0].spans[0].pc = 4_000;
         module
     };
+    let closure_capture_count_mismatch = {
+        let mut module = seed_calls();
+        module.functions[2].inherited_upvalue_count = 2;
+        module
+    };
+    let call_argument_out_of_window = {
+        let mut module = seed_calls();
+        let mut code = module.functions[0].code.to_builder();
+        code.replace(
+            4,
+            Op::Call,
+            &[
+                Operand::Register(3),
+                Operand::Register(0),
+                Operand::ConstIndex(1),
+                Operand::Register(200),
+            ],
+        );
+        module.functions[0].code = code.finish();
+        module
+    };
+    let iterator_loop_leaves_the_function = {
+        let mut module = seed_iterators();
+        let mut code = module.functions[0].code.to_builder();
+        code.replace(5, Op::Jump, &[Operand::Imm32(1_000_000)]);
+        module.functions[0].code = code.finish();
+        module
+    };
+    let suspension_target_outside_the_table = {
+        let mut module = seed_suspensions();
+        module.constants[2] = Constant::FunctionId { index: 9 };
+        module
+    };
+    let private_name_of_the_wrong_constant_kind = {
+        let mut module = seed_classes();
+        module.constants[0] = Constant::Number {
+            bits: 1.0f64.to_bits(),
+        };
+        module
+    };
+    let module_init_outside_the_table = {
+        let mut module = seed_modules();
+        module.module_inits[0].function_id = 42;
+        module
+    };
 
     for (name, module) in [
         ("sparse function ids", sparse),
@@ -407,6 +1065,30 @@ fn structural_mutations_are_typed_rejections() {
         (
             "immediate destination aliasing its left operand",
             aliased_immediate_destination,
+        ),
+        (
+            "closure capture count mismatch",
+            closure_capture_count_mismatch,
+        ),
+        (
+            "call argument outside the window",
+            call_argument_out_of_window,
+        ),
+        (
+            "iterator back edge leaving the function",
+            iterator_loop_leaves_the_function,
+        ),
+        (
+            "suspension target outside the function table",
+            suspension_target_outside_the_table,
+        ),
+        (
+            "private name of the wrong constant kind",
+            private_name_of_the_wrong_constant_kind,
+        ),
+        (
+            "module init outside the function table",
+            module_init_outside_the_table,
         ),
     ] {
         assert!(

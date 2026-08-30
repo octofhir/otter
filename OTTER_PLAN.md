@@ -49,8 +49,8 @@ claim.
 
 ## Live snapshot
 
-- Snapshot date: 2026-08-24.
-- Observed commit: `708c7bc5` (clean tree at snapshot time).
+- Snapshot date: 2026-08-30.
+- Observed commit: `242593b2` (clean tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: compile-cache unit/Unix tests
@@ -60,8 +60,8 @@ claim.
   `cargo check --all-targets`, and `clippy --all-targets --all-features
   -D warnings`. These are local observations, not a publishable clean-tree
   baseline.
-- The published `ES_CONFORMANCE.md` snapshot is historical. A fresh full run
-  is required before claiming a new conformance number.
+- `ES_CONFORMANCE.md` and `docs/site/public/conformance/data.json` are current
+  as of this commit: 99.98%, 12 fails of 53575, no crashes or timeouts.
 - No performance result from this dirty snapshot is eligible for publication.
 
 ## Program scorecard
@@ -76,7 +76,7 @@ claim.
 | E1 | Embedding | P1 | started by H1 | none | one reusable capability evaluator for all host surfaces |
 | J1 | JIT | P1 | active lane | B1, R1 | one typed target-neutral compiled pipeline |
 | J2 | Portability | P1 | queued | J1 | x86-64 parity over the same Machine IR |
-| C1 | Conformance | P1 | queued | current slices | reproducible green targeted and full Test262 baselines |
+| C1 | Conformance | P1 | complete | none | reproducible full Test262 baseline, 99.98%, residual documented |
 | O1 | Observability | P1 | started | R1 | resource, scheduling, JIT, and denial telemetry |
 
 Status meanings: `active` is the current implementation slice, `queued` has
@@ -393,210 +393,48 @@ bootstrap allocations, native-call allocations, and host-call transition cost.
 
 ### C1. Reproducible conformance baseline
 
-Before changing a language area, consult `ES_CONFORMANCE.md` and run its focused
-Test262 subset. After a substantial semantic slice, capture a fresh full run on
-a stable checkout and update the report with commit, configuration, pass/fail,
-timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
+Complete, with a documented residual. Before changing a language area, consult
+`ES_CONFORMANCE.md` and run its focused Test262 subset. After a substantial
+semantic slice, capture a fresh full run on a stable checkout and update the
+report with commit, configuration, pass/fail, timeout, and deltas. Never hide
+timeouts or compare partial runs as full runs, and diff failing *sets* rather
+than counts.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.98% at
-the legacy-surface slice, 12 fails, 0 crashes/timeouts (six fixes vs the
-18-fail set, zero regressions). The remaining twelve are nine intl402
-`DateTimeFormat` cases needing CLDR interval patterns, the chinese /
-dangi calendars, and `Intl.Era-monthcode`; one locale-padding case; and
-two mutually exclusive Annex B tests. That slice closed five legacy
-surfaces. §B.2.4 gives the `RegExp` constructor its match accessors
-(`input`, `lastMatch`, `$1`-`$9`, …), holding one subject handle plus
-index ranges on the realm so a match allocates nothing and the accessors
-slice on read; subclass-constructed instances and engine-hosted module
-literals opt out so internals never clobber program state. `fn.arguments`
-now answers with the running activation's arguments: building a frame's
-own arguments object had been *draining* the cold record's incoming
-values, and a sloppy function whose body never names `arguments` never
-captured them at all — a compilation unit that reads the property
-anywhere now materializes them. A direct eval inside `with` resolves
-against the object environment again: its captured cell already reached
-the eval body as an ordinary caller binding, but every inherited binding
-landed flat in the chunk's own function scope, so the caller's lexical
-depth had to travel with it for §9.1.1.2.1 to order declarations against
-object environments. `let` is a label in sloppy code once more, through a
-second parse-patch rule that rewrites the keyword to its escaped
-spelling — the same cooked LabelIdentifier, taking OXC's identifier path
-instead of its declaration path, with strict rejection still coming from
-the early-error pass. And the buffer a TypedArray constructor allocates
-implicitly is stamped with its creating realm's prototype, so a foreign
-buffer's `constructor` — and therefore `ArrayBuffer.prototype.slice`'s
-species lookup — resolves in the realm that made it. Assigning to an own
-accessor of a native function object also runs its setter now; an
-accessor descriptor carries no `[[Writable]]`, so the store path had
-been reporting these properties read-only. §13.3.6.1 reads the callee before the arguments, so a
-method call whose arguments can run user code loads the callee into its
-own register first; the fused method-call opcode stays for an argument
-list that cannot be ordered against that read. That split only became
-affordable because `Op::CallWithThis` — `obj[k](…)`, private method
-calls, and now these — had no call feedback slot at all and could never
-resolve a direct callee, leaving it 6.4x slower than the fused path; it
-is now a first-class call site with the generated direct-call edge. The
-tier/realm slice before it (19-fail baseline at `68ee255d`) closed a silent
-`finally` drop: generated template code returns through its own
-epilogue, so a `return` inside a `try` whose region owns a `finally`
-completed the frame without running it once the function was warm
-enough to tier up. Those returns now take the exact side exit, and the
-difftest corpus carries a case that reaches the tier-up threshold. Two
-prototype-resolution holes went with it: every constructor-named
-intrinsic prototype has a `RealmIntrinsics` slot, so replacing a global
-constructor no longer changes what an internal allocation stamps on a
-new object; and a body-slot exotic (ArrayBuffer, DataView, collections,
-Promise, iterators) is stamped with its creating realm's intrinsic, so
-it keeps that realm's methods and error classes after it crosses back.
-The spec-ordering slice before it (22-fail baseline at `3654f3d8`) moved every remaining
-observable step into its §-numbered position: the TypedArray constructor
-allocates (and reads `new.target.prototype`) before the byteOffset /
-length coercions and the detached check, and the alignment RangeError
-precedes ToIndex(length); Array.from performs GetMethod(@@iterator) once
-and its non-constructor branch is ArrayCreate(len); §7.4.9 IteratorClose
-run on an abrupt completion restores the caller's pending throw instead
-of letting a `return` getter's own throw replace it. Alongside that:
-non-unicode `i` canonicalizes through the Unicode uppercase mapping
-(§22.2.2.9) rather than an ASCII fold; the proxy
-getOwnPropertyDescriptor trap runs IsCompatiblePropertyDescriptor;
-`%TypedArray%.prototype.slice` copies bytes for a same-type transfer so
-a non-canonical NaN survives; a generic array-like iterator re-reads
-`length` and each element through the observable [[Get]]; a numeric
-literal property key with no settled integer spelling is formatted by
-the runtime's ToPropertyKey; NumberToBigInt reads the IEEE-754
-significand instead of saturating at `i128`; `Math.atanh` reduces to
-`|x|` first; `find` / `findIndex` keep a dense prefix over a pathological
-`length`; and the conformance harness defines `$262` on a created
-realm's global. The object-identity slice before it (36-fail baseline at
-`0cd4aa90`) moved per-instance
-function-object state out of the template-keyed side tables:
-[[Extensible]] and the [[Prototype]] override for a closure ride the
-closure body, so Object.seal / setPrototypeOf on one instance no longer
-seals every sibling of the same definition. [[SetPrototypeOf]] runs
-§10.1.2 for the body-slot exotics (ArrayBuffer, DataView, collections,
-RegExp, Promise, generators, iterators, Intl) instead of silently
-succeeding, ArrayBuffer / DataView stores go through OrdinarySet so an
-inherited accessor intercepts them, and the %TypedArray%.prototype named
-accessors stop answering off a base reached as somebody else's
-prototype. Op::IteratorNext routes a non-plain array element through the
-observable [[Get]], so a hole the prototype chain answers survives
-for-of, spread and destructuring. RegExp resolves new.target.prototype
-at its §22.2.4.1 step 7 position (and exactly once), the global
-environment record answers HasBinding through the proxy `has` trap,
-Date.parse separates the ISO-strict `T` reading from the lenient
-space-separated one, CreateDynamicFunction parses the parameter and body
-texts separately, and the strict directive prologue plus module-code
-`await` early errors land in the compiler's validator. The integrity
-slice before it (50-fail baseline at `21b9c7dc`): Object.isSealed /
-isFrozen walk symbol-keyed own slots (Private Name carriers stay
-excluded per §6.2.12), and §10.5.6 step 16 treats settingConfigFalse as
-set only for an EXPLICIT [[Configurable]]: false. The slice before that
-(52-fail baseline at `8b52630e`) closed a real
-shape-cache corruption: a duplicate object-literal key whose data member
-landed on an earlier accessor took the lenient shape store, leaving the
-hidden class claiming an accessor over a data cell and poisoning the
-shape-id-keyed lookup caches for later literals (the
-allocation-order-dependent __proto__/duplProps failures); it now runs
-the descriptor redefinition. Object.defineProperties / Object.create
-interleave the per-key enumerable probe with that key's [[Get]] for
-observable sources. The previous slice (55-fail baseline at `470eab23`): the parameter-expression body variable
-environment (§10.2.11 step 28 shadow bindings initialized from the
-parameter cells), error-class registry constructor stamping plus
-VmIntrinsic realm switching on the spread/invoke routes, the
-array-receiver prototype-override fallback, and the §7.3.22
-cross-realm %Array% species default. The class/private/delete slice: numeric and
-BigInt field keys with NamedEvaluation for private initializers,
-base-class field initialisers running before parameter binding, Private
-Name carriers invisible to the ordinary MOP (own-keys surfaces, seal /
-freeze cores) while staying writable on sealed objects, [[Delete]]
-refusing an ordinary function's implicit prototype and boxing primitive
-receivers with ToPropertyKey coercion of computed keys, strict-throwing
-String-exotic stores, symbol-keyed super assignment, and RegExp reading
-[[OriginalSource]]/[[OriginalFlags]] internal slots plus extra-realm
-literal prototype stamping and ordinary-funnel computed gets. That slice lands the §13.15.1 web-compat
-CallExpression assignment-target semantics end to end (parser retry with
-a synthetic member rewrite, runtime ReferenceError after the call
-evaluates, logical assignment / destructuring / strict kept as early
-SyntaxError), closes import-defer (canonical per-module deferred
-namespace identity across static and dynamic imports; gathering follows
-an EVALUATED cycle member to its still-settling async cycle root), fixes
-two real engine bugs surfaced by intl402 — the lean Array-callback fast
-path recycled frames without a callback's own upvalue cells (catch
-parameter ⇒ every compiled upvalue access one slot off), and the
-optimizing tier entered with the CALLER's ambient chunk so runtime stubs
-decoded published pcs against a foreign constant pool — and takes
-NumberFormat percent affixes from ICU4X (de-DE `89 %`, tr `%89`),
-forwards Array.prototype.toLocaleString arguments per ECMA-402, and
-accepts 5-8-alpha language subtags in Intl.Locale. The previous slice
-closed the direct-eval cluster (86-fail baseline at `dc1e9e2b`). The direct-eval cluster is closed: a script-top-level
-direct eval receives the caller's lexical-environment heritage (block and
-for-let cells spliced per call site) while its vars still land on the
-global object as deletable bindings; a strict top-level eval publishes
-its private variable-environment cells to nested evals; a
-parameter-initializer eval resolves only the function environment that
-exists at that point (formals, captured passthroughs, self-name), so
-`var arguments` in an arrow parameter default adopts into the arrow's
-funcEnv; deletable eval-introduced vars route reads, writes, typeof,
-updates, and deletes through the dynamic eval-environment ops —
-transitively across nested evals via the caller table's deletable bit —
-and an own function-scope binding shadows a same-named passthrough
-capture in the eval caller table; class heritage and computed keys
-lowered into a sloppy frame carry strict PutValue semantics through
-`Op::StorePropertyStrict` / `Op::StoreElementStrict`. Only
-`global-env-rec-with` (eval under `with` reading the with-object) remains
-from the cluster. The previous slice promotes
-every own name to a cell when a direct eval appears in the body or any
-nested function, and lowers a shadowed bare `eval(...)` through the
-runtime IsEvalIntrinsic guard so a parameter or var holding %eval% is a
-direct eval per §13.3.6.1. The realm-faithful cross-realm wave closed the
-whole realm cluster — nested parked-realm switching with identity
-travelling in the swap, full native stamping at createRealm, foreign
-bytecode frames resolving globals and sloppy this in their own realm,
-per-realm Intl [[FallbackSymbol]], typed-array and array realm
-prototypes, and the revoked-proxy GetFunctionRealm throw — plus
-Reflect.apply, TypedArray.of, JSON parse-with-source and two staging
-tests riding the same semantics. Two GC-soundness waves sit between this and
-`f8115ad8`: define paths take `&mut JsObject` with descriptor payloads
-anchored across expando/shape allocations, flatten and keyed promise
-combinators re-read every handle after allocating steps; then the
-remembered-set holes closed — TypedArray/DataView expando setters and
-parked generator frames record their write barriers, expando allocators
-re-derive their receivers, async-generator resume arguments ride anchor
-slots, and array exotics keep a chronological non-index key record (the
-for-in fix). Under `OTTER_GC_STRESS=1` the Object, defineProperty /
-defineProperties, Promise, flat/flatMap, Reflect, Proxy, Iterator,
-Set/Map/WeakMap/WeakSet, Array.from, Array.prototype, RegExp.prototype,
-TypedArray, ArrayBuffer/SharedArrayBuffer/DataView, class, and
-async-generator suites all pass with zero crashes. Follow-up slice
-(125→111):
-legacy Intl-constructed chaining on service-instance receivers +
-proxy-observable unwrap; per-closure-instance name/length deletion with
-real %Function.prototype% fallback; spec-ordered bind reads (proto,
-length, name — Proxy traps observe exactly those); dynamic Function
-without a self-name binding; proxy trap dispatch snapshots the target
-before the handler lookup (revoke-as-side-effect), getPrototypeOf
-invariant runs the target's isExtensible trap; array iteration and
-join take the observable [[Get]] for anything but plain dense elements. Latest slices (169→125, zero
-regressions): the Temporal wave went green (6642/6642 — ZonedDateTime
-offset-option string parsing via ParsedZonedDateTime, ToBigInt
-constructor coercion, identifier-only constructor time zones, fallible
-hoursInDay, PlainTime sub-second compare + per-field RegulateTime,
-PYM/PMD from date-bearing instances, %Object.prototype% on the
-namespaces, DateTimeFormat ISO-field civil conversion, h24 midnight,
-zero-offset GMT, PYM/PMD exact-calendar match); dispatch/object-model
-fixes (WeakMap/WeakSet expandos, bound-function [[Prototype]] slot +
-proxy-aware bind, proxy get-trap invariant on class-ctor prototype,
-temporal prototype-walk fallback, derived-this cell reads for escaped
-arrows); and compiler class/eval work (per-evaluation class cells via
-FreshUpvalue, eager super-store base, default-derived-ctor live parent,
-direct eval super() in derived constructors, static-block/-field
-eval-binding tables, HomeObject-gated super legality in eval).
-Remaining fail mass, largest first: staging/sm (~95, heterogeneous —
-Function metadata, RegExp constructor edges, TypedArray cross-realm,
-Proxy/Reflect realm semantics), intl402 DateTimeFormat
-chinese/dangi/era/formatRange rendering (11), annexB parser cluster
-(7, oxc-level), language/eval-code deletable-binding closures (6),
-import-defer (2), legacy Intl-constructed symbol object model (4).
+Baseline at `242593b2`: 99.98%, 12 fails of 53575, 0 crashes, 0 timeouts, 0
+OOM. Reproduce with `otter-test262 run --output test262_results/latest.json`,
+then `otter-test262 conformance test262_results/latest.json`. The per-subdir
+batch script omits `harness/`, so its totals are not comparable to this
+baseline.
+
+The residual twelve are held deliberately, not pending:
+
+- nine `intl402/DateTimeFormat` cases (CLDR interval patterns, the chinese and
+  dangi calendars, `Intl.Era-monthcode`) — a data lift against ICU4X, not an
+  engine defect;
+- `staging/sm/String/internalUsage.js`, which needs day/month padding to differ
+  between locales that ICU4X's data does not distinguish;
+- `staging/sm/regress/regress-602621.js` and
+  `staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js`,
+  which specify mutually exclusive Annex B behaviour — passing either fails the
+  other.
+
+Clusters closed on the way from 293 fails, each verified by a full run with a
+zero-regression set diff: direct and indirect `eval` (scope capture, dynamic
+and deletable bindings, per-site block-scope tables, `with` object
+environments); Temporal (6642/6642); the realm model (parked-in-slot state
+swap, typed intrinsic prototypes, cross-realm identity for body-slot exotics);
+GC soundness under `OTTER_GC_STRESS` (write barriers, iteration anchors,
+handle re-derivation after every allocating step); iterator helpers (647/647);
+dynamic `import` with attributes; class fields, private names, and the private
+MOP; destructuring and spec-ordered observable steps; `Function.prototype`
+metadata and the legacy `fn.arguments` / `RegExp` static surfaces.
+
+Two engine-level defects surfaced through this lane rather than through any
+benchmark, and are the reason the set diff is mandatory: generated template
+code returned through its own epilogue and silently skipped `finally` once a
+function tiered up, and `Op::CallWithThis` had no feedback slot at all, so it
+could never resolve a direct callee.
+
 
 ### C2. Web and Node compatibility
 

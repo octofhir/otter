@@ -277,6 +277,7 @@ impl Interpreter {
             jit_machine_roots: 0,
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
+            runtime_budget_telemetry: RuntimeBudgetTelemetry::default(),
             runtime_budget_depth: 0,
             runtime_budget_turn_started_at: None,
             runtime_budget_heap_start: None,

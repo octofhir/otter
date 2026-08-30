@@ -1,14 +1,17 @@
 //! Per-turn execution budget policy and VM accounting snapshots.
 //!
 //! This module owns the VM-side data contract for BEAM-style runtime
-//! accounting. The current slice is observational: it records reductions,
-//! turn latency, allocation pressure, host-op enqueue counts, and major
-//! call-shape counters without preempting execution.
+//! accounting: reductions, turn latency, allocation pressure, host-op enqueue
+//! counts, and major call-shape counters. Observe mode records them without
+//! changing execution; Reject mode turns the same crossings into a structural
+//! error at the next cooperative checkpoint.
 //!
 //! # Contents
 //! - [`RuntimeBudget`] — optional per-turn policy limits and enforcement mode.
 //! - [`RuntimeBudgetExceededAction`] — outcome policy when a limit is crossed.
 //! - [`RuntimeBudgetStats`] — aggregate counters exposed for diagnostics.
+//! - [`RuntimeBudgetTelemetry`] — the shareable cell an embedder reads the
+//!   counters from without owning the isolate.
 //! - Reduction cost helpers for the interpreter dispatch loop.
 //!
 //! # Invariants
@@ -17,6 +20,9 @@
 //!   changing execution; [`RuntimeBudgetExceededAction::Reject`] returns a
 //!   structural budget error at the next cooperative checkpoint.
 //! - Reduction accounting is approximate and stable, not a wall-clock timer.
+//! - Telemetry is published at root-turn boundaries and at every enforcement
+//!   rejection, so a reader observes whole turns rather than a torn count from
+//!   the middle of one.
 //!
 //! # See also
 //! - [`crate::Interpreter`]
@@ -25,6 +31,7 @@
 use otter_bytecode::Op;
 use otter_gc::GcHeap;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Optional execution budget policy for one contiguous VM turn.
@@ -72,6 +79,45 @@ pub enum RuntimeBudgetExceededAction {
     Observe,
     /// Return a structural budget error at the next VM checkpoint.
     Reject,
+}
+
+/// Shareable cell carrying one isolate's budget counters off its own thread.
+///
+/// The interpreter owns the authoritative [`RuntimeBudgetStats`] and copies
+/// them here at each root-turn boundary and at each enforcement rejection.
+/// A holder of the cell — a runtime handle, an embedder, a telemetry
+/// exporter — therefore reads whole turns, never a count torn out of the
+/// middle of one. Cloning shares the same cell; two isolates never publish
+/// into one.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeBudgetTelemetry(Arc<Mutex<RuntimeBudgetStats>>);
+
+impl RuntimeBudgetTelemetry {
+    /// Create an unpublished cell whose counters are all zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read the counters published by the owning isolate's most recent
+    /// boundary.
+    #[must_use]
+    pub fn snapshot(&self) -> RuntimeBudgetStats {
+        *self.lock()
+    }
+
+    pub(crate) fn publish(&self, stats: RuntimeBudgetStats) {
+        *self.lock() = stats;
+    }
+
+    /// A publisher that panicked mid-write would leave the cell poisoned;
+    /// the counters are plain copyable data, so recovering the value is
+    /// sound and keeps telemetry readable after an unrelated panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, RuntimeBudgetStats> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// Aggregate VM resource counters.

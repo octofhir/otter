@@ -91,6 +91,8 @@ fn install_regexp_legacy_accessors(
         name: &'static str,
         getter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
+        let property = crate::regexp_legacy::LegacyRegExpProperty::from_accessor_name(name)
+            .ok_or(JsSurfaceError::DefinePropertyFailed(name))?;
         let mut ctor_root = ctor;
         let mut getter_root = Value::undefined();
         let mut roots = otter_gc::RootScope::new(heap);
@@ -100,7 +102,8 @@ fn install_regexp_legacy_accessors(
             roots.add_value(&mut ctor_root);
             roots.add_value(&mut getter_root);
         }
-        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_root];
+        let captures: smallvec::SmallVec<[Value; 4]> =
+            smallvec::smallvec![ctor_root, Value::number_i32(property.code())];
         getter_root = Value::native_function(
             NativeFunction::with_length_and_captures(
                 heap,
@@ -128,6 +131,8 @@ fn install_regexp_legacy_accessors(
         getter_name: &'static str,
         setter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
+        let property = crate::regexp_legacy::LegacyRegExpProperty::from_accessor_name(name)
+            .ok_or(JsSurfaceError::DefinePropertyFailed(name))?;
         let mut ctor_root = ctor;
         let mut getter_root = Value::undefined();
         let mut setter_root = Value::undefined();
@@ -139,7 +144,8 @@ fn install_regexp_legacy_accessors(
             roots.add_value(&mut getter_root);
             roots.add_value(&mut setter_root);
         }
-        let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_root];
+        let g_captures: smallvec::SmallVec<[Value; 4]> =
+            smallvec::smallvec![ctor_root, Value::number_i32(property.code())];
         getter_root = Value::native_function(
             NativeFunction::with_length_and_captures(
                 heap,
@@ -215,6 +221,51 @@ fn legacy_accessor_getter(
             reason: "Method called on incompatible receiver".to_string(),
         });
     }
+    let property = captures
+        .get(1)
+        .and_then(|value| value.as_number())
+        .map(|code| code.as_f64() as i32)
+        .and_then(crate::regexp_legacy::LegacyRegExpProperty::from_code)
+        .ok_or_else(|| NativeError::TypeError {
+            name: "RegExp legacy accessor",
+            reason: "unknown legacy accessor".to_string(),
+        })?;
+    legacy_property_value(ctx, property)
+}
+
+/// Slice one §B.2.4 legacy static out of the realm's recorded subject.
+///
+/// An unpopulated slot reports the empty string — the behaviour the web
+/// depends on, rather than the proposal's throw on an empty slot.
+fn legacy_property_value(
+    ctx: &mut NativeCtx<'_>,
+    property: crate::regexp_legacy::LegacyRegExpProperty,
+) -> Result<Value, NativeError> {
+    let Some(input) = ctx.cx.interp.regexp_legacy.input() else {
+        return empty_legacy_value(ctx);
+    };
+    let Some(subject) = input.as_string(ctx.heap()) else {
+        return empty_legacy_value(ctx);
+    };
+    if property == crate::regexp_legacy::LegacyRegExpProperty::Input {
+        return Ok(input);
+    }
+    let len = subject.len() as usize;
+    let Some((start, end)) = ctx.cx.interp.regexp_legacy.range(property, len) else {
+        return empty_legacy_value(ctx);
+    };
+    let start = start.min(len);
+    let end = end.clamp(start, len);
+    let units = subject.with_utf16(ctx.heap(), |units| units[start..end].to_vec());
+    let sliced =
+        JsString::from_utf16_units(&units, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+            name: "RegExp legacy accessor",
+            reason: "out of memory".to_string(),
+        })?;
+    Ok(Value::string(sliced))
+}
+
+fn empty_legacy_value(ctx: &mut NativeCtx<'_>) -> Result<Value, NativeError> {
     Ok(Value::string(
         JsString::from_str("", ctx.heap_mut()).map_err(|_| NativeError::TypeError {
             name: "RegExp legacy accessor",
@@ -230,7 +281,7 @@ fn legacy_accessor_getter(
 /// the prop-desc tests that observe the setter shape.
 fn legacy_accessor_setter(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    args: &[Value],
     captures: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
@@ -241,6 +292,15 @@ fn legacy_accessor_setter(
             reason: "Method called on incompatible receiver".to_string(),
         });
     }
+    // §B.2.4 SetLegacyRegExpStaticProperty — only `[[RegExpInput]]` has
+    // a setter, and it stores `ToString(val)`.
+    let value = args.first().copied().unwrap_or_else(Value::undefined);
+    let coerced =
+        crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &value, "RegExp legacy accessor")?;
+    ctx.cx
+        .interp
+        .regexp_legacy
+        .set_input(Value::string(coerced));
     Ok(Value::undefined())
 }
 
@@ -668,6 +728,16 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         // RegExpInitialize coerces either to a string. Park the
         // prototype in the handle arena; it is stamped on the compiled
         // RegExp once the coercions and the compile are done.
+        let new_target_value = scope.context().new_target().copied();
+        let new_target_is_realm_regexp = match new_target_value {
+            None => true,
+            Some(new_target) => {
+                let new_target = scope.value(new_target);
+                scope
+                    .global("RegExp")
+                    .is_some_and(|intrinsic| scope.strict_equals(intrinsic, new_target))
+            }
+        };
         let new_target_prototype =
             crate::bootstrap::native_new_target_prototype(scope.context(), "RegExp")?
                 .map(|prototype| scope.value(prototype));
@@ -731,6 +801,13 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             let re_handle = re_value.as_regexp().ok_or_else(|| oom("RegExp"))?;
             let prototype = scope.raw(prototype);
             re_handle.set_prototype_override(scope.context().heap_mut(), Some(prototype));
+        }
+        // §B.2.4 RegExpAlloc — legacy statics track only instances whose
+        // `new.target` is the realm's own `%RegExp%`.
+        if !new_target_is_realm_regexp {
+            let re_value = scope.raw(re);
+            let re_handle = re_value.as_regexp().ok_or_else(|| oom("RegExp"))?;
+            re_handle.disable_legacy_features(scope.context().heap_mut());
         }
         Ok(scope.finish(re))
     })

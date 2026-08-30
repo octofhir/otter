@@ -161,6 +161,25 @@ pub(crate) fn exec_once_native(
                 )?;
             }
 
+            // §B.2.4 — a legacy-enabled instance publishes the match into
+            // the realm's `%RegExp%` statics. Only the subject handle and
+            // the ranges are stored; the accessors slice on demand.
+            let receiver_value = scope.raw(receiver);
+            if receiver_value
+                .as_regexp()
+                .is_some_and(|re| re.legacy_features_enabled(scope.context().heap()))
+            {
+                let subject = scope.raw(input);
+                let matched_range = matched.range.clone();
+                let captures = matched.captures.clone();
+                scope.with_turn_parts(|interp, _| {
+                    interp
+                        .regexp_legacy
+                        .record_match(subject, matched_range, &captures);
+                    Ok::<(), NativeError>(())
+                })?;
+            }
+
             build_match_result_native(&matched, input, flags.has_indices, &mut scope)
         })()?;
         Ok(scope.finish(result))

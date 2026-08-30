@@ -1131,6 +1131,37 @@ impl Interpreter {
             }
         } else if let Some(native) = receiver.as_native_function() {
             match native.own_property_descriptor(&mut self.gc_heap, name)? {
+                // §10.1.9.2 OrdinarySetWithOwnDescriptor step 3 — an own
+                // accessor runs its setter with this receiver. Falling
+                // into the `!writable()` arm below would report every
+                // accessor as read-only, since an accessor descriptor has
+                // no `[[Writable]]` at all.
+                Some(desc) if desc.is_accessor() => {
+                    match desc.kind {
+                        object::DescriptorKind::Accessor {
+                            setter: Some(setter),
+                            ..
+                        } if crate::abstract_ops::is_callable(&setter) => {
+                            self.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &setter,
+                                receiver,
+                                smallvec::smallvec![value],
+                            )?;
+                        }
+                        _ => {
+                            self.failed_set_result(
+                                strict,
+                                format!(
+                                    "Cannot assign to read-only property '{name}' of function {}",
+                                    native.name_string(&self.gc_heap)
+                                ),
+                            )?;
+                        }
+                    }
+                    None
+                }
                 Some(desc) if !desc.writable() => {
                     self.failed_set_result(
                         strict,

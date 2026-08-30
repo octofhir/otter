@@ -358,6 +358,12 @@ pub struct JsRegExpBody {
     /// Per-instance `[[Prototype]]` override for RegExp subclass
     /// construction.
     pub prototype_override: Option<Value>,
+    /// §B.2.4 `[[LegacyFeaturesEnabled]]` — set when `RegExpAlloc` ran
+    /// with `%RegExp%` itself as `new.target`, which is every literal
+    /// and every plain `new RegExp(…)`. A subclass instance leaves the
+    /// realm's `RegExp.lastMatch` and friends untouched.
+    #[pelt(skip)]
+    pub legacy_features_enabled: bool,
 }
 
 impl JsRegExpBody {
@@ -430,6 +436,7 @@ impl JsRegExp {
                 expando: None,
                 extensible: true,
                 prototype_override: None,
+                legacy_features_enabled: true,
             })?,
         })
     }
@@ -467,6 +474,7 @@ impl JsRegExp {
                 expando: None,
                 extensible: true,
                 prototype_override: None,
+                legacy_features_enabled: true,
             })?,
         })
     }
@@ -581,6 +589,17 @@ impl JsRegExp {
 
     pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
         heap.read_payload(self.inner, |body| body.prototype_override)
+    }
+
+    /// §B.2.4 `[[LegacyFeaturesEnabled]]`.
+    pub(crate) fn legacy_features_enabled(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.legacy_features_enabled)
+    }
+
+    /// Clear `[[LegacyFeaturesEnabled]]` — `RegExpAlloc` ran with a
+    /// `new.target` other than the realm's own `%RegExp%`.
+    pub(crate) fn disable_legacy_features(&self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.inner, |body| body.legacy_features_enabled = false);
     }
 
     pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {

@@ -854,6 +854,16 @@ impl Interpreter {
         )
         .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
         self.register_regexp_realm_proto(regex);
+        // §B.2.4 — a match run by engine-hosted builtin code must not
+        // publish into the realm's `RegExp.lastMatch` and friends, the
+        // same exemption a self-hosted builtin gets elsewhere. Without
+        // it every `console.log` overwrites what user code just matched.
+        if context
+            .exec_function(function_id)
+            .is_some_and(|block| module_is_engine_hosted(block.module_url()))
+        {
+            regex.disable_legacy_features(&mut self.gc_heap);
+        }
         Ok(Value::regexp(regex))
     }
 
@@ -953,4 +963,13 @@ impl Interpreter {
         frame.advance_pc()?;
         Ok(())
     }
+}
+
+/// Whether a module URL names engine-hosted builtin code rather than a
+/// user module. Hosted shims (`node:*`, `internal/*`, `otter:*`) are the
+/// engine's own implementation surface.
+fn module_is_engine_hosted(module_url: &str) -> bool {
+    module_url.starts_with("node:")
+        || module_url.starts_with("internal/")
+        || module_url.starts_with("otter:")
 }

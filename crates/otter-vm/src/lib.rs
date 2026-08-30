@@ -191,6 +191,7 @@ pub mod proxy;
 pub mod realm_intrinsics;
 pub mod reflect;
 pub mod regexp;
+pub(crate) mod regexp_legacy;
 pub mod regexp_prototype;
 mod register_stack;
 pub mod root_census;
@@ -357,6 +358,7 @@ pub(crate) struct RealmState {
     pub(crate) global_this: JsObject,
     pub(crate) error_classes: ErrorClassRegistry,
     pub(crate) realm_intrinsics: realm_intrinsics::RealmIntrinsics,
+    pub(crate) regexp_legacy: regexp_legacy::RegExpLegacyState,
     pub(crate) array_iterator_prototype: Option<JsObject>,
     pub(crate) map_iterator_prototype: Option<JsObject>,
     pub(crate) set_iterator_prototype: Option<JsObject>,
@@ -401,6 +403,7 @@ impl RealmState {
         self.global_this.trace_gc_roots(visitor);
         self.error_classes.trace_gc_roots(visitor);
         self.realm_intrinsics.trace_roots(visitor);
+        self.regexp_legacy.trace_roots(visitor);
         for object in [
             &self.array_iterator_prototype,
             &self.map_iterator_prototype,
@@ -1512,6 +1515,11 @@ pub struct Interpreter {
     /// falling back to the string-name path. See
     /// [`crate::realm_intrinsics::RealmIntrinsics`].
     realm_intrinsics: realm_intrinsics::RealmIntrinsics,
+    /// §B.2.4 `%RegExp%` legacy static state for the active realm. Parked
+    /// with the rest of the realm on a switch, so `RegExp.lastMatch` in
+    /// one realm never reports another realm's match. See
+    /// [`crate::regexp_legacy::RegExpLegacyState`].
+    pub(crate) regexp_legacy: regexp_legacy::RegExpLegacyState,
     /// Per-isolate cache of compiled regex programs, keyed by pattern +
     /// engine-relevant flags. Re-evaluating the same regex literal (or
     /// `new RegExp` over a repeated pattern) reuses the lowered program

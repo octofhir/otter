@@ -29,6 +29,7 @@ step "release verifier + adversarial corpus"
 cargo test --release -q -p otter-bytecode
 cargo test --release -q -p otter-vm --lib code_space
 cargo test --release -q -p otter-vm --test snapshot_boundary
+cargo test --release -q -p otter-jit --test artifact_agreement
 
 step "difftest: interpreter vs tiers vs gc-stress"
 # The full report is megabytes of per-case observations; keep it on disk and

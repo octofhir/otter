@@ -73,6 +73,13 @@ vs *args:
 bcdiff kernel function="engineKernel":
     bash scripts/bcdiff.sh {{kernel}} {{function}}
 
+# Release admission gate: the bytecode verifier, its adversarial mutation
+# corpus, and the code-space/snapshot admission tests, all in a release build.
+verifier-gate:
+    cargo test --release -p otter-bytecode
+    cargo test --release -p otter-vm --lib code_space
+    cargo test --release -p otter-vm --test snapshot_boundary
+
 # Iteration gate: fmt, clippy, vm/jit/bytecode tests, difftest across tiers,
 # kernel ledger. Deliberately excludes test262 — that is the closing gate,
 # compared as failing sets.

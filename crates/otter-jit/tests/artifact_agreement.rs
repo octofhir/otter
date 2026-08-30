@@ -206,7 +206,6 @@ enum Outcome {
 }
 
 fn observe(module: BytecodeModule, jit: bool) -> Outcome {
-    eprintln!("observe start jit={jit}");
     let mut interp = Interpreter::new();
     if jit {
         // Threshold 1 makes the first back edge tier up, so the loop body runs
@@ -217,12 +216,10 @@ fn observe(module: BytecodeModule, jit: bool) -> Outcome {
     let context = interp
         .link_module(module)
         .expect("fixture artifact is admitted");
-    let outcome = match interp.run(&context) {
+    match interp.run(&context) {
         Ok(value) => Outcome::Returned(describe(&interp, value)),
         Err(error) => Outcome::Threw(error.message()),
-    };
-    eprintln!("observe done jit={jit}: {outcome:?}");
-    outcome
+    }
 }
 
 fn describe(interp: &Interpreter, value: Value) -> String {
@@ -256,10 +253,18 @@ fn integer_overflow_in_a_hot_loop_agrees_across_tiers() {
 
 // Open engine defect, found by this suite. The artifact is the hot-loop case
 // register for register, with `Throw` in place of `Return` as the only exit.
-// The interpreter completes it; compiled code entered through OSR never leaves
-// the loop, so the process spins instead of throwing. No compiler emits a
-// function whose sole terminator is `Throw` — every source-level function ends
-// in a return — which is why only an artifact-level case reaches it.
+// The interpreter completes it; compiled code spins instead of throwing.
+//
+// Narrowed to the combination of OSR entry and an exit path that throws.
+// Each ingredient alone is fine: the same loop ending in `Return` agrees on
+// both consumers, the same throw with the loop cold agrees, and the same
+// 4000-trip loop with the OSR threshold left high (so the loop is never
+// entered compiled) agrees. Only entering the loop through OSR and then
+// reaching the throw fails to leave compiled code.
+//
+// No compiler emits a function whose sole terminator is `Throw` — every
+// source-level function ends in a return — which is why difftest cannot
+// reach it and only an artifact-level case does.
 //
 // The observation runs on a worker thread so the failure is a bounded, typed
 // disagreement rather than a hung test process.

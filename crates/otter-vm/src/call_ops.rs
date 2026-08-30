@@ -1523,6 +1523,10 @@ impl Interpreter {
         let rooted_this = *ctx.this_value();
         let (interp, stack) = ctx.cx.into_parts();
         let result = raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))?;
+        // The constructor ran under its own realm. A body-slot exotic it
+        // built carries no `[[Prototype]]`, so stamp the realm's
+        // intrinsic before the value escapes into another one.
+        interp.register_exotic_realm_proto(&result);
         Ok(if result.is_object_type() {
             result
         } else {

@@ -906,8 +906,8 @@ pub(super) fn emit_call(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
-    mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
-    mut code_map: Option<&mut CodeMapCapture>,
+    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
     argc: u16,
@@ -919,8 +919,57 @@ pub(super) fn emit_call(
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    emit_call_with_receiver(
+        ops,
+        relocations,
+        table,
+        view,
+        direct_call_events,
+        code_map,
+        dst,
+        callee,
+        None,
+        argc,
+        argument_registers,
+        logical_pc,
+        byte_pc,
+        bail,
+        threw,
+        throw_value,
+        fatal,
+    )
+}
+
+/// [`emit_call`] with an explicit receiver.
+///
+/// `receiver` is `None` for `Op::Call` (the callee sees the canonical
+/// `undefined` `this`) and `Some(register)` for `Op::CallWithThis`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_call_with_receiver(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    mut code_map: Option<&mut CodeMapCapture>,
+    dst: u16,
+    callee: u16,
+    receiver: Option<u16>,
+    argc: u16,
+    argument_registers: &[u16],
+    logical_pc: u32,
+    byte_pc: u32,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
-    if let Some(target) = view.static_native_calls.get(&byte_pc) {
+    if let Some(target) = view
+        .static_native_calls
+        .get(&byte_pc)
+        .filter(|_| receiver.is_none())
+    {
         let stub_id = target.leaf_stub_id;
         let name = native_leaf_call_name(stub_id);
         let start = ops.offset().0;
@@ -986,7 +1035,10 @@ pub(super) fn emit_call(
         return Ok(());
     }
     let direct_target = view.direct_callees.get(&byte_pc);
-    if let Some(candidate) = view.inline_callees.get(&byte_pc)
+    if let Some(candidate) = view
+        .inline_callees
+        .get(&byte_pc)
+        .filter(|_| receiver.is_none())
         && try_emit_inline_numeric_callee(
             ops,
             view,
@@ -1033,7 +1085,13 @@ pub(super) fn emit_call(
                 logical_pc,
                 byte_pc,
                 dst,
-                form: DirectCallForm::Plain { callable: callee },
+                form: match receiver {
+                    None => DirectCallForm::Plain { callable: callee },
+                    Some(receiver) => DirectCallForm::CallWithThis {
+                        callable: callee,
+                        receiver,
+                    },
+                },
                 arguments: DirectCallArguments::Fixed(argument_registers),
             },
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),

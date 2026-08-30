@@ -635,6 +635,33 @@ pub(crate) fn compile_method_call(
         }
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(method_name);
+        if !call_arguments_are_effect_free(cx, &call.arguments) {
+            // §13.3.6.1 — GetValue on the callee reference precedes
+            // ArgumentListEvaluation, so the method read is its own
+            // instruction here: a getter runs, and a nullish base throws,
+            // before any argument evaluates.
+            let callee_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(callee_reg),
+                    Operand::Register(receiver_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            check_call_arity(arg_regs.len(), "Op::CallWithThis", span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(receiver_reg));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::CallWithThis, operands, span);
+            return Ok(dst);
+        }
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
         cx.reset_scratch(call_mark);
@@ -686,7 +713,9 @@ pub(crate) fn compile_method_call(
     // EvaluateCall step 5.b.
     if let Expression::ComputedMemberExpression(member) = callee {
         let receiver_reg = compile_expr(cx, &member.object, span)?;
-        if let Expression::StringLiteral(lit) = unwrap_ts_expr(&member.expression) {
+        if let Expression::StringLiteral(lit) = unwrap_ts_expr(&member.expression)
+            && call_arguments_are_effect_free(cx, &call.arguments)
+        {
             let name_idx = cx.intern_string_constant(lit.value.as_str());
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
             check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
@@ -1036,6 +1065,85 @@ pub(crate) fn try_compile_function_method(
     _span: (u32, u32),
 ) -> Result<Option<u16>, CompileError> {
     Ok(None)
+}
+
+/// Whether evaluating this argument list can be observed relative to the
+/// callee's own property read.
+///
+/// §13.3.6.1 EvaluateCall reads the callee — `GetValue` on the member
+/// reference, which runs a getter and throws on a nullish base — BEFORE
+/// ArgumentListEvaluation. The fused `Op::CallMethodValue` performs that
+/// read after its operand registers are filled, so it is only admissible
+/// when no argument can run user code, throw, or otherwise be ordered
+/// against the read: literals, `this`, and reads of an already
+/// initialized local binding.
+pub(crate) fn call_arguments_are_effect_free(
+    cx: &Compiler,
+    args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+) -> bool {
+    args.iter().all(|arg| match arg {
+        oxc_ast::ast::Argument::SpreadElement(_) => false,
+        other => expression_is_effect_free(cx, other.to_expression()),
+    })
+}
+
+fn expression_is_effect_free(cx: &Compiler, expr: &Expression<'_>) -> bool {
+    use oxc_ast::ast::{ObjectPropertyKind, PropertyKey, UnaryOperator};
+
+    match unwrap_ts_expr(expr) {
+        Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::FunctionExpression(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::ThisExpression(_) => true,
+        Expression::Identifier(id) => cx
+            .lookup_binding(id.name.as_str())
+            .is_some_and(|info| info.initialized && !info.fn_self_name),
+        Expression::ParenthesizedExpression(p) => expression_is_effect_free(cx, &p.expression),
+        // `void 0`, `-1`, `!flag` — the operator itself runs no user code
+        // once its operand cannot. `typeof` and `delete` are excluded:
+        // both reach the environment / object protocol.
+        Expression::UnaryExpression(unary) => {
+            matches!(
+                unary.operator,
+                UnaryOperator::Void
+                    | UnaryOperator::UnaryNegation
+                    | UnaryOperator::UnaryPlus
+                    | UnaryOperator::LogicalNot
+                    | UnaryOperator::BitwiseNot
+            ) && expression_is_effect_free(cx, &unary.argument)
+        }
+        // An array literal with no spread allocates and stores; an object
+        // literal additionally needs every key settled at compile time,
+        // since a computed key runs ToPropertyKey.
+        Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
+            oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => false,
+            oxc_ast::ast::ArrayExpressionElement::Elision(_) => true,
+            other => other
+                .as_expression()
+                .is_some_and(|expr| expression_is_effect_free(cx, expr)),
+        }),
+        Expression::ObjectExpression(object) => {
+            object.properties.iter().all(|property| match property {
+                ObjectPropertyKind::SpreadProperty(_) => false,
+                ObjectPropertyKind::ObjectProperty(entry) => {
+                    !entry.computed
+                        && matches!(
+                            entry.key,
+                            PropertyKey::StaticIdentifier(_)
+                                | PropertyKey::StringLiteral(_)
+                                | PropertyKey::NumericLiteral(_)
+                        )
+                        && expression_is_effect_free(cx, &entry.value)
+                }
+            })
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn compile_call_args(

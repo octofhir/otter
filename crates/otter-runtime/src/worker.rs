@@ -393,8 +393,11 @@ fn spawn_managed_worker(
     let terminal = parent_spawner
         .admit_guaranteed(RuntimeLiveness::Unref)
         .map_err(|err| type_err("Worker", err.to_string()))?;
-    let child_config =
-        configure_worker_child(host.config.clone(), parent_spawner, requested_capabilities);
+    let child_config = configure_worker_child(
+        host.config.clone(),
+        parent_spawner.io_handle(),
+        requested_capabilities,
+    );
     let child = RuntimeHandle::spawn_worker(child_config)
         .map_err(|err| type_err("Worker", err.to_string()))?;
     let child_spawner = child.task_spawner();
@@ -443,12 +446,12 @@ fn spawn_managed_worker(
 /// family verbatim through the cloned config.
 fn configure_worker_child(
     mut config: RuntimeConfig,
-    parent_spawner: &RuntimeTaskSpawner,
+    parent_io_handle: Option<tokio::runtime::Handle>,
     requested_capabilities: Option<CapabilitySet>,
 ) -> RuntimeConfig {
     config.allow_blocking_atomics_wait = true;
     if config.runtime_host.is_none()
-        && let Some(io_handle) = parent_spawner.io_handle()
+        && let Some(io_handle) = parent_io_handle
     {
         config.runtime_host = Some(TokioRuntimeHost::from_handle(io_handle));
     }
@@ -2235,6 +2238,24 @@ mod tests {
         assert_send_sync_static::<Worker>();
         assert_send_sync_static::<OtterPool>();
         assert_send_sync_static::<WorkerShutdownReport>();
+    }
+
+    #[test]
+    fn a_child_isolate_inherits_the_parent_per_turn_budget() {
+        let parent_budget = otter_vm::RuntimeBudget {
+            on_exceeded: otter_vm::RuntimeBudgetExceededAction::Reject,
+            max_reductions_per_turn: Some(64),
+            ..otter_vm::RuntimeBudget::default()
+        };
+        let config = RuntimeConfig {
+            runtime_budget: parent_budget,
+            ..RuntimeConfig::default()
+        };
+        let child = configure_worker_child(config, None, None);
+
+        // Capabilities narrow on the way down; the CPU policy does not, so a
+        // worker cannot buy itself a longer turn than its parent runs under.
+        assert_eq!(child.runtime_budget, parent_budget);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -71,7 +71,7 @@ claim.
 | H1 | Security | P0 | complete | none | every HTTP redirect hop and cached final alias is authorized |
 | H2 | Isolation | P0 | complete | R1 | bounded, capability-aware Workers with deterministic shutdown |
 | B1 | Bytecode | P0 | complete | none | mandatory panic-free verifier before any bytecode executes |
-| R1 | Resources | P0 | active | none | one aggregate runtime budget and typed exhaustion errors |
+| R1 | Resources | P0 | complete | none | one aggregate runtime budget and typed exhaustion errors |
 | R2 | Resources | P1 | active | R1 | bound code, source, module, queue, worker, and external memory |
 | E1 | Embedding | P1 | started by H1 | none | one reusable capability evaluator for all host surfaces |
 | J1 | JIT | P1 | active lane | B1, R1 | one typed target-neutral compiled pipeline |
@@ -171,12 +171,35 @@ completion pump replace polling/retry loops; shutdown is cancellation-safe;
 timer handles are isolate-scoped and JavaScript-safe; process finalization
 detaches callback roots and host deadlines; the shared timer driver releases
 owners and compacts cancellation tombstones; IPC messages close untaken file
-descriptors. The next slices must bound the guaranteed-completion backlog,
-move dynamic-import liveness to an owned admission carrier, and charge retained
-message bodies, module sources, timers, host operations, external memory, and
-generated code at their physical owning lifetimes. Existing CPU reduction
-metering remains authoritative until it is folded into the same public budget
-configuration and telemetry surface.
+descriptors. The guaranteed-completion backlog is finite per isolate:
+`CompletionAdmissionPool` reserves a hard slot plus the complete ledger tuple
+before the producer publishes any terminal state, exhaustion is typed
+backpressure, and dynamic-import liveness rides the same unique carrier from
+before the pending promise exists through to dispatch. Retained module source,
+generated code, linked chunks, timers, host operations, and worker message
+bodies are charged at their physical owning lifetimes (see R2).
+
+CPU metering now lives in that one budget model rather than beside it. The
+per-turn execution policy is part of the runtime configuration
+(`RuntimeBuilder::runtime_budget`), so it is in force before the isolate's
+first turn on direct runtimes, handle threads, and workers alike — a child
+isolate inherits its parent's policy through the cloned configuration and
+cannot widen it, exactly as capabilities narrow but never escalate. It is
+installed after bootstrap: the builtin shims are host-chosen work of a fixed
+size, and metering them against a caller's per-turn limit would reject the
+isolate instead of the script it was configured for. Enforcement stays
+cooperative — interpreter instruction checkpoints, and compiled back edges
+that decrement inline fuel and reconcile the whole batch at the same
+checkpoint.
+
+Telemetry is one surface. The isolate publishes its counters into a shareable
+cell at every root-turn boundary and at every enforcement rejection, and
+`budget_report()` returns the configured limits, those counters, and the shared
+resource-ledger snapshot together, from a `Runtime`, a `RuntimeHandle`, or the
+`Otter` facade. The handle path crosses no command inbox, so a busy or blocked
+isolate still reports. Publishing at boundaries rather than per instruction is
+the point: a reader observes whole turns instead of a count torn out of the
+middle of one, and the hot path keeps charging a plain local counter.
 
 ### R2. Close unbounded stores and queues
 

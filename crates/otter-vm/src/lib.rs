@@ -479,7 +479,9 @@ pub use upvalue::{
     read_upvalue, store_upvalue,
 };
 
-pub use runtime_budget::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
+pub use runtime_budget::{
+    RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats, RuntimeBudgetTelemetry,
+};
 pub use runtime_cx::{NativeCallInfo, NativeCtx, NativeScope};
 
 use runtime_budget::RuntimeHeapSnapshot;
@@ -1273,6 +1275,9 @@ pub struct Interpreter {
     /// Aggregate VM resource counters for diagnostics and embedding policy
     /// work.
     runtime_budget_stats: RuntimeBudgetStats,
+    /// Cell the counters above are published to at every root-turn boundary,
+    /// so a holder outside this isolate's thread can read them.
+    runtime_budget_telemetry: RuntimeBudgetTelemetry,
     /// Nested dispatch loops share one root-turn accounting window.
     runtime_budget_depth: u32,
     runtime_budget_turn_started_at: Option<std::time::Instant>,

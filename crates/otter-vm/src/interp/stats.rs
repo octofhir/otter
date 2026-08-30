@@ -29,12 +29,34 @@ impl Interpreter {
         self.runtime_budget_stats
     }
 
+    /// Return the shareable cell this isolate publishes its budget counters
+    /// to.
+    #[must_use]
+    pub fn runtime_budget_telemetry(&self) -> RuntimeBudgetTelemetry {
+        self.runtime_budget_telemetry.clone()
+    }
+
+    /// Publish this isolate's budget counters into `telemetry` from now on.
+    ///
+    /// The runtime installs one cell per isolate before the first turn, so a
+    /// worker never publishes into its parent's counters.
+    pub fn set_runtime_budget_telemetry(&mut self, telemetry: RuntimeBudgetTelemetry) {
+        self.runtime_budget_telemetry = telemetry;
+        self.publish_runtime_budget_telemetry();
+    }
+
+    pub(crate) fn publish_runtime_budget_telemetry(&self) {
+        self.runtime_budget_telemetry
+            .publish(self.runtime_budget_stats);
+    }
+
     /// Reset aggregate runtime budget/resource counters.
     pub fn reset_runtime_budget_stats(&mut self) {
         self.runtime_budget_stats = RuntimeBudgetStats::default();
         self.runtime_budget_depth = 0;
         self.runtime_budget_turn_started_at = None;
         self.runtime_budget_heap_start = None;
+        self.publish_runtime_budget_telemetry();
     }
 
     pub(crate) fn begin_runtime_budget_turn(&mut self) {
@@ -59,6 +81,7 @@ impl Interpreter {
             }
             self.runtime_budget_stats
                 .finish_turn(started_at.elapsed(), self.runtime_budget);
+            self.publish_runtime_budget_telemetry();
         }
     }
 
@@ -86,6 +109,7 @@ impl Interpreter {
             self.runtime_budget,
         ) {
             self.runtime_budget_stats.record_budget_rejection();
+            self.publish_runtime_budget_telemetry();
             return Err(self.err_budget(("runtime budget exceeded".to_string()).into()));
         }
         Ok(())

@@ -61,7 +61,10 @@ use crate::{
     ResourceAccount, ResourceClass, ResourceLease, ResourceSnapshot, Runtime, RuntimeConfig,
     RuntimeModuleLoaderState, RuntimePackageManagerHandle, SourceInput, TimerFireOutcome,
 };
-use otter_vm::{DynamicImportAdmission, DynamicImportLoader, TimerAdmission, TimerScheduler};
+use otter_vm::{
+    DynamicImportAdmission, DynamicImportLoader, RuntimeBudget, RuntimeBudgetTelemetry,
+    TimerAdmission, TimerScheduler,
+};
 
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
 
@@ -160,6 +163,10 @@ struct RuntimeHandleInner {
     command_timeout: Duration,
     command_capacity: usize,
     counters: Arc<RuntimeCounters>,
+    /// Per-turn execution policy the isolate was built with, paired with the
+    /// counters it publishes so one reading carries both.
+    budget_limits: RuntimeBudget,
+    budget_telemetry: RuntimeBudgetTelemetry,
     exit: Arc<IsolateExit>,
     /// Shared fire-order queue every timer wake is handed to. Only the
     /// host-scheduled test path reaches it from this side; the isolate runner
@@ -1513,6 +1520,7 @@ impl RuntimeHandle {
             admitted.config.completion_capacities(),
         );
         let command_timeout = admitted.config.timeout();
+        let budget_limits = admitted.config.runtime_budget();
         let event_loop = match admitted.config.runtime_host() {
             Some(host) => host.event_loop(),
             None => TokioEventLoop::current_or_owned().map_err(|e| OtterError::Internal {
@@ -1557,7 +1565,7 @@ impl RuntimeHandle {
                 code: DiagnosticCode::IsolateSpawn.as_str().to_string(),
                 message: e.to_string(),
             })?;
-        let (interrupt, atomics_wait_agent) = match interrupt_rx.recv() {
+        let (interrupt, atomics_wait_agent, budget_telemetry) = match interrupt_rx.recv() {
             Ok(handles) => handles,
             Err(_) => {
                 // Bootstrap failed before publishing the interrupt handle.
@@ -1573,6 +1581,8 @@ impl RuntimeHandle {
         };
         let inner = Arc::new(RuntimeHandleInner {
             resources,
+            budget_limits,
+            budget_telemetry,
             completion_pool,
             inbox,
             runner: Mutex::new(Some(runner)),
@@ -2110,6 +2120,20 @@ impl RuntimeHandle {
         outcome.map_err(crate::map_graph_error)
     }
 
+    /// Read the isolate's CPU policy, its published counters, and the shared
+    /// resource ledger as one consistent picture.
+    ///
+    /// No command crosses the inbox: the counters are published by the isolate
+    /// at its own turn boundaries, so a busy or blocked isolate still reports.
+    #[must_use]
+    pub fn budget_report(&self) -> crate::RuntimeBudgetReport {
+        crate::RuntimeBudgetReport {
+            limits: self.inner.budget_limits,
+            execution: self.inner.budget_telemetry.snapshot(),
+            resources: self.inner.resources.snapshot(),
+        }
+    }
+
     /// Snapshot cheap activity counters.
     #[must_use]
     pub fn activity_stats(&self) -> RuntimeActivityStats {
@@ -2461,6 +2485,7 @@ fn run_isolate(
     interrupt_tx: SyncSender<(
         otter_vm::InterruptFlag,
         otter_vm::atomics_wait::WaitAgentHandle,
+        RuntimeBudgetTelemetry,
     )>,
     inbox: InboxSender,
     event_loop: TokioEventLoop,
@@ -2506,6 +2531,7 @@ fn run_isolate(
     let _ = interrupt_tx.send((
         runtime.interrupt_handle().raw_flag(),
         runtime.atomics_wait_agent_handle(),
+        runtime.budget_telemetry(),
     ));
     let mut runner = IsolateRunner {
         runtime,

@@ -14,6 +14,13 @@
 
 use crate::*;
 
+/// Synthetic binding-name prefix for the object environment a `with`
+/// statement captures. A direct eval nested in the `with` body receives
+/// these cells in its caller scope and rebuilds its own
+/// [`Compiler::active_with_envs`] from them, so the eval body resolves
+/// identifiers against the same object environments (§9.1.1.2.1).
+pub(crate) const WITH_ENV_PREFIX: &str = "__otter_with_env_";
+
 pub(crate) struct WithBindingProbe {
     pub(crate) object_reg: u16,
     pub(crate) found_reg: u16,
@@ -67,7 +74,7 @@ pub(crate) fn compile_with_statement(
     );
     let id = cx.next_with_env_id;
     cx.next_with_env_id = id.checked_add(1).expect("with env id overflow");
-    let env_name = format!("__otter_with_env_{id}");
+    let env_name = format!("{WITH_ENV_PREFIX}{id}");
     let storage = if cx.parent_captures.is_empty() {
         cx.declare_captured_binding(&env_name, false, span)?
     } else {
@@ -88,6 +95,29 @@ pub(crate) fn compile_with_statement(
     result
 }
 
+/// [`Compiler::binding_position`] expressed in the CALLER's scope
+/// numbering when `cx` is a direct-eval chunk.
+///
+/// An eval chunk flattens every inherited caller binding into its own
+/// function scope, which would sort them all level with the object
+/// environments. Re-project them onto the depth they had in the caller,
+/// and push anything the eval body itself declares below the function
+/// scope past every object environment — such a declaration is
+/// lexically innermost by construction.
+fn caller_aware_binding_position(cx: &Compiler, name: &str) -> Option<(usize, usize)> {
+    let (fn_depth, scope_depth) = cx.binding_position(name)?;
+    if cx.caller_scope_depths.is_empty() || fn_depth != 1 {
+        return Some((fn_depth, scope_depth));
+    }
+    if scope_depth > 1 {
+        return Some((fn_depth, usize::MAX));
+    }
+    Some((
+        fn_depth,
+        cx.caller_scope_depths.get(name).copied().unwrap_or(1),
+    ))
+}
+
 pub(crate) fn emit_with_binding_probe(
     cx: &mut Compiler,
     name: &str,
@@ -105,7 +135,7 @@ pub(crate) fn emit_with_binding_probe(
     // a function defined in a `with` body therefore shadows the
     // with-object property, while a `var` hoisted *outside* the
     // `with` is shadowed by it.
-    let binding_pos = cx.binding_position(name);
+    let binding_pos = caller_aware_binding_position(cx, name);
     let probed: Vec<String> = active_with_envs
         .iter()
         .rev()

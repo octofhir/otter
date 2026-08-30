@@ -114,6 +114,11 @@ pub struct EvalCallerBinding {
     /// dynamic eval-environment ops so a `delete` from any alias is
     /// observable everywhere.
     pub deletable: bool,
+    /// 1-based lexical scope depth of the binding inside the caller
+    /// function — the function scope is `1`, each enclosing block or
+    /// catch clause adds one. Orders the binding against the caller's
+    /// `with` object environments (§9.1.1.2.1).
+    pub scope_depth: u16,
 }
 
 /// Compile an `eval` / `new Function` body. Differs from script
@@ -707,6 +712,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
         .with_strict(main_is_strict)
         .with_module_url(script_module_url);
     top.captured_names = capture::analyze_module(program.body);
+    top.dot_arguments_observed = capture::program_reads_dot_arguments(program.body);
 
     // §19.2.1.3 EvalDeclarationInstantiation — direct eval inside a
     // function. The caller's bindings occupy the leading own-upvalue
@@ -871,6 +877,42 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                 },
             );
         }
+        // §9.1.1.2.1 — a direct eval inside a `with` body resolves
+        // identifiers against the same object environments as the
+        // caller. Their captured cells arrive as ordinary caller
+        // bindings; rebuild the chain from them, outermost first, so
+        // identifier sites probe the innermost object first. The
+        // whole chain sits at the chunk's own scope depth: an eval-body
+        // block declaration shadows it, an eval-body `var` — which lands
+        // in the caller's variable environment, outside the `with` —
+        // does not.
+        cx.caller_scope_depths = caller
+            .iter()
+            .map(|binding| (binding.name.clone(), binding.scope_depth as usize))
+            .collect();
+        let mut with_envs: Vec<(u32, String, usize)> = caller
+            .iter()
+            .filter_map(|binding| {
+                let id = binding
+                    .name
+                    .strip_prefix(crate::with_statement::WITH_ENV_PREFIX)?;
+                Some((
+                    id.parse::<u32>().ok()?,
+                    binding.name.clone(),
+                    binding.scope_depth as usize,
+                ))
+            })
+            .collect();
+        with_envs.sort_unstable();
+        let fn_depth = cx.stack.len();
+        cx.active_with_envs = with_envs
+            .into_iter()
+            .map(|(_, binding, scope_depth)| crate::with_statement::WithEnv {
+                binding,
+                fn_depth,
+                scope_depth,
+            })
+            .collect();
         // §19.2.1.1 — reconstruct the caller's PrivateEnvironment
         // from the spliced `__privsym_{ns}_{name}` cells so the eval
         // body resolves `obj.#name` through the ordinary
@@ -1156,6 +1198,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                             inner: false,
                             param: false,
                             deletable: cx.eval_var_names.contains(real),
+                            scope_depth: 1,
                         });
                         continue;
                     }
@@ -1188,6 +1231,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                         inner: false,
                         param: false,
                         deletable: cx.eval_var_names.contains(name.as_str()),
+                        scope_depth: 1,
                     });
                 }
             }

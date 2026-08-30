@@ -279,9 +279,13 @@ impl Interpreter {
                 .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
             let frame = &mut stack[frame_index];
+            // The cold record keeps its copy: §B.3.6.2 `fn.arguments` reads
+            // the same incoming values from a frame that has already built
+            // its own arguments object, and a second `Op::CollectArguments`
+            // in one frame must see them too.
             let elements: SmallVec<[Value; 4]> = self
                 .frame_cold_mut(frame)
-                .map(|cold| std::mem::take(&mut cold.incoming_args))
+                .map(|cold| cold.incoming_args.clone())
                 .unwrap_or_default();
             let mapped_entries = if function.arguments_object_kind == ArgumentsObjectKind::Mapped {
                 function

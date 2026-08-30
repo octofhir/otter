@@ -1090,6 +1090,7 @@ function outer() {
             fn_self_name: false,
             inner: false,
             deletable: false,
+            scope_depth: 1,
         }];
         let compile = |source| {
             compile_eval_source(

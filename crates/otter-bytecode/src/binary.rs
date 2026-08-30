@@ -425,6 +425,7 @@ impl Writer {
         self.bool(binding.inner);
         self.bool(binding.param);
         self.bool(binding.deletable);
+        self.u16(binding.scope_depth);
     }
 
     fn mapped_argument_binding(&mut self, binding: &MappedArgumentBinding) {
@@ -733,6 +734,7 @@ impl<'a> Reader<'a> {
             inner: self.bool()?,
             param: self.bool()?,
             deletable: self.bool()?,
+            scope_depth: self.u16()?,
         })
     }
 
@@ -930,6 +932,7 @@ mod tests {
                     inner: false,
                     param: false,
                     deletable: false,
+                    scope_depth: 1,
                 }],
                 eval_sites: vec![vec![DirectEvalBinding {
                     captured: false,
@@ -941,6 +944,7 @@ mod tests {
                     inner: true,
                     param: false,
                     deletable: false,
+                    scope_depth: 2,
                 }]],
                 contains_direct_eval: true,
                 source_text_range: Some((0, 18)),

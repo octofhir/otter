@@ -115,6 +115,12 @@ pub(crate) struct Compiler {
     /// `delete name` lowers to [`Op::DeleteDynamic`] instead of the
     /// declarative-binding `false`.
     pub(crate) eval_var_names: std::collections::HashSet<String>,
+    /// Lexical scope depth, inside the CALLER function, of each binding
+    /// a direct-eval chunk inherits through its caller scope. The chunk
+    /// declares them all in its own function scope, so this is the only
+    /// record of how they nested against the caller's `with` object
+    /// environments (§9.1.1.2.1). Empty outside an eval chunk.
+    pub(crate) caller_scope_depths: std::collections::HashMap<String, usize>,
     /// `true` while lowering class instance-field initializers
     /// (which compile into the constructor frame). A direct eval
     /// there may use `new.target` but observes `undefined`
@@ -181,6 +187,7 @@ impl Compiler {
             script_global_vars: std::collections::HashSet::new(),
             script_global_lexicals: std::collections::HashSet::new(),
             eval_var_names: std::collections::HashSet::new(),
+            caller_scope_depths: std::collections::HashMap::new(),
             in_field_initializer: false,
             eval_new_target_allowed: false,
             number_typed_cache: RefCell::new(HashMap::new()),

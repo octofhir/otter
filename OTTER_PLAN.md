@@ -398,9 +398,37 @@ Test262 subset. After a substantial semantic slice, capture a fresh full run on
 a stable checkout and update the report with commit, configuration, pass/fail,
 timeout, and deltas. Never hide timeouts or compare partial runs as full runs.
 
-Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.97% at
-`bbcc1066`, 18 fails, 0 crashes/timeouts (one fix vs the 19-fail set,
-zero regressions). §13.3.6.1 reads the callee before the arguments, so a
+Current baseline (see `ES_CONFORMANCE.md` for the full report): 99.98% at
+the legacy-surface slice, 12 fails, 0 crashes/timeouts (six fixes vs the
+18-fail set, zero regressions). The remaining twelve are nine intl402
+`DateTimeFormat` cases needing CLDR interval patterns, the chinese /
+dangi calendars, and `Intl.Era-monthcode`; one locale-padding case; and
+two mutually exclusive Annex B tests. That slice closed five legacy
+surfaces. §B.2.4 gives the `RegExp` constructor its match accessors
+(`input`, `lastMatch`, `$1`-`$9`, …), holding one subject handle plus
+index ranges on the realm so a match allocates nothing and the accessors
+slice on read; subclass-constructed instances and engine-hosted module
+literals opt out so internals never clobber program state. `fn.arguments`
+now answers with the running activation's arguments: building a frame's
+own arguments object had been *draining* the cold record's incoming
+values, and a sloppy function whose body never names `arguments` never
+captured them at all — a compilation unit that reads the property
+anywhere now materializes them. A direct eval inside `with` resolves
+against the object environment again: its captured cell already reached
+the eval body as an ordinary caller binding, but every inherited binding
+landed flat in the chunk's own function scope, so the caller's lexical
+depth had to travel with it for §9.1.1.2.1 to order declarations against
+object environments. `let` is a label in sloppy code once more, through a
+second parse-patch rule that rewrites the keyword to its escaped
+spelling — the same cooked LabelIdentifier, taking OXC's identifier path
+instead of its declaration path, with strict rejection still coming from
+the early-error pass. And the buffer a TypedArray constructor allocates
+implicitly is stamped with its creating realm's prototype, so a foreign
+buffer's `constructor` — and therefore `ArrayBuffer.prototype.slice`'s
+species lookup — resolves in the realm that made it. Assigning to an own
+accessor of a native function object also runs its setter now; an
+accessor descriptor carries no `[[Writable]]`, so the store path had
+been reporting these properties read-only. §13.3.6.1 reads the callee before the arguments, so a
 method call whose arguments can run user code loads the callee into its
 own register first; the fused method-call opcode stays for an argument
 list that cannot be ordered against that read. That split only became

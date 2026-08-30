@@ -64,6 +64,12 @@ pub(crate) struct FunctionContext {
     /// only when a parameter / body `var` / body lexical / body
     /// function declaration introduces the name.
     pub(crate) binds_arguments: bool,
+    /// `true` when the compilation unit reads a `.arguments` property
+    /// somewhere, so a sloppy ordinary function's arguments object may be
+    /// observed through the legacy `fn.arguments` accessor and has to be
+    /// materialized even when the body never names it. Inherited by every
+    /// nested function.
+    pub(crate) dot_arguments_observed: bool,
     /// Canonical source URL inherited by nested functions. Dynamic
     /// import uses this as the referrer when it runs inside a
     /// function body rather than at top level.
@@ -213,6 +219,7 @@ impl FunctionContext {
             super_home_static: false,
             in_param_init: false,
             binds_arguments: false,
+            dot_arguments_observed: false,
             module_url: String::new(),
             is_async_generator: false,
             loops: Vec::new(),

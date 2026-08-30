@@ -120,6 +120,62 @@ impl Interpreter {
         }
     }
 
+    /// The `[[Prototype]]` override stored on an exotic whose prototype
+    /// link rides a body slot, if one was installed. Mirrors
+    /// [`Self::set_exotic_prototype_override`]'s dispatch.
+    pub(crate) fn exotic_prototype_override(&self, value: &Value) -> Option<Value> {
+        if value.is_array_buffer()
+            || value.is_data_view()
+            || value.is_typed_array()
+            || value.is_iterator()
+            || value.as_intl(&self.gc_heap).is_some()
+        {
+            return self.non_gc_exotic_prototype_override(value);
+        }
+        if let Some(map) = value.as_map() {
+            return crate::collections::map_prototype_override(map, &self.gc_heap);
+        }
+        if let Some(set) = value.as_set() {
+            return crate::collections::set_prototype_override(set, &self.gc_heap);
+        }
+        if let Some(map) = value.as_weak_map() {
+            return crate::collections::weak_map_prototype_override(map, &self.gc_heap);
+        }
+        if let Some(set) = value.as_weak_set() {
+            return crate::collections::weak_set_prototype_override(set, &self.gc_heap);
+        }
+        if let Some(generator) = value.as_generator() {
+            return generator.prototype_override(&self.gc_heap);
+        }
+        if let Some(promise) = value.as_promise() {
+            return promise.prototype_override(&self.gc_heap);
+        }
+        if let Some(regexp) = value.as_regexp() {
+            return regexp.prototype_override(&self.gc_heap);
+        }
+        None
+    }
+
+    /// Stamp an exotic constructed while an extra realm is active with
+    /// THAT realm's intrinsic prototype.
+    ///
+    /// A body-slot exotic carries no `[[Prototype]]` of its own, so a
+    /// prototype walk that finds none falls back to the intrinsic of
+    /// whichever realm is active when the walk runs — the wrong realm
+    /// once the object crosses back. Constructors skip the override when
+    /// `new.target` is their own realm's intrinsic, which is exactly the
+    /// case this covers. Same policy as the typed-array, array, and
+    /// RegExp realm hooks.
+    pub(crate) fn register_exotic_realm_proto(&mut self, value: &Value) {
+        if !self.active_realm_is_extra || self.exotic_prototype_override(value).is_some() {
+            return;
+        }
+        let Some(proto) = self.intrinsic_prototype_object_for(value) else {
+            return;
+        };
+        self.set_exotic_prototype_override(value, Value::object(proto));
+    }
+
     /// Install a user-requested `[[Prototype]]` on an exotic whose
     /// prototype link rides a body slot rather than an `ObjectBody`.
     ///

@@ -728,8 +728,9 @@ impl TemplatePlan {
             let pc = lowered.instruction_pc;
             // The immediate-right binary operators carry no tier opcode: expand
             // each into a constant materialization plus the register operator
-            // it fuses. The destination doubles as the constant's register (the
-            // compiler guarantees it differs from the left operand), so no
+            // it fuses. The destination doubles as the constant's register,
+            // which the verifier guarantees differs from the left operand
+            // (`ImmediateOperandAliasesDestination`), so no
             // extra register or logical PC is needed — both emitted operations
             // share this instruction's PC, and only the first receives the
             // branch label.

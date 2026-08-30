@@ -518,6 +518,24 @@ pub enum BytecodeVerifyError {
         /// Encoded end.
         end: u32,
     },
+    /// An immediate-right operator names one register as both its destination
+    /// and its left operand.
+    ///
+    /// Consumers are free to materialize the immediate into the destination
+    /// register — that is what lets the form need no extra register — so an
+    /// aliased destination would destroy the left operand before the operator
+    /// reads it. The interpreter reads before it writes and would survive it;
+    /// generated code does not, so the two would disagree.
+    ImmediateOperandAliasesDestination {
+        /// Index of the offending function in the module table.
+        function_index: usize,
+        /// Logical PC of the offending instruction.
+        instruction_pc: usize,
+        /// The immediate-right opcode.
+        op: Op,
+        /// The register named as both destination and left operand.
+        register: u16,
+    },
     /// A class-hint target points outside this module's function range.
     ClassHintFunction {
         /// Owning function table index.
@@ -678,6 +696,15 @@ impl std::fmt::Display for BytecodeVerifyError {
                 f,
                 "function {function_index} instruction {instruction_pc} template site {template_index} is outside {template_count} entries"
             ),
+            Self::ImmediateOperandAliasesDestination {
+                function_index,
+                instruction_pc,
+                op,
+                register,
+            } => write!(
+                f,
+                "function {function_index} instruction {instruction_pc} {op:?} names r{register} as both destination and left operand"
+            ),
             Self::ConstantIndex {
                 function_index,
                 instruction_pc,
@@ -794,6 +821,51 @@ impl std::error::Error for BytecodeVerifyError {
             _ => None,
         }
     }
+}
+
+/// Reject an immediate-right operator that names one register as both its
+/// destination and its left operand.
+///
+/// The immediate-right forms carry their constant in the instruction rather
+/// than the constant pool, so a consumer may materialize it into the
+/// destination register and then run the ordinary two-register operator. That
+/// is sound only while the destination differs from the left operand. The
+/// interpreter reads both operands before writing and tolerates the alias;
+/// generated code does not, so admitting it would let the two consumers
+/// disagree on an artifact both accepted.
+fn verify_immediate_right_operands(
+    function_index: usize,
+    instruction_pc: usize,
+    instruction: &crate::wordcode::Instruction,
+    code: &crate::wordcode::FunctionCode,
+) -> Result<(), BytecodeVerifyError> {
+    if !matches!(
+        instruction.op,
+        Op::AddImm
+            | Op::SubImm
+            | Op::BitwiseAndImm
+            | Op::LessThanImm
+            | Op::EqualImm
+            | Op::NotEqualImm
+    ) {
+        return Ok(());
+    }
+    let (Some(Operand::Register(dst)), Some(Operand::Register(lhs))) =
+        (code.operand(instruction, 0), code.operand(instruction, 1))
+    else {
+        // Operand shapes are checked by the wordcode layout pass; anything
+        // else here is reported there.
+        return Ok(());
+    };
+    if dst == lhs {
+        return Err(BytecodeVerifyError::ImmediateOperandAliasesDestination {
+            function_index,
+            instruction_pc,
+            op: instruction.op,
+            register: dst,
+        });
+    }
+    Ok(())
 }
 
 /// Verify a normal compiler/cache module whose dense function ids start at 0.
@@ -1005,6 +1077,12 @@ fn verify_function(
     }
 
     for (instruction_pc, instruction) in function.code.iter().enumerate() {
+        verify_immediate_right_operands(
+            function_index,
+            instruction_pc,
+            instruction,
+            &function.code,
+        )?;
         for operand_index in 0..instruction.operand_count() {
             let operand = function.code.operand(instruction, operand_index).ok_or(
                 BytecodeVerifyError::OperandDecode {
@@ -1687,6 +1765,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn immediate_right_operators_reject_an_aliased_destination() {
+        // The lowering that gives these forms their register economy writes
+        // the constant into the destination first, so an aliased destination
+        // would destroy the left operand. Generated code diverges from the
+        // interpreter there, which is why admission has to reject it.
+        for op in [
+            Op::AddImm,
+            Op::SubImm,
+            Op::BitwiseAndImm,
+            Op::LessThanImm,
+            Op::EqualImm,
+            Op::NotEqualImm,
+        ] {
+            let mut aliased_code = FunctionCodeBuilder::new();
+            aliased_code.push(
+                op,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::Imm32(1),
+                ],
+            );
+            aliased_code.push(Op::Return, &[Operand::Register(0)]);
+            let aliased = module_with(aliased_code.finish());
+            assert!(
+                matches!(
+                    verify_module(&aliased),
+                    Err(BytecodeVerifyError::ImmediateOperandAliasesDestination {
+                        register: 0,
+                        ..
+                    })
+                ),
+                "{op:?} with an aliased destination was accepted"
+            );
+
+            let mut distinct_code = FunctionCodeBuilder::new();
+            distinct_code.push(
+                op,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(1),
+                ],
+            );
+            distinct_code.push(Op::Return, &[Operand::Register(1)]);
+            let distinct = module_with(distinct_code.finish());
+            verify_module(&distinct)
+                .unwrap_or_else(|error| panic!("{op:?} with a distinct destination: {error}"));
+        }
     }
 
     #[test]

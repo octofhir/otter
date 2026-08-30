@@ -347,13 +347,21 @@ fn compile_binary_to(
         if number_typed_operands && op_takes_number_hint(op) {
             cx.mark_number_hint_site();
         }
-        let dst = destination.unwrap_or_else(|| {
-            let mut candidate = cx.alloc_scratch();
-            while candidate == lhs {
-                candidate = cx.alloc_scratch();
+        // §the immediate-right forms materialize their constant into the
+        // destination register, so a destination that aliases the left operand
+        // would destroy it before the operator reads it. The verifier rejects
+        // that shape; allocate a distinct register when a caller-supplied
+        // destination would collide.
+        let dst = match destination {
+            Some(reg) if reg != lhs => reg,
+            _ => {
+                let mut candidate = cx.alloc_scratch();
+                while candidate == lhs {
+                    candidate = cx.alloc_scratch();
+                }
+                candidate
             }
-            candidate
-        });
+        };
         cx.emit(
             imm_op,
             vec![

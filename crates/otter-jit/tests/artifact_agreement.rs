@@ -68,9 +68,12 @@ fn module_from(name: &str, locals: u16, code: FunctionCodeBuilder) -> BytecodeMo
 /// artifact gets.
 fn hot_loop_module(trips: i32) -> BytecodeModule {
     let mut code = FunctionCodeBuilder::new();
-    // r0 = accumulator, r1 = induction variable, r2 = scratch predicate.
+    // r0 = accumulator, r1 = induction variable, r2 = predicate, r3 = step.
     code.push(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(0)]);
     code.push(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(0)]);
+    // The step lives in its own register: an immediate-right operator may not
+    // name one register as both destination and left operand.
+    code.push(Op::LoadInt32, &[Operand::Register(3), Operand::Imm32(1)]);
     let header = code.next_pc();
     code.push(
         Op::LessThanImm,
@@ -90,11 +93,11 @@ fn hot_loop_module(trips: i32) -> BytecodeModule {
         ],
     );
     code.push(
-        Op::AddImm,
+        Op::Add,
         &[
             Operand::Register(1),
             Operand::Register(1),
-            Operand::Imm32(1),
+            Operand::Register(3),
         ],
     );
     let back = code.push(Op::Jump, &[Operand::Imm32(0)]);
@@ -102,7 +105,7 @@ fn hot_loop_module(trips: i32) -> BytecodeModule {
     code.push(Op::Return, &[Operand::Register(0)]);
     set_offset(&mut code, exit, 0, done);
     set_offset(&mut code, back, 0, header);
-    module_from("hot_loop", 3, code)
+    module_from("hot_loop", 4, code)
 }
 
 /// A hot loop whose accumulator leaves the int32 range, so both consumers
@@ -114,6 +117,9 @@ fn overflowing_accumulator_module(trips: i32) -> BytecodeModule {
         &[Operand::Register(0), Operand::Imm32(i32::MAX - 1)],
     );
     code.push(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(0)]);
+    // The step lives in its own register: an immediate-right operator may not
+    // name one register as both destination and left operand.
+    code.push(Op::LoadInt32, &[Operand::Register(3), Operand::Imm32(1)]);
     let header = code.next_pc();
     code.push(
         Op::LessThanImm,
@@ -133,11 +139,11 @@ fn overflowing_accumulator_module(trips: i32) -> BytecodeModule {
         ],
     );
     code.push(
-        Op::AddImm,
+        Op::Add,
         &[
             Operand::Register(1),
             Operand::Register(1),
-            Operand::Imm32(1),
+            Operand::Register(3),
         ],
     );
     let back = code.push(Op::Jump, &[Operand::Imm32(0)]);
@@ -145,12 +151,13 @@ fn overflowing_accumulator_module(trips: i32) -> BytecodeModule {
     code.push(Op::Return, &[Operand::Register(0)]);
     set_offset(&mut code, exit, 0, done);
     set_offset(&mut code, back, 0, header);
-    module_from("overflow", 3, code)
+    module_from("overflow", 4, code)
 }
 
 /// The hot loop again, register for register, but ending in a `throw` instead
-/// of a `return`. Isolating the tail keeps any disagreement attributable to
-/// abrupt completion out of compiled code rather than to the loop body.
+/// of a `return`. A throwing exit disables the compare/branch fusion the
+/// returning case gets, so this is the artifact that exercises the unfused
+/// lowering of the loop.
 fn throwing_loop_module(trips: i32) -> BytecodeModule {
     let mut code = FunctionCodeBuilder::new();
     code.push(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(0)]);
@@ -174,11 +181,11 @@ fn throwing_loop_module(trips: i32) -> BytecodeModule {
         ],
     );
     code.push(
-        Op::AddImm,
+        Op::Add,
         &[
             Operand::Register(1),
             Operand::Register(1),
-            Operand::Imm32(1),
+            Operand::Register(3),
         ],
     );
     let back = code.push(Op::Jump, &[Operand::Imm32(0)]);
@@ -191,7 +198,7 @@ fn throwing_loop_module(trips: i32) -> BytecodeModule {
     set_offset(&mut code, exit, 0, done);
     set_offset(&mut code, back, 0, header);
 
-    let mut module = module_from("throwing_loop", 3, code);
+    let mut module = module_from("throwing_loop", 4, code);
     module.constants = vec![Constant::String {
         utf16: "loop finished".encode_utf16().collect(),
     }];
@@ -251,40 +258,11 @@ fn integer_overflow_in_a_hot_loop_agrees_across_tiers() {
     });
 }
 
-// Open engine defect, found by this suite. The artifact is the hot-loop case
-// register for register, with `Throw` in place of `Return` as the only exit.
-// The interpreter completes it; compiled code spins instead of throwing.
-//
-// Narrowed to the combination of OSR entry and an exit path that throws.
-// Each ingredient alone is fine: the same loop ending in `Return` agrees on
-// both consumers, the same throw with the loop cold agrees, and the same
-// 4000-trip loop with the OSR threshold left high (so the loop is never
-// entered compiled) agrees. Only entering the loop through OSR and then
-// reaching the throw fails to leave compiled code.
-//
-// No compiler emits a function whose sole terminator is `Throw` — every
-// source-level function ends in a return — which is why difftest cannot
-// reach it and only an artifact-level case does.
-//
-// The observation runs on a worker thread so the failure is a bounded, typed
-// disagreement rather than a hung test process.
 #[test]
-#[ignore = "open defect: compiled code does not leave a hot loop whose only exit is a throw"]
 fn a_throw_after_a_hot_loop_agrees_across_tiers() {
-    let oracle = observe(throwing_loop_module(4_000), false);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(observe(throwing_loop_module(4_000), true));
-    });
-    match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(tiered) => assert_eq!(
-            oracle, tiered,
-            "throwing loop: interpreter and JIT disagree on one verified artifact"
-        ),
-        Err(_) => panic!(
-            "throwing loop: compiled code never returned, while the interpreter produced {oracle:?}"
-        ),
-    }
+    // A throwing exit disables compare/branch fusion, so this case covers the
+    // unfused lowering of a loop that the returning case never reaches.
+    run_on_each_tier("throwing loop", || throwing_loop_module(4_000));
 }
 
 #[test]

@@ -376,6 +376,21 @@ fn structural_mutations_are_typed_rejections() {
         module.functions[0].class_hint_sites[0].class_function_id = 99;
         module
     };
+    let aliased_immediate_destination = {
+        let mut module = seed_minimal();
+        let mut code = module.functions[0].code.to_builder();
+        code.replace(
+            0,
+            Op::AddImm,
+            &[
+                Operand::Register(0),
+                Operand::Register(0),
+                Operand::Imm32(1),
+            ],
+        );
+        module.functions[0].code = code.finish();
+        module
+    };
     let out_of_range_span = {
         let mut module = seed_rich();
         module.functions[0].spans[0].pc = 4_000;
@@ -389,6 +404,10 @@ fn structural_mutations_are_typed_rejections() {
         ("missing capture spine", missing_capture_spine),
         ("dangling class hint", dangling_class_hint),
         ("out-of-range span pc", out_of_range_span),
+        (
+            "immediate destination aliasing its left operand",
+            aliased_immediate_destination,
+        ),
     ] {
         assert!(
             otter_bytecode::verify_module(&module).is_err(),

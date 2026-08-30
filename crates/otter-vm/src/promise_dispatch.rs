@@ -2424,7 +2424,7 @@ fn static_all_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -2467,7 +2467,7 @@ fn static_all_generic(
                     attach_then_value(interp, stack, &exec, entry_promise, on_fulfill, on_reject)
                 {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -2563,7 +2563,7 @@ fn static_race_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -2580,7 +2580,7 @@ fn static_race_generic(
                     on_rejected,
                 ) {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -2673,7 +2673,7 @@ fn static_all_settled_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -2707,7 +2707,7 @@ fn static_all_settled_generic(
                     attach_then_value(interp, stack, &exec, entry_promise, on_fulfill, on_reject)
                 {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -2958,7 +2958,7 @@ fn static_any_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -3002,7 +3002,7 @@ fn static_any_generic(
                     attach_then_value(interp, stack, &exec, entry_promise, on_fulfilled, on_reject)
                 {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    let _ = interp.iterator_close_sync(stack, &exec, &iterator_raw);
+                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }

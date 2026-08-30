@@ -79,7 +79,7 @@ fn to_bigint(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmErr
             return Err(interp
                 .err_range(("The number is not a safe integer for BigInt".to_string()).into()));
         }
-        return Ok(BigInt::from(f as i128));
+        return Ok(exact_integer_to_bigint(f));
     }
     if let Some(s) = value.as_string(interp.gc_heap()) {
         return string_to_bigint(interp, &s.to_lossy_string(interp.gc_heap()));
@@ -104,6 +104,40 @@ fn to_bigint(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmErr
         );
     }
     Err(interp.err_type(("Cannot convert value to a BigInt".to_string()).into()))
+}
+
+/// §21.2.1.1 NumberToBigInt for an integral, finite `f64`.
+///
+/// The IEEE-754 significand and exponent are read directly, so a value
+/// past the `i128` range (anything from `2^127` up to `Number.MAX_VALUE`)
+/// converts exactly instead of saturating.
+fn exact_integer_to_bigint(f: f64) -> BigInt {
+    if f == 0.0 {
+        return BigInt::from(0);
+    }
+    let bits = f.to_bits();
+    let raw_exponent = ((bits >> 52) & 0x7FF) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    // A subnormal is never a non-zero integer, so only the normal form
+    // needs the implicit leading bit.
+    let (significand, exponent) = if raw_exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), raw_exponent - 1075)
+    };
+    let mut magnitude = BigInt::from(significand);
+    if exponent > 0 {
+        magnitude <<= exponent as u32;
+    } else if exponent < 0 {
+        // The caller has already established `f.fract() == 0`, so every
+        // bit this drops is zero.
+        magnitude >>= exponent.unsigned_abs();
+    }
+    if f.is_sign_negative() {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 /// §7.1.13 ToBigInt — the strict conversion used by `BigInt.asIntN` /

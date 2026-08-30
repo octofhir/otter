@@ -327,6 +327,7 @@ impl Interpreter {
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
+            regexp_legacy: crate::regexp_legacy::RegExpLegacyState::default(),
             regex_compile_cache: regexp::RegexCompileCache::default(),
             tracer: None,
             cpu_profiler: None,
@@ -431,6 +432,7 @@ impl Interpreter {
         std::mem::swap(&mut self.global_this, &mut state.global_this);
         std::mem::swap(&mut self.error_classes, &mut state.error_classes);
         std::mem::swap(&mut self.realm_intrinsics, &mut state.realm_intrinsics);
+        std::mem::swap(&mut self.regexp_legacy, &mut state.regexp_legacy);
         std::mem::swap(&mut self.template_objects, &mut state.template_objects);
         std::mem::swap(&mut self.realm_context, &mut state.realm_context);
         std::mem::swap(
@@ -540,6 +542,7 @@ impl Interpreter {
             global_this: self.global_this,
             error_classes,
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
+            regexp_legacy: crate::regexp_legacy::RegExpLegacyState::default(),
             array_iterator_prototype: None,
             map_iterator_prototype: None,
             set_iterator_prototype: None,

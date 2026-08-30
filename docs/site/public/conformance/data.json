@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "94c6fb738ce8bb0f1c62e81783a3da3ace7b027a",
-  "ran_at": "2026-08-30T09:51:12.786702+00:00",
+  "engine_commit": "15855d553b18ced30fdd1d3b6b5a35f3306e4af2",
+  "ran_at": "2026-08-30T12:28:55.998135+00:00",
   "totals": {
     "total": 53575,
-    "passed": 52457,
-    "failed": 18,
+    "passed": 52463,
+    "failed": 12,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -28841,8 +28841,8 @@
     },
     "language/eval-code/direct": {
       "total": 286,
-      "passed": 285,
-      "failed": 1,
+      "passed": 286,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40919,8 +40919,8 @@
     },
     "staging/sm/ArrayBuffer": {
       "total": 5,
-      "passed": 4,
-      "failed": 1,
+      "passed": 5,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41198,8 +41198,8 @@
     },
     "staging/sm/extensions": {
       "total": 64,
-      "passed": 63,
-      "failed": 1,
+      "passed": 64,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41252,8 +41252,8 @@
     },
     "staging/sm/misc": {
       "total": 18,
-      "passed": 17,
-      "failed": 1,
+      "passed": 18,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41288,8 +41288,8 @@
     },
     "staging/sm/statements": {
       "total": 17,
-      "passed": 16,
-      "failed": 1,
+      "passed": 17,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41306,8 +41306,8 @@
     },
     "staging/sm/syntax": {
       "total": 11,
-      "passed": 10,
-      "failed": 1,
+      "passed": 11,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -41406,27 +41406,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-civil eras (AD,AD) should be unique Expected SameValue(«1», «2») to be true"
     },
     {
-      "path": "language/eval-code/direct/global-env-rec-with.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct eval"
-    },
-    {
-      "path": "staging/sm/ArrayBuffer/slice-species.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«function ArrayBuffer() { [native code] }», «function ArrayBuffer() { [native code] }») to be true"
-    },
-    {
       "path": "staging/sm/String/internalUsage.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/extensions/arguments-property-access-in-function.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «5») to be true"
     },
     {
       "path": "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",
@@ -41435,28 +41418,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"object\"», «\"function\"») to be true"
     },
     {
-      "path": "staging/sm/misc/future-reserved-words.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpected token\n    at testNormalAndStrict (staging/sm/misc/future-reserved-words.js:27:1)\n    at testWord (staging/sm/misc/future-reserved-words.js:59:3)\n    at staging/sm/misc/future-reserved-words.js:111:1"
-    },
-    {
       "path": "staging/sm/regress/regress-602621.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: function sub-statement must override arguments Expected SameValue(«\"function\"», «\"object\"») to be true"
-    },
-    {
-      "path": "staging/sm/statements/regress-642975.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"\"», «\"y\"») to be true"
-    },
-    {
-      "path": "staging/sm/syntax/let-as-label.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpected token\n    at staging/sm/syntax/let-as-label.js:3:1"
     }
   ]
 }

@@ -257,8 +257,20 @@ fn with_program_goal_after_parse<R, T>(
         // the early SyntaxError in strict code). One site per retry —
         // the parser stops at the first fatal error.
         if goal == SourceGoal::Script
-            && attempts < MAX_CALL_TARGET_PATCHES
+            && attempts < MAX_PARSE_PATCHES
             && let Some(next) = patch_call_assignment_target(src, kind, &ret.diagnostics)
+        {
+            patched = Some(next);
+            attempts += 1;
+            continue;
+        }
+        // §14.13.1 — `let` is a legal LabelIdentifier in sloppy code, but
+        // OXC commits to a `let` declaration on the unescaped keyword and
+        // reports a fatal parse error with no AST. Retry with the keyword
+        // written as an escape, which OXC parses as the label it is.
+        if goal == SourceGoal::Script
+            && attempts < MAX_PARSE_PATCHES
+            && let Some(next) = patch_let_label(src, &ret.diagnostics)
         {
             patched = Some(next);
             attempts += 1;
@@ -275,9 +287,9 @@ fn with_program_goal_after_parse<R, T>(
 /// throw ReferenceError" (strict code keeps the early SyntaxError).
 pub const INVALID_ASSIGNMENT_TARGET_PROPERTY: &str = "__otter_invalid_assignment_target__";
 
-/// Retry bound for [`patch_call_assignment_target`] — each fatal parse
-/// reveals at most one further call-target site.
-const MAX_CALL_TARGET_PATCHES: usize = 32;
+/// Retry bound for the parse-patch rules — each fatal parse reveals at
+/// most one further patchable site.
+const MAX_PARSE_PATCHES: usize = 32;
 
 /// When the first fatal diagnostic is OXC's invalid-assignment error and
 /// its span is a plain CallExpression (§13.15.1 web-compat shape — not an
@@ -344,6 +356,58 @@ fn next_operator_is_logical_assignment(rest: &str) -> bool {
     tail.starts_with("&&=") || tail.starts_with("||=") || tail.starts_with("??=")
 }
 
+/// The escaped spelling of `let`. A LabelIdentifier compares by its
+/// cooked name, so this labels — and is broken out of — exactly as the
+/// keyword spelling does.
+const ESCAPED_LET: &str = "l\\u0065t";
+
+/// When the first fatal diagnostic sits on a sloppy `let` used as a label,
+/// return the source with that keyword rewritten to [`ESCAPED_LET`].
+///
+/// OXC dispatches an unescaped statement-leading `let` into declaration
+/// parsing, where a following `:` is a fatal error; the escaped spelling
+/// takes the identifier path and yields the LabeledStatement the grammar
+/// calls for. Strict code still rejects the label — `otter-compiler`'s
+/// early-error pass tests the cooked name, so both spellings throw there.
+fn patch_let_label(source: &str, diagnostics: &[oxc_diagnostics::OxcDiagnostic]) -> Option<String> {
+    let label = diagnostics.first()?.labels.as_slice().first()?;
+    let (start, end) = let_label_keyword_span(source, label.offset() as usize)?;
+    let mut next = String::with_capacity(source.len() + ESCAPED_LET.len());
+    next.push_str(source.get(..start)?);
+    next.push_str(ESCAPED_LET);
+    next.push_str(source.get(end..)?);
+    Some(next)
+}
+
+/// The byte span of the `let` keyword of a `let:` label when `offset` —
+/// where OXC reported the fatal error — lands on either the keyword or
+/// the colon that follows it.
+fn let_label_keyword_span(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let rest = source.get(offset..)?;
+    if rest.starts_with("let") && rest[3..].trim_start().starts_with(':') {
+        return keyword_is_freestanding(source, offset).then_some((offset, offset + 3));
+    }
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let head = source.get(..offset)?.trim_end();
+    let end = head.len();
+    let start = end.checked_sub(3)?;
+    if head.get(start..) != Some("let") {
+        return None;
+    }
+    keyword_is_freestanding(source, start).then_some((start, end))
+}
+
+/// `true` when the character before `start` cannot continue an identifier,
+/// so the `let` at `start` is a whole token rather than the tail of one.
+fn keyword_is_freestanding(source: &str, start: usize) -> bool {
+    source[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '\\'))
+}
+
 /// `true` when `snippet` parses on its own as exactly one expression
 /// statement whose expression — modulo parentheses — is a plain (non-
 /// optional-chain) CallExpression.
@@ -375,6 +439,48 @@ fn snippet_is_plain_call(snippet: &str, kind: SourceKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn let_is_a_label_in_sloppy_script_code() {
+        let labeled = with_program_goal(
+            "let: while (false) break let;",
+            SourceKind::JavaScript,
+            SourceGoal::Script,
+            |program| {
+                matches!(
+                    program.body.first(),
+                    Some(oxc_ast::ast::Statement::LabeledStatement(stmt))
+                        if stmt.label.name == "let"
+                )
+            },
+        );
+        assert!(labeled.expect("sloppy `let` label parses"));
+    }
+
+    #[test]
+    fn let_declarations_are_untouched_by_the_label_patch() {
+        let declaration = with_program_goal(
+            "let x = 1;",
+            SourceKind::JavaScript,
+            SourceGoal::Script,
+            |program| {
+                matches!(
+                    program.body.first(),
+                    Some(oxc_ast::ast::Statement::VariableDeclaration(_))
+                )
+            },
+        );
+        assert!(declaration.expect("`let` declaration parses"));
+        assert!(
+            with_program_goal(
+                "let 1 = 2;",
+                SourceKind::JavaScript,
+                SourceGoal::Script,
+                |_| ()
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn detects_typescript_extension() {

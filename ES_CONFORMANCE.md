@@ -1,37 +1,31 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `94c6fb738ce8bb0f1c62e81783a3da3ace7b027a`
+- **Engine commit:** `15855d553b18ced30fdd1d3b6b5a35f3306e4af2`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-30T09:51:12.786702+00:00
+- **Captured:** 2026-08-30T12:28:55.998135+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52457 |
-| failed     | 18 |
+| passed     | 52463 |
+| failed     | 12 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.97%
+**Pass rate (excl. skipped):** 99.98%
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
-| language/eval-code/direct | 286 | 285 | 1 | 99.7% |
-| staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
-| staging/sm/extensions | 64 | 63 | 1 | 98.4% |
 | staging/sm/lexical-environment | 34 | 33 | 1 | 97.1% |
-| staging/sm/misc | 18 | 17 | 1 | 94.4% |
 | staging/sm/regress | 106 | 105 | 1 | 99.1% |
-| staging/sm/statements | 17 | 16 | 1 | 94.1% |
-| staging/sm/syntax | 11 | 10 | 1 | 90.9% |
 | annexB/built-ins/Array | 1 | 1 | 0 | 100.0% |
 | annexB/built-ins/Date | 24 | 24 | 0 | 100.0% |
 | annexB/built-ins/Function | 6 | 6 | 0 | 100.0% |
@@ -72,6 +66,12 @@
 | built-ins/AggregateError/order-of-args-evaluation.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/prop-desc.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/proto-from-ctor-realm.js | 1 | 0 | 0 | 0.0% |
+| built-ins/AggregateError/proto.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/prototype | 6 | 6 | 0 | 100.0% |
+| built-ins/Array/15.4.5-1.js | 1 | 1 | 0 | 100.0% |
+| built-ins/Array/15.4.5.1-5-1.js | 1 | 1 | 0 | 100.0% |
+| built-ins/Array/15.4.5.1-5-2.js | 1 | 1 | 0 | 100.0% |
+| built-ins/Array/S15.4.1_A1.1_T1.js | 1 | 1 | 0 | 100.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -86,13 +86,7 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: date = 2… | `intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month co… | `intl402/DateTimeFormat/prototype/formatToParts/dangi-calendar-dates.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-… | `intl402/DateTimeFormat/prototype/formatToParts/era.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct e… | `language/eval-code/direct/global-env-rec-with.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/ArrayBuffer/slice-species.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/String/internalUsage.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/arguments-property-access-in-function.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/misc/future-reserved-words.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: function… | `staging/sm/regress/regress-602621.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/statements/regress-642975.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: SyntaxError: Unexpecte… | `staging/sm/syntax/let-as-label.js` |
 

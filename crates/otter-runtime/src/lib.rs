@@ -1786,6 +1786,7 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
                         fn_self_name: binding.fn_self_name,
                         inner: binding.inner,
                         deletable: binding.deletable,
+                        scope_depth: binding.scope_depth,
                     })
                     .collect()
             });

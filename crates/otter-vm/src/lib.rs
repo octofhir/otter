@@ -2005,6 +2005,11 @@ pub struct EvalCallerBinding {
     /// through the dynamic eval-environment ops so a `delete` stays
     /// observable.
     pub deletable: bool,
+    /// 1-based lexical scope depth of the binding inside the caller
+    /// function — the function scope is `1`, each enclosing block or
+    /// catch clause adds one. Orders the binding against the caller's
+    /// `with` object environments (§9.1.1.2.1).
+    pub scope_depth: u16,
 }
 
 /// Embedder-supplied parse + compile callback used by

@@ -2244,6 +2244,21 @@ pub struct DirectEvalBinding {
     /// is observable through every alias.
     #[serde(default)]
     pub deletable: bool,
+    /// 1-based lexical scope depth of the binding inside the owning
+    /// function: the function scope is `1` and each enclosing block or
+    /// catch clause between it and the eval site adds one. A direct eval
+    /// nested in a `with` compares this against the object environments'
+    /// own depths to decide which of them a name resolution walks
+    /// (§9.1.1.2.1 — only object environments inner to the declaration
+    /// participate).
+    #[serde(default = "one_u16")]
+    pub scope_depth: u16,
+}
+
+/// `serde` default for [`DirectEvalBinding::scope_depth`] — the function
+/// scope.
+fn one_u16() -> u16 {
+    1
 }
 
 /// One argument index aliased to one formal parameter binding.

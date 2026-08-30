@@ -48,14 +48,24 @@ pub(crate) fn compile_function_full(
     let contains_direct_eval = body
         .as_ref()
         .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b));
-    let needs_arguments =
-        body_references_arguments(params, body.as_deref()) || contains_direct_eval;
+    // §B.3.6.2 — `fn.arguments` yields the arguments object of a sloppy
+    // ordinary function's running activation, which the body itself never
+    // names. When the unit reads the property anywhere, materialize it.
+    let legacy_arguments_observable = parent.dot_arguments_observed
+        && !function_is_strict
+        && !is_method
+        && !is_async
+        && !is_generator;
+    let needs_arguments = body_references_arguments(params, body.as_deref())
+        || contains_direct_eval
+        || legacy_arguments_observable;
     let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
     let active_with_envs = parent.active_with_envs.clone();
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(function_is_strict)
         .with_module_url(parent.module_url.clone());
+    child.dot_arguments_observed = parent.dot_arguments_observed;
     child.super_home_static = static_home;
     child.has_home_object = is_method || hinted_home;
     child.is_derived_ctor = hinted_derived_ctor;
@@ -390,9 +400,9 @@ pub(crate) fn compile_function_full(
 pub(crate) fn record_eval_site(cx: &mut Compiler) -> u32 {
     let mut entries: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for scope in cx.scopes.iter().skip(1).rev() {
+    for (index, scope) in cx.scopes.iter().enumerate().skip(1).rev() {
         for (name, info) in &scope.bindings {
-            if name.starts_with("__") {
+            if name.starts_with("__") && !name.starts_with(crate::with_statement::WITH_ENV_PREFIX) {
                 continue;
             }
             let BindingStorage::Upvalue { idx } = info.storage else {
@@ -411,6 +421,7 @@ pub(crate) fn record_eval_site(cx: &mut Compiler) -> u32 {
                 inner: true,
                 param: false,
                 deletable: false,
+                scope_depth: u16::try_from(index + 1).unwrap_or(u16::MAX),
             });
         }
     }
@@ -448,6 +459,7 @@ pub(crate) fn collect_direct_eval_bindings(
                 inner: false,
                 param: info.param,
                 deletable: cx.eval_var_dynamic_reference(name),
+                scope_depth: 1,
             }),
             BindingStorage::Register { .. } => None,
         })
@@ -481,6 +493,7 @@ pub(crate) fn collect_direct_eval_bindings(
                 inner: false,
                 param: true,
                 deletable: false,
+                scope_depth: 1,
             });
             continue;
         }
@@ -508,6 +521,7 @@ pub(crate) fn collect_direct_eval_bindings(
             inner: false,
             param: false,
             deletable: cx.eval_var_dynamic_reference(name),
+            scope_depth: 1,
         });
     }
     // `bindings` is hash-ordered; sort for deterministic bytecode.
@@ -560,6 +574,7 @@ pub(crate) fn compile_arrow_function(
         .with_module_url(parent.module_url.clone());
     // Arrows resolve `super` lexically — inherit the statics-side
     // home flag from the enclosing context.
+    child.dot_arguments_observed = parent.dot_arguments_observed;
     child.super_home_static = parent.super_home_static;
     child.active_with_envs = active_with_envs;
     // Arrows have no implicit `arguments` object; the binding exists

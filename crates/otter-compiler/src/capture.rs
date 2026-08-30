@@ -241,6 +241,54 @@ impl<'a> Visit<'a> for DirectEvalFinder {
     }
 }
 
+/// `true` when some expression in `stmts` reads a `.arguments` property.
+///
+/// The legacy `fn.arguments` accessor (§B.3.6.2) hands back the arguments
+/// object of a sloppy function's running activation, which cannot be seen
+/// from the callee's own body. A whole-program scan is the cheapest sound
+/// trigger: a script that never names the property pays nothing, and one
+/// that does materializes the object in its sloppy functions.
+#[must_use]
+pub fn program_reads_dot_arguments(stmts: &[Statement<'_>]) -> bool {
+    let mut finder = DotArgumentsFinder::default();
+    for stmt in stmts {
+        finder.visit_statement(stmt);
+        if finder.found {
+            return true;
+        }
+    }
+    finder.found
+}
+
+#[derive(Default)]
+struct DotArgumentsFinder {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for DotArgumentsFinder {
+    fn visit_static_member_expression(&mut self, it: &oxc_ast::ast::StaticMemberExpression<'a>) {
+        if it.property.name.as_str() == "arguments" {
+            self.found = true;
+            return;
+        }
+        walk::walk_static_member_expression(self, it);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        it: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if matches!(
+            &it.expression,
+            oxc_ast::ast::Expression::StringLiteral(key) if key.value.as_str() == "arguments"
+        ) {
+            self.found = true;
+            return;
+        }
+        walk::walk_computed_member_expression(self, it);
+    }
+}
+
 /// Module-body variant: collect names declared at the top level of
 /// `<main>` that some nested function references.
 #[must_use]

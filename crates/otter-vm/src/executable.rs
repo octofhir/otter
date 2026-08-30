@@ -1244,6 +1244,10 @@ pub(crate) struct ExecDirectEvalBinding {
     /// Deletable eval-introduced caller binding (§19.2.1.3
     /// CreateMutableBinding with deletable = true).
     pub(crate) deletable: bool,
+    /// 1-based lexical scope depth inside the owning function (function
+    /// scope is `1`), used to order the binding against a `with` object
+    /// environment (§9.1.1.2.1).
+    pub(crate) scope_depth: u16,
 }
 
 fn exec_direct_eval_binding(binding: &otter_bytecode::DirectEvalBinding) -> ExecDirectEvalBinding {
@@ -1257,6 +1261,7 @@ fn exec_direct_eval_binding(binding: &otter_bytecode::DirectEvalBinding) -> Exec
         inner: binding.inner,
         param: binding.param,
         deletable: binding.deletable,
+        scope_depth: binding.scope_depth,
     }
 }
 

@@ -1,11 +1,11 @@
 {
   "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
-  "engine_commit": "3e0072b9e57e2bdfd2a2f33e45ad4bf129d9fe96",
-  "ran_at": "2026-08-30T09:07:01.781115+00:00",
+  "engine_commit": "94c6fb738ce8bb0f1c62e81783a3da3ace7b027a",
+  "ran_at": "2026-08-30T09:51:12.786702+00:00",
   "totals": {
     "total": 53575,
-    "passed": 52456,
-    "failed": 19,
+    "passed": 52457,
+    "failed": 18,
     "skipped": 1100,
     "crashed": 0,
     "timed_out": 0,
@@ -29003,8 +29003,8 @@
     },
     "language/expressions/call": {
       "total": 92,
-      "passed": 90,
-      "failed": 1,
+      "passed": 91,
+      "failed": 0,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -41409,11 +41409,6 @@
       "path": "language/eval-code/direct/global-env-rec-with.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct eval"
-    },
-    {
-      "path": "language/expressions/call/11.2.3-3_3.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalled Expected SameValue(«true», «false») to be true"
     },
     {
       "path": "staging/sm/ArrayBuffer/slice-species.js",

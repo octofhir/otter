@@ -1,22 +1,22 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `3e0072b9e57e2bdfd2a2f33e45ad4bf129d9fe96`
+- **Engine commit:** `94c6fb738ce8bb0f1c62e81783a3da3ace7b027a`
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
-- **Captured:** 2026-08-30T09:07:01.781115+00:00
+- **Captured:** 2026-08-30T09:51:12.786702+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53575 |
-| passed     | 52456 |
-| failed     | 19 |
+| passed     | 52457 |
+| failed     | 18 |
 | skipped    | 1100 |
 | crashed    | 0 |
 | timed_out  | 0 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.96%
+**Pass rate (excl. skipped):** 99.97%
 
 ## Top failing sections (top 50)
 
@@ -24,7 +24,6 @@
 |---|---:|---:|---:|---:|
 | intl402/DateTimeFormat/prototype | 180 | 171 | 9 | 95.0% |
 | language/eval-code/direct | 286 | 285 | 1 | 99.7% |
-| language/expressions/call | 92 | 90 | 1 | 98.9% |
 | staging/sm/ArrayBuffer | 5 | 4 | 1 | 80.0% |
 | staging/sm/String | 47 | 45 | 1 | 97.8% |
 | staging/sm/extensions | 64 | 63 | 1 | 98.4% |
@@ -72,6 +71,7 @@
 | built-ins/AggregateError/newtarget-proto.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/order-of-args-evaluation.js | 1 | 1 | 0 | 100.0% |
 | built-ins/AggregateError/prop-desc.js | 1 | 1 | 0 | 100.0% |
+| built-ins/AggregateError/proto-from-ctor-realm.js | 1 | 0 | 0 | 0.0% |
 
 ## Top failing-test patterns (top 100)
 
@@ -87,7 +87,6 @@
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month co… | `intl402/DateTimeFormat/prototype/formatToParts/dangi-calendar-dates.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-… | `intl402/DateTimeFormat/prototype/formatToParts/era.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: direct e… | `language/eval-code/direct/global-env-rec-with.js` |
-| fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: fooCalle… | `language/expressions/call/11.2.3-3_3.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/ArrayBuffer/slice-species.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/String/internalUsage.js` |
 | fail | sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected… | `staging/sm/extensions/arguments-property-access-in-function.js` |

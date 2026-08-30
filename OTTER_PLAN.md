@@ -233,16 +233,46 @@ its isolate. Restored snapshot isolates keep their donor-charged chunks.
 
 Still open, in R1 terms:
 
-- Size-driven chunk eviction. Design constraints from the ownership audit:
-  escaped function values are bare `u32` ids with no ownership edge to their
-  chunk, so eviction requires a liveness proof, not a refcount. The intended
-  shape is a GC-census pipeline at an explicit between-turns safepoint:
-  select candidate chunks (unloaded eval/dynamic-import graphs), invalidate
-  and retire any JIT code for the id range, prove via full-heap census that
-  no live closure/frame/module-registry/timer reference carries an id in the
-  range, then splice the chunk under the single-writer link lock, leaving a
-  slim tombstone node so lock-free readers never observe a freed link.
-  Resolution of an evicted id must stay a typed miss, never a stale hit;
+- Size-driven chunk eviction. Escaped function values are bare `u32` ids with
+  no ownership edge to their chunk, so eviction requires a liveness proof, not
+  a refcount. The shape is a GC-census pipeline at an explicit between-turns
+  safepoint: select candidate chunks (unloaded eval/dynamic-import graphs),
+  invalidate and retire any JIT code for the id range, prove via full-heap
+  census that no live closure, frame, module-registry entry, or timer carries
+  an id in the range, then release the chunk's payload and its ledger charge.
+  Resolution of an evicted id must stay a typed miss, never a stale hit.
+
+  Reading the registry settles three of those steps more precisely than the
+  original sketch. First, the chain cannot be spliced: `CodeSpace` links nodes
+  through `OnceLock`, which is exactly why resolution needs no lock, and a
+  one-shot cell cannot be re-pointed. Eviction therefore keeps the node and
+  releases its payload — the tombstone is the mechanism, not a leftover.
+  Second, `chunk_for` hands out a borrowed `&ChunkTables` that lives in the
+  immutable node, so releasing a payload requires the accessor to yield an
+  owned handle instead — cheap at that call itself, expensive in what it
+  cascades into, below. Third, id liveness is not payload liveness: `ExecutionContext` holds
+  `Arc` clones of a chunk's module, executable, and atom tables, so a retained
+  context (a realm, a parked dynamic import, a worker's entry context) keeps
+  the bytes alive after the census proves no id is reachable. Releasing the
+  ledger charge on that evidence alone would report memory the process still
+  holds, so the proof must cover retained contexts as well as heap ids.
+
+  The cost that dominates the slice is none of those. `ExecutionContext`
+  answers foreign function ids by borrowing out of the sibling chunk's tables
+  — `function`, `exec_function`, `function_source_text`, and
+  `template_site_for_function` all return a `&T` whose lifetime is the
+  context's, which is sound only because a node's tables live forever. Make a
+  payload releasable and every one of those borrows becomes a reference into a
+  temporary. There are 122 such call sites across the VM and JIT, 82 of them
+  `exec_function`, and they sit on the call path. Two shapes resolve it: hand
+  out owned handles (the executable already has an `Arc<CodeBlock>` variant;
+  the rest would have to grow one), or drop the foreign fallback entirely and
+  require a caller to swap to the owning context first — which dispatch
+  already does through `for_function`, and which is how a JSC `JSFunction`
+  resolves through its own `Executable` rather than an ambient table. The
+  second is the smaller contract and the better one. Sizing it means finding
+  which callers actually pass an id their ambient chunk does not own; that
+  audit precedes any census work;
 - Remaining host-owned backing stores outside the ArrayBuffer/Blob paths.
   JS-side body buffering (`response.text()`/`arrayBuffer()` chunk collection,
   stream queues) accumulates `Uint8Array` chunks whose ArrayBuffer backing

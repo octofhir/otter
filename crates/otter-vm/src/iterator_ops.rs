@@ -2330,6 +2330,28 @@ impl Interpreter {
         outcome
     }
 
+    /// §7.4.9 IteratorClose run because the caller already has a throw
+    /// in hand. The close's own abrupt completion is discarded and the
+    /// original throw propagates.
+    ///
+    /// Dropping the `Result` is not enough. A JS-level throw travels as
+    /// `VmError::Uncaught` plus the thrown value on the interpreter's
+    /// side channel, so a `return` getter (or `return` itself) that
+    /// throws during the close would overwrite the payload the caller is
+    /// about to re-throw. The side channel is restored here.
+    pub(crate) fn iterator_close_discarding_completion(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iterator: &Value,
+    ) {
+        let pending_throw = self.pending_uncaught_throw;
+        let pending_frames = self.pending_uncaught_frames.take();
+        let _ = self.iterator_close_sync(stack, context, iterator);
+        self.pending_uncaught_throw = pending_throw;
+        self.pending_uncaught_frames = pending_frames;
+    }
+
     /// §7.4.8 IteratorClose — invoke `return` if present.
     ///
     /// The `completion` semantics are caller-owned: pass `Ok(())` to

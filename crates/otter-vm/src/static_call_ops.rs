@@ -2146,7 +2146,7 @@ fn close_scoped_iterator_preserving_abrupt<T>(
         .take_pending_uncaught_throw()
         .map(|value| interp.scoped_value(scope, value));
     let original_detail = interp.take_error_detail();
-    let _ = interp.iterator_close_sync(stack, context, &interp.escape_scoped(iterator));
+    interp.iterator_close_discarding_completion(stack, context, &interp.escape_scoped(iterator));
     // A throwing `return` completion never replaces the original abrupt
     // completion. Discard it, then reinstall the original from its traced
     // handle so a collection during close cannot leave a stale pending value.

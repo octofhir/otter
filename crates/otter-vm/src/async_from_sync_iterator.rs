@@ -165,7 +165,7 @@ impl Interpreter {
             Err(error) => {
                 if close_on_rejection && !done {
                     let thrown = self.take_pending_uncaught_throw();
-                    let _ = self.iterator_close_sync(stack, context, &sync_iterator);
+                    self.iterator_close_discarding_completion(stack, context, &sync_iterator);
                     if let Some(thrown) = thrown {
                         self.set_pending_uncaught_throw(thrown);
                     }
@@ -210,7 +210,11 @@ impl Interpreter {
                                 let Some(context) = interp.realm_execution_context() else {
                                     return;
                                 };
-                                let _ = interp.iterator_close_sync(stack, &context, &sync_iterator);
+                                interp.iterator_close_discarding_completion(
+                                    stack,
+                                    &context,
+                                    &sync_iterator,
+                                );
                             });
                             ctx.interp_mut().set_pending_uncaught_throw(reason);
                             Err(NativeError::Thrown {

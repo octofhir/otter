@@ -330,7 +330,9 @@ impl Interpreter {
                                 Ok(mapped) => mapped,
                                 Err(err) => {
                                     let iterator = interp.iteration_anchor(iterator_anchor);
-                                    let _ = interp.iterator_close_sync(stack, context, &iterator);
+                                    interp.iterator_close_discarding_completion(
+                                        stack, context, &iterator,
+                                    );
                                     break Err(err);
                                 }
                             }
@@ -346,7 +348,7 @@ impl Interpreter {
                             &k.to_string(),
                             mapped,
                         ) {
-                            let _ = interp.iterator_close_sync(stack, context, &iterator);
+                            interp.iterator_close_discarding_completion(stack, context, &iterator);
                             break Err(err);
                         }
                         k = k.saturating_add(1);

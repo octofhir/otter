@@ -21,6 +21,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 step "unit tests (vm, jit, bytecode)"
 cargo test -q -p otter-vm -p otter-jit -p otter-bytecode
 
+# B1 admission boundary. Every artifact that becomes executable is verified in
+# release code, so the gate must exercise that boundary in a RELEASE build:
+# debug-only coverage would leave overflow checks and codegen differences
+# untested on the path adversarial input actually takes.
+step "release verifier + adversarial corpus"
+cargo test --release -q -p otter-bytecode
+cargo test --release -q -p otter-vm --lib code_space
+cargo test --release -q -p otter-vm --test snapshot_boundary
+
 step "difftest: interpreter vs tiers vs gc-stress"
 # The full report is megabytes of per-case observations; keep it on disk and
 # surface only the verdict. Any mismatch fails the gate.

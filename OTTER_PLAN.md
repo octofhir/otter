@@ -261,7 +261,7 @@ untrusted or deserialized functions before installation or execution:
 - opcode and operand decoding without out-of-bounds reads;
 - register, constant, upvalue, exception, jump, and source-map ranges;
 - instruction-boundary and control-flow targets;
-- stack/register dataflow needed by interpreter and JIT invariants;
+- register and operand domains needed by interpreter and JIT invariants;
 - handler nesting and abrupt-completion structure;
 - bounded work and memory for adversarial artifacts.
 
@@ -292,7 +292,37 @@ capture-produced in-process `RuntimeSnapshot` restore remains and keeps the
 donor resource account. A future durable snapshot requires a typed logical
 object format that validates and reconstructs values instead of copying Rust
 representations, followed by fresh startup and memory measurements. The
-remaining B1 closeout is the release verifier/mutation gate set.
+admission boundary is now gated in a RELEASE build, not only in debug: the
+verifier, its adversarial corpus, and the code-space / snapshot admission
+tests run under `just verifier-gate` and inside `scripts/gate.sh`.
+
+The corpus (`crates/otter-bytecode/tests/adversarial.rs`) drives seed modules
+spanning the control-flow, closure, constant, and metadata domains through
+single- and multi-byte flips, every truncation prefix, insertions, appended
+bytes, and tampered `u32` counts, plus structural mutations of the decoded
+module. Two properties are asserted on every artifact: the decoder never
+panics, and it never returns a carrier its own verifier would reject. The
+corpus is deterministic — a fixed xorshift, no system entropy — so a failure
+reproduces byte for byte. Its teeth are demonstrated rather than assumed: a
+deliberately weakened constant-index bound and an injected panic on the
+metadata path are both caught by the sweeps.
+
+Two of the original bullets resolve differently than written. Register
+verification is index-domain only, and that is sufficient rather than
+incomplete: every frame window is fully initialized to `undefined` before the
+first instruction runs (`RegisterStack::allocate`), so a read with no
+dominating write yields `undefined` instead of unmapped memory. Def-before-use
+is therefore a semantic property of the compiler, not a safety obligation of
+the verifier, and adding a dataflow lattice would buy no soundness. Bounded
+work is likewise met by construction: verification is one pass per function,
+the handler layout is a single pass whose cost does not grow with nesting
+depth (asserted at depth 4096), the one analysis that is not linear carries an
+explicit transition budget, and the decoder bounds every allocation by the
+remaining input length.
+
+Still open for B1: agreement tests that run one verified artifact through the
+interpreter and each JIT tier and compare observable results, which belongs
+with the artifact-level differential work in B2.
 
 ### B2. Fuzzing and differential checks
 

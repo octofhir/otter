@@ -328,17 +328,23 @@ reaches shapes no compiler emits, which is the point — `otter-difftest`
 compares tiers from JavaScript source and can only exercise what the compiler
 chooses to produce.
 
-That distinction paid immediately. The suite found an open defect: an artifact
-whose sole terminator is `Throw` — a hot loop with no `Return` anywhere —
-completes on the interpreter and spins in compiled code. It is the combination
-of OSR entry and a throwing exit that fails; each ingredient alone agrees. The
-same loop ending in `Return` agrees, the same throw with a cold loop agrees,
-and the same 4000-trip loop with the OSR threshold left high — so the loop is
-never entered compiled — agrees. The case is `#[ignore]`d with the reason recorded and its JIT
-observation bounded by a worker-thread timeout, so running it reports a typed
-disagreement instead of hanging. No source-level function ends this way, which
-is exactly why only an artifact-level consumer test reaches it. Fixing it is the
-next B1 slice; `finally` reached through tier-up stays covered from source by
+That distinction paid immediately, and the defect it found was the kind B1
+exists to prevent: a consumer relying on an invariant the admission boundary
+did not enforce. The immediate-right operators (`AddImm`, `LessThanImm`, …)
+carry their constant in the instruction, and generated code materializes it
+into the destination register before running the ordinary two-register
+operator — which is sound only while the destination differs from the left
+operand. The interpreter reads both operands before writing and tolerates the
+alias. Nothing checked it: the lowering simply commented that "the compiler
+guarantees" it, the compiler guaranteed it only on the path where it allocates
+its own scratch, and the verifier admitted the aliased form. An admitted
+artifact therefore ran correctly on one consumer and, on the other, destroyed
+its own induction variable and looped forever.
+
+The invariant is now real at all three levels: the verifier rejects the
+aliased form (`ImmediateOperandAliasesDestination`), the compiler allocates a
+distinct destination instead of emitting it, and the lowering cites the
+verified guarantee rather than an assumption. `finally` reached through tier-up stays covered from source by
 the difftest corpus, because emitting a correct finally by hand means
 reproducing the compiler's parked-completion protocol.
 

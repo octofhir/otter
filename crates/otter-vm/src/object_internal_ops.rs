@@ -316,6 +316,22 @@ impl Interpreter {
                 }
             }
             (Some(target_desc), Some(trap_desc)) => {
+                // §10.5.5 steps 15-16 — the completed trap descriptor
+                // must be compatible with the target's current one.
+                // The per-attribute checks below are step 17's extra
+                // non-configurable rules, not a substitute for this.
+                if !is_compatible_partial_descriptor(
+                    target_desc,
+                    &complete_descriptor_as_partial(trap_desc),
+                    &self.gc_heap,
+                ) {
+                    return Err(self.err_type(
+                        ("Proxy getOwnPropertyDescriptor trap reported an incompatible \
+                          descriptor for a non-configurable target property"
+                            .to_string())
+                        .into(),
+                    ));
+                }
                 if !target_desc.configurable() && trap_desc.configurable() {
                     return Err(self.err_type(( "Proxy getOwnPropertyDescriptor trap reported configurable descriptor for non-configurable target property".to_string()).into()));
                 }
@@ -1133,6 +1149,33 @@ impl Interpreter {
 
         Ok(out)
     }
+}
+
+/// Every field of a complete descriptor as a partial one, so
+/// §6.2.5.7 IsCompatiblePropertyDescriptor can consume the result of
+/// §6.2.6.6 CompletePropertyDescriptor.
+fn complete_descriptor_as_partial(
+    desc: &object::PropertyDescriptor,
+) -> object::PartialPropertyDescriptor {
+    let mut partial = object::PartialPropertyDescriptor {
+        value: None,
+        writable: None,
+        get: None,
+        set: None,
+        enumerable: Some(desc.enumerable()),
+        configurable: Some(desc.configurable()),
+    };
+    match &desc.kind {
+        object::DescriptorKind::Data { value } => {
+            partial.value = Some(*value);
+            partial.writable = Some(desc.writable());
+        }
+        object::DescriptorKind::Accessor { getter, setter } => {
+            partial.get = Some(getter.unwrap_or_else(Value::undefined));
+            partial.set = Some(setter.unwrap_or_else(Value::undefined));
+        }
+    }
+    partial
 }
 
 /// §6.2.5.7 IsCompatiblePropertyDescriptor specialised to a target

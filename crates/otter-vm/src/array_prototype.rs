@@ -4530,7 +4530,17 @@ pub(crate) fn array_callback_native_dispatch(
             if reverse {
                 v.reverse();
             }
-            Box::new(v.into_iter())
+            if visit_all {
+                // `find` / `findIndex` must also visit absent indices, and
+                // the observable prefix of that walk is a dense `0..`
+                // ladder. Probing the whole pathological range is not
+                // possible, so the dense prefix runs first and the
+                // present-index set covers what lies beyond it.
+                v.retain(|index| *index >= MAX_ARRAY_LIKE_PROBE_LEN);
+                Box::new((0..MAX_ARRAY_LIKE_PROBE_LEN).chain(v))
+            } else {
+                Box::new(v.into_iter())
+            }
         };
 
         let mut acc = Value::undefined();

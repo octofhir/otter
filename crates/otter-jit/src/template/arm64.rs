@@ -749,6 +749,70 @@ pub(super) fn compile(
                     fatal,
                 )?;
             }
+            TemplateOp::CallWithThis {
+                dst,
+                callee,
+                this_value,
+                argc,
+                packed_args,
+                byte_pc,
+            } => {
+                let argument_registers = plan.call_argument_registers(argc, packed_args);
+                // A monomorphic site takes the generated direct-call edge;
+                // everything else keeps the variadic in-place transition,
+                // which completes without a side exit.
+                if view
+                    .direct_callees
+                    .get(&byte_pc)
+                    .is_some_and(crate::arm64::direct_call_target_is_supported)
+                {
+                    calls::emit_call_with_receiver(
+                        &mut ops,
+                        &mut relocations,
+                        transitions,
+                        view,
+                        direct_call_events.as_mut(),
+                        code_map.as_mut(),
+                        dst,
+                        callee,
+                        Some(this_value),
+                        argc,
+                        &argument_registers,
+                        instr.pc,
+                        byte_pc,
+                        bail,
+                        threw,
+                        committed_throw,
+                        fatal,
+                    )?;
+                } else {
+                    let mut lanes = 0u64;
+                    for (index, register) in argument_registers.iter().enumerate() {
+                        lanes |= u64::from(*register) << (index * 16);
+                    }
+                    spread_call::emit_spread_call_op(
+                        &mut ops,
+                        &mut relocations,
+                        transitions,
+                        view,
+                        direct_call_events.as_mut(),
+                        code_map.as_mut(),
+                        otter_bytecode::Op::CallWithThis as u8,
+                        u64::from(dst)
+                            | (u64::from(callee) << 16)
+                            | (u64::from(this_value) << 32)
+                            | (u64::from(argc) << 48),
+                        lanes,
+                        0,
+                        instr.pc,
+                        byte_pc,
+                        bail,
+                        threw,
+                        committed_throw,
+                        fatal,
+                    )?;
+                }
+            }
             TemplateOp::Construct {
                 dst,
                 callee,

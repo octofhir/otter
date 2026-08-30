@@ -306,6 +306,19 @@ pub(crate) enum TemplateOp {
         /// Serialized byte PC used to resolve the immutable call-site link.
         byte_pc: u32,
     },
+    /// `r<dst> = r<callee>.call(r<this_value>, args…)` — the same generated
+    /// linkage as [`Self::Call`] with an explicit receiver instead of the
+    /// canonical `undefined`. Lowered for `obj[k](…)`, a private method
+    /// call, and a method call whose arguments made the callee read its own
+    /// instruction.
+    CallWithThis {
+        dst: u16,
+        callee: u16,
+        this_value: u16,
+        argc: u16,
+        packed_args: u64,
+        byte_pc: u32,
+    },
     /// Fixed-arity `new` through baked generated linkage when the target is
     /// available; `super()` and unplanned `new` use the generic in-place
     /// construct transition. `super_construct` selects the current frame's immutable
@@ -1086,14 +1099,13 @@ impl TemplatePlan {
                         });
                         continue;
                     }
-                    TemplateOp::SpreadCallOp {
-                        opcode: Op::CallWithThis as u8,
-                        arg0: u64::from(operands.dst)
-                            | (u64::from(operands.callee) << 16)
-                            | (u64::from(operands.this_value) << 32)
-                            | ((arguments.len() as u64) << 48),
-                        arg1: pack_register_lanes(arguments),
-                        arg2: 0,
+                    TemplateOp::CallWithThis {
+                        dst: operands.dst,
+                        callee: operands.callee,
+                        this_value: operands.this_value,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
+                        byte_pc: meta.byte_pc,
                     }
                 }
                 Op::CallSpread => {

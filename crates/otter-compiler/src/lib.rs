@@ -843,12 +843,25 @@ mod tests {
     }
 
     #[test]
-    fn fn_apply_with_dynamic_args_uses_method_value_fallback() {
+    fn fn_apply_with_observable_args_loads_the_callee_first() {
+        // §13.3.6.1 — GetValue on `f.apply` precedes ArgumentListEvaluation.
+        // A binding read can throw, so the callee load is its own
+        // instruction and the call takes the explicit-receiver form.
         let module = compile_script_src("function f() {} const args = [1]; f.apply({}, args);");
         let main = module.main();
+        let load = main
+            .code
+            .iter()
+            .position(|i| i.op == Op::LoadProperty)
+            .expect("callee load");
+        let call = main
+            .code
+            .iter()
+            .position(|i| i.op == Op::CallWithThis)
+            .expect("explicit-receiver call");
         assert!(
-            main.code.iter().any(|i| i.op == Op::CallMethodValue),
-            "dynamic apply args should stay on method-call fallback: {:?}",
+            load < call,
+            "callee load must precede the call: {:?}",
             main.code
         );
     }

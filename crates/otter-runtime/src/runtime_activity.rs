@@ -7,10 +7,13 @@
 //!
 //! # Contents
 //! - [`RuntimeKeepAlive`] - idempotent liveness hold for a host resource.
+//! - [`RuntimeTaskSpawner`] - isolate task delivery plus its shared resource account.
 //! - [`RuntimeActivityAccounting`] - runtime-internal accounting sink.
 //!
 //! # Invariants
 //! - The primitive stores no VM values and never calls into JavaScript.
+//! - Every spawner clone carries the isolate's one shared resource account;
+//!   host tasks do not create a parallel unobservable budget.
 //! - Closing a hold is idempotent; dropping an open hold releases it as
 //!   cancelled activity.
 //! - Ref/unref semantics are generic runtime semantics, not HTTP-specific
@@ -24,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::event_loop::RuntimeLiveness;
-use crate::{OtterError, Runtime};
+use crate::{OtterError, ResourceAccount, Runtime};
 
 /// Runtime-internal sink for event-loop activity counters.
 pub(crate) trait RuntimeActivityAccounting: Send + Sync + 'static {
@@ -101,6 +104,7 @@ pub(crate) trait RuntimeTaskQueue: Send + Sync + 'static {
 pub struct RuntimeTaskSpawner {
     queue: Arc<dyn RuntimeTaskQueue>,
     accounting: Arc<dyn RuntimeActivityAccounting>,
+    resources: ResourceAccount,
     io_handle: Option<tokio::runtime::Handle>,
 }
 
@@ -108,13 +112,25 @@ impl RuntimeTaskSpawner {
     pub(crate) fn new(
         queue: Arc<dyn RuntimeTaskQueue>,
         accounting: Arc<dyn RuntimeActivityAccounting>,
+        resources: ResourceAccount,
         io_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
         Self {
             queue,
             accounting,
+            resources,
             io_handle,
         }
+    }
+
+    /// Clone the isolate's aggregate resource account for host-owned payloads.
+    ///
+    /// Extensions reserve on this account before retaining owned data across
+    /// an async or isolate boundary. The clone shares the same ledger and does
+    /// not create a new budget or capability decision.
+    #[must_use]
+    pub fn resource_account(&self) -> ResourceAccount {
+        self.resources.clone()
     }
 
     /// The shared Tokio runtime handle for host resources that own async IO

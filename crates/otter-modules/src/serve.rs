@@ -14,16 +14,18 @@
 //! - The Web Fetch classes remain owned by `otter-web`; server request/response
 //!   conversion will use their hidden plain-data factory.
 //! - No VM handles or contexts are stored in long-lived host state.
+//! - Native body storage is admitted incrementally against the runtime account
+//!   and finite per-server limits; the public Fetch-shaped API stays unchanged.
 //!
 //! # See also
 //! - [`crate::hosted_modules`]
 
 mod body;
 
-use body::ServeBody;
+use body::{ServeBody, ServeBodyBudget, ServeBodyBuilder, ServeBodyCharge, ServeBodyError};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
@@ -37,10 +39,13 @@ use otter_runtime::{
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::task::{Context, Poll};
 use tokio::sync::{Notify, oneshot};
 
 /// Per-server table of in-flight replies keyed by a monotonic token. A request
@@ -51,12 +56,12 @@ use tokio::sync::{Notify, oneshot};
 /// an inline microtask flush per request (the old reg-window leak).
 #[derive(Default)]
 struct ReplyRegistry {
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<HttpResponse, String>>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<HttpResponse, ServeHandlerError>>>>,
     next: AtomicU64,
 }
 
 impl ReplyRegistry {
-    fn register(&self, reply: oneshot::Sender<Result<HttpResponse, String>>) -> u64 {
+    fn register(&self, reply: oneshot::Sender<Result<HttpResponse, ServeHandlerError>>) -> u64 {
         let token = self.next.fetch_add(1, Ordering::Relaxed);
         self.pending
             .lock()
@@ -65,7 +70,7 @@ impl ReplyRegistry {
         token
     }
 
-    fn take(&self, token: u64) -> Option<oneshot::Sender<Result<HttpResponse, String>>> {
+    fn take(&self, token: u64) -> Option<oneshot::Sender<Result<HttpResponse, ServeHandlerError>>> {
         self.pending
             .lock()
             .expect("serve reply registry poisoned")
@@ -193,6 +198,7 @@ pub(crate) fn serve(
     let io_handle = task_spawner
         .io_handle()
         .ok_or_else(|| crate::type_error("serve", "Otter.serve requires a runtime event loop"))?;
+    let body_budget = ServeBodyBudget::standard(task_spawner.resource_account());
     let options = parse_options(ctx, args, capabilities)?;
     // Bind synchronously so the returned `server.url`/`server.port` are exact
     // (including an OS-assigned port when `port: 0`). The std listener is handed
@@ -228,10 +234,11 @@ pub(crate) fn serve(
     let slots = ServeSlots::resolve(ctx, slots_value)?;
     let deliver = {
         let registry = registry.clone();
+        let body_budget = body_budget.clone();
         ctx.native_value(
             "serve.deliver",
             smallvec::smallvec![],
-            move |ctx, args, _captures| deliver_reply(ctx, &registry, slots, args),
+            move |ctx, args, _captures| deliver_reply(ctx, &registry, slots, &body_budget, args),
         )
         .map_err(|err| crate::type_error("serve", err.to_string()))?
     };
@@ -276,6 +283,7 @@ pub(crate) fn serve(
         control,
         roots,
         registry,
+        body_budget,
     ));
     build_server_object(ctx, server, hostname, port, url)
 }
@@ -409,12 +417,71 @@ struct HttpResponse {
     body: ServeBody,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ServeHttpError {
+    #[error("{0}")]
+    Body(#[from] ServeBodyError),
+    #[error("bad request")]
+    BadRequest,
+    #[error("internal server error")]
+    Internal,
+}
+
+#[derive(Debug)]
+struct ServeHandlerError;
+
+/// Hyper body that keeps the native-byte leases alive until the transport
+/// finishes with the response body, rather than merely until headers are built.
+struct ServeHyperBody {
+    inner: Full<Bytes>,
+    _charge: Option<ServeBodyCharge>,
+}
+
+impl ServeHyperBody {
+    fn from_serve_body(body: ServeBody) -> Self {
+        let (bytes, charge) = body.into_buffered_parts();
+        Self {
+            inner: Full::new(Bytes::from(bytes)),
+            _charge: charge,
+        }
+    }
+
+    fn plain(bytes: Bytes) -> Self {
+        Self {
+            inner: Full::new(bytes),
+            _charge: None,
+        }
+    }
+}
+
+impl HyperBody for ServeHyperBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        Pin::new(&mut body.inner).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct ServeRequestTask {
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
     request: HttpRequest,
-    reply: oneshot::Sender<Result<HttpResponse, String>>,
+    reply: oneshot::Sender<Result<HttpResponse, ServeHandlerError>>,
     registry: Arc<ReplyRegistry>,
+    body_budget: ServeBodyBudget,
 }
 
 impl RuntimeTask for ServeRequestTask {
@@ -425,6 +492,7 @@ impl RuntimeTask for ServeRequestTask {
             request,
             reply,
             registry,
+            body_budget,
         } = *self;
         // Park the reply under a token, then call the user handler directly.
         // A synchronous Response is extracted and settled inline; a thenable
@@ -457,17 +525,17 @@ impl RuntimeTask for ServeRequestTask {
                     ],
                 )?;
             } else {
-                let response = extract_response(ctx, options.slots, outcome);
+                let response = extract_response(ctx, options.slots, outcome, &body_budget);
                 if let Some(reply) = registry_for_event.take(token) {
-                    let _ = reply.send(response.map_err(|err| err.to_string()));
+                    let _ = reply.send(response.map_err(|_| ServeHandlerError));
                 }
             }
             Ok(Value::undefined())
         });
-        if let Err(err) = result
+        if result.is_err()
             && let Some(reply) = registry.take(token)
         {
-            let _ = reply.send(Err(err.to_string()));
+            let _ = reply.send(Err(ServeHandlerError));
         }
         Ok(())
     }
@@ -477,6 +545,7 @@ fn deliver_reply(
     ctx: &mut NativeCtx<'_>,
     registry: &ReplyRegistry,
     slots: ServeSlots,
+    body_budget: &ServeBodyBudget,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let Some(token) = token_arg(args) else {
@@ -486,28 +555,23 @@ fn deliver_reply(
     // headers, and body straight out of the private symbol slots in Rust — no
     // `responseParts` JS call, intermediate arrays, or header string.
     let response = args.get(1).copied().unwrap_or_else(Value::null);
-    let result = extract_response(ctx, slots, response);
+    let result = extract_response(ctx, slots, response, body_budget);
     if let Some(reply) = registry.take(token) {
-        let _ = reply.send(result.map_err(|err| err.to_string()));
+        let _ = reply.send(result.map_err(|_| ServeHandlerError));
     }
     Ok(Value::undefined())
 }
 
 fn deliver_error(
-    ctx: &mut NativeCtx<'_>,
+    _ctx: &mut NativeCtx<'_>,
     registry: &ReplyRegistry,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let Some(token) = token_arg(args) else {
         return Ok(Value::undefined());
     };
-    let message = args
-        .get(1)
-        .and_then(|value| value.as_string(ctx.heap()))
-        .map(|value| value.to_lossy_string(ctx.heap()))
-        .unwrap_or_else(|| "fetch handler rejected".to_string());
     if let Some(reply) = registry.take(token) {
-        let _ = reply.send(Err(message));
+        let _ = reply.send(Err(ServeHandlerError));
     }
     Ok(Value::undefined())
 }
@@ -564,6 +628,7 @@ async fn accept_loop(
     control: Arc<ServeServerControl>,
     roots: ServeRoots,
     registry: Arc<ReplyRegistry>,
+    body_budget: ServeBodyBudget,
 ) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(listener) => listener,
@@ -586,6 +651,7 @@ async fn accept_loop(
         let task_spawner = task_spawner.clone();
         let context = context.clone();
         let registry = registry.clone();
+        let body_budget = body_budget.clone();
         // One task per connection; hyper reads successive keep-alive requests
         // off it until the peer closes or the connection goes idle.
         tokio::spawn(async move {
@@ -594,7 +660,10 @@ async fn accept_loop(
                 let task_spawner = task_spawner.clone();
                 let context = context.clone();
                 let registry = registry.clone();
-                async move { serve_one(&task_spawner, context, roots, registry, req).await }
+                let body_budget = body_budget.clone();
+                async move {
+                    serve_one(&task_spawner, context, roots, registry, &body_budget, req).await
+                }
             });
             let _ = http1::Builder::new()
                 .keep_alive(true)
@@ -611,9 +680,10 @@ async fn serve_one(
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
     registry: Arc<ReplyRegistry>,
+    body_budget: &ServeBodyBudget,
     req: HyperRequest<Incoming>,
-) -> Result<HyperResponse<Full<Bytes>>, std::convert::Infallible> {
-    match dispatch_request(task_spawner, context, roots, registry, req).await {
+) -> Result<HyperResponse<ServeHyperBody>, Infallible> {
+    match dispatch_request(task_spawner, context, roots, registry, body_budget, req).await {
         Ok(response) => Ok(build_hyper_response(response)),
         Err(err) => Ok(error_response(&err)),
     }
@@ -624,9 +694,10 @@ async fn dispatch_request(
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
     registry: Arc<ReplyRegistry>,
+    body_budget: &ServeBodyBudget,
     req: HyperRequest<Incoming>,
-) -> Result<HttpResponse, String> {
-    let request = read_hyper_request(req).await?;
+) -> Result<HttpResponse, ServeHttpError> {
+    let request = read_hyper_request(req, body_budget).await?;
     let (reply, rx) = oneshot::channel();
     task_spawner
         .enqueue(
@@ -636,25 +707,30 @@ async fn dispatch_request(
                 request,
                 reply,
                 registry,
+                body_budget: body_budget.clone(),
             },
             RuntimeLiveness::Ref,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|_| ServeHttpError::Internal)?;
     rx.await
-        .map_err(|_| "runtime closed before request completed".to_string())?
+        .map_err(|_| ServeHttpError::Internal)?
+        .map_err(|_| ServeHttpError::Internal)
 }
 
 /// Build the engine's [`HttpRequest`] from a hyper request, resolving the
 /// absolute URL from the request target and `Host` header and buffering the
 /// body (hyper handles Content-Length and chunked transfer decoding).
-async fn read_hyper_request(req: HyperRequest<Incoming>) -> Result<HttpRequest, String> {
+async fn read_hyper_request(
+    req: HyperRequest<Incoming>,
+    body_budget: &ServeBodyBudget,
+) -> Result<HttpRequest, ServeHttpError> {
     let method = req.method().as_str().to_string();
     let mut host: Option<String> = None;
     let mut headers: Vec<(String, String)> = Vec::with_capacity(req.headers().len());
     for (name, value) in req.headers() {
         let value = value
             .to_str()
-            .map_err(|_| "request header value is not valid UTF-8".to_string())?
+            .map_err(|_| ServeHttpError::BadRequest)?
             .to_string();
         // The `http` crate stores header field names lowercased (they are
         // case-insensitive per RFC 9110 §5.1), so `name.as_str()` is already
@@ -678,12 +754,7 @@ async fn read_hyper_request(req: HyperRequest<Incoming>) -> Result<HttpRequest, 
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
         format!("http://{authority}{path}")
     };
-    let collected = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(|err| format!("failed to read request body: {err}"))?;
-    let body = ServeBody::from_bytes(collected.to_bytes().to_vec());
+    let body = read_request_body(req.into_body(), body_budget).await?;
     Ok(HttpRequest {
         method,
         url,
@@ -692,7 +763,28 @@ async fn read_hyper_request(req: HyperRequest<Incoming>) -> Result<HttpRequest, 
     })
 }
 
-fn build_hyper_response(response: HttpResponse) -> HyperResponse<Full<Bytes>> {
+async fn read_request_body<B>(
+    mut body: B,
+    body_budget: &ServeBodyBudget,
+) -> Result<ServeBody, ServeHttpError>
+where
+    B: HyperBody<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    if let Some(upper) = body.size_hint().upper() {
+        body_budget.preflight(upper)?;
+    }
+    let mut builder = ServeBodyBuilder::new(body_budget);
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ServeHttpError::BadRequest)?;
+        if let Ok(data) = frame.into_data() {
+            builder.push_bytes(&data)?;
+        }
+    }
+    Ok(builder.finish())
+}
+
+fn build_hyper_response(response: HttpResponse) -> HyperResponse<ServeHyperBody> {
     let mut builder = HyperResponse::builder().status(response.status);
     let mut has_content_type = false;
     for (name, value) in &response.headers {
@@ -704,20 +796,30 @@ fn build_hyper_response(response: HttpResponse) -> HyperResponse<Full<Bytes>> {
     if !has_content_type {
         builder = builder.header("content-type", "text/plain;charset=UTF-8");
     }
-    let bytes = Bytes::from(response.body.as_buffered_bytes().to_vec());
+    let body = ServeHyperBody::from_serve_body(response.body);
     builder
-        .body(Full::new(bytes))
-        .unwrap_or_else(|_| error_response("failed to build response"))
+        .body(body)
+        .unwrap_or_else(|_| error_response(&ServeHttpError::Internal))
 }
 
-fn error_response(message: &str) -> HyperResponse<Full<Bytes>> {
+fn error_response(error: &ServeHttpError) -> HyperResponse<ServeHyperBody> {
+    let (status, body) = match error {
+        ServeHttpError::Body(ServeBodyError::TooLarge { .. }) => {
+            (413, Bytes::from_static(b"Payload Too Large\n"))
+        }
+        ServeHttpError::Body(
+            ServeBodyError::ServerBudget(_) | ServeBodyError::RuntimeBudget(_),
+        ) => (503, Bytes::from_static(b"Service Unavailable\n")),
+        ServeHttpError::BadRequest => (400, Bytes::from_static(b"Bad Request\n")),
+        ServeHttpError::Body(_) | ServeHttpError::Internal => {
+            (500, Bytes::from_static(b"Internal Server Error\n"))
+        }
+    };
     HyperResponse::builder()
-        .status(500)
+        .status(status)
         .header("content-type", "text/plain;charset=UTF-8")
-        .body(Full::new(Bytes::from(format!(
-            "Internal Server Error\n{message}"
-        ))))
-        .expect("static 500 response is always valid")
+        .body(ServeHyperBody::plain(body))
+        .expect("static error response is always valid")
 }
 
 fn build_server_object(
@@ -957,6 +1059,7 @@ fn extract_response(
     ctx: &mut NativeCtx<'_>,
     slots: ServeSlots,
     response: Value,
+    body_budget: &ServeBodyBudget,
 ) -> Result<HttpResponse, NativeError> {
     let Some(obj) = response.as_object() else {
         return Err(crate::type_error(
@@ -1024,7 +1127,7 @@ fn extract_response(
             object::get_own_symbol(obj, ctx.heap(), body_bytes_sym).unwrap_or_else(Value::null)
         }
     };
-    let body = ServeBody::from_js_value(ctx, body_value)?;
+    let body = ServeBody::from_js_value(ctx, body_value, body_budget)?;
     Ok(HttpResponse {
         status,
         headers,
@@ -1065,4 +1168,73 @@ fn serve_reentry_error(name: &'static str, error: NativeError) -> NativeError {
 
 fn header_is_managed(name: &str) -> bool {
     name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_runtime::{ResourceAccount, ResourceClass};
+
+    fn external_bytes(account: &ResourceAccount) -> u64 {
+        account
+            .snapshot()
+            .get(ResourceClass::ExternalBytes)
+            .current()
+    }
+
+    #[tokio::test]
+    async fn known_oversized_request_is_rejected_before_retention() {
+        let runtime = ResourceAccount::default();
+        let budget = ServeBodyBudget::for_test(runtime.clone(), 4, 32);
+        let body = Full::new(Bytes::from_static(b"abcde"));
+
+        let error = read_request_body(body, &budget).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ServeHttpError::Body(ServeBodyError::TooLarge {
+                requested: 5,
+                limit: 4
+            })
+        ));
+        assert_eq!(external_bytes(&runtime), 0);
+    }
+
+    #[test]
+    fn response_transport_retains_charge_until_its_body_drops() {
+        let runtime = ResourceAccount::default();
+        let budget = ServeBodyBudget::for_test(runtime.clone(), 16, 32);
+        let body = ServeBody::copy_from_slice(&budget, b"body").unwrap();
+        let response = build_hyper_response(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body,
+        });
+
+        assert_eq!(response.body().size_hint().exact(), Some(4));
+        assert_eq!(external_bytes(&runtime), 4);
+        drop(response);
+        assert_eq!(external_bytes(&runtime), 0);
+    }
+
+    #[test]
+    fn body_admission_errors_map_to_stable_http_statuses() {
+        let too_large = error_response(&ServeHttpError::Body(ServeBodyError::TooLarge {
+            requested: 5,
+            limit: 4,
+        }));
+        assert_eq!(too_large.status(), 413);
+
+        let runtime = ResourceAccount::new(
+            otter_runtime::ResourceLimits::builder()
+                .limit(ResourceClass::ExternalBytes, 0)
+                .build(),
+        );
+        let resource_error = runtime
+            .reserve_exact(ResourceClass::ExternalBytes, 1)
+            .unwrap_err();
+        let unavailable = error_response(&ServeHttpError::Body(ServeBodyError::RuntimeBudget(
+            resource_error,
+        )));
+        assert_eq!(unavailable.status(), 503);
+    }
 }

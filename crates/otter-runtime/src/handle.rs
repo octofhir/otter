@@ -2009,6 +2009,7 @@ impl RuntimeHandle {
                 completion_pool: self.inner.completion_pool.clone(),
             }),
             self.inner.counters.clone(),
+            self.inner.resources.clone(),
             Some(self.inner.event_loop.handle()),
         )
     }
@@ -2494,6 +2495,7 @@ fn run_isolate(
     completion_pool: CompletionAdmissionPool,
 ) {
     let module_task_handle = event_loop.handle();
+    let resources = admitted.config.resource_account.clone();
     let runtime_task_spawner = RuntimeTaskSpawner::new(
         Arc::new(InboxRuntimeTaskQueue {
             inbox: inbox.clone(),
@@ -2501,6 +2503,7 @@ fn run_isolate(
             completion_pool: completion_pool.clone(),
         }),
         counters.clone(),
+        resources,
         Some(event_loop.handle()),
     );
     let mut runtime =

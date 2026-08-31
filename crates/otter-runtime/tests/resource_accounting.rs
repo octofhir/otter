@@ -88,6 +88,30 @@ fn direct_runtimes_share_an_exact_isolate_limit_and_release_on_drop() {
 }
 
 #[test]
+fn task_spawner_shares_the_handle_resource_account() {
+    let account = ResourceAccount::default();
+    let handle = minimal_builder(account.clone())
+        .build_handle()
+        .expect("handle runtime");
+    let baseline = resource_entry(&account, ResourceClass::ExternalBytes).current();
+
+    let lease = handle
+        .task_spawner()
+        .resource_account()
+        .reserve_exact(ResourceClass::ExternalBytes, 7)
+        .expect("host payload admission");
+    assert_eq!(
+        resource_entry(&account, ResourceClass::ExternalBytes).current(),
+        baseline + 7
+    );
+    drop(lease);
+    assert_eq!(
+        resource_entry(&account, ResourceClass::ExternalBytes).current(),
+        baseline
+    );
+}
+
+#[test]
 fn runtime_roles_retain_their_exact_resource_tuples() {
     let direct_account = ResourceAccount::default();
     let direct = minimal_builder(direct_account.clone())

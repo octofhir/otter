@@ -624,17 +624,19 @@ class ChildProcess extends EventEmitter {
       return false;
     }
     const prepared = prepareSend(message, sendHandle, options, this._handle);
-    const accepted = native.ipcSend(this._handle, prepared.text, prepared.fd, prepared.token);
+    const status = native.ipcSend(this._handle, prepared.text, prepared.fd, prepared.token);
+    const accepted = status === 1;
     // A message that never left takes what it carried with it.
     if (!accepted && prepared.token !== 0) globalThis.__otterIpcSent(prepared.token);
-    if (typeof callback === 'function') {
-      // A message the channel would not take says so by name: a caller that
-      // knows a closed channel is one of the ways this can end tells that
-      // ending apart by the code, not by the text.
-      const failure = accepted
-        ? null
+    const failure = accepted
+      ? null
+      : status === -1
+        ? coded(new Error('IPC channel backlog limit'), 'ENOBUFS')
         : coded(new Error('Channel closed'), 'ERR_IPC_CHANNEL_CLOSED');
+    if (typeof callback === 'function') {
       setTimeout(() => callback(failure), 0);
+    } else if (failure !== null) {
+      process.nextTick(() => this.emit('error', failure));
     }
     return accepted;
   }

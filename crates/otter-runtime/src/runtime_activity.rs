@@ -14,6 +14,8 @@
 //! - The primitive stores no VM values and never calls into JavaScript.
 //! - Every spawner clone carries the isolate's one shared resource account;
 //!   host tasks do not create a parallel unobservable budget.
+//! - Every spawner clone also carries the isolate's finite IPC-family account,
+//!   so opening more channels cannot multiply the hard queue ceiling.
 //! - Closing a hold is idempotent; dropping an open hold releases it as
 //!   cancelled activity.
 //! - Ref/unref semantics are generic runtime semantics, not HTTP-specific
@@ -105,6 +107,7 @@ pub struct RuntimeTaskSpawner {
     queue: Arc<dyn RuntimeTaskQueue>,
     accounting: Arc<dyn RuntimeActivityAccounting>,
     resources: ResourceAccount,
+    ipc_resources: ResourceAccount,
     io_handle: Option<tokio::runtime::Handle>,
 }
 
@@ -113,12 +116,14 @@ impl RuntimeTaskSpawner {
         queue: Arc<dyn RuntimeTaskQueue>,
         accounting: Arc<dyn RuntimeActivityAccounting>,
         resources: ResourceAccount,
+        ipc_resources: ResourceAccount,
         io_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
         Self {
             queue,
             accounting,
             resources,
+            ipc_resources,
             io_handle,
         }
     }
@@ -131,6 +136,10 @@ impl RuntimeTaskSpawner {
     #[must_use]
     pub fn resource_account(&self) -> ResourceAccount {
         self.resources.clone()
+    }
+
+    pub(crate) fn ipc_resource_account(&self) -> ResourceAccount {
+        self.ipc_resources.clone()
     }
 
     /// The shared Tokio runtime handle for host resources that own async IO

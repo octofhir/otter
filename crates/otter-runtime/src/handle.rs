@@ -152,6 +152,7 @@ impl std::fmt::Debug for RuntimeHandle {
 
 struct RuntimeHandleInner {
     resources: ResourceAccount,
+    ipc_resources: ResourceAccount,
     completion_pool: CompletionAdmissionPool,
     inbox: InboxSender,
     runner: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1515,6 +1516,7 @@ impl RuntimeHandle {
             });
         }
         let resources = admitted.config.resource_account.clone();
+        let ipc_resources = crate::ipc::standard_ipc_resource_account();
         let completion_pool = CompletionAdmissionPool::new(
             resources.clone(),
             admitted.config.completion_capacities(),
@@ -1542,6 +1544,7 @@ impl RuntimeHandle {
         let runner_module_preparation = module_preparation.clone();
         let runner_module_cancellation = module_cancellation.clone();
         let runner_completion_pool = completion_pool.clone();
+        let runner_ipc_resources = ipc_resources.clone();
         let exit = Arc::new(IsolateExit::default());
         let runner_exit = exit.clone();
         let runner = std::thread::Builder::new()
@@ -1559,6 +1562,7 @@ impl RuntimeHandle {
                     runner_module_preparation,
                     runner_module_cancellation,
                     runner_completion_pool,
+                    runner_ipc_resources,
                 )
             })
             .map_err(|e| OtterError::Internal {
@@ -1581,6 +1585,7 @@ impl RuntimeHandle {
         };
         let inner = Arc::new(RuntimeHandleInner {
             resources,
+            ipc_resources,
             budget_limits,
             budget_telemetry,
             completion_pool,
@@ -2010,6 +2015,7 @@ impl RuntimeHandle {
             }),
             self.inner.counters.clone(),
             self.inner.resources.clone(),
+            self.inner.ipc_resources.clone(),
             Some(self.inner.event_loop.handle()),
         )
     }
@@ -2493,6 +2499,7 @@ fn run_isolate(
     module_preparation: ModulePreparation,
     module_cancellation: crate::module_loader::ModuleLoadCancellation,
     completion_pool: CompletionAdmissionPool,
+    ipc_resources: ResourceAccount,
 ) {
     let module_task_handle = event_loop.handle();
     let resources = admitted.config.resource_account.clone();
@@ -2504,6 +2511,7 @@ fn run_isolate(
         }),
         counters.clone(),
         resources,
+        ipc_resources,
         Some(event_loop.handle()),
     );
     let mut runtime =

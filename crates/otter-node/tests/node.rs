@@ -568,6 +568,46 @@ fn node_cluster_reports_the_primary_role() {
     runtime.run_module(&main).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn child_process_ipc_pressure_reports_enobufs() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import { spawn } from "node:child_process";
+
+        const child = spawn("/bin/sh", ["-c", "sleep 0.1"], {
+          stdio: ["ignore", "ignore", "ignore", "ipc"],
+        });
+        const code = await new Promise((resolve) => {
+          const accepted = child.send({ payload: "x" }, (error) => resolve(error?.code));
+          if (accepted) throw new Error("over-budget IPC message was accepted");
+        });
+        if (code !== "ENOBUFS") throw new Error("IPC pressure was " + code);
+        "#,
+    )
+    .unwrap();
+    let account = ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::QueuedMessageBytes, 2)
+            .build(),
+    );
+    let otter = otter_runtime::Otter::builder()
+        .resource_account(account.clone())
+        .capabilities(CapabilitySet::allow_all())
+        .with_node_apis()
+        .build()
+        .unwrap();
+
+    otter.blocking_run_module(&main).unwrap();
+    let snapshot = account.snapshot();
+    let bytes = snapshot.get(ResourceClass::QueuedMessageBytes);
+    assert_eq!(bytes.current(), 0);
+    assert!(bytes.rejections() >= 1);
+}
+
 /// `process` is an EventEmitter in its own right: the runtime installs one and
 /// nothing replaces it, so the listener methods, the meta-events, and the
 /// `events` helpers all address the same object.

@@ -150,7 +150,7 @@ pub use hooks::{
     RuntimeJobKind, RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
     RuntimeResolveRequest, default_check_capability, default_compile_source,
 };
-pub use ipc::{CarriedHandles, IpcChannel, IpcEvent};
+pub use ipc::{CarriedHandles, IpcChannel, IpcEvent, IpcSendError};
 pub use otter_compiler::{
     CompiledExport, CompiledFunctionSpans, CompiledImport, CompiledImportKind, CompiledModule,
     CompiledModuleMetadata, LiveBindingSlot,

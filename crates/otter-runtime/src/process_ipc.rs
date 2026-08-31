@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use otter_vm::{Attr, ErrorKind, Local, NativeCall, NativeError, NativeFn, NativeScope, Value};
 
-use crate::ipc::{CarriedHandles, IpcChannel, IpcEvent};
+use crate::ipc::{CarriedHandles, IpcChannel, IpcEvent, IpcSendError};
 use crate::{OtterError, Runtime};
 
 /// Give `process` its channel members.
@@ -84,25 +84,40 @@ pub(crate) fn install(
             } else {
                 (encode(&mut scope, message)?, -1, None)
             };
-            let accepted = if handle >= 0 {
+            let outcome = if handle >= 0 {
                 sender.send_with_handles(&text, vec![handle], token)
             } else {
                 sender.send(&text)
             };
+            let accepted = outcome.is_ok();
             // A message that never left takes what it carried with it; the
             // module that handed it over hears so at once rather than waiting
             // for a crossing that will not happen.
-            if !accepted && let Some(token) = token {
+            if outcome.is_err()
+                && let Some(token) = token
+            {
                 report_sent(&mut scope, token)?;
             }
             // Node reports the outcome to a callback when one is given, and
             // answers it either way.
             if let Some(callback) = callback {
                 {
-                    let error = if accepted {
-                        scope.null()
-                    } else {
-                        scope.string("channel closed")?
+                    let error = match outcome {
+                        Ok(()) => scope.null(),
+                        Err(reason) => {
+                            let (message, code) = match reason {
+                                IpcSendError::Disconnected => {
+                                    ("IPC channel is closed", "ERR_IPC_CHANNEL_CLOSED")
+                                }
+                                IpcSendError::Backpressure => {
+                                    ("IPC channel backlog limit", "ENOBUFS")
+                                }
+                            };
+                            let error = scope.error(ErrorKind::Error, message)?;
+                            let code = scope.string(code)?;
+                            scope.set(error, "code", code)?;
+                            error
+                        }
                     };
                     let undefined = scope.undefined();
                     scope.call(callback, undefined, &[error])?;
@@ -399,10 +414,10 @@ impl crate::RuntimeTask for ProcessIpcEvent {
                     return Ok(scope.finish(undefined));
                 }
                 match &self.event {
-                    IpcEvent::Message(payload, _) => {
+                    IpcEvent::Message(message) => {
                         let json = scope.get(globals, "JSON")?;
                         let parse = scope.get(json, "parse")?;
-                        let text = scope.string(payload)?;
+                        let text = scope.string(message.text())?;
                         let undefined = scope.undefined();
                         let message = scope.call(parse, undefined, &[text])?;
                         // A message may carry an open file, and what the

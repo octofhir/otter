@@ -18,6 +18,10 @@
 //! - Sending never blocks the isolate thread: a message is queued and written
 //!   by a task on the IO runtime, so ordering is the order of the sends. A
 //!   message sent before the child joins is queued, not lost.
+//! - One message is at most 16 MiB, and one isolate's IPC family retains at
+//!   most 4,096 messages or 64 MiB across all channels and both directions.
+//!   The finite family ledger and runtime ledger admit bytes before an owned
+//!   payload allocation.
 //! - Nothing but owned bytes crosses to the IO runtime; every re-entry into
 //!   JavaScript happens through a [`RuntimeTask`] on the isolate thread.
 //! - An open channel holds the run loop open, so a process waiting for a
@@ -32,23 +36,41 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use otter_resource::{ResourceAccount, ResourceClass, ResourceLeaseSet, ResourceLimits};
+
 use crate::{OtterError, RuntimeKeepAlive, RuntimeLiveness, RuntimeTask, RuntimeTaskSpawner};
+
+const MAX_IPC_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IPC_QUEUED_MESSAGES: u64 = 4_096;
+const MAX_IPC_QUEUED_MESSAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Names the channel a launched process is to join. A process launched without
 /// one, or one whose channel has already been joined, has no IPC members.
 pub const CHANNEL_VAR: &str = "OTTER_CHANNEL";
 
 /// What arrives on a channel.
+// Channel events are immediately embedded in a boxed runtime task. Boxing the
+// message again would add one allocation without shrinking that owning task.
+#[allow(clippy::large_enum_variant)]
 pub enum IpcEvent {
     /// A message the peer sent, as the text the sender encoded, together
     /// with any open files it carried.
-    Message(String, Vec<RawFd>),
+    Message(IpcMessage),
     /// The peer is gone; nothing further will arrive.
     Closed,
     /// A message the program handed over has left this process, named by the
     /// token the program gave it. What the message carried is the peer's from
     /// here on, which is when the sender may let go of its own copy.
     Sent(u32),
+}
+
+/// Why a synchronous handoff to the channel writer was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcSendError {
+    /// The peer or local channel end is gone.
+    Disconnected,
+    /// The finite IPC family or runtime queue budget cannot admit the payload.
+    Backpressure,
 }
 
 impl IpcEvent {
@@ -58,7 +80,7 @@ impl IpcEvent {
     /// carried, and closes what it takes here.
     pub fn take_handles(&mut self) -> Vec<RawFd> {
         match self {
-            Self::Message(_, handles) => std::mem::take(handles),
+            Self::Message(message) => message.take_handles(),
             Self::Closed | Self::Sent(_) => Vec::new(),
         }
     }
@@ -71,6 +93,33 @@ impl Drop for IpcEvent {
         // inbox cancellation drops that task first, nobody gets a chance to
         // take the descriptors, so the event itself is their final owner.
         close_all(self.take_handles());
+    }
+}
+
+/// One admitted incoming message.
+///
+/// The text, carried descriptors, and queue charges remain one ownership unit
+/// until the isolate task consumes or drops the event.
+pub struct IpcMessage {
+    text: String,
+    handles: Vec<RawFd>,
+    _leases: IpcPayloadLeases,
+}
+
+impl IpcMessage {
+    /// Borrow the encoded message text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Move the encoded text out while the event retains its queue charges.
+    pub fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+
+    fn take_handles(&mut self) -> Vec<RawFd> {
+        std::mem::take(&mut self.handles)
     }
 }
 
@@ -112,6 +161,8 @@ impl Drop for CarriedHandles {
 pub struct OutgoingFrame {
     bytes: Vec<u8>,
     handles: Vec<RawFd>,
+    /// Runtime and per-family queue charges for `bytes`.
+    payload_leases: Option<IpcPayloadLeases>,
     /// Held until the frame has left this process. A message the program
     /// handed to the channel is work in flight, and a program does not finish
     /// with unsent work — the socket takes only a buffer's worth at a time, so
@@ -143,7 +194,8 @@ impl Drop for OutgoingFrame {
 
 /// One end of a channel.
 pub struct IpcChannel {
-    outgoing: Mutex<Option<tokio::sync::mpsc::UnboundedSender<OutgoingFrame>>>,
+    outgoing: Mutex<Option<tokio::sync::mpsc::Sender<OutgoingFrame>>>,
+    payload_budget: IpcPayloadBudget,
     /// What a frame in flight holds the run loop open with.
     spawner: RuntimeTaskSpawner,
     /// Whether this end is pulling messages off the socket yet. A channel is
@@ -163,6 +215,83 @@ pub struct IpcChannel {
 struct ReadGate {
     open: AtomicBool,
     opened: tokio::sync::Notify,
+}
+
+/// Paired admission state for payloads retained by one isolate's IPC family.
+#[derive(Clone)]
+struct IpcPayloadBudget {
+    runtime: ResourceAccount,
+    family: ResourceAccount,
+}
+
+impl IpcPayloadBudget {
+    fn standard(spawner: &RuntimeTaskSpawner) -> Self {
+        Self {
+            runtime: spawner.resource_account(),
+            family: spawner.ipc_resource_account(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(runtime: ResourceAccount, messages: u64, bytes: u64) -> Self {
+        Self {
+            runtime,
+            family: ResourceAccount::new(
+                ResourceLimits::builder()
+                    .limit(ResourceClass::QueuedMessages, messages)
+                    .limit(ResourceClass::QueuedMessageBytes, bytes)
+                    .build(),
+            ),
+        }
+    }
+
+    fn admit(&self, bytes: usize) -> Result<IpcPayloadLeases, IpcPayloadError> {
+        let bytes = u64::try_from(bytes).map_err(|_| IpcPayloadError::TooLarge)?;
+        if bytes > MAX_IPC_MESSAGE_BYTES {
+            return Err(IpcPayloadError::TooLarge);
+        }
+        let requests = [
+            (ResourceClass::QueuedMessages, 1),
+            (ResourceClass::QueuedMessageBytes, bytes),
+        ];
+        let family = self
+            .family
+            .reserve_exact_many(&requests)
+            .map_err(|_| IpcPayloadError::FamilyBudget)?;
+        let runtime = self
+            .runtime
+            .reserve_exact_many(&requests)
+            .map_err(|_| IpcPayloadError::RuntimeBudget)?;
+        Ok(IpcPayloadLeases {
+            _family: family,
+            _runtime: runtime,
+        })
+    }
+}
+
+/// Queue charges retained with one incoming or outgoing payload.
+struct IpcPayloadLeases {
+    _family: ResourceLeaseSet,
+    _runtime: ResourceLeaseSet,
+}
+
+#[derive(Debug)]
+enum IpcPayloadError {
+    TooLarge,
+    FamilyBudget,
+    RuntimeBudget,
+}
+
+pub(crate) fn standard_ipc_resource_account() -> ResourceAccount {
+    ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::QueuedMessages, MAX_IPC_QUEUED_MESSAGES)
+            .limit(
+                ResourceClass::QueuedMessageBytes,
+                MAX_IPC_QUEUED_MESSAGE_BYTES,
+            )
+            .build(),
+    )
 }
 
 impl ReadGate {
@@ -243,6 +372,7 @@ impl IpcChannel {
 
         let (channel, outgoing) = Self::new_gated(spawner, Some(address.clone()), true);
         let accept_gate = channel.reading.clone();
+        let accept_budget = channel.payload_budget.clone();
         let accept_address = address.clone();
         let accept_connected = channel.connected.clone();
         let accept_keep_alive = channel.keep_alive.clone();
@@ -267,6 +397,7 @@ impl IpcChannel {
                 accept_keep_alive,
                 accept_spawner,
                 accept_gate,
+                accept_budget,
                 deliver,
             )
             .await;
@@ -307,6 +438,7 @@ impl IpcChannel {
         let (channel, outgoing) = Self::new_gated(spawner, None, false);
         let connected = channel.connected.clone();
         let gate = channel.reading.clone();
+        let budget = channel.payload_budget.clone();
         let keep_alive = channel.keep_alive.clone();
         let join_spawner = spawner.clone();
         io.spawn(async move {
@@ -317,6 +449,7 @@ impl IpcChannel {
                 keep_alive,
                 join_spawner,
                 gate,
+                budget,
                 deliver,
             )
             .await;
@@ -328,17 +461,16 @@ impl IpcChannel {
         spawner: &RuntimeTaskSpawner,
         address: Option<PathBuf>,
         reading: bool,
-    ) -> (
-        Arc<Self>,
-        tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
-    ) {
-        let (outgoing, queued) = tokio::sync::mpsc::unbounded_channel::<OutgoingFrame>();
+    ) -> (Arc<Self>, tokio::sync::mpsc::Receiver<OutgoingFrame>) {
+        let (outgoing, queued) =
+            tokio::sync::mpsc::channel::<OutgoingFrame>(MAX_IPC_QUEUED_MESSAGES as usize);
         // An open channel is a reason to keep running only while the program
         // is listening to it, which it says by referencing the channel. A
         // process that never asks for a message must be free to finish.
         let keep_alive = spawner.retain_keep_alive(RuntimeLiveness::Unref);
         let channel = Arc::new(Self {
             outgoing: Mutex::new(Some(outgoing)),
+            payload_budget: IpcPayloadBudget::standard(spawner),
             spawner: spawner.clone(),
             reading: Arc::new(ReadGate::new(reading)),
             keep_alive: Arc::new(Mutex::new(Some(keep_alive))),
@@ -382,9 +514,13 @@ impl IpcChannel {
         }
     }
 
-    /// Queue one message. Answers whether it was accepted; a disconnected
-    /// channel accepts nothing.
-    pub fn send(&self, payload: &str) -> bool {
+    /// Queue one message.
+    ///
+    /// # Errors
+    /// Returns [`IpcSendError::Disconnected`] when the channel is closed and
+    /// [`IpcSendError::Backpressure`] when the retained queue cannot admit the
+    /// message.
+    pub fn send(&self, payload: &str) -> Result<(), IpcSendError> {
         self.send_with_handles(payload, Vec::new(), None)
     }
 
@@ -393,31 +529,31 @@ impl IpcChannel {
     /// The descriptors ride the same datagram as the message's first byte, so
     /// the peer can tell which message they belong to without a protocol of
     /// their own.
-    #[must_use]
-    pub fn send_with_handles(&self, payload: &str, handles: Vec<RawFd>, sent: Option<u32>) -> bool {
-        // The descriptors belong to the frame from here on, so every way out
-        // of this call closes them exactly once: the writer does it once they
-        // have crossed, and dropping the frame does it if they never do.
-        let mut frame = OutgoingFrame {
-            bytes: Vec::new(),
-            handles,
-            in_flight: None,
-            sent,
-        };
+    ///
+    /// # Errors
+    /// Returns [`IpcSendError::Disconnected`] when the channel is closed and
+    /// [`IpcSendError::Backpressure`] when the retained queue cannot admit the
+    /// message. Refused descriptors are closed before returning.
+    pub fn send_with_handles(
+        &self,
+        payload: &str,
+        handles: Vec<RawFd>,
+        sent: Option<u32>,
+    ) -> Result<(), IpcSendError> {
         if !self.connected() {
-            return false;
+            close_all(handles);
+            return Err(IpcSendError::Disconnected);
         }
-        let Ok(length) = u32::try_from(payload.len()) else {
-            return false;
-        };
-        frame.bytes.reserve(4 + payload.len());
-        frame.bytes.extend_from_slice(&length.to_le_bytes());
-        frame.bytes.extend_from_slice(payload.as_bytes());
+        let mut frame = prepare_outgoing_frame(payload, handles, sent, &self.payload_budget)?;
         frame.in_flight = Some(self.spawner.retain_keep_alive(RuntimeLiveness::Ref));
         let queue = self.outgoing.lock().unwrap_or_else(|p| p.into_inner());
-        queue
-            .as_ref()
-            .is_some_and(|outgoing| outgoing.send(frame).is_ok())
+        let Some(outgoing) = queue.as_ref() else {
+            return Err(IpcSendError::Disconnected);
+        };
+        outgoing.try_send(frame).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => IpcSendError::Backpressure,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => IpcSendError::Disconnected,
+        })
     }
 
     /// Close this end. Messages already queued are still written, then the peer
@@ -430,6 +566,39 @@ impl IpcChannel {
             .take();
         release(&self.keep_alive);
     }
+}
+
+/// Admit and copy one frame before it enters the writer queue.
+fn prepare_outgoing_frame(
+    payload: &str,
+    handles: Vec<RawFd>,
+    sent: Option<u32>,
+    budget: &IpcPayloadBudget,
+) -> Result<OutgoingFrame, IpcSendError> {
+    // The descriptors belong to the frame from here on, so every way out
+    // closes them exactly once: the writer after crossing, or Drop on refusal.
+    let mut frame = OutgoingFrame {
+        bytes: Vec::new(),
+        handles,
+        payload_leases: None,
+        in_flight: None,
+        sent,
+    };
+    let payload_leases = budget
+        .admit(payload.len())
+        .map_err(|_| IpcSendError::Backpressure)?;
+    let length = u32::try_from(payload.len()).map_err(|_| IpcSendError::Backpressure)?;
+    let frame_len = 4_usize
+        .checked_add(payload.len())
+        .ok_or(IpcSendError::Backpressure)?;
+    frame
+        .bytes
+        .try_reserve_exact(frame_len)
+        .map_err(|_| IpcSendError::Backpressure)?;
+    frame.bytes.extend_from_slice(&length.to_le_bytes());
+    frame.bytes.extend_from_slice(payload.as_bytes());
+    frame.payload_leases = Some(payload_leases);
+    Ok(frame)
 }
 
 /// Let go of the hold this channel has on the run loop. Idempotent: the local
@@ -451,11 +620,12 @@ impl Drop for IpcChannel {
 #[cfg(unix)]
 async fn carry<T, F>(
     stream: tokio::net::UnixStream,
-    mut queued: tokio::sync::mpsc::UnboundedReceiver<OutgoingFrame>,
+    mut queued: tokio::sync::mpsc::Receiver<OutgoingFrame>,
     connected: Arc<AtomicBool>,
     keep_alive: Arc<Mutex<Option<RuntimeKeepAlive>>>,
     spawner: RuntimeTaskSpawner,
     reading: Arc<ReadGate>,
+    payload_budget: IpcPayloadBudget,
     deliver: F,
 ) where
     F: Fn(IpcEvent) -> T + Send + Sync + 'static,
@@ -475,18 +645,24 @@ async fn carry<T, F>(
             // The peer has its own copies now; these were duplicated for the
             // crossing and are this side's to close.
             frame.drop_handles();
+            let in_flight = frame.in_flight.take();
+            let sent = frame.sent.take();
+            // The socket no longer borrows the bytes. Release their queue
+            // charge before awaiting isolate delivery of completion events.
+            drop(frame.payload_leases.take());
+            drop(frame);
             // The hold this frame had on the run loop is let go of on the loop
             // itself: dropping it here would lower the count without waking
             // the thread that reads it, and a program with nothing left to do
             // would keep waiting to be told so.
-            if let Some(in_flight) = frame.in_flight.take() {
+            if let Some(in_flight) = in_flight {
                 writer_spawner
                     .enqueue_ordered(FrameWritten { in_flight }, RuntimeLiveness::Unref)
                     .await;
             }
             // The message has gone; what it carried belongs to the peer now,
             // and the sender is told so it can let go of its own copy.
-            if let Some(token) = frame.sent.take() {
+            if let Some(token) = sent {
                 writer_spawner
                     .enqueue_ordered(
                         writer_deliver(IpcEvent::Sent(token)),
@@ -499,7 +675,14 @@ async fn carry<T, F>(
             }
         }
     });
-    read_loop(&reader, &spawner, &reading, deliver.as_ref()).await;
+    read_loop(
+        &reader,
+        &spawner,
+        &reading,
+        &payload_budget,
+        deliver.as_ref(),
+    )
+    .await;
     connected.store(false, Ordering::SeqCst);
     // The peer is gone, so this end stops holding the run loop open whether or
     // not the program ever calls `disconnect` itself.
@@ -528,6 +711,7 @@ async fn read_loop<T, F>(
     stream: &tokio::net::unix::OwnedReadHalf,
     spawner: &RuntimeTaskSpawner,
     reading: &ReadGate,
+    payload_budget: &IpcPayloadBudget,
     deliver: &F,
 ) where
     F: Fn(IpcEvent) -> T + Send + Sync + 'static,
@@ -535,14 +719,15 @@ async fn read_loop<T, F>(
 {
     // Nothing leaves the socket before someone is there to hear it.
     reading.wait().await;
-    let mut pending: Vec<u8> = Vec::new();
+    let mut decoder = IncomingFrameDecoder::default();
     let mut chunk = vec![0u8; 8192];
     // Descriptors arrive with the byte their sender attached them to, which
     // is the first byte of the message that carries them. Remembering where
     // in the stream that byte fell is what pairs them with that message and
     // no other.
     let mut arrived: std::collections::VecDeque<(u64, RawFd)> = std::collections::VecDeque::new();
-    let mut consumed: u64 = 0;
+    let mut received: u64 = 0;
+    let mut decoded: u64 = 0;
     'reading: loop {
         if stream.readable().await.is_err() {
             break;
@@ -550,35 +735,50 @@ async fn read_loop<T, F>(
         let read = match receive_with_fds(stream, &mut chunk) {
             Ok((0, _)) => break,
             Ok((length, handles)) => {
-                let offset = consumed + pending.len() as u64;
-                for handle in handles {
+                let offset = received;
+                let Some(next_received) = received.checked_add(length as u64) else {
+                    close_all(handles);
+                    break;
+                };
+                let mut handles = handles.into_iter();
+                while let Some(handle) = handles.next() {
+                    if arrived.len() == MAX_HANDLES_PER_MESSAGE {
+                        let _ = nix::unistd::close(handle);
+                        close_all(handles);
+                        break 'reading;
+                    }
                     arrived.push_back((offset, handle));
                 }
+                received = next_received;
                 length
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => break,
         };
-        pending.extend_from_slice(&chunk[..read]);
-        while let Some((payload, frame_len)) = take_frame_sized(&mut pending) {
-            let end = consumed + frame_len as u64;
+        let mut cursor = 0;
+        while cursor < read {
+            let Ok((used, message)) = decoder.consume(&chunk[cursor..read], payload_budget) else {
+                break 'reading;
+            };
+            cursor += used;
+            decoded += used as u64;
+            let Some(mut message) = message else {
+                continue;
+            };
             let mut handles = Vec::new();
-            while arrived.front().is_some_and(|(offset, _)| *offset < end) {
+            while arrived.front().is_some_and(|(offset, _)| *offset < decoded) {
                 if let Some((_, handle)) = arrived.pop_front() {
                     handles.push(handle);
                 }
             }
-            consumed = end;
+            message.handles = handles;
             // Room in the inbox is worth waiting for — a peer that sends
             // faster than the program reads must be made to wait, not go
             // unheard — so only an isolate that is gone ends the loop. The
             // event owns its descriptors, including when its queued task is
             // cancelled before delivery.
             if !spawner
-                .enqueue_ordered(
-                    deliver(IpcEvent::Message(payload, handles)),
-                    RuntimeLiveness::Unref,
-                )
+                .enqueue_ordered(deliver(IpcEvent::Message(message)), RuntimeLiveness::Unref)
                 .await
             {
                 break 'reading;
@@ -588,6 +788,98 @@ async fn read_loop<T, F>(
     // Descriptors that arrived attached to a message the peer never finished
     // sending are this side's to close.
     close_all(arrived.into_iter().map(|(_, handle)| handle));
+}
+
+/// Incremental decoder for the length-prefixed IPC wire format.
+///
+/// The four-byte header is fixed scratch. Once it is complete, admission and
+/// exact capacity reservation happen before any payload byte is copied.
+#[derive(Default)]
+struct IncomingFrameDecoder {
+    header: [u8; 4],
+    header_len: usize,
+    expected: Option<usize>,
+    payload: Vec<u8>,
+    leases: Option<IpcPayloadLeases>,
+}
+
+impl IncomingFrameDecoder {
+    fn consume(
+        &mut self,
+        input: &[u8],
+        budget: &IpcPayloadBudget,
+    ) -> Result<(usize, Option<IpcMessage>), IncomingFrameError> {
+        debug_assert!(!input.is_empty());
+        let mut used = 0;
+        if self.expected.is_none() {
+            let header_bytes = (4 - self.header_len).min(input.len());
+            self.header[self.header_len..self.header_len + header_bytes]
+                .copy_from_slice(&input[..header_bytes]);
+            self.header_len += header_bytes;
+            used += header_bytes;
+            if self.header_len != 4 {
+                return Ok((used, None));
+            }
+
+            let expected = u32::from_le_bytes(self.header) as usize;
+            let leases = budget.admit(expected).map_err(IncomingFrameError::from)?;
+            self.payload
+                .try_reserve_exact(expected)
+                .map_err(|_| IncomingFrameError::Allocation)?;
+            self.expected = Some(expected);
+            self.leases = Some(leases);
+            if expected == 0 {
+                return self.finish(used);
+            }
+        }
+
+        let expected = self.expected.expect("a complete header sets a length");
+        let payload_bytes = (expected - self.payload.len()).min(input.len() - used);
+        self.payload
+            .extend_from_slice(&input[used..used + payload_bytes]);
+        used += payload_bytes;
+        if self.payload.len() == expected {
+            self.finish(used)
+        } else {
+            Ok((used, None))
+        }
+    }
+
+    fn finish(&mut self, used: usize) -> Result<(usize, Option<IpcMessage>), IncomingFrameError> {
+        let payload = std::mem::take(&mut self.payload);
+        let leases = self
+            .leases
+            .take()
+            .expect("an admitted frame retains its leases");
+        self.header_len = 0;
+        self.expected = None;
+        let text = String::from_utf8(payload).map_err(|_| IncomingFrameError::InvalidUtf8)?;
+        Ok((
+            used,
+            Some(IpcMessage {
+                text,
+                handles: Vec::new(),
+                _leases: leases,
+            }),
+        ))
+    }
+}
+
+#[derive(Debug)]
+enum IncomingFrameError {
+    TooLarge,
+    QueueBudget,
+    Allocation,
+    InvalidUtf8,
+}
+
+impl From<IpcPayloadError> for IncomingFrameError {
+    fn from(error: IpcPayloadError) -> Self {
+        match error {
+            IpcPayloadError::TooLarge => Self::TooLarge,
+            IpcPayloadError::FamilyBudget | IpcPayloadError::RuntimeBudget => Self::QueueBudget,
+        }
+    }
 }
 
 /// Close descriptors nothing will take ownership of.
@@ -685,29 +977,25 @@ fn receive_with_fds(
 #[cfg(unix)]
 const MAX_HANDLES_PER_MESSAGE: usize = 4;
 
-/// Split off the first whole message, if the buffer holds one yet, and say
-/// how many bytes it occupied.
-///
-/// A message is its byte length followed by its text, so a reader never has
-/// to guess where one ends — which a delimiter would force it to do, and
-/// which would then constrain what a message may contain. The size is what
-/// pairs a message with the descriptors that arrived inside it.
-fn take_frame_sized(buffer: &mut Vec<u8>) -> Option<(String, usize)> {
-    if buffer.len() < 4 {
-        return None;
-    }
-    let length = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-    if buffer.len() < 4 + length {
-        return None;
-    }
-    let payload = String::from_utf8(buffer[4..4 + length].to_vec()).ok();
-    buffer.drain(..4 + length);
-    payload.map(|text| (text, 4 + length))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{IpcEvent, take_frame_sized};
+    use super::*;
+
+    struct CaptureEvent {
+        event: IpcEvent,
+        sender: std::sync::mpsc::Sender<IpcEvent>,
+    }
+
+    impl RuntimeTask for CaptureEvent {
+        fn run(self: Box<Self>, _runtime: &mut crate::Runtime) -> Result<(), OtterError> {
+            self.sender
+                .send(self.event)
+                .map_err(|_| OtterError::Internal {
+                    code: "IPC_TEST".to_string(),
+                    message: "IPC test receiver dropped".to_string(),
+                })
+        }
+    }
 
     fn frame(payload: &str) -> Vec<u8> {
         let mut bytes = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
@@ -715,67 +1003,204 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn a_partial_message_is_left_in_the_buffer() {
-        let whole = frame("hello");
-        for split in 0..whole.len() {
-            let mut buffer = whole[..split].to_vec();
-            assert!(take_frame_sized(&mut buffer).is_none(), "split at {split}");
-            assert_eq!(buffer.len(), split);
-        }
+    fn current(account: &ResourceAccount, class: ResourceClass) -> u64 {
+        account.snapshot().get(class).current()
     }
 
     #[test]
-    fn messages_come_out_in_order_however_they_arrived() {
-        let mut buffer = Vec::new();
-        for payload in ["one", "", "three"] {
-            buffer.extend_from_slice(&frame(payload));
-        }
+    fn payload_charges_both_ledgers_until_message_drop() {
+        let runtime = ResourceAccount::default();
+        let budget = IpcPayloadBudget::with_limits(runtime.clone(), 2, 8);
+        let leases = budget.admit(3).expect("payload admitted");
+        let message = IpcMessage {
+            text: "abc".to_string(),
+            handles: Vec::new(),
+            _leases: leases,
+        };
+
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 1);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 3);
         assert_eq!(
-            take_frame_sized(&mut buffer)
-                .map(|(text, _)| text)
-                .as_deref(),
-            Some("one")
+            current(&budget.family, ResourceClass::QueuedMessageBytes),
+            3
         );
-        assert_eq!(
-            take_frame_sized(&mut buffer)
-                .map(|(text, _)| text)
-                .as_deref(),
-            Some("")
-        );
-        assert_eq!(
-            take_frame_sized(&mut buffer)
-                .map(|(text, _)| text)
-                .as_deref(),
-            Some("three")
-        );
-        assert!(take_frame_sized(&mut buffer).is_none());
-        assert!(buffer.is_empty());
+
+        drop(message);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 0);
     }
 
     #[test]
-    fn a_message_may_contain_anything_a_delimiter_would_have_claimed() {
+    fn runtime_rejection_rolls_family_charge_back() {
+        let runtime = ResourceAccount::new(
+            ResourceLimits::builder()
+                .limit(ResourceClass::QueuedMessageBytes, 2)
+                .build(),
+        );
+        let budget = IpcPayloadBudget::with_limits(runtime.clone(), 2, 8);
+
+        assert!(matches!(
+            budget.admit(3),
+            Err(IpcPayloadError::RuntimeBudget)
+        ));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+        assert_eq!(current(&budget.family, ResourceClass::QueuedMessages), 0);
+    }
+
+    #[test]
+    fn outgoing_frame_pressure_rejects_before_copy_and_recovers() {
+        let runtime = ResourceAccount::new(
+            ResourceLimits::builder()
+                .limit(ResourceClass::QueuedMessages, 1)
+                .limit(ResourceClass::QueuedMessageBytes, 3)
+                .build(),
+        );
+        let budget = IpcPayloadBudget::with_limits(runtime.clone(), 2, 8);
+
+        let outgoing =
+            prepare_outgoing_frame("abc", Vec::new(), None, &budget).expect("first frame admitted");
+        assert_eq!(outgoing.bytes, frame("abc"));
+        assert!(matches!(
+            prepare_outgoing_frame("x", Vec::new(), None, &budget),
+            Err(IpcSendError::Backpressure)
+        ));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 1);
+
+        drop(outgoing);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+        drop(prepare_outgoing_frame("x", Vec::new(), None, &budget).expect("capacity recovered"));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+    }
+
+    #[test]
+    fn oversized_header_is_rejected_before_payload_allocation() {
+        let runtime = ResourceAccount::default();
+        let budget = IpcPayloadBudget::with_limits(runtime.clone(), 4_096, 64 * 1024 * 1024);
+        let mut decoder = IncomingFrameDecoder::default();
+        let header = u32::try_from(MAX_IPC_MESSAGE_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+
+        assert!(matches!(
+            decoder.consume(&header, &budget),
+            Err(IncomingFrameError::TooLarge)
+        ));
+        assert_eq!(decoder.payload.capacity(), 0);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+    }
+
+    #[test]
+    fn incremental_decoder_preserves_arbitrary_text_and_charges_it() {
+        let runtime = ResourceAccount::default();
+        let budget = IpcPayloadBudget::with_limits(runtime.clone(), 4_096, 64 * 1024 * 1024);
         let payload = "{\"line\":\"a\\nb\",\"nul\":\"\\u0000\"}\n\n";
-        let mut buffer = frame(payload);
+        let bytes = frame(payload);
+        let mut decoder = IncomingFrameDecoder::default();
+        let mut message = None;
+        for byte in bytes {
+            let (used, decoded) = decoder.consume(&[byte], &budget).unwrap();
+            assert_eq!(used, 1);
+            if decoded.is_some() {
+                message = decoded;
+            }
+        }
+        let message = message.expect("complete message");
+        assert_eq!(message.text(), payload);
         assert_eq!(
-            take_frame_sized(&mut buffer)
-                .map(|(text, _)| text)
-                .as_deref(),
-            Some(payload)
+            current(&runtime, ResourceClass::QueuedMessageBytes),
+            payload.len() as u64
         );
-        assert!(buffer.is_empty());
+        drop(message);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 0);
+    }
+
+    #[test]
+    fn decoder_returns_multiple_frames_without_losing_remainder() {
+        let runtime = ResourceAccount::default();
+        let budget = IpcPayloadBudget::with_limits(runtime.clone(), 4, 16);
+        let mut bytes = frame("one");
+        bytes.extend_from_slice(&frame(""));
+        bytes.extend_from_slice(&frame("three"));
+        let mut decoder = IncomingFrameDecoder::default();
+        let mut cursor = 0;
+        let mut messages = Vec::new();
+
+        while cursor < bytes.len() {
+            let (used, message) = decoder.consume(&bytes[cursor..], &budget).unwrap();
+            assert!(used > 0);
+            cursor += used;
+            if let Some(message) = message {
+                messages.push(message);
+            }
+        }
+
+        let texts: Vec<&str> = messages.iter().map(IpcMessage::text).collect();
+        assert_eq!(texts, ["one", "", "three"]);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 3);
+        drop(messages);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_channel_holds_incoming_charge_until_event_drop() {
+        let otter = crate::Otter::builder().build().unwrap();
+        let spawner = otter.handle().task_spawner();
+        let (parent_tx, _parent_rx) = std::sync::mpsc::channel();
+        let (parent, address) = IpcChannel::listen(&spawner, move |event| CaptureEvent {
+            event,
+            sender: parent_tx.clone(),
+        })
+        .unwrap();
+        let (child_tx, child_rx) = std::sync::mpsc::channel();
+        let child = IpcChannel::join(&address, &spawner, move |event| CaptureEvent {
+            event,
+            sender: child_tx.clone(),
+        })
+        .unwrap();
+        child.start_reading();
+
+        parent.send("abc").expect("message accepted");
+        let event = child_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("message delivered");
+        let IpcEvent::Message(message) = &event else {
+            panic!("expected a message event");
+        };
+        assert_eq!(message.text(), "abc");
+        assert_eq!(
+            current(&otter.resource_account(), ResourceClass::QueuedMessageBytes),
+            3
+        );
+
+        drop(event);
+        assert_eq!(
+            current(&otter.resource_account(), ResourceClass::QueuedMessageBytes),
+            0
+        );
+        parent.disconnect();
+        child.disconnect();
     }
 
     #[cfg(unix)]
     #[test]
     fn dropping_a_message_closes_untaken_handles() {
+        use std::io::Read;
         use std::os::fd::IntoRawFd;
 
-        let (read_end, _write_end) = nix::unistd::pipe().unwrap();
-        let raw = read_end.into_raw_fd();
-        drop(IpcEvent::Message("message".to_string(), vec![raw]));
+        let (carried, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let raw = carried.into_raw_fd();
+        let budget =
+            IpcPayloadBudget::with_limits(ResourceAccount::default(), 4_096, 64 * 1024 * 1024);
+        let message = IpcMessage {
+            text: "message".to_string(),
+            handles: vec![raw],
+            _leases: budget.admit(7).unwrap(),
+        };
+        drop(IpcEvent::Message(message));
 
-        assert_eq!(nix::unistd::close(raw), Err(nix::errno::Errno::EBADF));
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
     }
 
     #[cfg(unix)]
@@ -785,7 +1210,14 @@ mod tests {
 
         let (read_end, write_end) = nix::unistd::pipe().unwrap();
         let raw = read_end.as_raw_fd();
-        let mut event = IpcEvent::Message("message".to_string(), vec![raw]);
+        let budget =
+            IpcPayloadBudget::with_limits(ResourceAccount::default(), 4_096, 64 * 1024 * 1024);
+        let message = IpcMessage {
+            text: "message".to_string(),
+            handles: vec![raw],
+            _leases: budget.admit(7).unwrap(),
+        };
+        let mut event = IpcEvent::Message(message);
         let handles = event.take_handles();
         assert_eq!(handles, vec![raw]);
 

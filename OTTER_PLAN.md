@@ -349,11 +349,44 @@ unbounded MPSC can buffer arbitrarily until process memory is exhausted:
 [libuv UDP](https://docs.libuv.org/en/v1.x/udp.html), and
 [Tokio MPSC](https://docs.rs/tokio/latest/tokio/sync/mpsc/).
 
-Still open: audit the remaining active host state that retains bytes across a
-call or task boundary, chiefly child-process IPC/process capture and
-snapshot/artifact capture. Fixed transport read slabs, synchronous scratch
-vectors, bounded codec state, and already hard-bounded diagnostic artifacts
-must be distinguished from retained stores before changing them.
+Child-process IPC and process capture are now bounded without extending the
+JavaScript permission or option surface. Every isolate owns one finite IPC
+family ledger shared by all of its channels: at most 4,096 retained messages,
+64 MiB total payload, and 16 MiB for one message. The same payload is admitted
+against the runtime `QueuedMessages` / `QueuedMessageBytes` ledger before its
+owned copy. The writer uses a bounded Tokio channel, holds both leases until
+the socket accepts or refuses the bytes, and distinguishes closed-channel
+failure from observable `ENOBUFS` pressure.
+
+The reader no longer grows a pending `Vec` from a peer-controlled 32-bit
+length. It incrementally collects the fixed four-byte header, rejects an
+oversized frame, admits its complete size, reserves exact capacity, and only
+then copies payload bytes. Its lease crosses the bounded isolate inbox and is
+released after JSON/string handoff or cancellation. Descriptor accumulation
+is capped with the frame and surplus descriptors are closed. This matches the
+public contract Node documents — `subprocess.send()` returns false once the
+unsent backlog is unsafe — while enforcing the harder memory boundary below
+that compatibility surface. Tokio's own documentation recommends bounded
+MPSC when backpressure is required and warns that the unbounded form can abort
+the process on OOM:
+[Node child-process IPC](https://nodejs.org/api/child_process.html#subprocesssendmessage-sendhandle-options-callback),
+[Node IPC implementation](https://github.com/nodejs/node/blob/main/lib/internal/child_process.js),
+and [Tokio MPSC](https://docs.rs/tokio/latest/tokio/sync/mpsc/).
+
+Process output has two distinct ownership paths. Async `spawn` pipes are
+ordinary bounded native transports; `exec` / `execFile` collect VM-owned
+Buffers under Node's existing 1 MiB default `maxBuffer`. Synchronous capture
+is native scratch retained for the duration of one call, so it now has an
+internal 64 MiB ceiling per stdout/stderr stream in addition to the caller's
+smaller `maxBuffer`, truncates exactly at the boundary, kills the overflowing
+child, and reports the existing `ENOBUFS` outcome. Node likewise specifies
+`maxBuffer` in bytes and terminates the child when it is exceeded:
+[Node `maxBuffer`](https://nodejs.org/api/child_process.html#maxbuffer-and-unicode).
+
+Still open: audit snapshot/artifact capture. Fixed transport read slabs,
+bounded synchronous scratch, bounded codec state, and already hard-bounded
+diagnostic artifacts must be distinguished from retained stores before
+changing them.
 
 Also landed: heap external charges are folded into the runtime ledger.
 `GcHeap` mirrors its outstanding external/off-slot reservation bytes into an

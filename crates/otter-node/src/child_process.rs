@@ -17,6 +17,9 @@
 //!   methods, so filtered `process.env` proxies cannot leak hidden host values.
 //! - Waiting for a child never happens on the isolate thread: a program that
 //!   forked a child and is exchanging messages with it must keep running.
+//! - Synchronous stdout and stderr capture obey the caller's `maxBuffer` and
+//!   an internal 64 MiB per-stream ceiling; overflow stops the child without
+//!   retaining the read that crossed the limit.
 //! - No VM state is retained across the spawn.
 
 use std::collections::HashMap;
@@ -25,14 +28,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
-    CapabilitySet, CarriedHandles, IpcChannel, IpcEvent, OtterError, Runtime, RuntimeLiveness,
-    RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeScope as NativeScope, RuntimeTask, RuntimeTaskSpawner, RuntimeValue as Value,
-    runtime_arg_to_string,
+    CapabilitySet, CarriedHandles, IpcChannel, IpcEvent, IpcSendError, OtterError, Runtime,
+    RuntimeLiveness, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTask,
+    RuntimeTaskSpawner, RuntimeValue as Value, runtime_arg_to_string,
 };
 use otter_vm::object;
 
 const SHIM: &str = include_str!("child_process.js");
+const MAX_SYNC_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 /// CommonJS export: the `child_process` namespace built by `child_process.js`.
 pub fn child_process_cjs_value<'scope>(
@@ -127,16 +131,23 @@ fn native_value<'scope>(
                 .map(|fd| vec![fd as std::os::fd::RawFd])
                 .unwrap_or_default();
             let channel = lookup_channel(&send_table, id);
-            let accepted = match channel {
+            let outcome = match channel {
                 Some(channel) => channel.send_with_handles(&payload, handles, token),
                 None => {
                     for handle in handles {
                         let _ = nix::unistd::close(handle);
                     }
-                    false
+                    Err(IpcSendError::Disconnected)
                 }
             };
-            Ok(Value::boolean(accepted))
+            let status = match outcome {
+                Ok(()) => 1,
+                Err(IpcSendError::Disconnected) => 0,
+                Err(IpcSendError::Backpressure) => -1,
+            };
+            Ok(Value::number(otter_vm::number::NumberValue::from_i32(
+                status,
+            )))
         },
     )?;
     scope.set(object, "ipcSend", send)?;
@@ -234,7 +245,7 @@ impl RuntimeTask for ChildIpcEvent {
         };
         let id = self.id;
         let (kind, payload) = match &mut self.event {
-            IpcEvent::Message(payload, _) => ("message", std::mem::take(payload)),
+            IpcEvent::Message(message) => ("message", message.take_text()),
             IpcEvent::Closed => ("disconnect", String::new()),
             IpcEvent::Sent(token) => ("sent", token.to_string()),
         };
@@ -914,7 +925,8 @@ fn spawn_sync_raw(
         max_buffer as usize
     } else {
         usize::MAX
-    };
+    }
+    .min(MAX_SYNC_CAPTURE_BYTES);
     let mut streams = SyncStreams::adopt(wired.kept, input.as_deref());
 
     let deadline = if timeout_ms > 0.0 {
@@ -1106,9 +1118,8 @@ impl SyncStreams {
 
     /// Read one pipe as far as it will go right now.
     ///
-    /// A read is kept whole: the limit is what the caller agreed to hold, and
-    /// it is noticed after the read that crosses it rather than by cutting
-    /// that read in half.
+    /// Only bytes inside the limit are retained. The read that crosses it is
+    /// consumed from the pipe but truncated at the exact capture boundary.
     fn pull<P: std::io::Read>(
         pipe: &mut Option<P>,
         kept: &mut Option<Vec<u8>>,
@@ -1127,9 +1138,15 @@ impl SyncStreams {
                     return moved;
                 }
                 Ok(read) => {
-                    kept.extend_from_slice(&chunk[..read]);
+                    let retained = read.min(cap.saturating_sub(kept.len()));
+                    if kept.try_reserve(retained).is_err() {
+                        *overflowed = true;
+                        *pipe = None;
+                        return true;
+                    }
+                    kept.extend_from_slice(&chunk[..retained]);
                     moved = true;
-                    if kept.len() > cap {
+                    if retained != read {
                         *overflowed = true;
                         *pipe = None;
                         return moved;
@@ -1277,4 +1294,33 @@ fn set_number(
 ) -> Result<(), NativeError> {
     let value = scope.number(value);
     scope.set(object, key, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncStreams;
+
+    #[test]
+    fn synchronous_capture_stops_at_the_exact_limit() {
+        let mut pipe = Some(std::io::Cursor::new(b"abcdef".to_vec()));
+        let mut kept = Some(Vec::new());
+        let mut overflowed = false;
+
+        assert!(SyncStreams::pull(&mut pipe, &mut kept, 3, &mut overflowed));
+        assert_eq!(kept.as_deref(), Some(b"abc".as_slice()));
+        assert!(overflowed);
+        assert!(pipe.is_none());
+    }
+
+    #[test]
+    fn synchronous_capture_accepts_output_equal_to_the_limit() {
+        let mut pipe = Some(std::io::Cursor::new(b"abc".to_vec()));
+        let mut kept = Some(Vec::new());
+        let mut overflowed = false;
+
+        assert!(SyncStreams::pull(&mut pipe, &mut kept, 3, &mut overflowed));
+        assert_eq!(kept.as_deref(), Some(b"abc".as_slice()));
+        assert!(!overflowed);
+        assert!(pipe.is_none());
+    }
 }

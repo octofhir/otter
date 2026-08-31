@@ -1,5 +1,7 @@
 use otter_node::{NodeApiBuilderExt, hosted_modules};
-use otter_runtime::{CapabilitySet, Permission, Runtime};
+use otter_runtime::{
+    CapabilitySet, Permission, ResourceAccount, ResourceClass, ResourceLimits, Runtime,
+};
 
 #[test]
 fn hosted_node_module_specs_are_static_and_ordered() {
@@ -683,6 +685,128 @@ fn node_net_classifies_addresses_and_exposes_its_shapes() {
         .build()
         .unwrap();
     runtime.run_module(&main).unwrap();
+}
+
+#[test]
+fn node_tcp_and_udp_payloads_round_trip_and_release_queue_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import net from "node:net";
+        import dgram from "node:dgram";
+
+        const tcpServer = net.createServer((socket) => {
+          socket.on('data', (chunk) => socket.end(Buffer.concat([Buffer.from('tcp:'), chunk])));
+        });
+        await new Promise((resolve, reject) => {
+          tcpServer.once('error', reject);
+          tcpServer.listen(0, '127.0.0.1', resolve);
+        });
+        const tcpAddress = tcpServer.address();
+        const tcpReply = await new Promise((resolve, reject) => {
+          const chunks = [];
+          const socket = net.connect(tcpAddress.port, '127.0.0.1', () => socket.write('otter'));
+          socket.on('data', (chunk) => chunks.push(chunk));
+          socket.once('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+          socket.once('error', reject);
+        });
+        if (tcpReply !== 'tcp:otter') throw new Error('TCP reply: ' + tcpReply);
+        await new Promise((resolve, reject) => tcpServer.close((error) => error ? reject(error) : resolve()));
+
+        const receiver = dgram.createSocket('udp4');
+        await new Promise((resolve, reject) => {
+          receiver.once('error', reject);
+          receiver.bind(0, '127.0.0.1', resolve);
+        });
+        const udpAddress = receiver.address();
+        const sender = dgram.createSocket('udp4');
+        const udpReply = new Promise((resolve, reject) => {
+          receiver.once('message', (payload) => resolve(payload.toString('utf8')));
+          receiver.once('error', reject);
+        });
+        await new Promise((resolve, reject) => {
+          sender.send(Buffer.from('datagram'), udpAddress.port, '127.0.0.1', (error) => {
+            if (error) reject(error); else resolve();
+          });
+        });
+        if (await udpReply !== 'datagram') throw new Error('UDP reply mismatch');
+        sender.close();
+        receiver.close();
+        "#,
+    )
+    .unwrap();
+
+    let account = ResourceAccount::default();
+    let otter = otter_runtime::Otter::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .resource_account(account.clone())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    otter.blocking_run_module(&main).unwrap();
+
+    let snapshot = account.snapshot();
+    assert!(snapshot.get(ResourceClass::QueuedMessages).peak() > 0);
+    assert!(snapshot.get(ResourceClass::QueuedMessageBytes).peak() > 0);
+    assert_eq!(snapshot.get(ResourceClass::QueuedMessages).current(), 0);
+    assert_eq!(snapshot.get(ResourceClass::QueuedMessageBytes).current(), 0);
+}
+
+#[test]
+fn node_udp_receive_budget_pressure_reports_enobufs_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+        import dgram from "node:dgram";
+
+        const receiver = dgram.createSocket('udp4');
+        await new Promise((resolve, reject) => {
+          receiver.once('error', reject);
+          receiver.bind(0, '127.0.0.1', resolve);
+        });
+        const address = receiver.address();
+        const sender = dgram.createSocket('udp4');
+        const failure = new Promise((resolve, reject) => {
+          receiver.once('error', (error) => {
+            if (error?.code === 'ENOBUFS') resolve(); else reject(error);
+          });
+        });
+        await new Promise((resolve, reject) => {
+          sender.send(Buffer.from('pressure'), address.port, '127.0.0.1', (error) => {
+            if (error) reject(error); else resolve();
+          });
+        });
+        await failure;
+        sender.close();
+        receiver.close();
+        "#,
+    )
+    .unwrap();
+
+    let account = ResourceAccount::new(
+        ResourceLimits::builder()
+            .limit(ResourceClass::QueuedMessageBytes, 0)
+            .build(),
+    );
+    let otter = otter_runtime::Otter::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .resource_account(account.clone())
+        .with_node_apis()
+        .build()
+        .unwrap();
+    otter.blocking_run_module(&main).unwrap();
+
+    let snapshot = account.snapshot();
+    assert_eq!(
+        snapshot.get(ResourceClass::QueuedMessageBytes).rejections(),
+        1
+    );
+    assert_eq!(snapshot.get(ResourceClass::QueuedMessages).current(), 0);
+    assert_eq!(snapshot.get(ResourceClass::QueuedMessageBytes).current(), 0);
 }
 
 /// A `once` listener is `onceWrapper.bind(state)`, so every once-emit calls

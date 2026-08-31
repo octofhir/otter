@@ -49,6 +49,7 @@ pub mod readline;
 pub mod stream;
 pub mod string_decoder;
 pub mod stubs;
+mod transport_payload;
 pub mod tty;
 pub mod url;
 pub mod util;

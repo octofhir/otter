@@ -15,7 +15,8 @@
 //! - The loops never touch VM state; they hand owned bytes to a task that
 //!   re-enters JavaScript on the isolate thread.
 //! - Writing never blocks the isolate thread: bytes are queued and written by
-//!   a task, so ordering is the order of the writes.
+//!   a task, so ordering is the order of the writes. Every retained payload is
+//!   admitted before allocation against finite binding and runtime ledgers.
 //! - A listener holds the runtime open while it is listening, and a connection
 //!   while it is open, so a program serving or awaiting data does not exit.
 //!
@@ -32,6 +33,8 @@ use otter_runtime::{
     RuntimeLocal, RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeScope, RuntimeTask,
     RuntimeTaskSpawner, RuntimeValue, runtime_arg_to_string, runtime_type_error,
 };
+
+use crate::transport_payload::{QueuedPayload, TransportPayloadBudget, TransportPayloadError};
 
 /// One live listener or connection.
 struct Entry {
@@ -267,15 +270,36 @@ impl NetSocket {
 }
 
 /// One queued item for a connection's writer task.
+// Queue leases dominate the enum size. Keeping them inline avoids a second
+// allocation for every write; the channel already stores messages in blocks.
+#[allow(clippy::large_enum_variant)]
 enum WriteMsg {
     /// Bytes to send; a non-zero token requests a completion event.
-    Data(Vec<u8>, u32),
+    Data(QueuedPayload, u32),
     /// Flush everything queued before this marker, then close the write
     /// half and report completion for the token.
     End(u32),
 }
 
-type Table = Arc<Mutex<HashMap<u32, Entry>>>;
+struct NetTable {
+    entries: Mutex<HashMap<u32, Entry>>,
+    payloads: TransportPayloadBudget,
+}
+
+impl NetTable {
+    fn new(runtime_resources: otter_runtime::ResourceAccount) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            payloads: TransportPayloadBudget::standard(runtime_resources),
+        }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<u32, Entry>>> {
+        self.entries.lock()
+    }
+}
+
+type Table = Arc<NetTable>;
 
 /// Deliver one event to the isolate without dropping or reordering it.
 /// See [`RuntimeTaskSpawner::enqueue_ordered`].
@@ -309,7 +333,11 @@ fn build_native<'scope>(
     spawner: Option<RuntimeTaskSpawner>,
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
     let object = scope.object()?;
-    let table: Table = Arc::new(Mutex::new(HashMap::new()));
+    let runtime_resources = spawner
+        .as_ref()
+        .map(RuntimeTaskSpawner::resource_account)
+        .unwrap_or_default();
+    let table: Table = Arc::new(NetTable::new(runtime_resources));
     let next_id = Arc::new(AtomicU32::new(1));
 
     let listen_caps = capabilities.clone();
@@ -413,15 +441,12 @@ fn build_native<'scope>(
                 let sent = view.buffer(heap).with_bytes(heap, |bytes| {
                     write_bytes(&write_table, id, &bytes[offset..offset + len], token)
                 });
-                return Ok(RuntimeValue::boolean(sent));
+                return Ok(RuntimeValue::boolean(sent.map_err(write_payload_error)?));
             }
             let payload = runtime_arg_to_string(args, 1, ctx.heap());
-            Ok(RuntimeValue::boolean(write_bytes(
-                &write_table,
-                id,
-                &latin1_to_bytes(&payload),
-                token,
-            )))
+            let sent = write_bytes(&write_table, id, &latin1_to_bytes(&payload), token)
+                .map_err(write_payload_error)?;
+            Ok(RuntimeValue::boolean(sent))
         },
     )?;
     scope.set(object, "write", write)?;
@@ -1131,7 +1156,11 @@ fn adopt(
             let _decrement = scopeguard_decrement(&writer_queued);
             match message {
                 WriteMsg::Data(bytes, token) => {
-                    if let Err(error) = write_all(&writer_stream, &bytes).await {
+                    let outcome = write_all(&writer_stream, bytes.as_slice()).await;
+                    // The kernel has either accepted the complete write or
+                    // refused it. Completion delivery owns no payload bytes.
+                    drop(bytes);
+                    if let Err(error) = outcome {
                         enqueue_ordered(
                             &writer_spawner,
                             NetEvent::WriteDone {
@@ -1215,11 +1244,20 @@ fn adopt(
             match stream.try_read(&mut chunk) {
                 Ok(0) => break,
                 Ok(length) => {
+                    let payload = match reader_table.payloads.copy_from(&chunk[..length]) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            // The bytes have already left the kernel, so a
+                            // typed read failure is the only non-lossy result.
+                            read_error = Some("ENOBUFS");
+                            break;
+                        }
+                    };
                     if !enqueue_ordered(
                         &reader_spawner,
                         NetEvent::Data {
                             connection: id,
-                            payload: chunk[..length].to_vec(),
+                            payload: Some(payload),
                         },
                         RuntimeLiveness::Unref,
                     )
@@ -1597,7 +1635,6 @@ fn bind_listener(
 }
 
 /// Everything the shim is told about, in the order it happened.
-#[derive(Clone)]
 enum NetEvent {
     Accepted {
         server: u32,
@@ -1615,7 +1652,7 @@ enum NetEvent {
     },
     Data {
         connection: u32,
-        payload: Vec<u8>,
+        payload: Option<QueuedPayload>,
     },
     Ended {
         connection: u32,
@@ -1656,7 +1693,7 @@ fn deliver(
     // a latin1 string here and no decode back to a Buffer there, and the
     // buffer costs one move rather than three passes over every byte.
     let mut chunk = match &mut event {
-        NetEvent::Data { payload, .. } => Some(std::mem::take(payload)),
+        NetEvent::Data { payload, .. } => payload.take(),
         _ => None,
     };
     runtime.run_native_event(context, |ctx| {
@@ -1703,8 +1740,15 @@ fn deliver(
                 NetEvent::Data { connection, .. } => {
                     let name = scope.string("data")?;
                     let connection = scope.number(f64::from(*connection));
-                    let payload =
-                        scope.array_buffer_from_bytes(chunk.take().unwrap_or_default())?;
+                    let (bytes, queue_lease) = chunk
+                        .take()
+                        .expect("data events own one admitted payload")
+                        .into_parts();
+                    let payload = scope.array_buffer_from_bytes(bytes)?;
+                    // Keep the queue charge until VM backing-store admission
+                    // succeeds; ownership is accounted on both sides during
+                    // the handoff rather than on neither.
+                    drop(queue_lease);
                     let undefined = scope.undefined();
                     (name, connection, payload, undefined)
                 }
@@ -1763,25 +1807,36 @@ fn io_spawner(
     })
 }
 
-fn write_bytes(table: &Table, id: u32, bytes: &[u8], token: u32) -> bool {
-    let table = table
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match table.get(&id).map(|entry| &entry.kind) {
-        Some(EntryKind::Connection {
-            outgoing: Some(outgoing),
-            queued,
-            ..
-        }) => {
-            queued.fetch_add(1, Ordering::SeqCst);
-            let sent = outgoing.send(WriteMsg::Data(bytes.to_vec(), token)).is_ok();
-            if !sent {
-                queued.fetch_sub(1, Ordering::SeqCst);
-            }
-            sent
+fn write_bytes(
+    table: &Table,
+    id: u32,
+    bytes: &[u8],
+    token: u32,
+) -> Result<bool, TransportPayloadError> {
+    let target = {
+        let table = table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match table.get(&id).map(|entry| &entry.kind) {
+            Some(EntryKind::Connection {
+                outgoing: Some(outgoing),
+                queued,
+                ..
+            }) => Some((outgoing.clone(), queued.clone())),
+            _ => None,
         }
-        _ => false,
+    };
+    let Some((outgoing, queued)) = target else {
+        return Ok(false);
+    };
+
+    let payload = table.payloads.copy_from(bytes)?;
+    queued.fetch_add(1, Ordering::SeqCst);
+    let sent = outgoing.send(WriteMsg::Data(payload, token)).is_ok();
+    if !sent {
+        queued.fetch_sub(1, Ordering::SeqCst);
     }
+    Ok(sent)
 }
 
 /// Attempt an in-line non-blocking write while the writer queue is idle.
@@ -2058,6 +2113,17 @@ fn system_error_code(code: &'static str, syscall: &'static str) -> RuntimeNative
     }
 }
 
+fn write_payload_error(error: TransportPayloadError) -> RuntimeNativeError {
+    RuntimeNativeError::Syscall {
+        code: "ENOBUFS",
+        message: format!("write ENOBUFS: {error}"),
+        syscall: "write",
+        path: None,
+        dest: None,
+        errno: libc::ENOBUFS,
+    }
+}
+
 fn latin1_to_bytes(text: &str) -> Vec<u8> {
     text.chars()
         .map(|character| character as u32 as u8)
@@ -2069,5 +2135,74 @@ fn latin1_to_bytes(text: &str) -> Vec<u8> {
 impl Drop for Entry {
     fn drop(&mut self) {
         self.keep_alive.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_runtime::{ResourceAccount, ResourceClass};
+
+    fn current(account: &ResourceAccount, class: ResourceClass) -> u64 {
+        account.snapshot().get(class).current()
+    }
+
+    #[test]
+    fn write_queue_holds_charge_and_recovers_on_delivery_or_disconnect() {
+        let io = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime");
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().expect("Unix stream pair");
+        stream
+            .set_nonblocking(true)
+            .expect("non-blocking Unix stream");
+        let stream = {
+            let _entered = io.enter();
+            tokio::net::UnixStream::from_std(stream).expect("Tokio Unix stream")
+        };
+
+        let runtime = ResourceAccount::default();
+        let table = Arc::new(NetTable {
+            entries: Mutex::new(HashMap::new()),
+            payloads: TransportPayloadBudget::for_test(runtime.clone(), 1, 3),
+        });
+        let (outgoing, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        table.lock().expect("net table").insert(
+            1,
+            Entry {
+                kind: EntryKind::Connection {
+                    outgoing: Some(outgoing),
+                    socket: NetSocket::Unix(Arc::new(stream)),
+                    abort: Arc::new(tokio::sync::Notify::new()),
+                    queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    read_gate: Arc::new(ReadGate::new(false)),
+                    shared: Arc::new(AtomicBool::new(false)),
+                    resetting: Arc::new(AtomicBool::new(false)),
+                },
+                keep_alive: None,
+                local: None,
+                remote: None,
+            },
+        );
+
+        assert!(matches!(write_bytes(&table, 1, b"abc", 9), Ok(true)));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 1);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 3);
+        assert!(write_bytes(&table, 1, b"x", 10).is_err());
+
+        let message = receiver.try_recv().expect("queued write");
+        assert!(matches!(
+            message,
+            WriteMsg::Data(ref payload, 9) if payload.as_slice() == b"abc"
+        ));
+        drop(message);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 0);
+
+        drop(receiver);
+        assert!(matches!(write_bytes(&table, 1, b"xy", 11), Ok(false)));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 0);
     }
 }

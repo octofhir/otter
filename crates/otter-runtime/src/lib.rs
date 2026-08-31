@@ -156,7 +156,7 @@ pub use otter_compiler::{
     CompiledModuleMetadata, LiveBindingSlot,
 };
 pub use otter_resource::{
-    ResourceAccount, ResourceClass, ResourceError, ResourceLease, ResourceLimits,
+    ResourceAccount, ResourceClass, ResourceError, ResourceLease, ResourceLeaseSet, ResourceLimits,
     ResourceLimitsBuilder, ResourceReservation, ResourceSnapshot, ResourceSnapshotEntry,
     SharedSource, SharedSourceBuilder, SharedSourceError,
 };

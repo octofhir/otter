@@ -177,6 +177,10 @@ class UDP {
       return;
     }
     if (typeof this.onmessage !== 'function') return;
+    if (datagram.error !== undefined) {
+      this.onmessage(uvCode(datagram.error), this, Buffer.alloc(0), {});
+      return;
+    }
     const buffer = Buffer.from(datagram.payload, 'latin1');
     this.onmessage(buffer.length, this, buffer, {
       address: datagram.address,
@@ -300,10 +304,10 @@ class UDP {
 }
 
 // The receive loop dispatches here, once per datagram, on the isolate thread.
-globalThis.__otterDgramDeliver = function deliver(handle, payload, address, port, family) {
+globalThis.__otterDgramDeliver = function deliver(handle, payload, address, port, family, error) {
   const udp = handles.get(handle);
   if (udp === undefined) return;
-  udp._deliver({ payload, address, port, family });
+  udp._deliver({ payload, address, port, family, error });
 };
 Object.defineProperty(globalThis, '__otterDgramDeliver', { enumerable: false });
 

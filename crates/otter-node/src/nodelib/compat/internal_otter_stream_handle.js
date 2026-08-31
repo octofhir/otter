@@ -253,8 +253,8 @@ class StreamHandle {
     let accepted = false;
     try {
       accepted = native.write(this._id, queued, token);
-    } catch {
-      return uvCode('EPIPE');
+    } catch (error) {
+      return uvCode(error?.code ?? 'EPIPE');
     }
     if (!accepted) return uvCode('EBADF');
     this.bytesWritten += buffer.length;

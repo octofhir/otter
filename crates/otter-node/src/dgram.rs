@@ -12,7 +12,8 @@
 //!   capability, checked against the address involved.
 //! - The receive loop runs on the host's IO runtime and never touches VM
 //!   state; it hands owned bytes to a task that re-enters JavaScript on the
-//!   isolate thread, in order and without dropping.
+//!   isolate thread, in order. Every retained datagram is admitted before
+//!   allocation against finite binding and runtime ledgers.
 //! - A socket holds the runtime open while it is bound, so a program waiting
 //!   for a datagram does not exit early.
 //!
@@ -30,6 +31,8 @@ use otter_runtime::{
     RuntimeTaskSpawner, RuntimeValue, runtime_type_error,
 };
 
+use crate::transport_payload::{QueuedPayload, TransportPayloadBudget};
+
 /// One live socket: the sending half, plus whatever keeps the loop alive.
 struct SocketEntry {
     socket: Arc<tokio::net::UdpSocket>,
@@ -42,7 +45,25 @@ struct SocketEntry {
     resumed: Arc<tokio::sync::Notify>,
 }
 
-type SocketTable = Arc<Mutex<HashMap<u32, SocketEntry>>>;
+struct DatagramTable {
+    entries: Mutex<HashMap<u32, SocketEntry>>,
+    payloads: TransportPayloadBudget,
+}
+
+impl DatagramTable {
+    fn new(runtime_resources: otter_runtime::ResourceAccount) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            payloads: TransportPayloadBudget::standard(runtime_resources),
+        }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<u32, SocketEntry>>> {
+        self.entries.lock()
+    }
+}
+
+type SocketTable = Arc<DatagramTable>;
 
 /// Build the CommonJS export of `node:dgram`.
 ///
@@ -86,7 +107,11 @@ fn build_native<'scope>(
     spawner: Option<RuntimeTaskSpawner>,
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
     let object = scope.object()?;
-    let sockets: SocketTable = Arc::new(Mutex::new(HashMap::new()));
+    let runtime_resources = spawner
+        .as_ref()
+        .map(RuntimeTaskSpawner::resource_account)
+        .unwrap_or_default();
+    let sockets: SocketTable = Arc::new(DatagramTable::new(runtime_resources));
     let next_id = Arc::new(AtomicU32::new(1));
 
     let bind_caps = capabilities.clone();
@@ -336,13 +361,7 @@ fn spawn_receive_loop(
             }
             match received {
                 Ok((length, from)) => {
-                    let datagram = Datagram {
-                        id,
-                        payload: buffer[..length].to_vec(),
-                        address: address_text(&from),
-                        port: from.port(),
-                        family: if from.is_ipv4() { "IPv4" } else { "IPv6" },
-                    };
+                    let datagram = received_datagram(&sockets, id, &buffer[..length], from);
                     // Ordered delivery retries on backpressure: a bounded
                     // inbox that dropped would silently lose datagrams the
                     // kernel had already handed over.
@@ -881,13 +900,45 @@ fn address_text(address: &std::net::SocketAddr) -> String {
 }
 
 /// One received datagram, handed to the isolate thread.
-#[derive(Clone)]
-struct Datagram {
+// Runtime tasks are boxed at enqueue. Boxing the payload again would add an
+// allocation without shrinking the task allocation that owns this enum.
+#[allow(clippy::large_enum_variant)]
+enum Datagram {
+    Message {
+        id: u32,
+        payload: QueuedPayload,
+        address: String,
+        port: u16,
+        family: &'static str,
+    },
+    ReadFailed {
+        id: u32,
+        code: &'static str,
+    },
+}
+
+fn received_datagram(
+    sockets: &SocketTable,
     id: u32,
-    payload: Vec<u8>,
-    address: String,
-    port: u16,
-    family: &'static str,
+    bytes: &[u8],
+    from: std::net::SocketAddr,
+) -> Datagram {
+    match sockets.payloads.copy_from(bytes) {
+        Ok(payload) => Datagram::Message {
+            id,
+            payload,
+            address: address_text(&from),
+            port: from.port(),
+            family: if from.is_ipv4() { "IPv4" } else { "IPv6" },
+        },
+        // The kernel has already consumed this datagram. Make the loss
+        // observable and continue the receive loop; libuv likewise reports
+        // an allocation ENOBUFS and keeps receiving.
+        Err(_) => Datagram::ReadFailed {
+            id,
+            code: "ENOBUFS",
+        },
+    }
 }
 
 impl RuntimeTask for Datagram {
@@ -913,13 +964,38 @@ fn deliver(
             if !scope.is_callable(dispatch) {
                 return Ok(RuntimeValue::undefined());
             }
-            let id = scope.number(f64::from(datagram.id));
-            let payload = scope.string(&bytes_to_latin1(&datagram.payload))?;
-            let address = scope.string(&datagram.address)?;
-            let port = scope.number(f64::from(datagram.port));
-            let family = scope.string(datagram.family)?;
+            let (id, payload, address, port, family, error) = match &datagram {
+                Datagram::Message {
+                    id,
+                    payload,
+                    address,
+                    port,
+                    family,
+                } => {
+                    let id = scope.number(f64::from(*id));
+                    let payload = scope.string(&bytes_to_latin1(payload.as_slice()))?;
+                    let address = scope.string(address)?;
+                    let port = scope.number(f64::from(*port));
+                    let family = scope.string(family)?;
+                    let error = scope.undefined();
+                    (id, payload, address, port, family, error)
+                }
+                Datagram::ReadFailed { id, code } => {
+                    let id = scope.number(f64::from(*id));
+                    let payload = scope.undefined();
+                    let address = scope.undefined();
+                    let port = scope.undefined();
+                    let family = scope.undefined();
+                    let error = scope.string(code)?;
+                    (id, payload, address, port, family, error)
+                }
+            };
             let undefined = scope.undefined();
-            let result = scope.call(dispatch, undefined, &[id, payload, address, port, family])?;
+            let result = scope.call(
+                dispatch,
+                undefined,
+                &[id, payload, address, port, family, error],
+            )?;
             Ok(scope.finish(result))
         })
     })
@@ -1054,5 +1130,51 @@ fn latin1_to_bytes(text: &str) -> Vec<u8> {
 impl Drop for SocketEntry {
     fn drop(&mut self) {
         self.keep_alive.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_runtime::{ResourceAccount, ResourceClass};
+
+    fn current(account: &ResourceAccount, class: ResourceClass) -> u64 {
+        account.snapshot().get(class).current()
+    }
+
+    #[test]
+    fn received_datagram_holds_charge_and_reports_pressure() {
+        let runtime = ResourceAccount::default();
+        let sockets = Arc::new(DatagramTable {
+            entries: Mutex::new(HashMap::new()),
+            payloads: TransportPayloadBudget::for_test(runtime.clone(), 1, 3),
+        });
+        let from = "127.0.0.1:1234".parse().expect("socket address");
+
+        let admitted = received_datagram(&sockets, 7, b"abc", from);
+        assert!(matches!(
+            admitted,
+            Datagram::Message {
+                id: 7,
+                ref payload,
+                ..
+            } if payload.as_slice() == b"abc"
+        ));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 1);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 3);
+
+        assert!(matches!(
+            received_datagram(&sockets, 7, b"x", from),
+            Datagram::ReadFailed {
+                id: 7,
+                code: "ENOBUFS"
+            }
+        ));
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 1);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 3);
+
+        drop(admitted);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessages), 0);
+        assert_eq!(current(&runtime, ResourceClass::QueuedMessageBytes), 0);
     }
 }

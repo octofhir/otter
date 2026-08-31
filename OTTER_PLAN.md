@@ -299,11 +299,39 @@ Web Streams can carry backpressure end to end:
 [Fetch bodies](https://fetch.spec.whatwg.org/#concept-body), and
 [Node HTTP](https://nodejs.org/api/http.html).
 
+The active `node:zlib` binding now follows the same boundary. Brotli and
+Zstandard advance their native state directly into the caller's output chunk;
+the handle no longer accumulates a whole compression or decompression step in
+an unbounded `Vec`. The remaining zlib dictionary and parameter-change carry
+buffers are admitted before allocation against both `ExternalBytes` and an
+always-finite module ledger: 16 MiB per dictionary, 64 KiB per carry buffer,
+and 64 MiB across one installed binding. Brotli and Zstandard additionally
+reject frames requiring decoder windows over 16 MiB. These are internal safety
+defaults; Node's existing `chunkSize`, dictionary, and stream API remain
+unchanged and no permission/configuration surface was added.
+
+Dynamic deflate parameter changes pre-admit their complete carry capacity
+before `deflateParams` can close a block. A `Z_BUF_ERROR` rolls that admission
+back and remains an error because zlib specifies that the parameters were not
+changed; successful output stays charged until the next caller buffer drains
+it ([zlib 1.3.1 manual](https://www.zlib.net/manual.html#Advanced)).
+
+This matches Node's documented model: compression is a `Transform`, with one
+internal output slab whose `chunkSize` defaults to 16 KiB, while
+`maxOutputLength` limits whole-result convenience methods rather than native
+stream retention. The Rust codec APIs also expose the required bounded step:
+Brotli accepts caller-owned input/output slices and reports
+`NeedsMoreInput`/`NeedsMoreOutput`, and `zstd-safe` streaming calls consume an
+`InBuffer` into an `OutBuffer`:
+[Node zlib](https://nodejs.org/api/zlib.html),
+[Brotli stream API](https://docs.rs/brotli/latest/brotli/fn.BrotliDecompressStream.html),
+and [zstd-safe `DStream`](https://docs.rs/zstd-safe/latest/zstd_safe/type.DStream.html).
+
 Still open: audit the remaining active host state that retains bytes across a
-call or task boundary, chiefly `node:zlib` dictionary/carry buffers, queued
-native net/datagram payloads, and child-process or snapshot/artifact captures.
-Synchronous scratch vectors and already hard-bounded diagnostic artifacts must
-be distinguished from retained stores before changing them.
+call or task boundary, chiefly queued native net/datagram payloads and
+child-process or snapshot/artifact captures. Synchronous scratch vectors,
+bounded codec state, and already hard-bounded diagnostic artifacts must be
+distinguished from retained stores before changing them.
 
 Also landed: heap external charges are folded into the runtime ledger.
 `GcHeap` mirrors its outstanding external/off-slot reservation bytes into an

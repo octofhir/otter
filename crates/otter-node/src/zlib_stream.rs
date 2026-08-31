@@ -7,11 +7,17 @@
 //!   wraps in the shape Node's own binding has.
 //! - A table of live streams owned by the natives, keyed by the id the
 //!   handle holds.
+//! - `codec` advances Brotli and Zstandard directly into caller output.
+//! - `retained` admits dictionaries and parameter-change carry buffers.
 //!
 //! # Invariants
 //! - One `z_stream` per handle, driven exactly the way zlib is driven: the
 //!   caller owns both buffers, and every call reports what is left of each,
 //!   which is the contract `_processChunk` loops on.
+//! - Brotli and Zstandard never accumulate whole-step output in native
+//!   handles; the JavaScript `Transform` output buffer owns backpressure.
+//! - Dictionary/carry bytes are charged to both the isolate and an always
+//!   finite module ledger before native allocation.
 //! - The stream's own state — window bits, memory level, strategy, level —
 //!   is set once at `init` and changed only through `params`, so a live
 //!   parameter change keeps the stream unbroken.
@@ -28,6 +34,14 @@ use otter_runtime::{
     RuntimeTaskSpawner, RuntimeValue, runtime_type_error,
 };
 
+use self::codec::Codec;
+use self::retained::{
+    MAX_CARRY_BYTES, MAX_DICTIONARY_BYTES, RetainedBytes, RetainedBytesError, ZlibRetainedBudget,
+};
+
+mod codec;
+mod retained;
+
 /// `node_zlib_mode` — the stream a handle drives.
 const DEFLATE: u32 = 1;
 const GZIP: u32 = 3;
@@ -39,17 +53,6 @@ const BROTLI_DECODE: u32 = 8;
 const BROTLI_ENCODE: u32 = 9;
 const ZSTD_COMPRESS: u32 = 10;
 const ZSTD_DECOMPRESS: u32 = 11;
-
-/// Brotli's operations, as the JS side passes them through in place of a
-/// zlib flush value.
-const BROTLI_OPERATION_PROCESS: i32 = 0;
-const BROTLI_OPERATION_FLUSH: i32 = 1;
-const BROTLI_OPERATION_FINISH: i32 = 2;
-
-/// Zstd's end directives, likewise.
-const ZSTD_E_CONTINUE: i32 = 0;
-const ZSTD_E_FLUSH: i32 = 1;
-const ZSTD_E_END: i32 = 2;
 
 /// A `z_stream` and the buffers it points at, owned by one handle.
 ///
@@ -63,30 +66,16 @@ struct OwnedStream(Box<z::z_stream>);
 // serialized by the table's mutex.
 unsafe impl Send for OwnedStream {}
 
-/// The codecs `node:zlib` streams besides deflate. Each writes into a
-/// buffer the handle drains into the caller's output, which is what makes
-/// them behave like the zlib stream next to them.
-enum Codec {
-    BrotliEncode(Box<brotli::CompressorWriter<Vec<u8>>>),
-    BrotliDecode(Box<brotli::DecompressorWriter<Vec<u8>>>),
-    ZstdCompress(Box<zstd_safe::CCtx<'static>>),
-    ZstdDecompress(Box<zstd_safe::DCtx<'static>>),
-}
-
-// SAFETY: as with the zlib stream, a codec is reachable only through the
-// handle table's mutex and is driven from the isolate thread.
-unsafe impl Send for Codec {}
-
 /// A live stream and everything needed to restart it.
 struct Handle {
     mode: u32,
     stream: OwnedStream,
     initialized: bool,
-    dictionary: Vec<u8>,
+    dictionary: RetainedBytes,
     window_bits: i32,
     /// Bytes the stream produced outside a `process` call — a parameter
     /// change closes the open block — waiting for the caller's next buffer.
-    carry: Vec<u8>,
+    carry: RetainedBytes,
     /// Non-deflate codec, when the mode names one.
     codec: Option<Codec>,
     /// Set once the stream reported `Z_STREAM_END`, so a further call
@@ -170,16 +159,21 @@ type Table = Arc<Mutex<HashMap<u32, Handle>>>;
 pub fn zlib_stream_binding_cjs_value<'scope>(
     scope: &mut RuntimeNativeScope<'scope, '_>,
     _capabilities: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
     _module: RuntimeLocal<'scope>,
     _require: RuntimeLocal<'scope>,
 ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
     let object = scope.object()?;
     let table: Table = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
+    let runtime_resources = runtime_task_spawner
+        .map(|spawner| spawner.resource_account())
+        .unwrap_or_default();
+    let retained_budget = ZlibRetainedBudget::standard(runtime_resources);
 
     let create_table = table.clone();
     let create_ids = next_id.clone();
+    let create_budget = retained_budget.clone();
     let create = scope.native_closure(
         "create",
         1,
@@ -187,6 +181,10 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
             let mode = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             let id = create_ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dictionary = RetainedBytes::new(&create_budget, MAX_DICTIONARY_BYTES)
+                .map_err(|error| retained_native_error("zlib.create", error))?;
+            let carry = RetainedBytes::new(&create_budget, MAX_CARRY_BYTES)
+                .map_err(|error| retained_native_error("zlib.create", error))?;
             create_table
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -196,9 +194,9 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
                         mode,
                         stream: OwnedStream(Box::new(unsafe { std::mem::zeroed() })),
                         initialized: false,
-                        dictionary: Vec::new(),
+                        dictionary,
                         window_bits: 15,
-                        carry: Vec::new(),
+                        carry,
                         codec: None,
                         finished: false,
                     },
@@ -291,33 +289,35 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
             if !handle.initialized || !is_deflate(handle.mode) {
                 return Ok(RuntimeValue::undefined());
             }
-            // zlib closes the open block before the new parameters take
-            // effect, so it needs room to write it; the caller has no
-            // buffer here and the bytes belong to the stream, so they go
-            // into the stream's own scratch and out with the next call.
-            let mut scratch = vec![0u8; 64 * 1024];
-            let stream = &raw mut *handle.stream.0;
-            // SAFETY: `scratch` outlives the call, and the stream is live.
+            // `deflateParams` may close the open block before changing the
+            // settings. Pre-admit every byte it can produce; Z_BUF_ERROR means
+            // the settings did not change, so no effect needs to be replayed.
+            let Handle { stream, carry, .. } = handle;
+            let available = carry.remaining_capacity();
+            let mut append = carry
+                .prepare_append(available)
+                .map_err(|error| retained_native_error("zlib.params", error))?;
+            let output = append.output_mut();
+            let stream = &raw mut *stream.0;
+            // SAFETY: the prepared output outlives the call, and the stream is live.
             let status = unsafe {
-                (*stream).next_out = scratch.as_mut_ptr();
-                (*stream).avail_out = scratch.len() as u32;
+                (*stream).next_out = output.as_mut_ptr();
+                (*stream).avail_out = output.len() as u32;
                 (*stream).next_in = std::ptr::null_mut();
                 (*stream).avail_in = 0;
                 let status = z::deflateParams(stream, level, strategy);
-                let produced = scratch.len() - (*stream).avail_out as usize;
-                scratch.truncate(produced);
                 (*stream).next_out = std::ptr::null_mut();
+                let produced = output.len() - (*stream).avail_out as usize;
                 (*stream).avail_out = 0;
-                status
+                (status, produced)
             };
-            if status != z::Z_OK && status != z::Z_BUF_ERROR {
+            if status.0 != z::Z_OK {
                 return Err(runtime_type_error(
                     "zlib.params",
-                    format!("deflateParams failed with {status}"),
+                    format!("deflateParams failed with {}", status.0),
                 ));
             }
-            handle.dictionary.shrink_to_fit();
-            handle.carry_extend(scratch);
+            append.commit(status.1);
             Ok(RuntimeValue::undefined())
         },
     )?;
@@ -365,41 +365,48 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
     Ok(object)
 }
 
-impl Handle {
-    /// Park bytes the stream produced outside a `process` call.
-    fn carry_extend(&mut self, bytes: Vec<u8>) {
-        self.carry.extend(bytes);
-    }
-}
-
 /// Bytes of an input argument, whatever kind of buffer source it is.
 ///
 /// `zlib` takes a string, a Buffer, any typed array, a `DataView` or a
 /// bare `ArrayBuffer`, so the binding reads all of them.
 fn buffer_source_bytes(ctx: &mut RuntimeNativeCtx<'_>, value: RuntimeValue) -> Option<Vec<u8>> {
+    with_buffer_source_bytes(ctx, value, <[u8]>::to_vec)
+}
+
+/// Borrow a buffer source for one synchronous operation without retaining a
+/// raw VM pointer across allocation or native-table boundaries.
+fn with_buffer_source_bytes<R>(
+    ctx: &RuntimeNativeCtx<'_>,
+    value: RuntimeValue,
+    read: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
     if let Some(view) = value.as_typed_array(ctx.heap()) {
         let heap = ctx.heap();
         let offset = view.byte_offset(heap);
         let length = view.byte_length(heap);
-        return Some(
-            view.buffer(heap)
-                .with_bytes(heap, |bytes| bytes[offset..offset + length].to_vec()),
-        );
+        return view.buffer(heap).with_bytes(heap, |bytes| {
+            let end = offset.checked_add(length)?;
+            bytes.get(offset..end).map(read)
+        });
     }
     if let Some(view) = value.as_data_view() {
         let heap = ctx.heap();
         let offset = view.byte_offset(heap);
         let length = view.byte_length(heap);
-        return Some(
-            view.buffer(heap)
-                .with_bytes(heap, |bytes| bytes[offset..offset + length].to_vec()),
-        );
+        return view.buffer(heap).with_bytes(heap, |bytes| {
+            let end = offset.checked_add(length)?;
+            bytes.get(offset..end).map(read)
+        });
     }
     if let Some(buffer) = value.as_array_buffer() {
         let heap = ctx.heap();
-        return Some(buffer.with_bytes(heap, <[u8]>::to_vec));
+        return Some(buffer.with_bytes(heap, read));
     }
     None
+}
+
+fn retained_native_error(operation: &'static str, error: RetainedBytesError) -> RuntimeNativeError {
+    runtime_type_error(operation, error.to_string())
 }
 
 /// Install the handle's dictionary where zlib takes one up front.
@@ -416,8 +423,8 @@ fn install_dictionary(handle: &mut Handle) {
         return;
     }
     let stream = &raw mut *handle.stream.0;
-    let pointer = handle.dictionary.as_ptr();
-    let length = handle.dictionary.len() as u32;
+    let pointer = handle.dictionary.as_slice().as_ptr();
+    let length = handle.dictionary.as_slice().len() as u32;
     // SAFETY: the stream is live and the dictionary outlives the call.
     unsafe {
         if deflating {
@@ -439,11 +446,6 @@ fn init_stream(
     let level = args.get(2).and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
     let mem_level = args.get(3).and_then(|v| v.as_f64()).unwrap_or(8.0) as i32;
     let strategy = args.get(4).and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
-    let dictionary = args
-        .get(5)
-        .copied()
-        .and_then(|value| buffer_source_bytes(ctx, value))
-        .unwrap_or_default();
 
     let mut table = table
         .lock()
@@ -458,9 +460,7 @@ fn init_stream(
         // Brotli takes its quality and window from the parameter array the
         // JS side passes as `level`/`windowBits`; zstd takes its level.
         handle.codec = Some(match handle.mode {
-            BROTLI_ENCODE => Codec::BrotliEncode(Box::new(brotli::CompressorWriter::new(
-                Vec::new(),
-                4096,
+            BROTLI_ENCODE => Codec::brotli_encode(
                 if level < 0 {
                     11
                 } else {
@@ -471,26 +471,31 @@ fn init_stream(
                 } else {
                     (window_bits as u32).clamp(10, 24)
                 },
-            ))),
-            BROTLI_DECODE => {
-                Codec::BrotliDecode(Box::new(brotli::DecompressorWriter::new(Vec::new(), 4096)))
-            }
-            ZSTD_COMPRESS => {
-                let mut context = zstd_safe::CCtx::create();
-                if level > 0 {
-                    let _ = context.set_parameter(zstd_safe::CParameter::CompressionLevel(level));
-                }
-                Codec::ZstdCompress(Box::new(context))
-            }
-            _ => Codec::ZstdDecompress(Box::new(zstd_safe::DCtx::create())),
+            ),
+            BROTLI_DECODE => Codec::brotli_decode(),
+            ZSTD_COMPRESS => Codec::zstd_compress(level)
+                .map_err(|message| runtime_type_error("zlib.init", message))?,
+            _ => Codec::zstd_decompress()
+                .map_err(|message| runtime_type_error("zlib.init", message))?,
         });
         handle.initialized = true;
         handle.finished = false;
         return Ok(RuntimeValue::undefined());
     }
+    let dictionary_result = args.get(5).copied().and_then(|value| {
+        with_buffer_source_bytes(ctx, value, |bytes| {
+            handle.dictionary.replace_from_slice(bytes)
+        })
+    });
+    match dictionary_result {
+        Some(result) => result.map_err(|error| retained_native_error("zlib.init", error))?,
+        None => handle
+            .dictionary
+            .replace_from_slice(&[])
+            .map_err(|error| retained_native_error("zlib.init", error))?,
+    }
     let bits = window_bits_for(handle.mode, window_bits);
     handle.window_bits = bits;
-    handle.dictionary = dictionary;
     let stream = &raw mut *handle.stream.0;
     let version = c"1.3.1".as_ptr();
     let stream_size = std::mem::size_of::<z::z_stream>() as i32;
@@ -541,15 +546,18 @@ fn process_chunk(
     let input = args
         .get(2)
         .copied()
-        .and_then(|value| buffer_source_bytes(ctx, value))
-        .map(|bytes| {
-            let start = in_off.min(bytes.len());
-            let end = (start + in_len).min(bytes.len());
-            bytes[start..end].to_vec()
+        .and_then(|value| {
+            with_buffer_source_bytes(ctx, value, |bytes| {
+                let start = in_off.min(bytes.len());
+                let end = start.saturating_add(in_len).min(bytes.len());
+                bytes[start..end].to_vec()
+            })
         })
         .unwrap_or_default();
 
-    let mut output = vec![0u8; out_len];
+    let output_view = args
+        .get(5)
+        .and_then(|value| value.as_typed_array(ctx.heap()));
     let outcome = {
         let mut table = table
             .lock()
@@ -560,27 +568,30 @@ fn process_chunk(
                 "unknown handle".to_string(),
             ));
         };
-        run_stream(handle, flush, &input, &mut output)
+        if let Some(view) = output_view {
+            let heap = ctx.heap_mut();
+            let base = view.byte_offset(heap);
+            view.buffer(heap).with_bytes_mut(heap, |bytes| {
+                let start = base
+                    .checked_add(out_off)
+                    .ok_or_else(|| "zlib output offset overflow".to_string())?;
+                let end = start
+                    .checked_add(out_len)
+                    .ok_or_else(|| "zlib output length overflow".to_string())?;
+                let output = bytes
+                    .get_mut(start..end)
+                    .ok_or_else(|| "zlib output buffer is out of bounds".to_string())?;
+                run_stream(handle, flush, &input, output)
+            })
+        } else {
+            Err("zlib output must be a typed array".to_string())
+        }
     };
 
     let (consumed, produced, error) = match outcome {
         Ok(pair) => (pair.0, pair.1, None),
         Err(message) => (0, 0, Some(message)),
     };
-
-    if produced > 0
-        && let Some(view) = args.get(5).and_then(|v| v.as_typed_array(ctx.heap()))
-    {
-        let heap = ctx.heap_mut();
-        let base = view.byte_offset(heap);
-        view.buffer(heap).with_bytes_mut(heap, |bytes| {
-            let start = base + out_off;
-            let end = (start + produced).min(bytes.len());
-            if start < end {
-                bytes[start..end].copy_from_slice(&output[..end - start]);
-            }
-        });
-    }
 
     ctx.scope(|mut scope| {
         let result = scope.object()?;
@@ -609,9 +620,7 @@ fn run_stream(
     // Bytes the stream produced between calls go out first, in order.
     let mut carried = 0;
     if !handle.carry.is_empty() {
-        carried = handle.carry.len().min(output.len());
-        output[..carried].copy_from_slice(&handle.carry[..carried]);
-        handle.carry.drain(..carried);
+        carried = handle.carry.drain_into(output);
         if carried == output.len() {
             return Ok((0, carried));
         }
@@ -622,8 +631,13 @@ fn run_stream(
     }
 
     if is_codec(handle.mode) {
-        let produced = run_codec(handle, flush, input, output)?;
-        return Ok((input.len(), produced + carried));
+        let codec = handle
+            .codec
+            .as_mut()
+            .ok_or_else(|| "codec handle is not initialized".to_string())?;
+        let step = codec.process(flush, input, output)?;
+        handle.finished = step.finished;
+        return Ok((step.consumed, step.produced + carried));
     }
     let deflating = is_deflate(handle.mode);
     let stream = &raw mut *handle.stream.0;
@@ -662,8 +676,8 @@ fn run_stream(
             let status = unsafe {
                 z::inflateSetDictionary(
                     stream,
-                    handle.dictionary.as_ptr(),
-                    handle.dictionary.len() as u32,
+                    handle.dictionary.as_slice().as_ptr(),
+                    handle.dictionary.as_slice().len() as u32,
                 )
             };
             if status != z::Z_OK {
@@ -709,94 +723,4 @@ fn stream_message(handle: &Handle) -> Option<String> {
     // SAFETY: zlib leaves a NUL-terminated static string in `msg`.
     let text = unsafe { std::ffi::CStr::from_ptr(message) };
     Some(text.to_string_lossy().into_owned())
-}
-
-/// One codec step. The codec writes into its own buffer, and as much of
-/// that as fits goes into the caller's output; the rest is carried, the
-/// same way a zlib parameter change is.
-fn run_codec(
-    handle: &mut Handle,
-    flush: i32,
-    input: &[u8],
-    output: &mut [u8],
-) -> Result<usize, String> {
-    use std::io::Write;
-
-    let mut drained = Vec::new();
-    match handle.codec.as_mut() {
-        Some(Codec::BrotliEncode(writer)) => {
-            writer.write_all(input).map_err(|error| error.to_string())?;
-            match flush {
-                BROTLI_OPERATION_FLUSH | BROTLI_OPERATION_FINISH => {
-                    writer.flush().map_err(|error| error.to_string())?;
-                }
-                BROTLI_OPERATION_PROCESS => {}
-                _ => {}
-            }
-            drained.append(writer.get_mut());
-            if flush == BROTLI_OPERATION_FINISH {
-                handle.finished = true;
-            }
-        }
-        Some(Codec::BrotliDecode(writer)) => {
-            writer
-                .write_all(input)
-                .map_err(|_| "Brotli decompression failed".to_string())?;
-            writer
-                .flush()
-                .map_err(|_| "Brotli decompression failed".to_string())?;
-            drained.append(writer.get_mut());
-        }
-        Some(Codec::ZstdCompress(context)) => {
-            let mut buffer = Vec::with_capacity(input.len() + 128);
-            let mut in_buffer = zstd_safe::InBuffer::around(input);
-            loop {
-                let mut out_buffer = zstd_safe::OutBuffer::around(&mut buffer);
-                let directive = match flush {
-                    ZSTD_E_FLUSH => zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_flush,
-                    ZSTD_E_END => zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end,
-                    _ => zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_continue,
-                };
-                let remaining = context
-                    .compress_stream2(&mut out_buffer, &mut in_buffer, directive)
-                    .map_err(|code| format!("zstd error {code}"))?;
-                let produced = out_buffer.as_slice().len();
-                drained.extend_from_slice(&buffer[..produced]);
-                buffer.clear();
-                if remaining == 0 && in_buffer.pos() == input.len() {
-                    break;
-                }
-                if produced == 0 && in_buffer.pos() == input.len() && flush == ZSTD_E_CONTINUE {
-                    break;
-                }
-            }
-            if flush == ZSTD_E_END {
-                handle.finished = true;
-            }
-        }
-        Some(Codec::ZstdDecompress(context)) => {
-            let mut in_buffer = zstd_safe::InBuffer::around(input);
-            let mut buffer = Vec::with_capacity(input.len() * 4 + 128);
-            loop {
-                let mut out_buffer = zstd_safe::OutBuffer::around(&mut buffer);
-                let hint = context
-                    .decompress_stream(&mut out_buffer, &mut in_buffer)
-                    .map_err(|code| format!("zstd error {code}"))?;
-                let produced = out_buffer.as_slice().len();
-                drained.extend_from_slice(&buffer[..produced]);
-                buffer.clear();
-                if in_buffer.pos() == input.len() && (produced == 0 || hint == 0) {
-                    break;
-                }
-            }
-        }
-        None => return Err("codec handle is not initialized".to_string()),
-    }
-
-    let direct = drained.len().min(output.len());
-    output[..direct].copy_from_slice(&drained[..direct]);
-    if direct < drained.len() {
-        handle.carry.extend_from_slice(&drained[direct..]);
-    }
-    Ok(direct)
 }

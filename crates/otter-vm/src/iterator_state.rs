@@ -418,6 +418,45 @@ pub enum ZipMode {
 }
 
 impl IteratorState {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        match self {
+            Self::ArrayLike { object, .. } => crate::code_liveness::visit_value(object, visitor),
+            Self::RegExpString { matcher, .. } => {
+                crate::code_liveness::visit_value(matcher, visitor);
+            }
+            Self::User {
+                iterator,
+                next_method,
+            } => {
+                crate::code_liveness::visit_value(iterator, visitor);
+                if let Some(value) = next_method {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+            }
+            Self::Map { mapper, .. } | Self::FlatMap { mapper, .. } => {
+                crate::code_liveness::visit_value(mapper, visitor);
+            }
+            Self::Filter { predicate, .. } => {
+                crate::code_liveness::visit_value(predicate, visitor);
+            }
+            Self::Array { .. }
+            | Self::ArrayKey { .. }
+            | Self::ArrayEntry { .. }
+            | Self::TypedArray { .. }
+            | Self::String { .. }
+            | Self::MapCollection { .. }
+            | Self::SetCollection { .. }
+            | Self::Exhausted { .. }
+            | Self::Take { .. }
+            | Self::Drop { .. }
+            | Self::Generator { .. }
+            | Self::Chunks { .. }
+            | Self::Windows { .. }
+            | Self::Concat { .. }
+            | Self::Zip { .. } => {}
+        }
+    }
+
     /// Per-kind iterator-prototype origin for the built-in iterator
     /// variants. Returns `None` for variants whose prototype is
     /// `%IteratorPrototype%` directly (user iterators, helpers,

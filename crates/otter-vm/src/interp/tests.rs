@@ -949,7 +949,7 @@ fn bytecode_instanceof_function_prototype_uses_stack_roots() {
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[1] = Value::object(lhs);
-    frame.registers[2] = Value::function(1);
+    frame.registers[2] = Value::function(0);
     stack.push(frame);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let result = interp
@@ -958,7 +958,7 @@ fn bytecode_instanceof_function_prototype_uses_stack_roots() {
             &context,
             crate::ObjectProtocolValueOp::Instanceof,
             Value::object(lhs),
-            Value::function(1),
+            Value::function(0),
         )
         .expect("instanceof");
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -968,7 +968,7 @@ fn bytecode_instanceof_function_prototype_uses_stack_roots() {
     );
     assert_eq!(result, Value::boolean(false));
     let desc = interp
-        .ordinary_function_own_property_descriptor(Some(&context), None, 1, "prototype")
+        .ordinary_function_own_property_descriptor(Some(&context), None, 0, "prototype")
         .unwrap()
         .expect("prototype descriptor");
     assert!(descriptor_value(&desc).is_object());
@@ -1030,9 +1030,12 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
         fid, 2,
         "eval chunk ids rebase past the outer chunk's single function"
     );
-    let function = context
-        .function(fid)
+    let owner = context
+        .for_function(fid)
         .expect("foreign id resolves through the shared code space");
+    let function = owner
+        .function(fid)
+        .expect("function exists in its owning chunk");
     assert_eq!(function.name, "anonymous");
 }
 

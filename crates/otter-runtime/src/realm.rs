@@ -670,6 +670,7 @@ fn execute_linked_module_in_active_realm(
         }
     });
     let context = interp.link_module(module)?;
+    records.retain_linked_context(realm_id, &context);
     records.mark_evaluating(realm_id);
     let script = interp.run(&context);
     let checkpoint = interp.drain_microtasks(&context);

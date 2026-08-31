@@ -341,12 +341,15 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
     // arrows, generators, async functions and async generators are
     // not constructors.
     let ordinary_fn_is_ctor = |fid: u32| -> bool {
-        if context.function_is_arrow(fid) {
+        let Ok(owner) = context.for_function(fid) else {
+            return false;
+        };
+        if owner.function_is_arrow(fid) {
             return false;
         }
-        context
+        owner
             .function(fid)
-            .is_none_or(|f| !f.is_generator && !f.is_async)
+            .is_some_and(|f| !f.is_generator && !f.is_async)
     };
     if let Some(fid) = value.as_function() {
         return ordinary_fn_is_ctor(fid);

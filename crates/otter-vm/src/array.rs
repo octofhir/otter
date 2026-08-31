@@ -466,6 +466,47 @@ fn trace_array_symbol_accessors(
 }
 
 impl ArrayExoticSlots {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(entries) = &self.sparse_elements {
+            for value in entries.values() {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+        if let Some(entries) = &self.named_properties {
+            for value in entries.values() {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+        if let Some(entries) = &self.accessors {
+            for (getter, setter) in entries.values() {
+                if let Some(value) = getter {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+                if let Some(value) = setter {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+            }
+        }
+        if let Some(entries) = &self.symbol_properties {
+            for (_, value) in entries {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+        if let Some(entries) = &self.symbol_accessors {
+            for (_, (getter, setter)) in entries {
+                if let Some(value) = getter {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+                if let Some(value) = setter {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+            }
+        }
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+
     /// Capture the sidecar's rebuildable per-key descriptor flags as
     /// `(key, writable, enumerable, configurable)`. Every other container must
     /// be empty for an opaque snapshot

@@ -92,6 +92,12 @@ impl OwnedRegisterSnapshot {
             value.trace_value_slots(visitor);
         }
     }
+
+    fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for value in &self.0 {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
 }
 
 /// Materialized interpreter-owned frame.
@@ -711,6 +717,13 @@ impl ParkedFrameState {
                     .cast::<RawGc>(),
             );
         }
+    }
+
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        visitor(self.header.function_id);
+        self.registers.visit_function_ids(visitor);
+        crate::code_liveness::visit_value(&self.self_value, visitor);
+        crate::code_liveness::visit_value(&self.this_value, visitor);
     }
 
     #[cfg(test)]

@@ -93,6 +93,11 @@ pub(crate) struct TierPolicy {
 }
 
 impl TierPolicy {
+    pub(crate) fn evict_function_range(&mut self, start: u32, end: u32) {
+        self.functions
+            .retain(|function_id, _| !(*function_id >= start && *function_id < end));
+    }
+
     /// Classify one function from its shared entry hotness and its
     /// current feedback epoch. A cold function creates no state; a hot one
     /// accumulates only feedback-stability history. This is the sole mutator of

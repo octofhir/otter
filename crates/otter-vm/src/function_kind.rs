@@ -305,7 +305,8 @@ impl FunctionKindPrototypes {
         context: &ExecutionContext,
         function_id: u32,
     ) -> Option<JsObject> {
-        match context.function(function_id) {
+        let owner = context.for_function(function_id).ok()?;
+        match owner.function(function_id) {
             Some(function) if function.is_async_generator => self.async_generator_prototype,
             Some(function) if function.is_async => self.async_prototype,
             Some(function) if function.is_generator => self.generator_prototype,

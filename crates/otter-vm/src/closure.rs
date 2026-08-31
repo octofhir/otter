@@ -297,6 +297,15 @@ const _: [(); 24] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
 const _: [(); 32] = [(); CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET];
 
 impl JsClosureBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        visitor(self.call_header.function_id);
+        crate::code_liveness::visit_value(&self.bound_this, visitor);
+        crate::code_liveness::visit_value(&self.bound_new_target, visitor);
+        if let Some(value) = &self.proto_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+
     fn new(
         function_id: u32,
         spine: UpvalueSpineHandle,

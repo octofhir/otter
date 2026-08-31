@@ -611,8 +611,10 @@ pub(crate) fn snapshot_frames(
         .rev()
         .enumerate()
         .map(|(depth, f)| {
-            let function = context.function(f.function_id);
-            let exec_function = context.exec_function(f.function_id);
+            let owner = context.for_function(f.function_id).ok();
+            let owner = owner.as_deref();
+            let function = owner.and_then(|owner| owner.function(f.function_id));
+            let exec_function = owner.and_then(|owner| owner.exec_function(f.function_id));
             let function_name = function
                 .map(|fun| fun.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string());
@@ -647,7 +649,12 @@ pub(crate) fn snapshot_frames(
             let module_url = function
                 .filter(|fun| !fun.module_url.is_empty())
                 .map(|fun| fun.module_url.clone())
-                .unwrap_or_else(|| context.module_name().to_string());
+                .unwrap_or_else(|| {
+                    owner
+                        .map(ExecutionContext::module_name)
+                        .unwrap_or_else(|| context.module_name())
+                        .to_string()
+                });
             StackFrameSnapshot {
                 function_id: f.function_id,
                 function_name,
@@ -860,9 +867,15 @@ impl crate::Interpreter {
         let function_id = ctor
             .as_function()
             .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))?;
-        let chunk = self.code_space.chunk_for(function_id)?;
-        let local = function_id.checked_sub(chunk.function_base)? as usize;
-        let name = chunk.module.functions.get(local)?.name.clone();
+        let crate::code_space::ChunkResolution::Live {
+            function_base,
+            payload,
+        } = self.code_space.resolve_chunk(function_id)
+        else {
+            return None;
+        };
+        let local = function_id.checked_sub(function_base)? as usize;
+        let name = payload.module.functions.get(local)?.name.clone();
         (!name.is_empty()).then_some(name)
     }
 }

@@ -347,6 +347,33 @@ pub struct PurePromiseBody {
     prototype_override: Option<Value>,
 }
 
+impl PurePromiseBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        match &self.state {
+            PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+            PromiseState::Pending => {}
+        }
+        for reaction in self.fulfill_reactions.iter().chain(&self.reject_reactions) {
+            for value in [
+                &reaction.capability.promise,
+                &reaction.capability.resolve,
+                &reaction.capability.reject,
+                &reaction.async_context,
+            ] {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+            if let PromiseReactionHandler::Call(Some(value)) = &reaction.handler {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 impl PurePromise {
     /// Construct a fresh pending promise.
     pub fn pending(heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {

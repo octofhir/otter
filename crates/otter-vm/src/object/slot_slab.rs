@@ -87,6 +87,14 @@ impl SlotSlabBody {
                 .cast()
         }
     }
+
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for index in 0..self.capacity() {
+            // SAFETY: every capacity word is initialized when the slab is
+            // published and remains initialized for its lifetime.
+            crate::code_liveness::visit_value(unsafe { &*self.words_ptr().add(index) }, visitor);
+        }
+    }
 }
 
 impl otter_gc::SafeTraceable for SlotSlabBody {

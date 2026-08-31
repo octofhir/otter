@@ -128,6 +128,8 @@ impl Interpreter {
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space: std::sync::Arc::clone(&snapshot.code_space),
+            code_eviction_high_water_bytes: Self::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES,
+            code_eviction_stats: crate::CodeEvictionStats::default(),
             names,
             property_cache: crate::property_cache::PropertyLookupCache::default(),
             realm_context: None,

@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 pub use otter_vm::HostAtomInterner;
 pub use otter_vm::object::{
+    HostCodeLivenessTracer as RuntimeHostCodeLivenessTracer,
     HostDataTracer as RuntimeHostDataTracer, HostObjectData as RuntimeHostObjectData,
     HostValueSlot as RuntimeHostValueSlot, TracedHostObjectData as RuntimeTracedHostObjectData,
 };

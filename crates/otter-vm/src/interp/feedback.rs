@@ -6,6 +6,7 @@
 //! - Intent-level IC accounting, installation, snapshots, and tracing views.
 //! - Narrow lookup helpers for lock-free CodeBlock feedback slots.
 //! - Single-writer bounded method-target distributions.
+//! - Range purge for tombstoned code chunks.
 //!
 //! # Invariants
 //! - All mutable executable IC state is owned by the isolate and reached
@@ -13,7 +14,8 @@
 //! - CodeBlock property/call summaries contain atomics and stable numeric ids
 //!   only. GC-bearing executable recipes never cross that boundary.
 //! - A site id maps to exactly one canonical instruction for the lifetime of
-//!   the isolate.
+//!   a live chunk. Tombstoned ranges remain reserved and hold no slot address
+//!   or executable IC state.
 //! - Generated-call plans remain separate from observational feedback.
 //!
 //! # See also
@@ -53,6 +55,20 @@ pub(crate) struct FeedbackDirectory {
 }
 
 impl FeedbackDirectory {
+    pub(crate) fn evict_site_range(&mut self, start: u32, end: u32) {
+        let start = start as usize;
+        let end = (end as usize).min(self.slots.len());
+        for site in start..end {
+            self.slots[site] = None;
+            self.method_targets[site] = None;
+            self.load_ics[site] = PropertyIcEntry::Empty;
+            self.store_ics[site] = PropertyIcEntry::Empty;
+            self.method_ics[site] = None;
+        }
+        self.installed_chunks
+            .retain(|chunk| chunk.strong_count() != 0);
+    }
+
     fn install_context(&mut self, context: &ExecutionContext) {
         let executable = context.executable_module();
         if self

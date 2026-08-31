@@ -351,7 +351,7 @@ impl Interpreter {
             .collect();
         let module = self.compile_escaped_source(&source, options)?;
         let context = self
-            .link_module(module)
+            .link_evictable_module(module)
             .map_err(|_| VmError::InvalidOperand)?;
         let main = context.exec_main();
         // A strict direct eval owns a private current record whose parent is
@@ -568,7 +568,7 @@ impl Interpreter {
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.
         let context = self
-            .link_module(module)
+            .link_evictable_module(module)
             .map_err(|_| VmError::InvalidOperand)?;
         let main = context.exec_main();
         let upvalues =
@@ -718,7 +718,7 @@ impl Interpreter {
         self.register_module_source_owned(module_url.to_string(), source)
             .map_err(|_| VmError::InvalidOperand)?;
         let context = self
-            .link_module(module)
+            .link_evictable_module(module)
             .map_err(|_| VmError::InvalidOperand)?;
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
@@ -784,7 +784,7 @@ impl Interpreter {
             },
         )?;
         let context = self
-            .link_module(module)
+            .link_evictable_module(module)
             .map_err(|_| VmError::InvalidOperand)?;
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the

@@ -16,22 +16,22 @@
 //! turn. Otter keeps ids dense and chunk-relative instead of holding a
 //! per-value code pointer, which leaves [`crate::Frame`],
 //! [`crate::closure::JsClosure`], and [`crate::Value`] layouts
-//! untouched; every [`crate::ExecutionContext`] carries the registry
-//! handle and resolves foreign ids through it.
+//! untouched. A foreign id is first resolved to its owning
+//! [`crate::ExecutionContext`]; table access is always chunk-local.
 //!
 //! # Contents
 //!
 //! - [`CodeSpace`] — append-only chunk chain with monotonic function-id and
 //!   IC-site bases.
-//! - [`ChunkTables`] — one linked chunk's shared tables.
+//! - [`ChunkPayload`] — one live linked chunk's tables and retained-byte lease.
 //! - [`ResolvedCtx`] — borrowed-or-owned context for one function id.
 //!
 //! # Invariants
 //!
-//! - Each chunk is immutable after construction. Its `next` link is published
-//!   exactly once, so reads never lock and old contexts immediately see chunks
-//!   linked later in the same code space. Linking holds one single-writer lock
-//!   from global-base selection through publication.
+//! - Node ranges and `next` links are immutable after publication. Resolution
+//!   walks those fields without locking and locks only the matching payload
+//!   slot. Linking holds one single-writer lock from global-base selection
+//!   through publication.
 //! - Chunks are appended with monotonically increasing `function_base` values.
 //! - Fresh compiler output is rebased fallibly and verified exactly once at
 //!   its assigned base before publication. Decoded cache carriers retain the
@@ -45,14 +45,12 @@
 //!   ids at runtime.
 //! - Registry entries hold no [`crate::ExecutionContext`] (and thus no
 //!   registry handle), so linked chunks never form an `Arc` cycle.
-//! - Linked chunks live for the registry's lifetime. Escaped function
-//!   values may be called arbitrarily late (timers, jobs), so nothing
-//!   is evicted.
-//! - Every published chunk carries an exact `SourceModuleBytes` lease for
-//!   its retained bytecode, executable view, and atom table, reserved
-//!   against the linking caller's account before publication. A rejected
-//!   budget is a typed [`BytecodeLinkError::RetainedBytes`] and leaves the
-//!   registry unchanged; the lease is released when the registry drops.
+//! - Eviction leaves an immutable tombstone node. Function ids and IC-site
+//!   ranges are never reused, and an evicted id is distinguishable from an id
+//!   that was never linked.
+//! - Every live payload carries the exact `SourceModuleBytes` lease for its
+//!   retained bytecode, executable view, and atom table. Dropping the payload
+//!   drops the physical tables and the charge in the same operation.
 //! - IC-site bases keep dense property-IC ids globally unique, so two
 //!   chunks never alias one interpreter IC slot.
 //!
@@ -61,7 +59,8 @@
 //! - [`crate::execution_context`]
 //! - [`crate::executable`]
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use otter_bytecode::{
     BytecodeModule, BytecodeRebaseError, BytecodeVerifyError, Constant, Op, VerifiedBytecodeModule,
@@ -72,17 +71,84 @@ use crate::ExecutionContext;
 use crate::executable::ExecutableModule;
 use crate::property_atom::AtomTable;
 
-/// One linked chunk's shared tables, as stored in the registry.
-#[derive(Debug, Clone)]
-pub(crate) struct ChunkTables {
-    pub(crate) function_base: u32,
-    pub(crate) function_count: u32,
+/// One live chunk's tables and exact retained-byte ownership.
+///
+/// Execution contexts clone this one `Arc`, rather than cloning the three
+/// table Arcs independently. Consequently `Arc::strong_count == 1` on the
+/// registry slot is an exact proof that no context still retains the payload.
+#[derive(Debug)]
+pub(crate) struct ChunkPayload {
     pub(crate) module: Arc<BytecodeModule>,
     pub(crate) executable: Arc<ExecutableModule>,
     pub(crate) atoms: Arc<AtomTable>,
+    retained_bytes: u64,
+    /// Drops in the same payload as the retained tables.
+    _retained_lease: ResourceLease,
 }
 
-/// Append-only registry of every code chunk linked into one interpreter.
+impl ChunkPayload {
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+}
+
+/// Whether a linked chunk participates in automatic reclamation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkRetention {
+    /// Entry/bootstrap chunks remain installed for the isolate lifetime.
+    Pinned,
+    /// Eval and on-demand module chunks may be reclaimed after liveness proof.
+    Evictable,
+}
+
+/// Result of resolving a global function id through the immutable node chain.
+#[derive(Debug)]
+pub(crate) enum ChunkResolution {
+    /// The id belongs to a live payload.
+    Live {
+        function_base: u32,
+        payload: Arc<ChunkPayload>,
+    },
+    /// The id belongs to a linked range whose payload has been reclaimed.
+    Evicted {
+        function_base: u32,
+        function_count: u32,
+    },
+    /// No linked node ever owned the id.
+    Unlinked,
+}
+
+/// Immutable candidate metadata copied out before liveness and JIT retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkEvictionCandidate {
+    pub(crate) function_base: u32,
+    pub(crate) function_count: u32,
+    pub(crate) property_ic_site_base: u32,
+    pub(crate) property_ic_site_end: u32,
+    pub(crate) module_identity: usize,
+    pub(crate) retained_bytes: u64,
+}
+
+impl ChunkEvictionCandidate {
+    #[must_use]
+    pub(crate) fn function_end(self) -> u32 {
+        self.function_base + self.function_count
+    }
+}
+
+/// Result of attempting to tombstone one previously selected node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkEvictionResult {
+    /// The payload and its lease were dropped.
+    Evicted { retained_bytes: u64 },
+    /// A context acquired the payload after candidate selection.
+    RetainedContext,
+    /// The node is pinned, already evicted, or no longer matches the candidate.
+    NotEligible,
+}
+
+/// Append-only node registry of every code chunk linked into one interpreter.
 ///
 /// The registry is an immutable-node chain rather than a locked `Vec`. Linking
 /// claims the first empty one-shot link; resolution only follows already
@@ -94,6 +160,14 @@ pub(crate) struct CodeSpace {
     /// Last chunk this registry published, used as the starting point for the
     /// next link. Taken only while linking; resolution never touches it.
     tail: Mutex<Option<Arc<CodeChunk>>>,
+    /// Advances after every topology or payload-state publication. Turn-local
+    /// owner caches compare this before reusing a context, so linking or
+    /// eviction cannot leave a stale fast-path answer.
+    epoch: AtomicU64,
+    /// Exact bytes owned by live evictable payloads. Link and eviction update
+    /// this in O(1); telemetry must not turn repeated `eval` linking into an
+    /// O(n²) walk of the append-only chunk chain.
+    evictable_retained_bytes: AtomicU64,
 }
 
 /// Typed failure to admit a bytecode module into a [`CodeSpace`].
@@ -205,39 +279,43 @@ impl From<BytecodeRebaseError> for BytecodeLinkError {
     }
 }
 
-/// Function-id and IC-site bases the chunk after `tables` would start at.
-fn next_bases(tables: &ChunkTables) -> Result<(u32, u32), BytecodeLinkError> {
-    let function_base = tables
-        .function_base
-        .checked_add(tables.function_count)
-        .ok_or(BytecodeLinkError::FunctionIdCapacity {
-            base: tables.function_base,
-            function_count: tables.function_count as usize,
-        })?;
-    Ok((function_base, tables.executable.property_ic_site_end()))
+/// Function-id and IC-site bases the chunk after `node` would start at.
+fn next_bases(node: &CodeChunk) -> Result<(u32, u32), BytecodeLinkError> {
+    let function_base = node.function_base.checked_add(node.function_count).ok_or(
+        BytecodeLinkError::FunctionIdCapacity {
+            base: node.function_base,
+            function_count: node.function_count as usize,
+        },
+    )?;
+    Ok((function_base, node.property_ic_site_end))
 }
 
-/// One immutable registry node. `next` is the sole publication point for a
-/// later chunk; installed nodes and their tables are never replaced or evicted.
+/// One immutable-range registry node. `next` is the sole publication point for
+/// a later chunk; eviction clears only `payload` and leaves this tombstone.
 #[derive(Debug)]
 struct CodeChunk {
-    tables: ChunkTables,
-    /// Exact `SourceModuleBytes` charge for the chunk's retained bytecode,
-    /// executable view, and atom table. Chunks are never evicted, so the
-    /// lease is released only when the registry itself is dropped.
-    _retained_lease: ResourceLease,
+    function_base: u32,
+    function_count: u32,
+    property_ic_site_base: u32,
+    property_ic_site_end: u32,
+    retention: ChunkRetention,
+    payload: RwLock<Option<Arc<ChunkPayload>>>,
     next: OnceLock<Arc<CodeChunk>>,
 }
 
-/// Exact bytes one linked chunk retains for the registry's lifetime.
-fn chunk_retained_bytes(tables: &ChunkTables) -> u64 {
-    (std::mem::size_of::<CodeChunk>() as u64)
+/// Exact bytes one live payload retains.
+fn chunk_retained_bytes(
+    module: &BytecodeModule,
+    executable: &ExecutableModule,
+    atoms: &AtomTable,
+) -> u64 {
+    (std::mem::size_of::<ChunkPayload>() as u64)
         .saturating_add(std::mem::size_of::<BytecodeModule>() as u64)
-        .saturating_add(tables.module.retained_bytes())
+        .saturating_add(module.retained_bytes())
         .saturating_add(std::mem::size_of::<ExecutableModule>() as u64)
-        .saturating_add(tables.executable.retained_bytes())
+        .saturating_add(executable.retained_bytes())
         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
-        .saturating_add(tables.atoms.retained_bytes())
+        .saturating_add(atoms.retained_bytes())
 }
 
 fn ensure_function_id_capacity(base: u32, function_count: usize) -> Result<u32, BytecodeLinkError> {
@@ -305,6 +383,7 @@ fn build_chunk(
     function_base: u32,
     function_count: u32,
     property_ic_base: u32,
+    retention: ChunkRetention,
     account: &ResourceAccount,
 ) -> Result<Arc<CodeChunk>, BytecodeLinkError> {
     let executable = Arc::new(ExecutableModule::from_verified_bytecode_with_ic_base(
@@ -312,22 +391,26 @@ fn build_chunk(
         property_ic_base,
     ));
     let module = verified.into_module();
-    let tables = ChunkTables {
-        function_base,
-        function_count,
-        executable,
-        atoms: Arc::new(AtomTable::from_constants(&module.constants)),
-        module: Arc::new(module),
-    };
+    let atoms = Arc::new(AtomTable::from_constants(&module.constants));
+    let retained_bytes = chunk_retained_bytes(&module, &executable, &atoms);
     // Retained-bytes admission: a rejected budget declines the link before
     // publication and the rejection is visible on the ledger.
-    let retained_lease = account.reserve_exact(
-        ResourceClass::SourceModuleBytes,
-        chunk_retained_bytes(&tables),
-    )?;
-    Ok(Arc::new(CodeChunk {
-        tables,
+    let retained_lease = account.reserve_exact(ResourceClass::SourceModuleBytes, retained_bytes)?;
+    let payload = Arc::new(ChunkPayload {
+        module: Arc::new(module),
+        executable,
+        atoms,
+        retained_bytes,
         _retained_lease: retained_lease,
+    });
+    let property_ic_site_end = payload.executable.property_ic_site_end();
+    Ok(Arc::new(CodeChunk {
+        function_base,
+        function_count,
+        property_ic_site_base: property_ic_base,
+        property_ic_site_end,
+        retention,
+        payload: RwLock::new(Some(payload)),
         next: OnceLock::new(),
     }))
 }
@@ -344,11 +427,30 @@ fn publish_chunk(
     if !published {
         return Err(BytecodeLinkError::CodeSpaceConflict);
     }
+    if chunk.retention == ChunkRetention::Evictable {
+        let retained_bytes = chunk
+            .payload
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("published chunks start with a live payload")
+            .retained_bytes();
+        space
+            .evictable_retained_bytes
+            .fetch_add(retained_bytes, Ordering::AcqRel);
+    }
     *tail = Some(chunk);
+    space.epoch.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
 impl CodeSpace {
+    /// Current registry publication epoch for turn-local owner caches.
+    #[inline]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     /// Rebase `module` onto this registry's id space and append it as a new
     /// immutable chunk. Returns the chunk's [`ExecutionContext`] bound to this
     /// code space.
@@ -362,15 +464,33 @@ impl CodeSpace {
     /// admission error. No chunk is published on failure.
     pub(crate) fn link_module(
         self: &Arc<Self>,
+        module: BytecodeModule,
+        account: &ResourceAccount,
+    ) -> Result<ExecutionContext, BytecodeLinkError> {
+        self.link_module_with_retention(module, account, ChunkRetention::Pinned)
+    }
+
+    /// Link a chunk that may be reclaimed after an explicit liveness proof.
+    pub(crate) fn link_evictable_module(
+        self: &Arc<Self>,
+        module: BytecodeModule,
+        account: &ResourceAccount,
+    ) -> Result<ExecutionContext, BytecodeLinkError> {
+        self.link_module_with_retention(module, account, ChunkRetention::Evictable)
+    }
+
+    fn link_module_with_retention(
+        self: &Arc<Self>,
         mut module: BytecodeModule,
         account: &ResourceAccount,
+        retention: ChunkRetention,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
         let mut tail = self
             .tail
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (function_base, property_ic_base) = match tail.as_ref() {
-            Some(chunk) => next_bases(&chunk.tables)?,
+            Some(chunk) => next_bases(chunk)?,
             None => (0, 0),
         };
         let function_count = ensure_function_id_capacity(function_base, module.functions.len())?;
@@ -385,11 +505,20 @@ impl CodeSpace {
             function_base,
             function_count,
             property_ic_base,
+            retention,
             account,
         )?;
         publish_chunk(self, &mut tail, Arc::clone(&chunk))?;
-        Ok(ExecutionContext::from_chunk_tables(
-            chunk.tables.clone(),
+        let payload = chunk
+            .payload
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("newly built chunk has a live payload")
+            .clone();
+        Ok(ExecutionContext::from_chunk_payload(
+            payload,
+            function_base,
             Arc::clone(self),
         ))
     }
@@ -411,7 +540,7 @@ impl CodeSpace {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (function_base, property_ic_base) = match tail.as_ref() {
-            Some(chunk) => next_bases(&chunk.tables)?,
+            Some(chunk) => next_bases(chunk)?,
             None => (0, 0),
         };
         let function_count =
@@ -425,30 +554,50 @@ impl CodeSpace {
             function_base,
             function_count,
             property_ic_base,
+            ChunkRetention::Pinned,
             account,
         )?;
         publish_chunk(self, &mut tail, Arc::clone(&chunk))?;
-        Ok(ExecutionContext::from_chunk_tables(
-            chunk.tables.clone(),
+        let payload = chunk
+            .payload
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("newly built chunk has a live payload")
+            .clone();
+        Ok(ExecutionContext::from_chunk_payload(
+            payload,
+            function_base,
             Arc::clone(self),
         ))
     }
 
-    /// Resolve the chunk owning `function_id`, if any chunk was linked
-    /// over that id.
-    pub(crate) fn chunk_for(&self, function_id: u32) -> Option<&ChunkTables> {
+    /// Resolve the node owning `function_id` as live, evicted, or never linked.
+    pub(crate) fn resolve_chunk(&self, function_id: u32) -> ChunkResolution {
         let mut chunk = self.first.get();
         while let Some(current) = chunk {
-            let tables = &current.tables;
-            if function_id < tables.function_base {
-                return None;
+            if function_id < current.function_base {
+                return ChunkResolution::Unlinked;
             }
-            if function_id - tables.function_base < tables.function_count {
-                return Some(tables);
+            if function_id - current.function_base < current.function_count {
+                let payload = current
+                    .payload
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                return match payload.as_ref() {
+                    Some(payload) => ChunkResolution::Live {
+                        function_base: current.function_base,
+                        payload: Arc::clone(payload),
+                    },
+                    None => ChunkResolution::Evicted {
+                        function_base: current.function_base,
+                        function_count: current.function_count,
+                    },
+                };
             }
             chunk = current.next.get();
         }
-        None
+        ChunkResolution::Unlinked
     }
 
     /// Resolve every linked chunk's property-name atoms against `names`.
@@ -462,7 +611,14 @@ impl CodeSpace {
     pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
         let mut chunk = self.first.get();
         while let Some(current) = chunk {
-            current.tables.atoms.resolve(names);
+            if let Some(payload) = current
+                .payload
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                payload.atoms.resolve(names);
+            }
             chunk = current.next.get();
         }
     }
@@ -471,11 +627,101 @@ impl CodeSpace {
     /// ambient execution context. Used only by the explicit optimizing-tier
     /// policy query; baseline compilation and dispatch do not call it.
     pub(crate) fn feedback_epoch(&self, function_id: u32) -> Option<u32> {
-        let chunk = self.chunk_for(function_id)?;
-        chunk
+        let ChunkResolution::Live {
+            function_base,
+            payload,
+        } = self.resolve_chunk(function_id)
+        else {
+            return None;
+        };
+        payload
             .executable
-            .function(function_id - chunk.function_base)
+            .function(function_id - function_base)
             .map(crate::executable::CodeBlock::feedback_epoch)
+    }
+
+    /// Snapshot reclaimable payloads, largest first with base as a stable tie
+    /// breaker. A payload with a retained context is omitted: its physical
+    /// tables and lease cannot be released even if no function id is live.
+    #[must_use]
+    pub(crate) fn eviction_candidates(&self) -> Vec<ChunkEvictionCandidate> {
+        let mut candidates = Vec::new();
+        let mut chunk = self.first.get();
+        while let Some(current) = chunk {
+            if current.retention == ChunkRetention::Evictable {
+                let payload = current
+                    .payload
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(payload) = payload.as_ref()
+                    && Arc::strong_count(payload) == 1
+                {
+                    candidates.push(ChunkEvictionCandidate {
+                        function_base: current.function_base,
+                        function_count: current.function_count,
+                        property_ic_site_base: current.property_ic_site_base,
+                        property_ic_site_end: current.property_ic_site_end,
+                        module_identity: Arc::as_ptr(&payload.module) as usize,
+                        retained_bytes: payload.retained_bytes(),
+                    });
+                }
+            }
+            chunk = current.next.get();
+        }
+        candidates.sort_unstable_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.retained_bytes),
+                candidate.function_base,
+            )
+        });
+        candidates
+    }
+
+    /// Total bytes retained by live automatically reclaimable payloads.
+    #[must_use]
+    pub(crate) fn evictable_retained_bytes(&self) -> u64 {
+        self.evictable_retained_bytes.load(Ordering::Acquire)
+    }
+
+    /// Clear one selected payload after the caller has proved its id range
+    /// unreachable and physically retired generated code for that range.
+    pub(crate) fn evict_candidate(&self, candidate: ChunkEvictionCandidate) -> ChunkEvictionResult {
+        let mut chunk = self.first.get();
+        while let Some(current) = chunk {
+            if current.function_base == candidate.function_base {
+                if current.function_count != candidate.function_count
+                    || current.retention != ChunkRetention::Evictable
+                {
+                    return ChunkEvictionResult::NotEligible;
+                }
+                let mut payload = current
+                    .payload
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(live) = payload.as_ref() else {
+                    return ChunkEvictionResult::NotEligible;
+                };
+                if Arc::strong_count(live) != 1 {
+                    return ChunkEvictionResult::RetainedContext;
+                }
+                let retained_bytes = live.retained_bytes();
+                let dropped = payload.take();
+                self.evictable_retained_bytes
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        current.checked_sub(retained_bytes)
+                    })
+                    .expect("live evictable byte accounting covers its payload");
+                self.epoch.fetch_add(1, Ordering::Release);
+                drop(payload);
+                drop(dropped);
+                return ChunkEvictionResult::Evicted { retained_bytes };
+            }
+            if current.function_base > candidate.function_base {
+                return ChunkEvictionResult::NotEligible;
+            }
+            chunk = current.next.get();
+        }
+        ChunkEvictionResult::NotEligible
     }
 }
 
@@ -625,9 +871,13 @@ mod tests {
         assert!(second.exec_function(3).is_some());
         assert!(second.exec_function(4).is_some());
         assert!(
-            second.exec_function(2).is_some(),
-            "sibling-chunk ids resolve transparently through the shared space",
+            second.exec_function(2).is_none(),
+            "table access is local to the owning chunk",
         );
+        let first_owner = second
+            .for_function(2)
+            .expect("sibling id resolves to an owned context");
+        assert!(first_owner.exec_function(2).is_some());
         assert!(second.exec_function(5).is_none());
     }
 
@@ -668,7 +918,7 @@ mod tests {
         );
         let back = second.for_function(0).expect("first chunk's id resolves");
         assert_eq!(back.function_base(), 0);
-        assert!(first.for_function(5).is_none());
+        assert!(first.for_function(5).is_err());
     }
 
     #[test]
@@ -730,7 +980,10 @@ mod tests {
         bases.sort_unstable();
         assert_eq!(bases, [0, 2, 4, 6]);
         for function_id in 0..8 {
-            assert!(space.chunk_for(function_id).is_some());
+            assert!(matches!(
+                space.resolve_chunk(function_id),
+                super::ChunkResolution::Live { .. }
+            ));
         }
     }
 
@@ -926,6 +1179,84 @@ mod tests {
                 .current(),
             0
         );
+    }
+
+    #[test]
+    fn evictable_payload_becomes_a_typed_tombstone_and_releases_its_lease() {
+        use otter_resource::ResourceClass;
+
+        let space = Arc::new(CodeSpace::default());
+        let account = unlimited();
+        let pinned = space
+            .link_module(module_with_functions(2), &account)
+            .expect("pinned chunk");
+        let baseline = account
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current();
+        let evictable = space
+            .link_evictable_module(module_with_functions(2), &account)
+            .expect("evictable chunk");
+        let old_base = evictable.function_base();
+        assert_eq!(old_base, 2);
+        assert!(space.evictable_retained_bytes() > 0);
+        assert!(
+            account
+                .snapshot()
+                .get(ResourceClass::SourceModuleBytes)
+                .current()
+                > baseline
+        );
+
+        assert!(space.eviction_candidates().is_empty());
+        drop(evictable);
+        let candidates = space.eviction_candidates();
+        let [candidate] = candidates.as_slice() else {
+            panic!("one unretained dynamic chunk is eligible");
+        };
+        let candidate = *candidate;
+        let retained_bytes = candidate.retained_bytes;
+        assert_eq!(space.evictable_retained_bytes(), retained_bytes);
+        let rescued = pinned
+            .for_function(old_base)
+            .expect("a context acquired after selection retains the payload");
+        assert_eq!(
+            space.evict_candidate(candidate),
+            super::ChunkEvictionResult::RetainedContext,
+        );
+        drop(rescued);
+        assert_eq!(
+            space.evict_candidate(candidate),
+            super::ChunkEvictionResult::Evicted { retained_bytes }
+        );
+        assert_eq!(space.evictable_retained_bytes(), 0);
+        assert_eq!(
+            account
+                .snapshot()
+                .get(ResourceClass::SourceModuleBytes)
+                .current(),
+            baseline
+        );
+        assert!(matches!(
+            space.resolve_chunk(old_base),
+            super::ChunkResolution::Evicted {
+                function_base: 2,
+                function_count: 2,
+            }
+        ));
+        assert!(matches!(
+            pinned.for_function(old_base),
+            Err(crate::execution_context::FunctionResolutionError::Evicted {
+                function_id: 2,
+                function_base: 2,
+                function_count: 2,
+            })
+        ));
+
+        let later = space
+            .link_module(module_with_functions(2), &account)
+            .expect("later chunk");
+        assert_eq!(later.function_base(), 4, "tombstoned ids are never reused");
     }
 
     #[test]

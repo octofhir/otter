@@ -1488,7 +1488,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<()> {
-        let owner = context.for_function(fid)?;
+        let owner = context.for_function(fid).ok()?;
         let function = owner.exec_function(fid)?;
         let mut instruction_index = 0usize;
         while let Some(instruction) = function.instr_at_index(instruction_index) {
@@ -1525,7 +1525,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<()> {
-        let owner = context.for_function(fid)?;
+        let owner = context.for_function(fid).ok()?;
         for instruction in &view.instructions {
             if instruction.op(&view.code_block) != Op::LoadString {
                 continue;

@@ -124,6 +124,12 @@ pub const LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET: usize =
     std::mem::offset_of!(LocalArrayBufferBodyGc, detached);
 
 impl LocalArrayBufferBodyGc {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+
     /// Recompute the compiled-code-visible byte cache after any mutation
     /// that can move or resize the storage.
     #[inline]
@@ -245,6 +251,14 @@ impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
             proto.trace_value_slot_mut(visitor);
         }
         // Bytes live behind an `Arc` outside the cage.
+    }
+}
+
+impl SharedArrayBufferBodyGc {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
     }
 }
 

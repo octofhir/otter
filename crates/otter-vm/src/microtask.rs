@@ -308,6 +308,29 @@ impl MicrotaskQueue {
 }
 
 impl Microtask {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for value in [&self.callee, &self.this_value, &self.async_context] {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for value in &self.args {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        if let Some(capability) = &self.result_capability {
+            crate::code_liveness::visit_value(&capability.resolve, visitor);
+            crate::code_liveness::visit_value(&capability.reject, visitor);
+        }
+        match &self.kind {
+            MicrotaskKind::Call | MicrotaskKind::FinalizationCallback => {}
+            MicrotaskKind::AsyncResume { frame, cold, .. }
+            | MicrotaskKind::AsyncGenResume { frame, cold, .. } => {
+                frame.visit_function_ids(visitor);
+                if let Some(cold) = cold {
+                    cold.visit_function_ids(visitor);
+                }
+            }
+        }
+    }
+
     /// Trace every GC-bearing value slot held by this queued task.
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.callee.trace_value_slots(visitor);
@@ -342,6 +365,12 @@ impl Microtask {
 }
 
 impl MicrotaskQueue {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for task in self.pending.iter().chain(&self.in_flight) {
+            task.visit_function_ids(visitor);
+        }
+    }
+
     /// Trace every queued isolate-local task — both the pending
     /// generation and the in-flight one a drain is executing.
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {

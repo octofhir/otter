@@ -327,11 +327,33 @@ Brotli accepts caller-owned input/output slices and reports
 [Brotli stream API](https://docs.rs/brotli/latest/brotli/fn.BrotliDecompressStream.html),
 and [zstd-safe `DStream`](https://docs.rs/zstd-safe/latest/zstd_safe/type.DStream.html).
 
+Native TCP and datagram delivery now account the payloads they retain across a
+call or isolate-task boundary. Each installed binding has a finite ledger
+capped at 4,096 messages and 64 MiB, paired with the runtime `QueuedMessages` and
+`QueuedMessageBytes` account. TCP write bytes are admitted before their owned
+copy enters the writer channel and stay charged until the kernel accepts or
+refuses them; disconnect and send failure drop the same RAII lease. TCP and UDP
+receive payloads carry the lease through the bounded isolate inbox. TCP keeps
+the charge until VM backing-store adoption succeeds, while UDP keeps it through
+the existing latin1 handoff. Pressure is an observable `ENOBUFS` read/write
+failure rather than a silent drop. Direct `tryWrite` and `try_send_to` successes
+retain no host copy and therefore take no queue charge.
+
+This follows the ownership boundary exposed by the production stack. Node
+reports when socket bytes entered user-memory buffering and emits `drain` when
+that buffer is free; libuv requires write buffers to stay valid until their
+callback and exposes stream/UDP queued byte counts. Tokio documents that its
+unbounded MPSC can buffer arbitrarily until process memory is exhausted:
+[Node `net.Socket.write`](https://nodejs.org/api/net.html#socketwritedata-encoding-callback),
+[libuv streams](https://docs.libuv.org/en/v1.x/stream.html),
+[libuv UDP](https://docs.libuv.org/en/v1.x/udp.html), and
+[Tokio MPSC](https://docs.rs/tokio/latest/tokio/sync/mpsc/).
+
 Still open: audit the remaining active host state that retains bytes across a
-call or task boundary, chiefly queued native net/datagram payloads and
-child-process or snapshot/artifact captures. Synchronous scratch vectors,
-bounded codec state, and already hard-bounded diagnostic artifacts must be
-distinguished from retained stores before changing them.
+call or task boundary, chiefly child-process IPC/process capture and
+snapshot/artifact capture. Fixed transport read slabs, synchronous scratch
+vectors, bounded codec state, and already hard-bounded diagnostic artifacts
+must be distinguished from retained stores before changing them.
 
 Also landed: heap external charges are folded into the runtime ledger.
 `GcHeap` mirrors its outstanding external/off-slot reservation bytes into an

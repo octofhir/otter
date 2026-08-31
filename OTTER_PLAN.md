@@ -278,16 +278,32 @@ dispatch took 231.011 ms and a `new Function` sibling chunk took 231.149 ms
 epoch-validated owner cache; it retains no context across the between-turn
 census.
 
-Still open, in R1 terms:
+The residual host-owned backing-store audit now covers `Otter.serve`. Incoming
+HTTP bodies are consumed frame by frame instead of through whole-body
+`collect()`, and every retained Rust byte is admitted before buffer growth
+against both the runtime `ExternalBytes` account and an always-finite
+per-server ledger. One buffered request or response is capped at 16 MiB and
+one server at 64 MiB without adding JavaScript options, permission classes, or
+configuration ceremony. Known oversized requests fail before their body is
+polled; incremental overflow is 413, aggregate pressure is 503, and rejected
+or partially read bodies recover both ledgers. Response leases move with the
+Hyper body and remain live until network delivery drops it.
 
-- Remaining host-owned backing stores outside the ArrayBuffer/Blob paths.
-  JS-side body buffering (`response.text()`/`arrayBuffer()` chunk collection,
-  stream queues) accumulates `Uint8Array` chunks whose ArrayBuffer backing
-  stores charge heap external memory and therefore the `ExternalBytes`
-  ledger; host-class byte payloads (Blob/File) charge at construction and
-  release on collection; the native fetch boundary holds one bounded chunk
-  with pull backpressure. Residual audit target: any Rust-side retained
-  `Vec<u8>`/`BytesMut` accumulation not represented by a charged token.
+This is deliberately an internal safety boundary, not the final Web API.
+Hyper models a body as asynchronously yielded frames, the Fetch standard
+models request and response bodies as streams, and Node's HTTP API explicitly
+avoids buffering entire messages. Otter therefore keeps its public
+Fetch-shaped call simple while using bounded buffering only until server-side
+Web Streams can carry backpressure end to end:
+[Hyper `Body`](https://docs.rs/http-body/latest/http_body/trait.Body.html),
+[Fetch bodies](https://fetch.spec.whatwg.org/#concept-body), and
+[Node HTTP](https://nodejs.org/api/http.html).
+
+Still open: audit the remaining active host state that retains bytes across a
+call or task boundary, chiefly `node:zlib` dictionary/carry buffers, queued
+native net/datagram payloads, and child-process or snapshot/artifact captures.
+Synchronous scratch vectors and already hard-bounded diagnostic artifacts must
+be distinguished from retained stores before changing them.
 
 Also landed: heap external charges are folded into the runtime ledger.
 `GcHeap` mirrors its outstanding external/off-slot reservation bytes into an

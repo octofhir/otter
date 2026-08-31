@@ -73,6 +73,14 @@ impl otter_gc::SafeTraceable for DataViewBodyGc {
     }
 }
 
+impl DataViewBodyGc {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.custom_proto {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 /// 4-byte compressed GC handle to a [`DataViewBodyGc`]. `Copy`. Packs
 /// into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type DataViewHandle = otter_gc::Gc<DataViewBodyGc>;

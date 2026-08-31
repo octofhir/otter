@@ -122,6 +122,14 @@ impl ValueSlabBody {
                 .cast()
         }
     }
+
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        let base = self.values_ptr();
+        for index in 0..self.len() {
+            // SAFETY: the live prefix is initialized before `len` is published.
+            crate::code_liveness::visit_value(unsafe { &*base.add(index) }, visitor);
+        }
+    }
 }
 
 // The trailing values must land on their own alignment, so the header has

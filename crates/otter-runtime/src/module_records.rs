@@ -20,8 +20,8 @@
 //!   Evaluated|Errored`. The transition methods enforce that ordering;
 //!   skipping a phase or going backwards is a programmer bug.
 //! - The VM module-env registry is the sole owner/root of allocated
-//!   environments. Runtime records contain lifecycle metadata only and never
-//!   retain raw VM handles.
+//!   environments. Runtime records retain the owning [`ExecutionContext`] for
+//!   their initializer id, but never retain raw VM handles.
 //! - Cycle support: a module that the loader has already started
 //!   instantiating is in [`RuntimeModuleRecordState::Instantiated`] (or
 //!   later) by the time a back-edge revisits it. The host treats the
@@ -35,7 +35,7 @@
 //! - <https://tc39.es/ecma262/#sec-InnerModuleEvaluation>
 
 use otter_bytecode::ModuleInit;
-use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, NativeError};
+use otter_vm::{ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, NativeError};
 use std::collections::BTreeMap;
 
 use crate::{CapabilitySet, HostedModule, OtterError, RuntimeTaskSpawner};
@@ -77,12 +77,14 @@ pub(crate) enum RuntimeModuleRecordState {
 }
 
 /// One runtime-owned module record.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct RuntimeModuleRecord {
     /// Function id of this module's `<module-init>` inside linked bytecode.
     pub(crate) function_id: u32,
     /// Current lifecycle state.
     pub(crate) state: RuntimeModuleRecordState,
+    /// Owning linked chunk for `function_id` once the bytecode is admitted.
+    context: Option<ExecutionContext>,
 }
 
 /// Per-realm tables of allocated module records owned by one runtime.
@@ -225,6 +227,7 @@ impl RuntimeModuleRecords {
                             RuntimeModuleRecord {
                                 function_id: init.function_id,
                                 state: RuntimeModuleRecordState::Instantiated,
+                                context: None,
                             },
                         );
                     }
@@ -232,6 +235,25 @@ impl RuntimeModuleRecords {
                 })
             },
         )
+    }
+
+    /// Retain the linked chunk that owns newly allocated module records.
+    ///
+    /// Existing records from an earlier graph keep their original context:
+    /// their canonical URL may also occur in this graph with a different
+    /// linker-assigned function id.
+    pub(crate) fn retain_linked_context(&mut self, realm_id: u32, context: &ExecutionContext) {
+        let Some(records) = self.realms.get_mut(&realm_id) else {
+            return;
+        };
+        for init in context.module_inits() {
+            let Some(record) = records.get_mut(&init.url) else {
+                continue;
+            };
+            if record.function_id == init.function_id && record.context.is_none() {
+                record.context = Some(context.clone());
+            }
+        }
     }
 
     /// Mark all instantiated records as evaluating. Called once

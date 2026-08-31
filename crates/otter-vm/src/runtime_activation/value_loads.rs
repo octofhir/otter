@@ -74,7 +74,7 @@ impl RuntimeCall<'_> {
         let ambient = unsafe { self.context.as_ref() };
         let context = ambient
             .for_function(self.function_id())
-            .ok_or(VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)?;
         let context = &*context;
         let (dst, value) = match operation {
             ValueLoadRuntimeOp::Math { dst, name_index } => {

@@ -67,6 +67,7 @@ pub mod boolean;
 mod call_feedback;
 mod call_ops;
 pub mod closure;
+mod code_liveness;
 mod code_space;
 mod coerce;
 pub mod cold_frame;
@@ -657,6 +658,23 @@ pub struct JitRuntimeStats {
     pub receiver_alloc_rust_transitions: u64,
 }
 
+/// Per-isolate code-chunk reclamation telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeEvictionStats {
+    /// Full-GC census passes triggered after crossing the byte high-water mark.
+    pub census_passes: u64,
+    /// Payloads physically reclaimed.
+    pub evicted_chunks: u64,
+    /// Source/module bytes released from the resource ledger.
+    pub evicted_bytes: u64,
+    /// Candidate chunks retained because a live bare function id was found.
+    pub live_id_skips: u64,
+    /// Current bytes held by live evictable payloads.
+    pub retained_bytes: u64,
+    /// Largest observed live evictable payload total.
+    pub peak_retained_bytes: u64,
+}
+
 /// Snapshot of VM-published collection method IC mirror slots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCollectionMethodIcStats {
@@ -846,9 +864,7 @@ pub(crate) struct MethodSite {
     pub(crate) holder_shape_offset: u32,
 }
 
-/// Match-based dispatch loop. The harness baseline; slice tasks may
-/// later switch to threaded dispatch after benchmark-driven review
-/// (foundation plan §"Interpreter requirements").
+/// Match-based bytecode interpreter and isolate-owned runtime state.
 pub struct Interpreter {
     /// Host local time zone for `Date`'s local-time getters, resolved on first
     /// use and kept for this isolate. See [`date::LocalTimeZone`].
@@ -952,6 +968,9 @@ pub struct Interpreter {
     /// frame; every linked [`ExecutionContext`] resolves foreign ids
     /// through this shared registry.
     code_space: std::sync::Arc<code_space::CodeSpace>,
+    /// Byte-driven high-water mark for eval and on-demand module payloads.
+    code_eviction_high_water_bytes: u64,
+    code_eviction_stats: CodeEvictionStats,
     /// This isolate's property-name interner: the single authority for what
     /// name a given [`property_atom::AtomId`] means. Chunk atom tables resolve
     /// their string constants through it at link time, hidden-class transitions

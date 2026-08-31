@@ -69,6 +69,14 @@ pub struct WeakRefBody {
     prototype_override: Option<Value>,
 }
 
+impl WeakRefBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 impl otter_gc::trace::SeverRestoredPayload for WeakRefBody {
     /// A restored weak target is a source-isolate offset the weak channel does
     /// not participate in relocating; clear it (the deref observes
@@ -138,6 +146,18 @@ pub struct FinalizationRegistryBody {
     cleanup_context: Option<ExecutionContext>,
     cells: Vec<FinalizerCell>,
     prototype_override: Option<Value>,
+}
+
+impl FinalizationRegistryBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.cleanup_callback, visitor);
+        for cell in &self.cells {
+            crate::code_liveness::visit_value(&cell.held_value, visitor);
+        }
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
 }
 
 /// Cleanup work prepared during post-mark weak processing.

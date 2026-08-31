@@ -57,6 +57,13 @@ pub struct ClassConstructorBody {
     pub ctor_proto: Value,
 }
 
+impl ClassConstructorBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.ctor, visitor);
+        crate::code_liveness::visit_value(&self.ctor_proto, visitor);
+    }
+}
+
 /// Byte offset of the underlying callable in [`ClassConstructorBody`].
 pub const CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET: usize =
     std::mem::offset_of!(ClassConstructorBody, ctor);

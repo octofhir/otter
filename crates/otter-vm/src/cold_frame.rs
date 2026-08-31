@@ -191,6 +191,46 @@ pub struct ColdFrame {
 }
 
 impl ColdFrame {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(pending) = &self.pending_to_primitive {
+            crate::code_liveness::visit_value(&pending.obj, visitor);
+        }
+        if let Some(pending) = &self.pending_bind_function {
+            crate::code_liveness::visit_value(&pending.target, visitor);
+            crate::code_liveness::visit_value(&pending.bound_this, visitor);
+            for value in &pending.bound_args {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+            if let Some(value) = &pending.target_length {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+        if let Some(pending) = &self.pending_iterator_next {
+            crate::code_liveness::visit_value(&pending.iterator, visitor);
+        }
+        for (parked, _) in &self.parked_finally {
+            match parked {
+                ParkedFinally::Throw(value)
+                | ParkedFinally::Abrupt(AbruptKind::Return(value), _) => {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+                ParkedFinally::Normal | ParkedFinally::Abrupt(AbruptKind::Jump(_), _) => {}
+            }
+        }
+        if let Some(value) = &self.new_target {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for value in &self.rest_args {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for value in &self.incoming_args {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for (value, _) in &self.active_iterator_closers {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+
     /// Whether this slot is logically empty (no cold state worth
     /// keeping).
     #[must_use]

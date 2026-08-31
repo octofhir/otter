@@ -1,9 +1,10 @@
 //! Top-level execution drivers: `run`, microtask drain, dispatch entry.
 //!
 //! # Contents
-//! `run`/`run_inner`, `link_module`, GC-heap accessors and `force_gc`,
-//! microtask drain (with per-task origin contexts) and capability
-//! settlement, and the activation-root / `dispatch_loop` shells.
+//! `run`/`run_inner`, pinned and reclaimable module linking, between-turn code
+//! reclamation, GC-heap accessors and `force_gc`, microtask drain (with
+//! per-task origin contexts) and capability settlement, and the
+//! activation-root / `dispatch_loop` shells.
 //!
 //! # Invariants
 //! Drains that run outside `run`'s rooted scope must push the
@@ -14,10 +15,135 @@
 //! downstream settlement.
 //! Linked bytecode chunks retain the scalar identity of their creation realm;
 //! no moving-GC handle is stored in function metadata.
+//! Dynamic-code reclamation runs only with no active native/materialized
+//! activation, completes a full collection, retires generated code, and only
+//! then tombstones a payload proven free of ids and retained contexts.
 #![allow(unused_imports)]
 use crate::*;
 
 impl Interpreter {
+    /// Default retained-byte high-water mark for reclaimable dynamic code.
+    pub const DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES: u64 = 16 * 1024 * 1024;
+
+    /// Current code-chunk reclamation counters.
+    #[must_use]
+    pub fn code_eviction_stats(&self) -> CodeEvictionStats {
+        let mut stats = self.code_eviction_stats;
+        stats.retained_bytes = self.code_space.evictable_retained_bytes();
+        stats.peak_retained_bytes = stats.peak_retained_bytes.max(stats.retained_bytes);
+        stats
+    }
+
+    /// Configure the byte high-water mark checked at between-turn entry.
+    pub fn set_code_eviction_high_water_bytes(&mut self, bytes: u64) {
+        self.code_eviction_high_water_bytes = bytes;
+    }
+
+    /// Run a full-GC liveness census and reclaim dead dynamic chunks until the
+    /// configured retained-byte target is met.
+    pub fn reclaim_dynamic_code(&mut self) -> Result<(), otter_gc::OutOfMemory> {
+        self.reclaim_dynamic_code_to(self.code_eviction_high_water_bytes)
+    }
+
+    fn reclaim_dynamic_code_to(&mut self, target_bytes: u64) -> Result<(), otter_gc::OutOfMemory> {
+        let mut retained = self.code_space.evictable_retained_bytes();
+        self.code_eviction_stats.retained_bytes = retained;
+        self.code_eviction_stats.peak_retained_bytes =
+            self.code_eviction_stats.peak_retained_bytes.max(retained);
+        if retained <= target_bytes {
+            return Ok(());
+        }
+        debug_assert_eq!(self.sync_reentry_depth, 0);
+        debug_assert_eq!(self.jit_native_activation_top, 0);
+        debug_assert_eq!(self.jit_machine_roots, 0);
+
+        self.code_eviction_stats.census_passes =
+            self.code_eviction_stats.census_passes.saturating_add(1);
+        self.force_gc()?;
+        let candidates = self.code_space.eviction_candidates();
+        let liveness = crate::code_liveness::census_candidate_ids(self, candidates.clone());
+        let mut retired_jit = false;
+        for candidate in candidates {
+            if retained <= target_bytes {
+                break;
+            }
+            if liveness.is_live(candidate) {
+                self.code_eviction_stats.live_id_skips =
+                    self.code_eviction_stats.live_id_skips.saturating_add(1);
+                continue;
+            }
+            if !retired_jit {
+                self.retire_jit_for_code_eviction();
+                retired_jit = true;
+            }
+            if let crate::code_space::ChunkEvictionResult::Evicted { retained_bytes } =
+                self.code_space.evict_candidate(candidate)
+            {
+                self.purge_chunk_side_tables(candidate);
+                retained = retained.saturating_sub(retained_bytes);
+                self.code_eviction_stats.evicted_chunks =
+                    self.code_eviction_stats.evicted_chunks.saturating_add(1);
+                self.code_eviction_stats.evicted_bytes = self
+                    .code_eviction_stats
+                    .evicted_bytes
+                    .saturating_add(retained_bytes);
+            }
+        }
+        self.code_eviction_stats.retained_bytes = self.code_space.evictable_retained_bytes();
+        Ok(())
+    }
+
+    fn retire_jit_for_code_eviction(&mut self) {
+        let invalidated = self.jit_code_registry.invalidate_all().len() as u64;
+        self.jit_runtime_stats.caller_invalidations = self
+            .jit_runtime_stats
+            .caller_invalidations
+            .saturating_add(invalidated);
+        self.jit_code.clear();
+        self.jit_optimized_code.clear();
+        self.jit_code_cache = None;
+        self.jit_optimized_code_cache = None;
+        self.jit_template_osr_fids.clear();
+        self.jit_entry_osr_only.clear();
+        self.jit_template_compiling.clear();
+        self.jit_code_registry.retire_unreferenced();
+    }
+
+    fn purge_chunk_side_tables(&mut self, candidate: crate::code_space::ChunkEvictionCandidate) {
+        let start = candidate.function_base;
+        let end = candidate.function_end();
+        let outside = |function_id: &u32| *function_id < start || *function_id >= end;
+        self.template_objects
+            .retain(|(function_base, _), _| *function_base != start);
+        self.string_constant_cells
+            .retain(|(identity, _), _| *identity != candidate.module_identity);
+        self.bigint_constant_cache
+            .retain(|(identity, _), _| *identity != candidate.module_identity);
+        self.simple_constructor_init_cache
+            .retain(|id, _| outside(id));
+        self.simple_constructor_shape_cache
+            .retain(|id, _| outside(id));
+        self.constructor_field_transition_cache
+            .retain(|id, _| outside(id));
+        self.constructor_field_capacity_cache
+            .retain(|(id, _), _| outside(id));
+        self.constructor_prototype_shape_cache
+            .retain(|(id, _), _| outside(id));
+        self.global_lexical_load_ic.retain(|(id, _), _| outside(id));
+        self.global_object_load_ic.retain(|(id, _), _| outside(id));
+        self.function_realm_ids.retain(|id, _| outside(id));
+        self.function_user_props.retain(|id, _| outside(id));
+        self.function_prototype_overrides
+            .retain(|id, _| outside(id));
+        self.function_non_extensible.retain(outside);
+        self.function_deleted_metadata.retain(|(id, _)| outside(id));
+        self.optimizing_tier_policy.evict_function_range(start, end);
+        self.feedback_directory.evict_site_range(
+            candidate.property_ic_site_base,
+            candidate.property_ic_site_end,
+        );
+    }
+
     /// Borrow the per-isolate GC heap (read-only).
     #[must_use]
     pub fn gc_heap(&self) -> &otter_gc::GcHeap {
@@ -111,6 +237,29 @@ impl Interpreter {
         self.finish_linked_module(context, function_count)
     }
 
+    /// Link an eval or on-demand module chunk that may be reclaimed after a
+    /// between-turn liveness census proves its ids and payload unreachable.
+    pub fn link_evictable_module(
+        &mut self,
+        module: otter_bytecode::BytecodeModule,
+    ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
+        let function_count = u32::try_from(module.functions.len()).map_err(|_| {
+            crate::BytecodeLinkError::FunctionIdCapacity {
+                base: 0,
+                function_count: module.functions.len(),
+            }
+        })?;
+        let context = self
+            .code_space
+            .link_evictable_module(module, self.module_sources.account())?;
+        let context = self.finish_linked_module(context, function_count)?;
+        let retained = self.code_space.evictable_retained_bytes();
+        self.code_eviction_stats.retained_bytes = retained;
+        self.code_eviction_stats.peak_retained_bytes =
+            self.code_eviction_stats.peak_retained_bytes.max(retained);
+        Ok(context)
+    }
+
     /// Link a decoded or cached module while retaining its mandatory
     /// verification proof through code-space rebasing and executable building.
     ///
@@ -182,6 +331,13 @@ impl Interpreter {
         // context-less job (async-resume continuation, host-settled reaction)
         // never strands for want of one.
         self.realm_context = Some(context.clone());
+        if let Err(error) = self.reclaim_dynamic_code() {
+            return Err(RunError {
+                error: crate::oom_to_vm(error),
+                frames: Vec::new(),
+                detail: self.take_error_detail(),
+            });
+        }
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
@@ -640,6 +796,17 @@ impl Interpreter {
                 });
             }
         };
+        let owner = match context.for_function(function_id) {
+            Ok(owner) => owner,
+            Err(_) => {
+                return Err(RunError {
+                    error: VmError::InvalidOperand,
+                    frames: Vec::new(),
+                    detail: self.take_error_detail(),
+                });
+            }
+        };
+        let context = &*owner;
         let function = match context.exec_function(function_id) {
             Some(f) => f,
             None => {

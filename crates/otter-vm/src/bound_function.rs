@@ -84,6 +84,25 @@ pub struct BoundFunctionBody {
     pub(crate) prototype_override: Option<Value>,
 }
 
+impl BoundFunctionBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.target, visitor);
+        crate::code_liveness::visit_value(&self.bound_this, visitor);
+        for value in &self.bound_args {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for property in [&self.name_property, &self.length_property] {
+            let BoundFunctionMetadataProperty::Overridden(descriptor) = property else {
+                continue;
+            };
+            crate::code_liveness::visit_descriptor(descriptor, visitor);
+        }
+    }
+}
+
 fn no_extra_roots(_: &mut dyn FnMut(*mut RawGc)) {}
 
 /// Cheap-to-clone handle for [`BoundFunctionBody`].

@@ -367,6 +367,13 @@ pub struct JsRegExpBody {
 }
 
 impl JsRegExpBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.last_index.borrow(), visitor);
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+
     /// Sever foreign ownership after a snapshot restore.
     ///
     /// A restored body's `regex`, `pattern_utf16` and `source` alias the

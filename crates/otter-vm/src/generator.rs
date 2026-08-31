@@ -129,6 +129,39 @@ pub struct GeneratorBody {
     pub async_state: AsyncGeneratorState,
 }
 
+impl GeneratorBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(frame) = &self.frame {
+            frame.visit_function_ids(visitor);
+        }
+        if let Some(cold) = &self.cold {
+            cold.visit_function_ids(visitor);
+        }
+        for value in [self.yielded, self.prototype_override, self.expando]
+            .into_iter()
+            .flatten()
+        {
+            crate::code_liveness::visit_value(&value, visitor);
+        }
+        for request in &self.async_requests {
+            match &request.resume {
+                GeneratorResumeKind::Next(value)
+                | GeneratorResumeKind::Return(value)
+                | GeneratorResumeKind::Throw(value) => {
+                    crate::code_liveness::visit_value(value, visitor);
+                }
+            }
+            for value in [
+                &request.capability.promise,
+                &request.capability.resolve,
+                &request.capability.reject,
+            ] {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+    }
+}
+
 fn trace_parked_frame_state(field: &Option<Box<ParkedFrameState>>, visitor: &mut SlotVisitor<'_>) {
     if let Some(state) = field {
         state.trace_slots(visitor);
@@ -196,6 +229,17 @@ pub struct ParkedFrameBody {
     frame: Option<Box<ParkedFrameState>>,
     #[pelt(via = trace_generator_cold)]
     cold: Option<Box<crate::cold_frame::ColdFrame>>,
+}
+
+impl ParkedFrameBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(frame) = &self.frame {
+            frame.visit_function_ids(visitor);
+        }
+        if let Some(cold) = &self.cold {
+            cold.visit_function_ids(visitor);
+        }
+    }
 }
 
 impl JsGenerator {

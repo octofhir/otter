@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use otter_runtime::{
-    Runtime, RuntimeHostDataTracer, RuntimeHostValueSlot, RuntimeTracedHostObjectData, SourceInput,
+    Runtime, RuntimeHostCodeLivenessTracer, RuntimeHostDataTracer, RuntimeHostValueSlot,
+    RuntimeTracedHostObjectData, SourceInput,
 };
 
 struct ListenerPayload {
@@ -23,6 +24,10 @@ struct ListenerPayload {
 impl RuntimeTracedHostObjectData for ListenerPayload {
     fn trace_gc_slots(&mut self, tracer: &mut RuntimeHostDataTracer<'_>) {
         tracer.trace(&mut self.callback);
+    }
+
+    fn visit_function_ids(&self, tracer: &mut RuntimeHostCodeLivenessTracer<'_>) {
+        tracer.trace(&self.callback);
     }
 }
 

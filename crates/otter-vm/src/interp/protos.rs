@@ -453,9 +453,12 @@ impl Interpreter {
                 if let Some(over) = self.ordinary_function_prototype_override(owner, function_id) {
                     return Ok(over);
                 }
-                if let Some(chunk) = self.code_space.chunk_for(function_id)
-                    && let Some(local) = function_id.checked_sub(chunk.function_base)
-                    && let Some(function) = chunk.module.functions.get(local as usize)
+                if let crate::code_space::ChunkResolution::Live {
+                    function_base,
+                    payload,
+                } = self.code_space.resolve_chunk(function_id)
+                    && let Some(local) = function_id.checked_sub(function_base)
+                    && let Some(function) = payload.module.functions.get(local as usize)
                     && let Some(proto) = self.function_kind_prototypes.kind_prototype_for_flags(
                         function.is_generator,
                         function.is_async || function.is_async_generator,

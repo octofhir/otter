@@ -550,6 +550,14 @@ impl otter_gc::SafeTraceable for TypedArrayBodyGc {
     }
 }
 
+impl TypedArrayBodyGc {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.custom_proto {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 /// 4-byte compressed GC handle to a [`TypedArrayBodyGc`]. `Copy`.
 /// Packs into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type TypedArrayHandle = otter_gc::Gc<TypedArrayBodyGc>;

@@ -60,6 +60,11 @@ impl Interpreter {
         // foreign chunk so repeated foreign-frame ticks don't re-lock
         // the code-space registry.
         let mut foreign_context: Option<ExecutionContext> = None;
+        // Call-target owners are separate from `foreign_context`: the current
+        // function may borrow the latter for the whole opcode, while this
+        // epoch-validated cache can retain sibling callees without cloning an
+        // owner on every call.
+        let mut function_owner_cache = crate::call_ops::FunctionOwnerCache::new(entry_context);
         // Hoisted once per turn: the budget config does not change mid-turn,
         // so the per-op checkpoint only needs to run when enforcement is on.
         // In the default Observe mode this collapses to a not-taken branch.
@@ -163,7 +168,7 @@ impl Interpreter {
                             .is_some_and(|c| c.covers_function(function_id));
                         if !cached_covers {
                             foreign_context = match entry_context.for_function(function_id) {
-                                Some(code_space::ResolvedCtx::Owned(owned)) => {
+                                Ok(code_space::ResolvedCtx::Owned(owned)) => {
                                     // Foreign chunks linked after this loop
                                     // started (eval during this turn) carry
                                     // IC sites past the entry chunk's range.
@@ -276,7 +281,7 @@ impl Interpreter {
                         );
                     }
                     let depth_before = stack.len();
-                    let static_native_target = if jit_installed {
+                    let callee_value =
                         register_operand(function.operand(instr, 1))
                             .ok()
                             .and_then(|register| {
@@ -284,7 +289,9 @@ impl Interpreter {
                                     .get(top_idx)
                                     .and_then(|frame| frame.registers.get(register as usize))
                                     .copied()
-                            })
+                            });
+                    let static_native_target = if jit_installed {
+                        callee_value
                             .and_then(Value::as_native_function)
                             .and_then(|native| {
                                 crate::jit_static_native::jit_static_call_target(
@@ -295,7 +302,7 @@ impl Interpreter {
                     } else {
                         None
                     };
-                    self.do_call_exec(stack, context, function, instr)?;
+                    self.do_call_exec(stack, context, &mut function_owner_cache, function, instr)?;
                     // Record the resolved typed target before a tier-up hook
                     // consumes a newly pushed bytecode frame. Static natives
                     // complete synchronously and therefore leave stack depth
@@ -342,7 +349,13 @@ impl Interpreter {
                     if self.interrupt.is_set() {
                         return Err(VmError::Interrupted);
                     }
-                    self.do_tail_call_exec(stack, context, function, instr)?;
+                    self.do_tail_call_exec(
+                        stack,
+                        context,
+                        &mut function_owner_cache,
+                        function,
+                        instr,
+                    )?;
                     continue;
                 }
                 Op::CallWithThis => {
@@ -360,7 +373,13 @@ impl Interpreter {
                         );
                     }
                     let depth_before = stack.len();
-                    self.do_call_with_this_exec(stack, context, function, instr)?;
+                    self.do_call_with_this_exec(
+                        stack,
+                        context,
+                        &mut function_owner_cache,
+                        function,
+                        instr,
+                    )?;
                     let bytecode_pushed = stack.len() > depth_before;
                     if jit_installed && bytecode_pushed {
                         let target = crate::feedback::OrdinaryCallTarget::Bytecode(

@@ -268,7 +268,9 @@ impl Interpreter {
         }
         // See `run_compiled_frame`: the activation must name the chunk owning
         // the OSR-entered frame, not the caller tick's chunk.
-        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let resolved = context
+            .for_function(fid)
+            .map_err(|_| VmError::InvalidOperand)?;
         let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let optimized_outcome = self
             .resolve_optimized_osr_code(context, fid, osr_pc)
@@ -777,7 +779,7 @@ impl Interpreter {
         // CALLER's ambient chunk, and runtime stubs decode published pcs and
         // constant indices through the activation — a foreign chunk's tables
         // resolve the same function id to a different function.
-        let resolved = context.for_function(fid)?;
+        let resolved = context.for_function(fid).ok()?;
         let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
         if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
@@ -1171,8 +1173,8 @@ impl Interpreter {
             .get(top_idx)
             .map_or(u32::MAX, |frame| frame.function_id);
         let resolved = match context.for_function(fid) {
-            Some(resolved) => resolved,
-            None => return jit::JitExecOutcome::Fatal(VmError::InvalidOperand),
+            Ok(resolved) => resolved,
+            Err(_) => return jit::JitExecOutcome::Fatal(VmError::InvalidOperand),
         };
         // SAFETY: the raw pointers are formed from this method's own live
         // borrows (`self`, `stack`, `resolved`) and are valid for the duration

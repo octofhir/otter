@@ -281,6 +281,17 @@ pub(crate) const NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET: usize =
 const _: () = assert!(NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET == 0);
 
 impl NativeFunctionBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for property in [&self.name_property, &self.length_property] {
+            if let NativeOwnProperty::Overridden(descriptor) = property {
+                crate::code_liveness::visit_descriptor(descriptor, visitor);
+            }
+        }
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+
     /// Describe this body's non-GC payload for
     /// [`crate::native_census`]. Lives here because the storage enum
     /// and the raw entry address are module-private; the census

@@ -412,6 +412,20 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
+    /// Unlink every installed generation. Chunk reclamation uses this
+    /// conservative boundary because an installed caller may have inlined a
+    /// function from the retiring chunk even when its own id lies elsewhere.
+    pub(crate) fn invalidate_all(&mut self) -> Vec<u32> {
+        let seeds = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                (registered.state == CodeLifetimeState::Installed).then_some(code_object_id)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_code_objects(seeds)
+    }
+
     /// Unlink one exact installed generation while preserving every other tier
     /// and OSR body for the same function.
     ///

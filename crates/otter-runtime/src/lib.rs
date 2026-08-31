@@ -160,7 +160,7 @@ pub use otter_resource::{
     ResourceLimitsBuilder, ResourceReservation, ResourceSnapshot, ResourceSnapshotEntry,
     SharedSource, SharedSourceBuilder, SharedSourceError,
 };
-pub use otter_vm::CpuProfile;
+pub use otter_vm::{CodeEvictionStats, CpuProfile};
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{
     ExecutionContext as RuntimeExecutionContext, PersistentRootId as RuntimePersistentRootId,
@@ -202,17 +202,17 @@ pub use structured_clone::{
 pub use surface::{
     HostAtomInterner, RuntimeAccessorSpec, RuntimeAttr, RuntimeClassSpec, RuntimeConstSpec,
     RuntimeConstValue, RuntimeConstructorSpec, RuntimeHostAtom, RuntimeHostAtomId,
-    RuntimeHostDataTracer, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeHostValueSlot,
-    RuntimeJsObject, RuntimeJsString, RuntimeLocal, RuntimeMethodSpec, RuntimeNamespaceSpec,
-    RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn,
-    RuntimeNativeScope, RuntimeNumberValue, RuntimeObjectLayout, RuntimePendingValue,
-    RuntimePendingValues, RuntimePropertySpec, RuntimeSurfaceError, RuntimeTracedHostObjectData,
-    RuntimeValue, runtime_accessor, runtime_alloc_object, runtime_arg_to_string,
-    runtime_array_from_elements, runtime_class, runtime_constant, runtime_constructor,
-    runtime_getter, runtime_method, runtime_method_with_attrs, runtime_namespace,
-    runtime_native_dynamic, runtime_native_static, runtime_optional_arg_to_string,
-    runtime_property, runtime_set_property, runtime_string_value, runtime_this_object,
-    runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeHostCodeLivenessTracer, RuntimeHostDataTracer, RuntimeHostObjectData,
+    RuntimeHostObjectError, RuntimeHostValueSlot, RuntimeJsObject, RuntimeJsString, RuntimeLocal,
+    RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall, RuntimeNativeCtx,
+    RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNativeScope,
+    RuntimeNumberValue, RuntimeObjectLayout, RuntimePendingValue, RuntimePendingValues,
+    RuntimePropertySpec, RuntimeSurfaceError, RuntimeTracedHostObjectData, RuntimeValue,
+    runtime_accessor, runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements,
+    runtime_class, runtime_constant, runtime_constructor, runtime_getter, runtime_method,
+    runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
+    runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
+    runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
 };
 pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
@@ -4180,11 +4180,14 @@ impl Runtime {
         }
         self.register_resolved_exports(&linked.metadata);
         self.register_module_sources(&linked.module_sources);
-        let context = self.interp.link_module(linked.module).map_err(|error| {
-            DynLoadError::type_error(format!(
-                "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
-            ))
-        })?;
+        let context = self
+            .interp
+            .link_evictable_module(linked.module)
+            .map_err(|error| {
+                DynLoadError::type_error(format!(
+                    "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
+                ))
+            })?;
         // Hosted builtins in this batch get their real namespaces (running
         // their installers when needed); plain modules get fresh
         // environments — the same records pipeline the static loader uses.
@@ -4199,6 +4202,8 @@ impl Runtime {
             .map_err(|e| {
                 DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
             })?;
+        self.module_records
+            .retain_linked_context(self.interp.active_host_realm_id(), &context);
         // §13.3.10 step 7 — Evaluate(target): the records-backed
         // InnerModuleEvaluation walks the target's eager dependency
         // closure, parking on top-level await instead of blocking.
@@ -5086,11 +5091,10 @@ impl Runtime {
 
     /// Force a full GC cycle (scavenge + old-gen mark-sweep).
     ///
-    /// **Debug / test only.** Production code must never call
-    /// this — the GC's own triggers are tuned to allocation
-    /// pressure, and a forced cycle perturbs those metrics.
-    /// Tests use this to assert "after dropping these handles
-    /// and forcing a GC, live counts return to baseline".
+    /// This explicit embedding hook is primarily for diagnostics and tests;
+    /// ordinary collection remains allocation-pressure driven. The runtime's
+    /// between-turn code-reclamation policy uses the same complete collection
+    /// internally before its liveness census.
     ///
     /// The walker delegates to
     /// [`otter_vm::runtime_state::RuntimeState::trace_roots`]
@@ -5098,6 +5102,30 @@ impl Runtime {
     /// owns the heap and does the split-borrow internally.
     pub fn force_gc(&mut self) -> Result<(), OtterError> {
         self.interp.force_gc().map_err(Into::into)
+    }
+
+    /// Current per-isolate dynamic-code reclamation counters.
+    #[must_use]
+    pub fn code_eviction_stats(&self) -> CodeEvictionStats {
+        self.interp.code_eviction_stats()
+    }
+
+    /// Configure the retained-byte high-water mark checked between turns.
+    ///
+    /// A zero threshold is useful for deterministic embedding tests. Normal
+    /// runtimes use [`Interpreter::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES`].
+    pub fn set_code_eviction_high_water_bytes(&mut self, bytes: u64) {
+        self.interp.set_code_eviction_high_water_bytes(bytes);
+    }
+
+    /// Run the between-turn liveness census and reclaim eligible dynamic code
+    /// until the configured retained-byte target is met.
+    ///
+    /// # Errors
+    /// Returns an out-of-memory error if the full collection required for the
+    /// census cannot complete.
+    pub fn reclaim_dynamic_code(&mut self) -> Result<(), OtterError> {
+        self.interp.reclaim_dynamic_code().map_err(Into::into)
     }
 
     /// Configured stack-depth cap.
@@ -6017,6 +6045,8 @@ impl Runtime {
         }
         let codeblock_started = timings.is_some().then(std::time::Instant::now);
         let context = self.interp.link_module(module)?;
+        self.module_records
+            .retain_linked_context(realm_id, &context);
         self.module_records.mark_evaluating(realm_id);
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), codeblock_started) {
             timings.compile_time_ns = timings
@@ -7592,11 +7622,13 @@ fn evaluate_dynamic_linked_module_on(
     for (url, text) in &linked.module_sources {
         interp.register_module_source(url.clone(), text.clone());
     }
-    let context = interp.link_module(linked.module).map_err(|error| {
-        DynLoadError::type_error(format!(
-            "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
-        ))
-    })?;
+    let context = interp
+        .link_evictable_module(linked.module)
+        .map_err(|error| {
+            DynLoadError::type_error(format!(
+                "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
+            ))
+        })?;
     for init in context.module_inits() {
         if interp.module_env(&init.url).is_some() {
             continue;

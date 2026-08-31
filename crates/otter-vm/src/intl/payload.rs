@@ -484,6 +484,14 @@ pub struct IntlBody {
     pub user_props: Option<crate::object::JsObject>,
 }
 
+impl IntlBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 /// 4-byte compressed GC handle to an [`IntlBody`]. `Copy`. Packs
 /// into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type IntlHandle = otter_gc::Gc<IntlBody>;

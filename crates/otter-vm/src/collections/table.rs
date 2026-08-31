@@ -56,6 +56,9 @@ pub trait TableEntry: Sized + 'static {
     /// Visit every GC reference this entry holds.
     fn trace_entry(&mut self, visitor: &mut SlotVisitor<'_>);
 
+    /// Visit every immediate bytecode function id this entry holds.
+    fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32));
+
     /// Hash of this entry's key, or `None` when the key is not
     /// chainable and must be found by linear scan.
     fn entry_hash(&self) -> Option<u64>;
@@ -198,6 +201,12 @@ impl<E: TableEntry> OrderedTableBody<E> {
         // SAFETY: the first `len` records were written before the table
         // became reachable.
         unsafe { std::slice::from_raw_parts(self.entries_ptr().cast_const(), self.len()) }
+    }
+
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for entry in self.entries() {
+            entry.visit_function_ids(visitor);
+        }
     }
 
     /// The appended entries, mutably.

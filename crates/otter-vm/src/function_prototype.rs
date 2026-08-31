@@ -153,9 +153,10 @@ fn throw_restricted_function_property(
             .map(|c| c.cached_function_id)
     });
     if let (Some(fid), Some(exec)) = (fid, ctx.execution_context().cloned())
-        && !exec.function_is_strict(fid)
-        && !exec.function_is_arrow(fid)
-        && exec
+        && let Ok(owner) = exec.for_function(fid)
+        && !owner.function_is_strict(fid)
+        && !owner.function_is_arrow(fid)
+        && owner
             .function(fid)
             .is_some_and(|f| !f.is_generator && !f.is_async && !f.is_method)
     {

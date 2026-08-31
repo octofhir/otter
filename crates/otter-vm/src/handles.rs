@@ -144,6 +144,12 @@ impl HandleArena {
             slot.trace_value_slots(visitor);
         }
     }
+
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for value in &self.slots {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
 }
 
 /// Collector-traced scratch roots for values that have not entered a heap

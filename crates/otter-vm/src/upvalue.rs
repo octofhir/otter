@@ -58,6 +58,12 @@ pub struct UpvalueCellBody {
     pub value: Value,
 }
 
+impl UpvalueCellBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.value, visitor);
+    }
+}
+
 /// Compressed handle to an [`UpvalueCellBody`]. `Copy + Eq + Hash`
 /// (inherited from [`otter_gc::Gc`]); identity comparison via
 /// `cell == other`.

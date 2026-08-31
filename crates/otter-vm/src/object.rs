@@ -37,6 +37,8 @@
 //! - [`JsObject`] / [`ObjectBody`] / [`Properties`] — the public object handle,
 //!   the GC-allocated storage, and the read-only view used by JSON
 //!   serialisation and `Object.keys` enumeration.
+//! - [`HostDataTracer`] / [`HostCodeLivenessTracer`] — safe paired visitors for
+//!   host payloads that retain JavaScript values.
 //!
 //! # Invariants
 //! - Insertion order is encoded by the GC shape chain, or by
@@ -58,6 +60,8 @@
 //!   prototype assignment, and every symbol-property write records
 //!   the store through [`otter_gc::GcHeap::record_write`] so the
 //!   generational and incremental marker observe the new pointer.
+//! - Traced host payloads enumerate the same strong slots for moving-GC
+//!   tracing and the allocation-free dynamic-code liveness census.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-property-attributes>
@@ -206,6 +210,18 @@ pub struct HostDataTracer<'a> {
     visitor: &'a mut SlotVisitor<'a>,
 }
 
+/// Allocation-free function-id visitor paired with [`HostDataTracer`].
+pub struct HostCodeLivenessTracer<'a> {
+    visitor: &'a mut dyn FnMut(u32),
+}
+
+impl HostCodeLivenessTracer<'_> {
+    /// Visit one strong host slot for dynamic-code reachability.
+    pub fn trace(&mut self, slot: &HostValueSlot) {
+        crate::code_liveness::visit_value(&slot.value, self.visitor);
+    }
+}
+
 impl HostDataTracer<'_> {
     /// Trace one strong host slot.
     pub fn trace(&mut self, slot: &mut HostValueSlot) {
@@ -223,12 +239,16 @@ impl HostDataTracer<'_> {
 pub trait TracedHostObjectData: Any {
     /// Enumerate every strong JavaScript slot owned by this payload.
     fn trace_gc_slots(&mut self, tracer: &mut HostDataTracer<'_>);
+
+    /// Enumerate the same strong slots without allocating during a code census.
+    fn visit_function_ids(&self, tracer: &mut HostCodeLivenessTracer<'_>);
 }
 
 trait ErasedTracedHostObjectData {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn trace_gc_slots_erased(&mut self, visitor: &mut SlotVisitor<'_>);
+    fn visit_function_ids_erased(&self, visitor: &mut dyn FnMut(u32));
 }
 
 impl<T: TracedHostObjectData> ErasedTracedHostObjectData for T {
@@ -243,6 +263,11 @@ impl<T: TracedHostObjectData> ErasedTracedHostObjectData for T {
     fn trace_gc_slots_erased(&mut self, visitor: &mut SlotVisitor<'_>) {
         let mut tracer = HostDataTracer { visitor };
         self.trace_gc_slots(&mut tracer);
+    }
+
+    fn visit_function_ids_erased(&self, visitor: &mut dyn FnMut(u32)) {
+        let mut tracer = HostCodeLivenessTracer { visitor };
+        self.visit_function_ids(&mut tracer);
     }
 }
 
@@ -276,6 +301,12 @@ impl HostData {
     fn trace_gc_slots(&mut self, visitor: &mut SlotVisitor<'_>) {
         if let Self::Traced(data) = self {
             data.trace_gc_slots_erased(visitor);
+        }
+    }
+
+    fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Self::Traced(data) = self {
+            data.visit_function_ids_erased(visitor);
         }
     }
 }
@@ -366,6 +397,13 @@ pub struct AccessorCellBody {
     pub getter: Value,
     /// `[[Set]]` — a callable, or `undefined` when absent.
     pub setter: Value,
+}
+
+impl AccessorCellBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.getter, visitor);
+        crate::code_liveness::visit_value(&self.setter, visitor);
+    }
 }
 
 /// Allocate an [`AccessorCellBody`] for an accessor pair and return a
@@ -763,6 +801,16 @@ pub struct ObjectBody {
     slab_len: u16,
 }
 
+impl ObjectBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if self.slab.is_null() {
+            for value in &self.inline_values[..self.slab_len as usize] {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+    }
+}
+
 /// In-body inline string-keyed slot capacity. Objects with this many own data
 /// properties or fewer carry their slab in [`ObjectBody::inline_values`]; larger
 /// objects spill the whole slab to the out-of-line `values` vector.
@@ -942,6 +990,23 @@ impl otter_gc::SafeTraceable for ExoticSlots {
         }
         if let Some(data) = self.host_data.as_mut() {
             data.trace_gc_slots(v);
+        }
+    }
+}
+
+impl ExoticSlots {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(ObjectPrototype::Value(value)) = &self.proto_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        if let Some(value) = &self.call_native {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        if let Some(value) = &self.constructor_native {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        if let Some(data) = &self.host_data {
+            data.visit_function_ids(visitor);
         }
     }
 }
@@ -1520,6 +1585,24 @@ impl otter_gc::SafeTraceable for SymbolPropsBody {
     /// pending copy on the stack has nothing to trace: everything
     /// `trace_slots_safe` walks is storage that does not exist yet.
     fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
+}
+
+impl SymbolPropsBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for (_, slot) in self.entries() {
+            match &slot.kind {
+                SlotKind::Data => crate::code_liveness::visit_value(&slot.value, visitor),
+                SlotKind::Accessor(pair) => {
+                    if let Some(value) = &pair.getter {
+                        crate::code_liveness::visit_value(value, visitor);
+                    }
+                    if let Some(value) = &pair.setter {
+                        crate::code_liveness::visit_value(value, visitor);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SlotMetaBody`].
@@ -4496,6 +4579,10 @@ impl ModuleNamespaceData {
 impl TracedHostObjectData for ModuleNamespaceData {
     fn trace_gc_slots(&mut self, tracer: &mut HostDataTracer<'_>) {
         tracer.trace(&mut self.env);
+    }
+
+    fn visit_function_ids(&self, tracer: &mut HostCodeLivenessTracer<'_>) {
+        tracer.trace(&self.env);
     }
 }
 

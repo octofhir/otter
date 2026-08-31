@@ -225,7 +225,7 @@ impl Interpreter {
         let function_id = frame.function_id();
         let resolved = context
             .for_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)?;
         let saved_pc = frame.pc();
         let result = self.run_load_builtin_error_active(&resolved, frame, dst, kind_index);
         frame.set_pc(saved_pc);
@@ -277,7 +277,7 @@ impl Interpreter {
         }
         let resolved = context
             .for_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)?;
         let saved_pc = frame.pc();
         let result = self.run_make_closure_active_regs(
             &resolved,
@@ -311,7 +311,7 @@ impl Interpreter {
         }
         let resolved = context
             .for_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)?;
         let saved_pc = frame.pc();
         let result = self.run_make_function_active_reg(&resolved, frame, dst, function_index);
         frame.set_pc(saved_pc);

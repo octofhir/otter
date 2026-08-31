@@ -235,6 +235,14 @@ pub struct MapBody {
     expando: Option<crate::object::JsObject>,
 }
 
+impl MapBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 pub(crate) const MAP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
     std::mem::offset_of!(MapBody, jit_guard_flags);
 
@@ -280,6 +288,13 @@ impl table::TableEntry for MapEntry {
 
     fn trace_entry(&mut self, visitor: &mut SlotVisitor<'_>) {
         <Self as crate::pelt::PeltField>::pelt_trace(self, visitor);
+    }
+
+    fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if self.is_live() {
+            crate::code_liveness::visit_value(&self.key, visitor);
+            crate::code_liveness::visit_value(&self.value, visitor);
+        }
     }
 
     fn entry_hash(&self) -> Option<u64> {
@@ -828,6 +843,14 @@ pub struct SetBody {
     expando: Option<crate::object::JsObject>,
 }
 
+impl SetBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 pub(crate) const SET_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
     std::mem::offset_of!(SetBody, jit_guard_flags);
 
@@ -846,6 +869,15 @@ impl table::TableEntry for SetEntry {
 
     fn trace_entry(&mut self, visitor: &mut SlotVisitor<'_>) {
         <Self as crate::pelt::PeltField>::pelt_trace(self, visitor);
+    }
+
+    fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(MapKey::ObjectValue(value)) = &self.key_hash {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        if let Some(value) = &self.value {
+            crate::code_liveness::visit_value(value, visitor);
+        }
     }
 
     fn entry_hash(&self) -> Option<u64> {
@@ -1228,6 +1260,14 @@ pub struct WeakMapBody {
     expando: Option<crate::object::JsObject>,
 }
 
+impl WeakMapBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
+}
+
 pub(crate) fn weak_map_expando(
     map: JsWeakMap,
     heap: &otter_gc::GcHeap,
@@ -1479,6 +1519,14 @@ pub struct WeakSetBody {
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
     expando: Option<crate::object::JsObject>,
+}
+
+impl WeakSetBody {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if let Some(value) = &self.prototype_override {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+    }
 }
 
 fn weak_set_ephemeron_walk(

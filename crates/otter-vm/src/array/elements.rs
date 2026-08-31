@@ -145,6 +145,17 @@ impl ElementSlabBody {
         self.data_ptr().cast()
     }
 
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        if self.kind != DenseElementKind::Tagged {
+            return;
+        }
+        for index in 0..self.len() {
+            // SAFETY: tagged values in the live prefix are initialized before
+            // `len` is published.
+            crate::code_liveness::visit_value(unsafe { &*self.values_ptr().add(index) }, visitor);
+        }
+    }
+
     #[inline]
     fn doubles_ptr(&self) -> *mut f64 {
         self.data_ptr().cast()

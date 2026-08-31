@@ -10,6 +10,7 @@
 //! - Spread and explicit-`this` call forms.
 //! - Stack-owned generated-call upvalue-spine initialization.
 //! - Same-stack synchronous re-entry and reusable lean callback frames.
+//! - Dispatch-local owner resolution for cross-chunk callees.
 //!
 //! # Invariants
 //! - Call-site helpers advance the caller PC before pushing or synchronously
@@ -32,7 +33,10 @@
 //!   current rooted stack; native boundary slots are collector-rewritten in
 //!   their original storage.
 //! - Lean callback state owns reusable frame storage, never a detached stack;
-//!   caller argument slots remain traced through allocating frame setup.
+//!   caller argument slots remain traced through allocating frame setup, and
+//!   the callback's owning code payload stays retained for the loop.
+//! - Cross-chunk call resolution caches owned contexts only for one dispatch
+//!   and invalidates them against the code-space publication epoch.
 //! - A freshly-started generator remains in a moving GC root through observable
 //!   `prototype` lookup and publication into the caller.
 //!
@@ -312,6 +316,17 @@ pub(crate) struct LeanCallbackRoot {
 }
 
 impl LeanCallbackRoot {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        visitor(self.function_id);
+        crate::code_liveness::visit_value(&self.callback, visitor);
+        for value in [self.bound_this, self.bound_new_target]
+            .into_iter()
+            .flatten()
+        {
+            crate::code_liveness::visit_value(&value, visitor);
+        }
+    }
+
     fn from_callback(callback: Value, heap: &otter_gc::GcHeap) -> Option<Self> {
         if let Some(function_id) = callback.as_function() {
             return Some(Self {
@@ -375,9 +390,70 @@ impl LeanCallbackRoot {
     }
 }
 
+const FUNCTION_OWNER_CACHE_CAPACITY: usize = 4;
+
+/// Dispatch-local cache for resolving call targets owned by sibling chunks.
+///
+/// Entries are epoch-validated and live no longer than their activation
+/// dispatch, so they remove the payload read lock from repeated call sites
+/// without becoming between-turn liveness roots.
+pub(crate) struct FunctionOwnerCache {
+    epoch: u64,
+    entries: [Option<ExecutionContext>; FUNCTION_OWNER_CACHE_CAPACITY],
+    next: usize,
+}
+
+impl FunctionOwnerCache {
+    pub(crate) fn new(context: &ExecutionContext) -> Self {
+        Self {
+            epoch: context.space().epoch(),
+            entries: std::array::from_fn(|_| None),
+            next: 0,
+        }
+    }
+
+    fn resolve<'a>(
+        &'a mut self,
+        ambient: &'a ExecutionContext,
+        function_id: u32,
+    ) -> Result<&'a ExecutionContext, crate::execution_context::FunctionResolutionError> {
+        if ambient.covers_function(function_id) {
+            return Ok(ambient);
+        }
+        let epoch = ambient.space().epoch();
+        if self.epoch != epoch {
+            self.entries.fill(None);
+            self.epoch = epoch;
+            self.next = 0;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|context| context.covers_function(function_id))
+        }) {
+            return Ok(self.entries[index]
+                .as_ref()
+                .expect("the matching owner-cache entry is present"));
+        }
+        let owner = match ambient.for_function(function_id)? {
+            crate::code_space::ResolvedCtx::Owned(owner) => owner,
+            crate::code_space::ResolvedCtx::Ambient(_) => {
+                unreachable!("foreign owner resolution returned the ambient context")
+            }
+        };
+        let slot = self.next;
+        self.entries[slot] = Some(owner);
+        self.next = (slot + 1) % FUNCTION_OWNER_CACHE_CAPACITY;
+        Ok(self.entries[slot]
+            .as_ref()
+            .expect("the newly cached owner is present"))
+    }
+}
+
 pub(crate) struct LeanCallbackState {
     root_index: usize,
     function_id: u32,
+    context: ExecutionContext,
     /// Callee register-window length, read once from the executable function.
     register_count: usize,
     /// Number of formal parameters to bind on the lean path.
@@ -545,6 +621,10 @@ impl Interpreter {
         prototype: Value,
         roots: &SyncJsCallRoots,
     ) -> Result<Option<(crate::object::ShapeHandle, usize)>, VmError> {
+        let Ok(owner) = context.for_function(function_id) else {
+            return Ok(None);
+        };
+        let context = &*owner;
         let Some(function) = context.exec_function(function_id) else {
             return Ok(None);
         };
@@ -681,14 +761,18 @@ impl Interpreter {
         if derived_function_id != base_function_id {
             chain_functions.push(derived_function_id);
         }
-        let store_count = chain_functions
-            .into_iter()
-            .filter_map(|function_id| context.exec_function(function_id))
-            .map(|function| {
-                crate::constructor_fast_path::match_constructor_shape_stores(context, function)
-                    .len()
-            })
-            .sum::<usize>();
+        let mut store_count = 0usize;
+        for function_id in chain_functions {
+            let Ok(owner) = context.for_function(function_id) else {
+                continue;
+            };
+            let Some(function) = owner.exec_function(function_id) else {
+                continue;
+            };
+            store_count +=
+                crate::constructor_fast_path::match_constructor_shape_stores(&owner, function)
+                    .len();
+        }
         if store_count == 0 || store_count > crate::object::INLINE_SLOT_CAP {
             return Ok(());
         }
@@ -744,8 +828,14 @@ impl Interpreter {
         let derived_function_id = new_target_function_id.filter(|&function_id| {
             function_id != base_function_id
                 && context
-                    .exec_function(function_id)
-                    .is_some_and(|function| function.is_derived_constructor)
+                    .for_function(function_id)
+                    .ok()
+                    .and_then(|owner| {
+                        owner
+                            .exec_function(function_id)
+                            .map(|function| function.is_derived_constructor)
+                    })
+                    .unwrap_or(false)
         });
         let chain_key = (
             base_function_id,
@@ -793,14 +883,17 @@ impl Interpreter {
         let mut seen = rustc_hash::FxHashSet::default();
         let mut reopt_functions = smallvec::SmallVec::<[u32; 2]>::new();
         for function_id in functions {
-            let Some(function) = context.exec_function(function_id) else {
+            let Ok(owner) = context.for_function(function_id) else {
+                break;
+            };
+            let Some(function) = owner.exec_function(function_id) else {
                 break;
             };
             let stores =
-                crate::constructor_fast_path::match_constructor_shape_stores(context, function);
+                crate::constructor_fast_path::match_constructor_shape_stores(&owner, function);
             let simple_init = (function_id == base_function_id)
                 .then(|| {
-                    crate::constructor_fast_path::match_simple_constructor_init(context, function)
+                    crate::constructor_fast_path::match_simple_constructor_init(&owner, function)
                 })
                 .flatten();
             let receiver_is_pre_shaped = simple_init.is_some();
@@ -980,6 +1073,10 @@ impl Interpreter {
         inherited: u16,
     ) -> Result<bool, VmError> {
         let function_id = unsafe { (*frame).header.function_id };
+        let Ok(owner) = context.for_function(function_id) else {
+            return Ok(false);
+        };
+        let context = &*owner;
         let Some(function) = context.exec_function(function_id) else {
             return Ok(false);
         };
@@ -1290,6 +1387,10 @@ impl Interpreter {
     ) -> Result<Frame, VmError> {
         let (function_id, parent_upvalues) =
             Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -1386,6 +1487,10 @@ impl Interpreter {
     ) -> Result<Frame, VmError> {
         let (function_id, parent_upvalues) =
             Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -1555,6 +1660,10 @@ impl Interpreter {
                 limit: self.max_stack_depth,
             });
         }
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -1858,6 +1967,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         callee: &Value,
         this_value: Value,
         operands: ArgumentOperands<'_>,
@@ -1886,6 +1996,9 @@ impl Interpreter {
             }
             Err(_) => return Ok(false),
         };
+        let context = owner_cache
+            .resolve(context, function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -2019,19 +2132,27 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
-        self.do_call_inner(stack, context, ArgumentOperands::decoded(operands.into()))
+        let mut owner_cache = FunctionOwnerCache::new(context);
+        self.do_call_inner(
+            stack,
+            context,
+            &mut owner_cache,
+            ArgumentOperands::decoded(operands.into()),
+        )
     }
 
     pub(crate) fn do_call_exec(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
         self.do_call_inner(
             stack,
             context,
+            owner_cache,
             ArgumentOperands::execution(function, instruction),
         )
     }
@@ -2040,6 +2161,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         operands: ArgumentOperands<'_>,
     ) -> Result<(), VmError> {
         // The call header (`dst`, callee, argc) reads from one operand-word
@@ -2061,6 +2183,7 @@ impl Interpreter {
         if self.try_push_bytecode_call_frame_from_window(
             stack,
             context,
+            owner_cache,
             &callee,
             Value::undefined(),
             operands,
@@ -2104,12 +2227,14 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
         self.do_tail_call_inner(
             stack,
             context,
+            owner_cache,
             ArgumentOperands::execution(function, instruction),
         )
     }
@@ -2118,6 +2243,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         operands: ArgumentOperands<'_>,
     ) -> Result<(), VmError> {
         let callee_reg = operands.register(1)?;
@@ -2141,7 +2267,7 @@ impl Interpreter {
             if !tco_safe {
                 // Restore ordinary call semantics: `do_call` advances the
                 // caller pc and pushes a fresh callee frame above this one.
-                return self.do_call_inner(stack, context, operands);
+                return self.do_call_inner(stack, context, owner_cache, operands);
             }
             let callee = *read_register(frame, callee_reg)?;
             let args =
@@ -2479,10 +2605,17 @@ impl Interpreter {
         let function_id = current
             .as_function()
             .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()));
-        if function_id
-            .and_then(|id| context.exec_function(id))
-            .is_some_and(|function| function.is_derived_constructor)
-        {
+        if function_id.is_some_and(|id| {
+            context
+                .for_function(id)
+                .ok()
+                .and_then(|owner| {
+                    owner
+                        .exec_function(id)
+                        .map(|function| function.is_derived_constructor)
+                })
+                .unwrap_or(false)
+        }) {
             // A derived constructor has no receiver until `super(...)`.
             // Preserve the caller's stable argument window and push the frame
             // directly: no prototype lookup, receiver allocation, or Vec copy
@@ -3253,12 +3386,14 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
         self.do_call_with_this_inner(
             stack,
             context,
+            owner_cache,
             ArgumentOperands::execution(function, instruction),
         )
     }
@@ -3267,6 +3402,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        owner_cache: &mut FunctionOwnerCache,
         operands: ArgumentOperands<'_>,
     ) -> Result<(), VmError> {
         let dst = operands.register(0)?;
@@ -3280,6 +3416,7 @@ impl Interpreter {
         if self.try_push_bytecode_call_frame_from_window(
             stack,
             context,
+            owner_cache,
             &callee,
             this_value,
             operands,
@@ -3548,7 +3685,8 @@ impl Interpreter {
         callback: Value,
     ) -> Option<LeanCallbackState> {
         let root = LeanCallbackRoot::from_callback(callback, &self.gc_heap)?;
-        let function = context.exec_function(root.function_id).filter(|f| {
+        let owner = context.for_function(root.function_id).ok()?;
+        let function = owner.exec_function(root.function_id).filter(|f| {
             !f.is_generator
                 && !f.is_async
                 && !f.is_async_generator
@@ -3580,6 +3718,7 @@ impl Interpreter {
             Some(LeanCallbackState {
                 root_index,
                 function_id,
+                context: (*owner).clone(),
                 register_count,
                 param_count,
                 this_passthrough,
@@ -3627,6 +3766,10 @@ impl Interpreter {
             &self.gc_heap,
         )?;
         roots.set_receiver(this_for_callee);
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -3811,10 +3954,11 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         state: &mut LeanCallbackState,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         effective_this: Value,
         effective_args: &[Value],
     ) -> Result<Value, VmError> {
+        let context = state.context.clone();
         // Prepared fast path: a callback that needs no pooled cold record
         // resolves its compiled body once and then re-enters that body with a
         // recycled frame, so per element only the receiver coercion (cached),
@@ -3824,7 +3968,7 @@ impl Interpreter {
         if state.fast_reuse {
             let already_compiled = state.compiled.is_some();
             if state.compiled.is_none() {
-                state.compiled = self.resolve_jit_code_for_fid(context, state.function_id);
+                state.compiled = self.resolve_jit_code_for_fid(&context, state.function_id);
             }
             if let Some(code) = state.compiled.clone() {
                 if already_compiled {
@@ -3833,7 +3977,7 @@ impl Interpreter {
                 return self.invoke_prepared_lean(
                     stack,
                     state,
-                    context,
+                    &context,
                     &code,
                     effective_this,
                     effective_args,
@@ -3845,7 +3989,7 @@ impl Interpreter {
             return self.invoke_cold_lean(
                 stack,
                 state,
-                context,
+                &context,
                 effective_this,
                 effective_args,
                 false,
@@ -3854,7 +3998,7 @@ impl Interpreter {
         // Callback carries a bound `new.target` / derived-`this` cell / captured
         // eval environment: build a fresh frame per element and tier up through
         // the synchronous-entry path as before.
-        self.invoke_cold_lean(stack, state, context, effective_this, effective_args, true)
+        self.invoke_cold_lean(stack, state, &context, effective_this, effective_args, true)
     }
 
     /// Re-enter the callback's already-compiled body with the recycled frame

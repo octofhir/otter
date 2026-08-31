@@ -13,6 +13,48 @@
 use crate::*;
 
 impl Interpreter {
+    pub(crate) fn visit_root_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for value in self.template_objects.values() {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for value in self.string_constant_cells.values() {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for value in self.small_int_string_cache.iter().flatten() {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for value in self.bigint_constant_cache.values() {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for root in &self.lean_callback_roots {
+            root.visit_function_ids(visitor);
+        }
+        self.handle_arena.visit_function_ids(visitor);
+        self.microtasks.visit_function_ids(visitor);
+        for value in self
+            .module_records
+            .values()
+            .filter_map(|record| record.evaluation_error.as_ref())
+            .chain(self.function_prototype_overrides.values())
+            .chain(self.pending_generator_throw.iter())
+            .chain(self.pending_uncaught_throw.iter())
+            .chain(std::iter::once(&self.async_context))
+            .chain(self.iteration_anchors.iter())
+        {
+            crate::code_liveness::visit_value(value, visitor);
+        }
+        for realm in &self.extra_realms {
+            for value in realm.template_objects.values().chain(
+                realm
+                    .module_records
+                    .values()
+                    .filter_map(|record| record.evaluation_error.as_ref()),
+            ) {
+                crate::code_liveness::visit_value(value, visitor);
+            }
+        }
+    }
+
     /// Iterator over every `module_env` object in the per-run
     /// module-environment registry. Used by the GC root
     /// walker (task 75) — values are `JsObject`s holding

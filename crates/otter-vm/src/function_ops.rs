@@ -1492,8 +1492,11 @@ impl Interpreter {
         {
             return Ok(true);
         }
+        let owner_context = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         Ok(key == "prototype"
-            && context.function_has_prototype_property(function_id)
+            && owner_context.function_has_prototype_property(function_id)
             && !self
                 .function_deleted_metadata
                 .contains(&(function_id, "prototype")))
@@ -1533,7 +1536,10 @@ impl Interpreter {
         function_id: u32,
     ) -> Vec<String> {
         let mut keys = Vec::new();
-        let has_prototype = context.function_has_prototype_property(function_id);
+        let has_prototype = context
+            .for_function(function_id)
+            .ok()
+            .is_some_and(|owner| owner.function_has_prototype_property(function_id));
         let deleted = |key: &'static str| self.ordinary_metadata_deleted(owner, function_id, key);
         if !deleted("length") {
             keys.push("length".to_string());
@@ -1664,6 +1670,10 @@ impl Interpreter {
         let Some(context) = context else {
             return Ok(None);
         };
+        let owner_context = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner_context;
         let owner_bag = self.callable_bag_read(owner, function_id);
         let owner_deleted = self.callable_deleted_flags(owner);
         let mut ctx = function_metadata::FunctionMetadataContext::new(
@@ -1719,7 +1729,10 @@ impl Interpreter {
             None => {
                 let has_virtual_prototype = context.is_some_and(|context| {
                     key == "prototype"
-                        && context.function_has_prototype_property(function_id)
+                        && context
+                            .for_function(function_id)
+                            .ok()
+                            .is_some_and(|owner| owner.function_has_prototype_property(function_id))
                         && !self
                             .function_deleted_metadata
                             .contains(&(function_id, "prototype"))
@@ -2282,6 +2295,10 @@ impl Interpreter {
         let Some(fid) = fid else {
             return Ok(None);
         };
+        let owner = context
+            .for_function(fid)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
         if !self.legacy_function_metadata_eligible(context, fid) {
             return Ok(None);
         }
@@ -2329,17 +2346,20 @@ impl Interpreter {
                 found = frame.self_value == callee;
                 continue;
             }
-            let Some(function) = context.exec_function(frame.function_id) else {
+            let Ok(owner) = context.for_function(frame.function_id) else {
                 continue;
             };
-            let is_main = context
+            let Some(function) = owner.exec_function(frame.function_id) else {
+                continue;
+            };
+            let is_main = owner
                 .function(frame.function_id)
                 .is_none_or(|f| f.name == "<main>");
             if function.is_module || is_main {
                 continue;
             }
-            if context.function_is_strict(frame.function_id)
-                || context
+            if owner.function_is_strict(frame.function_id)
+                || owner
                     .function(frame.function_id)
                     .is_none_or(|f| f.is_generator || f.is_async)
             {
@@ -2518,6 +2538,10 @@ impl Interpreter {
         receiver: Option<Value>,
         name: &str,
     ) -> Result<Value, VmError> {
+        let owner_context = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner_context;
         if name != "prototype" {
             return self.function_property_get_non_prototype(
                 stack,

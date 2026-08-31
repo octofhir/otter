@@ -19,10 +19,9 @@
 //! - The bytecode module is an implementation detail of the
 //!   context. Callers use narrow accessors for function-table,
 //!   constant-pool, and module-resolution reads.
-//! - One context owns one chunk of the interpreter's shared
-//!   [`crate::code_space::CodeSpace`]; function ids are global, and
-//!   fid-keyed reads resolve foreign ids through the registry while
-//!   constant-pool reads stay chunk-local.
+//! - One context owns one live chunk payload in the interpreter's shared
+//!   [`crate::code_space::CodeSpace`]. Table reads are chunk-local; callers
+//!   resolve a foreign function id to its owning context before reading.
 //!
 //! # See also
 //!
@@ -34,9 +33,9 @@
 use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
 use std::sync::Arc;
 
-use crate::code_space::{ChunkTables, CodeSpace, ResolvedCtx};
+use crate::code_space::{ChunkPayload, ChunkResolution, CodeSpace, ResolvedCtx};
 use crate::executable::{CodeBlock, CodeBlockInstruction, ExecutableModule};
-use crate::property_atom::{AtomTable, AtomizedPropertyKey};
+use crate::property_atom::AtomizedPropertyKey;
 
 /// Owned snapshot of bounded ordinary-call feedback in one execution context.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -51,11 +50,22 @@ pub struct CallFeedbackStats {
     pub megamorphic_sites: u64,
 }
 
+/// Typed failure to resolve a global function id to a live chunk context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FunctionResolutionError {
+    /// The id belonged to a linked range whose payload was reclaimed.
+    Evicted {
+        function_id: u32,
+        function_base: u32,
+        function_count: u32,
+    },
+    /// No linked chunk ever covered this id.
+    Unlinked { function_id: u32 },
+}
+
 /// Cloneable dispatch context for VM-owned JS jobs.
 pub struct ExecutionContext {
-    module: Arc<BytecodeModule>,
-    executable: Arc<ExecutableModule>,
-    atoms: Arc<AtomTable>,
+    payload: Arc<ChunkPayload>,
     /// First global function id owned by this chunk. Function-table
     /// lookups subtract this before indexing; ids below the base or
     /// past the table belong to sibling chunks in `space`.
@@ -69,7 +79,7 @@ pub struct ExecutionContext {
 impl std::fmt::Debug for ExecutionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionContext")
-            .field("module", &self.module.module)
+            .field("module", &self.payload.module.module)
             .field("function_base", &self.function_base())
             .finish_non_exhaustive()
     }
@@ -78,9 +88,7 @@ impl std::fmt::Debug for ExecutionContext {
 impl Clone for ExecutionContext {
     fn clone(&self) -> Self {
         Self {
-            module: Arc::clone(&self.module),
-            executable: Arc::clone(&self.executable),
-            atoms: Arc::clone(&self.atoms),
+            payload: Arc::clone(&self.payload),
             function_base: self.function_base,
             space: Arc::clone(&self.space),
         }
@@ -118,15 +126,17 @@ impl ExecutionContext {
             .link_verified_module(module, &otter_resource::ResourceAccount::default())
     }
 
-    /// Wrap one linked chunk's tables. Only [`CodeSpace::link_module`] and
+    /// Wrap one linked chunk's payload. Only [`CodeSpace::link_module`] and
     /// [`Self::for_function`] construct contexts this way.
     #[must_use]
-    pub(crate) fn from_chunk_tables(tables: ChunkTables, space: Arc<CodeSpace>) -> Self {
+    pub(crate) fn from_chunk_payload(
+        payload: Arc<ChunkPayload>,
+        function_base: u32,
+        space: Arc<CodeSpace>,
+    ) -> Self {
         Self {
-            module: tables.module,
-            executable: tables.executable,
-            atoms: tables.atoms,
-            function_base: tables.function_base,
+            payload,
+            function_base,
             space,
         }
     }
@@ -137,14 +147,7 @@ impl ExecutionContext {
     /// adopts its code space) publishes the ids, so every id a running isolate
     /// sees comes from that isolate's interner.
     pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
-        self.atoms.resolve(names);
-    }
-
-    /// Resolve the immutable sibling chunk owning a foreign `function_id`.
-    /// Registry nodes never move or disappear, so their tables borrow directly
-    /// from the shared code-space chain without a per-context cache.
-    fn sibling_tables(&self, function_id: u32) -> Option<&ChunkTables> {
-        self.space.chunk_for(function_id)
+        self.payload.atoms.resolve(names);
     }
 
     /// First global function id owned by this chunk.
@@ -159,7 +162,7 @@ impl ExecutionContext {
     /// rather than by function id alone.
     #[must_use]
     pub(crate) fn constant_cache_key(&self, idx: u32) -> (usize, u32) {
-        (Arc::as_ptr(&self.module) as usize, idx)
+        (Arc::as_ptr(&self.payload.module) as usize, idx)
     }
 
     /// Shared code-space registry this chunk was linked into.
@@ -173,53 +176,70 @@ impl ExecutionContext {
     pub(crate) fn covers_function(&self, function_id: u32) -> bool {
         function_id
             .checked_sub(self.function_base)
-            .is_some_and(|local| (local as usize) < self.module.functions.len())
+            .is_some_and(|local| (local as usize) < self.payload.module.functions.len())
     }
 
     /// Resolve the context owning `function_id`: this chunk on the hot
-    /// in-chunk path, otherwise the sibling chunk registered in the
-    /// shared code space. `None` means the id was never linked.
-    #[must_use]
-    pub(crate) fn for_function(&self, function_id: u32) -> Option<ResolvedCtx<'_>> {
+    /// in-chunk path, otherwise an owned context for the matching live sibling.
+    /// Evicted and never-linked ids remain distinct typed failures.
+    pub(crate) fn for_function(
+        &self,
+        function_id: u32,
+    ) -> Result<ResolvedCtx<'_>, FunctionResolutionError> {
         if self.covers_function(function_id) {
-            return Some(ResolvedCtx::Ambient(self));
+            return Ok(ResolvedCtx::Ambient(self));
         }
-        let tables = self.space.chunk_for(function_id)?.clone();
-        Some(ResolvedCtx::Owned(Self::from_chunk_tables(
-            tables,
-            Arc::clone(&self.space),
-        )))
+        match self.space.resolve_chunk(function_id) {
+            ChunkResolution::Live {
+                function_base,
+                payload,
+            } => Ok(ResolvedCtx::Owned(Self::from_chunk_payload(
+                payload,
+                function_base,
+                Arc::clone(&self.space),
+            ))),
+            ChunkResolution::Evicted {
+                function_base,
+                function_count,
+            } => Err(FunctionResolutionError::Evicted {
+                function_id,
+                function_base,
+                function_count,
+            }),
+            ChunkResolution::Unlinked => Err(FunctionResolutionError::Unlinked { function_id }),
+        }
     }
 
     /// Translate a global function id to this chunk's local table
     /// index.
     fn local_function_index(&self, function_id: u32) -> Option<u32> {
         let local = function_id.checked_sub(self.function_base)?;
-        ((local as usize) < self.module.functions.len()).then_some(local)
+        ((local as usize) < self.payload.module.functions.len()).then_some(local)
     }
 
     /// Synthetic bytecode module name.
     #[must_use]
     pub fn module_name(&self) -> &str {
-        &self.module.module
+        &self.payload.module.module
     }
 
     /// Entry function for a script/module turn.
     #[must_use]
     pub fn main(&self) -> &Function {
-        self.module.main()
+        self.payload.module.main()
     }
 
     /// Shared executable chunk this context runs, for identity comparisons.
     #[must_use]
     pub(crate) fn executable_module(&self) -> &Arc<ExecutableModule> {
-        &self.executable
+        &self.payload.executable
     }
 
     /// Entry executable function for a script/module turn.
     #[must_use]
     pub(crate) fn exec_main(&self) -> &CodeBlock {
-        self.executable
+        self.payload
+            .executable
             .function(0)
             .expect("bytecode modules always carry main function 0")
     }
@@ -227,7 +247,7 @@ impl ExecutionContext {
     /// Tagged-template site descriptor (§13.2.8.4).
     #[must_use]
     pub fn template_site(&self, idx: u32) -> Option<&otter_bytecode::TemplateSite> {
-        self.module.template_sites.get(idx as usize)
+        self.payload.module.template_sites.get(idx as usize)
     }
 
     /// Resolve a tagged-template site in the chunk that owns `function_id`.
@@ -240,61 +260,37 @@ impl ExecutionContext {
         function_id: u32,
         idx: u32,
     ) -> Option<&otter_bytecode::TemplateSite> {
-        if self.local_function_index(function_id).is_some() {
-            return self.module.template_sites.get(idx as usize);
-        }
-        self.sibling_tables(function_id)?
-            .module
-            .template_sites
-            .get(idx as usize)
+        self.local_function_index(function_id)?;
+        self.payload.module.template_sites.get(idx as usize)
     }
 
     /// Return the stable linked-chunk base that owns `function_id`.
     #[must_use]
     pub(crate) fn function_base_for_function(&self, function_id: u32) -> Option<u32> {
-        if self.local_function_index(function_id).is_some() {
-            return Some(self.function_base);
-        }
-        Some(self.sibling_tables(function_id)?.function_base)
+        self.local_function_index(function_id)
+            .map(|_| self.function_base)
     }
 
     /// Module initialization records for linked module graphs.
     #[must_use]
     pub fn module_inits(&self) -> &[ModuleInit] {
-        &self.module.module_inits
+        &self.payload.module.module_inits
     }
 
-    /// Function-table lookup by global VM function id. Foreign ids
-    /// resolve transparently through the shared code space, so
-    /// fid-keyed metadata reads (name, length, flags) work on any
-    /// linked function value regardless of which chunk it escaped
-    /// from.
+    /// Function-table lookup by global VM function id in this context's chunk.
+    /// Callers holding a foreign id must use [`Self::for_function`] first.
     #[must_use]
     pub fn function(&self, function_id: u32) -> Option<&Function> {
-        if let Some(local) = self.local_function_index(function_id) {
-            return self.module.functions.get(local as usize);
-        }
-        let tables = self.sibling_tables(function_id)?;
-        tables
-            .module
-            .functions
-            .get((function_id - tables.function_base) as usize)
+        let local = self.local_function_index(function_id)?;
+        self.payload.module.functions.get(local as usize)
     }
 
     /// §20.2.3.5 [[SourceText]] for a function: its validated range
-    /// sliced from the owning module's shared source snapshot. Resolves
-    /// foreign ids through the same chunk lookup as [`Self::function`].
+    /// sliced from this chunk's shared source snapshot.
     #[must_use]
     pub fn function_source_text(&self, function_id: u32) -> Option<&str> {
-        let (module, local) = if let Some(local) = self.local_function_index(function_id) {
-            (&*self.module, local as usize)
-        } else {
-            let tables = self.sibling_tables(function_id)?;
-            (
-                &*tables.module,
-                (function_id - tables.function_base) as usize,
-            )
-        };
+        let local = self.local_function_index(function_id)? as usize;
+        let module = &self.payload.module;
         let function = module.functions.get(local)?;
         let (start, end) = function.source_text_range?;
         module
@@ -303,30 +299,16 @@ impl ExecutionContext {
             .get(start as usize..end as usize)
     }
 
-    /// Executable function lookup by global VM function id. Foreign
-    /// ids resolve like [`Self::function`]. Dispatch must still swap
-    /// to the owning chunk's context (via [`Self::for_function`])
-    /// before decoding constant-pool operands — only the function
-    /// body itself is chunk-portable.
+    /// Executable lookup by global VM function id in this context's chunk.
     #[must_use]
     pub(crate) fn exec_function(&self, function_id: u32) -> Option<&CodeBlock> {
-        if let Some(local) = self.local_function_index(function_id) {
-            return self.executable.function(local);
-        }
-        let tables = self.sibling_tables(function_id)?;
-        tables
-            .executable
-            .function(function_id - tables.function_base)
+        let local = self.local_function_index(function_id)?;
+        self.payload.executable.function(local)
     }
 
     fn code_block_arc(&self, function_id: u32) -> Option<std::sync::Arc<CodeBlock>> {
-        if let Some(local) = self.local_function_index(function_id) {
-            return self.executable.function_arc(local);
-        }
-        let tables = self.sibling_tables(function_id)?;
-        tables
-            .executable
-            .function_arc(function_id - tables.function_base)
+        let local = self.local_function_index(function_id)?;
+        self.payload.executable.function_arc(local)
     }
 
     /// Build an owned JIT compile-input snapshot for a global VM function id.
@@ -438,15 +420,15 @@ impl ExecutionContext {
     /// to dispatch this chunk.
     #[must_use]
     pub(crate) fn property_ic_site_end(&self) -> usize {
-        self.executable.property_ic_site_end() as usize
+        self.payload.executable.property_ic_site_end() as usize
     }
 
     /// Summarize bounded ordinary-call feedback without exposing VM cells.
     #[must_use]
     pub fn call_feedback_stats(&self) -> CallFeedbackStats {
         let mut stats = CallFeedbackStats::default();
-        for local_index in 0..self.module.functions.len() {
-            let Some(function) = self.executable.function(local_index as u32) else {
+        for local_index in 0..self.payload.module.functions.len() {
+            let Some(function) = self.payload.executable.function(local_index as u32) else {
                 continue;
             };
             for instruction_index in 0..function.code.len() {
@@ -477,7 +459,7 @@ impl ExecutionContext {
     pub(crate) fn feedback_slot_addresses(
         &self,
     ) -> Vec<(usize, crate::executable::FeedbackSlotAddress)> {
-        self.executable.feedback_slot_addresses()
+        self.payload.executable.feedback_slot_addresses()
     }
 
     /// Dense property IC site for a named property instruction at the
@@ -517,7 +499,7 @@ impl ExecutionContext {
     /// Resolve a function-id constant.
     #[must_use]
     pub fn function_id_constant(&self, idx: u32) -> Option<u32> {
-        match self.module.constants.get(idx as usize) {
+        match self.payload.module.constants.get(idx as usize) {
             Some(Constant::FunctionId { index }) => Some(*index),
             _ => None,
         }
@@ -526,7 +508,7 @@ impl ExecutionContext {
     /// Resolve a string constant as WTF-16 code units.
     #[must_use]
     pub fn string_constant_units(&self, idx: u32) -> Option<&[u16]> {
-        match self.module.constants.get(idx as usize) {
+        match self.payload.module.constants.get(idx as usize) {
             Some(Constant::String { utf16 }) => Some(utf16.as_slice()),
             _ => None,
         }
@@ -535,7 +517,7 @@ impl ExecutionContext {
     /// Resolve a string constant as a borrowed UTF-8 string.
     #[must_use]
     pub fn string_constant_str(&self, idx: u32) -> Option<&str> {
-        self.atoms.string_constant_str(idx)
+        self.payload.atoms.string_constant_str(idx)
     }
 
     /// Resolve a string constant in the chunk that owns `function_id`.
@@ -547,18 +529,14 @@ impl ExecutionContext {
     /// atom table rather than `self.atoms`.
     #[must_use]
     pub fn string_constant_str_for_function(&self, function_id: u32, idx: u32) -> Option<&str> {
-        if self.local_function_index(function_id).is_some() {
-            return self.atoms.string_constant_str(idx);
-        }
-        self.sibling_tables(function_id)?
-            .atoms
-            .string_constant_str(idx)
+        self.local_function_index(function_id)?;
+        self.payload.atoms.string_constant_str(idx)
     }
 
     /// Resolve a string constant as an atomized property key.
     #[must_use]
     pub(crate) fn property_atom(&self, idx: u32) -> Option<AtomizedPropertyKey<'_>> {
-        self.atoms.property_atom(idx)
+        self.payload.atoms.property_atom(idx)
     }
 
     /// Resolve an atomized property key in the chunk that owns `function_id`.
@@ -568,16 +546,14 @@ impl ExecutionContext {
         function_id: u32,
         idx: u32,
     ) -> Option<AtomizedPropertyKey<'_>> {
-        if self.local_function_index(function_id).is_some() {
-            return self.atoms.property_atom(idx);
-        }
-        self.sibling_tables(function_id)?.atoms.property_atom(idx)
+        self.local_function_index(function_id)?;
+        self.payload.atoms.property_atom(idx)
     }
 
     /// Resolve a numeric constant's raw IEEE-754 bits.
     #[must_use]
     pub fn number_constant_bits(&self, idx: u32) -> Option<u64> {
-        match self.module.constants.get(idx as usize) {
+        match self.payload.module.constants.get(idx as usize) {
             Some(Constant::Number { bits }) => Some(*bits),
             _ => None,
         }
@@ -595,24 +571,14 @@ impl ExecutionContext {
         function_id: u32,
         idx: u32,
     ) -> Option<u64> {
-        if self.local_function_index(function_id).is_some() {
-            return self.number_constant_bits(idx);
-        }
-        match self
-            .sibling_tables(function_id)?
-            .module
-            .constants
-            .get(idx as usize)
-        {
-            Some(Constant::Number { bits }) => Some(*bits),
-            _ => None,
-        }
+        self.local_function_index(function_id)?;
+        self.number_constant_bits(idx)
     }
 
     /// Resolve a BigInt decimal literal constant.
     #[must_use]
     pub fn bigint_decimal_constant(&self, idx: u32) -> Option<&str> {
-        match self.module.constants.get(idx as usize) {
+        match self.payload.module.constants.get(idx as usize) {
             Some(Constant::BigInt { decimal }) => Some(decimal.as_str()),
             _ => None,
         }
@@ -621,7 +587,7 @@ impl ExecutionContext {
     /// Resolve a RegExp literal constant.
     #[must_use]
     pub fn regexp_constant(&self, idx: u32) -> Option<(&[u16], &str)> {
-        match self.module.constants.get(idx as usize) {
+        match self.payload.module.constants.get(idx as usize) {
             Some(Constant::RegExp {
                 pattern_utf16,
                 flags,
@@ -644,21 +610,8 @@ impl ExecutionContext {
         function_id: u32,
         idx: u32,
     ) -> Option<(&[u16], &str)> {
-        if self.local_function_index(function_id).is_some() {
-            return self.regexp_constant(idx);
-        }
-        match self
-            .sibling_tables(function_id)?
-            .module
-            .constants
-            .get(idx as usize)
-        {
-            Some(Constant::RegExp {
-                pattern_utf16,
-                flags,
-            }) => Some((pattern_utf16.as_slice(), flags.as_str())),
-            _ => None,
-        }
+        self.local_function_index(function_id)?;
+        self.regexp_constant(idx)
     }
 
     /// Resolve a module import edge from the bytecode resolution table.
@@ -672,7 +625,8 @@ impl ExecutionContext {
         specifier: &str,
         attr_type: Option<&str>,
     ) -> Option<&str> {
-        self.module
+        self.payload
+            .module
             .module_resolutions
             .iter()
             .find(|r| {
@@ -686,7 +640,8 @@ impl ExecutionContext {
     /// Function id of a module's `<module-init>` by canonical URL.
     #[must_use]
     pub fn module_init_function_id(&self, url: &str) -> Option<u32> {
-        self.module
+        self.payload
+            .module
             .module_inits
             .iter()
             .find(|m| m.url == url)
@@ -698,7 +653,8 @@ impl ExecutionContext {
     /// excluded, so the result is exactly the modules to evaluate before `url`.
     #[must_use]
     pub fn eager_dep_targets(&self, url: &str) -> Vec<&str> {
-        self.module
+        self.payload
+            .module
             .module_resolutions
             .iter()
             .filter(|r| r.referrer == url && !r.deferred && !r.synthetic)
@@ -712,7 +668,8 @@ impl ExecutionContext {
     /// excluded, as are runtime synthetic env-resolution edges.
     #[must_use]
     pub fn module_requests(&self, url: &str) -> Vec<(&str, bool)> {
-        self.module
+        self.payload
+            .module
             .module_resolutions
             .iter()
             .filter(|r| r.referrer == url && !r.synthetic && !(r.deferred && r.dynamic))
@@ -937,7 +894,10 @@ mod tests {
             ))
             .expect("valid bytecode fixture");
 
-        let snapshot = ambient
+        let owner = ambient
+            .for_function(owner_function)
+            .expect("sibling function owner");
+        let snapshot = owner
             .jit_compile_snapshot(owner_function)
             .expect("sibling function snapshot");
         assert_eq!(snapshot.instructions[0].load_number, Some(17.25));

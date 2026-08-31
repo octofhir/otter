@@ -110,6 +110,12 @@ pub struct WeakTableBody<K> {
 }
 
 impl<K: WeakTableKind> WeakTableBody<K> {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for entry in self.entries() {
+            crate::code_liveness::visit_value(&entry.value, visitor);
+        }
+    }
+
     /// Buckets a table of `capacity` entries uses.
     #[must_use]
     fn bucket_count_for(capacity: usize) -> usize {

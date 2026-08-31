@@ -59,6 +59,13 @@ pub struct ProxyBodyGc {
     pub private_elements: PrivateSlotsHandle,
 }
 
+impl ProxyBodyGc {
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.target, visitor);
+        crate::code_liveness::visit_value(&self.handler, visitor);
+    }
+}
+
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`PrivateSlotsBody`].
 pub const PRIVATE_SLOTS_BODY_TYPE_TAG: u8 = 0x36;
 
@@ -137,6 +144,12 @@ impl PrivateSlotsBody {
     pub fn slots_mut(&mut self) -> &mut [PrivateSlot] {
         // SAFETY: as in `slots`.
         unsafe { std::slice::from_raw_parts_mut(self.slots_ptr(), self.len()) }
+    }
+
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for slot in self.slots() {
+            crate::code_liveness::visit_value(&slot.value, visitor);
+        }
     }
 }
 

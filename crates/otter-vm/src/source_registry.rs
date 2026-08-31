@@ -23,7 +23,7 @@
 //!   is admitted against the registry's account before retention.
 //!
 //! # See also
-//! - [`crate::error_ops::snapshot_frames`] — produces the
+//! - [`crate::stack_snapshot::snapshot_frames`] — produces the
 //!   `(function, module, span)` frames this registry maps to positions.
 
 use otter_resource::{ResourceAccount, SharedSource, SharedSourceError};

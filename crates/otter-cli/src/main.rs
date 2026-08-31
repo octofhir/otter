@@ -1222,11 +1222,13 @@ async fn run_file_with_cwd(
             "completion": result.completion_string(),
             "exitCode": result.exit_code()
         });
-        if let Some((artifacts, samples)) = &profile_artifacts {
+        if let Some((artifacts, samples, dropped_samples, truncated_frames)) = &profile_artifacts {
             payload["cpuProfile"] = serde_json::json!({
                 "cpuprofile": artifacts.cpuprofile,
                 "folded": artifacts.folded,
                 "samples": samples,
+                "droppedSamples": dropped_samples,
+                "truncatedFrames": truncated_frames,
             });
         }
         println!("{payload}");
@@ -1248,21 +1250,30 @@ fn report_cpu_profile(
     path: &Path,
     result: &otter_runtime::ExecutionResult,
     options: &CpuProfileOptions,
-) -> Result<(CpuProfileArtifacts, usize), OtterError> {
+) -> Result<(CpuProfileArtifacts, usize, u64, u64), OtterError> {
     let empty = otter_runtime::CpuProfile {
         interval: options.interval.max(1),
         samples: Vec::new(),
         time_deltas_us: Vec::new(),
+        dropped_samples: 0,
+        truncated_frames: 0,
     };
     let profile = result.cpu_profile().unwrap_or(&empty);
     let artifacts = write_cpu_profile_artifacts(path, profile, options)?;
     eprintln!(
-        "cpu profile written: {} ({} samples), {}",
+        "cpu profile written: {} ({} samples, {} dropped, {} truncated frames), {}",
         artifacts.cpuprofile.display(),
         profile.sample_count(),
+        profile.dropped_samples,
+        profile.truncated_frames,
         artifacts.folded.display()
     );
-    Ok((artifacts, profile.sample_count()))
+    Ok((
+        artifacts,
+        profile.sample_count(),
+        profile.dropped_samples,
+        profile.truncated_frames,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1393,6 +1404,8 @@ fn write_chrome_cpu_profile(
         "endTime": end_time,
         "samples": sample_ids,
         "timeDeltas": time_deltas,
+        "xOtterDroppedSamples": profile.dropped_samples,
+        "xOtterTruncatedFrames": profile.truncated_frames,
     });
     let file = std::fs::File::create(path).map_err(|err| pm_io_error(path, err))?;
     serde_json::to_writer_pretty(file, &payload).map_err(|err| OtterError::Internal {

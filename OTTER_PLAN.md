@@ -72,7 +72,7 @@ claim.
 | H2 | Isolation | P0 | complete | R1 | bounded, capability-aware Workers with deterministic shutdown |
 | B1 | Bytecode | P0 | complete | none | mandatory panic-free verifier before any bytecode executes |
 | R1 | Resources | P0 | complete | none | one aggregate runtime budget and typed exhaustion errors |
-| R2 | Resources | P1 | active | R1 | bound code, source, module, queue, worker, and external memory |
+| R2 | Resources | P1 | complete | R1 | bound code, source, module, queue, worker, and external memory |
 | E1 | Embedding | P1 | started by H1 | none | one reusable capability evaluator for all host surfaces |
 | J1 | JIT | P1 | active lane | B1, R1 | one typed target-neutral compiled pipeline |
 | J2 | Portability | P1 | queued | J1 | x86-64 parity over the same Machine IR |
@@ -405,12 +405,19 @@ otherwise require roughly twice the heap:
 [V8 `OutputStream`](https://v8.github.io/api/head/classv8_1_1OutputStream.html)
 and [Node heap snapshots](https://nodejs.org/api/v8.html).
 
-CPU profiling remains a distinct capture path: its sample vector and cloned
-stack strings currently grow for the full profiling session. V8 handles the
-same pressure with a maximum sample count and discarded-sample reporting, and
-bounds one sampled stack to 255 frames. Otter should adopt an internal bounded
-sample/frame budget with explicit dropped-sample telemetry, without exposing
-another user-facing tuning surface:
+CPU profiling is now bounded across the complete installed-profiler lifetime,
+including every batch transferred through `drain()`: at most 65,536 retained
+samples and 64 MiB of logical sample storage, with a 1 MiB / 255-frame ceiling
+for one sample. The shared stack walker exposes borrowed frame metadata to the
+profiler, so oversized function/module strings are rejected before a fallible
+owned copy is allocated; error stacks still collect the same complete owned
+DTOs through that walker. Count, memory, and allocation admission failures are
+reported as `dropped_samples`, and frames beyond the stack ceiling as
+`truncated_frames`. CLI JSON, Chrome artifacts, and the normal status line
+carry both counters. No new profiler option or capability was added.
+
+This follows V8's maximum sample count, discarded-sample reporting, and
+255-frame sampled-stack bound:
 [V8 CPU profiler](https://v8.github.io/api/head/classv8_1_1CpuProfiler.html),
 [profiling options](https://v8.github.io/api/head/classv8_1_1CpuProfilingOptions.html),
 and [discarded samples](https://v8.github.io/api/head/classv8_1_1DiscardedSamplesDelegate.html).

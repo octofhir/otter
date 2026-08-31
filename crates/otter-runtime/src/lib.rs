@@ -735,6 +735,12 @@ impl ExecutionResult {
             Some(mut existing) => {
                 existing.samples.extend(profile.samples);
                 existing.time_deltas_us.extend(profile.time_deltas_us);
+                existing.dropped_samples = existing
+                    .dropped_samples
+                    .saturating_add(profile.dropped_samples);
+                existing.truncated_frames = existing
+                    .truncated_frames
+                    .saturating_add(profile.truncated_frames);
                 self.cpu_profile = Some(existing);
             }
             None => self.cpu_profile = Some(Box::new(profile)),
@@ -2686,7 +2692,9 @@ impl RuntimeBuilder {
     /// whole run, so a program that only finishes when its event loop drains
     /// — a server, say — still produces a profile. The samples reach the
     /// caller on [`ExecutionResult::cpu_profile`]. `None` (the default)
-    /// leaves the profiler uninstalled.
+    /// leaves the profiler uninstalled. Capture uses fixed internal sample,
+    /// frame, and retained-byte bounds; discarded work is reported on
+    /// [`CpuProfile::dropped_samples`] without another configuration surface.
     #[must_use]
     pub fn cpu_profile_interval(mut self, interval: Option<u64>) -> Self {
         self.config.cpu_profile_interval = interval;

@@ -393,7 +393,7 @@ impl<'rt> NativeCtx<'rt> {
         &self,
         context: &ExecutionContext,
     ) -> Vec<crate::StackFrameSnapshot> {
-        crate::error_ops::snapshot_frames(context, self.cx.activations())
+        crate::stack_snapshot::snapshot_frames(context, self.cx.activations())
     }
 
     /// How many innermost frames belong to `callee` and its callees.

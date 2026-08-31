@@ -82,6 +82,7 @@ mod cpu_profile;
 pub mod date;
 mod element_feedback;
 mod eval_env;
+mod stack_snapshot;
 // `date` is a directory module — see `date/mod.rs`.
 mod activation_stack;
 pub mod bootstrap;
@@ -263,14 +264,13 @@ use smallvec::SmallVec;
 use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
-pub(crate) use error_ops::{
-    native_to_vm_error, native_to_vm_error_with_stack, snapshot_frames, symbol_to_vm_error,
-};
+pub(crate) use error_ops::{native_to_vm_error, native_to_vm_error_with_stack, symbol_to_vm_error};
 pub use executable::code_block_cfg::{
     ActiveCatchRegionError, ActiveCatchRegions, CodeBlockControlFlowView, CodeBlockExceptionRegion,
 };
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
 use operand_decode::{apply_branch, const_operand, register_operand};
+pub(crate) use stack_snapshot::snapshot_frames;
 
 pub use activation_stack::{ActivationFloor, ActivationStack};
 pub use array::JsArray;

@@ -6,7 +6,7 @@
 //! baseline". Distinct from
 //! [`crate::devtools_snapshot::write_heap_snapshot`], which is
 //! the Chrome DevTools `.heapsnapshot` JSON exporter — that
-//! writer is for production debugging; this snapshot is for
+//! writer streams its document for production debugging; this snapshot is for
 //! Rust-side assertions and for computing per-root retained
 //! size.
 //!

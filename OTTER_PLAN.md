@@ -383,10 +383,37 @@ child, and reports the existing `ENOBUFS` outcome. Node likewise specifies
 `maxBuffer` in bytes and terminates the child when it is exceeded:
 [Node `maxBuffer`](https://nodejs.org/api/child_process.html#maxbuffer-and-unicode).
 
-Still open: audit snapshot/artifact capture. Fixed transport read slabs,
-bounded synchronous scratch, bounded codec state, and already hard-bounded
-diagnostic artifacts must be distinguished from retained stores before
-changing them.
+The snapshot/artifact audit separates bounded diagnostics from retained
+stores. JIT event capture already stops at 16,384 events; artifact capture is
+already capped at 1,024 bundles and 64 MiB. The opaque in-process runtime
+snapshot is an explicit caller-owned whole-heap image, bounded by the
+isolate's heap/cage and semantically unable to omit live image bytes.
+
+The Chrome DevTools heap exporter was the hidden multiplier: it retained an
+object list, lookup map, node array, edge array, string table, and complete
+`serde_json::Value` before the VM serialized any bytes. It now walks the
+stable heap in multiple non-allocating passes and streams the flat node and
+edge arrays directly to the caller. Its only size-dependent scratch is a
+sorted compressed-offset index with a hard 64 MiB ceiling; admission failure
+aborts before that index is allocated. The lightweight heap summary now folds
+the collector's fixed 256-tag census instead of constructing the retained-size
+graph. No option, permission, feature flag, or capability was added.
+
+This matches V8's caller-owned chunked snapshot `OutputStream` and Node's
+Readable heap-snapshot API; Node also warns that materializing a snapshot can
+otherwise require roughly twice the heap:
+[V8 `OutputStream`](https://v8.github.io/api/head/classv8_1_1OutputStream.html)
+and [Node heap snapshots](https://nodejs.org/api/v8.html).
+
+CPU profiling remains a distinct capture path: its sample vector and cloned
+stack strings currently grow for the full profiling session. V8 handles the
+same pressure with a maximum sample count and discarded-sample reporting, and
+bounds one sampled stack to 255 frames. Otter should adopt an internal bounded
+sample/frame budget with explicit dropped-sample telemetry, without exposing
+another user-facing tuning surface:
+[V8 CPU profiler](https://v8.github.io/api/head/classv8_1_1CpuProfiler.html),
+[profiling options](https://v8.github.io/api/head/classv8_1_1CpuProfilingOptions.html),
+and [discarded samples](https://v8.github.io/api/head/classv8_1_1DiscardedSamplesDelegate.html).
 
 Also landed: heap external charges are folded into the runtime ledger.
 `GcHeap` mirrors its outstanding external/off-slot reservation bytes into an

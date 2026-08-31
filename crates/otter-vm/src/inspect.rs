@@ -41,6 +41,8 @@
 //!   re-fire the observer).
 //! - [`FrameSnapshot`] / [`RegisterSnapshot`] — frame and
 //!   register window inspection from inside a step-tracer hook.
+//! - [`HeapSnapshotSummary`] — fixed-size census-derived live-object totals;
+//!   summaries never build the retained-size edge graph.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -566,26 +568,28 @@ pub struct HeapSnapshotSummary {
 }
 
 impl HeapSnapshotSummary {
-    /// Build a summary from a raw [`otter_gc::HeapSnapshot`].
+    /// Build a whole-heap summary from a bounded [`otter_gc::HeapCensus`].
     #[must_use]
-    pub fn from_snapshot(snapshot: &otter_gc::HeapSnapshot) -> Self {
-        let totals = snapshot.group_by_type();
-        let mut counts = [0u32; 256];
-        let mut object_count: u64 = 0;
-        for obj in &snapshot.objects {
-            counts[obj.type_tag as usize] = counts[obj.type_tag as usize].saturating_add(1);
-            object_count += 1;
+    pub fn from_census(census: &otter_gc::HeapCensus) -> Self {
+        let mut bytes = [0u64; 256];
+        let mut counts = [0u64; 256];
+        for space in [&census.old, &census.young, &census.large] {
+            for row in &space.rows {
+                let tag = row.type_tag as usize;
+                bytes[tag] = bytes[tag].saturating_add(row.bytes);
+                counts[tag] = counts[tag].saturating_add(row.object_count);
+            }
         }
         let mut buckets: Vec<HeapTypeBucket> = (0..256u16)
             .filter_map(|tag| {
-                let bytes = totals[tag as usize] as u64;
-                let object_count = counts[tag as usize];
-                if bytes == 0 && object_count == 0 {
+                let bytes = bytes[tag as usize];
+                let count = counts[tag as usize];
+                if bytes == 0 && count == 0 {
                     return None;
                 }
                 Some(HeapTypeBucket {
                     type_tag: tag as u8,
-                    object_count,
+                    object_count: u32::try_from(count).unwrap_or(u32::MAX),
                     bytes,
                 })
             })
@@ -595,7 +599,8 @@ impl HeapSnapshotSummary {
                 .cmp(&a.bytes)
                 .then_with(|| a.type_tag.cmp(&b.type_tag))
         });
-        let total_bytes = buckets.iter().map(|b| b.bytes).sum();
+        let object_count = counts.iter().copied().sum();
+        let total_bytes = bytes.iter().copied().sum();
         Self {
             object_count,
             total_bytes,

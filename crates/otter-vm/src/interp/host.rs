@@ -525,8 +525,8 @@ impl Interpreter {
     /// any mutator-turn boundary.
     #[must_use]
     pub fn heap_snapshot_summary(&self) -> inspect::HeapSnapshotSummary {
-        let raw = self.gc_heap.snapshot(&[]);
-        inspect::HeapSnapshotSummary::from_snapshot(&raw)
+        let census = self.gc_heap.census();
+        inspect::HeapSnapshotSummary::from_census(&census)
     }
 
     /// Per-space, per-type-tag census of the live heap. Cheaper than
@@ -634,11 +634,7 @@ impl Interpreter {
         &self,
         writer: &mut W,
     ) -> std::io::Result<()> {
-        // Single-mutator model: `&self` while no allocator path
-        // runs is the documented STW-equivalent for the safe
-        // `chrome_heap_snapshot` wrapper.
-        let payload = otter_gc::devtools_snapshot::chrome_heap_snapshot(&self.gc_heap);
-        serde_json::to_writer(&mut *writer, &payload.0).map_err(std::io::Error::other)?;
+        otter_gc::devtools_snapshot::write_heap_snapshot(&self.gc_heap, &mut *writer)?;
         writer.write_all(b"\n")?;
         Ok(())
     }

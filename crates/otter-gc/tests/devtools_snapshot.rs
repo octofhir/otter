@@ -28,10 +28,9 @@ fn snapshot_emits_chrome_devtools_format() {
     let node = heap.alloc(Cell { next: leaf }).unwrap();
     let _root = scope.local(node);
 
-    let snapshot = unsafe { write_heap_snapshot(&heap) };
-    // Round-trip via JSON serialisation for structural sanity.
-    let s = serde_json::to_string(&snapshot.0).expect("serialise");
-    let parsed: serde_json::Value = serde_json::from_str(&s).expect("parse");
+    let mut bytes = Vec::new();
+    write_heap_snapshot(&heap, &mut bytes).expect("write snapshot");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
 
     // Header.
     let meta = &parsed["snapshot"]["meta"];
@@ -53,6 +52,10 @@ fn snapshot_emits_chrome_devtools_format() {
         edges.len().is_multiple_of(3),
         "edges count not a multiple of 3"
     );
+    assert_eq!(edges.len(), 3, "node should point to its leaf");
+    let target = edges[2].as_u64().expect("edge target");
+    assert_eq!(target % 7, 0, "edge target must align to a node row");
+    assert!(target < nodes.len() as u64, "edge target must be live");
 
     // String table is non-empty (canonical "" plus our names).
     let strings = parsed["strings"].as_array().expect("strings array");

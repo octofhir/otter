@@ -26,8 +26,8 @@ use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use crate::{
-    ActiveFrameMut, ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError,
-    StackFrameSnapshot, Value, VmError, error_classes, object, read_register, symbol_dispatch,
+    ActiveFrameMut, ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError, Value,
+    VmError, error_classes, object, read_register, snapshot_frames, symbol_dispatch,
     write_register,
 };
 
@@ -600,69 +600,6 @@ pub(crate) fn frames_above_callee(stack: &ActivationStack, callee: Value) -> Opt
         .rev()
         .position(|frame| frame.self_value == callee)
         .map(|index| index + 1)
-}
-
-pub(crate) fn snapshot_frames(
-    context: &ExecutionContext,
-    stack: &ActivationStack,
-) -> Vec<StackFrameSnapshot> {
-    stack
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(depth, f)| {
-            let owner = context.for_function(f.function_id).ok();
-            let owner = owner.as_deref();
-            let function = owner.and_then(|owner| owner.function(f.function_id));
-            let exec_function = owner.and_then(|owner| owner.exec_function(f.function_id));
-            let function_name = function
-                .map(|fun| fun.name.clone())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            // A frame with a callee above it advanced its `pc` past the
-            // call before pushing that callee, so its current instruction
-            // is one step ahead of the call site the frame is reported at.
-            // The innermost frame has no callee and is at its own current
-            // instruction.
-            let instruction = if depth == 0 {
-                f.pc as usize
-            } else {
-                (f.pc as usize).saturating_sub(1)
-            };
-            let byte_pc = exec_function
-                .and_then(|fun| fun.instruction_byte_pc(instruction))
-                .unwrap_or(0);
-            // `byte_spans` is sorted by `pc`. `partition_point` finds
-            // the predecessor entry (largest `pc <= byte_pc`), so
-            // `idx - 1` is the matching span.
-            let span = exec_function
-                .and_then(|fun| {
-                    let spans = fun.byte_spans();
-                    let idx = spans.partition_point(|s| s.pc <= byte_pc);
-                    if idx == 0 {
-                        spans.first().map(|s| s.span)
-                    } else {
-                        Some(spans[idx - 1].span)
-                    }
-                })
-                .or_else(|| function.map(|fun| fun.span))
-                .unwrap_or((0, 0));
-            let module_url = function
-                .filter(|fun| !fun.module_url.is_empty())
-                .map(|fun| fun.module_url.clone())
-                .unwrap_or_else(|| {
-                    owner
-                        .map(ExecutionContext::module_name)
-                        .unwrap_or_else(|| context.module_name())
-                        .to_string()
-                });
-            StackFrameSnapshot {
-                function_id: f.function_id,
-                function_name,
-                module: module_url,
-                span,
-            }
-        })
-        .collect()
 }
 
 pub(crate) fn symbol_to_vm_error(

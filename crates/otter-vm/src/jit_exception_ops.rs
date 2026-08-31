@@ -30,8 +30,7 @@ use crate::{
     ExecutionContext, Frame, Interpreter, TryHandler, Value, VmError,
     activation_stack::ActivationStack,
     cold_frame::{AbruptFrameOutcome, AbruptKind, ParkedFinally},
-    error_ops::snapshot_frames,
-    read_register,
+    read_register, snapshot_frames,
 };
 
 /// Result of a committed exception-region operation in compiled code.

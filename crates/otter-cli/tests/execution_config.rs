@@ -642,5 +642,7 @@ if (total !== 19900) throw new Error("bad total");
             .expect("valid Chrome CPU profile");
     assert!(profile["nodes"].is_array());
     assert!(profile["samples"].is_array());
+    assert!(profile["xOtterDroppedSamples"].is_u64());
+    assert!(profile["xOtterTruncatedFrames"].is_u64());
     assert!(folded.is_file(), "folded stack artifact exists");
 }

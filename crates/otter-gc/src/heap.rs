@@ -91,6 +91,22 @@ const MAJOR_GC_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
 /// clamped; see `maybe_major_gc`). ~92% leaves headroom for the
 /// young semispaces + per-page slack.
 const MAJOR_GC_CAGE_SOFTCAP_NUM: u64 = 236; // 236/256 ≈ 92% of cage
+/// Growth ratio applied to the surviving off-slot (external / backing-store)
+/// reservations when the next major-GC budget is computed. External bytes
+/// share the one major-GC budget with old-space pages: objects owning them
+/// are small slots with drop glue, so page occupancy barely moves while their
+/// payloads can pin gigabytes of native memory, and without counting them
+/// dead payloads survive until the byte cap or the cage is exhausted. The
+/// ratio is capped below the page ratio because external bytes are neither
+/// marked nor copied: a large live external set must not proportionally
+/// license a large external garbage set. This is V8's global allocation
+/// limit (`heap-controller.cc`: consumed old-generation bytes times the
+/// growing factor plus external memory since the last mark-compact times
+/// `min(factor, external_memory_max_growing_factor = 1.1)`), and JSC's
+/// `updateAllocationLimits` counts `extraMemorySize()` in the heap size it
+/// grows proportionally.
+const MAJOR_GC_EXTERNAL_GROWTH_NUM: u64 = 11;
+const MAJOR_GC_EXTERNAL_GROWTH_DEN: u64 = 10;
 
 /// Trivial empty-roots implementation; useful in tests where all
 /// reachable objects sit in handle scopes.
@@ -233,15 +249,17 @@ pub struct GcHeap {
     /// state changes; shrinks follow every release path, including drained
     /// shared-token releases. `None` until the runtime installs its account.
     external_ledger: Option<otter_resource::ResourceLease>,
-    /// Old-space byte high-water mark that triggers a major
-    /// (full) GC when no hard cap is configured. After every major
-    /// GC it is recomputed as `live × MAJOR_GC_GROWTH_NUM /
-    /// MAJOR_GC_GROWTH_DEN`, clamped to
-    /// `[MAJOR_GC_FLOOR_BYTES, soft cap]`. Without it, a cap-less
-    /// heap never runs a full GC (the cap path is the only other
-    /// caller of `collect_full`), so old space — fed by scavenge
-    /// promotion and the nursery-overflow path — grows unbounded
-    /// until the cage is exhausted even when most of it is garbage.
+    /// Major-GC budget over old/large page bytes plus outstanding
+    /// external reservations. After every major GC it is recomputed
+    /// as `live_pages × MAJOR_GC_GROWTH_NUM / MAJOR_GC_GROWTH_DEN +
+    /// live_reserved × MAJOR_GC_EXTERNAL_GROWTH_NUM /
+    /// MAJOR_GC_EXTERNAL_GROWTH_DEN`, clamped to
+    /// `[MAJOR_GC_FLOOR_BYTES, soft cap + live_reserved]`. Without it,
+    /// a cap-less heap never runs a full GC (the cap path is the only
+    /// other caller of `collect_full`), so old space — fed by scavenge
+    /// promotion and the nursery-overflow path — and dead external
+    /// payloads grow unbounded until the cage or the cap is exhausted
+    /// even when most of it is garbage.
     next_major_gc_bytes: u64,
     /// Re-entrancy guard: `true` while a growth-triggered major GC
     /// is running, so the minor scavenge it performs internally
@@ -586,9 +604,11 @@ impl GcHeap {
     /// slot (off-slot accounting — e.g. `Vec` capacity inside a
     /// payload).
     ///
-    /// On overshoot: one emergency full GC, then retry once. If
-    /// still over → [`OutOfMemory::HeapCapExceeded`] and the
-    /// reservation is **not** booked.
+    /// Runs the growth-triggered major GC first when the major-GC
+    /// budget (pages plus outstanding reservations) is due. On cap
+    /// overshoot: one emergency full GC, then retry once. If still
+    /// over → [`OutOfMemory::HeapCapExceeded`] and the reservation is
+    /// **not** booked.
     ///
     /// # Errors
     ///
@@ -597,6 +617,8 @@ impl GcHeap {
     /// emergency full GC.
     pub fn reserve_bytes(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
         self.drain_shared_external_releases();
+        let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.maybe_major_gc(&mut noop)?;
         self.admit_external_growth(bytes)?;
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
@@ -623,8 +645,9 @@ impl GcHeap {
     ///
     /// Use this for off-slot backing storage that is being prepared by a
     /// mutator stack frame whose values are not all present in heap
-    /// handle/global tables. The reservation is booked only after the cap
-    /// check succeeds.
+    /// handle/global tables. The growth-triggered major GC, when due, and
+    /// any emergency collection both see those roots. The reservation is
+    /// booked only after the cap check succeeds.
     ///
     /// # Errors
     ///
@@ -637,6 +660,7 @@ impl GcHeap {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
         self.drain_shared_external_releases();
+        self.maybe_major_gc(external_visit)?;
         self.admit_external_growth(bytes)?;
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
@@ -1811,6 +1835,13 @@ impl GcHeap {
             .saturating_add(self.large_space.page_count() as u64)
             .saturating_mul(crate::page::PAGE_SIZE as u64);
         let cage_hardcap = (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM;
+        // Payload tokens dropped by the sweep report through the shared
+        // release channel; reconcile them so the surviving reservation set
+        // — not the pre-GC one — sizes the next budget, and so a capped
+        // heap's tracked total no longer counts the dead slots.
+        self.drain_shared_external_releases();
+        let live_reserved = self.reserved_bytes;
+        let live_total = live_pages.saturating_add(live_reserved);
         // Adaptive growth. A collection that reclaims little means the heap is
         // mostly live: re-marking it again after only the tight `3/2` growth
         // would re-scan nearly the whole live set every 50% of growth, which is
@@ -1819,14 +1850,32 @@ impl GcHeap {
         // pre-GC heap, back off to a wider growth band so the next collection is
         // amortized over far more allocation; productive collections (lots of
         // short-lived garbage) keep the tight band for prompt reclamation.
-        let (num, den) = if live_pages.saturating_mul(4) >= occupancy.saturating_mul(3) {
+        let (num, den) = if live_total.saturating_mul(4) >= occupancy.saturating_mul(3) {
             // <25% reclaimed — unproductive, grow ~3x.
             (3, 1)
         } else {
             (MAJOR_GC_GROWTH_NUM, MAJOR_GC_GROWTH_DEN)
         };
-        let target = live_pages.saturating_mul(num).saturating_div(den);
-        self.next_major_gc_bytes = target.max(MAJOR_GC_FLOOR_BYTES).min(cage_hardcap);
+        let (external_num, external_den) =
+            if num * MAJOR_GC_EXTERNAL_GROWTH_DEN < MAJOR_GC_EXTERNAL_GROWTH_NUM * den {
+                (num, den)
+            } else {
+                (MAJOR_GC_EXTERNAL_GROWTH_NUM, MAJOR_GC_EXTERNAL_GROWTH_DEN)
+            };
+        let target = live_pages
+            .saturating_mul(num)
+            .saturating_div(den)
+            .saturating_add(
+                live_reserved
+                    .saturating_mul(external_num)
+                    .saturating_div(external_den),
+            );
+        self.next_major_gc_bytes = target
+            .max(MAJOR_GC_FLOOR_BYTES)
+            .min(cage_hardcap.saturating_add(live_reserved));
+        if self.max_heap_bytes != 0 {
+            self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
+        }
         Ok(())
     }
 
@@ -1851,11 +1900,14 @@ impl GcHeap {
         occupancy >= self.next_major_gc_bytes
     }
 
+    /// Bytes charged against the major-GC budget: old/large page bytes plus
+    /// outstanding external reservations (see `MAJOR_GC_EXTERNAL_GROWTH_NUM`).
     fn major_gc_occupancy_bytes(&self) -> u64 {
         let page_bytes = crate::page::PAGE_SIZE as u64;
         (self.old_space.page_count() as u64)
             .saturating_add(self.large_space.page_count() as u64)
             .saturating_mul(page_bytes)
+            .saturating_add(self.reserved_bytes)
     }
 
     /// Begin a full-GC mark phase and drain the ordinary root graph.

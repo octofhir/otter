@@ -198,3 +198,75 @@ fn installing_an_account_charges_outstanding_external_bytes() {
         200
     );
 }
+
+/// Old-space slot whose only payload is an external reservation: the shape
+/// of a JavaScript `ArrayBuffer` body.
+struct ExternalHolder {
+    _token: otter_gc::ExternalMemory,
+}
+
+impl otter_gc::trace::Traceable for ExternalHolder {
+    const TYPE_TAG: u8 = 0x42;
+    unsafe fn trace_slots(_this: *mut Self, _v: &mut otter_gc::trace::SlotVisitor<'_>) {}
+}
+
+const HOLDER_BYTES: u64 = 4 * 1024 * 1024;
+/// The major-GC budget floor: with no surviving pages or reservations the
+/// budget sits at this floor, so dead payloads can accumulate to it plus one
+/// in-flight holder before the growth-triggered collection reclaims them.
+const MAJOR_GC_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+
+fn churn_dead_holders(heap: &mut otter_gc::GcHeap, count: usize) -> u64 {
+    heap.register_traceable::<ExternalHolder>();
+    let mut peak_reserved = 0;
+    for _ in 0..count {
+        let token = heap.reserve_external(HOLDER_BYTES).expect("reserve");
+        let _dead = heap
+            .alloc_old(ExternalHolder { _token: token })
+            .expect("alloc holder");
+        peak_reserved = peak_reserved.max(heap.stats().reserved_bytes);
+    }
+    peak_reserved
+}
+
+#[test]
+fn dead_external_payloads_trigger_major_gc_without_a_cap() {
+    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let churned = 128 * HOLDER_BYTES;
+    let peak = churn_dead_holders(&mut heap, 128);
+    assert!(
+        peak <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        "dead external bytes peaked at {peak} of {churned} churned"
+    );
+}
+
+#[test]
+fn dead_external_payloads_trigger_major_gc_below_the_cap() {
+    let mut heap = otter_gc::GcHeap::with_max_heap_bytes(2 * 1024 * 1024 * 1024).expect("heap");
+    let peak = churn_dead_holders(&mut heap, 128);
+    assert!(
+        peak <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        "dead external bytes peaked at {peak} below a 2 GiB cap"
+    );
+    assert!(
+        heap.tracked_bytes() <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        "tracked bytes must be reconciled after the growth-triggered major GC"
+    );
+}
+
+#[test]
+fn external_pressure_keeps_the_ledger_peak_bounded() {
+    let account = otter_resource::ResourceAccount::new(otter_resource::ResourceLimits::default());
+    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    heap.set_external_bytes_account(&account)
+        .expect("install ledger");
+    let _ = churn_dead_holders(&mut heap, 128);
+    let peak = account
+        .snapshot()
+        .get(otter_resource::ResourceClass::ExternalBytes)
+        .peak();
+    assert!(
+        peak <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        "ledger ExternalBytes peak {peak} must follow the major-GC budget"
+    );
+}

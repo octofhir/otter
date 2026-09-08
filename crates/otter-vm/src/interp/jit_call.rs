@@ -767,19 +767,21 @@ impl Interpreter {
         }
         let fid = frame.function_id;
         let code = self.resolve_optimized_code_for_fid(context, fid)?;
-        let function = context.exec_function(fid)?;
+        // Resolve the chunk owning the entered frame before any table read: a
+        // caller in another chunk (a later script, an eval body, a
+        // synchronous re-entry through an Array callback or comparator)
+        // passes its own ambient chunk, whose tables do not describe this
+        // function id at all — and runtime stubs decode published pcs and
+        // constant indices through the activation, so the activation must be
+        // the owner as well.
+        let resolved = context.for_function(fid).ok()?;
+        let function = resolved.exec_function(fid)?;
         let param_count = usize::from(function.param_count);
         if param_count > stack[top_idx].registers.len() {
             return None;
         }
         self.jit_runtime_stats.optimized_entries =
             self.jit_runtime_stats.optimized_entries.saturating_add(1);
-        // The activation context must be the chunk owning the entered frame:
-        // a synchronous re-entry (Array callback, comparator) passes the
-        // CALLER's ambient chunk, and runtime stubs decode published pcs and
-        // constant indices through the activation — a foreign chunk's tables
-        // resolve the same function id to a different function.
-        let resolved = context.for_function(fid).ok()?;
         let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
         if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {

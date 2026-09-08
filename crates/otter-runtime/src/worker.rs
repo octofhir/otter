@@ -47,8 +47,8 @@ use std::time::Duration;
 
 use otter_gc::raw::RawGc;
 use otter_resource::{ResourceClass, ResourceLease, ResourceLeaseSet};
-use otter_vm::binary::JsArrayBuffer;
 use otter_vm::binary::array_buffer::SharedBody;
+use otter_vm::binary::{JsArrayBuffer, TypedArrayKind};
 use otter_vm::host_completion::{HostCompletionAdmission, HostCompletionOutcome};
 use otter_vm::{
     ExecutionContext, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope,
@@ -108,6 +108,19 @@ enum WorkerPayload {
     Set(Vec<WorkerPayload>),
     ArrayBuffer(Vec<u8>),
     SharedArrayBuffer(Arc<SharedBody>),
+    /// A typed-array view: its kind and range over the cloned `buffer`.
+    TypedArray {
+        kind: TypedArrayKind,
+        buffer: Box<WorkerPayload>,
+        byte_offset: usize,
+        length: usize,
+    },
+    /// A `DataView` over the cloned `buffer`.
+    DataView {
+        buffer: Box<WorkerPayload>,
+        byte_offset: usize,
+        byte_length: usize,
+    },
 }
 
 #[derive(Default)]
@@ -1178,16 +1191,26 @@ fn run_worker_entry(
     runtime: &mut Runtime,
     specifier: &str,
 ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-    // Path-shaped specifiers run as files; everything else resolves as a
-    // module. The choice is syntactic: probing the filesystem before the
-    // capability boundary would leak existence information and race the
-    // actual open.
+    // A `file:` URL names the same file its path form names. Path-shaped
+    // specifiers run as files; everything else resolves as a module. The
+    // choice is syntactic: probing the filesystem before the capability
+    // boundary would leak existence information and race the actual open.
+    if let Some(path) = file_url_path(specifier) {
+        return runtime.run_file_with_context(path);
+    }
     let path = Path::new(specifier);
     if path.is_absolute() || specifier.starts_with("./") || specifier.starts_with("../") {
         runtime.run_file_with_context(PathBuf::from(specifier))
     } else {
         runtime.run_module_with_context(PathBuf::from(specifier))
     }
+}
+
+/// The filesystem path a `file:` URL specifier names, or `None` for any other
+/// specifier (including a `file:` URL with a host or a malformed path).
+fn file_url_path(specifier: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(specifier).ok()?;
+    (url.scheme() == "file").then(|| url.to_file_path().ok())?
 }
 
 fn install_worker_scope_natives(
@@ -1308,6 +1331,18 @@ fn measure_worker_value(
             .checked_mul(2)
             .ok_or_else(measure_overflow)?;
         return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, bytes);
+    }
+    if let Some(view) = value.as_typed_array(heap) {
+        let buffer = Value::array_buffer(view.buffer(heap));
+        let buffer =
+            measure_worker_value(&buffer, heap, format!("{path}.buffer"), depth + 1, active)?;
+        return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, buffer);
+    }
+    if let Some(view) = value.as_data_view() {
+        let buffer = Value::array_buffer(view.buffer(heap));
+        let buffer =
+            measure_worker_value(&buffer, heap, format!("{path}.buffer"), depth + 1, active)?;
+        return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, buffer);
     }
     if let Some(buf) = value.as_array_buffer() {
         if buf.as_shared_arc(heap).is_some() {
@@ -1552,6 +1587,37 @@ fn clone_worker_value_inner(
     if let Some(s) = value.as_string(heap) {
         return Ok(WorkerPayload::String(s.to_lossy_string(heap)));
     }
+    if let Some(view) = value.as_typed_array(heap) {
+        let buffer = clone_worker_value_inner(
+            &Value::array_buffer(view.buffer(heap)),
+            heap,
+            transfers,
+            format!("{path}.buffer"),
+            depth + 1,
+            active,
+        )?;
+        return Ok(WorkerPayload::TypedArray {
+            kind: view.kind(),
+            buffer: Box::new(buffer),
+            byte_offset: view.raw_byte_offset(heap),
+            length: view.raw_length(heap),
+        });
+    }
+    if let Some(view) = value.as_data_view() {
+        let buffer = clone_worker_value_inner(
+            &Value::array_buffer(view.buffer(heap)),
+            heap,
+            transfers,
+            format!("{path}.buffer"),
+            depth + 1,
+            active,
+        )?;
+        return Ok(WorkerPayload::DataView {
+            buffer: Box::new(buffer),
+            byte_offset: view.byte_offset(heap),
+            byte_length: view.byte_length(heap),
+        });
+    }
     if let Some(buf) = value.as_array_buffer() {
         if let Some(shared) = buf.as_shared_arc(heap) {
             return Ok(WorkerPayload::SharedArrayBuffer(shared));
@@ -1735,6 +1801,23 @@ fn materialize_worker_payload_in_scope<'scope, 'rt>(
         }
         WorkerPayload::ArrayBuffer(bytes) => scope.array_buffer_from_bytes(bytes.to_vec()),
         WorkerPayload::SharedArrayBuffer(body) => scope.shared_array_buffer(body.clone()),
+        WorkerPayload::TypedArray {
+            kind,
+            buffer,
+            byte_offset,
+            length,
+        } => {
+            let buffer = materialize_worker_payload_in_scope(scope, buffer)?;
+            scope.typed_array_view(buffer, *kind, *byte_offset, *length)
+        }
+        WorkerPayload::DataView {
+            buffer,
+            byte_offset,
+            byte_length,
+        } => {
+            let buffer = materialize_worker_payload_in_scope(scope, buffer)?;
+            scope.data_view(buffer, *byte_offset, *byte_length)
+        }
     }
 }
 
@@ -2758,6 +2841,99 @@ mod tests {
                 }}, 20);
                 "#,
                 worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typed_array_and_data_view_messages_keep_their_view_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            globalThis.onmessage = (event) => {
+              const { words, view } = event.data;
+              postMessage([
+                words.constructor.name, words.byteOffset, words.length, words[0], words[2],
+                view.constructor.name, view.byteOffset, view.byteLength, view.getUint8(0),
+                words.buffer.byteLength,
+              ]);
+            };
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                const buffer = new ArrayBuffer(10);
+                const bytes = new Uint8Array(buffer);
+                for (let i = 0; i < bytes.length; i++) bytes[i] = i + 1;
+                const words = new Uint16Array(buffer, 2, 3);
+                const view = new DataView(buffer, 1, 4);
+                let got = null;
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = "ERR:" + event.message;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data.join(",");
+                  w.terminate();
+                }};
+                w.postMessage({{ words, view }});
+                setTimeout(() => {{
+                  const expected = ["Uint16Array", 2, 3, words[0], words[2], "DataView", 1, 4, 2, 10].join(",");
+                  if (got !== expected) throw "bad view clone: " + got + " expected " + expected;
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_entry_accepts_a_file_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(&worker_path, "postMessage('ready');").unwrap();
+        let worker_url = url::Url::from_file_path(&worker_path).unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                let got = "pending";
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = "ERR:" + event.message;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data;
+                  w.terminate();
+                }};
+                setTimeout(() => {{
+                  if (got !== "ready") throw "bad worker message: " + got;
+                }}, 20);
+                "#,
+                worker_url.as_str()
             ),
         )
         .unwrap();

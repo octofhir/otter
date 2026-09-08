@@ -245,8 +245,8 @@ pub enum IcEntryVariant {
     DirectPrototypeData,
     /// Append transition that adds a slot on store.
     OwnAddTransition,
-    /// Store transition guarded by a direct-prototype miss.
-    DirectPrototypeMissingTransition,
+    /// Store transition guarded by a missing-key prototype chain.
+    PrototypeChainMissingTransition,
     /// Store transition guarded by a direct-prototype writable
     /// data slot.
     DirectPrototypeWritableDataTransition,
@@ -453,8 +453,8 @@ pub(crate) fn snapshot_store_state(
                     } else if let Some(t) = ic.store_transition_ref() {
                         let variant = match t.kind {
                             StorePropertyTransitionKind::OwnAdd => IcEntryVariant::OwnAddTransition,
-                            StorePropertyTransitionKind::DirectPrototypeMissing { .. } => {
-                                IcEntryVariant::DirectPrototypeMissingTransition
+                            StorePropertyTransitionKind::PrototypeChainMissing { .. } => {
+                                IcEntryVariant::PrototypeChainMissingTransition
                             }
                             StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => {
                                 IcEntryVariant::DirectPrototypeWritableDataTransition

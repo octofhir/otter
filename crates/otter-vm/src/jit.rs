@@ -345,6 +345,19 @@ pub struct JitCompileSnapshot {
     /// string-keyed slots or fewer holds them inline; a larger one spills to the
     /// out-of-line `values` vector whose base is a stable heap allocation.
     pub object_inline_slot_cap: u32,
+    /// Byte offset from a decompressed out-of-line slab cell pointer to its
+    /// `u32` word capacity (`HEADER_SIZE + SLOT_SLAB_CAPACITY_OFFSET`). An
+    /// add-transition into a spilled object proves in generated code that the
+    /// appended slot index is below this capacity before it publishes; a slot
+    /// at or beyond it needs the runtime's slab growth.
+    pub object_slab_capacity_byte: u32,
+    /// Byte offset of the ordinary object's one-byte flag that it cannot be a
+    /// guarded prototype-chain link: its `[[Prototype]]` is a Proxy or
+    /// non-object value (the flat mirror at [`Self::jit_proto_byte`] is then
+    /// null without ending the chain) or it is a String wrapper whose keys
+    /// the shape does not describe. Chain guards require it clear on every
+    /// link.
+    pub object_chain_link_opaque_byte: u32,
     /// Byte offset of the ordinary object's one-byte `[[Extensible]]` Boolean.
     pub object_extensible_byte: u32,
     /// Byte offset of the `u8` fast-shape eligibility discriminant. Generated
@@ -806,6 +819,12 @@ pub struct JitPropertyIcWay {
     /// zero for a null receiver prototype or the guarded direct-prototype
     /// shape for a completely missing property.
     pub transition_shape: u32,
+    /// For an add transition whose missing-key chain is two prototypes long,
+    /// the guarded shape of the direct prototype's own prototype; `0` means
+    /// the direct prototype (or the receiver) ends the chain. The guard
+    /// proves the object after the last guarded link is null, so every
+    /// object that ordinary `[[Set]]` would consult has a checked shape.
+    pub chain_shape: u32,
 }
 
 impl JitPropertyIcWay {
@@ -822,7 +841,7 @@ impl JitPropertyIcWay {
     }
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<JitPropertyIcWay>()];
+const _: [(); 20] = [(); std::mem::size_of::<JitPropertyIcWay>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitPropertyIcWay>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitPropertyIcWay, receiver_shape)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitPropertyIcWay, holder_shape)];
@@ -1388,6 +1407,8 @@ impl JitCompileSnapshot {
             object_slab_handle_byte: 0,
             object_slab_len_byte: 0,
             object_inline_slot_cap: 0,
+            object_slab_capacity_byte: 0,
+            object_chain_link_opaque_byte: 0,
             object_extensible_byte: 0,
             object_shape_cache_mode_byte: 0,
             object_shape_cache_fast: 0,

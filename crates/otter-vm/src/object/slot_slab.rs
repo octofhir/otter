@@ -43,6 +43,11 @@ pub const SLOT_SLAB_BODY_TYPE_TAG: u8 = 0x31;
 /// Handle to an object's out-of-line property slab.
 pub type SlotSlabHandle = otter_gc::Gc<SlotSlabBody>;
 
+/// Payload-relative byte offset of a slab's word capacity, baked into the
+/// JIT compile snapshot so generated add-transitions can bound-check a slot
+/// against the live slab without a runtime call.
+pub const SLOT_SLAB_CAPACITY_OFFSET: usize = std::mem::offset_of!(SlotSlabBody, capacity);
+
 /// Capacity header for an out-of-line property slab. The words follow it
 /// in the same cell.
 #[repr(C, align(8))]

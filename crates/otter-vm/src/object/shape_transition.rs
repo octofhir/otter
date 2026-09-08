@@ -20,15 +20,18 @@
 //! - Replay only applies to fast-shape ordinary objects.
 //! - Replay guards run before sidecar or slab growth, so a failed probe is
 //!   allocation-free and cannot relocate a caller-owned receiver handle.
-//! - Prototype guards are complete here: null prototype, direct prototype with
-//!   missing key and no deeper chain, or direct prototype with a writable data
-//!   slot.
+//! - Prototype guards are complete here: null prototype, a prototype chain on
+//!   which every object is a fast-shape ordinary object missing the key
+//!   (each link's shape is recorded and revalidated, as SpiderMonkey's
+//!   CacheIR guards every prototype shape for an add-slot store), or a
+//!   direct prototype with a writable data slot.
 //! - Descriptor changes that do not alter shape are still guarded: inherited
 //!   writable-data replay rechecks the direct prototype slot's writability.
-//! - Native lowering is deliberately narrower than VM replay: it admits only
-//!   inline-capacity null-prototype additions and a direct, terminal prototype
-//!   on which the key is absent. Every other transition stays on the runtime
-//!   stub.
+//! - Native lowering is narrower than VM replay: it admits a null receiver
+//!   prototype or a missing-key chain of at most two prototypes, and the
+//!   generated guard bound-checks the appended slot against the receiver's
+//!   live storage. Deeper chains and inherited writable data stay on the
+//!   runtime stub.
 //! - Accessors, proxies, string wrapper objects, deep prototype hits,
 //!   non-writable inherited data, and dictionary-compatible objects remain
 //!   fallback paths.
@@ -44,7 +47,16 @@ use super::{
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use otter_gc::raw::{RawGc, SlotVisitor};
+use smallvec::SmallVec;
 use std::cell::Cell;
+
+/// Longest missing-key prototype chain a transition records. A deeper chain
+/// keeps the store on ordinary `[[Set]]`; every recorded link costs one shape
+/// read per replay.
+const MAX_TRANSITION_CHAIN: usize = 8;
+
+/// Shape ids of each prototype on a missing-key chain, nearest first.
+pub(crate) type PrototypeChainShapes = SmallVec<[ShapeId; 4]>;
 
 /// Atom-aware hidden-class transition for adding one ordinary own data slot.
 #[derive(Debug, Clone)]
@@ -69,9 +81,13 @@ pub(crate) struct StorePropertyTransition {
 pub(crate) struct LowerableStoreTransition {
     /// Parent shape guarded before the append.
     pub(crate) from_shape: ShapeHandle,
-    /// Direct-prototype shape for a terminal missing-property proof, or null
-    /// when the receiver itself has a null prototype.
+    /// Direct-prototype shape for a missing-property proof, or null when the
+    /// receiver itself has a null prototype.
     pub(crate) prototype_shape: ShapeHandle,
+    /// Shape of the direct prototype's own prototype when the missing-key
+    /// chain is two links long, or null when the direct prototype is the
+    /// chain's end (or the receiver has no prototype).
+    pub(crate) prototype_chain_shape: ShapeHandle,
     /// Canonical child shape published after the value append.
     pub(crate) to_shape: ShapeHandle,
     /// New inline own-slot index.
@@ -100,7 +116,7 @@ impl StorePropertyTransition {
         heap: &otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<LowerableStoreTransition> {
-        if self.atom_id != key.atom().id() || usize::from(self.slot) >= super::INLINE_SLOT_CAP {
+        if self.atom_id != key.atom().id() {
             return None;
         }
 
@@ -141,31 +157,43 @@ impl StorePropertyTransition {
             return None;
         }
 
-        let prototype_shape = match &self.kind {
+        let (prototype_shape, prototype_chain_shape) = match &self.kind {
             StorePropertyTransitionKind::OwnAdd => {
                 if prototype_value(obj, heap).is_some() {
                     return None;
                 }
-                ShapeHandle::null()
+                (ShapeHandle::null(), ShapeHandle::null())
             }
-            StorePropertyTransitionKind::DirectPrototypeMissing { prototype_shape_id } => {
-                let proto = super::prototype(obj, heap)?;
-                if !super::supports_fast_property_ic(proto, heap)
-                    || prototype_value(proto, heap).is_some()
-                    || shape_id(proto, heap) != *prototype_shape_id
-                    || *prototype_shape_id == ShapeId::UNASSIGNED
-                {
+            StorePropertyTransitionKind::PrototypeChainMissing { chain } => {
+                if chain.len() > 2 {
                     return None;
                 }
-                let lookup = lookup_own_atom(proto, heap, key);
-                if lookup.hit.is_some() || !matches!(lookup.lookup, PropertyLookup::Absent) {
+                let mut shapes = [ShapeHandle::null(); 2];
+                let mut proto = super::prototype(obj, heap)?;
+                for (index, expected) in chain.iter().enumerate() {
+                    if index > 0 {
+                        proto = super::prototype(proto, heap)?;
+                    }
+                    if !super::supports_fast_property_ic(proto, heap)
+                        || shape_id(proto, heap) != *expected
+                        || *expected == ShapeId::UNASSIGNED
+                    {
+                        return None;
+                    }
+                    let lookup = lookup_own_atom(proto, heap, key);
+                    if lookup.hit.is_some() || !matches!(lookup.lookup, PropertyLookup::Absent) {
+                        return None;
+                    }
+                    let shape = object_shape(proto, heap);
+                    if shape.is_null() || shape.offset() == 0 {
+                        return None;
+                    }
+                    shapes[index] = shape;
+                }
+                if prototype_value(proto, heap).is_some() {
                     return None;
                 }
-                let shape = object_shape(proto, heap);
-                if shape.is_null() || shape.offset() == 0 {
-                    return None;
-                }
-                shape
+                (shapes[0], shapes[1])
             }
             StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => return None,
         };
@@ -173,6 +201,7 @@ impl StorePropertyTransition {
         Some(LowerableStoreTransition {
             from_shape,
             prototype_shape,
+            prototype_chain_shape,
             to_shape,
             slot: self.slot,
         })
@@ -189,11 +218,13 @@ fn object_shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
 pub(crate) enum StorePropertyTransitionKind {
     /// Existing receiver had `null` prototype and added a new own data slot.
     OwnAdd,
-    /// Receiver's direct prototype had this shape, no own key, and no further
-    /// prototype chain when the transition was installed.
-    DirectPrototypeMissing {
-        /// Direct prototype shape observed at install time.
-        prototype_shape_id: ShapeId,
+    /// Every prototype on the receiver's chain was a fast-shape ordinary
+    /// object without an own key when the transition was installed; `chain`
+    /// holds their shape ids nearest first, and the last one's prototype was
+    /// null.
+    PrototypeChainMissing {
+        /// Prototype shape ids observed at install time, nearest first.
+        chain: PrototypeChainShapes,
     },
     /// Receiver's direct prototype had a writable ordinary data property for
     /// this key. Setting through it creates an own data property on receiver.
@@ -470,23 +501,36 @@ fn transition_kind(
         }
     })? {
         ObjectPrototype::Null => Some(StorePropertyTransitionKind::OwnAdd),
-        ObjectPrototype::Object(proto) => {
-            if !super::supports_fast_property_ic(proto, heap) {
-                return None;
-            }
-            let lookup = lookup_own_atom(proto, heap, key);
-            match lookup.lookup {
-                PropertyLookup::Absent => prototype_value(proto, heap).is_none().then(|| {
-                    StorePropertyTransitionKind::DirectPrototypeMissing {
-                        prototype_shape_id: shape_id(proto, heap),
-                    }
-                }),
-                PropertyLookup::Data { flags, .. } if flags.writable() => {
-                    lookup.hit.map(|prototype_hit| {
-                        StorePropertyTransitionKind::DirectPrototypeWritableData { prototype_hit }
-                    })
+        ObjectPrototype::Object(first) => {
+            let mut chain = PrototypeChainShapes::new();
+            let mut proto = first;
+            loop {
+                if !super::supports_fast_property_ic(proto, heap) {
+                    return None;
                 }
-                PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => None,
+                let lookup = lookup_own_atom(proto, heap, key);
+                match lookup.lookup {
+                    PropertyLookup::Absent => {
+                        if chain.len() == MAX_TRANSITION_CHAIN {
+                            return None;
+                        }
+                        chain.push(shape_id(proto, heap));
+                    }
+                    PropertyLookup::Data { flags, .. } if flags.writable() && chain.is_empty() => {
+                        return lookup.hit.map(|prototype_hit| {
+                            StorePropertyTransitionKind::DirectPrototypeWritableData {
+                                prototype_hit,
+                            }
+                        });
+                    }
+                    PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => return None,
+                }
+                if prototype_value(proto, heap).is_none() {
+                    return Some(StorePropertyTransitionKind::PrototypeChainMissing { chain });
+                }
+                // A non-object prototype (a Proxy or an exotic value) ends
+                // the fast chain without proving the key absent.
+                proto = super::prototype(proto, heap)?;
             }
         }
         ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
@@ -508,12 +552,24 @@ fn transition_kind_matches(
     match (&transition.kind, prototype) {
         (StorePropertyTransitionKind::OwnAdd, Some(ObjectPrototype::Null)) => true,
         (
-            StorePropertyTransitionKind::DirectPrototypeMissing { prototype_shape_id },
-            Some(ObjectPrototype::Object(proto)),
+            StorePropertyTransitionKind::PrototypeChainMissing { chain },
+            Some(ObjectPrototype::Object(first)),
         ) => {
-            super::supports_fast_property_ic(proto, heap)
-                && prototype_value(proto, heap).is_none()
-                && shape_id(proto, heap) == *prototype_shape_id
+            let mut proto = first;
+            for (index, expected) in chain.iter().enumerate() {
+                if index > 0 {
+                    let Some(next) = super::prototype(proto, heap) else {
+                        return false;
+                    };
+                    proto = next;
+                }
+                if !super::supports_fast_property_ic(proto, heap)
+                    || shape_id(proto, heap) != *expected
+                {
+                    return false;
+                }
+            }
+            prototype_value(proto, heap).is_none()
         }
         (
             StorePropertyTransitionKind::DirectPrototypeWritableData { prototype_hit },
@@ -534,7 +590,7 @@ fn transition_kind_matches_receiver_body(
         (kind, &body.prototype()),
         (StorePropertyTransitionKind::OwnAdd, ObjectPrototype::Null)
             | (
-                StorePropertyTransitionKind::DirectPrototypeMissing { .. }
+                StorePropertyTransitionKind::PrototypeChainMissing { .. }
                     | StorePropertyTransitionKind::DirectPrototypeWritableData { .. },
                 ObjectPrototype::Object(_),
             )

@@ -283,8 +283,12 @@ impl CodeBlock {
             object_slab_len_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SLAB_LEN_OFFSET as u32,
             object_inline_slot_cap: crate::object::INLINE_SLOT_CAP as u32,
+            object_slab_capacity_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::slot_slab::SLOT_SLAB_CAPACITY_OFFSET as u32,
             object_extensible_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_EXTENSIBLE_OFFSET as u32,
+            object_chain_link_opaque_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET as u32,
             object_shape_cache_mode_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET as u32,
             object_shape_cache_fast: crate::object::SHAPE_CACHE_MODE_FAST,

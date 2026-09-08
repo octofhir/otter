@@ -50,10 +50,14 @@ struct WhiskerIcWay {
     /// Child hidden class for an add-property transition; `0` keeps the
     /// existing-slot program above.
     transition_shape: u32,
+    /// Guarded shape of the direct prototype's own prototype for a
+    /// two-link missing-key add transition; `0` when the chain ends at the
+    /// direct prototype.
+    chain_shape: u32,
 }
 
 /// Byte stride between ways, shared by the cell and the emitted probes.
-pub(crate) const WHISKER_IC_WAY_BYTES: u32 = 16;
+pub(crate) const WHISKER_IC_WAY_BYTES: u32 = 20;
 
 const _: () = assert!(
     std::mem::size_of::<WhiskerIcWay>() == WHISKER_IC_WAY_BYTES as usize,
@@ -95,6 +99,7 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIc
         ways[slot].value_byte = way.value_byte;
         ways[slot].holder_shape = way.holder_shape;
         ways[slot].transition_shape = way.transition_shape;
+        ways[slot].chain_shape = way.chain_shape;
         ways[slot].shape = way.receiver_shape;
     }
 }
@@ -433,12 +438,14 @@ mod tests {
                     holder_shape: 23,
                     value_byte: 40,
                     transition_shape: 29,
+                    chain_shape: 31,
                 },
             );
         }
         assert_eq!(cell.ways[0].value_byte, 40);
         assert_eq!(cell.ways[0].holder_shape, 23);
         assert_eq!(cell.ways[0].transition_shape, 29);
+        assert_eq!(cell.ways[0].chain_shape, 31);
         assert_eq!(cell.ways[0].shape, 17);
     }
 }

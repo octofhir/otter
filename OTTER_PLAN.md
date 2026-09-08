@@ -50,11 +50,11 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-08.
-- Observed commit: `0abccced` (clean tree at snapshot time).
+- Observed commit: `7de3e50f` (clean tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
-- Checkpoint gates passed on this commit: `otter-gc` full suite,
-  `otter-vm --lib` (936), `otter-runtime --lib` (267), code-chunk eviction
+- Checkpoint gates passed on this commit: `otter-gc` full suite (incl. free-list units),
+  `otter-vm --lib` (936), `otter-runtime --lib` (269, incl. worker view-clone and file: URL), code-chunk eviction
   and cross-chunk JIT integration tests, `clippy --all-targets
   --all-features -D warnings` on `otter-gc`, `otter-resource`, `otter-vm`,
   and `otter-runtime`, and `OTTER_GC_STRESS` 1/3/5 smoke on buffer, eval,
@@ -269,13 +269,33 @@ installed chunks are keyed by executable address. The cost is flat at about
 2.3 s. The `CodeSpaceConflict` link error, which only the one-shot chain could
 raise, is gone.
 
-Recorded, not yet acted on: one `setTimeout` costs about 18 µs and about 3 KB
-resident while queued, almost entirely in Node's `Timeout` constructor, list
-insertion, and async-hooks bookkeeping running on the VM's property-store
-path rather than in any resource accounting; that belongs to the object-model
-and JIT lanes. Worker messaging round-trips a 4 KiB `ArrayBuffer` in about
-12 µs and a 4 KiB string in about 35 µs, a `Uint8Array` fails structured
-clone, and `new Worker` accepts a path but not a `file:` URL. Under eight
+The timer finding led into the old-space allocator. One `setTimeout` cost
+about 18 µs and about 3 KB resident while queued, almost entirely in Node's
+`Timeout` constructor; isolating that showed a twelve-field constructor
+costing 12.8 µs against 0.4 µs for a three-field one, growing with heap size
+(6.6 µs at twenty thousand live objects, 20 µs at four hundred thousand), and
+94% of the time inside `OldSpace::alloc`. The free list had eight power-of-two
+classes and served a request by scanning its own class linearly for the first
+range that fit, so every slot-slab allocation into a swept heap walked every
+too-small hole the sweep had left in that class. The classes now follow V8's
+`FreeListMany::categories_min`: one class per cell size below 256 bytes, then
+one per doubling. A precise class holds ranges of exactly its size and pops in
+O(1); a doubling class keeps its ranges largest-first and either pops its
+largest or fails in O(1); any class above the request's own guarantees a fit.
+The twelve-field constructor now costs 3.4 µs at every heap size and the
+sixteen-symbol-and-field variant 4.6 µs instead of 25 µs
+([`free-list.h`](https://github.com/v8/v8/blob/main/src/heap/free-list.h)).
+
+Still recorded, not yet acted on: a property store on a fresh object costs
+about 300 ns (shape transition plus slab growth), and Node's timer lists run
+in the interpreter, so one `setTimeout` still costs 11–22 µs and grows with
+the number queued. V8 sizes new instances from constructor feedback
+(in-object slack tracking) and JSC from inline capacity; that is object-model
+and tiering work outside this lane. Worker messaging round-trips a 4 KiB `ArrayBuffer` in about
+12 µs and a 4 KiB string in about 35 µs. Typed-array and `DataView` messages
+now clone as views over their cloned buffer with the original kind, offset,
+and length, and `new Worker` accepts a `file:` URL as well as a path. Under
+eight
 concurrent isolates the 4 KiB allocate/free pattern is bounded by the platform
 allocator; the structural answer is young-generation finalization of buffer
 bodies as in V8's `ArrayBufferSweeper`, which is a GC design slice of its own.

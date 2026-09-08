@@ -50,7 +50,7 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-08.
-- Observed commit: `7de3e50f` (clean tree at snapshot time).
+- Observed commit: `7de3e50f` plus the add-transition slice (clean tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: `otter-gc` full suite (incl. free-list units),
@@ -286,12 +286,58 @@ The twelve-field constructor now costs 3.4 µs at every heap size and the
 sixteen-symbol-and-field variant 4.6 µs instead of 25 µs
 ([`free-list.h`](https://github.com/v8/v8/blob/main/src/heap/free-list.h)).
 
-Still recorded, not yet acted on: a property store on a fresh object costs
-about 300 ns (shape transition plus slab growth), and Node's timer lists run
-in the interpreter, so one `setTimeout` still costs 11–22 µs and grows with
-the number queued. V8 sizes new instances from constructor feedback
-(in-object slack tracking) and JSC from inline capacity; that is object-model
-and tiering work outside this lane. Worker messaging round-trips a 4 KiB `ArrayBuffer` in about
+The remaining per-store cost was the add-property inline cache. Generated
+code could commit an add-transition only for the three in-body inline slots
+and only when the receiver's direct prototype had no prototype of its own —
+which no constructor instance satisfies, since `Foo.prototype` inherits from
+`Object.prototype`. Every other store left generated code for the runtime
+stub, which re-resolved `[[Set]]` along the prototype chain with string
+compares and a shape-table lookup before its own cache could answer. The
+transition record now captures the shape of every prototype on a missing-key
+chain (up to eight links) and replays by walking the live chain, and the
+generated way carries a second chain shape so a two-link chain — a
+constructor prototype above `Object.prototype` — commits inline; the guard
+also bound-checks the appended slot against the live slab's capacity, so
+stores into the spilled slab commit inline and only the growth points reach
+the runtime. A chain link is guarded by its shape, its fast-IC mode, and a
+new body flag that marks it opaque (a Proxy or non-object prototype, or a
+String wrapper whose keys the shape does not list); sidecars and attribute
+overrides on a link do not affect key absence, so `Object.prototype`, which
+carries a sidecar, stays guardable. This is SpiderMonkey's design:
+`SetPropIRGenerator::tryAttachAddSlotStub` emits `ShapeGuardProtoChain`, one
+shape guard per prototype, before `EmitAddAndStoreSlotShared`
+([`CacheIR.cpp`](https://searchfox.org/mozilla-central/source/js/src/jit/CacheIR.cpp)).
+V8 reaches the same proof through one prototype-chain validity cell per
+receiver map in `StoreHandler::StoreTransition`
+([`ic.cc`](https://github.com/v8/v8/blob/main/src/ic/ic.cc)), and JSC through
+an `ObjectPropertyConditionSet` of absence conditions on each prototype
+structure in `AccessCase::Transition`
+([`AccessCase.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/bytecode/AccessCase.cpp)).
+No tier was added: the VM record, the CacheIR replay, and the one way-cell
+guard shared by the template and machine tiers changed in place, and the
+runtime property-stub count for a twelve-field constructor is now bounded by
+its slab growth points instead of its store count. The twelve-field
+constructor costs 1.3 µs per object (12.8 µs at the start of this lane) and
+the sixteen-slot symbol variant 2.5 µs (25 µs), about 80 ns per appended
+field; `otter-difftest` agrees across interpreter, tiers, and GC stress
+(22/22), and `OTTER_GC_STRESS` 1/3/5 smoke on the constructor scripts is
+clean.
+
+Found while gating, outside this lane: seventeen tests across the
+`otter-runtime` `jit_machine_*`, `jit_control_ops`, `jit_artifacts`, and
+`jit_debug_events` suites fail identically with and without this slice and
+with each of this lane's commits reversed, so they predate it; `gate.sh` does
+not run them. Most assert on artifact shapes or event counts that the machine
+tier no longer produces the same way, but `jit_control_ops` reports a tier
+completion of `3240:180:3` against the interpreter's `2760:180:3` — a getter
+evaluated more than once in generated code — which is a real divergence the
+JIT lane must take.
+
+Still recorded, not yet acted on: Node's timer lists run in the interpreter,
+so one `setTimeout` still costs about 10 µs and grows with the number queued;
+symbol-keyed stores have no inline cache; and V8 sizes new instances from
+constructor feedback (in-object slack tracking) where Otter grows the slab by
+doubling. Worker messaging round-trips a 4 KiB `ArrayBuffer` in about
 12 µs and a 4 KiB string in about 35 µs. Typed-array and `DataView` messages
 now clone as views over their cloned buffer with the original kind, offset,
 and length, and `new Worker` accepts a `file:` URL as well as a path. Under

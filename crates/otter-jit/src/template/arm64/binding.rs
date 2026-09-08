@@ -157,11 +157,22 @@ pub(super) fn emit_binding_value(
             let dst = result.ok_or(Unsupported::OperandShape("globalThis read result"))?;
             cold_reachable = false;
             guard_end = ops.offset().0;
+            // The isolate publishes the global object as a compressed cage
+            // offset; a Value is the full address, so rebase before it can
+            // reach a register (bit-compared by `===` and traced by GC).
             dynasm!(ops
                 ; .arch aarch64
                 ; ldr x14, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET]
                 ; ldr w9, [x14]
             );
+            emit_load_symbol_u64(
+                ops,
+                relocations,
+                13,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            dynasm!(ops ; .arch aarch64 ; add x9, x9, x13);
             emit_store_reg(ops, 9, dst)?;
             dynasm!(ops ; .arch aarch64 ; b =>done);
             hit_end = ops.offset().0;

@@ -1208,8 +1208,11 @@ fn emit_binding_hit(
             }
             match read {
                 BindingRead::GlobalThis { .. } => {
-                    emit_load_allocated_integer(ops, frame, locations[1], 13, 0)?;
-                    dynasm!(ops ; .arch aarch64 ; ldr w9, [x13]);
+                    // The guard rebased the published compressed offset into
+                    // the owner address; that address is the object Value.
+                    // The storage word alone is a bare cage offset and must
+                    // never reach a tagged home.
+                    emit_load_allocated_integer(ops, frame, locations[0], 9, 0)?;
                 }
                 BindingRead::Exists { .. } => {
                     emit_load_u64(ops, 9, Value::boolean(true).to_bits());

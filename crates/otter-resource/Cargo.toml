@@ -11,3 +11,10 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "ledger"
+harness = false

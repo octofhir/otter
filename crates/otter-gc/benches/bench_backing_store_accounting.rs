@@ -1,10 +1,12 @@
 //! Bench: external/backing-store accounting tokens.
 //!
-//! Measures cap accounting for off-object bytes such as future typed-array or
-//! host backing stores.
+//! Measures cap accounting for off-object bytes such as typed-array or host
+//! backing stores, both heap-local and with the shared runtime ledger
+//! mirroring every change as `ExternalBytes`.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use otter_gc::{GcHeap, init_cage_with_size};
+use otter_resource::{ResourceAccount, ResourceLimits};
 
 fn bench(c: &mut Criterion) {
     let _ = init_cage_with_size(512 * 1024 * 1024);
@@ -20,6 +22,26 @@ fn bench(c: &mut Criterion) {
         });
     });
     group.bench_function("resize_4k_to_8k_to_1k", |b| {
+        b.iter(|| {
+            let mut token = heap.reserve_external(4096).expect("reserve");
+            token.resize(&mut heap, 8192).expect("grow");
+            token.resize(&mut heap, 1024).expect("shrink");
+            std::hint::black_box(token.bytes());
+            drop(token);
+        });
+    });
+
+    let account = ResourceAccount::new(ResourceLimits::default());
+    heap.set_external_bytes_account(&account)
+        .expect("install ledger");
+    group.bench_function("reserve_release_4k_ledger", |b| {
+        b.iter(|| {
+            let token = heap.reserve_external(4096).expect("reserve");
+            std::hint::black_box(token.bytes());
+            drop(token);
+        });
+    });
+    group.bench_function("resize_4k_to_8k_to_1k_ledger", |b| {
         b.iter(|| {
             let mut token = heap.reserve_external(4096).expect("reserve");
             token.resize(&mut heap, 8192).expect("grow");

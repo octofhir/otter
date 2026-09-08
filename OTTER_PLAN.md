@@ -49,17 +49,17 @@ claim.
 
 ## Live snapshot
 
-- Snapshot date: 2026-08-30.
-- Observed commit: `242593b2` (clean tree at snapshot time).
+- Snapshot date: 2026-09-08.
+- Observed commit: `0abccced` (clean tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
-- Checkpoint gates passed on this commit: compile-cache unit/Unix tests
-  (incl. root-symlink and hardlinked-lock regressions), worker suite under
-  `OTTER_GC_STRESS` 1/13, `resource_accounting`, `otter-resource`,
-  release `otter-bytecode` verifier/mutation tests, workspace
-  `cargo check --all-targets`, and `clippy --all-targets --all-features
-  -D warnings`. These are local observations, not a publishable clean-tree
-  baseline.
+- Checkpoint gates passed on this commit: `otter-gc` full suite,
+  `otter-vm --lib` (936), `otter-runtime --lib` (267), code-chunk eviction
+  and cross-chunk JIT integration tests, `clippy --all-targets
+  --all-features -D warnings` on `otter-gc`, `otter-resource`, `otter-vm`,
+  and `otter-runtime`, and `OTTER_GC_STRESS` 1/3/5 smoke on buffer, eval,
+  and timer churn. These are local observations, not a publishable
+  clean-tree baseline.
 - `ES_CONFORMANCE.md` and `docs/site/public/conformance/data.json` are current
   as of this commit: 99.98%, 12 fails of 53575, no crashes or timeouts.
 - No performance result from this dirty snapshot is eligible for publication.
@@ -207,6 +207,78 @@ For each bounded resource record idle cost, steady-state cost, peak usage,
 rejection count, and recovery to baseline. Prefer zero-allocation fast checks,
 batched accounting, and cache-friendly counters, but only after correctness is
 measured.
+
+Measured first. `otter-resource` now carries a criterion bench for the shared
+ledger (single-class reserve/release, lease resize, multi-class admission,
+rejection, snapshot, and the same resize loop under 1/2/4/8-thread contention
+on one account), and the `otter-gc` backing-store bench runs with and without
+the runtime ledger installed. One uncontended ledger operation is a mutex
+round trip of about 9 ns; the GC external reserve/release pair goes from about
+20 ns heap-local to about 33 ns mirrored, and a JavaScript
+`new ArrayBuffer(4096)` costs about 500 ns, so the ledger is roughly two
+percent of the cheapest path that charges it. Eight threads resizing leases on
+one account convoy to about 750 ns per grow/shrink pair. That contention is
+not what bounds multi-isolate work: eight workers churning 4 KiB buffers spend
+their time in the platform allocator, and a standalone 4 KiB alloc/free loop
+scales identically badly on macOS under both the system allocator and
+mimalloc. The ledger therefore stays a single mutex; lock-free counters are
+not justified by any measured path.
+
+The peak-usage finding was the real defect. Objects owning external bytes are
+small old-space slots with drop glue, so old-space page occupancy barely moved
+while their payloads pinned native memory; dead `ArrayBuffer` bodies survived
+until the heap byte cap. Churning two million 4 KiB buffers reached 2.2 GB of
+resident memory on one isolate and 5.6 GB across eight workers. Landed:
+outstanding external reservations are part of the one major-GC budget. The
+occupancy that fires a growth-triggered major GC is old/large page bytes plus
+reserved external bytes, and after every major GC the next budget is
+`live_pages × factor + live_reserved × min(factor, 11/10)`, floored and
+cage-clamped as before; the reserve paths run the same due check before
+admission. The same churn now peaks at 79 MB resident (399 MB across eight
+workers) and runs about 30% faster per allocation. The ledger's `ExternalBytes`
+peak follows the budget, which the `otter-gc` tests assert directly.
+
+The model was taken from production engines rather than chosen as a constant.
+V8 folds external memory into its global allocation limit — consumed
+old-generation bytes times the growing factor plus external memory since the
+last mark-compact times `min(factor, external_memory_max_growing_factor)` (1.1)
+— re-checks it every 128 KB of external growth, and keeps a hard limit at the
+low-water mark plus half the maximum old generation:
+[`heap-controller.cc`](https://github.com/v8/v8/blob/main/src/heap/heap-controller.cc),
+[`heap.cc` `UpdateExternalMemory`](https://github.com/v8/v8/blob/main/src/heap/heap.cc).
+JavaScriptCore counts `extraMemorySize()` as heap bytes: `didAllocate` charges
+the cycle budget and `updateAllocationLimits` grows the next maximum heap
+proportionally from the visited bytes plus extra memory:
+[`Heap.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/heap/Heap.cpp).
+SpiderMonkey keeps a separate malloc threshold of
+`max(lastBytes, JSGC_MALLOC_THRESHOLD_BASE = 38 MB) × growthFactor`:
+[`Scheduling.cpp`](https://searchfox.org/mozilla-central/source/js/src/gc/Scheduling.cpp).
+Otter follows V8 and JSC — one budget — with V8's capped external ratio, since
+external bytes are neither marked nor copied and a large live external set must
+not license a proportionally large external garbage set.
+
+The steady-state finding for `SourceModuleBytes` was algorithmic. Resolving a
+function id walked the append-only code-chunk chain, and the feedback
+directory probed its installed-chunk list linearly, so `new Function` cost
+grew with every chunk already linked: 21 µs at two thousand chunks, 350 µs at
+fifty thousand, and two hundred thousand did not finish in ten minutes. The
+registry is now one vector ordered by `function_base` under a read/write lock,
+resolved by binary search and appended under the single-writer link lock;
+installed chunks are keyed by executable address. The cost is flat at about
+12 µs per `new Function` at every size, and two hundred thousand finish in
+2.3 s. The `CodeSpaceConflict` link error, which only the one-shot chain could
+raise, is gone.
+
+Recorded, not yet acted on: one `setTimeout` costs about 18 µs and about 3 KB
+resident while queued, almost entirely in Node's `Timeout` constructor, list
+insertion, and async-hooks bookkeeping running on the VM's property-store
+path rather than in any resource accounting; that belongs to the object-model
+and JIT lanes. Worker messaging round-trips a 4 KiB `ArrayBuffer` in about
+12 µs and a 4 KiB string in about 35 µs, a `Uint8Array` fails structured
+clone, and `new Worker` accepts a path but not a `file:` URL. Under eight
+concurrent isolates the 4 KiB allocate/free pattern is bounded by the platform
+allocator; the structural answer is young-generation finalization of buffer
+bodies as in V8's `ArrayBufferSweeper`, which is a GC design slice of its own.
 
 ## B — Bytecode and artifact integrity
 

@@ -781,6 +781,16 @@ pub struct ObjectBody {
     /// carries no per-slot metadata at all and derives everything from the
     /// hidden class.
     slot_attrs_overridden: bool,
+    /// `true` while this object cannot serve as a guarded link of a
+    /// prototype chain: its `[[Prototype]]` is a Proxy or a non-object value
+    /// held in [`ExoticSlots::proto_override`] (the flat `jit_proto` mirror
+    /// is then null without meaning `null`), or it is a String wrapper whose
+    /// index and `length` keys live outside its shape. Generated
+    /// add-transition guards read this byte for every chain link, so a
+    /// shape match proves the key absent only on objects whose keys the
+    /// shape fully describes. Lives in the padding after
+    /// [`Self::slot_attrs_overridden`], so it adds no object size.
+    chain_link_opaque: bool,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
     /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
     /// slots, and the Date/Error/raw-JSON/arguments markers. `None` for plain
@@ -2017,6 +2027,10 @@ pub(crate) const OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, slot_attrs_overridden);
 /// Byte offset of the 4-byte rare-state GC handle inside [`ExoticSlot`].
 /// A zero word proves the complete sidecar is absent.
+/// Byte offset of the `chain_link_opaque` flag within an ordinary object
+/// body, read by generated prototype-chain guards.
+pub(crate) const OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, chain_link_opaque);
 pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, exotic) + std::mem::offset_of!(ExoticSlot, handle);
 /// Total fixed cell bytes for an ordinary object, including its GC header.
@@ -2042,6 +2056,7 @@ const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 16);
 const _: () = assert!(OBJECT_BODY_EXTENSIBLE_OFFSET == 40);
 const _: () = assert!(OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET == 32);
 const _: () = assert!(OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET == 41);
+const _: () = assert!(OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET == 42);
 const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 48);
 const _: () = assert!(OBJECT_BODY_CELL_BYTES == 96);
 // The shape guard word must sit at offset 0 (single-compare guard) and the
@@ -2925,6 +2940,7 @@ fn empty_object_body() -> ObjectBody {
         jit_proto: otter_gc::Gc::null(),
         extensible: true,
         slot_attrs_overridden: false,
+        chain_link_opaque: false,
         exotic: ExoticSlot::null(),
     }
 }
@@ -3058,6 +3074,7 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
         jit_proto: prototype.unwrap_or_default(),
         extensible: true,
         slot_attrs_overridden: false,
+        chain_link_opaque: false,
         exotic: ExoticSlot::null(),
     };
     body.refresh_values_ptr();
@@ -3221,6 +3238,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
+            chain_link_opaque: false,
             exotic: slot,
         },
         &mut visit,
@@ -3263,6 +3281,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
+            chain_link_opaque: false,
             exotic: slot,
         },
         &mut visit,
@@ -3306,6 +3325,7 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
+            chain_link_opaque: false,
             exotic: slot,
         },
         &mut visit,
@@ -4263,6 +4283,7 @@ pub fn set_string_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: J
         .expect("pending string survives rooting");
     heap.with_payload(*obj, |body| {
         body.exotic_mut().string_data = Some(value);
+        body.chain_link_opaque = true;
     });
     heap.record_write(*obj, &value);
 }
@@ -5131,6 +5152,11 @@ pub fn set_prototype_value(
     };
     heap.with_payload(obj, |body| {
         body.jit_proto = jit_proto;
+        body.chain_link_opaque = body.string_data().is_some()
+            || matches!(
+                new_proto,
+                ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)
+            );
         match &new_proto {
             // Common case: encoded entirely by `jit_proto`; drop any stale
             // non-ordinary override so the object carries no exotic box for it.
@@ -7192,7 +7218,7 @@ mod tests {
                 .expect("transition install");
         assert!(matches!(
             transition.kind,
-            StorePropertyTransitionKind::DirectPrototypeMissing { .. }
+            StorePropertyTransitionKind::PrototypeChainMissing { .. }
         ));
 
         let second = alloc_object_old_for_fixture(&mut heap).unwrap();

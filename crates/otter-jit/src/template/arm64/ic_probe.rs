@@ -88,14 +88,16 @@ use crate::entry::{
 /// Match `w14` against the cell's ways, branching to `miss` when none hold.
 ///
 /// On a match `w7` carries the way's holder shape, `w17` its slot byte offset,
-/// and `w6` its add-transition child shape (`0` for an existing-slot program),
-/// then control falls through to `matched`.
+/// `w6` its add-transition child shape (`0` for an existing-slot program), and
+/// `w11` the second prototype-chain shape of a two-link add transition (`0`
+/// otherwise), then control falls through to `matched`.
 pub(crate) fn emit_way_walk(ops: &mut Assembler, matched: DynamicLabel, miss: DynamicLabel) {
     for way in 0..IC_WAYS as u32 {
         let shape_off = way * WHISKER_IC_WAY_BYTES;
         let holder_off = shape_off + 4;
         let value_byte_off = shape_off + 8;
         let transition_shape_off = shape_off + 12;
+        let chain_shape_off = shape_off + 16;
         let next = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
@@ -105,6 +107,7 @@ pub(crate) fn emit_way_walk(ops: &mut Assembler, matched: DynamicLabel, miss: Dy
             ; ldr w7, [x15, holder_off]
             ; ldr w17, [x15, value_byte_off]
             ; ldr w6, [x15, transition_shape_off]
+            ; ldr w11, [x15, chain_shape_off]
             ; b =>matched
             ; =>next
         );
@@ -141,6 +144,41 @@ fn emit_fast_object_state_guard(
         ; ldrb W(scratch), [X(header), attrs_byte]
         ; cbnz W(scratch), =>miss
         ; ldr W(scratch), [X(header), exotic_byte]
+        ; cbnz W(scratch), =>miss
+    );
+}
+
+/// Prove that one prototype-chain link still supports the missing-key proof a
+/// generated add-transition carries.
+///
+/// A link needs less than a receiver: its shape fixes which keys it owns, so
+/// the guard requires only that hidden-class ICs may still trust that shape
+/// (fast mode) and that the link is not opaque — a Proxy or non-object
+/// `[[Prototype]]` leaves the flat mirror null without ending the chain, and a
+/// String wrapper owns keys its shape does not list. Sidecars, overridden
+/// attributes, and extensibility do not affect whether a key is absent, so a
+/// prototype such as `Object.prototype` that carries a sidecar stays
+/// guardable.
+fn emit_chain_link_state_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    miss: DynamicLabel,
+) {
+    let scratch = if header == 14 { 11 } else { 14 };
+    let mode_byte = view.object_shape_cache_mode_byte;
+    let fast_mode = u32::from(view.object_shape_cache_fast);
+    let opaque_byte = view.object_chain_link_opaque_byte;
+    dynasm!(ops ; .arch aarch64 ; ldrb W(scratch), [X(header), mode_byte]);
+    if fast_mode == 0 {
+        dynasm!(ops ; .arch aarch64 ; cbnz W(scratch), =>miss);
+    } else {
+        emit_load_u64(ops, 10, u64::from(fast_mode));
+        dynasm!(ops ; .arch aarch64 ; cmp W(scratch), w10 ; b.ne =>miss);
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldrb W(scratch), [X(header), opaque_byte]
         ; cbnz W(scratch), =>miss
     );
 }
@@ -527,19 +565,40 @@ where
     emit_way_walk(ops, do_store, miss);
     let existing = ops.new_dynamic_label();
     let transition_proto_done = ops.new_dynamic_label();
+    let inline_storage = ops.new_dynamic_label();
+    let storage_fits = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; cbz w6, =>existing
-        // VM admission limits this first slice to slots resident in the
-        // receiver's in-body slab. Revalidate both alignment and capacity in
-        // generated code before any mutation.
+        // Revalidate alignment and storage capacity in generated code before
+        // any mutation: the appended slot must already have a word, either in
+        // the in-body inline array or in the spilled slab. A slot the live
+        // storage cannot hold misses to the runtime, which grows the slab.
         ; tst w17, #7
         ; b.ne =>miss
+        ; ldr w16, [x13, view.object_slab_handle_byte]
+        ; cbz w16, =>inline_storage
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x15, x15, x16
+        ; ldr w14, [x15, view.object_slab_capacity_byte]
+        ; lsr w16, w17, #3
+        ; cmp w16, w14
+        ; b.hs =>miss
+        ; b =>storage_fits
+        ; =>inline_storage
         ; lsr w16, w17, #3
         ; cmp w16, view.object_inline_slot_cap
         ; b.hs =>miss
-        ; ldr w16, [x13, view.object_slab_handle_byte]
-        ; cbnz w16, =>miss
+        ; =>storage_fits
         ; ldrb w16, [x13, view.object_extensible_byte]
         ; cbz w16, =>miss
         ; ldrh w16, [x13, view.object_slab_len_byte]
@@ -547,12 +606,16 @@ where
         ; cmp w16, w15
         ; b.ne =>miss
         // holder_shape==0 describes a null receiver prototype. Otherwise it
-        // describes one fast direct prototype with no further parent.
+        // describes a fast direct prototype missing the key, whose own
+        // prototype is null (chain shape 0) or is the one further fast object
+        // the chain shape guards, itself with a null prototype. Every object
+        // ordinary `[[Set]]` would consult is therefore shape-checked.
         ; ldr w16, [x13, view.jit_proto_byte]
         ; cbnz w7, =>transition_proto_done
         ; cbnz w16, =>miss
     );
     let transition_guards_done = ops.new_dynamic_label();
+    let chain_link_two = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; b =>transition_guards_done ; =>transition_proto_done);
     dynasm!(ops ; .arch aarch64 ; cbz w16, =>miss);
     emit_load_symbol_u64(
@@ -569,11 +632,38 @@ where
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>miss
     );
-    emit_fast_object_state_guard(ops, view, 15, miss);
+    emit_chain_link_state_guard(ops, view, 15, miss);
     dynasm!(ops
         ; .arch aarch64
         ; ldr w14, [x15, view.object_shape_byte]
         ; cmp w14, w7
+        ; b.ne =>miss
+        ; ldr w14, [x15, view.jit_proto_byte]
+        ; cbnz w11, =>chain_link_two
+        ; cbnz w14, =>miss
+        ; b =>transition_guards_done
+        ; =>chain_link_two
+        ; cbz w14, =>miss
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x15, x15, x14
+        ; ldrb w14, [x15]
+        ; cmp w14, OBJECT_BODY_TYPE_TAG
+        ; b.ne =>miss
+    );
+    emit_chain_link_state_guard(ops, view, 15, miss);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [x15, view.object_shape_byte]
+        ; cmp w14, w11
         ; b.ne =>miss
         ; ldr w14, [x15, view.jit_proto_byte]
         ; cbnz w14, =>miss
@@ -599,7 +689,7 @@ where
     dynasm!(ops ; .arch aarch64 ; mov x12, x13);
     super::values::emit_slab_base(ops, view, 13, 14);
     // Existing slots still reject malformed null storage. A transition has
-    // already proved inline storage and must not branch after publication.
+    // already proved its storage and must not branch after publication.
     let have_slab = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; cbnz x13, =>have_slab ; cbz w6, =>miss ; =>have_slab);
     // x16 is outside every tier's allocatable bank. Callers preserve it only

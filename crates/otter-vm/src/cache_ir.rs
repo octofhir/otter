@@ -437,6 +437,7 @@ impl CacheStub {
                         holder_shape,
                         value_byte: slot_value_byte(hit.slot),
                         transition_shape: 0,
+                        chain_shape: 0,
                     });
                 }
                 CacheOp::StoreDataSlot { obj: 0, hit } => {
@@ -449,6 +450,7 @@ impl CacheStub {
                         holder_shape,
                         value_byte: slot_value_byte(hit.slot),
                         transition_shape: 0,
+                        chain_shape: 0,
                     });
                 }
                 CacheOp::StoreAddTransition { transition } => {
@@ -459,6 +461,7 @@ impl CacheStub {
                         holder_shape: transition.prototype_shape.offset(),
                         value_byte: slot_value_byte(transition.slot),
                         transition_shape: transition.to_shape.offset(),
+                        chain_shape: transition.prototype_chain_shape.offset(),
                     });
                 }
                 // Ops with no inline lowering yet keep the site on the stub.

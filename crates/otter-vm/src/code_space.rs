@@ -21,18 +21,20 @@
 //!
 //! # Contents
 //!
-//! - [`CodeSpace`] — append-only chunk chain with monotonic function-id and
+//! - [`CodeSpace`] — append-only chunk index with monotonic function-id and
 //!   IC-site bases.
 //! - [`ChunkPayload`] — one live linked chunk's tables and retained-byte lease.
 //! - [`ResolvedCtx`] — borrowed-or-owned context for one function id.
 //!
 //! # Invariants
 //!
-//! - Node ranges and `next` links are immutable after publication. Resolution
-//!   walks those fields without locking and locks only the matching payload
-//!   slot. Linking holds one single-writer lock from global-base selection
-//!   through publication.
-//! - Chunks are appended with monotonically increasing `function_base` values.
+//! - Node ranges are immutable after publication. Resolution binary-searches
+//!   the published index under its shared lock and then locks only the
+//!   matching payload slot; no resolution or census is proportional to the
+//!   number of linked chunks. Linking holds one single-writer lock from
+//!   global-base selection through publication.
+//! - Chunks are appended with monotonically increasing `function_base` values,
+//!   so index order is id order.
 //! - Fresh compiler output is rebased fallibly and verified exactly once at
 //!   its assigned base before publication. Decoded cache carriers retain the
 //!   same proof through proof-preserving rebasing and executable building.
@@ -60,7 +62,7 @@
 //! - [`crate::executable`]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use otter_bytecode::{
     BytecodeModule, BytecodeRebaseError, BytecodeVerifyError, Constant, Op, VerifiedBytecodeModule,
@@ -150,16 +152,16 @@ pub(crate) enum ChunkEvictionResult {
 
 /// Append-only node registry of every code chunk linked into one interpreter.
 ///
-/// The registry is an immutable-node chain rather than a locked `Vec`. Linking
-/// claims the first empty one-shot link; resolution only follows already
-/// published links. This preserves late visibility for escaped functions while
-/// keeping the execution path lock-free.
+/// Published chunks live in one vector ordered by `function_base`, so a
+/// function id resolves to its owning node by binary search. Readers hold the
+/// shared lock only for that search; linking appends under the exclusive lock
+/// as its final, infallible step, after every fallible admission check.
 #[derive(Debug, Default)]
 pub(crate) struct CodeSpace {
-    first: OnceLock<Arc<CodeChunk>>,
-    /// Last chunk this registry published, used as the starting point for the
-    /// next link. Taken only while linking; resolution never touches it.
-    tail: Mutex<Option<Arc<CodeChunk>>>,
+    chunks: RwLock<Vec<Arc<CodeChunk>>>,
+    /// Single-writer link lock, held from global-base selection through
+    /// publication so two links cannot select the same bases.
+    link: Mutex<()>,
     /// Advances after every topology or payload-state publication. Turn-local
     /// owner caches compare this before reusing a context, so linking or
     /// eviction cannot leave a stale fast-path answer.
@@ -206,9 +208,6 @@ pub enum BytecodeLinkError {
         /// Number of property-IC sites in the chunk.
         site_count: usize,
     },
-    /// The append slot was unexpectedly already occupied while holding the
-    /// single-writer lock.
-    CodeSpaceConflict,
     /// The chunk's retained bytes were rejected by the linking account's
     /// `SourceModuleBytes` budget.
     RetainedBytes(ResourceError),
@@ -240,9 +239,6 @@ impl std::fmt::Display for BytecodeLinkError {
                 f,
                 "property-IC range from code-space base {base} with {site_count} sites exceeds u32"
             ),
-            Self::CodeSpaceConflict => {
-                write!(f, "code-space append slot was already occupied")
-            }
             Self::RetainedBytes(error) => {
                 write!(f, "cannot admit linked chunk's retained bytes: {error}")
             }
@@ -290,8 +286,8 @@ fn next_bases(node: &CodeChunk) -> Result<(u32, u32), BytecodeLinkError> {
     Ok((function_base, node.property_ic_site_end))
 }
 
-/// One immutable-range registry node. `next` is the sole publication point for
-/// a later chunk; eviction clears only `payload` and leaves this tombstone.
+/// One immutable-range registry node. Eviction clears only `payload` and
+/// leaves this tombstone in the index.
 #[derive(Debug)]
 struct CodeChunk {
     function_base: u32,
@@ -300,7 +296,6 @@ struct CodeChunk {
     property_ic_site_end: u32,
     retention: ChunkRetention,
     payload: RwLock<Option<Arc<ChunkPayload>>>,
-    next: OnceLock<Arc<CodeChunk>>,
 }
 
 /// Exact bytes one live payload retains.
@@ -363,21 +358,6 @@ fn ensure_property_ic_capacity(
     Ok(())
 }
 
-fn ensure_append_slot_empty(
-    space: &CodeSpace,
-    tail: Option<&Arc<CodeChunk>>,
-) -> Result<(), BytecodeLinkError> {
-    let occupied = match tail {
-        Some(chunk) => chunk.next.get().is_some(),
-        None => space.first.get().is_some(),
-    };
-    if occupied {
-        Err(BytecodeLinkError::CodeSpaceConflict)
-    } else {
-        Ok(())
-    }
-}
-
 fn build_chunk(
     verified: VerifiedBytecodeModule,
     function_base: u32,
@@ -411,22 +391,12 @@ fn build_chunk(
         property_ic_site_end,
         retention,
         payload: RwLock::new(Some(payload)),
-        next: OnceLock::new(),
     }))
 }
 
-fn publish_chunk(
-    space: &CodeSpace,
-    tail: &mut Option<Arc<CodeChunk>>,
-    chunk: Arc<CodeChunk>,
-) -> Result<(), BytecodeLinkError> {
-    let published = match tail.as_ref() {
-        Some(previous) => previous.next.set(Arc::clone(&chunk)).is_ok(),
-        None => space.first.set(Arc::clone(&chunk)).is_ok(),
-    };
-    if !published {
-        return Err(BytecodeLinkError::CodeSpaceConflict);
-    }
+/// Append a fully built chunk to the index. Called with the link lock held;
+/// the exclusive index lock is taken only for the push itself.
+fn publish_chunk(space: &CodeSpace, chunk: Arc<CodeChunk>) {
     if chunk.retention == ChunkRetention::Evictable {
         let retained_bytes = chunk
             .payload
@@ -439,9 +409,12 @@ fn publish_chunk(
             .evictable_retained_bytes
             .fetch_add(retained_bytes, Ordering::AcqRel);
     }
-    *tail = Some(chunk);
+    space
+        .chunks
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(chunk);
     space.epoch.fetch_add(1, Ordering::Release);
-    Ok(())
 }
 
 impl CodeSpace {
@@ -485,17 +458,13 @@ impl CodeSpace {
         account: &ResourceAccount,
         retention: ChunkRetention,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        let mut tail = self
-            .tail
+        let _link = self
+            .link
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (function_base, property_ic_base) = match tail.as_ref() {
-            Some(chunk) => next_bases(chunk)?,
-            None => (0, 0),
-        };
+        let (function_base, property_ic_base) = self.next_bases()?;
         let function_count = ensure_function_id_capacity(function_base, module.functions.len())?;
         ensure_property_ic_capacity(&module, property_ic_base)?;
-        ensure_append_slot_empty(self, tail.as_ref())?;
 
         rebase_module(&mut module, function_base)?;
         let verified = VerifiedBytecodeModule::new_at_base(module, function_base)?;
@@ -508,7 +477,7 @@ impl CodeSpace {
             retention,
             account,
         )?;
-        publish_chunk(self, &mut tail, Arc::clone(&chunk))?;
+        publish_chunk(self, Arc::clone(&chunk));
         let payload = chunk
             .payload
             .read()
@@ -535,18 +504,14 @@ impl CodeSpace {
         verified: VerifiedBytecodeModule,
         account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        let mut tail = self
-            .tail
+        let _link = self
+            .link
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (function_base, property_ic_base) = match tail.as_ref() {
-            Some(chunk) => next_bases(chunk)?,
-            None => (0, 0),
-        };
+        let (function_base, property_ic_base) = self.next_bases()?;
         let function_count =
             ensure_function_id_capacity(function_base, verified.module().functions.len())?;
         ensure_property_ic_capacity(verified.module(), property_ic_base)?;
-        ensure_append_slot_empty(self, tail.as_ref())?;
 
         let verified = verified.rebase_to(function_base)?;
         let chunk = build_chunk(
@@ -557,7 +522,7 @@ impl CodeSpace {
             ChunkRetention::Pinned,
             account,
         )?;
-        publish_chunk(self, &mut tail, Arc::clone(&chunk))?;
+        publish_chunk(self, Arc::clone(&chunk));
         let payload = chunk
             .payload
             .read()
@@ -572,32 +537,47 @@ impl CodeSpace {
         ))
     }
 
+    /// Bases the next link must use, from the last published chunk.
+    fn next_bases(&self) -> Result<(u32, u32), BytecodeLinkError> {
+        match self.chunks().last() {
+            Some(chunk) => next_bases(chunk),
+            None => Ok((0, 0)),
+        }
+    }
+
+    fn chunks(&self) -> RwLockReadGuard<'_, Vec<Arc<CodeChunk>>> {
+        self.chunks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The published node whose dense id range contains `function_id`.
+    fn chunk_for(chunks: &[Arc<CodeChunk>], function_id: u32) -> Option<&Arc<CodeChunk>> {
+        let after = chunks.partition_point(|chunk| chunk.function_base <= function_id);
+        let chunk = chunks[..after].last()?;
+        (function_id - chunk.function_base < chunk.function_count).then_some(chunk)
+    }
+
     /// Resolve the node owning `function_id` as live, evicted, or never linked.
     pub(crate) fn resolve_chunk(&self, function_id: u32) -> ChunkResolution {
-        let mut chunk = self.first.get();
-        while let Some(current) = chunk {
-            if function_id < current.function_base {
-                return ChunkResolution::Unlinked;
-            }
-            if function_id - current.function_base < current.function_count {
-                let payload = current
-                    .payload
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                return match payload.as_ref() {
-                    Some(payload) => ChunkResolution::Live {
-                        function_base: current.function_base,
-                        payload: Arc::clone(payload),
-                    },
-                    None => ChunkResolution::Evicted {
-                        function_base: current.function_base,
-                        function_count: current.function_count,
-                    },
-                };
-            }
-            chunk = current.next.get();
+        let chunks = self.chunks();
+        let Some(current) = Self::chunk_for(&chunks, function_id) else {
+            return ChunkResolution::Unlinked;
+        };
+        let payload = current
+            .payload
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match payload.as_ref() {
+            Some(payload) => ChunkResolution::Live {
+                function_base: current.function_base,
+                payload: Arc::clone(payload),
+            },
+            None => ChunkResolution::Evicted {
+                function_base: current.function_base,
+                function_count: current.function_count,
+            },
         }
-        ChunkResolution::Unlinked
     }
 
     /// Resolve every linked chunk's property-name atoms against `names`.
@@ -609,8 +589,7 @@ impl CodeSpace {
     /// adopting interpreter's atoms. Resolution is idempotent, so the walk is
     /// safe to repeat.
     pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
-        let mut chunk = self.first.get();
-        while let Some(current) = chunk {
+        for current in self.chunks().iter() {
             if let Some(payload) = current
                 .payload
                 .read()
@@ -619,7 +598,6 @@ impl CodeSpace {
             {
                 payload.atoms.resolve(names);
             }
-            chunk = current.next.get();
         }
     }
 
@@ -646,8 +624,7 @@ impl CodeSpace {
     #[must_use]
     pub(crate) fn eviction_candidates(&self) -> Vec<ChunkEvictionCandidate> {
         let mut candidates = Vec::new();
-        let mut chunk = self.first.get();
-        while let Some(current) = chunk {
+        for current in self.chunks().iter() {
             if current.retention == ChunkRetention::Evictable {
                 let payload = current
                     .payload
@@ -666,7 +643,6 @@ impl CodeSpace {
                     });
                 }
             }
-            chunk = current.next.get();
         }
         candidates.sort_unstable_by_key(|candidate| {
             (
@@ -686,42 +662,37 @@ impl CodeSpace {
     /// Clear one selected payload after the caller has proved its id range
     /// unreachable and physically retired generated code for that range.
     pub(crate) fn evict_candidate(&self, candidate: ChunkEvictionCandidate) -> ChunkEvictionResult {
-        let mut chunk = self.first.get();
-        while let Some(current) = chunk {
-            if current.function_base == candidate.function_base {
-                if current.function_count != candidate.function_count
-                    || current.retention != ChunkRetention::Evictable
-                {
-                    return ChunkEvictionResult::NotEligible;
-                }
-                let mut payload = current
-                    .payload
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(live) = payload.as_ref() else {
-                    return ChunkEvictionResult::NotEligible;
-                };
-                if Arc::strong_count(live) != 1 {
-                    return ChunkEvictionResult::RetainedContext;
-                }
-                let retained_bytes = live.retained_bytes();
-                let dropped = payload.take();
-                self.evictable_retained_bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                        current.checked_sub(retained_bytes)
-                    })
-                    .expect("live evictable byte accounting covers its payload");
-                self.epoch.fetch_add(1, Ordering::Release);
-                drop(payload);
-                drop(dropped);
-                return ChunkEvictionResult::Evicted { retained_bytes };
-            }
-            if current.function_base > candidate.function_base {
-                return ChunkEvictionResult::NotEligible;
-            }
-            chunk = current.next.get();
+        let chunks = self.chunks();
+        let Some(current) = Self::chunk_for(&chunks, candidate.function_base) else {
+            return ChunkEvictionResult::NotEligible;
+        };
+        if current.function_base != candidate.function_base
+            || current.function_count != candidate.function_count
+            || current.retention != ChunkRetention::Evictable
+        {
+            return ChunkEvictionResult::NotEligible;
         }
-        ChunkEvictionResult::NotEligible
+        let mut payload = current
+            .payload
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(live) = payload.as_ref() else {
+            return ChunkEvictionResult::NotEligible;
+        };
+        if Arc::strong_count(live) != 1 {
+            return ChunkEvictionResult::RetainedContext;
+        }
+        let retained_bytes = live.retained_bytes();
+        let dropped = payload.take();
+        self.evictable_retained_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(retained_bytes)
+            })
+            .expect("live evictable byte accounting covers its payload");
+        self.epoch.fetch_add(1, Ordering::Release);
+        drop(payload);
+        drop(dropped);
+        ChunkEvictionResult::Evicted { retained_bytes }
     }
 }
 
@@ -1001,14 +972,7 @@ mod tests {
                 actual: 7,
             }))
         ));
-        assert!(space.first.get().is_none());
-        assert!(
-            space
-                .tail
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
-        );
+        assert!(space.chunks().is_empty());
 
         let context = space
             .link_module(module_with_functions(2), &unlimited())
@@ -1051,7 +1015,7 @@ mod tests {
                 }
             )))
         ));
-        assert!(space.first.get().is_none());
+        assert!(space.chunks().is_empty());
 
         let context = space
             .link_module(module_with_functions(2), &unlimited())
@@ -1085,7 +1049,7 @@ mod tests {
                 BytecodeVerifyError::RegisterOperand { .. }
             )))
         ));
-        assert!(space.first.get().is_none());
+        assert!(space.chunks().is_empty());
 
         let context = space
             .link_module(module_with_functions(2), &unlimited())
@@ -1130,7 +1094,7 @@ mod tests {
                 }
             )))
         ));
-        assert!(space.first.get().is_none());
+        assert!(space.chunks().is_empty());
     }
 
     #[test]
@@ -1160,7 +1124,7 @@ mod tests {
             .link_module(module_with_functions(2), &limited)
             .expect_err("budget below one chunk rejects the link");
         assert!(matches!(error, BytecodeLinkError::RetainedBytes(_)));
-        assert!(rejecting_space.first.get().is_none());
+        assert!(rejecting_space.chunks().is_empty());
         let entry = *limited.snapshot().get(ResourceClass::SourceModuleBytes);
         assert_eq!(entry.current(), 0);
         assert_eq!(entry.rejections(), 1);

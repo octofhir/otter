@@ -46,12 +46,15 @@ pub(crate) struct FeedbackDirectory {
     store_ics: Vec<ExecutablePropertyIc>,
     method_ics: Vec<Option<MethodCallIc>>,
     property_stats: PropertyIcStats,
-    /// Chunks whose slot addresses are already installed. A chunk's sites are
-    /// immutable once linked, so installation happens once per chunk, not once
-    /// per dispatch entry. Held weakly: the allocation behind a `Weak` is
-    /// never reused while the `Weak` lives, so pointer identity cannot alias a
-    /// later chunk.
-    installed_chunks: Vec<std::sync::Weak<crate::executable::ExecutableModule>>,
+    /// Chunks whose slot addresses are already installed, keyed by executable
+    /// address. A chunk's sites are immutable once linked, so installation
+    /// happens once per chunk, not once per dispatch entry, and the membership
+    /// probe stays O(1) however many chunks an isolate has linked. Held
+    /// weakly: the allocation behind a `Weak` is never reused while the `Weak`
+    /// lives, so an address cannot alias a later chunk until its entry is
+    /// purged with the tombstoned range.
+    installed_chunks:
+        rustc_hash::FxHashMap<usize, std::sync::Weak<crate::executable::ExecutableModule>>,
 }
 
 impl FeedbackDirectory {
@@ -66,20 +69,25 @@ impl FeedbackDirectory {
             self.method_ics[site] = None;
         }
         self.installed_chunks
-            .retain(|chunk| chunk.strong_count() != 0);
+            .retain(|_, chunk| chunk.strong_count() != 0);
     }
 
     fn install_context(&mut self, context: &ExecutionContext) {
         let executable = context.executable_module();
-        if self
-            .installed_chunks
-            .iter()
-            .any(|chunk| std::ptr::eq(chunk.as_ptr(), std::sync::Arc::as_ptr(executable)))
-        {
-            return;
+        let identity = std::sync::Arc::as_ptr(executable) as usize;
+        match self.installed_chunks.entry(identity) {
+            std::collections::hash_map::Entry::Occupied(installed)
+                if installed.get().strong_count() != 0 =>
+            {
+                return;
+            }
+            std::collections::hash_map::Entry::Occupied(mut stale) => {
+                stale.insert(std::sync::Arc::downgrade(executable));
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(std::sync::Arc::downgrade(executable));
+            }
         }
-        self.installed_chunks
-            .push(std::sync::Arc::downgrade(executable));
         let site_count = context.property_ic_site_end();
         if self.slots.len() < site_count {
             self.slots.resize_with(site_count, || None);

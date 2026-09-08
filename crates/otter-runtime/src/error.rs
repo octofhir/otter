@@ -381,7 +381,10 @@ mod tests {
 
     #[test]
     fn bytecode_link_failures_use_stable_internal_code() {
-        let err = OtterError::from(otter_vm::BytecodeLinkError::CodeSpaceConflict);
+        let err = OtterError::from(otter_vm::BytecodeLinkError::FunctionIdCapacity {
+            base: u32::MAX,
+            function_count: 2,
+        });
         assert!(matches!(
             err,
             OtterError::Internal { ref code, .. } if code == "VM_BYTECODE_INVALID"

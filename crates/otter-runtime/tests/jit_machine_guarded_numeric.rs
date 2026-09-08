@@ -667,9 +667,9 @@ fn assert_packed_double_element_flow(optimized_ir: &str) {
     let mut store_inputs = std::collections::BTreeSet::new();
 
     for line in &lines {
-        let operation = if line.contains(" PackedDoubleElementLoad(") {
+        let operation = if line.contains(" PackedDoubleElementLoad {") {
             "load"
-        } else if line.contains(" PackedDoubleElementStore(") {
+        } else if line.contains(" PackedDoubleElementStore {") {
             "store"
         } else {
             continue;
@@ -735,7 +735,7 @@ fn checked_number_element_byte_pc(optimized_ir: &str, opcode: &str) -> u64 {
         .split_once("allocation target=")
         .map_or(optimized_ir, |(machine_ir, _)| machine_ir);
     let lines = machine_ir.lines().collect::<Vec<_>>();
-    let opcode_marker = format!(" {opcode}(");
+    let opcode_marker = format!(" {opcode} {{ byte_pc: ");
     for element_line in &lines {
         if !element_line.contains(&opcode_marker) {
             continue;
@@ -743,7 +743,7 @@ fn checked_number_element_byte_pc(optimized_ir: &str, opcode: &str) -> u64 {
         let element = machine_values(element_line);
         let byte_pc = element_line
             .split_once(&opcode_marker)
-            .and_then(|(_, tail)| tail.split_once(')'))
+            .and_then(|(_, tail)| tail.split_once([',', ' ']))
             .and_then(|(byte_pc, _)| byte_pc.parse::<u64>().ok())
             .unwrap_or_else(|| panic!("invalid {opcode} byte PC: {element_line}"));
         let index = *element
@@ -1009,7 +1009,7 @@ fn tagged_packed_element(optimized_ir: &str, opcode: &str) -> (u64, u32) {
     let machine_ir = optimized_ir
         .split_once("allocation target=")
         .map_or(optimized_ir, |(machine_ir, _)| machine_ir);
-    let opcode_marker = format!(" {opcode}(");
+    let opcode_marker = format!(" {opcode} {{ byte_pc: ");
     let matching = machine_ir
         .lines()
         .filter_map(|line| {
@@ -1022,7 +1022,7 @@ fn tagged_packed_element(optimized_ir: &str, opcode: &str) -> (u64, u32) {
             }
             let byte_pc = line
                 .split_once(&opcode_marker)
-                .and_then(|(_, tail)| tail.split_once(')'))
+                .and_then(|(_, tail)| tail.split_once([',', ' ']))
                 .and_then(|(byte_pc, _)| byte_pc.parse::<u64>().ok())
                 .unwrap_or_else(|| panic!("invalid tagged-index {opcode} byte PC: {line}"));
             assert_eq!(
@@ -1213,7 +1213,7 @@ fn run_with_delta(runtime: &mut Runtime, source: &str, module: &str) -> (String,
     (result, delta)
 }
 
-fn assert_delta_constructor_stays_on_template(artifacts: &JitArtifactBatch) {
+fn assert_delta_constructor_compiles_with_ordered_fields(artifacts: &JitArtifactBatch) {
     let entry_bundle = artifacts
         .bundles()
         .iter()
@@ -1221,10 +1221,10 @@ fn assert_delta_constructor_stays_on_template(artifacts: &JitArtifactBatch) {
             let manifest = bundle.manifest();
             manifest.module() == DELTA_MODULE
                 && manifest.function_name() == "DeltaGuarded"
-                && manifest.tier() == JitDebugTier::Template
+                && manifest.tier() == JitDebugTier::Optimizing
                 && manifest.entry() == JitDebugTarget::Entry
         })
-        .expect("DeltaGuarded Template entry artifact");
+        .expect("DeltaGuarded Optimizing entry artifact");
     let bytecode = std::str::from_utf8(
         entry_bundle
             .file(JitArtifactFileName::Bytecode)
@@ -1239,17 +1239,6 @@ fn assert_delta_constructor_stays_on_template(artifacts: &JitArtifactBatch) {
             .count(),
         3,
         "DeltaGuarded must retain its three ordered constructor fields: {bytecode}"
-    );
-
-    assert!(
-        artifacts.bundles().iter().all(|bundle| {
-            let manifest = bundle.manifest();
-            manifest.module() != DELTA_MODULE
-                || manifest.function_name() != "DeltaGuarded"
-                || manifest.tier() != JitDebugTier::Optimizing
-                || manifest.entry() != JitDebugTarget::Entry
-        }),
-        "Machine rejection must retain Template without a second optimizing backend"
     );
 }
 
@@ -1538,7 +1527,7 @@ fn tagged_packed_double_indices_hit_int32_and_exact_deopt_other_property_keys() 
 }
 
 #[test]
-fn delta_mixed_default_constructor_stays_on_template_and_preserves_fields() {
+fn delta_mixed_default_constructor_compiles_and_preserves_fields() {
     let mut oracle = runtime(JitSelection::InterpreterOnly, false);
     completion(
         &mut oracle,
@@ -1559,7 +1548,7 @@ fn delta_mixed_default_constructor_stays_on_template_and_preserves_fields() {
     let setup = compiled
         .run_script(SourceInput::from_javascript(DELTA_SETUP), DELTA_MODULE)
         .expect("DeltaGuarded setup");
-    assert_delta_constructor_stays_on_template(
+    assert_delta_constructor_compiles_with_ordered_fields(
         setup
             .jit_artifacts()
             .expect("enabled DeltaGuarded artifact batch"),
@@ -1572,8 +1561,8 @@ fn delta_mixed_default_constructor_stays_on_template_and_preserves_fields() {
         "jit-machine-guarded-numeric-delta-probe.js",
     );
     assert_eq!(actual, expected);
-    assert_eq!(
-        delta.optimized_entries, 0,
-        "Machine-rejected DeltaGuarded must keep using Template: {delta:?}"
+    assert!(
+        delta.optimized_entries > 0,
+        "the mixed-default DeltaGuarded constructor must enter Machine code: {delta:?}"
     );
 }

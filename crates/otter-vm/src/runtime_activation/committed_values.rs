@@ -329,7 +329,12 @@ impl RuntimeCall<'_> {
         if instruction.instruction_pc != instruction_pc {
             return Err(VmError::InvalidOperand);
         }
-        Ok(instruction.const_word(usize::from(operand)))
+        // Binding opcodes may carry more than the inline operand words (the
+        // snapshot forms have five), so resolve through the owning CodeBlock,
+        // which consults the overflow table.
+        function
+            .const_index(instruction, usize::from(operand))
+            .ok_or(VmError::InvalidOperand)
     }
 
     /// The published instruction's signed immediate operand at `operand`.

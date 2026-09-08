@@ -271,7 +271,11 @@ pub(crate) fn read_snapshot_register(
     frame: &crate::Frame,
     register: u16,
 ) -> Result<u64, crate::VmError> {
-    let value = *crate::read_register(frame, register)?;
+    snapshot_from_value(*crate::read_register(frame, register)?)
+}
+
+/// Decode one eval-binding sequence snapshot carried as a boxed number.
+pub(crate) fn snapshot_from_value(value: Value) -> Result<u64, crate::VmError> {
     let number = value
         .as_number()
         .map(|number| number.as_f64())
@@ -280,4 +284,33 @@ pub(crate) fn read_snapshot_register(
         return Err(crate::VmError::InvalidOperand);
     }
     Ok(number as u64)
+}
+
+impl Interpreter {
+    /// §9.1.1.1.5 — re-create a deleted sloppy-eval `var` binding in the
+    /// frame's current eval-environment record from its captured cell. A
+    /// frame without an eval environment, or one whose chain still resolves
+    /// the name, is left unchanged.
+    pub(crate) fn eval_restore_binding(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        name_idx: u32,
+        index: u32,
+    ) -> Result<(), VmError> {
+        let Some(env) = frame.eval_env() else {
+            return Ok(());
+        };
+        let name = context
+            .string_constant_str_for_function(frame.function_id(), name_idx)
+            .ok_or(VmError::InvalidOperand)?
+            .to_string();
+        if crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, &name).is_some() {
+            return Ok(());
+        }
+        let cell = frame.upvalue(index)?;
+        let seq = self.next_eval_binding_seq();
+        crate::eval_env::eval_env_insert_current(&mut self.gc_heap, env, name, cell, seq);
+        Ok(())
+    }
 }

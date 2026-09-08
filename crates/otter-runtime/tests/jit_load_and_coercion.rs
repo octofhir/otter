@@ -476,8 +476,8 @@ fn global_lexical_loads_read_live_cells_and_side_exit_for_tdz() {
             "global lexical fixture must enter compiled code: {stats:?}"
         );
         assert!(
-            stats.jit_runtime_property_stubs > 0,
-            "the TDZ hole must enter the canonical throwing stub: {stats:?}"
+            stats.jit_runtime_stub_transitions > 0,
+            "the TDZ hole must enter the canonical throwing binding stub: {stats:?}"
         );
         assert!(
             stats.jit_runtime_property_stubs < 16,

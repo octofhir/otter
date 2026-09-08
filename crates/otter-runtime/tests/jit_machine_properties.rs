@@ -417,16 +417,16 @@ fn assert_machine_property_artifact(
              {relocations:?}"
         );
     }
-    for (minimum, stub_id, stub, signature) in [
+    // The stub is named by its symbol and signature: the numeric id is the
+    // table's private ordering and moves whenever a stub is added or retired.
+    for (minimum, stub, signature) in [
         (
             minimum_loads,
-            18u64,
             "jit_load_property_value",
             "reentrantNamedLoad",
         ),
         (
             minimum_stores,
-            19u64,
             "jit_store_property_value",
             "reentrantNamedStore",
         ),
@@ -435,11 +435,10 @@ fn assert_machine_property_artifact(
             assert!(
                 relocations.iter().any(|relocation| {
                     relocation["target"]["kind"] == "runtimeStub"
-                        && relocation["target"]["id"].as_u64() == Some(stub_id)
                         && relocation["target"]["name"] == stub
                         && relocation["target"]["signature"] == signature
                 }),
-                "{function_name} must retain fixed stub {stub_id}:{stub}:{signature}: \
+                "{function_name} must retain fixed stub {stub}:{signature}: \
                  {relocations:?}"
             );
         }

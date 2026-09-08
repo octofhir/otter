@@ -2234,10 +2234,14 @@ fn lower_binding(
             })
             .map(NumericBindingTarget::Global),
         BindingSemantics::Read(
-            BindingRead::Dynamic { .. } | BindingRead::ShadowedUpvalue { .. },
+            BindingRead::Dynamic { .. }
+            | BindingRead::ShadowedUpvalue { .. }
+            | BindingRead::EvalBindingSeq { .. },
         )
         | BindingSemantics::Write(
-            BindingWrite::Dynamic { .. } | BindingWrite::ShadowedUpvalue { .. },
+            BindingWrite::Dynamic { .. }
+            | BindingWrite::ShadowedUpvalue { .. }
+            | BindingWrite::ShadowedRestore { .. },
         )
         | BindingSemantics::Delete(_) => None,
         BindingSemantics::Read(BindingRead::GlobalThis { .. } | BindingRead::Upvalue { .. })

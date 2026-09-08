@@ -1174,6 +1174,7 @@ fn verify_instruction_semantics(
             | BindingSemantics::Read(BindingRead::ShadowedUpvalue { index, .. })
             | BindingSemantics::Write(BindingWrite::Upvalue { index, .. })
             | BindingSemantics::Write(BindingWrite::ShadowedUpvalue { index, .. })
+            | BindingSemantics::Write(BindingWrite::ShadowedRestore { index, .. })
             | BindingSemantics::Delete(BindingDelete::ShadowedUpvalue { index, .. }) => {
                 Some(usize::from(index))
             }

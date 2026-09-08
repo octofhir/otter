@@ -1221,7 +1221,9 @@ fn emit_binding_hit(
                     emit_load_allocated_integer(ops, frame, locations[1], 13, 0)?;
                     dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
                 }
-                BindingRead::Dynamic { .. } | BindingRead::ShadowedUpvalue { .. } => {
+                BindingRead::Dynamic { .. }
+                | BindingRead::ShadowedUpvalue { .. }
+                | BindingRead::EvalBindingSeq { .. } => {
                     return Err(Unsupported::OperandShape("scalar dynamic binding hit"));
                 }
             }

@@ -433,6 +433,18 @@ pub enum BindingRead {
         /// Number of physical eval-environment records that may shadow the
         /// captured declaration.
         eval_depth: u8,
+        /// Register operand position of the eval-binding sequence snapshot
+        /// that bounds which eval bindings the read may see (§13.15.2: the
+        /// assignment target resolves before its right-hand side), or `None`
+        /// when every live eval binding is visible.
+        snapshot: Option<u8>,
+    },
+    /// Snapshot the isolate's monotonic eval-binding sequence into a register
+    /// so a later shadowed read or write resolves against the bindings that
+    /// existed at this point.
+    EvalBindingSeq {
+        /// Result-register operand position.
+        destination: u8,
     },
 }
 
@@ -583,6 +595,18 @@ pub enum BindingWrite {
         index: u8,
         /// Packed [`ShadowedUpvalueStorePolicy`] immediate operand position.
         policy: u8,
+        /// Register operand position of the eval-binding sequence snapshot
+        /// that bounds which eval bindings the write may reach, or `None`
+        /// when every live eval binding is a candidate.
+        snapshot: Option<u8>,
+    },
+    /// Re-create a deleted sloppy-eval `var` binding in the current
+    /// eval-environment record from its captured cell (Annex B.3.3.3 sync).
+    ShadowedRestore {
+        /// String-constant operand position.
+        name: u8,
+        /// Captured-cell index operand position.
+        index: u8,
     },
 }
 
@@ -634,6 +658,7 @@ impl BindingSemantics {
             | Self::Read(BindingRead::Upvalue { destination, .. })
             | Self::Read(BindingRead::Dynamic { destination, .. })
             | Self::Read(BindingRead::ShadowedUpvalue { destination, .. })
+            | Self::Read(BindingRead::EvalBindingSeq { destination })
             | Self::Delete(BindingDelete::Dynamic { destination, .. })
             | Self::Delete(BindingDelete::ShadowedUpvalue { destination, .. }) => Some(destination),
             Self::Write(_) => None,
@@ -646,11 +671,15 @@ impl BindingSemantics {
         match self {
             Self::Write(BindingWrite::Global { value, .. })
             | Self::Write(BindingWrite::Upvalue { value, .. })
-            | Self::Write(BindingWrite::Dynamic { value, .. })
-            | Self::Write(BindingWrite::ShadowedUpvalue { value, .. }) => [Some(value), None],
+            | Self::Write(BindingWrite::Dynamic { value, .. }) => [Some(value), None],
+            Self::Write(BindingWrite::ShadowedUpvalue {
+                value, snapshot, ..
+            }) => [Some(value), snapshot],
             Self::Write(BindingWrite::GlobalChecked { value, exists, .. }) => {
                 [Some(value), Some(exists)]
             }
+            Self::Write(BindingWrite::ShadowedRestore { .. }) => [None, None],
+            Self::Read(BindingRead::ShadowedUpvalue { snapshot, .. }) => [snapshot, None],
             Self::Read(_) | Self::Delete(_) => [None, None],
         }
     }
@@ -1550,6 +1579,17 @@ const fn binding_semantics(op: Op) -> Option<BindingSemantics> {
             name: 1,
             index: 2,
             eval_depth: 3,
+            snapshot: None,
+        })),
+        Op::LoadShadowedUpvalueSnap => Some(BindingSemantics::Read(BindingRead::ShadowedUpvalue {
+            destination: 0,
+            name: 1,
+            index: 2,
+            eval_depth: 3,
+            snapshot: Some(4),
+        })),
+        Op::EvalBindingSeq => Some(BindingSemantics::Read(BindingRead::EvalBindingSeq {
+            destination: 0,
         })),
         Op::StoreGlobalBinding => Some(BindingSemantics::Write(BindingWrite::Global {
             value: 0,
@@ -1582,8 +1622,22 @@ const fn binding_semantics(op: Op) -> Option<BindingSemantics> {
                 name: 1,
                 index: 2,
                 policy: 3,
+                snapshot: None,
             }))
         }
+        Op::StoreShadowedUpvalueCheckedSnap => {
+            Some(BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
+                value: 0,
+                name: 1,
+                index: 2,
+                policy: 3,
+                snapshot: Some(4),
+            }))
+        }
+        Op::EvalRestoreBinding => Some(BindingSemantics::Write(BindingWrite::ShadowedRestore {
+            name: 0,
+            index: 1,
+        })),
         Op::DeleteDynamic => Some(BindingSemantics::Delete(BindingDelete::Dynamic {
             destination: 0,
             name: 1,

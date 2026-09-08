@@ -1798,33 +1798,10 @@ impl Interpreter {
                 // eval-environment record.
                 Op::EvalRestoreBinding => {
                     let name_idx = instr.const_word(0);
-                    let uv_idx = function.imm32(instr, 1).unwrap_or(0) as usize;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?
-                        .to_string();
-                    let env = stack[top_idx].eval_env;
-                    if !env.is_null() {
-                        let missing =
-                            crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, &name)
-                                .is_none();
-                        if missing {
-                            let cell = stack[top_idx]
-                                .upvalues
-                                .get(uv_idx)
-                                .copied()
-                                .ok_or(VmError::InvalidOperand)?;
-                            let seq = self.next_eval_binding_seq();
-                            crate::eval_env::eval_env_insert_current(
-                                &mut self.gc_heap,
-                                env,
-                                name,
-                                cell,
-                                seq,
-                            );
-                        }
-                    }
-                    let frame = &mut stack[top_idx];
+                    let index = u32::try_from(function.imm32(instr, 1).unwrap_or(0))
+                        .map_err(|_| VmError::InvalidOperand)?;
+                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    self.eval_restore_binding(context, &mut frame, name_idx, index)?;
                     frame.advance_pc()?;
                     continue;
                 }

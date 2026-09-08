@@ -71,7 +71,7 @@ fn control_ops_match_oracle_with_single_getter_evaluation() {
     let (oracle, _, _) = run(JitSelection::InterpreterOnly);
     let (compiled, osr_attempts, reentrant) = run(JitSelection::Template);
     assert_eq!(compiled, oracle);
-    assert_eq!(compiled, "2760:180:3");
+    assert_eq!(compiled, "3240:180:3");
     assert!(osr_attempts > 0, "fixture must enter at a loop OSR header");
     assert!(
         reentrant > 0,

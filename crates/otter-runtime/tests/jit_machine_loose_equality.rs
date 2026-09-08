@@ -217,10 +217,14 @@ fn assert_machine_artifact(bundle: &JitArtifactBundle, equal: bool) {
     let relocations = relocations["relocations"]
         .as_array()
         .expect("relocation entries");
+    // Every Machine body links the shared exact-deopt handler and the
+    // abrupt-completion finisher; the comparison itself must add no other
+    // runtime target.
     assert!(
         relocations.iter().all(|relocation| {
             relocation["target"]["kind"] != "runtimeStub"
                 || relocation["target"]["name"] == "jit_deopt_rebuild_frames"
+                || relocation["target"]["name"] == "jit_finish_error"
         }),
         "tagged/nullish emission may call only the shared exact-deopt handler: {relocations:?}"
     );

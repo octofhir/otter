@@ -86,9 +86,13 @@ fn machine_global_bundle(artifacts: &JitArtifactBatch) -> &JitArtifactBundle {
                                 let Some(regions) = code_map["regions"].as_array() else {
                                     return false;
                                 };
-                                ["machineGlobalLexicalLoad", "machineGlobalObjectLoad"]
-                                    .into_iter()
-                                    .all(|kind| regions.iter().any(|region| region["kind"] == kind))
+                                [
+                                    "machineBindingGuard",
+                                    "machineBindingHit",
+                                    "machineBindingCold",
+                                ]
+                                .into_iter()
+                                .all(|kind| regions.iter().any(|region| region["kind"] == kind))
                             },
                         )
                     })
@@ -112,17 +116,37 @@ fn machine_global_bundle(artifacts: &JitArtifactBatch) -> &JitArtifactBundle {
 }
 
 fn assert_machine_global_artifact(bundle: &JitArtifactBundle) {
+    // Each global read is one schema-driven Machine binding: a guard on the
+    // live cell (lexical) or on the global object's shape and declarative
+    // epoch (object), a hit that reads the slot, a cold path that completes
+    // through the binding runtime when the guard fails, and the join.
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"].as_array().expect("code-map regions");
     let mut global_byte_pcs = BTreeSet::new();
-    for kind in ["machineGlobalLexicalLoad", "machineGlobalObjectLoad"] {
+    for kind in [
+        "machineBindingGuard",
+        "machineBindingHit",
+        "machineBindingCold",
+        "machineBindingJoin",
+    ] {
         let matching = regions
             .iter()
             .filter(|region| region["kind"] == kind)
             .collect::<Vec<_>>();
-        assert_eq!(matching.len(), 1, "one direct {kind}: {code_map}");
-        global_byte_pcs.insert(matching[0]["bytePc"].as_u64().expect("global-load byte PC"));
+        assert_eq!(matching.len(), 2, "one {kind} per global read: {code_map}");
+        for region in matching {
+            global_byte_pcs.insert(region["bytePc"].as_u64().expect("global-load byte PC"));
+        }
     }
+    assert_eq!(
+        global_byte_pcs.len(),
+        2,
+        "two distinct global-read sites: {code_map}"
+    );
+    let cold_regions = regions
+        .iter()
+        .filter(|region| region["kind"] == "machineBindingCold")
+        .count();
 
     let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
     let relocations = relocations["relocations"]
@@ -153,9 +177,19 @@ fn assert_machine_global_artifact(bundle: &JitArtifactBundle) {
         relocations.iter().all(|relocation| {
             relocation["target"]["kind"] != "propertyIcCell"
                 && (relocation["target"]["kind"] != "runtimeStub"
-                    || relocation["target"]["name"] == "jit_deopt_rebuild_frames")
+                    || relocation["target"]["name"] == "jit_deopt_rebuild_frames"
+                    || relocation["target"]["name"] == "jit_finish_error"
+                    || relocation["target"]["name"] == "jit_binding_value")
         }),
-        "the only runtime target may be the shared exact-deopt handler: {relocations:?}"
+        "global reads may target only the binding runtime, the exact-deopt handler, \
+         and the abrupt-completion finisher: {relocations:?}"
+    );
+    assert!(
+        relocations.iter().any(|relocation| {
+            relocation["target"]["kind"] == "runtimeStub"
+                && relocation["target"]["name"] == "jit_binding_value"
+        }),
+        "the cold binding path must link the binding runtime: {relocations:?}"
     );
 
     let deopt = artifact_json(bundle, JitArtifactFileName::Deopt);
@@ -166,16 +200,18 @@ fn assert_machine_global_artifact(bundle: &JitArtifactBundle) {
         .flat_map(|exit| exit["frames"].as_array().into_iter().flatten())
         .filter_map(|frame| frame["bytePc"].as_u64())
         .collect::<BTreeSet<_>>();
+    // A failed guard completes through the cold binding call and never
+    // deoptimizes, so no exit is attributed to a global-read site.
     assert!(
-        global_byte_pcs.is_subset(&deopt_byte_pcs),
-        "each global guard owns exact source deopt metadata: {deopt}"
+        global_byte_pcs.is_disjoint(&deopt_byte_pcs),
+        "global guards miss to the cold binding path instead of deopting: {deopt}"
     );
 
     let safepoints = artifact_json(bundle, JitArtifactFileName::Safepoints);
     assert_eq!(
         safepoints["safepoints"].as_array().map(Vec::len),
-        Some(0),
-        "direct global reads allocate, reenter, and safepoint nowhere"
+        Some(cold_regions),
+        "only the cold binding calls reenter and safepoint"
     );
 }
 
@@ -247,7 +283,10 @@ fn assert_exact_global_object_miss(mutation: &str, module: &str) {
     let (entries, deopts) = stats_delta(before, after_first);
     assert_eq!(first, "42");
     assert!(entries >= 1, "the stale guard must execute before its miss");
-    assert_eq!(deopts, 1, "the stale guard must exact-deopt once");
+    assert_eq!(
+        deopts, 0,
+        "a stale global-object guard completes through the cold binding path, not a deopt"
+    );
 
     let reused = completion(
         &mut compiled,
@@ -258,16 +297,16 @@ fn assert_exact_global_object_miss(mutation: &str, module: &str) {
     assert_eq!(reused, "43");
     assert!(
         reuse_entries >= 1,
-        "the runtime remains executable after deopt"
+        "the generated body stays installed and reusable after the miss"
     );
     assert_eq!(
-        reuse_deopts, 1,
-        "policy deliberately retains a rare-miss generation until its bail threshold"
+        reuse_deopts, 0,
+        "the cold path keeps answering without invalidating the generation"
     );
 }
 
 #[test]
-fn machine_global_object_epoch_miss_exact_deopts_once() {
+fn machine_global_object_epoch_miss_takes_the_cold_binding_path() {
     assert_exact_global_object_miss(
         "let machineGlobalEpochBump = 1;",
         "jit-machine-globals-epoch-miss.js",
@@ -275,7 +314,7 @@ fn machine_global_object_epoch_miss_exact_deopts_once() {
 }
 
 #[test]
-fn machine_global_object_shape_miss_exact_deopts_once() {
+fn machine_global_object_shape_miss_takes_the_cold_binding_path() {
     assert_exact_global_object_miss(
         "globalThis.machineGlobalShapeBump = 1;",
         "jit-machine-globals-shape-miss.js",

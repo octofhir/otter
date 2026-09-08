@@ -131,6 +131,7 @@ impl RuntimeCall<'_> {
                 name,
                 index,
                 eval_depth,
+                snapshot,
                 ..
             }) => {
                 let name_idx = self
@@ -147,11 +148,22 @@ impl RuntimeCall<'_> {
                     .and_then(|depth| u32::try_from(depth).ok())
                     .filter(|depth| *depth != 0)
                     .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                // The snapshot rides as the first boxed input when the
+                // opcode carries one.
+                let snapshot = snapshot
+                    .map(|_| {
+                        crate::jit_control_ops::snapshot_from_value(value0)
+                            .map_err(CommittedValueError::Fatal)
+                    })
+                    .transpose()?;
                 self.with_frame(|frame| {
                     vm.load_shadowed_upvalue_value(
-                        context, frame, name_idx, index, eval_depth, None,
+                        context, frame, name_idx, index, eval_depth, snapshot,
                     )
                 })
+            }
+            BindingSemantics::Read(BindingRead::EvalBindingSeq { .. }) => {
+                Ok(Value::number_f64(vm.current_eval_binding_seq() as f64))
             }
             BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
                 let name_idx = self
@@ -212,10 +224,23 @@ impl RuntimeCall<'_> {
                 )
                 .map(|()| Value::undefined())
             }
+            BindingSemantics::Write(BindingWrite::ShadowedRestore { name, index }) => {
+                let name_idx = self
+                    .published_const_index(name)
+                    .map_err(CommittedValueError::Fatal)?;
+                let index = self
+                    .published_imm32(index)
+                    .ok()
+                    .and_then(|index| u32::try_from(index).ok())
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                self.with_frame(|frame| vm.eval_restore_binding(context, frame, name_idx, index))
+                    .map(|()| Value::undefined())
+            }
             BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
                 name,
                 index,
                 policy,
+                snapshot,
                 ..
             }) => {
                 let name_idx = self
@@ -233,6 +258,14 @@ impl RuntimeCall<'_> {
                         ShadowedUpvalueStorePolicy::from_imm32(encoded)
                             .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
                     })?;
+                // The snapshot rides as the second boxed input when the
+                // opcode carries one.
+                let snapshot = snapshot
+                    .map(|_| {
+                        crate::jit_control_ops::snapshot_from_value(value1)
+                            .map_err(CommittedValueError::Fatal)
+                    })
+                    .transpose()?;
                 self.with_frame(|frame| {
                     vm.store_shadowed_upvalue_value(
                         context,
@@ -242,7 +275,7 @@ impl RuntimeCall<'_> {
                         policy.eval_depth,
                         policy.fallback,
                         value0,
-                        None,
+                        snapshot,
                     )
                 })
                 .map(|()| Value::undefined())

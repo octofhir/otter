@@ -137,7 +137,8 @@ use crate::{
         emit_settled_property_store_guard,
     },
     template::arm64::values::{
-        CellTest, emit_cell_test, emit_slab_base, emit_write_barrier_with_context,
+        CellTest, emit_cell_test, emit_initialize_inline_values_ptr, emit_slab_base,
+        emit_write_barrier_with_context,
     },
 };
 use std::collections::BTreeMap;
@@ -2618,20 +2619,7 @@ pub(super) fn emit(
                     ; mov x12, x13
                 );
                 if transition.slot == 0 {
-                    let values_ready = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; .arch aarch64
-                        // Receiver preparation can reserve an out-of-line
-                        // slab for a multi-field transition program before
-                        // the first StoreProperty executes. Preserve that
-                        // stable slab pointer; only a genuinely inline object
-                        // needs its cached values pointer initialized here.
-                        ; ldr w16, [x13, view.object_slab_handle_byte]
-                        ; cbnz w16, =>values_ready
-                        ; add x16, x13, view.object_inline_values_byte
-                        ; str x16, [x13, view.object_values_ptr_byte]
-                        ; =>values_ready
-                    );
+                    emit_initialize_inline_values_ptr(&mut ops, view, 13, 16);
                 }
                 dynasm!(ops ; .arch aarch64 ; mov x10, x17);
                 dynasm!(ops ; .arch aarch64 ; mov x13, x12);

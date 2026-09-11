@@ -675,8 +675,10 @@ where
         ; add w16, w16, #1
         ; strh w16, [x13, view.object_slab_len_byte]
         ; cbnz w17, =>existing
-        ; add x16, x13, view.object_inline_values_byte
-        ; str x16, [x13, view.object_values_ptr_byte]
+    );
+    super::values::emit_initialize_inline_values_ptr(ops, view, 13, 16);
+    dynasm!(ops
+        ; .arch aarch64
         ; =>existing
     );
     // Existing-slot ways may only name an own slot. For a transition the same

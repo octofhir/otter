@@ -5,7 +5,11 @@
 //!   its stores land in the spilled slot slab rather than the in-body inline
 //!   array, run hot enough to compile and compared against the interpreter.
 //! - A receiver whose slab was reserved ahead of its length, so an inline
-//!   slot index meets a non-null slab handle.
+//!   slot index meets a non-null slab handle: a compiled caller constructs
+//!   through the generated direct-construct boundary, whose receiver
+//!   preparation reserves the whole transition program's capacity before the
+//!   first store, and the constructor's non-scalar field values keep it off
+//!   the pre-shaped simple-constructor path.
 //! - The runtime property-stub count, which must stay bounded by the slab
 //!   growth points rather than scale with every store.
 //!
@@ -13,6 +17,9 @@
 //! - Every tier produces the interpreter's result for every field.
 //! - A compiled add-transition into a slab word with capacity commits in
 //!   generated code; only the growth points reach the runtime stub.
+//! - Appending slot zero to a receiver that already owns an out-of-line slab
+//!   leaves its value base on that slab; every later slab-relative store must
+//!   land in the slab, never in the body.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -84,4 +91,53 @@ fn slab_add_transitions_stay_in_generated_code() {
         runtime_stubs < 600 * 4,
         "runtime property stubs must not scale with every slab store: {runtime_stubs}"
     );
+}
+
+const RESERVED_RECEIVER_SOURCE: &str = r#"
+function Cell(v) {
+  this.a = v; this.b = v + 1; this.c = null; this.d = v * 2; this.e = "x" + (v & 1); this.f = v;
+}
+function make(v) { return new Cell(v); }
+function run(rounds) {
+  let acc = 0;
+  let keys = "";
+  let bad = 0;
+  for (let i = 0; i < rounds; i++) {
+    const c = make(i);
+    acc += c.a + c.b + c.d + c.f + c.e.length;
+    if (c.c !== null || c.a !== i || c.f !== i) bad++;
+    keys = Object.keys(c).join(",");
+  }
+  return acc + "|" + keys + "|" + bad;
+}
+run(400);
+"#;
+
+fn run_reserved_receiver(selection: JitSelection) -> String {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .build()
+        .expect("runtime");
+    runtime
+        .run_script(
+            SourceInput::from_javascript(RESERVED_RECEIVER_SOURCE.to_string()),
+            "jit-reserved-receiver-transitions.js",
+        )
+        .expect("compiled caller constructing a spilled receiver")
+        .completion_string()
+        .to_owned()
+}
+
+#[test]
+fn slot_zero_transition_keeps_a_reserved_slab_as_the_value_base() {
+    // The constructor tiers up before its caller does, so the caller's
+    // generated construct boundary prepares the receiver: a non-simple
+    // constructor body means the receiver arrives with the root shape and a
+    // reserved out-of-line slab, and every field is appended by generated
+    // add-transitions starting at slot zero.
+    let oracle = run_reserved_receiver(JitSelection::InterpreterOnly);
+    assert!(oracle.ends_with("|a,b,c,d,e,f|0"), "{oracle}");
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        assert_eq!(run_reserved_receiver(selection), oracle, "{selection:?}");
+    }
 }

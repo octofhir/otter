@@ -57,7 +57,8 @@
 //! - Guarded element operands are late location uses, so target emission may
 //!   materialize stack or register homes without overwriting a live input.
 //! - Tagged nullish loose equality deoptimizes before its Boolean definition
-//!   for every non-nullish cell so canonical HTMLDDA semantics remain visible.
+//!   only for a native-function cell, the sole HTMLDDA carrier; every other
+//!   cell completes as not nullish in generated code.
 //! - Target register files enumerate physical registers explicitly. There is
 //!   no synthetic constant register budget.
 //!
@@ -766,8 +767,9 @@ pub enum MachineOpcode {
     /// Invert canonical Boolean bits.
     BooleanNot,
     /// Compare one tagged value with a statically known `null` or `undefined`.
-    /// Non-nullish cells deopt before defining the result so the canonical
-    /// equality path can observe HTMLDDA objects.
+    /// A native-function cell deopts before defining the result so the
+    /// canonical equality path can observe HTMLDDA; every other cell completes
+    /// as not nullish.
     TaggedNullishEqual {
         /// Source bytecode offset used by artifacts and exact deoptimization.
         byte_pc: u32,

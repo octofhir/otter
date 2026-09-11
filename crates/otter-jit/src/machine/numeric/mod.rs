@@ -51,8 +51,9 @@
 //!   relocation and tagged load. No moving string handle, safepoint, deopt
 //!   state, or runtime-fill boundary survives selection.
 //! - Tagged loose equality against a static nullish literal classifies
-//!   immediates directly but exits before its Boolean definition for any cell,
-//!   preserving canonical HTMLDDA semantics without a generated call.
+//!   immediates and ordinary cells directly and exits before its Boolean
+//!   definition only for a native-function cell, the sole HTMLDDA carrier,
+//!   without a generated call.
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.

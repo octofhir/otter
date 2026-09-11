@@ -52,7 +52,8 @@
 //!   roots at the committed cold safepoint.
 //! - Loose numeric equality reuses the guarded numeric path. A tagged value may
 //!   compare directly with a static nullish literal, but the node retains an
-//!   exact pre-operation state so every Cell can deopt for HTMLDDA semantics.
+//!   exact pre-operation state so a native-function cell can deopt for HTMLDDA
+//!   semantics.
 //! - `ArrayConstruct` accepts only zero arguments or one exact Int32 length.
 //!   The allocating operation and any required tagged decode retain the same
 //!   exact pre-construction frame state; all wider arities stay on the Template

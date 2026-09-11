@@ -398,6 +398,7 @@ pub(super) fn compile(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
                     dst,
                     lhs,
                     rhs,

@@ -2,14 +2,16 @@
 //!
 //! # Contents
 //! - Direct null/undefined, Number, and Boolean comparison semantics.
-//! - Exact ordinary-object deoptimization without coercion or replay.
+//! - Ordinary objects complete in generated code without coercion; a
+//!   native-function cell exact-deopts without coercion or replay.
 //! - Machine code-map, deopt, relocation, and empty-safepoint proofs.
 //!
 //! # Invariants
 //! - A static nullish operand forms one equivalence class containing exactly
 //!   `null` and `undefined` for every non-cell JavaScript value.
-//! - Every cell exits at the original comparison before the Boolean result is
-//!   defined, so the canonical path retains the HTMLDDA decision.
+//! - Only a native-function cell, the sole Annex B `[[IsHTMLDDA]]` carrier,
+//!   exits at the original comparison before the Boolean result is defined;
+//!   every other cell is decided by its tag in generated code.
 //! - The generated comparison neither allocates nor owns a safepoint.
 
 #![cfg(target_arch = "aarch64")]
@@ -90,6 +92,15 @@ try {
   machineLooseCaught++;
 }
 JSON.stringify([machineLooseObjectResults, machineLooseCoercions, machineLooseCaught]);
+"#;
+
+const NATIVE_PROBE: &str = r#"
+JSON.stringify([
+  machineLooseEqNull(Math.max),
+  machineLooseNeNull(Math.max),
+  machineLooseEqUndefined(Math.max),
+  machineLooseNeUndefined(Math.max)
+]);
 "#;
 
 fn runtime(selection: JitSelection, artifacts: bool) -> Runtime {
@@ -299,7 +310,7 @@ fn machine_tagged_nullish_primitives_match_interpreter_without_deopt() {
 }
 
 #[test]
-fn machine_tagged_nullish_cells_exact_deopt_without_coercion_or_replay() {
+fn machine_tagged_nullish_ordinary_objects_complete_without_deopt_or_coercion() {
     let mut compiled = compiled_fixture(false);
     let before = compiled.execution_stats();
     let actual = completion(
@@ -307,10 +318,31 @@ fn machine_tagged_nullish_cells_exact_deopt_without_coercion_or_replay() {
         OBJECT_PROBE,
         "jit-machine-loose-equality-object.js",
     );
-    let after_object = compiled.execution_stats();
-    let (entries, deopts) = stats_delta(before, after_object);
+    let (entries, deopts) = stats_delta(before, compiled.execution_stats());
     assert_eq!(actual, "[[false,true,false,true],0,0]");
     assert!(entries >= 4, "each cell comparison must enter Machine code");
+    assert_eq!(
+        deopts, 0,
+        "an ordinary object is decided by its tag inside generated code"
+    );
+}
+
+#[test]
+fn machine_tagged_nullish_native_functions_exact_deopt_without_coercion_or_replay() {
+    let mut compiled = compiled_fixture(false);
+    let before = compiled.execution_stats();
+    let actual = completion(
+        &mut compiled,
+        NATIVE_PROBE,
+        "jit-machine-loose-equality-native.js",
+    );
+    let after_object = compiled.execution_stats();
+    let (entries, deopts) = stats_delta(before, after_object);
+    assert_eq!(actual, "[false,true,false,true]");
+    assert!(
+        entries >= 4,
+        "each native-function comparison must enter Machine code"
+    );
     assert_eq!(
         deopts, 4,
         "each function must exact-deopt once before its Boolean destination"

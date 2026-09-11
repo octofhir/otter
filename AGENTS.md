@@ -346,8 +346,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 
 - Long-running scripts/servers: use `--timeout 0` (disables the timeout).
 - Normal CLI execution always uses the production tier policy. `--jitless`
-  selects the existing interpreter-only runtime path for semantic-oracle and
-  no-native-code comparisons; there is no user-facing tier selector.
+  runs the template baseline tier without optimizing compilation;
+  `--interpreter` runs the bytecode interpreter alone and is the semantic
+  oracle for differential comparisons (`otter-difftest` uses it). There is no
+  finer-grained user-facing tier selector.
 - When editing embedded JS shims: they are compiled in via `include_str!` and passed through `CString::new(...)` (no `\0` bytes).
 - Bytecode disassembly (compile and exit):
   - Text: `cargo run -p otter-cli -- --dump-bytecode <file>`

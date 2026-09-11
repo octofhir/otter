@@ -342,6 +342,40 @@ pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
     );
 }
 
+/// Initialize a receiver's cached value-slab base once generated code has
+/// appended its first own slot.
+///
+/// The VM keeps `values_ptr` current for every mutation. An inline object
+/// (null out-of-line slab handle) points it at the in-body array as soon as
+/// slot zero exists, while a spilled object already points at its stable
+/// out-of-line slab — receiver preparation reserves such a slab ahead of a
+/// multi-field transition program, before any `StoreProperty` runs. Only the
+/// inline case may be written here: rewriting a spilled object's base would
+/// aim every later slab-relative store into the body past its three inline
+/// words. `header` holds the receiver's `GcHeader` pointer in `x13`; `x16` is
+/// clobbered.
+pub(crate) fn emit_initialize_inline_values_ptr(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    scratch: u8,
+) {
+    assert_eq!(
+        (header, scratch),
+        (13, 16),
+        "fixed-register values-pointer initialization form"
+    );
+    let ready = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w16, [x13, view.object_slab_handle_byte]
+        ; cbnz w16, =>ready
+        ; add x16, x13, view.object_inline_values_byte
+        ; str x16, [x13, view.object_values_ptr_byte]
+        ; =>ready
+    );
+}
+
 /// Run the write barrier a pointer store owes.
 ///
 /// `parent` holds the guarded receiver's `GcHeader` address and `child` the

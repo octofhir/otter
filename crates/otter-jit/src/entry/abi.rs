@@ -198,6 +198,10 @@ pub(crate) const VM_THREAD_MARKING_FLAG_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, marking_flag_cell) as u32;
 pub(crate) const VM_THREAD_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(VmThread, current_code_object_id) as u32;
+pub(crate) const VM_THREAD_CODE_REGISTRY_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, code_registry) as u32;
+pub(crate) const CODE_REGISTRY_VIEW_HOT_FUNCTION_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::native_abi::CodeRegistryView, hot_function) as u32;
 pub(crate) const VM_THREAD_CURRENT_FRAME_OFFSET: u32 =
     std::mem::offset_of!(VmThread, current_frame) as u32;
 /// Byte offsets of the native-activation publish fields in [`JitCtx`], used by

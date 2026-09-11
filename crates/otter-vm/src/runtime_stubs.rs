@@ -2515,6 +2515,7 @@ mod tests {
         let registry = Box::leak(Box::new(CodeRegistryView {
             context: std::ptr::from_ref(active) as u64,
             resolve_safepoint: resolve_test_safepoint as *const () as u64,
+            hot_function: 0,
         }));
         let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation::for_test(vm)));
         let native_frame = NativeFrame::new(

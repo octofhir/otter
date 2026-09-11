@@ -34,7 +34,16 @@ pub struct CodeRegistryView {
     pub context: u64,
     /// Address of a [`SafepointResolverFn`].
     pub resolve_safepoint: u64,
+    /// Bytecode function identity plus one of the most recent generated
+    /// callee whose current generation has reached the optimizing-tier
+    /// hotness threshold, or zero. Generated call linkage writes it without a
+    /// runtime call on every such entry; the VM drains it at its own safe
+    /// boundaries, so a callee that is only ever entered through generated
+    /// linkage still reaches the promotion policy.
+    pub hot_function: u64,
 }
+
+const _: [(); 16] = [(); std::mem::offset_of!(CodeRegistryView, hot_function)];
 
 impl CodeRegistryView {
     /// Resolve one code-object-local safepoint record.
@@ -224,7 +233,7 @@ impl SafepointRecord {
 }
 
 const _: [(); 4] = [(); std::mem::size_of::<TaggedLocation>()];
-const _: [(); 16] = [(); std::mem::size_of::<CodeRegistryView>()];
+const _: [(); 24] = [(); std::mem::size_of::<CodeRegistryView>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeRegistryView>()];
 const _: [(); 12] = [(); std::mem::size_of::<FrameMap>()];
 const _: [(); 12] = [(); std::mem::size_of::<SpillMap>()];

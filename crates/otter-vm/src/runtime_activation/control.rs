@@ -12,6 +12,7 @@ impl RuntimeCall<'_> {
     pub fn backedge_poll(&mut self) -> Result<(), VmError> {
         // SAFETY: the branded call owns exclusive mutator access for this
         // short operation and retains only a raw descriptor afterwards.
-        unsafe { &mut *self.vm.as_ptr() }.jit_backedge_poll()
+        let context = unsafe { self.context.as_ref() };
+        unsafe { &mut *self.vm.as_ptr() }.jit_backedge_poll(context)
     }
 }

@@ -177,6 +177,46 @@ impl Interpreter {
         result
     }
 
+    /// Complete one explicit-receiver call for a published compiled frame:
+    /// the callee value is already resolved, so only call-target feedback and
+    /// the canonical rooted call remain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn jit_runtime_call_with_this_values(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        call_pc: u32,
+        callee: Value,
+        receiver: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        self.record_call_attempt_feedback(function, call_pc, function_id);
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        self.jit_runtime_stats.jit_to_rust_call_transitions = self
+            .jit_runtime_stats
+            .jit_to_rust_call_transitions
+            .saturating_add(1);
+        if let Some(target_function_id) = callee.as_function().or_else(|| {
+            callee
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        }) {
+            let transition = self.record_ordinary_call_feedback(
+                function,
+                call_pc,
+                crate::feedback::OrdinaryCallTarget::Bytecode(target_function_id),
+            );
+            if transition.evict_for_reopt() {
+                self.evict_compiled_for_reopt(function_id);
+            }
+        }
+        self.run_rooted_call_values(stack, context, callee, receiver, args)
+    }
+
     /// Final hidden class of an `arguments` object: index keys, `length`,
     /// and `callee`, built through the ordinary transition table so every
     /// arguments object of one arity shares a shape and stays IC-cacheable.

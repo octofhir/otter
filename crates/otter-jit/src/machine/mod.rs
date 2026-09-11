@@ -34,7 +34,9 @@
 //!   independently of deoptimization metadata or the lowering path that
 //!   selected the call.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
-//!   and constructor targets remain monomorphic. A cold call exit owns no
+//!   and constructor targets remain monomorphic; an explicit-receiver call
+//!   owns at most one candidate and otherwise the generic value call. A cold
+//!   call exit owns no
 //!   inputs, effects, clobbers, roots, or safepoint and must carry an exact
 //!   pre-call deoptimization state.
 //! - Committed runtime calls own zero to two true tagged inputs and one GC
@@ -458,6 +460,10 @@ pub enum SafepointKind {
 pub enum DirectCallKind {
     /// Ordinary call whose dynamic callable is an allocator-owned operand.
     Plain,
+    /// Call whose receiver is argument word zero: at most one identity-guarded
+    /// candidate, and every guard miss or absent candidate completes through
+    /// the generic explicit-receiver value call.
+    CallWithThis,
     /// Method call whose receiver/prototype chain and current callable must be
     /// revalidated immediately before native entry.
     Method,
@@ -2343,6 +2349,8 @@ impl InstructionSequence {
                             let valid_count = if method {
                                 !descriptor.arguments.is_empty()
                                     && count <= MAX_MACHINE_DIRECT_METHOD_TARGETS
+                            } else if *kind == DirectCallKind::CallWithThis {
+                                descriptor.arguments.len() >= 2 && count <= 1
                             } else {
                                 count == 1
                             };

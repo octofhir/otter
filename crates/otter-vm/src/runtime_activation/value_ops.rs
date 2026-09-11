@@ -62,6 +62,52 @@ impl RuntimeCall<'_> {
         Ok(())
     }
 
+    /// Complete the exact published explicit-receiver call from boxed SSA
+    /// values: `values[0]` is the callee, `values[1]` the receiver, and the
+    /// rest every actual argument. The site is a `CallWithThis`, or a plain
+    /// `Call` whose generated caller supplies `undefined` as the receiver; the
+    /// callee's own binding rules apply either way.
+    pub fn call_with_this_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
+        let (callee, rest) = values.split_first().ok_or(VmError::InvalidOperand)?;
+        let (receiver, args) = rest.split_first().ok_or(VmError::InvalidOperand)?;
+        let function_id = self.function_id();
+        let call_pc = self.pc();
+        let context = unsafe { self.context.as_ref() };
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let instruction = function
+            .instr_at_index(call_pc as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let count_operand = match function.op(instruction) {
+            otter_bytecode::Op::CallWithThis => 3,
+            otter_bytecode::Op::Call => 2,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        if instruction.instruction_pc != call_pc {
+            return Err(VmError::InvalidOperand);
+        }
+        let argument_count = function
+            .const_index(instruction, count_operand)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(VmError::InvalidOperand)?;
+        if args.len() != argument_count {
+            return Err(VmError::InvalidOperand);
+        }
+        let args = SmallVec::from_slice(args);
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        vm.jit_runtime_call_with_this_values(
+            context,
+            stack,
+            function_id,
+            call_pc,
+            *callee,
+            *receiver,
+            args,
+        )
+    }
+
     /// Complete the exact published `CallMethodValue` from boxed SSA values.
     ///
     /// `values[0]` is the receiver and the remaining values are the complete

@@ -209,6 +209,39 @@ pub(crate) extern "C" fn jit_call_method_value_stub(
     committed_vm_result(ctx, result)
 }
 
+/// Complete the exact published explicit-receiver call from boxed SSA values.
+///
+/// `packet[0]` is the callee, `packet[1]` the receiver, and the remaining
+/// `count - 2` values are every actual argument; the packet is copied before
+/// the VM runtime call is bound, exactly like the method-value entry.
+pub(crate) extern "C" fn jit_call_with_this_value_stub(
+    ctx: *mut JitCtx,
+    packet: *const Value,
+    count: u32,
+) -> NativeResultPair {
+    let copied = if count < 2
+        || packet.is_null()
+        || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
+    {
+        Err(VmError::InvalidOperand)
+    } else {
+        let count = count as usize;
+        // SAFETY: generated code passes one live, naturally aligned span of
+        // `count` initialized Value words; copying ends the machine-memory
+        // borrow before any runtime operation begins.
+        let values = unsafe { std::slice::from_raw_parts(packet, count) };
+        Ok(smallvec::SmallVec::<[Value; 8]>::from_slice(values))
+    };
+
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = copied.and_then(|values| {
+        ctx.runtime_call()
+            .and_then(|mut runtime| runtime.call_with_this_values(values.as_slice()))
+    });
+    committed_vm_result(ctx, result)
+}
+
 /// Complete computed `[[Get]]` from fixed boxed-value operands.
 ///
 /// The active native frame supplies the exact function/PC feedback identity

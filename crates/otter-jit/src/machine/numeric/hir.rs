@@ -302,6 +302,9 @@ pub(super) enum NumericDirectCallArguments {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericDirectCallKind {
     Plain,
+    /// Explicit receiver in argument word zero; at most one identity-guarded
+    /// candidate, otherwise the generic value call.
+    CallWithThis,
     Method,
     Construct,
     DerivedConstruct,
@@ -375,6 +378,13 @@ fn method_direct_call_target(
 fn generic_method_call_target() -> NumericDirectCallTarget {
     NumericDirectCallTarget {
         kind: NumericDirectCallKind::Method,
+        candidates: Vec::new(),
+    }
+}
+
+fn generic_call_with_this_target() -> NumericDirectCallTarget {
+    NumericDirectCallTarget {
+        kind: NumericDirectCallKind::CallWithThis,
         candidates: Vec::new(),
     }
 }
@@ -2326,6 +2336,7 @@ fn lower_instruction(
         || matches!(
             op,
             Op::Call
+                | Op::CallWithThis
                 | Op::CallSpread
                 | Op::CallMethodValue
                 | Op::New
@@ -2774,16 +2785,22 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::Call => {
+        Op::Call | Op::CallWithThis => {
+            let explicit_receiver = op == Op::CallWithThis;
             let source = read_value(registers, register(instruction, code, 1)?)?;
-            let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
+            let (count_operand, first_argument) = if explicit_receiver { (3, 4) } else { (2, 3) };
+            let argument_count =
+                usize::try_from(instruction.const_index(code, count_operand)?).ok()?;
             let arguments = (0..argument_count)
-                .map(|index| read_value(registers, register(instruction, code, 3 + index)?))
+                .map(|index| {
+                    read_value(
+                        registers,
+                        register(instruction, code, first_argument + index)?,
+                    )
+                })
                 .collect::<Option<Vec<_>>>()?;
-            let Some(callee) = direct_callees.get(&instruction.byte_pc).copied() else {
-                if instruction.call_attempted {
-                    return None;
-                }
+            let direct = direct_callees.get(&instruction.byte_pc).copied();
+            if direct.is_none() && !instruction.call_attempted {
                 return lower_cold_call_exit(
                     NumericColdCallKind::Plain,
                     register(instruction, code, 0)?,
@@ -2798,13 +2815,41 @@ fn lower_instruction(
                     live_in,
                     exceptional_value,
                 );
+            }
+            // A plain call with a monomorphic plan keeps its receiver-free
+            // linkage. Every other attempted site — an explicit receiver, or a
+            // plain call the profile could not settle — carries the receiver
+            // as argument word zero: a plain call passes `undefined` there and
+            // the callee's own binding rules apply.
+            let (target, arguments) = match (direct, explicit_receiver) {
+                (Some(callee), false) => (
+                    monomorphic_direct_call_target(NumericDirectCallKind::Plain, callee),
+                    arguments,
+                ),
+                (direct, _) => {
+                    let receiver = if explicit_receiver {
+                        read_value(registers, register(instruction, code, 2)?)?
+                    } else {
+                        let receiver = push(
+                            nodes,
+                            NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                        );
+                        block_nodes.push(receiver);
+                        receiver
+                    };
+                    let target = match direct {
+                        Some(callee) => monomorphic_direct_call_target(
+                            NumericDirectCallKind::CallWithThis,
+                            callee,
+                        ),
+                        None => generic_call_with_this_target(),
+                    };
+                    (target, std::iter::once(receiver).chain(arguments).collect())
+                }
             };
             let (argument_start, argument_count) =
                 append_direct_call_arguments(direct_call_arguments, arguments)?;
-            let target = intern_direct_call_target(
-                direct_call_targets,
-                monomorphic_direct_call_target(NumericDirectCallKind::Plain, callee),
-            )?;
+            let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
@@ -4587,12 +4632,35 @@ mod tests {
     }
 
     #[test]
-    fn attempted_unplanned_plain_rejects_but_method_owns_a_generic_final_miss() {
+    fn attempted_unplanned_plain_and_method_calls_own_a_generic_final_miss() {
+        // An attempted plain call the profile could not settle takes the
+        // explicit-receiver value call with `undefined` as argument word zero.
         let mut plain = call_view(false);
         plain.seed_call_attempted_for_test(0);
+        let hir = NumericFunction::build(&plain).expect("attempted generic plain HIR");
+        let target = &hir.direct_call_targets[0];
+        assert_eq!(target.kind, NumericDirectCallKind::CallWithThis);
+        assert!(target.candidates.is_empty());
+        let (start, count) = hir
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                NumericNode::DirectCall {
+                    arguments: NumericDirectCallArguments::Fixed { start, count },
+                    ..
+                } => Some((*start as usize, *count)),
+                _ => None,
+            })
+            .expect("generic plain call node");
+        assert_eq!(count, 2, "receiver word plus one argument");
+        assert!(matches!(
+            hir.nodes[hir.direct_call_arguments[start].0],
+            NumericNode::TaggedConstant(bits) if bits == otter_vm::Value::undefined().to_bits()
+        ));
         assert!(
-            NumericFunction::build(&plain).is_none(),
-            "attempted unplanned plain call still needs a direct callee"
+            hir.nodes
+                .iter()
+                .all(|node| !matches!(node, NumericNode::ColdCallExit { .. }))
         );
 
         let mut method = call_view_with_arguments(true, &[1, 1, 1, 1, 1, 1, 1, 1]);

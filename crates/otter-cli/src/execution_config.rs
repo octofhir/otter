@@ -11,7 +11,8 @@
 //! - Normal CLI execution uses the production tier policy; `--jitless` selects
 //!   the template baseline compiler (interpreter plus the template tier, no
 //!   optimizing compilation) — the jitless engine, analogous to running with a
-//!   bytecode baseline instead of an optimizing JIT.
+//!   bytecode baseline instead of an optimizing JIT; `--interpreter` selects
+//!   the bytecode interpreter alone, the differential-testing oracle.
 //! - `None` keeps the runtime timeout default while `Some(Duration::ZERO)`
 //!   explicitly disables it.
 //! - Engine crates only return owned JIT reports. This outer configuration
@@ -70,15 +71,10 @@ impl CliExecutionConfig {
     pub(crate) fn new(
         timeout_secs: Option<u64>,
         trace_target: Option<String>,
-        jitless: bool,
+        jit_selection: JitSelection,
         jit_events_target: Option<String>,
         jit_artifacts_target: Option<String>,
     ) -> Self {
-        let jit_selection = if jitless {
-            JitSelection::Template
-        } else {
-            JitSelection::ProductionTiered
-        };
         Self {
             timeout: timeout_secs.map(Duration::from_secs),
             trace_target,

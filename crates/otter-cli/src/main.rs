@@ -34,8 +34,8 @@ use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
 use otter_runtime::{
-    CapabilitySet, DiagnosticCode, ExecutionAttempt, JitArtifactBatch, JitDebugReport, OtterError,
-    Permission, SourceInput,
+    CapabilitySet, DiagnosticCode, ExecutionAttempt, JitArtifactBatch, JitDebugReport,
+    JitSelection, OtterError, Permission, SourceInput,
 };
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
@@ -129,9 +129,16 @@ struct Cli {
     )]
     jit_artifacts: Option<String>,
 
-    /// Disable all JIT tiers and execute through the bytecode interpreter.
-    #[arg(long, global = true)]
+    /// Run the jitless engine: the bytecode interpreter plus the template
+    /// baseline compiler, with no optimizing compilation.
+    #[arg(long, global = true, conflicts_with = "interpreter")]
     jitless: bool,
+
+    /// Run the bytecode interpreter alone, with no native code generation.
+    /// This is the semantic oracle for differential testing and is several
+    /// times slower than `--jitless`.
+    #[arg(long, global = true, conflicts_with = "jitless")]
+    interpreter: bool,
 
     /// Silence all process warning output (Node's `--no-warnings`).
     #[arg(long = "no-warnings", global = true)]
@@ -920,10 +927,17 @@ async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse_from(clustered_switches(std::env::args()));
     startup_timer.mark("parse_args");
+    let jit_selection = if cli.interpreter {
+        JitSelection::InterpreterOnly
+    } else if cli.jitless {
+        JitSelection::Template
+    } else {
+        JitSelection::ProductionTiered
+    };
     let mut execution = CliExecutionConfig::new(
         cli.timeout_secs,
         cli.trace.clone(),
-        cli.jitless,
+        jit_selection,
         cli.jit_events.clone(),
         cli.jit_artifacts.clone(),
     );

@@ -27,8 +27,9 @@ target/release/otter \
 ```
 
 Normal CLI execution always includes the optimizing tier with template
-fallback. Use `--jitless` as the no-native-code oracle. Diagnostics remain
-default-off in either mode.
+fallback. `--jitless` runs the template baseline tier without optimizing
+compilation; `--interpreter` runs the bytecode interpreter alone and is the
+no-native-code oracle. Diagnostics remain default-off in every mode.
 
 `--jit-events` without a value defaults to `otter-jit-events.json`.
 `--jit-artifacts` without a value defaults to `otter-jit-artifacts`. Both flags
@@ -690,7 +691,8 @@ must not be used for cross-process comparison or as an executable pointer.
 Use this order when a hot function produces a wrong result or unexpected
 fallback:
 
-1. Re-run with `--jitless` to establish the bytecode oracle.
+1. Re-run with `--interpreter` to establish the bytecode oracle, then with
+   `--jitless` to tell a template-tier defect from an optimizing-tier one.
 2. Capture `--jit-events` and find the function's `compilePrepared`,
    call plan/final-lowering events, `compileFinished`, OSR, bail, or deopt
    records. For a static-native site, compare `staticNativeCallPlan` with

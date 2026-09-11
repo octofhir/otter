@@ -99,11 +99,13 @@ fn run(otter: &Path, source: &str, case: &str, mode: &Mode, timeout: Duration) -
         .env_remove("OTTER_GC_VERIFY")
         .env_remove("OTTER_JIT_OSR_THRESHOLD");
     // Tier selection is a CLI decision, not an environment one: the oracle asks
-    // the binary for the interpreter, so a renamed or retired environment
-    // variable can never silently turn the oracle into another tiered run.
+    // the binary for the interpreter alone (`--jitless` is the template
+    // baseline tier, a code generator in its own right), so a renamed or
+    // retired environment variable can never silently turn the oracle into
+    // another tiered run.
     match mode {
         Mode::InterpreterOnly => {
-            command.arg("--jitless");
+            command.arg("--interpreter");
         }
         Mode::NormalTiering => {}
         Mode::ForcedBaseline => {

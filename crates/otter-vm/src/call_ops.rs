@@ -554,15 +554,40 @@ impl Interpreter {
         } else {
             self.constructor_prototype_value("Object")?
         });
+        Ok(Some(self.allocate_bytecode_constructor_receiver(
+            context,
+            function_id,
+            &roots,
+        )?))
+    }
+
+    /// Allocate the receiver one bytecode constructor body will initialize:
+    /// OrdinaryCreateFromConstructor plus this engine's constructor feedback.
+    ///
+    /// Every construct path — generated linkage, the runtime construct
+    /// boundary, and the interpreter's own `New` — hands the constructor body
+    /// the same receiver contract through this one function: the body's
+    /// baked field-transition program has its slab capacity reserved ahead
+    /// of the first store, and a simple constructor receives its final hidden
+    /// class with undefined slots, which its straight-line writes overwrite
+    /// in source order before anything can observe them. `roots.scratch_0`
+    /// holds the resolved prototype and `roots.new_target` the construct's
+    /// `new.target`; the returned value is also left in `roots.receiver`.
+    fn allocate_bytecode_constructor_receiver(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        roots: &SyncJsCallRoots,
+    ) -> Result<Value, VmError> {
         let reserved_field_count = self.prepare_constructor_field_transitions(
             context,
             function_id,
             roots.new_target.get(),
             roots.scratch_0.get(),
-            &roots,
+            roots,
         )?;
         let simple_shape =
-            self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), &roots)?;
+            self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), roots)?;
         let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         roots.receiver.set(Value::object(receiver));
         if let Some((shape, field_count)) = simple_shape {
@@ -603,7 +628,7 @@ impl Interpreter {
             &mut self.gc_heap,
             Some(roots.scratch_0.get()),
         );
-        Ok(Some(roots.receiver.get()))
+        Ok(roots.receiver.get())
     }
 
     /// Resolve the hidden class a conservative generated constructor can own
@@ -679,35 +704,7 @@ impl Interpreter {
             .construct_prototype_for_callee(stack, context, &new_target)?
             .unwrap_or(self.constructor_prototype_value("Object")?);
         roots.scratch_0.set(proto);
-        let reserved_field_count = self.prepare_constructor_field_transitions(
-            context,
-            function_id,
-            roots.new_target.get(),
-            roots.scratch_0.get(),
-            &roots,
-        )?;
-        let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
-        roots.receiver.set(Value::object(receiver));
-        if reserved_field_count != 0 {
-            let mut receiver = roots
-                .receiver
-                .get()
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?;
-            crate::object::reserve_fresh_object_slot_capacity(
-                &mut receiver,
-                &mut self.gc_heap,
-                reserved_field_count,
-            )
-            .map_err(VmError::from)?;
-            roots.receiver.set(Value::object(receiver));
-        }
-        crate::object::set_prototype_value(
-            receiver,
-            &mut self.gc_heap,
-            Some(roots.scratch_0.get()),
-        );
-        Ok(roots.receiver.get())
+        self.allocate_bytecode_constructor_receiver(context, function_id, &roots)
     }
 
     /// Build guarded, pre-reserved field-transition programs for one exact
@@ -4506,10 +4503,44 @@ impl Interpreter {
         }
         let proto = proto.expect("construct prototype fallback always resolves");
         roots.scratch_0.set(proto);
-        let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
-        roots.receiver.set(Value::object(receiver));
-        let proto = roots.scratch_0.get();
-        crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
+        // A base bytecode constructor takes the shared receiver contract its
+        // generated construct paths use; natives and derived constructors
+        // (whose `this` is bound by `super()`) keep the bare ordinary object.
+        let bytecode_base_constructor = {
+            let callable = roots
+                .current
+                .get()
+                .as_class_constructor()
+                .map(|class| class.ctor(&self.gc_heap))
+                .unwrap_or(roots.current.get());
+            callable
+                .as_function()
+                .or_else(|| {
+                    callable
+                        .as_closure(&self.gc_heap)
+                        .map(|closure| closure.function_id())
+                })
+                .filter(|&function_id| {
+                    context.for_function(function_id).ok().is_some_and(|owner| {
+                        owner
+                            .exec_function(function_id)
+                            .is_some_and(|function| !function.is_derived_constructor)
+                    })
+                })
+        };
+        let receiver = match bytecode_base_constructor {
+            Some(function_id) => self
+                .allocate_bytecode_constructor_receiver(context, function_id, roots)?
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?,
+            None => {
+                let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+                roots.receiver.set(Value::object(receiver));
+                let proto = roots.scratch_0.get();
+                crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
+                receiver
+            }
+        };
         // Keep arguments in `SyncJsCallRoots` through the observable
         // new-target prototype lookup and receiver allocation. Taking the
         // SmallVec earlier detached it from the registered root provider, so

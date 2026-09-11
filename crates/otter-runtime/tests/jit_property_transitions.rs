@@ -20,6 +20,10 @@
 //! - Appending slot zero to a receiver that already owns an out-of-line slab
 //!   leaves its value base on that slab; every later slab-relative store must
 //!   land in the slab, never in the body.
+//! - A constructor body proves its receiver's storage capacity before every
+//!   baked field transition; a receiver that arrived without the program's
+//!   reservation (a foreign `new.target`) exits to the canonical store instead
+//!   of writing past the inline words.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -139,5 +143,76 @@ fn slot_zero_transition_keeps_a_reserved_slab_as_the_value_base() {
     assert!(oracle.ends_with("|a,b,c,d,e,f|0"), "{oracle}");
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         assert_eq!(run_reserved_receiver(selection), oracle, "{selection:?}");
+    }
+}
+
+const UNRESERVED_RECEIVER_SOURCE: &str = r#"
+function Cell(v) {
+  this.a = v; this.b = v + 1; this.c = v * 2; this.d = v - 1; this.e = v & 7; this.f = v | 1;
+}
+function Other() {}
+Other.prototype.tag = "other";
+function warm(rounds) {
+  let acc = 0;
+  for (let i = 0; i < rounds; i++) { const c = new Cell(i); acc += c.a + c.f; }
+  return acc;
+}
+function foreign(rounds) {
+  let acc = 0;
+  let proto = "";
+  for (let i = 0; i < rounds; i++) {
+    const c = Reflect.construct(Cell, [i], Other);
+    acc += c.a + c.b + c.c + c.d + c.e + c.f;
+    proto = Object.getPrototypeOf(c).tag + "|" + Object.keys(c).join(",");
+  }
+  return acc + "|" + proto;
+}
+function runtime(rounds) {
+  let acc = 0;
+  for (let i = 0; i < rounds; i++) {
+    const c = Reflect.construct(Cell, [i]);
+    acc += c.a + c.b + c.c + c.d + c.e + c.f;
+  }
+  return acc + "|" + Object.keys(Reflect.construct(Cell, [1])).join(",");
+}
+warm(6000) + ";" + foreign(400) + ";" + runtime(400);
+"#;
+
+fn run_unreserved_receiver(selection: JitSelection) -> (String, u64) {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .build()
+        .expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(UNRESERVED_RECEIVER_SOURCE.to_string()),
+            "jit-unreserved-receiver-transitions.js",
+        )
+        .expect("constructor entered from every construct path")
+        .completion_string()
+        .to_owned();
+    (completion, runtime.execution_stats().jit_optimized_entries)
+}
+
+#[test]
+fn constructor_field_transitions_prove_storage_for_any_receiver() {
+    // `warm` promotes the constructor to the optimizing tier with baked field
+    // transitions. `foreign` then constructs it through a `new.target` that
+    // receiver preparation does not reserve for, and `runtime` through the
+    // runtime construct boundary; the generated body must prove every slab
+    // slot's storage (deopting to the canonical store that grows the slab)
+    // rather than assume the caller reserved it.
+    let (oracle, _) = run_unreserved_receiver(JitSelection::InterpreterOnly);
+    assert!(oracle.contains("|other|a,b,c,d,e,f;"), "{oracle}");
+    assert!(oracle.ends_with("|a,b,c,d,e,f"), "{oracle}");
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let (compiled, optimized_entries) = run_unreserved_receiver(selection);
+        assert_eq!(compiled, oracle, "{selection:?}");
+        if selection == JitSelection::ProductionTiered {
+            assert!(
+                optimized_entries > 0,
+                "the constructor must run on the optimizing tier for this proof"
+            );
+        }
     }
 }

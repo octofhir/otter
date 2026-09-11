@@ -594,6 +594,7 @@ impl Interpreter {
             opcode,
             value
                 if value == Op::CallSpread as u8
+                    || value == Op::Call as u8
                     || value == Op::CallWithThis as u8
                     || value == Op::NewSpread as u8
                     || value == Op::SuperConstructSpread as u8
@@ -605,13 +606,20 @@ impl Interpreter {
         }
         let saved_pc = stack[frame_index].pc;
         let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
-        let packed_regs = |packed: u64, count: usize| {
-            let mut regs = SmallVec::<[u16; 4]>::with_capacity(count);
-            for index in 0..count {
-                regs.push(lane(packed, index));
-            }
-            regs
-        };
+        // Argument registers travel as 16-bit lanes: the first four in
+        // `arg1`, the next four in `arg2`.
+        let packed_regs =
+            |low: u64, high: u64, count: usize| -> Result<SmallVec<[u16; 8]>, VmError> {
+                if count > 8 {
+                    return Err(VmError::InvalidOperand);
+                }
+                let mut regs = SmallVec::<[u16; 8]>::with_capacity(count);
+                for index in 0..count {
+                    let word = if index < 4 { low } else { high };
+                    regs.push(lane(word, index % 4));
+                }
+                Ok(regs)
+            };
         match opcode {
             value if value == Op::CallSpread as u8 => {
                 self.run_call_spread_full_regs(
@@ -625,7 +633,7 @@ impl Interpreter {
                 )?;
             }
             value if value == Op::CallWithThis as u8 => {
-                let regs = packed_regs(arg1, lane(arg0, 3) as usize);
+                let regs = packed_regs(arg1, arg2, lane(arg0, 3) as usize)?;
                 self.run_call_full_regs(
                     context,
                     stack,
@@ -633,6 +641,18 @@ impl Interpreter {
                     lane(arg0, 0),
                     lane(arg0, 1),
                     Some(lane(arg0, 2)),
+                    &regs,
+                )?;
+            }
+            value if value == Op::Call as u8 => {
+                let regs = packed_regs(arg1, arg2, lane(arg0, 3) as usize)?;
+                self.run_call_full_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    lane(arg0, 0),
+                    lane(arg0, 1),
+                    None,
                     &regs,
                 )?;
             }

@@ -897,9 +897,10 @@ fn emit_packed_args(
 ///
 /// A baked monomorphic pure leaf gets an exact guarded splice. Otherwise a
 /// baked stable code-entry plan emits the complete rooted native call in
-/// machine code. Missing plans and all pre-effect guard/setup failures
-/// deoptimize the original opcode; plain calls never prepare, replay, or enter
-/// a generic call transition.
+/// machine code. Pre-effect guard/setup failures of a generated edge
+/// deoptimize the original opcode; a site without a generated edge completes
+/// in place through the variadic call transition, so a polymorphic or
+/// never-planned call never leaves generated code on every execution.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_call(
     ops: &mut Assembler,
@@ -1031,8 +1032,24 @@ pub(super) fn emit_call_with_receiver(
                 },
             );
         }
-        dynasm!(ops ; .arch aarch64 ; b =>bail);
-        return Ok(());
+        return emit_generic_call_transition(
+            ops,
+            relocations,
+            table,
+            view,
+            None,
+            code_map,
+            dst,
+            callee,
+            receiver,
+            argument_registers,
+            logical_pc,
+            byte_pc,
+            bail,
+            threw,
+            throw_value,
+            fatal,
+        );
     }
     let direct_target = view.direct_callees.get(&byte_pc);
     if let Some(candidate) = view
@@ -1126,7 +1143,7 @@ pub(super) fn emit_call_with_receiver(
         return Ok(());
     }
 
-    if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
+    if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
         events.insert(
             (byte_pc, 0),
             direct_call_lowering_event(
@@ -1142,8 +1159,99 @@ pub(super) fn emit_call_with_receiver(
             ),
         );
     }
-    dynasm!(ops ; .arch aarch64 ; b =>bail);
-    Ok(())
+    emit_generic_call_transition(
+        ops,
+        relocations,
+        table,
+        view,
+        direct_call_events,
+        code_map,
+        dst,
+        callee,
+        receiver,
+        argument_registers,
+        logical_pc,
+        byte_pc,
+        bail,
+        threw,
+        throw_value,
+        fatal,
+    )
+}
+
+/// Number of 16-bit register lanes the in-place call transition carries in
+/// each of its two argument words.
+pub(super) const GENERIC_CALL_LANES_PER_WORD: usize = 4;
+
+/// Pack up to eight argument registers into the two lane words of the
+/// in-place call transition; `None` when the site has more.
+pub(super) fn pack_generic_call_lanes(argument_registers: &[u16]) -> Option<(u64, u64)> {
+    if argument_registers.len() > 2 * GENERIC_CALL_LANES_PER_WORD {
+        return None;
+    }
+    let mut words = [0u64; 2];
+    for (index, register) in argument_registers.iter().enumerate() {
+        words[index / GENERIC_CALL_LANES_PER_WORD] |=
+            u64::from(*register) << ((index % GENERIC_CALL_LANES_PER_WORD) * 16);
+    }
+    Some((words[0], words[1]))
+}
+
+/// Complete `Op::Call` / `Op::CallWithThis` in place through the variadic
+/// call transition when the site owns no generated edge.
+///
+/// The transition reads the callee, receiver, and arguments from the
+/// published register window, runs the canonical call, and writes the result
+/// back; a throw reaches the frame's committed-throw router. Only a site
+/// wider than the transition's eight argument lanes keeps the exact
+/// pre-effect side exit.
+#[allow(clippy::too_many_arguments)]
+fn emit_generic_call_transition(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    code_map: Option<&mut CodeMapCapture>,
+    dst: u16,
+    callee: u16,
+    receiver: Option<u16>,
+    argument_registers: &[u16],
+    logical_pc: u32,
+    byte_pc: u32,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let Some((lanes_low, lanes_high)) = pack_generic_call_lanes(argument_registers) else {
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
+        return Ok(());
+    };
+    let argc = u64::try_from(argument_registers.len())
+        .map_err(|_| Unsupported::OperandShape("generic call argument count"))?;
+    let (opcode, this_lane) = match receiver {
+        Some(receiver) => (otter_bytecode::Op::CallWithThis, u64::from(receiver)),
+        None => (otter_bytecode::Op::Call, 0),
+    };
+    super::spread_call::emit_spread_call_op(
+        ops,
+        relocations,
+        table,
+        view,
+        direct_call_events,
+        code_map,
+        opcode as u8,
+        u64::from(dst) | (u64::from(callee) << 16) | (this_lane << 32) | (argc << 48),
+        lanes_low,
+        lanes_high,
+        logical_pc,
+        byte_pc,
+        bail,
+        threw,
+        throw_value,
+        fatal,
+    )
 }
 
 pub(super) fn direct_call_target_tier(

@@ -2596,6 +2596,31 @@ pub(super) fn emit(
                     ; cmp w16, transition.slot as u32
                     ; b.ne =>deopt
                 );
+                // The appended slot must already own a word. Receiver
+                // preparation normally reserves the whole transition program's
+                // capacity, but a receiver can reach this body from any
+                // construct path — a foreign `new.target`, an interpreter
+                // construct, a prepared receiver whose program was cut short —
+                // so the live storage is proved here, before any mutation: a
+                // spilled slab must hold the slot below its capacity and an
+                // inline object must still have an inline word. Anything else
+                // deopts to the canonical store, which grows the slab.
+                let storage_fits = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr w16, [x13, view.object_slab_handle_byte]
+                    ; cbz w16, >inline_storage
+                    ; add x14, x12, x16
+                    ; ldr w14, [x14, view.object_slab_capacity_byte]
+                    ; cmp w14, transition.slot as u32
+                    ; b.ls =>deopt
+                    ; b =>storage_fits
+                    ; inline_storage:
+                );
+                if u32::from(transition.slot) >= view.object_inline_slot_cap {
+                    dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                }
+                dynasm!(ops ; .arch aarch64 ; =>storage_fits);
                 for &prototype_shape in &transition.prototype_shapes {
                     dynasm!(ops
                         ; .arch aarch64

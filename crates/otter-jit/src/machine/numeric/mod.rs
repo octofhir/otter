@@ -61,8 +61,11 @@
 //!   stack-owned allocating boundary directly with fixed ABI registers. Wider
 //!   or non-Int32 forms remain outside this pipeline.
 //! - Complete one-to-four-target guarded method chains, zero-candidate attempted
-//!   methods, monomorphic plain calls, and fixed/spread base/derived/super
-//!   construction share one typed descriptor and generated linkage emitter.
+//!   methods, monomorphic plain calls, explicit-receiver calls (one
+//!   identity-guarded candidate or the generic value call, which an attempted
+//!   polymorphic plain call also takes with an `undefined` receiver), and
+//!   fixed/spread base/derived/super construction share one typed descriptor
+//!   and generated linkage emitter.
 //!   Method arity is independent of guarded target count. Every method's
 //!   receiver-plus-argument packet fits one frame-wide untraced raw window used
 //!   only by its canonical final miss. A never-attempted unplanned plain/method
@@ -84,10 +87,10 @@ use otter_vm::{
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
         STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL,
-        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
-        STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
-        STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS,
+        STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        STUB_JIT_INITIALIZE_UPVALUES, STUB_JIT_PREPARE_BASE_CONSTRUCT,
+        STUB_JIT_RESOLVE_DIRECT_ENTRY, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -155,7 +158,7 @@ pub(super) fn method_value_packet_frame(
             matches!(
                 &descriptor.target,
                 CallTarget::Direct {
-                    kind: DirectCallKind::Method,
+                    kind: DirectCallKind::Method | DirectCallKind::CallWithThis,
                     ..
                 }
             )
@@ -287,6 +290,7 @@ pub(crate) fn try_compile(
         transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
         transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
+        transitions.entry(STUB_JIT_CALL_WITH_THIS_VALUE),
         &mut load_ic_cells,
         &mut store_ic_cells,
         view.code_block.register_count,
@@ -2490,6 +2494,7 @@ fn direct_call_descriptor(
         target: CallTarget::Direct {
             kind: match target.kind {
                 NumericDirectCallKind::Plain => DirectCallKind::Plain,
+                NumericDirectCallKind::CallWithThis => DirectCallKind::CallWithThis,
                 NumericDirectCallKind::Method => DirectCallKind::Method,
                 NumericDirectCallKind::Construct => DirectCallKind::Construct,
                 NumericDirectCallKind::DerivedConstruct => DirectCallKind::DerivedConstruct,

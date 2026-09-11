@@ -1545,6 +1545,22 @@ pub const STUB_JIT_CALL_METHOD_VALUE: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// Complete the exact published `CallWithThis` (or an attempted plain `Call`
+/// whose receiver is `undefined`) from an owned boxed-value span: the callee,
+/// the receiver, then every argument. The published frame supplies exact
+/// function/PC identity and precise roots; the call commits exactly once and
+/// never asks generated code to replay it.
+pub const STUB_JIT_CALL_WITH_THIS_VALUE: RuntimeStubDescriptor = descriptor(
+    91,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::ReentrantValueSpan,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Complete the exact published schema-owned binding operation from two boxed
 /// values. Function/PC identity selects the semantic family and operand roles
 /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
@@ -1701,6 +1717,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         88 => "jit_acknowledge_caught_throw",
         89 => "jit_binding_value",
         90 => "jit_global_declaration_value",
+        91 => "jit_call_with_this_value",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1797,6 +1814,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
     STUB_JIT_BINDING_VALUE,
     STUB_JIT_GLOBAL_DECLARATION_VALUE,
+    STUB_JIT_CALL_WITH_THIS_VALUE,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -2210,6 +2228,27 @@ mod tests {
             STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
             NO_SAFEPOINT
         ));
+    }
+
+    #[test]
+    fn call_with_this_entry_is_reentrant_value_span_committed_pair() {
+        assert_eq!(STUB_JIT_CALL_WITH_THIS_VALUE.id, 91);
+        assert_eq!(
+            STUB_JIT_CALL_WITH_THIS_VALUE.signature,
+            RuntimeStubSignature::ReentrantValueSpan
+        );
+        assert_eq!(
+            runtime_stub_name(STUB_JIT_CALL_WITH_THIS_VALUE.id),
+            "jit_call_with_this_value"
+        );
+        assert_eq!(
+            STUB_JIT_CALL_WITH_THIS_VALUE.result_abi,
+            RuntimeStubResultAbi::NativePair
+        );
+        assert_eq!(
+            STUB_JIT_CALL_WITH_THIS_VALUE.result_domain,
+            NativeResultDomain::Committed
+        );
     }
 
     #[test]

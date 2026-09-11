@@ -90,11 +90,11 @@ use otter_vm::{
         NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor, RuntimeStubResultAbi,
         RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
         STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE, STUB_JIT_CALL_METHOD_VALUE,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR,
-        STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_ELEMENT,
-        STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
-        STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC,
-        STUB_TO_BOOLEAN_LEAF,
+        STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY,
+        STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF,
+        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
+        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
     },
 };
 
@@ -1294,6 +1294,7 @@ pub(super) fn emit(
     load_property_entry: u64,
     store_property_entry: u64,
     call_method_value_entry: u64,
+    call_with_this_value_entry: u64,
     load_ic_cells: &mut [WhiskerIcCell],
     store_ic_cells: &mut [WhiskerIcCell],
     vm_register_count: u16,
@@ -1665,6 +1666,9 @@ pub(super) fn emit(
                 let destination = integer_register(locations[2])?;
                 let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                 let nonzero = ops.new_dynamic_label();
+                // A test-bit branch reaches only 32 KiB, so the negative-zero
+                // exit goes through a local skip and an unconditional branch
+                // that reaches the deopt trampolines of any body size.
                 dynasm!(ops
                     ; .arch aarch64
                     ; smull x16, W(left), W(right)
@@ -1673,7 +1677,8 @@ pub(super) fn emit(
                     ; b.ne =>exit
                     ; cbnz w16, =>nonzero
                     ; eor w17, W(left), W(right)
-                    ; tbnz w17, #31, =>exit
+                    ; tbz w17, #31, =>nonzero
+                    ; b =>exit
                     ; =>nonzero
                     ; mov W(destination), w16
                 );
@@ -2774,7 +2779,16 @@ pub(super) fn emit(
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
                     let result_index = descriptor.arguments.len();
-                    let arguments = (1..result_index)
+                    // An explicit-receiver call carries its receiver as
+                    // operand one; the linkage takes it through the call form
+                    // rather than the argument list.
+                    let first_argument = if *kind == DirectCallKind::CallWithThis {
+                        2
+                    } else {
+                        1
+                    };
+                    let call_with_this_guard_miss = ops.new_dynamic_label();
+                    let arguments = (first_argument..result_index)
                         .map(|index| {
                             u16::try_from(index).map_err(|_| {
                                 Unsupported::OperandShape("scalar direct call argument count")
@@ -2794,6 +2808,10 @@ pub(super) fn emit(
                             next_method_candidate.unwrap_or(final_method_guard_miss);
                         let form = match kind {
                             DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
+                            DirectCallKind::CallWithThis => DirectCallForm::CallWithThis {
+                                callable: 0,
+                                receiver: 1,
+                            },
                             DirectCallKind::Method => {
                                 let guard = candidate.guard.as_ref().ok_or(
                                     Unsupported::OperandShape("scalar method candidate guard"),
@@ -2882,7 +2900,11 @@ pub(super) fn emit(
                             copy_spread_arguments_entry,
                             initialize_upvalues_entry,
                             None,
-                            direct_bail,
+                            if *kind == DirectCallKind::CallWithThis {
+                                call_with_this_guard_miss
+                            } else {
+                                direct_bail
+                            },
                             finish_error,
                             direct_threw,
                             fatal,
@@ -2989,8 +3011,37 @@ pub(super) fn emit(
                             dynasm!(ops ; .arch aarch64 ; =>next_method_candidate);
                         }
                     }
-                    if *kind == DirectCallKind::Method {
-                        dynasm!(ops ; .arch aarch64 ; =>final_method_guard_miss);
+                    if matches!(kind, DirectCallKind::Method | DirectCallKind::CallWithThis) {
+                        if *kind == DirectCallKind::Method {
+                            dynasm!(ops ; .arch aarch64 ; =>final_method_guard_miss);
+                        } else {
+                            // A candidate reaches the loop's end with its
+                            // roots still published. The linkage's guard miss
+                            // restored the allocator registers and cleared
+                            // the record, so it publishes again before the
+                            // generic call.
+                            let generic_ready = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; b =>generic_ready
+                                ; =>call_with_this_guard_miss
+                            );
+                            emit_save_safepoint_roots(&mut ops, frame, site)?;
+                            emit_publish_machine_roots(&mut ops, frame, site)?;
+                            dynasm!(ops ; .arch aarch64 ; =>generic_ready);
+                        }
+                        let (generic_entry, generic_stub, generic_region) = match kind {
+                            DirectCallKind::Method => (
+                                call_method_value_entry,
+                                STUB_JIT_CALL_METHOD_VALUE,
+                                "machineGenericMethodCall",
+                            ),
+                            _ => (
+                                call_with_this_value_entry,
+                                STUB_JIT_CALL_WITH_THIS_VALUE,
+                                "machineGenericCallWithThis",
+                            ),
+                        };
                         if *argument_mode == DirectCallArgumentMode::Fixed {
                             let generic_start = ops.offset().0;
                             let packet = super::method_value_packet_frame(sequence)?;
@@ -3068,8 +3119,8 @@ pub(super) fn emit(
                                 &mut ops,
                                 &mut relocations,
                                 16,
-                                call_method_value_entry,
-                                RelocationTarget::runtime_stub(STUB_JIT_CALL_METHOD_VALUE),
+                                generic_entry,
+                                RelocationTarget::runtime_stub(generic_stub),
                             );
                             dynasm!(ops
                                 ; .arch aarch64
@@ -3103,7 +3154,7 @@ pub(super) fn emit(
                                 ; b =>direct_threw
                             );
                             structural_regions.push((
-                                "machineGenericMethodCall",
+                                generic_region,
                                 Some(*byte_pc),
                                 generic_start,
                                 ops.offset().0,
@@ -5010,6 +5061,7 @@ mod tests {
                 1,
                 1,
                 1,
+                1,
                 &mut load_ic_cells,
                 &mut store_ic_cells,
                 3,
@@ -5085,6 +5137,7 @@ mod tests {
             &DeoptRuntime::default(),
             &safepoints,
             &transitions,
+            1,
             1,
             1,
             1,

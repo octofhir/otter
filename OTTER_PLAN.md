@@ -49,17 +49,24 @@ claim.
 
 ## Live snapshot
 
-- Snapshot date: 2026-09-08.
-- Observed commit: `7de3e50f` plus the add-transition slice (clean tree at snapshot time).
+- Snapshot date: 2026-09-11.
+- Observed commit: `84839db3` (clean tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
-- Checkpoint gates passed on this commit: `otter-gc` full suite (incl. free-list units),
-  `otter-vm --lib` (936), `otter-runtime --lib` (269, incl. worker view-clone and file: URL), code-chunk eviction
-  and cross-chunk JIT integration tests, `clippy --all-targets
-  --all-features -D warnings` on `otter-gc`, `otter-resource`, `otter-vm`,
-  and `otter-runtime`, and `OTTER_GC_STRESS` 1/3/5 smoke on buffer, eval,
-  and timer churn. These are local observations, not a publishable
-  clean-tree baseline.
+- Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
+  full suite, the `otter-runtime` JIT integration suites touched by this
+  lane (property transitions, loose equality, direct-call receivers,
+  construct), `clippy --all-targets --all-features -D warnings` on
+  `otter-jit`, `otter-vm`, `otter-runtime`, and `otter-cli`, `otter-difftest`
+  23/23 with the interpreter oracle (`--interpreter`), `OTTER_GC_STRESS` 1/3/5
+  smoke on the constructor, receiver, and call repros, and focused Test262
+  (`language/expressions/equals`, `does-not-equals`, `language/statements/class`)
+  at 100%. Pre-existing failures that predate this lane and that `gate.sh`
+  never runs: `otter-runtime` `jit_artifacts`, `jit_debug_events`,
+  `jit_machine_call_chain`, `jit_machine_direct_call`, `jit_machine_elements`,
+  `jit_machine_generic_elements`, `jit_machine_generic_properties`, and
+  `jit_stack_owned_array_construct::invalid_length` (20 tests). These are local
+  observations, not a publishable clean-tree baseline.
 - `ES_CONFORMANCE.md` and `docs/site/public/conformance/data.json` are current
   as of this commit: 99.98%, 12 fails of 53575, no crashes or timeouts.
 - No performance result from this dirty snapshot is eligible for publication.
@@ -492,6 +499,28 @@ typed values, direct calls/constructs, exact leaves, GC-aware allocation,
 element/property/binding access, string constants, intrinsics, exceptions, and
 deopt reconstruction. Keep extending the final path; do not translate new IR
 back into deleted/legacy SSA or add an emitter-specific semantic path.
+
+Current state (measured 2026-09-11, Octane in fresh processes against node
+v24): Richards 20x, Splay 21x, NavierStokes 11x, Box2D 71x, DeltaBlue 92x,
+EarleyBoyer 149x, RayTrace 155x, Crypto 264x behind. Real workloads run
+almost entirely on the template tier: the Machine HIR admits 79 of 188
+opcodes and one unsupported opcode declines the whole function (object and
+array literals, closures, `throw`, `length`, `push`, iterators, `??` and
+`CallWithThis` are all outside), a plain `Op::Call` that was attempted but is
+not monomorphic declines the function while methods take a generic call, and
+recompilation never reads the recorded bail PCs, so a failed speculation is
+re-emitted until the generation is abandoned. Every producer of a
+constructor's receiver shares one preparation contract and every baked field
+transition proves its storage before writing; sloppy callees bind an object
+receiver in generated code; only a native-function cell leaves a nullish
+comparison.
+
+Next work, in order: give the template plain `Op::Call` the same in-place
+generic transition `CallWithThis` already has instead of a per-execution
+bail; admit the opcode families above into the Machine HIR with committed
+cold paths where no fast path is proven yet, measuring the decline histogram
+on Octane after each family; read `optimized_bail_pcs` during lowering so a
+recompile does not repeat the exited speculation; then the sequence below.
 
 Active sequence:
 

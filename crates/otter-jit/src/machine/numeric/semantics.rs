@@ -98,6 +98,12 @@ fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<Commit
         Op::SetPrototype => {
             CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::SetPrototype)
         }
+        Op::LooseEqual => {
+            CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::LooseEqual)
+        }
+        Op::LooseNotEqual => {
+            CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::LooseNotEqual)
+        }
         Op::ToObject => CommittedValueOperation::Scalar(ScalarValueOp::ToObject),
         Op::ToPropertyKey => CommittedValueOperation::Scalar(ScalarValueOp::ToPropertyKey),
         Op::TypeOf => CommittedValueOperation::Scalar(ScalarValueOp::TypeOf),
@@ -140,7 +146,15 @@ fn classify_instruction(
     let instruction = view.instructions.get(logical_pc)?;
     let code = view.code_block.as_ref();
     let op = instruction.op(code);
-    let committed_value = committed_value_operation(op, view.derived_constructor);
+    // Loose equality stays a guarded numeric or nullish comparison while its
+    // feedback is numeric or empty; only a site that has seen coercive
+    // operands takes the committed canonical comparison.
+    let committed_value = committed_value_operation(op, view.derived_constructor).filter(|_| {
+        !matches!(op, Op::LooseEqual | Op::LooseNotEqual) || {
+            let feedback = instruction.arith_feedback();
+            !feedback.is_numeric_only() && !feedback.is_empty()
+        }
+    });
     let effects = if committed_value.is_some() || opcode_schema(op).binding.is_some() {
         EFFECTS_COMMITTED_RUNTIME
     } else {

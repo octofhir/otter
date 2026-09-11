@@ -35,8 +35,8 @@
 //!   selected the call.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
 //!   and constructor targets remain monomorphic; an explicit-receiver call
-//!   owns at most one candidate and otherwise the generic value call. A cold
-//!   call exit owns no
+//!   and a base construct own at most one candidate and otherwise the generic
+//!   value call. A cold call exit owns no
 //!   inputs, effects, clobbers, roots, or safepoint and must carry an exact
 //!   pre-call deoptimization state.
 //! - Committed runtime calls own zero to two true tagged inputs and one GC
@@ -2351,6 +2351,8 @@ impl InstructionSequence {
                                     && count <= MAX_MACHINE_DIRECT_METHOD_TARGETS
                             } else if *kind == DirectCallKind::CallWithThis {
                                 descriptor.arguments.len() >= 2 && count <= 1
+                            } else if *kind == DirectCallKind::Construct {
+                                count <= 1
                             } else {
                                 count == 1
                             };

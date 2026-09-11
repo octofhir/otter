@@ -334,12 +334,14 @@ mod tests {
         let view = JitCompileSnapshot::without_feedback(17, 1, 2, instructions);
         let result = compile_optimized(&view, 91);
         assert!(result.is_err());
+        // The refusal names the opcode the Machine HIR has no lowering for.
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(
             result,
-            Err(super::Unsupported::OperandShape(
-                "function outside Machine HIR"
-            ))
+            Err(super::Unsupported::Constraint {
+                op: Op::Throw,
+                constraint: "opcode outside the Machine HIR",
+            })
         ));
     }
 }

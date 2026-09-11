@@ -507,6 +507,13 @@ impl Interpreter {
                 }
                 Op::New => {
                     let depth_before = stack.len();
+                    if jit_installed {
+                        self.record_call_attempt_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                        );
+                    }
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()

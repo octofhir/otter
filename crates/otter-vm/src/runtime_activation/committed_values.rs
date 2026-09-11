@@ -57,6 +57,11 @@ pub enum ObjectProtocolValueOp {
     GetPrototype,
     /// `[[SetPrototypeOf]]`.
     SetPrototype,
+    /// ECMAScript `IsLooselyEqual(x, y)`, including object-to-primitive
+    /// coercion and the HTMLDDA equivalence class.
+    LooseEqual,
+    /// The negation of [`Self::LooseEqual`].
+    LooseNotEqual,
 }
 
 impl ObjectProtocolValueOp {
@@ -66,6 +71,8 @@ impl ObjectProtocolValueOp {
             Op::HasProperty => Ok(Self::HasProperty),
             Op::GetPrototype => Ok(Self::GetPrototype),
             Op::SetPrototype => Ok(Self::SetPrototype),
+            Op::LooseEqual => Ok(Self::LooseEqual),
+            Op::LooseNotEqual => Ok(Self::LooseNotEqual),
             _ => Err(VmError::InvalidOperand),
         }
     }
@@ -134,6 +141,12 @@ impl Interpreter {
         result = match operation {
             ObjectProtocolValueOp::Instanceof => {
                 Value::boolean(self.instanceof_operator(stack, context, &value0, &value1)?)
+            }
+            ObjectProtocolValueOp::LooseEqual => {
+                Value::boolean(self.loose_equal_with_context(stack, context, &value0, &value1)?)
+            }
+            ObjectProtocolValueOp::LooseNotEqual => {
+                Value::boolean(!self.loose_equal_with_context(stack, context, &value0, &value1)?)
             }
             ObjectProtocolValueOp::HasProperty => {
                 if !value1.is_object_type() {

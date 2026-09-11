@@ -318,6 +318,39 @@ pub(super) enum NumericColdCallKind {
     Method,
 }
 
+/// Why one function stayed outside the Machine HIR.
+///
+/// The first decline observed wins: a structural rule names itself, and an
+/// instruction the lowering rejected names its opcode, logical PC, and the
+/// condition that failed, so compile diagnostics attribute every refusal to
+/// something a reader can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HirDecline {
+    Structural(&'static str),
+    Instruction {
+        op: Op,
+        logical_pc: u32,
+        constraint: &'static str,
+    },
+}
+
+fn note_decline(
+    decline: &mut Option<HirDecline>,
+    op: Op,
+    logical_pc: u32,
+    constraint: &'static str,
+) {
+    decline.get_or_insert(HirDecline::Instruction {
+        op,
+        logical_pc,
+        constraint,
+    });
+}
+
+fn note_structural(decline: &mut Option<HirDecline>, constraint: &'static str) {
+    decline.get_or_insert(HirDecline::Structural(constraint));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericDirectCallCandidate {
     pub(super) target_index: u32,
@@ -727,19 +760,28 @@ struct InstructionExceptionHandler {
 }
 
 impl NumericFunction {
-    pub(super) fn build(view: &JitCompileSnapshot) -> Option<Self> {
+    pub(super) fn build(view: &JitCompileSnapshot) -> Result<Self, HirDecline> {
         let mut phi_types = PhiTypeOverrides::new();
+        let mut decline = None;
         for _ in 0..MAX_FUNCTION_INSTRUCTIONS {
-            let (function, next_phi_types, retry) = Self::build_attempt(view, &phi_types)?;
+            let Some((function, next_phi_types, retry)) =
+                Self::build_attempt(view, &phi_types, &mut decline)
+            else {
+                return Err(decline.unwrap_or(HirDecline::Structural("Machine HIR lowering")));
+            };
             if !retry {
-                return Some(function);
+                return Ok(function);
             }
             if next_phi_types == phi_types {
-                return None;
+                return Err(HirDecline::Structural(
+                    "phi representations did not converge",
+                ));
             }
             phi_types = next_phi_types;
         }
-        None
+        Err(HirDecline::Structural(
+            "phi representation retries exhausted",
+        ))
     }
 
     /// Plan bounded raw view caches for safe packed-double loop sites.
@@ -839,18 +881,21 @@ impl NumericFunction {
     fn build_attempt(
         view: &JitCompileSnapshot,
         phi_types: &PhiTypeOverrides,
+        decline: &mut Option<HirDecline>,
     ) -> Option<(Self, PhiTypeOverrides, bool)> {
         let code = view.code_block.as_ref();
         let parameter_count = code.param_count;
         let register_count = code.register_count;
-        if code.is_async
-            || code.is_generator
-            || code.is_async_generator
-            || parameter_count > register_count
+        if code.is_async || code.is_generator || code.is_async_generator {
+            note_structural(decline, "suspendable function");
+            return None;
+        }
+        if parameter_count > register_count
             || parameter_count > MAX_FUNCTION_PARAMETERS
             || view.instructions.is_empty()
             || view.instructions.len() > MAX_FUNCTION_INSTRUCTIONS
         {
+            note_structural(decline, "function size outside the Machine bounds");
             return None;
         }
         if code
@@ -859,15 +904,30 @@ impl NumericFunction {
             .iter()
             .any(|region| region.catch_pc.is_none() || region.finally_pc.is_some())
         {
+            note_structural(decline, "finally or catch-less exception region");
             return None;
         }
 
-        let instruction_semantics = classify_snapshot(view)?;
-        let raw_blocks = build_raw_blocks(view, &instruction_semantics)?;
-        let parameter_types =
-            infer_parameter_types(view, &raw_blocks, parameter_count, register_count)?;
-        let exception_handlers =
-            build_instruction_exception_handlers(view, &raw_blocks, &instruction_semantics)?;
+        let Some(instruction_semantics) = classify_snapshot(view) else {
+            note_structural(decline, "instruction semantics");
+            return None;
+        };
+        let Some(raw_blocks) = build_raw_blocks(view, &instruction_semantics) else {
+            note_structural(decline, "reducible control flow");
+            return None;
+        };
+        let Some(parameter_types) =
+            infer_parameter_types(view, &raw_blocks, parameter_count, register_count)
+        else {
+            note_structural(decline, "parameter representations");
+            return None;
+        };
+        let Some(exception_handlers) =
+            build_instruction_exception_handlers(view, &raw_blocks, &instruction_semantics)
+        else {
+            note_structural(decline, "exception handler layout");
+            return None;
+        };
         let live_in = build_liveness(
             view,
             &raw_blocks,
@@ -1006,7 +1066,8 @@ impl NumericFunction {
                 if pc == terminal_pc && raw.exceptional_edge.is_some() {
                     exceptional_pre_state = Some(registers.clone());
                 }
-                lower_instruction(
+                let lowered = lower_instruction(
+                    decline,
                     instruction,
                     code,
                     view.derived_constructor,
@@ -1033,7 +1094,16 @@ impl NumericFunction {
                         .then_some(raw.exceptional_edge)
                         .flatten(),
                     &mut exceptional_value,
-                )?;
+                );
+                if lowered.is_none() {
+                    note_decline(
+                        decline,
+                        instruction.op(code),
+                        u32::try_from(pc).ok()?,
+                        "lowering rejected the site",
+                    );
+                    return None;
+                }
             }
 
             let terminal = &view.instructions[terminal_pc];
@@ -1153,6 +1223,10 @@ impl NumericFunction {
         }
 
         if requires_mixed_join && !view.constructor_field_transitions.is_empty() {
+            note_structural(
+                decline,
+                "mixed representation join inside a constructor transition program",
+            );
             return None;
         }
 
@@ -2296,6 +2370,7 @@ fn lower_binding(
 }
 
 fn lower_instruction(
+    decline: &mut Option<HirDecline>,
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
     derived_constructor: bool,
@@ -2328,6 +2403,12 @@ fn lower_instruction(
     let local_handler = has_local_exception_handler(code, logical_pc);
     let expects_exceptional_edge = local_handler && semantics.has_implicit_exception_side_exit(op);
     if exceptional_edge.is_some() != expects_exceptional_edge {
+        note_decline(
+            decline,
+            op,
+            logical_pc,
+            "exceptional edge disagrees with the local handler",
+        );
         return None;
     }
     let binding = opcode_schema(op).binding;
@@ -2345,6 +2426,12 @@ fn lower_instruction(
                 | Op::SuperConstructSpread
         );
     if exceptional_edge.is_some() && !pure_exception_value {
+        note_decline(
+            decline,
+            op,
+            logical_pc,
+            "effectful operation inside a local catch",
+        );
         return None;
     }
     if let Some(binding) = binding {
@@ -2365,7 +2452,17 @@ fn lower_instruction(
             exceptional_value,
         );
     }
-    if let Some(operation) = semantics.committed_value {
+    // A loose comparison with a static nullish operand keeps its direct
+    // lowering even when its feedback made the site committed; every other
+    // committed site completes through the canonical operation here.
+    let nullish_compare = matches!(op, Op::LooseEqual | Op::LooseNotEqual)
+        && semantics.committed_value.is_some()
+        && {
+            let left = read_value(registers, register(instruction, code, 1)?)?;
+            let right = read_value(registers, register(instruction, code, 2)?)?;
+            value_is_static_nullish(nodes, left) || value_is_static_nullish(nodes, right)
+        };
+    if let Some(operation) = semantics.committed_value.filter(|_| !nullish_compare) {
         return lower_committed_value(
             instruction,
             code,
@@ -2468,6 +2565,7 @@ fn lower_instruction(
             // handlers on the Template baseline instead of replaying the
             // original operation after an observable effect.
             if exceptional_edge.is_some() {
+                note_decline(decline, op, logical_pc, "inside a local catch");
                 return None;
             }
             let value = push(
@@ -2497,6 +2595,7 @@ fn lower_instruction(
         Op::StoreProperty => {
             let _ = instruction.const_index(code, 1)?;
             if exceptional_edge.is_some() {
+                note_decline(decline, op, logical_pc, "inside a local catch");
                 return None;
             }
             let value = push(
@@ -2570,6 +2669,12 @@ fn lower_instruction(
                 return Some(());
             };
             if access == NumericElementAccess::Tagged && exceptional_edge.is_some() {
+                note_decline(
+                    decline,
+                    op,
+                    logical_pc,
+                    "tagged element access inside a local catch",
+                );
                 return None;
             }
             if access == NumericElementAccess::PackedDouble
@@ -2674,6 +2779,12 @@ fn lower_instruction(
                 return Some(());
             };
             if access == NumericElementAccess::Tagged && exceptional_edge.is_some() {
+                note_decline(
+                    decline,
+                    op,
+                    logical_pc,
+                    "tagged element access inside a local catch",
+                );
                 return None;
             }
             if access == NumericElementAccess::PackedDouble
@@ -2882,25 +2993,55 @@ fn lower_instruction(
             return Some(());
         }
         Op::New | Op::SuperConstruct => {
-            let callee = *direct_constructs.get(&instruction.byte_pc)?;
-            let kind = match (op, callee.plan.is_derived_constructor) {
-                (Op::New, false) => NumericDirectCallKind::Construct,
-                (Op::New, true) => NumericDirectCallKind::DerivedConstruct,
-                (Op::SuperConstruct, false) => NumericDirectCallKind::SuperConstruct,
-                (Op::SuperConstruct, true) => NumericDirectCallKind::DerivedSuperConstruct,
-                _ => return None,
-            };
+            let direct = direct_constructs.get(&instruction.byte_pc).copied();
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let argument_count = usize::try_from(instruction.const_index(code, 2)?).ok()?;
             let arguments = (0..argument_count)
                 .map(|index| read_value(registers, register(instruction, code, 3 + index)?))
                 .collect::<Option<Vec<_>>>()?;
+            // A base `new` without a generated construct edge — a site the
+            // profile could not settle, or whose constructor has no entry
+            // generation — completes through the generic construct call once
+            // it has been attempted; before that it is an exact cold exit.
+            let target = match (direct, op) {
+                (Some(callee), _) => {
+                    let kind = match (op, callee.plan.is_derived_constructor) {
+                        (Op::New, false) => NumericDirectCallKind::Construct,
+                        (Op::New, true) => NumericDirectCallKind::DerivedConstruct,
+                        (Op::SuperConstruct, false) => NumericDirectCallKind::SuperConstruct,
+                        (Op::SuperConstruct, true) => NumericDirectCallKind::DerivedSuperConstruct,
+                        _ => return None,
+                    };
+                    monomorphic_direct_call_target(kind, callee)
+                }
+                (None, Op::New) if instruction.call_attempted => NumericDirectCallTarget {
+                    kind: NumericDirectCallKind::Construct,
+                    candidates: Vec::new(),
+                },
+                (None, Op::New) => {
+                    return lower_cold_call_exit(
+                        NumericColdCallKind::Plain,
+                        register(instruction, code, 0)?,
+                        logical_pc,
+                        instruction.byte_pc,
+                        exceptional_edge,
+                        registers,
+                        nodes,
+                        block_nodes,
+                        frame_states,
+                        function_id,
+                        live_in,
+                        exceptional_value,
+                    );
+                }
+                (None, _) => {
+                    note_decline(decline, op, logical_pc, "super construct without a plan");
+                    return None;
+                }
+            };
             let (argument_start, argument_count) =
                 append_direct_call_arguments(direct_call_arguments, arguments)?;
-            let target = intern_direct_call_target(
-                direct_call_targets,
-                monomorphic_direct_call_target(kind, callee),
-            )?;
+            let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
                 NumericNode::DirectCall {
@@ -3134,6 +3275,7 @@ fn lower_instruction(
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => {
             let feedback = instruction.arith_feedback();
             if !feedback.is_numeric_only() && !feedback.is_empty() {
+                note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
             let tagged_decode =
@@ -3187,6 +3329,7 @@ fn lower_instruction(
         Op::Increment | Op::AddImm | Op::SubImm => {
             let feedback = instruction.arith_feedback();
             if !feedback.is_numeric_only() && !feedback.is_empty() {
+                note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
             let immediate = instruction.imm32(code, 2)?;
@@ -3238,6 +3381,7 @@ fn lower_instruction(
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
             let feedback = instruction.arith_feedback();
             if !feedback.is_numeric_only() && !feedback.is_empty() {
+                note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
             let immediate = instruction.imm32(code, 2)?;
@@ -3313,6 +3457,7 @@ fn lower_instruction(
         Op::Neg => {
             let feedback = instruction.arith_feedback();
             if !feedback.is_numeric_only() && !feedback.is_empty() {
+                note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
             let tagged_decode = if feedback.is_int32_only() {
@@ -3381,9 +3526,18 @@ fn lower_instruction(
                         }
                         (true, false) => right,
                         (false, true) => left,
-                        (false, false) => return None,
+                        (false, false) => {
+                            note_decline(
+                                decline,
+                                op,
+                                logical_pc,
+                                "coercive loose equality without committed feedback",
+                            );
+                            return None;
+                        }
                     };
                     if value_type(nodes, source)? != NumericType::Tagged {
+                        note_decline(decline, op, logical_pc, "nullish operand is not tagged");
                         return None;
                     }
                     let value = push(
@@ -3455,6 +3609,7 @@ fn lower_instruction(
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             let feedback = instruction.arith_feedback();
             if !feedback.is_numeric_only() && !feedback.is_empty() {
+                note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
             let tagged_decode = if feedback.is_int32_only() {
@@ -3501,7 +3656,10 @@ fn lower_instruction(
                 }
             }
         }
-        _ => return None,
+        _ => {
+            note_decline(decline, op, logical_pc, "opcode outside the Machine HIR");
+            return None;
+        }
     };
     let destination = register(instruction, code, 0)?;
     let value = push(nodes, node);
@@ -4768,7 +4926,7 @@ mod tests {
         for methods in invalid {
             let mut view = call_view(true);
             view.direct_methods.insert(0, methods);
-            assert!(NumericFunction::build(&view).is_none());
+            assert!(NumericFunction::build(&view).is_err());
         }
     }
 
@@ -4820,7 +4978,7 @@ mod tests {
         assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
 
         assert!(
-            NumericFunction::build(&array_construct_view(2)).is_none(),
+            NumericFunction::build(&array_construct_view(2)).is_err(),
             "wider Array construction must retain the Template baseline"
         );
     }
@@ -4946,7 +5104,7 @@ mod tests {
             ],
         );
         assert!(
-            NumericFunction::build(&view).is_none(),
+            NumericFunction::build(&view).is_err(),
             "an unprepared literal must keep the function on Template"
         );
 
@@ -5249,7 +5407,7 @@ mod tests {
                 vec![JitTestInstruction::new(op, 0, 0, operands), tail],
             );
             let hir = NumericFunction::build(&view)
-                .unwrap_or_else(|| panic!("{op:?} must enter generic committed HIR"));
+                .unwrap_or_else(|_| panic!("{op:?} must enter generic committed HIR"));
             let committed = hir
                 .nodes
                 .iter()
@@ -5456,7 +5614,7 @@ mod tests {
                     JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
                 ],
             );
-            assert!(NumericFunction::build(&malformed).is_none());
+            assert!(NumericFunction::build(&malformed).is_err());
         }
     }
 
@@ -5804,14 +5962,14 @@ mod tests {
         let mut caught = catch_liveness_view();
         caught.element_accesses.clear();
         assert!(
-            NumericFunction::build(&caught).is_none(),
+            NumericFunction::build(&caught).is_err(),
             "a generic value call inside a local catch stays on the Template baseline"
         );
 
         for store in [false, true] {
             let mut caught = catch_liveness_view_with_element_store(store);
             assert!(
-                NumericFunction::build(&caught).is_none(),
+                NumericFunction::build(&caught).is_err(),
                 "a prepared tagged element committed miss inside a local catch stays on the Template baseline"
             );
 
@@ -5820,7 +5978,7 @@ mod tests {
                 .element_accesses
                 .insert(byte_pc, JitElementAccess::packed_double_array());
             assert!(
-                NumericFunction::build(&caught).is_none(),
+                NumericFunction::build(&caught).is_err(),
                 "a may-throw element needs an explicit committed exception value before entering a local catch"
             );
         }
@@ -5834,7 +5992,7 @@ mod tests {
             .element_accesses
             .insert(byte_pc, JitElementAccess::packed_double_array());
         assert!(
-            NumericFunction::build(&caught).is_none(),
+            NumericFunction::build(&caught).is_err(),
             "StoreElement operand zero is its receiver, not a NativeResultPair exception result"
         );
     }
@@ -6402,7 +6560,7 @@ mod tests {
             },
         );
         assert!(
-            NumericFunction::build(&constructor).is_none(),
+            NumericFunction::build(&constructor).is_err(),
             "mixed representations must keep constructor transitions on the Template baseline"
         );
     }
@@ -6642,7 +6800,7 @@ mod tests {
             ],
         );
         assert!(
-            NumericFunction::build(&view).is_none(),
+            NumericFunction::build(&view).is_err(),
             "the opaque setter scratch must not become a reusable HIR value"
         );
     }
@@ -6677,7 +6835,7 @@ mod tests {
         );
 
         assert!(
-            NumericFunction::build(&view).is_none(),
+            NumericFunction::build(&view).is_err(),
             "a runtime-backed property operation inside a local catch stays on the Template baseline"
         );
     }
@@ -6709,7 +6867,7 @@ mod tests {
         );
 
         assert!(
-            NumericFunction::build(&view).is_none(),
+            NumericFunction::build(&view).is_err(),
             "a prepared tagged element miss cannot enter a local catch before committed-throw landing exists"
         );
     }

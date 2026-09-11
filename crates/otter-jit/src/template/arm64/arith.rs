@@ -25,12 +25,13 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::Op;
+use otter_vm::JitCompileSnapshot;
 
 use super::transitions::{TransitionTable, emit_add_delegate, emit_string_concat_alloc_call};
 use super::values::{
     emit_box_bool, emit_box_double, emit_box_int32, emit_box_number, emit_guard_int32,
-    emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_num_to_double, emit_store_reg,
-    emit_to_int32_fast, emit_to_uint32_fast,
+    emit_html_dda_candidate_exit, emit_load_reg, emit_load_runtime_stub, emit_load_u64,
+    emit_num_to_double, emit_store_reg, emit_to_int32_fast, emit_to_uint32_fast,
 };
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
@@ -521,12 +522,15 @@ fn emit_cset<C: ConditionSet>(ops: &mut Assembler, kind: CompareKind, _condition
 }
 
 /// Emit abstract (in)equality for numbers and the null/undefined equivalence
-/// class. String/object/coercive cases side-exit before observable work.
+/// class. String/object/coercive cases side-exit before observable work; a
+/// nullish operand against a native-function cell, the sole HTMLDDA carrier,
+/// completes through the same transition.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_loose_compare(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -580,6 +584,7 @@ pub(super) fn emit_loose_compare(
     dynasm!(ops ; .arch aarch64 ; fcmp d0, d1 ; cset w13, eq ; b =>have_bool);
 
     dynasm!(ops ; .arch aarch64 ; =>lhs_nullish);
+    emit_html_dda_candidate_exit(ops, relocations, view, 10, 11, 12, slow);
     emit_load_u64(ops, 11, VALUE_NULL);
     dynasm!(ops ; .arch aarch64 ; cmp x10, x11 ; b.eq >both_nullish);
     emit_load_u64(ops, 11, VALUE_UNDEFINED);
@@ -592,6 +597,10 @@ pub(super) fn emit_loose_compare(
         ; movz w13, #1
         ; b =>have_bool
         ; =>rhs_nullish
+    );
+    emit_html_dda_candidate_exit(ops, relocations, view, 9, 11, 12, slow);
+    dynasm!(ops
+        ; .arch aarch64
         ; movz w13, #0
         ; =>have_bool
     );

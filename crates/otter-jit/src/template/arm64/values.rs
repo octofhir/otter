@@ -376,6 +376,56 @@ pub(crate) fn emit_initialize_inline_values_ptr(
     );
 }
 
+/// Branch to `exit` when `X(value)` is the one cell kind whose loose equality
+/// with `null`/`undefined` its tag does not decide.
+///
+/// Only a native-function body can carry Annex B `[[IsHTMLDDA]]`, so a nullish
+/// comparison against every other cell is definitively false and needs no
+/// runtime decision; a native-function cell leaves that decision to the
+/// canonical comparison behind `exit`. Non-cells fall through untouched.
+/// Without a cage base no cell can be inspected, so every cell exits. Clobbers
+/// `X(scratch_a)` and `X(scratch_b)`.
+pub(crate) fn emit_html_dda_candidate_exit(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    value: u8,
+    scratch_a: u8,
+    scratch_b: u8,
+    exit: DynamicLabel,
+) {
+    if view.cage_base == 0 {
+        emit_cell_test(ops, value, scratch_a, CellTest::IsCell, exit);
+        return;
+    }
+    let fall_through = ops.new_dynamic_label();
+    emit_cell_test(ops, value, scratch_a, CellTest::IsNotCell, fall_through);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        scratch_a,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov W(scratch_b), W(value)
+        ; add X(scratch_a), X(scratch_a), X(scratch_b)
+        ; ldrb W(scratch_b), [X(scratch_a)]
+    );
+    emit_load_u64(
+        ops,
+        scratch_a,
+        u64::from(view.collection_layout.native_function_type_tag),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp W(scratch_b), W(scratch_a)
+        ; b.eq =>exit
+        ; =>fall_through
+    );
+}
+
 /// Run the write barrier a pointer store owes.
 ///
 /// `parent` holds the guarded receiver's `GcHeader` address and `child` the

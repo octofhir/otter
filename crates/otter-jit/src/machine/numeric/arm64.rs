@@ -22,9 +22,9 @@
 //!   numeric guards use allocator-driven exact deopt state at their owning
 //!   bytecode operation, always before externally visible effects.
 //! - Tagged loose comparisons against a static nullish operand return directly
-//!   for null, undefined, and non-cell primitives. Every cell exits at the
-//!   original comparison before the Boolean result is defined, preserving the
-//!   canonical HTMLDDA decision.
+//!   for null, undefined, non-cell primitives, and every cell that cannot carry
+//!   HTMLDDA. Only a native-function cell exits at the original comparison
+//!   before the Boolean result is defined, preserving the canonical decision.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
 //!   the emitter owns no parallel reconstruction recipe.
 //! - Settled tagged dense and typed element accesses keep receiver, fast index,
@@ -137,8 +137,8 @@ use crate::{
         emit_settled_property_store_guard,
     },
     template::arm64::values::{
-        CellTest, emit_cell_test, emit_initialize_inline_values_ptr, emit_slab_base,
-        emit_write_barrier_with_context,
+        CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_initialize_inline_values_ptr,
+        emit_slab_base, emit_write_barrier_with_context,
     },
 };
 use std::collections::BTreeMap;
@@ -1847,14 +1847,24 @@ pub(super) fn emit(
                 let start = ops.offset().0;
 
                 // The two immediate members of the nullish equivalence class
-                // complete without reentry. Any cell must use the canonical
-                // comparison because HTMLDDA is observable there. Keep that
-                // guard before either possible write to the allocated result.
+                // and every other non-cell complete without reentry. Among
+                // cells only a native-function body can carry HTMLDDA, so
+                // that one kind exits to the canonical comparison before the
+                // allocated result is written; every other cell is
+                // definitively not nullish.
                 emit_load_u64(&mut ops, 16, VALUE_NULL);
                 dynasm!(ops ; .arch aarch64 ; cmp X(source), x16 ; b.eq =>nullish);
                 emit_load_u64(&mut ops, 16, VALUE_UNDEFINED);
                 dynasm!(ops ; .arch aarch64 ; cmp X(source), x16 ; b.eq =>nullish);
-                emit_cell_test(&mut ops, source, 16, CellTest::IsCell, deopt);
+                emit_html_dda_candidate_exit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    source,
+                    16,
+                    15,
+                    deopt,
+                );
                 if equal {
                     dynasm!(ops ; .arch aarch64 ; mov W(destination), wzr);
                 } else {

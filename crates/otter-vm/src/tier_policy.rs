@@ -11,9 +11,11 @@
 //! # Invariants
 //! - The policy is deterministic and isolate-local; it reads no environment or
 //!   process-global state.
-//! - Function entry advances the shared tiering call counter. Entry selection
-//!   samples feedback stability only while a hot function has no installed
-//!   optimizing body; back-edge OSR policy remains independent.
+//! - Function entry advances the shared tiering call counter, and generated
+//!   call linkage counts entries into the current published generation; both
+//!   feed hotness. Entry selection samples feedback stability only while a
+//!   hot function has no installed optimizing body; back-edge OSR policy
+//!   remains independent.
 //! - Promotion requires both sustained hotness and an unchanged feedback epoch
 //!   across [`STABLE_SAMPLES`] consecutive checks.
 //! - A decision itself never compiles or installs code. The function-entry path
@@ -130,9 +132,17 @@ impl Interpreter {
     /// installs, or executes JIT code.
     #[must_use]
     pub fn optimizing_tier_decision(&mut self, function_id: u32) -> OptimizingDecision {
-        // Hotness is read lazily from the shared entry counter, so cold calls do
-        // not touch policy-local stability state.
-        let hotness = self.jit_call_counts.get(&function_id).copied().unwrap_or(0);
+        // Hotness is read lazily from the shared entry counter plus the
+        // generated entries into the current published generation, so cold
+        // calls do not touch policy-local stability state and a callee reached
+        // only through generated linkage still counts.
+        let hotness = u32::try_from(
+            u64::from(self.jit_call_counts.get(&function_id).copied().unwrap_or(0)).saturating_add(
+                self.jit_code_registry
+                    .generated_entries_for_function(function_id),
+            ),
+        )
+        .unwrap_or(u32::MAX);
         let feedback_epoch = self.code_space.feedback_epoch(function_id);
         self.optimizing_tier_policy
             .sample_and_decide(function_id, hotness, feedback_epoch)

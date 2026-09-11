@@ -790,6 +790,26 @@ impl Interpreter {
         Some(outcome)
     }
 
+    /// Run the promotion policy for the callee generated linkage most recently
+    /// reported hot.
+    ///
+    /// Generated direct calls never enter through the interpreter, so their
+    /// callee's entry counter would stay cold forever; the linkage instead
+    /// counts entries into the callee's generation and, once that count
+    /// reaches the optimizing threshold, records the function in the code
+    /// registry's mailbox. This drain runs the ordinary decision for it: a
+    /// promoted body publishes through the function's permanent entry cell,
+    /// so every generated caller switches without recompiling.
+    pub(crate) fn promote_hot_generated_callee(&mut self, context: &ExecutionContext) {
+        let Some(fid) = self.jit_code_registry.take_hot_function() else {
+            return;
+        };
+        let Ok(owner) = context.for_function(fid) else {
+            return;
+        };
+        let _ = self.resolve_optimized_code_for_fid(&owner, fid);
+    }
+
     /// Resolve the current optimizing body, replacing the baseline generation
     /// exactly once after the deterministic promotion policy reaches
     /// `Promote`.
@@ -842,6 +862,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        self.promote_hot_generated_callee(context);
         let count = self.note_jit_function_entry(fid);
         self.maybe_refresh_successful_baseline(context, fid);
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array

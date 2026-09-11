@@ -125,6 +125,7 @@ impl JitCodeRegistry {
             view: CodeRegistryView {
                 context: 0,
                 resolve_safepoint: resolve_jit_registry_safepoint as *const () as u64,
+                hot_function: 0,
             },
             account: otter_resource::ResourceAccount::default(),
             codes: rustc_hash::FxHashMap::default(),
@@ -310,6 +311,30 @@ impl JitCodeRegistry {
                     cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0
                 })
         })
+    }
+
+    /// Take the function identity generated linkage reported as hot, if any.
+    pub(crate) fn take_hot_function(&mut self) -> Option<u32> {
+        let raw = std::mem::take(&mut self.view.hot_function);
+        raw.checked_sub(1).and_then(|id| u32::try_from(id).ok())
+    }
+
+    /// Generated native entries into `function_id`'s current published
+    /// generation, or zero without one. Generated linkage counts these without
+    /// a runtime call, so tier policy folds them into the function's hotness.
+    #[must_use]
+    pub(crate) fn generated_entries_for_function(&self, function_id: u32) -> u64 {
+        let Some(function_entry) = self.function_entry_cells.get(&function_id) else {
+            return 0;
+        };
+        let generation_addr = function_entry.current_generation();
+        if generation_addr == 0 {
+            return 0;
+        }
+        self.entry_cells
+            .values()
+            .find(|cell| std::ptr::from_ref(cell.as_ref()) as u64 == generation_addr)
+            .map_or(0, |cell| cell.generated_entries.get())
     }
 
     /// Resolve one stable function entry into the complete tier-neutral

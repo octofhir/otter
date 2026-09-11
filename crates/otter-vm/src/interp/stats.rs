@@ -144,8 +144,15 @@ impl Interpreter {
     /// it charges one reduction per backedge and then reuses the same budget
     /// checkpoint. This keeps timeout/budget semantics independent of whether a
     /// hot loop has OSR'd into native code.
-    pub fn jit_backedge_poll(&mut self) -> Result<(), VmError> {
+    pub fn jit_backedge_poll(
+        &mut self,
+        context: &crate::execution_context::ExecutionContext,
+    ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(native_abi::STUB_JIT_BACKEDGE_POLL.class);
+        // A compiled loop is the one place a long-running program may spend
+        // all its time without an interpreter entry; promote the callee its
+        // generated calls reported hot here.
+        self.promote_hot_generated_callee(context);
         // The interrupt flag is polled inline at every back-edge, so reaching
         // this re-entry with the flag set means a cancellation is pending.
         if self.interrupt.is_set() {

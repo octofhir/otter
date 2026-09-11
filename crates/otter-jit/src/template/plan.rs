@@ -1091,15 +1091,6 @@ impl TemplatePlan {
                 Op::CallWithThis => {
                     let operands = lowered.call_with_this_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > PACKED_REGISTER_LANES {
-                        osr_only = true;
-                        instructions.push(TemplateInstr {
-                            pc,
-                            byte_pc: lowered.byte_pc,
-                            op: TemplateOp::UnsupportedBail,
-                        });
-                        continue;
-                    }
                     TemplateOp::CallWithThis {
                         dst: operands.dst,
                         callee: operands.callee,

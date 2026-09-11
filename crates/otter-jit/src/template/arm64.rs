@@ -786,11 +786,9 @@ pub(super) fn compile(
                         committed_throw,
                         fatal,
                     )?;
-                } else {
-                    let mut lanes = 0u64;
-                    for (index, register) in argument_registers.iter().enumerate() {
-                        lanes |= u64::from(*register) << (index * 16);
-                    }
+                } else if let Some((lanes_low, lanes_high)) =
+                    calls::pack_generic_call_lanes(&argument_registers)
+                {
                     spread_call::emit_spread_call_op(
                         &mut ops,
                         &mut relocations,
@@ -803,8 +801,8 @@ pub(super) fn compile(
                             | (u64::from(callee) << 16)
                             | (u64::from(this_value) << 32)
                             | (u64::from(argc) << 48),
-                        lanes,
-                        0,
+                        lanes_low,
+                        lanes_high,
                         instr.pc,
                         byte_pc,
                         bail,
@@ -812,6 +810,8 @@ pub(super) fn compile(
                         committed_throw,
                         fatal,
                     )?;
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; b =>bail);
                 }
             }
             TemplateOp::Construct {

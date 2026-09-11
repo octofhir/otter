@@ -50,22 +50,25 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-11.
-- Observed commit: `84839db3` (clean tree at snapshot time).
+- Observed commit: the generated-callee promotion commit (clean tree at
+  snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
   full suite, the `otter-runtime` JIT integration suites touched by this
-  lane (property transitions, loose equality, direct-call receivers,
+  lane (explicit-receiver calls, generated-callee promotion, generic call
+  transition, property transitions, loose equality, direct-call receivers,
   construct), `clippy --all-targets --all-features -D warnings` on
   `otter-jit`, `otter-vm`, `otter-runtime`, and `otter-cli`, `otter-difftest`
   23/23 with the interpreter oracle (`--interpreter`), `OTTER_GC_STRESS` 1/3/5
   smoke on the constructor, receiver, and call repros, and focused Test262
   (`language/expressions/equals`, `does-not-equals`, `language/statements/class`)
   at 100%. Pre-existing failures that predate this lane and that `gate.sh`
-  never runs: `otter-runtime` `jit_artifacts`, `jit_debug_events`,
-  `jit_machine_call_chain`, `jit_machine_direct_call`, `jit_machine_elements`,
-  `jit_machine_generic_elements`, `jit_machine_generic_properties`, and
-  `jit_stack_owned_array_construct::invalid_length` (20 tests). These are local
+  never runs: `otter-runtime` `jit_artifacts`, `jit_debug_events` (3),
+  `jit_machine_call_chain` (3), `jit_machine_direct_call` (3),
+  `jit_machine_elements`, `jit_machine_generic_elements`,
+  `jit_machine_generic_properties`, and
+  `jit_stack_owned_array_construct::invalid_length`. These are local
   observations, not a publishable clean-tree baseline.
 - `ES_CONFORMANCE.md` and `docs/site/public/conformance/data.json` are current
   as of this commit: 99.98%, 12 fails of 53575, no crashes or timeouts.
@@ -501,25 +504,27 @@ deopt reconstruction. Keep extending the final path; do not translate new IR
 back into deleted/legacy SSA or add an emitter-specific semantic path.
 
 Current state (measured 2026-09-11, Octane in fresh processes against node
-v24): Richards 20x, Splay 21x, NavierStokes 11x, Box2D 71x, DeltaBlue 92x,
-EarleyBoyer 149x, RayTrace 155x, Crypto 264x behind. Real workloads run
-almost entirely on the template tier: the Machine HIR admits 79 of 188
-opcodes and one unsupported opcode declines the whole function (object and
-array literals, closures, `throw`, `length`, `push`, iterators, `??` and
-`CallWithThis` are all outside), a plain `Op::Call` that was attempted but is
-not monomorphic declines the function while methods take a generic call, and
-recompilation never reads the recorded bail PCs, so a failed speculation is
-re-emitted until the generation is abandoned. Every producer of a
-constructor's receiver shares one preparation contract and every baked field
-transition proves its storage before writing; sloppy callees bind an object
-receiver in generated code; only a native-function cell leaves a nullish
-comparison.
+v24): NavierStokes 2x, Richards 20x, Splay 21x, Box2D 65x, DeltaBlue 88x,
+EarleyBoyer 149x, RayTrace 156x, Crypto 255x behind. Explicit-receiver calls
+and attempted polymorphic plain calls now lower to one explicit-receiver
+direct call (generic completion through a callee-carrying value entry), the
+template's unplanned plain calls complete in place, callees entered only
+through generated linkage promote through the registry's hot-function word,
+every producer of a constructor's receiver shares one preparation contract
+and every baked field transition proves its storage, sloppy callees bind an
+object receiver in generated code, and only a native-function cell leaves a
+nullish comparison. The Machine HIR still admits 80 of 188 opcodes and one
+unsupported opcode declines the whole function; over the hot Octane
+functions it refused, the remaining blockers are `Throw`/`NewError`,
+`MakeClosure`/`StoreUpvalue`, `CollectArguments`, object and array
+literals, and catch regions around named-property misses. Recompilation
+never reads the recorded bail PCs, so a failed speculation is re-emitted
+until the generation is abandoned.
 
-Next work, in order: give the template plain `Op::Call` the same in-place
-generic transition `CallWithThis` already has instead of a per-execution
-bail; admit the opcode families above into the Machine HIR with committed
-cold paths where no fast path is proven yet, measuring the decline histogram
-on Octane after each family; read `optimized_bail_pcs` during lowering so a
+Next work, in order: admit `Throw`/`NewError`, closures with captured
+cells, and object/array literals into the Machine HIR with committed cold
+paths where no fast path is proven yet, measuring the decline histogram on
+Octane after each family; read `optimized_bail_pcs` during lowering so a
 recompile does not repeat the exited speculation; then the sequence below.
 
 Active sequence:

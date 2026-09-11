@@ -78,7 +78,7 @@ use crate::{
         RECEIVER_ALLOC_PAGE_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
         RECEIVER_ALLOC_TRACKED_BYTES_OFFSET, RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
         RECEIVER_ALLOC_TYPE_COUNT_OFFSET, RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
-        RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+        RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
         VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
     },
@@ -462,40 +462,45 @@ fn emit_fatal_pair(ops: &mut Assembler) {
 
 /// Branch on the exact ECMAScript Object-vs-primitive split for one tagged
 /// value. Function-id immediates and every non-primitive GC body are Objects;
-/// strings, symbols, and bigints are the only primitive cell families.
+/// strings, symbols, and bigints are the only primitive cell families. The
+/// three scratch registers are clobbered; `value` is preserved.
 fn emit_object_type_branch(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     value: u8,
+    scratch: [u8; 3],
     object: DynamicLabel,
     primitive: DynamicLabel,
 ) {
+    let [a, b, c] = scratch;
     let non_cell = ops.new_dynamic_label();
-    emit_cell_test(ops, value, 9, CellTest::IsNotCell, non_cell);
-    dynasm!(ops ; .arch aarch64 ; mov w10, W(value));
+    emit_cell_test(ops, value, a, CellTest::IsNotCell, non_cell);
+    dynasm!(ops ; .arch aarch64 ; mov W(b), W(value));
     crate::template::arm64::values::emit_load_symbol_u64(
         ops,
         relocations,
-        11,
+        c,
         view.cage_base as u64,
         RelocationTarget::GcCageBase,
     );
     dynasm!(ops
         ; .arch aarch64
-        ; add x10, x11, x10
-        ; ldrb w10, [x10]
+        ; add X(b), X(c), X(b)
+        ; ldrb W(b), [X(b)]
     );
     for tag in view.primitive_cell_type_tags {
-        dynasm!(ops ; .arch aarch64 ; cmp w10, tag as u32 ; b.eq =>primitive);
+        emit_load_u64(ops, c, u64::from(tag));
+        dynasm!(ops ; .arch aarch64 ; cmp W(b), W(c) ; b.eq =>primitive);
     }
-    dynasm!(ops ; .arch aarch64 ; b =>object ; =>non_cell ; lsr x10, X(value), #48);
-    dynasm!(ops ; .arch aarch64 ; cbnz x10, =>primitive);
-    emit_load_u64(ops, 10, value_tag::FUNCTION_ID_TAG);
+    dynasm!(ops ; .arch aarch64 ; b =>object ; =>non_cell ; lsr X(b), X(value), #48);
+    dynasm!(ops ; .arch aarch64 ; cbnz X(b), =>primitive);
+    emit_load_u64(ops, b, value_tag::FUNCTION_ID_TAG);
+    emit_load_u64(ops, c, 0xffff);
     dynasm!(ops
         ; .arch aarch64
-        ; and w11, W(value), #0xffff
-        ; cmp w11, w10
+        ; and W(c), W(value), W(c)
+        ; cmp W(c), W(b)
         ; b.eq =>object
         ; b =>primitive
     );
@@ -987,34 +992,47 @@ where
                     emit_load_u64(ops, 12, VALUE_UNDEFINED);
                 }
             } else {
-                // Plain `Op::Call` supplies `undefined`, which sloppy call
-                // binding normalizes to the active realm's global object. An
-                // explicitly bound closure may require primitive `ToObject`;
-                // keep that uncommon case on the exact pre-effect side exit.
+                // An explicitly bound closure may require primitive
+                // `ToObject`; keep that uncommon case on the exact pre-effect
+                // side exit. Both callable forms then share one sloppy
+                // receiver binding below.
                 emit_load_u64(ops, 14, u64::from(view.closure_call_layout.bound_this_flag));
+                let sloppy_this = ops.new_dynamic_label();
                 dynasm!(ops
                     ; .arch aarch64
                     ; tst w13, w14
                     ; b.ne =>caller_bail
-                );
-                if let Some(receiver) = explicit_receiver {
-                    load(ops, receiver, 12, 0)?;
-                    emit_load_u64(ops, 14, VALUE_UNDEFINED);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; cmp x12, x14
-                        ; b.ne =>caller_bail
-                    );
-                }
-                emit_load_sloppy_global_this(ops, relocations, view, context_register);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; b =>callable_ready
+                    ; b =>sloppy_this
                     ; =>direct_function
                     ; mov x10, xzr
                     ; mov w11, wzr
                     ; mov w15, wzr
+                    ; =>sloppy_this
                 );
+                // OrdinaryCallBindThis for a sloppy callee: `undefined` and
+                // `null` — including the implicit receiver of a plain
+                // `Op::Call` — bind the active realm's global object, an
+                // Object receiver binds itself, and a primitive receiver needs
+                // `ToObject`, which stays an interpreter operation behind the
+                // exact pre-effect side exit.
+                if let Some(receiver) = explicit_receiver {
+                    let global_this = ops.new_dynamic_label();
+                    load(ops, receiver, 12, 0)?;
+                    emit_load_u64(ops, 14, VALUE_UNDEFINED);
+                    dynasm!(ops ; .arch aarch64 ; cmp x12, x14 ; b.eq =>global_this);
+                    emit_load_u64(ops, 14, VALUE_NULL);
+                    dynasm!(ops ; .arch aarch64 ; cmp x12, x14 ; b.eq =>global_this);
+                    emit_object_type_branch(
+                        ops,
+                        relocations,
+                        view,
+                        12,
+                        [14, 16, 17],
+                        callable_ready,
+                        caller_bail,
+                    );
+                    dynasm!(ops ; .arch aarch64 ; =>global_this);
+                }
                 emit_load_sloppy_global_this(ops, relocations, view, context_register);
             }
         }
@@ -1665,7 +1683,7 @@ where
         let object = ops.new_dynamic_label();
         let primitive = ops.new_dynamic_label();
         let ready = ops.new_dynamic_label();
-        emit_object_type_branch(ops, relocations, view, 0, object, primitive);
+        emit_object_type_branch(ops, relocations, view, 0, [9, 10, 11], object, primitive);
         dynasm!(ops
             ; .arch aarch64
             ; =>primitive
@@ -1691,7 +1709,7 @@ where
         let cold = ops.new_dynamic_label();
         let ready = ops.new_dynamic_label();
         let invalid_construct_result = ops.new_dynamic_label();
-        emit_object_type_branch(ops, relocations, view, 0, object, primitive);
+        emit_object_type_branch(ops, relocations, view, 0, [9, 10, 11], object, primitive);
         dynasm!(ops ; .arch aarch64 ; =>primitive);
         emit_load_u64(ops, 9, VALUE_UNDEFINED);
         dynasm!(ops

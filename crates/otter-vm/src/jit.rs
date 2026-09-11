@@ -762,9 +762,11 @@ pub enum JitDirectCallThisMode {
     /// Strict functions receive `undefined`; arrows retain their lexical
     /// binding from the guarded closure metadata.
     StrictOrLexical,
-    /// An ordinary sloppy `Op::Call` receives the active realm's rooted global
-    /// object. Closures carrying an explicit bound receiver side-exit before
-    /// entry because primitive `ToObject` remains an interpreter operation.
+    /// A sloppy callee binds `this` by OrdinaryCallBindThis in generated code:
+    /// a plain `Op::Call` and a nullish explicit receiver bind the active
+    /// realm's rooted global object, an Object receiver binds itself, and a
+    /// primitive receiver side-exits before entry because `ToObject` remains
+    /// an interpreter operation, as does a closure carrying a bound receiver.
     SloppyGlobal,
     /// A guarded method call passes its exact object receiver.
     MethodReceiver,

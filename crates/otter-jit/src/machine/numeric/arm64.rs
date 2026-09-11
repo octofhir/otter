@@ -90,11 +90,11 @@ use otter_vm::{
         NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor, RuntimeStubResultAbi,
         RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
         STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE, STUB_JIT_CALL_METHOD_VALUE,
-        STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY,
-        STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF,
-        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
-        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+        STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE,
+        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT,
+        STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
     },
 };
 
@@ -1295,6 +1295,7 @@ pub(super) fn emit(
     store_property_entry: u64,
     call_method_value_entry: u64,
     call_with_this_value_entry: u64,
+    construct_value_entry: u64,
     load_ic_cells: &mut [WhiskerIcCell],
     store_ic_cells: &mut [WhiskerIcCell],
     vm_register_count: u16,
@@ -3011,10 +3012,12 @@ pub(super) fn emit(
                             dynasm!(ops ; .arch aarch64 ; =>next_method_candidate);
                         }
                     }
-                    if matches!(kind, DirectCallKind::Method | DirectCallKind::CallWithThis) {
+                    if matches!(kind, DirectCallKind::Method | DirectCallKind::CallWithThis)
+                        || (*kind == DirectCallKind::Construct && candidates.is_empty())
+                    {
                         if *kind == DirectCallKind::Method {
                             dynasm!(ops ; .arch aarch64 ; =>final_method_guard_miss);
-                        } else {
+                        } else if *kind == DirectCallKind::CallWithThis {
                             // A candidate reaches the loop's end with its
                             // roots still published. The linkage's guard miss
                             // restored the allocator registers and cleared
@@ -3035,6 +3038,11 @@ pub(super) fn emit(
                                 call_method_value_entry,
                                 STUB_JIT_CALL_METHOD_VALUE,
                                 "machineGenericMethodCall",
+                            ),
+                            DirectCallKind::Construct => (
+                                construct_value_entry,
+                                STUB_JIT_CONSTRUCT_VALUE,
+                                "machineGenericConstruct",
                             ),
                             _ => (
                                 call_with_this_value_entry,
@@ -5062,6 +5070,7 @@ mod tests {
                 1,
                 1,
                 1,
+                1,
                 &mut load_ic_cells,
                 &mut store_ic_cells,
                 3,
@@ -5137,6 +5146,7 @@ mod tests {
             &DeoptRuntime::default(),
             &safepoints,
             &transitions,
+            1,
             1,
             1,
             1,

@@ -87,10 +87,11 @@ use otter_vm::{
     deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
     native_abi::{
         STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL,
-        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS,
-        STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-        STUB_JIT_INITIALIZE_UPVALUES, STUB_JIT_PREPARE_BASE_CONSTRUCT,
-        STUB_JIT_RESOLVE_DIRECT_ENTRY, STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CONSTRUCT_VALUE,
+        STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
+        STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
+        STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -158,7 +159,9 @@ pub(super) fn method_value_packet_frame(
             matches!(
                 &descriptor.target,
                 CallTarget::Direct {
-                    kind: DirectCallKind::Method | DirectCallKind::CallWithThis,
+                    kind: DirectCallKind::Method
+                        | DirectCallKind::CallWithThis
+                        | DirectCallKind::Construct,
                     ..
                 }
             )
@@ -181,8 +184,12 @@ pub(crate) fn try_compile(
     transitions: &TransitionTable,
     artifact_request: Option<ArtifactRequest>,
 ) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
-    let hir = NumericFunction::build(view)
-        .ok_or(Unsupported::OperandShape("function outside Machine HIR"))?;
+    let hir = NumericFunction::build(view).map_err(|decline| match decline {
+        hir::HirDecline::Structural(constraint) => Unsupported::OperandShape(constraint),
+        hir::HirDecline::Instruction { op, constraint, .. } => {
+            Unsupported::Constraint { op, constraint }
+        }
+    })?;
     let packed_double_view_caches = hir.plan_packed_double_view_caches(view);
     let sequence = select_with_packed_double_view_caches(&hir, &packed_double_view_caches)
         .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
@@ -291,6 +298,7 @@ pub(crate) fn try_compile(
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
         transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
         transitions.entry(STUB_JIT_CALL_WITH_THIS_VALUE),
+        transitions.entry(STUB_JIT_CONSTRUCT_VALUE),
         &mut load_ic_cells,
         &mut store_ic_cells,
         view.code_block.register_count,
@@ -6018,8 +6026,9 @@ mod tests {
                 terminator,
             ],
         );
-        NumericFunction::build(&view)
-            .unwrap_or_else(|| panic!("schema binding {:?} must build cold Machine HIR", schema.op))
+        NumericFunction::build(&view).unwrap_or_else(|_| {
+            panic!("schema binding {:?} must build cold Machine HIR", schema.op)
+        })
     }
 
     fn binding_catch_hir() -> NumericFunction {

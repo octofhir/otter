@@ -206,6 +206,17 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         self.note_jit_optimized_bail(outermost.callee_fid, outermost.callee_pc);
+        // The speculation that exited lives in the innermost spliced body; its
+        // own exit profile must learn the PC so the next bake of that body,
+        // inline or standalone, widens the site.
+        if let Some(innermost) = frames.last()
+            && frames.len() > 1
+        {
+            self.jit_optimized_bail_pcs
+                .entry(innermost.callee_fid)
+                .or_default()
+                .insert(innermost.callee_pc);
+        }
         let handler_plans = frames
             .iter()
             .map(|frame| {

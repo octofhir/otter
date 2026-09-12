@@ -608,6 +608,18 @@ impl ArithFeedback {
         self.0 == ARITH_INT32
     }
 
+    /// The cell after an optimized generation exited at this site.
+    ///
+    /// Operand observation cannot see an `int32` result that overflowed or a
+    /// value the exit refused; the exit itself is the evidence. The site keeps
+    /// its numeric observations but is no longer `int32`-only, so a rebuilt
+    /// generation speculates no narrower than `Float64` here instead of
+    /// re-emitting the speculation that exited.
+    #[must_use]
+    pub const fn after_optimized_exit(self) -> Self {
+        Self(self.0 | ARITH_WIDEN_FLOAT)
+    }
+
     /// `true` when `+` has observed at least one primitive String operand and
     /// no BigInt, object, Symbol, nullish, or Boolean operand. Number bits may
     /// coexist because primitive string concatenation accepts Number on the
@@ -992,6 +1004,16 @@ impl<'a> InstructionFeedbackRecorder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_optimized_exit_widens_an_int32_site_but_keeps_it_numeric() {
+        let site = ArithFeedback::from_bits(ARITH_INT32);
+        assert!(site.is_int32_only());
+        let exited = site.after_optimized_exit();
+        assert!(!exited.is_int32_only());
+        assert!(exited.is_numeric_only());
+        assert_eq!(exited.after_optimized_exit(), exited);
+    }
 
     #[test]
     fn empty_is_neither_numeric_nor_int32() {

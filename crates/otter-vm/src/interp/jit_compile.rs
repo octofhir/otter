@@ -457,11 +457,7 @@ impl Interpreter {
         self.bake_element_accesses(&mut snapshot);
         self.bake_property_loads(&mut snapshot);
         self.bake_constructor_field_transitions(&mut snapshot);
-        snapshot.optimized_bail_pcs = self
-            .jit_optimized_bail_pcs
-            .get(&fid)
-            .cloned()
-            .unwrap_or_default();
+        self.bake_optimized_exit_profile(&mut snapshot, fid);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -1571,7 +1567,29 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut body);
         self.bake_element_accesses(&mut body);
         self.bake_property_loads(&mut body);
+        self.bake_optimized_exit_profile(&mut body, fid);
         Some(std::sync::Arc::new(body))
+    }
+
+    /// Bake the logical PCs at which earlier optimized generations of `fid`
+    /// exited, and widen the baked feedback of those instructions.
+    ///
+    /// The exit profile is evidence the operand observations cannot carry: an
+    /// int32 result that overflowed, or a value a guard refused. Folding it
+    /// into the per-instruction feedback means a rebuilt generation — or a
+    /// caller splicing this body inline — does not emit the speculation that
+    /// already exited.
+    fn bake_optimized_exit_profile(&self, snapshot: &mut jit::JitCompileSnapshot, fid: u32) {
+        snapshot.optimized_bail_pcs = self
+            .jit_optimized_bail_pcs
+            .get(&fid)
+            .cloned()
+            .unwrap_or_default();
+        for pc in snapshot.optimized_bail_pcs.clone() {
+            if let Some(instruction) = snapshot.instructions.get_mut(pc as usize) {
+                instruction.note_optimized_exit();
+            }
+        }
     }
 
     /// Bake compiler-native direct-call plans and inline-candidate bodies for

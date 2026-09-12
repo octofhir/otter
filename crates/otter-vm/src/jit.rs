@@ -295,6 +295,9 @@ pub struct JitCompileSnapshot {
     /// deoptimized at. Moving a settled access out of a loop makes its guard
     /// run on paths that would not have reached it, so a pass that would place
     /// one at a PC already known to deoptimize leaves the loop alone instead.
+    /// The baked per-instruction feedback of every listed PC is already
+    /// widened past the exited speculation
+    /// ([`JitInstructionMetadata::note_optimized_exit`]).
     pub optimized_bail_pcs: std::collections::BTreeSet<u32>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
@@ -1504,6 +1507,13 @@ impl JitInstructionMetadata {
     #[must_use]
     pub fn arith_feedback(&self) -> ArithFeedback {
         self.arith_feedback
+    }
+
+    /// Fold an earlier optimized generation's exit at this instruction into
+    /// its baked feedback, so lowering speculates no narrower than the exit
+    /// already refuted.
+    pub fn note_optimized_exit(&mut self) {
+        self.arith_feedback = self.arith_feedback.after_optimized_exit();
     }
 
     /// Opcode from the authoritative CodeBlock instruction.

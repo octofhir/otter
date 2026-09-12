@@ -20,6 +20,8 @@
 //! - Replay only applies to fast-shape ordinary objects.
 //! - Replay guards run before sidecar or slab growth, so a failed probe is
 //!   allocation-free and cannot relocate a caller-owned receiver handle.
+//! - Allocation failure after a matched transition propagates as OOM; it is
+//!   never converted into a miss that could reuse a stale receiver.
 //! - Prototype guards are complete here: null prototype, a prototype chain on
 //!   which every object is a fast-shape ordinary object missing the key
 //!   (each link's shape is recorded and revalidated, as SpiderMonkey's
@@ -368,18 +370,19 @@ pub(crate) fn capture_store_property_transition_with_shape(
 
 /// Replay a cached add-property transition for a fresh matching receiver.
 ///
-/// Returns `Some(())` only after the property was added. Any shape/key,
+/// Returns `Ok(Some(()))` only after the property was added. Any shape/key,
 /// prototype, extensibility, or dictionary-mode mismatch falls back to ordinary
-/// `[[Set]]`.
+/// `[[Set]]`. Allocation failure after a matched guard propagates to the VM
+/// without probing another recipe or replaying the operation.
 pub(crate) fn replay_store_property_transition(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
     transition: &StorePropertyTransition,
     value: &Value,
-) -> Option<()> {
+) -> Result<Option<()>, otter_gc::OutOfMemory> {
     if !transition_kind_matches(obj, heap, transition) {
-        return None;
+        return Ok(None);
     }
     let current_shape_id = super::shape_id(obj, heap);
     let to_shape = transition.to_shape.get();
@@ -419,7 +422,7 @@ pub(crate) fn replay_store_property_transition(
         true
     });
     if !guard_matches {
-        return None;
+        return Ok(None);
     }
 
     // Only a confirmed hit may allocate for sidecar/slab growth. On a miss the
@@ -433,8 +436,11 @@ pub(crate) fn replay_store_property_transition(
         // The dictionary arm below appends through `dict_push_key`,
         // which writes the sidecar and materializes per-slot metadata;
         // the shape-append arm never touches either and allocates none.
-        super::ensure_exotic_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored))
-            .ok()?;
+        super::ensure_exotic_with_pending_values(
+            &mut obj,
+            heap,
+            std::slice::from_mut(&mut stored),
+        )?;
         let slot_metas = super::slot_metas_for_shape_transition(heap, obj, None);
         slot_meta_table = super::slot_meta_table_for_install(
             &mut obj,
@@ -442,8 +448,7 @@ pub(crate) fn replay_store_property_transition(
             &slot_metas,
             usize::from(transition.slot) + 1,
             std::slice::from_mut(&mut stored),
-        )
-        .ok()?;
+        )?;
         let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, None);
         dict_table = super::dict_keys_table_for_install(
             &mut obj,
@@ -451,8 +456,7 @@ pub(crate) fn replay_store_property_transition(
             &dictionary_keys,
             key.name(),
             std::slice::from_mut(&mut stored),
-        )
-        .ok()?;
+        )?;
     }
     // Reserve before taking the payload borrow; the slot stores `Value`
     // directly and performs no numeric box allocation.
@@ -461,8 +465,7 @@ pub(crate) fn replay_store_property_transition(
         heap,
         usize::from(transition.slot) + 1,
         std::slice::from_mut(&mut stored),
-    )
-    .ok()?;
+    )?;
     heap.with_payload(obj, |body| {
         let offset = usize::from(transition.slot);
         if to_shape.is_null() {
@@ -485,7 +488,7 @@ pub(crate) fn replay_store_property_transition(
     if !to_shape.is_null() {
         heap.record_write(obj, &to_shape);
     }
-    Some(())
+    Ok(Some(()))
 }
 
 fn transition_kind(
@@ -599,4 +602,93 @@ fn transition_kind_matches_receiver_body(
 
 fn is_fast_shape_body(body: &ObjectBody) -> bool {
     super::shape_cache::supports_fast_property_ic(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rooting::RootScopeExt;
+
+    #[test]
+    fn matched_transition_allocation_failure_is_not_a_cache_miss() {
+        let mut interp = crate::Interpreter::with_string_heap_cap(4 * 1024 * 1024);
+        let owner = otter_gc::ExtraRoots::new(&interp);
+        let _owner = interp.gc_heap_mut().register_extra_roots(owner);
+        let mut first = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("first receiver");
+        let mut second = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("second receiver");
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both receiver slots precede the scope and stay stationary
+        // through transition capture and the allocation-triggered full GC.
+        unsafe {
+            roots.add_object(&mut first);
+            roots.add_object(&mut second);
+        }
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
+            "x",
+        );
+        let transition = capture_store_property_transition(
+            first,
+            interp.gc_heap_mut(),
+            key,
+            &Value::boolean(true),
+        )
+        .expect("capture an allocating dictionary transition");
+        assert!(transition.to_shape.get().is_null());
+        assert_eq!(
+            super::super::shape_id(second, interp.gc_heap()),
+            transition.from_shape_id
+        );
+        // A bootstrap allocation may survive its first collection. Settle
+        // the live set before filling the cap so emergency GC cannot simply
+        // reclaim unrelated bootstrap garbage and make the request succeed.
+        let mut settled = false;
+        for round in 0..8 {
+            let before = interp.gc_heap().stats().allocated_bytes;
+            interp
+                .gc_heap_mut()
+                .collect_full(&mut |_| {})
+                .expect("settle live heap");
+            if round > 0 && before == interp.gc_heap().stats().allocated_bytes {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "bootstrap live set must stabilize");
+        let stats = interp.gc_heap().stats();
+        // Admission recomputes allocated + reserved after emergency GC;
+        // explicit collection leaves the conservative tracked counter intact.
+        let remaining = stats.max_heap_bytes - stats.allocated_bytes as u64 - stats.reserved_bytes;
+        interp
+            .gc_heap_mut()
+            .reserve_bytes(remaining)
+            .expect("fill cap");
+        let before = (
+            interp.gc_heap().tracked_bytes(),
+            interp.gc_heap().gc_cycle_counts(),
+        );
+        let result = crate::cache_ir::CacheStub::store_transition(transition).run_store(
+            second,
+            interp.gc_heap_mut(),
+            key,
+            &Value::null(),
+        );
+        assert!(
+            matches!(result, Err(otter_gc::OutOfMemory::HeapCapExceeded { .. })),
+            "{result:?}: before={before:?}, after={:?}, cycles={:?}",
+            interp.gc_heap().tracked_bytes(),
+            interp.gc_heap().gc_cycle_counts()
+        );
+        assert_ne!(
+            interp.gc_heap().gc_cycle_counts(),
+            before.1,
+            "allocation must attempt GC before refusal"
+        );
+        assert_eq!(super::super::get_own(second, interp.gc_heap(), "x"), None);
+        interp.gc_heap_mut().release_bytes(remaining);
+    }
 }

@@ -494,14 +494,25 @@ above. All initial 20 failures and the additional constructor-retention defect
 are resolved. No failures are allowlisted, and no gate restart or bisect was
 used. Source/release checks are reusable evidence for the unchanged code.
 
-Next: S1 attribution of runtime property-store cost by site, key and miss
-reason. `jit_runtime_store_property_value` resolves `[[Set]]` before probing an
-installed store IC; measure its contribution and audit the IC's complete guard
-proof before changing that order. Preserve setters, non-writable descriptors,
-prototype mutation, exotic receivers, moving roots and exactly-once effects.
-Use focused tests while changing this path; do not restart the completed S0
-gates for profiling or documentation changes. Forwarded generated calls,
-spread packets, Machine coverage and root scanning follow the handoff order.
+S1's first change is validated: generated runtime stores probe complete IC
+programs before canonical `[[Set]]` resolution. Matched transition allocation
+failures propagate through the bank instead of becoming misses after GC.
+Focused validation passed 59 object tests, 6 property-IC tests, 5 runtime tests,
+GC stress on the new invalidation sequence, scoped clippy and three release
+differential programs. No S0 gate was repeated.
+
+RayTrace improved from 857 ± 1 to 939 ± 2 (median ± MAD, five fresh processes),
++9.57%, with identical program SHA-256 and all results validated. Memory was
+roughly unchanged. Report:
+`benchmarks/results/s1-20260913-store-probe/README.md`. This is a single-workload
+win; the substantial gap to other runtimes remains.
+
+Next: continue S1 site/key/miss-reason attribution for stores still entering
+runtime ICs. Audit generated-way coverage and root-publication cost using a
+usable CPU profile before another change. The post-change short CPU capture
+was sparse and supplies no hotspot evidence. Forwarded generated calls, spread
+packets, Machine coverage and root scanning follow the handoff order. Reuse
+successful checks and recorded baselines; profiling/docs do not need a new gate.
 
 The intended replacement path remains:
 

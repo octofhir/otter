@@ -16,6 +16,8 @@
 //!   allocation-free native subset.
 //!
 //! # Invariants
+//! - Store misses are allocation-free; failure while growing a matched
+//!   transition propagates as OOM rather than falling through to another stub.
 //!
 //! - Operand `0` is always the receiver; `1` is the receiver's prototype once a
 //!   [`CacheOp::LoadPrototype`] has run. No op reads an operand before it is
@@ -253,21 +255,29 @@ impl CacheStub {
         }
     }
 
-    /// Execute as a `StoreProperty` cache. `Some(())` once the write completes.
+    /// Execute as a `StoreProperty` cache. `Ok(Some(()))` commits the write;
+    /// `Ok(None)` is an allocation-free miss, and OOM stops the probe bank.
     pub(crate) fn run_store(
         &self,
         recv: JsObject,
         heap: &mut otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
         value: &Value,
-    ) -> Option<()> {
+    ) -> Result<Option<()>, otter_gc::OutOfMemory> {
         if !object::supports_fast_property_ic(recv, heap) {
-            return None;
+            return Ok(None);
         }
-        match self.ops.last().copied()? {
-            CacheOp::StoreDataSlot { obj: 0, hit } => {
-                object::store_own_data_slot_atom(recv, heap, key, self.hits[hit as usize], value)
-            }
+        let Some(op) = self.ops.last().copied() else {
+            return Ok(None);
+        };
+        match op {
+            CacheOp::StoreDataSlot { obj: 0, hit } => Ok(object::store_own_data_slot_atom(
+                recv,
+                heap,
+                key,
+                self.hits[hit as usize],
+                value,
+            )),
             CacheOp::StoreAddTransition { transition } => object::replay_store_property_transition(
                 recv,
                 heap,
@@ -275,7 +285,7 @@ impl CacheStub {
                 &self.transitions[transition as usize],
                 value,
             ),
-            _ => None,
+            _ => Ok(None),
         }
     }
 

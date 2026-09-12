@@ -507,12 +507,22 @@ roughly unchanged. Report:
 `benchmarks/results/s1-20260913-store-probe/README.md`. This is a single-workload
 win; the substantial gap to other runtimes remains.
 
-Next: continue S1 site/key/miss-reason attribution for stores still entering
-runtime ICs. Audit generated-way coverage and root-publication cost using a
-usable CPU profile before another change. The post-change short CPU capture
-was sparse and supplies no hotspot evidence. Forwarded generated calls, spread
-packets, Machine coverage and root scanning follow the handoff order. Reuse
-successful checks and recorded baselines; profiling/docs do not need a new gate.
+S1 sustained CPU attribution now supplies usable post-change evidence:
+`benchmarks/results/s1-20260913-store-attribution/README.md`. The isolate has
+4644 sampled stacks; the store runtime boundary appears in 1348 and the load
+boundary in 1037. System allocator descendants account for 457/428 respectively;
+these are overlapping inclusive sample weights, not operation counts.
+Source inspection confirms a boxed root provider plus entry-Vec allocation
+before each property IC probe. All diagnostic suites complete successfully.
+
+Next: remove per-entry allocation for bounded property operands through the
+existing GC root boundary, preserving stable provider/slot addresses, nested
+reentry, unwinding and moved-operand reload before cell fill. The 601-sample
+store-recipe hotspot also requires site/key/miss-reason attribution before
+expanding generated-way coverage; compile snapshot events are not frequency
+counters. Forwarded generated calls, spread packets, Machine coverage and root
+scanning follow the handoff order. Reuse successful checks and recorded
+baselines; profiling/docs do not need a new gate.
 
 The intended replacement path remains:
 

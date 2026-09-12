@@ -1536,9 +1536,17 @@ pub(super) fn emit_method_call(
         );
     }
     let planned_methods = view.direct_methods.get(&byte_pc);
+    let mut inlined_target: Option<u32> = None;
+    // A monomorphic inlinable body keeps its receiver guard as a fall-through
+    // to the layers below, exactly as the polymorphic chain does: an unseen
+    // shape reaches the direct call or the generic packet instead of pinning
+    // the site back to the interpreter. Only a bail raised inside the
+    // accepted body is a real deopt.
     if planned_methods.is_none_or(|methods| methods.len() == 1 && methods[0].target_count == 1)
         && let Some(method) = view.inline_methods.get(&byte_pc)
-        && try_emit_inline_numeric_method(
+    {
+        let inline_miss = ops.new_dynamic_label();
+        if try_emit_inline_numeric_method(
             ops,
             relocations,
             view,
@@ -1552,29 +1560,29 @@ pub(super) fn emit_method_call(
             byte_pc,
             code_map.as_deref_mut(),
             done,
+            inline_miss,
             bail,
-            bail,
-        )?
-    {
-        if let (Some(events), Some(target)) = (
-            direct_call_events.as_deref_mut(),
-            planned_methods.and_then(|methods| methods.first()),
-        ) {
-            events.insert(
-                (byte_pc, target.target_index),
-                direct_call_lowering_event(
-                    otter_vm::JitDirectCallKind::Method,
-                    logical_pc,
-                    byte_pc,
-                    &target.callee,
-                    target.target_index,
-                    target.target_count,
-                    otter_vm::JitDirectCallLoweringOutcome::Inlined,
-                ),
-            );
+        )? {
+            if let (Some(events), Some(target)) = (
+                direct_call_events.as_deref_mut(),
+                planned_methods.and_then(|methods| methods.first()),
+            ) {
+                events.insert(
+                    (byte_pc, target.target_index),
+                    direct_call_lowering_event(
+                        otter_vm::JitDirectCallKind::Method,
+                        logical_pc,
+                        byte_pc,
+                        &target.callee,
+                        target.target_index,
+                        target.target_count,
+                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                    ),
+                );
+                inlined_target = Some(target.target_index);
+            }
+            dynasm!(ops ; .arch aarch64 ; =>inline_miss);
         }
-        dynasm!(ops ; .arch aarch64 ; =>done);
-        return Ok(());
     }
     // A site that observed several inlinable shapes emits one guarded body per
     // shape. Each guard miss falls through to the next candidate rather than
@@ -1605,7 +1613,11 @@ pub(super) fn emit_method_call(
     }
     for method in planned_methods.into_iter().flatten() {
         if !direct_call_target_is_supported(&method.callee) {
-            if let Some(events) = direct_call_events.as_deref_mut() {
+            // An inlined body already owns this target's lowering record; its
+            // guard-miss layer is not a second outcome.
+            if let Some(events) = direct_call_events.as_deref_mut()
+                && inlined_target != Some(method.target_index)
+            {
                 events.insert(
                     (byte_pc, method.target_index),
                     direct_call_lowering_event(
@@ -1682,7 +1694,9 @@ pub(super) fn emit_method_call(
             fatal,
             done,
         )?;
-        if let Some(events) = direct_call_events.as_deref_mut() {
+        if let Some(events) = direct_call_events.as_deref_mut()
+            && inlined_target != Some(method.target_index)
+        {
             events.insert(
                 (byte_pc, method.target_index),
                 direct_call_lowering_event(

@@ -1,8 +1,9 @@
 //! Compiled call-family, arguments, and tail-call transitions.
 //!
 //! # Contents
-//! - The shared `CollectArguments` register helper used by interpreter and JIT
-//!   dispatch.
+//! - `CollectArguments` construction shared by interpreter frames and
+//!   compiled activations, including stack-owned frames whose generated
+//!   caller published the actual arguments after the register window.
 //! - Synchronous full-completion siblings for frame-pushing call/construct
 //!   helpers.
 //! - Canonical `GetMethod + Call` completion for compiled method-call misses.
@@ -347,8 +348,7 @@ impl Interpreter {
         Ok(shape)
     }
 
-    /// §10.4.4 Arguments exotic object construction shared by interpreter and
-    /// compiled dispatch.
+    /// §10.4.4 Arguments exotic object construction for an interpreter frame.
     pub(crate) fn run_collect_arguments_reg(
         &mut self,
         context: &ExecutionContext,
@@ -370,35 +370,101 @@ impl Interpreter {
                 .frame_cold_mut(frame)
                 .map(|cold| cold.incoming_args.clone())
                 .unwrap_or_default();
-            let mapped_entries = if function.arguments_object_kind == ArgumentsObjectKind::Mapped {
-                function
-                    .mapped_argument_bindings
-                    .iter()
-                    .filter_map(|binding| {
-                        if binding.argument_index as usize >= elements.len() {
-                            return None;
-                        }
-                        let ArgumentBindingStorage::Upvalue { idx } = binding.storage else {
-                            return None;
-                        };
-                        let cell = *frame.upvalues.get(idx as usize)?;
-                        Some(crate::object::MappedArgumentEntry {
-                            key: binding.argument_index.to_string(),
-                            cell,
-                        })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let callee = frame.self_value;
+            let mapped_entries = Self::mapped_argument_entries(function, elements.len(), |idx| {
+                frame.upvalues.get(idx as usize).copied()
+            });
             (
                 elements,
                 function.arguments_object_kind,
                 mapped_entries,
-                callee,
+                frame.self_value,
             )
         };
+        let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
+        let frame = &mut stack[frame_index];
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// §10.4.4 Arguments exotic object construction for a compiled activation.
+    ///
+    /// A stack-owned frame reads the actual arguments its generated caller
+    /// published after the register window; a materialized activation reads
+    /// the same list from its cold record. Mapped parameters alias through the
+    /// activation's capture cells either way.
+    pub(crate) fn jit_runtime_collect_arguments(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame: &mut crate::ActiveFrameMut<'_>,
+        materialized_frame_index: Option<usize>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let function = context
+            .exec_function(frame.function_id())
+            .ok_or(VmError::InvalidOperand)?;
+        let elements: SmallVec<[Value; 4]> =
+            match (frame.incoming_argument_count(), materialized_frame_index) {
+                (Some(count), _) => (0..count)
+                    .map(|index| frame.incoming_argument(index))
+                    .collect::<Result<_, _>>()?,
+                (None, Some(frame_index)) => {
+                    let materialized = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
+                    self.frame_cold_mut(materialized)
+                        .map(|cold| cold.incoming_args.clone())
+                        .unwrap_or_default()
+                }
+                (None, None) => return Err(VmError::InvalidOperand),
+            };
+        let mapped_entries = Self::mapped_argument_entries(function, elements.len(), |idx| {
+            frame.upvalue(u32::from(idx)).ok()
+        });
+        let callee = frame.self_value();
+        let kind = function.arguments_object_kind;
+        let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
+        frame.write(dst, value)
+    }
+
+    /// Parameter bindings that alias the arguments object's indexed entries,
+    /// resolved against the activation's capture cells.
+    fn mapped_argument_entries(
+        function: &crate::executable::CodeBlock,
+        argument_count: usize,
+        mut upvalue: impl FnMut(u16) -> Option<crate::UpvalueCell>,
+    ) -> Vec<crate::object::MappedArgumentEntry> {
+        if function.arguments_object_kind != ArgumentsObjectKind::Mapped {
+            return Vec::new();
+        }
+        function
+            .mapped_argument_bindings
+            .iter()
+            .filter_map(|binding| {
+                if binding.argument_index as usize >= argument_count {
+                    return None;
+                }
+                let ArgumentBindingStorage::Upvalue { idx } = binding.storage else {
+                    return None;
+                };
+                let cell = upvalue(idx)?;
+                Some(crate::object::MappedArgumentEntry {
+                    key: binding.argument_index.to_string(),
+                    cell,
+                })
+            })
+            .collect()
+    }
+
+    /// Allocate and initialize one arguments exotic object from already
+    /// collected inputs; the caller commits the result to its destination.
+    fn collect_arguments_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        elements: SmallVec<[Value; 4]>,
+        kind: ArgumentsObjectKind,
+        mapped_entries: Vec<crate::object::MappedArgumentEntry>,
+        callee: Value,
+    ) -> Result<Value, VmError> {
         let elements_len = elements.len();
         let callee_anchor = self.push_iteration_anchor(callee) - 1;
         let anchor_base = callee_anchor;
@@ -494,10 +560,7 @@ impl Interpreter {
                     shape,
                 )
             };
-            let frame = &mut stack[frame_index];
-            write_register(frame, dst, Value::object(obj))?;
-            frame.advance_pc()?;
-            Ok(())
+            Ok(Value::object(obj))
         };
         let result = collect(self);
         self.pop_iteration_anchors_to(anchor_base);
@@ -738,9 +801,6 @@ impl Interpreter {
                     None,
                     &regs,
                 )?;
-            }
-            value if value == Op::CollectArguments as u8 => {
-                self.run_collect_arguments_reg(context, stack, frame_index, arg0 as u16)?;
             }
             value if value == Op::NewSpread as u8 || value == Op::SuperConstructSpread as u8 => {
                 self.run_construct_spread_full_regs(

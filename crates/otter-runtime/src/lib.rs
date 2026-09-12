@@ -170,7 +170,8 @@ pub use otter_vm::{
     JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactManifest,
     JitDebugCompileOutcome, JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget,
     JitDebugTier, JitDirectCallKind, JitDirectCallLoweringOutcome,
-    JitDirectCallLoweringRejectionReason, JitInlineRejectionReason, array, object,
+    JitDirectCallLoweringRejectionReason, JitDirectCallPlanOutcome, JitInlineRejectionReason,
+    array, object,
 };
 pub use otter_vm::{
     JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,

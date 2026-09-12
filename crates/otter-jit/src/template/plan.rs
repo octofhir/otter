@@ -256,6 +256,8 @@ pub(crate) enum TemplateOp {
     LoadBuiltinError { dst: u16, constant: u32 },
     /// `r<dst> = {}`.
     NewObject { dst: u16 },
+    /// `r<dst> = arguments` built from the activation's actual arguments.
+    CollectArguments { dst: u16 },
     /// `r<dst> = [elements…]` from the plan-owned register tail.
     NewArray { dst: u16, elements: TemplateTail },
     /// Refresh the captured binding cell at `index` (per-iteration bindings).
@@ -519,8 +521,8 @@ pub(crate) enum TemplateOp {
         method: u64,
         packed_args: u64,
     },
-    /// Complete spread calls/constructions, explicit-receiver calls, and
-    /// `CollectArguments` through the shared synchronous VM transition.
+    /// Complete spread calls/constructions and explicit-receiver calls
+    /// through the shared synchronous VM transition.
     /// `TailCall` is intentionally excluded — its interpreter completion
     /// discards the caller frame for true tail-call stack reuse, which the
     /// compiled call helper cannot reproduce, so it stays an exact side exit.
@@ -1121,11 +1123,8 @@ impl TemplatePlan {
                         arg2: u64::from(operands.third),
                     }
                 }
-                Op::CollectArguments => TemplateOp::SpreadCallOp {
-                    opcode: Op::CollectArguments as u8,
-                    arg0: u64::from(lowered.destination_operands()?.dst),
-                    arg1: 0,
-                    arg2: 0,
+                Op::CollectArguments => TemplateOp::CollectArguments {
+                    dst: lowered.destination_operands()?.dst,
                 },
                 Op::New => {
                     let operands = lowered.call_operands()?;

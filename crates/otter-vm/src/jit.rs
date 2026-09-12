@@ -909,6 +909,11 @@ pub struct JitDirectCallPlan {
     pub own_upvalue_count: u16,
     /// Closure-owned capture cells copied after the fresh prefix.
     pub inherited_upvalue_count: u16,
+    /// The body materializes an `arguments` object, so the generated caller
+    /// must publish every actual argument after the callee's register window
+    /// and flag the frame with
+    /// [`crate::native_abi::NativeFrameFlags::INCOMING_ARGUMENTS`].
+    pub needs_incoming_arguments: bool,
 }
 
 /// One baked compiler-native target for a monomorphic plain-call site.

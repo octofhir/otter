@@ -365,6 +365,26 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_new_array(&mut frame, dst, sources)
     }
 
+    /// Build the activation's `arguments` object and commit it to `dst`.
+    ///
+    /// The actual arguments come from the published incoming-argument window
+    /// of a stack-owned frame or from the cold record of the materialized
+    /// interpreter activation this call views.
+    pub fn collect_arguments(&mut self, dst: u16) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let frame = self.frame.as_ptr();
+        // SAFETY: as [`Self::add`].
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        let materialized = match self.identity {
+            super::RuntimeFrameIdentity::Materialized(index) => Some(index),
+            super::RuntimeFrameIdentity::StackOwned => None,
+        };
+        vm.jit_runtime_collect_arguments(context, stack, &mut frame, materialized, dst)
+    }
+
     /// Allocate and commit an ordinary object.
     pub fn new_object(&mut self, dst: u16) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };

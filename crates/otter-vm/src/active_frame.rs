@@ -17,6 +17,9 @@
 //! - Native views are created at one audited `unsafe` boundary. Their register
 //!   and upvalue descriptors must refer to published, initialized storage for
 //!   the whole view lifetime.
+//! - A stack-owned frame may publish its actual arguments as a third tagged
+//!   window directly after the register window; it is traced with the
+//!   registers and read only through checked single-slot accessors.
 //! - Native windows stay raw inside the view. Safe operations create no slice
 //!   whose borrow can survive an allocating or reentrant VM call; reads return
 //!   copied handles and writes touch exactly one checked slot.
@@ -44,7 +47,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 use crate::{
     Frame, UpvalueCell, Value, VmError,
     eval_env::EvalEnvHandle,
-    native_abi::{NativeFrame, NativeFrameKind, VmFrameHeader},
+    native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader},
 };
 
 /// Physical representation backing an active frame view.
@@ -75,6 +78,9 @@ pub enum ActiveFrameError {
     AddressOutOfRange,
     /// The described allocation range overflows the target address space.
     WindowOutOfRange,
+    /// The frame publishes an actual-argument window without owning its
+    /// register window on the generated-code stack.
+    UnownedIncomingArguments,
 }
 
 impl fmt::Display for ActiveFrameError {
@@ -88,6 +94,9 @@ impl fmt::Display for ActiveFrameError {
             Self::MisalignedUpvalueSpine => "native upvalue spine is misaligned",
             Self::AddressOutOfRange => "native ABI address is outside the target pointer range",
             Self::WindowOutOfRange => "native ABI window is outside the target address range",
+            Self::UnownedIncomingArguments => {
+                "native incoming-argument window requires stack-owned registers"
+            }
         };
         f.write_str(message)
     }
@@ -106,6 +115,16 @@ impl std::error::Error for ActiveFrameError {}
 struct NativeWindow<T> {
     base: NonNull<T>,
     len: usize,
+}
+
+impl<T> NativeWindow<T> {
+    #[inline]
+    const fn empty() -> Self {
+        Self {
+            base: NonNull::dangling(),
+            len: 0,
+        }
+    }
 }
 
 impl<T: Copy> NativeWindow<T> {
@@ -136,6 +155,7 @@ impl<T: Copy> NativeWindow<T> {
 struct NativeFrameRef {
     frame: NonNull<NativeFrame>,
     registers: NativeWindow<Value>,
+    incoming: NativeWindow<Value>,
     upvalues: NativeWindow<UpvalueCell>,
 }
 
@@ -143,7 +163,46 @@ struct NativeFrameRef {
 struct NativeFrameMut {
     frame: NonNull<NativeFrame>,
     registers: NativeWindow<Value>,
+    incoming: NativeWindow<Value>,
     upvalues: NativeWindow<UpvalueCell>,
+}
+
+/// Validate the register window and the actual-argument window that a
+/// generated caller publishes directly after it.
+fn checked_register_windows(
+    frame: &NativeFrame,
+) -> Result<(NativeWindow<Value>, NativeWindow<Value>), ActiveFrameError> {
+    let register_count = usize::from(frame.header.register_count);
+    let registers = checked_window::<Value>(
+        frame.register_base,
+        register_count,
+        ActiveFrameError::MissingRegisterWindow,
+        ActiveFrameError::MisalignedRegisterWindow,
+    )?;
+    let Some(argument_count) = frame.incoming_argument_count() else {
+        return Ok((registers, NativeWindow::empty()));
+    };
+    if !frame
+        .header
+        .flags
+        .contains(NativeFrameFlags::STACK_REGISTERS)
+    {
+        return Err(ActiveFrameError::UnownedIncomingArguments);
+    }
+    let register_bytes = (register_count as u64)
+        .checked_mul(mem::size_of::<Value>() as u64)
+        .ok_or(ActiveFrameError::WindowOutOfRange)?;
+    let incoming_base = frame
+        .register_base
+        .checked_add(register_bytes)
+        .ok_or(ActiveFrameError::WindowOutOfRange)?;
+    let incoming = checked_window::<Value>(
+        incoming_base,
+        argument_count as usize,
+        ActiveFrameError::MissingRegisterWindow,
+        ActiveFrameError::MisalignedRegisterWindow,
+    )?;
+    Ok((registers, incoming))
 }
 
 #[derive(Debug)]
@@ -208,12 +267,7 @@ impl<'a> ActiveFrameRef<'a> {
         // SAFETY: null and alignment were validated above. The short reference
         // is used only to copy scalar window descriptors.
         let frame_ref = unsafe { &*frame };
-        let registers = checked_window::<Value>(
-            frame_ref.register_base,
-            usize::from(frame_ref.header.register_count),
-            ActiveFrameError::MissingRegisterWindow,
-            ActiveFrameError::MisalignedRegisterWindow,
-        )?;
+        let (registers, incoming) = checked_register_windows(frame_ref)?;
         let upvalues = checked_window::<UpvalueCell>(
             frame_ref.upvalue_base,
             frame_ref.upvalue_count as usize,
@@ -225,6 +279,7 @@ impl<'a> ActiveFrameRef<'a> {
             inner: ActiveFrameRefInner::Native(NativeFrameRef {
                 frame,
                 registers,
+                incoming,
                 upvalues,
             }),
         })
@@ -298,6 +353,29 @@ impl<'a> ActiveFrameRef<'a> {
                 .registers
                 .read(usize::from(register))
                 .ok_or(VmError::InvalidOperand),
+        }
+    }
+
+    /// Number of actual arguments the generated caller published after the
+    /// register window, or `None` when this activation keeps them elsewhere.
+    #[must_use]
+    pub fn incoming_argument_count(&self) -> Option<usize> {
+        match &self.inner {
+            ActiveFrameRefInner::Materialized { .. } => None,
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref() }
+                .incoming_argument_count()
+                .map(|count| count as usize),
+        }
+    }
+
+    /// Read one published actual argument.
+    pub fn incoming_argument(&self, index: usize) -> Result<Value, VmError> {
+        match &self.inner {
+            ActiveFrameRefInner::Materialized { .. } => Err(VmError::InvalidOperand),
+            ActiveFrameRefInner::Native(native) => {
+                native.incoming.read(index).ok_or(VmError::InvalidOperand)
+            }
         }
     }
 
@@ -391,12 +469,15 @@ impl<'a> ActiveFrameRef<'a> {
         let ActiveFrameRefInner::Native(native) = &self.inner else {
             return;
         };
-        for index in 0..native.registers.len {
-            // SAFETY: the validated published window remains live until native
-            // activation pop. Stop-the-world tracing owns this short in-place
-            // relocation update and retains no reference afterward.
-            let slot = unsafe { native.registers.base.as_ptr().add(index) };
-            unsafe { (&mut *slot).trace_value_slot_mut(visitor) };
+        for window in [native.registers, native.incoming] {
+            for index in 0..window.len {
+                // SAFETY: the validated published window remains live until
+                // native activation pop. Stop-the-world tracing owns this
+                // short in-place relocation update and retains no reference
+                // afterward.
+                let slot = unsafe { window.base.as_ptr().add(index) };
+                unsafe { (&mut *slot).trace_value_slot_mut(visitor) };
+            }
         }
     }
 
@@ -481,12 +562,7 @@ impl<'a> ActiveFrameMut<'a> {
         // SAFETY: null and alignment were validated above. The short reference
         // is used only to copy scalar window descriptors.
         let frame_ref = unsafe { &*frame };
-        let registers = checked_window::<Value>(
-            frame_ref.register_base,
-            usize::from(frame_ref.header.register_count),
-            ActiveFrameError::MissingRegisterWindow,
-            ActiveFrameError::MisalignedRegisterWindow,
-        )?;
+        let (registers, incoming) = checked_register_windows(frame_ref)?;
         let upvalues = checked_window::<UpvalueCell>(
             frame_ref.upvalue_base,
             frame_ref.upvalue_count as usize,
@@ -498,6 +574,7 @@ impl<'a> ActiveFrameMut<'a> {
             inner: ActiveFrameMutInner::Native(NativeFrameMut {
                 frame,
                 registers,
+                incoming,
                 upvalues,
             }),
         })
@@ -514,6 +591,7 @@ impl<'a> ActiveFrameMut<'a> {
                 inner: ActiveFrameRefInner::Native(NativeFrameRef {
                     frame: native.frame,
                     registers: native.registers,
+                    incoming: native.incoming,
                     upvalues: native.upvalues,
                 }),
             },
@@ -573,6 +651,18 @@ impl<'a> ActiveFrameMut<'a> {
             ActiveFrameMutInner::Materialized { frame, .. } => frame.registers.len(),
             ActiveFrameMutInner::Native(native) => native.registers.len,
         }
+    }
+
+    /// Number of actual arguments the generated caller published after the
+    /// register window, or `None` when this activation keeps them elsewhere.
+    #[must_use]
+    pub fn incoming_argument_count(&self) -> Option<usize> {
+        self.as_ref().incoming_argument_count()
+    }
+
+    /// Read one published actual argument.
+    pub fn incoming_argument(&self, index: usize) -> Result<Value, VmError> {
+        self.as_ref().incoming_argument(index)
     }
 
     /// Raw base of the initialized tagged register window.
@@ -802,10 +892,7 @@ fn checked_window<T>(
     misaligned: ActiveFrameError,
 ) -> Result<NativeWindow<T>, ActiveFrameError> {
     if count == 0 {
-        return Ok(NativeWindow {
-            base: NonNull::dangling(),
-            len: 0,
-        });
+        return Ok(NativeWindow::empty());
     }
     let address = usize::try_from(address).map_err(|_| ActiveFrameError::AddressOutOfRange)?;
     if address == 0 {
@@ -896,6 +983,57 @@ mod tests {
         assert_eq!(native.self_value(), Value::function(17));
         assert_eq!(native.header.kind, NativeFrameKind::Optimizing);
         assert_eq!(native.register_base, native_base as u64);
+    }
+
+    #[test]
+    fn incoming_argument_window_follows_the_registers_and_is_traced() {
+        let mut slots = [
+            Value::number_i32(1),
+            Value::number_i32(2),
+            Value::number_i32(30),
+            Value::number_i32(40),
+            Value::number_i32(50),
+        ];
+        let mut native = NativeFrame::new(
+            header(2),
+            slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        native.set_stack_registers();
+        native.set_incoming_arguments(3);
+        // SAFETY: the frame, its two registers, and the three published
+        // arguments remain live for the view.
+        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
+        assert_eq!(active.register_count(), 2);
+        assert_eq!(active.incoming_argument_count(), Some(3));
+        assert_eq!(active.incoming_argument(0).unwrap(), Value::number_i32(30));
+        assert_eq!(active.incoming_argument(2).unwrap(), Value::number_i32(50));
+        assert!(matches!(
+            active.incoming_argument(3),
+            Err(VmError::InvalidOperand)
+        ));
+        let mut visited = 0;
+        active.trace_stack_register_slots(&mut |_slot| {
+            visited += 1;
+        });
+        assert_eq!(visited, 0, "tagged integers carry no heap slot");
+
+        let mut plain = NativeFrame::new(
+            header(2),
+            slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        plain.header.flags = NativeFrameFlags::from_bits(NativeFrameFlags::INCOMING_ARGUMENTS);
+        plain.argument_count = 3;
+        // SAFETY: the frame record is valid; the unowned argument window is
+        // rejected before any window is formed.
+        let unowned = unsafe { ActiveFrameRef::from_native_ptr(&plain) };
+        assert!(matches!(
+            unowned,
+            Err(ActiveFrameError::UnownedIncomingArguments)
+        ));
     }
 
     #[test]

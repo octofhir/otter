@@ -382,6 +382,13 @@ pub(crate) enum DirectCallArguments<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct StackLayout {
+    /// Start of the published actual-argument window, directly after the
+    /// callee's register window. Meaningful only when `incoming_count != 0`
+    /// or the target publishes an empty window.
+    incoming_base: u32,
+    /// Actual arguments published after the register window; zero when the
+    /// target does not materialize `arguments`.
+    incoming_count: u32,
     upvalue_base: u32,
     saved_x25: u32,
     entry_addr: u32,
@@ -392,9 +399,20 @@ struct StackLayout {
 }
 
 impl StackLayout {
-    fn for_target(target: &JitDirectCallee) -> Option<Self> {
+    /// Layout for a site passing `argument_count` fixed actual arguments.
+    ///
+    /// A target that materializes `arguments` receives every actual argument
+    /// in a tagged window after its register window; every other target only
+    /// receives its declared parameter prefix, so the window is empty.
+    fn for_site(target: &JitDirectCallee, argument_count: u32) -> Option<Self> {
         let register_bytes = u32::from(target.plan.register_count).checked_mul(8)?;
-        let upvalue_base = NATIVE_FRAME_STACK_SIZE.checked_add(register_bytes)?;
+        let incoming_base = NATIVE_FRAME_STACK_SIZE.checked_add(register_bytes)?;
+        let incoming_count = if target.plan.needs_incoming_arguments {
+            argument_count
+        } else {
+            0
+        };
+        let upvalue_base = incoming_base.checked_add(incoming_count.checked_mul(8)?)?;
         let upvalue_count = u32::from(target.plan.own_upvalue_count)
             .checked_add(u32::from(target.plan.inherited_upvalue_count))?;
         let upvalue_bytes = upvalue_count.checked_mul(4)?;
@@ -405,6 +423,8 @@ impl StackLayout {
             .filter(|bytes| *bytes != 0)?;
         let frame_bytes = spill.checked_add(40)?.checked_add(15)? & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
+            incoming_base,
+            incoming_count,
             upvalue_base,
             saved_x25: spill,
             entry_addr: spill + 8,
@@ -419,7 +439,7 @@ impl StackLayout {
 /// Whether a baked target fits the bounded generated stack-call layout.
 #[must_use]
 pub(crate) fn target_is_supported(target: &JitDirectCallee) -> bool {
-    StackLayout::for_target(target).is_some()
+    StackLayout::for_site(target, 0).is_some()
 }
 
 /// Compare `w11` against a baked function id.
@@ -534,6 +554,53 @@ fn emit_reset_generated_bail_streak(ops: &mut Assembler) {
         ; .arch aarch64
         ; str wzr, [x25, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET]
     );
+}
+
+/// [`abi::NativeFrameFlags::INCOMING_ARGUMENTS`] positioned in the 32-bit
+/// header word that holds register count, tier, and flags.
+const INCOMING_ARGUMENTS_HEADER_WORD: u32 = (abi::NativeFrameFlags::INCOMING_ARGUMENTS as u32)
+    << (8
+        * (std::mem::offset_of!(abi::VmFrameHeader, flags)
+            - std::mem::offset_of!(abi::VmFrameHeader, register_count)));
+
+/// Copy the fixed actual arguments into the stack-owned callee frame.
+///
+/// The declared parameter prefix lands in the callee's first registers. When
+/// the target materializes `arguments`, every actual argument is also stored
+/// in the published window after the register window, so the callee's
+/// `arguments` object sees the exact call-site list.
+fn emit_copy_fixed_arguments<Load>(
+    ops: &mut Assembler,
+    layout: &StackLayout,
+    site: DirectCallSite<'_>,
+    context: &'static str,
+    load: &mut Load,
+) -> Result<(), Unsupported>
+where
+    Load: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
+{
+    let DirectCallArguments::Fixed(arguments) = site.arguments else {
+        return Ok(());
+    };
+    let param_count = usize::from(site.target.plan.param_count);
+    for (argument, &source) in arguments.iter().enumerate() {
+        let index = u32::try_from(argument).map_err(|_| Unsupported::OperandShape(context))?;
+        let in_prefix = argument < param_count;
+        let in_window = index < layout.incoming_count;
+        if !in_prefix && !in_window {
+            break;
+        }
+        load(ops, source, 15, layout.frame_bytes)?;
+        if in_prefix {
+            let destination_offset = NATIVE_FRAME_STACK_SIZE + index * 8;
+            dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
+        }
+        if in_window {
+            let destination_offset = layout.incoming_base + index * 8;
+            dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
+        }
+    }
+    Ok(())
 }
 
 /// Initialize one compile-time register range in the stack-owned callee frame.
@@ -657,7 +724,17 @@ fn layout_and_artifact(
     view: &JitCompileSnapshot,
     site: DirectCallSite<'_>,
 ) -> Result<(StackLayout, DirectCallArtifact), Unsupported> {
-    let layout = StackLayout::for_target(site.target)
+    let argument_count = match site.arguments {
+        DirectCallArguments::Fixed(arguments) => u32::try_from(arguments.len())
+            .map_err(|_| Unsupported::OperandShape("direct call argument count"))?,
+        DirectCallArguments::Spread(_) if site.target.plan.needs_incoming_arguments => {
+            return Err(Unsupported::OperandShape(
+                "spread direct call publishing incoming arguments",
+            ));
+        }
+        DirectCallArguments::Spread(_) => 0,
+    };
+    let layout = StackLayout::for_site(site.target, argument_count)
         .ok_or(Unsupported::OperandShape("direct call stack frame"))?;
     if matches!(
         site.form,
@@ -1172,19 +1249,7 @@ where
             .min(usize::from(site.target.plan.param_count)),
         DirectCallArguments::Spread(_) => 0,
     };
-    if let DirectCallArguments::Fixed(arguments) = site.arguments {
-        for (argument, &source) in arguments.iter().take(copied_argument_count).enumerate() {
-            let destination_offset = NATIVE_FRAME_STACK_SIZE
-                + u32::try_from(argument)
-                    .map_err(|_| Unsupported::OperandShape("direct call argument index"))?
-                    * 8;
-            load(ops, source, 15, layout.frame_bytes)?;
-            dynasm!(ops
-                ; .arch aarch64
-                ; str x15, [sp, destination_offset]
-            );
-        }
-    }
+    emit_copy_fixed_arguments(ops, &layout, site, "direct call argument index", &mut load)?;
 
     // Generated callers bake the permanent function-cell address. The hot
     // load selects its current generation; only an empty publication enters
@@ -1242,7 +1307,22 @@ where
         ; ldr x13, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET]
         ; ldr w14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET + 8]
         ; str x13, [sp]
+    );
+    // The header word covers register count, tier, and flags. A target that
+    // materializes `arguments` gets its actual-argument window published in
+    // the same store; every frame records its argument count so the field is
+    // never read uninitialized.
+    if site.target.plan.needs_incoming_arguments {
+        dynasm!(ops
+            ; .arch aarch64
+            ; orr w14, w14, INCOMING_ARGUMENTS_HEADER_WORD
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
         ; str w14, [sp, 8]
+        ; movz w13, layout.incoming_count
+        ; str w13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         ; add x14, sp, NATIVE_FRAME_STACK_SIZE
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
@@ -1464,16 +1544,7 @@ where
             ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             ; str w15, [sp, abi::NATIVE_FRAME_EVAL_ENV_OFFSET]
         );
-        if let DirectCallArguments::Fixed(arguments) = site.arguments {
-            for (argument, &source) in arguments.iter().take(copied_argument_count).enumerate() {
-                let destination_offset = NATIVE_FRAME_STACK_SIZE
-                    + u32::try_from(argument)
-                        .map_err(|_| Unsupported::OperandShape("construct argument index"))?
-                        * 8;
-                load(ops, source, 15, layout.frame_bytes)?;
-                dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
-            }
-        }
+        emit_copy_fixed_arguments(ops, &layout, site, "construct argument index", &mut load)?;
         record_region(
             &mut code_map,
             "directConstructPrepare",

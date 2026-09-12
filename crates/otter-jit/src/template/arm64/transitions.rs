@@ -241,6 +241,26 @@ pub(super) fn emit_new_object(
     );
 }
 
+pub(super) fn emit_collect_arguments(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    dst: u16,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    emit_ctx_arg(ops);
+    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
+    emit_transition_call(
+        ops,
+        relocations,
+        table.variadic_entry(abi::STUB_JIT_COLLECT_ARGUMENTS),
+        abi::STUB_JIT_COLLECT_ARGUMENTS,
+        threw,
+        fatal,
+    );
+}
+
 pub(super) fn emit_new_array(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

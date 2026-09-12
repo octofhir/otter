@@ -384,6 +384,7 @@ impl JitCodeRegistry {
             register_count: function.register_count,
             own_upvalue_count: function.own_upvalue_count,
             inherited_upvalue_count: function.inherited_upvalue_count,
+            needs_incoming_arguments: function.needs_arguments,
         })
     }
 

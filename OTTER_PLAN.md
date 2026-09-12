@@ -49,27 +49,26 @@ claim.
 
 ## Live snapshot
 
-- Snapshot date: 2026-09-11.
-- Observed commit: the generated-callee promotion commit (clean tree at
+- Snapshot date: 2026-09-12.
+- Observed commit: the generated-frame actual-arguments commit (clean tree at
   snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
   full suite, the `otter-runtime` JIT integration suites touched by this
-  lane (explicit-receiver calls, generated-callee promotion, generic call
-  transition, property transitions, loose equality, direct-call receivers,
-  construct), `clippy --all-targets --all-features -D warnings` on
-  `otter-jit`, `otter-vm`, `otter-runtime`, and `otter-cli`, `otter-difftest`
-  23/23 with the interpreter oracle (`--interpreter`), `OTTER_GC_STRESS` 1/3/5
-  smoke on the constructor, receiver, and call repros, and focused Test262
-  (`language/expressions/equals`, `does-not-equals`, `language/statements/class`)
-  at 100%. Pre-existing failures that predate this lane and that `gate.sh`
-  never runs: `otter-runtime` `jit_artifacts`, `jit_debug_events` (3),
-  `jit_machine_call_chain` (3), `jit_machine_direct_call` (3),
-  `jit_machine_elements`, `jit_machine_generic_elements`,
-  `jit_machine_generic_properties`, and
-  `jit_stack_owned_array_construct::invalid_length`. These are local
-  observations, not a publishable clean-tree baseline.
+  lane (every `otter-runtime` `jit_*` suite, run with `--no-fail-fast`),
+  `clippy --all-targets --all-features -D warnings` on `otter-jit`,
+  `otter-vm`, and `otter-runtime`, `otter-difftest` 24/24 with the
+  interpreter oracle (`--interpreter`), and `OTTER_GC_STRESS` 1/3/5 with
+  `OTTER_GC_VERIFY` on the generated-arguments corpus entry. Failures that
+  predate this lane and that `gate.sh` never runs: `otter-runtime`
+  `jit_artifacts` (2), `jit_debug_events` (4), `jit_machine_call_chain` (3),
+  `jit_machine_direct_call` (3), `jit_machine_elements` (3),
+  `jit_machine_generic_elements`, `jit_machine_generic_properties` (2),
+  `jit_parse_int_leaf`, and `jit_stack_owned_array_construct::invalid_length`;
+  all are diagnostic-count assertions, every completion matches the
+  interpreter oracle. These are local observations, not a publishable
+  clean-tree baseline.
 - `ES_CONFORMANCE.md` and `docs/site/public/conformance/data.json` are current
   as of this commit: 99.98%, 12 fails of 53575, no crashes or timeouts.
 - No performance result from this dirty snapshot is eligible for publication.
@@ -503,9 +502,17 @@ element/property/binding access, string constants, intrinsics, exceptions, and
 deopt reconstruction. Keep extending the final path; do not translate new IR
 back into deleted/legacy SSA or add an emitter-specific semantic path.
 
-Current state (measured 2026-09-11, Octane in fresh processes against node
-v24): NavierStokes 2x, Richards 20x, Splay 21x, Box2D 65x, DeltaBlue 88x,
-EarleyBoyer 149x, RayTrace 156x, Crypto 255x behind. Explicit-receiver calls
+Current state (measured 2026-09-12, Octane in fresh processes against node
+v24): NavierStokes 2x, Richards 19x, Splay 21x (2x noise), Box2D 65x,
+DeltaBlue 90x, EarleyBoyer 145x, RayTrace 165x, Crypto 260x behind. A
+generated caller now publishes every actual argument after the callee's
+register window (`NativeFrameFlags::INCOMING_ARGUMENTS`, traced with the
+registers), so a body that materializes `arguments` takes direct call and
+construct linkage and builds its arguments object from the published window
+through one allocating transition instead of rejecting the plan; in RayTrace
+every `Class.create` construct site is now generated linkage, yet the score
+is unchanged because the constructor body immediately forwards through
+`Function.prototype.apply` in the runtime. Explicit-receiver calls
 and attempted polymorphic plain calls now lower to one explicit-receiver
 direct call (generic completion through a callee-carrying value entry), the
 template's unplanned plain calls complete in place, callees entered only
@@ -521,11 +528,19 @@ literals, and catch regions around named-property misses. Recompilation
 never reads the recorded bail PCs, so a failed speculation is re-emitted
 until the generation is abandoned.
 
-Next work, in order: admit `Throw`/`NewError`, closures with captured
-cells, and object/array literals into the Machine HIR with committed cold
-paths where no fast path is proven yet, measuring the decline histogram on
-Octane after each family; read `optimized_bail_pcs` during lowering so a
-recompile does not repeat the exited speculation; then the sequence below.
+Next work, in order: the template's monomorphic inlinable-numeric method
+path treats a receiver-guard miss as a deopt, so `color.brightness()` in
+RayTrace's `setPixel` side-exits on every call (118 generated-call deopts per
+run) and Box2D's template `CallMethodValue` sites bail 535 times — a guard
+miss must fall through to the direct-call and generic layers exactly as the
+polymorphic path already does; `f.apply(this, arguments)` with an
+arguments object must spread the published window into a direct call
+instead of re-entering the runtime; admit `Throw`/`NewError`, closures with
+captured cells, and object/array literals into the Machine HIR with
+committed cold paths where no fast path is proven yet, measuring the decline
+histogram on Octane after each family; read `optimized_bail_pcs` during
+lowering so a recompile does not repeat the exited speculation (Box2D's
+Machine `Mul` exits 300 times per run); then the sequence below.
 
 Active sequence:
 

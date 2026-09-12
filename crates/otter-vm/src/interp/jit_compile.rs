@@ -1699,15 +1699,18 @@ impl Interpreter {
                 );
                 continue;
             };
-            if callee.is_generator
+            let direct_ineligible = callee.is_generator
                 || callee.is_async
                 || callee.is_async_generator
-                || callee.needs_arguments
                 || callee.has_rest
                 || callee.contains_direct_eval
                 || (callee.is_derived_constructor && (!is_construct || callee.makes_function))
-                || (is_construct && callee.is_method)
-            {
+                || (is_construct && callee.is_method);
+            // An `arguments` body reads the actual-argument window its
+            // generated caller publishes, so it still takes direct linkage;
+            // spliced into the caller it would have no window to read.
+            let inline_ineligible = direct_ineligible || callee.needs_arguments;
+            if inline_ineligible {
                 self.record_jit_inline_candidate(
                     fid,
                     instruction_pc,
@@ -1724,6 +1727,8 @@ impl Interpreter {
                         makes_function: callee.makes_function,
                     }),
                 );
+            }
+            if direct_ineligible {
                 self.record_jit_direct_call_plan(
                     unresolved_call_kind,
                     fid,
@@ -1810,7 +1815,7 @@ impl Interpreter {
             if is_construct || op == Op::CallSpread {
                 continue;
             }
-            if !splice_candidates {
+            if !splice_candidates || inline_ineligible {
                 continue;
             }
             let Some(body) = self.bake_inline_body(context, callee_fid, tier) else {

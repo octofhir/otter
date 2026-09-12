@@ -1576,6 +1576,21 @@ pub const STUB_JIT_CONSTRUCT_VALUE: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// Build the activation's `arguments` object into one destination register.
+/// A stack-owned frame supplies the actual arguments its generated caller
+/// published after the register window; a materialized activation supplies
+/// them from its cold record. Allocating, never reentrant.
+pub const STUB_JIT_COLLECT_ARGUMENTS: RuntimeStubDescriptor = descriptor(
+    93,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::allocating(true, false),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+    NativeResultDomain::None,
+);
+
 /// Complete the exact published schema-owned binding operation from two boxed
 /// values. Function/PC identity selects the semantic family and operand roles
 /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
@@ -1734,6 +1749,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         90 => "jit_global_declaration_value",
         91 => "jit_call_with_this_value",
         92 => "jit_construct_value",
+        93 => "jit_collect_arguments",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1832,6 +1848,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_GLOBAL_DECLARATION_VALUE,
     STUB_JIT_CALL_WITH_THIS_VALUE,
     STUB_JIT_CONSTRUCT_VALUE,
+    STUB_JIT_COLLECT_ARGUMENTS,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -2245,6 +2262,24 @@ mod tests {
             STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
             NO_SAFEPOINT
         ));
+    }
+
+    #[test]
+    fn collect_arguments_entry_is_an_allocating_status_word_transition() {
+        assert_eq!(STUB_JIT_COLLECT_ARGUMENTS.id, 93);
+        assert_eq!(
+            STUB_JIT_COLLECT_ARGUMENTS.signature,
+            RuntimeStubSignature::Variadic
+        );
+        assert_eq!(STUB_JIT_COLLECT_ARGUMENTS.class, RuntimeStubClass::Alloc);
+        assert_eq!(
+            runtime_stub_name(STUB_JIT_COLLECT_ARGUMENTS.id),
+            "jit_collect_arguments"
+        );
+        assert_eq!(
+            STUB_JIT_COLLECT_ARGUMENTS.result_abi,
+            RuntimeStubResultAbi::StatusWord
+        );
     }
 
     #[test]

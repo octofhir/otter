@@ -317,6 +317,25 @@ pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 
     }
 }
 
+/// Runtime stub: build the activation's `arguments` object for
+/// `CollectArguments` from compiled code. A stack-owned frame reads the actual
+/// arguments its generated caller published; a materialized activation reads
+/// its cold record. Allocating; never re-enters JavaScript.
+pub(crate) extern "C" fn jit_collect_arguments_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = ctx
+        .runtime_call()
+        .and_then(|mut runtime| runtime.collect_arguments(dst as u16));
+    match result {
+        Ok(()) => NativeResultStatus::Success as u64,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            NativeResultStatus::Throw as u64
+        }
+    }
+}
+
 /// Materialize a regex literal (`Op::LoadRegExp`) into the frame's
 /// destination register. Allocating; a bad pattern reports `Throw`.
 pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {

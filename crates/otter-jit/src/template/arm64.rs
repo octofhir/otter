@@ -581,6 +581,16 @@ pub(super) fn compile(
                     fatal,
                 );
             }
+            TemplateOp::CollectArguments { dst } => {
+                transitions::emit_collect_arguments(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    threw,
+                    fatal,
+                );
+            }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
                     &mut ops,

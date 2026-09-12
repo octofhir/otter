@@ -3962,6 +3962,7 @@ mod tests {
                 register_count: 2,
                 own_upvalue_count: 0,
                 inherited_upvalue_count: 0,
+                needs_incoming_arguments: false,
             },
             receiver_allocation: None,
         }
@@ -4563,6 +4564,7 @@ mod tests {
                     register_count: 1,
                     own_upvalue_count: 0,
                     inherited_upvalue_count: 0,
+                    needs_incoming_arguments: false,
                 },
                 receiver_allocation: None,
             },
@@ -4724,6 +4726,7 @@ mod tests {
                     register_count: 1,
                     own_upvalue_count: 0,
                     inherited_upvalue_count: 0,
+                    needs_incoming_arguments: false,
                 },
                 receiver_allocation: None,
             },

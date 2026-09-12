@@ -104,6 +104,12 @@ impl NativeFrameFlags {
     /// semantics. The bit is representation-neutral: materialized entries and
     /// generated stack calls publish the same fact.
     pub const DERIVED_CONSTRUCTOR: u8 = 1 << 2;
+    /// The generated caller published every actual argument of this call in
+    /// a tagged window that starts right after the register window and holds
+    /// [`NativeFrame::argument_count`] values. Only stack-owned frames carry
+    /// the bit: a materialized activation keeps the same list in its cold
+    /// record instead.
+    pub const INCOMING_ARGUMENTS: u8 = 1 << 3;
 
     /// Empty flag set.
     #[must_use]
@@ -190,6 +196,9 @@ pub struct NativeFrame {
     /// native activation is published. Materialization moves the handle into
     /// the replacement [`crate::Frame`]; it never copies the root.
     pub(crate) eval_env: EvalEnvHandle,
+    /// Number of actual arguments published after the register window when
+    /// [`NativeFrameFlags::INCOMING_ARGUMENTS`] is set; otherwise unused.
+    pub argument_count: u32,
 }
 
 impl NativeFrame {
@@ -213,6 +222,7 @@ impl NativeFrame {
             self_value_bits: self_value.to_abi_bits(),
             upvalue_count: 0,
             eval_env: EvalEnvHandle::null(),
+            argument_count: 0,
         }
     }
 
@@ -285,6 +295,39 @@ impl NativeFrame {
         );
     }
 
+    /// Publish the actual-argument window that follows the register window.
+    ///
+    /// The owner must keep `register_base + register_count * 8` onward
+    /// initialized with `count` tagged values while this frame is active. The
+    /// register window itself must be generated-code stack storage.
+    pub fn set_incoming_arguments(&mut self, count: u32) {
+        debug_assert!(
+            self.header
+                .flags
+                .contains(NativeFrameFlags::STACK_REGISTERS),
+            "incoming arguments are published only by stack-owned frames"
+        );
+        self.argument_count = count;
+        self.header.flags = NativeFrameFlags::from_bits(
+            self.header.flags.bits() | NativeFrameFlags::INCOMING_ARGUMENTS,
+        );
+    }
+
+    /// Number of published actual arguments, or `None` when the caller kept
+    /// them elsewhere.
+    #[must_use]
+    pub const fn incoming_argument_count(&self) -> Option<u32> {
+        if self
+            .header
+            .flags
+            .contains(NativeFrameFlags::INCOMING_ARGUMENTS)
+        {
+            Some(self.argument_count)
+        } else {
+            None
+        }
+    }
+
     /// Mark this activation as a derived constructor.
     pub fn set_derived_constructor(&mut self) {
         self.header.flags = NativeFrameFlags::from_bits(
@@ -331,7 +374,7 @@ impl NativeFrame {
 const _: [(); 72] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
-const _: [(); 64] = [(); std::mem::size_of::<NativeFrame>()];
+const _: [(); 72] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmThread, current_code_object_id)];
@@ -349,6 +392,7 @@ const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, new_target_bits)];
 const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, self_value_bits)];
 const _: [(); 56] = [(); std::mem::offset_of!(NativeFrame, upvalue_count)];
 const _: [(); 60] = [(); std::mem::offset_of!(NativeFrame, eval_env)];
+const _: [(); 64] = [(); std::mem::offset_of!(NativeFrame, argument_count)];
 
 /// Byte offset of the VM-owned direct-eval environment root in
 /// [`NativeFrame`].
@@ -356,6 +400,11 @@ const _: [(); 60] = [(); std::mem::offset_of!(NativeFrame, eval_env)];
 /// Generated code may write the nullable compressed handle at this numeric
 /// offset, but the Rust field and its typed accessors remain VM-private.
 pub const NATIVE_FRAME_EVAL_ENV_OFFSET: u32 = std::mem::offset_of!(NativeFrame, eval_env) as u32;
+
+/// Byte offset of [`NativeFrame::argument_count`], written by generated
+/// callers that publish the actual-argument window.
+pub const NATIVE_FRAME_ARGUMENT_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, argument_count) as u32;
 
 #[cfg(test)]
 mod tests {
@@ -402,6 +451,9 @@ mod tests {
                 .flags
                 .contains(NativeFrameFlags::STACK_REGISTERS)
         );
+        assert_eq!(frame.incoming_argument_count(), None);
+        frame.set_incoming_arguments(5);
+        assert_eq!(frame.incoming_argument_count(), Some(5));
     }
 
     #[test]
@@ -434,10 +486,12 @@ mod tests {
     #[test]
     fn native_frame_layout_includes_traced_eval_env_slot() {
         assert_eq!(std::mem::size_of::<VmFrameHeader>(), 12);
-        assert_eq!(std::mem::size_of::<NativeFrame>(), 64);
+        assert_eq!(std::mem::size_of::<NativeFrame>(), 72);
         assert_eq!(std::mem::offset_of!(NativeFrame, register_base), 16);
         assert_eq!(std::mem::offset_of!(NativeFrame, upvalue_base), 24);
         assert_eq!(std::mem::offset_of!(NativeFrame, self_value_bits), 48);
         assert_eq!(std::mem::offset_of!(NativeFrame, eval_env), 60);
+        assert_eq!(std::mem::offset_of!(NativeFrame, argument_count), 64);
+        assert_eq!(NATIVE_FRAME_ARGUMENT_COUNT_OFFSET, 64);
     }
 }

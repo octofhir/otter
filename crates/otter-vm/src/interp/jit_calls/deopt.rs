@@ -135,6 +135,15 @@ impl Interpreter {
         );
         frame.self_value = self_value;
         frame.pc = native.header.pc;
+        // The generated caller's actual-argument window dies with its stack
+        // frame; the interpreter continuation reads the same list from the
+        // cold record, exactly as an interpreter-entered call would.
+        if let Some(count) = active.incoming_argument_count() {
+            let incoming = (0..count)
+                .map(|index| active.incoming_argument(index))
+                .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()?;
+            self.frame_ensure_cold(&mut frame).incoming_args = incoming;
+        }
         if matches!(
             call_kind,
             jit::JitDirectCallKind::Construct | jit::JitDirectCallKind::SuperConstruct

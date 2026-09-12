@@ -50,7 +50,7 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-12.
-- Observed commit: the optimized-exit-profile fold commit (clean tree at
+- Observed commit: the construct-prepare GC-counter fix (clean tree at
   snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
@@ -503,8 +503,13 @@ deopt reconstruction. Keep extending the final path; do not translate new IR
 back into deleted/legacy SSA or add an emitter-specific semantic path.
 
 Current state (measured 2026-09-12, Octane in fresh processes against node
-v24): NavierStokes 2x, Richards 19x, Splay 21x (2x noise), Box2D 62x,
-DeltaBlue 90x, EarleyBoyer 122x, RayTrace 163x, Crypto 243x behind. The
+v24): NavierStokes 2x, Richards 19x, Splay 27x (2x noise), Box2D 61x,
+DeltaBlue 86x, EarleyBoyer 96x, RayTrace 137x, Crypto 248x behind. The
+generated construct-prepare transition sampled the collector's cycle counts
+through `gc_stats()`, which re-aggregates the whole per-type table; two such
+calls per construct were the hottest leaf in RayTrace (17% of the main
+thread). The heap now exposes the two maintained counters directly
+(RayTrace 559 → 670, EarleyBoyer 833 → 1043, DeltaBlue 1373 → 1543). The
 template's plain and explicit-receiver calls without a generated edge now
 complete through the callee-carrying value transition that the Machine tier
 already used, so a native call inside a stack-owned generated callee no

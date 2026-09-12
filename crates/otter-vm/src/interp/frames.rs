@@ -343,9 +343,8 @@ impl Interpreter {
     }
 
     /// Collector cycle counts used to classify a rooted receiver fallback.
-    pub fn jit_gc_cycle_counts(&mut self) -> (u64, u64) {
-        let stats = self.gc_heap.gc_stats();
-        (stats.minor_gc_cycles, stats.gc_cycles)
+    pub fn jit_gc_cycle_counts(&self) -> (u64, u64) {
+        self.gc_heap.gc_cycle_counts()
     }
 
     /// Address of the collector's incremental-marking flag byte, read by the

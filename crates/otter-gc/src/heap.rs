@@ -2352,6 +2352,17 @@ impl GcHeap {
         }
     }
 
+    /// `(minor cycles, full cycles)` completed so far.
+    ///
+    /// Reads the two maintained counters directly; unlike [`Self::gc_stats`]
+    /// it does not re-aggregate the per-type table, so a hot allocation path
+    /// may sample it before and after one operation to learn whether a
+    /// collection ran in between.
+    #[must_use]
+    pub fn gc_cycle_counts(&self) -> (u64, u64) {
+        (self.gc_stats.minor_gc_cycles, self.gc_stats.gc_cycles)
+    }
+
     /// Per-heap GC counters (alloc / live / free, per-type
     /// breakdown). The alloc fast path only updates the per-tag
     /// rows; the aggregates `live_objects` / `live_bytes` are

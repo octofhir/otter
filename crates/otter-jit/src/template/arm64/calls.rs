@@ -1036,17 +1036,10 @@ pub(super) fn emit_call_with_receiver(
             ops,
             relocations,
             table,
-            view,
-            None,
-            code_map,
             dst,
             callee,
             receiver,
             argument_registers,
-            logical_pc,
-            byte_pc,
-            bail,
-            threw,
             throw_value,
             fatal,
         );
@@ -1143,7 +1136,7 @@ pub(super) fn emit_call_with_receiver(
         return Ok(());
     }
 
-    if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
+    if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
         events.insert(
             (byte_pc, 0),
             direct_call_lowering_event(
@@ -1163,92 +1156,116 @@ pub(super) fn emit_call_with_receiver(
         ops,
         relocations,
         table,
-        view,
-        direct_call_events,
-        code_map,
         dst,
         callee,
         receiver,
         argument_registers,
-        logical_pc,
-        byte_pc,
-        bail,
-        threw,
         throw_value,
         fatal,
     )
 }
 
-/// Number of 16-bit register lanes the in-place call transition carries in
-/// each of its two argument words.
-pub(super) const GENERIC_CALL_LANES_PER_WORD: usize = 4;
-
-/// Pack up to eight argument registers into the two lane words of the
-/// in-place call transition; `None` when the site has more.
-pub(super) fn pack_generic_call_lanes(argument_registers: &[u16]) -> Option<(u64, u64)> {
-    if argument_registers.len() > 2 * GENERIC_CALL_LANES_PER_WORD {
-        return None;
-    }
-    let mut words = [0u64; 2];
-    for (index, register) in argument_registers.iter().enumerate() {
-        words[index / GENERIC_CALL_LANES_PER_WORD] |=
-            u64::from(*register) << ((index % GENERIC_CALL_LANES_PER_WORD) * 16);
-    }
-    Some((words[0], words[1]))
+/// One word of a boxed-value packet handed to a reentrant value transition.
+#[derive(Debug, Clone, Copy)]
+enum PacketWord {
+    /// A live interpreter-compatible register of the compiled frame.
+    Register(u16),
+    /// The `undefined` constant.
+    Undefined,
 }
 
-/// Complete `Op::Call` / `Op::CallWithThis` in place through the variadic
-/// call transition when the site owns no generated edge.
+/// Build one contiguous boxed-value packet on the machine stack, complete it
+/// through `descriptor`, and commit the returned value to `dst`.
 ///
-/// The transition reads the callee, receiver, and arguments from the
-/// published register window, runs the canonical call, and writes the result
-/// back; a throw reaches the frame's committed-throw router. Only a site
-/// wider than the transition's eight argument lanes keeps the exact
-/// pre-effect side exit.
+/// The packet lives below `sp` only for the duration of the transition; the
+/// VM copies it before any allocation, so no packet word is a collector root.
+/// Success falls through with `dst` written, a JavaScript exception reaches
+/// `throw_value`, and a structural failure reaches `fatal`. The transition
+/// never requests a side exit or a replay.
 #[allow(clippy::too_many_arguments)]
-fn emit_generic_call_transition(
+fn emit_value_packet_transition(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    view: &JitCompileSnapshot,
-    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
-    code_map: Option<&mut CodeMapCapture>,
+    descriptor: abi::RuntimeStubDescriptor,
+    words: &[PacketWord],
+    dst: u16,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let packet_words = u32::try_from(words.len())
+        .ok()
+        .filter(|words| *words != 0)
+        .ok_or(Unsupported::OperandShape(
+            "template value-packet word count",
+        ))?;
+    let packet_bytes = packet_words
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(15))
+        .map(|bytes| bytes & !15)
+        .filter(|bytes| *bytes <= 4_080)
+        .ok_or(Unsupported::OperandShape("template value-packet frame"))?;
+    dynasm!(ops ; .arch aarch64 ; sub sp, sp, packet_bytes);
+    for (index, word) in words.iter().enumerate() {
+        match *word {
+            PacketWord::Register(register) => emit_load_reg(ops, 9, register)?,
+            PacketWord::Undefined => emit_load_u64(ops, 9, VALUE_UNDEFINED),
+        }
+        let offset = u32::try_from(index)
+            .ok()
+            .and_then(|word| word.checked_mul(8))
+            .ok_or(Unsupported::OperandShape("template value-packet offset"))?;
+        dynasm!(ops ; .arch aarch64 ; str x9, [sp, offset]);
+    }
+    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; mov x1, sp ; movz w2, packet_words);
+    emit_load_runtime_stub(ops, relocations, 16, table.entry(descriptor), descriptor);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; add sp, sp, packet_bytes
+        ; cbz x1, >completed
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
+        ; completed:
+    );
+    emit_store_reg(ops, 0, dst)
+}
+
+/// Complete `Op::Call` / `Op::CallWithThis` through the callee-carrying value
+/// transition when the site owns no generated edge.
+///
+/// The packet is `[callee, receiver, arguments…]`; a plain call passes
+/// `undefined` as the receiver and the callee's own binding rules apply. The
+/// transition completes against the published native frame, so it works
+/// identically for a materialized activation and for a stack-owned generated
+/// callee; the site never side-exits merely because it has no direct target.
+pub(super) fn emit_generic_call_transition(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
     dst: u16,
     callee: u16,
     receiver: Option<u16>,
     argument_registers: &[u16],
-    logical_pc: u32,
-    byte_pc: u32,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let Some((lanes_low, lanes_high)) = pack_generic_call_lanes(argument_registers) else {
-        dynasm!(ops ; .arch aarch64 ; b =>bail);
-        return Ok(());
-    };
-    let argc = u64::try_from(argument_registers.len())
-        .map_err(|_| Unsupported::OperandShape("generic call argument count"))?;
-    let (opcode, this_lane) = match receiver {
-        Some(receiver) => (otter_bytecode::Op::CallWithThis, u64::from(receiver)),
-        None => (otter_bytecode::Op::Call, 0),
-    };
-    super::spread_call::emit_spread_call_op(
+    let mut words = Vec::with_capacity(argument_registers.len() + 2);
+    words.push(PacketWord::Register(callee));
+    words.push(receiver.map_or(PacketWord::Undefined, PacketWord::Register));
+    words.extend(
+        argument_registers
+            .iter()
+            .map(|&register| PacketWord::Register(register)),
+    );
+    emit_value_packet_transition(
         ops,
         relocations,
         table,
-        view,
-        direct_call_events,
-        code_map,
-        opcode as u8,
-        u64::from(dst) | (u64::from(callee) << 16) | (this_lane << 32) | (argc << 48),
-        lanes_low,
-        lanes_high,
-        logical_pc,
-        byte_pc,
-        bail,
-        threw,
+        abi::STUB_JIT_CALL_WITH_THIS_VALUE,
+        &words,
+        dst,
         throw_value,
         fatal,
     )
@@ -1685,53 +1702,23 @@ pub(super) fn emit_method_call(
         }
         dynasm!(ops ; .arch aarch64 ; =>next_target);
     }
-    let packet_words = argument_registers
-        .len()
-        .checked_add(1)
-        .and_then(|words| u32::try_from(words).ok())
-        .ok_or(Unsupported::OperandShape(
-            "template method value-packet word count",
-        ))?;
-    let packet_bytes = packet_words
-        .checked_mul(8)
-        .and_then(|bytes| bytes.checked_add(15))
-        .map(|bytes| bytes & !15)
-        .ok_or(Unsupported::OperandShape(
-            "template method value-packet frame",
-        ))?;
-    dynasm!(ops ; .arch aarch64 ; sub sp, sp, packet_bytes);
-    emit_load_reg(ops, 9, receiver)?;
-    dynasm!(ops ; .arch aarch64 ; str x9, [sp]);
-    for (index, &argument) in argument_registers.iter().enumerate() {
-        emit_load_reg(ops, 9, argument)?;
-        let offset = u32::try_from(index + 1)
-            .ok()
-            .and_then(|word| word.checked_mul(8))
-            .ok_or(Unsupported::OperandShape(
-                "template method value-packet offset",
-            ))?;
-        dynasm!(ops ; .arch aarch64 ; str x9, [sp, offset]);
-    }
-    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; mov x1, sp ; movz w2, packet_words);
-    emit_load_runtime_stub(
+    let mut words = Vec::with_capacity(argument_registers.len() + 1);
+    words.push(PacketWord::Register(receiver));
+    words.extend(
+        argument_registers
+            .iter()
+            .map(|&register| PacketWord::Register(register)),
+    );
+    emit_value_packet_transition(
         ops,
         relocations,
-        16,
-        table.entry(abi::STUB_JIT_CALL_METHOD_VALUE),
+        table,
         abi::STUB_JIT_CALL_METHOD_VALUE,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; add sp, sp, packet_bytes
-        ; cbz x1, >method_value_completed
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>throw_value
-        ; b =>fatal
-        ; method_value_completed:
-    );
-    emit_store_reg(ops, 0, dst)?;
-    dynasm!(ops ; .arch aarch64 ; b =>done);
+        &words,
+        dst,
+        throw_value,
+        fatal,
+    )?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

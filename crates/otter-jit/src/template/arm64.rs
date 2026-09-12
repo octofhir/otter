@@ -770,8 +770,8 @@ pub(super) fn compile(
             } => {
                 let argument_registers = plan.call_argument_registers(argc, packed_args);
                 // A monomorphic site takes the generated direct-call edge;
-                // everything else keeps the variadic in-place transition,
-                // which completes without a side exit.
+                // everything else completes through the callee-carrying value
+                // transition, which never side-exits.
                 if view
                     .direct_callees
                     .get(&byte_pc)
@@ -796,32 +796,18 @@ pub(super) fn compile(
                         committed_throw,
                         fatal,
                     )?;
-                } else if let Some((lanes_low, lanes_high)) =
-                    calls::pack_generic_call_lanes(&argument_registers)
-                {
-                    spread_call::emit_spread_call_op(
+                } else {
+                    calls::emit_generic_call_transition(
                         &mut ops,
                         &mut relocations,
                         transitions,
-                        view,
-                        direct_call_events.as_mut(),
-                        code_map.as_mut(),
-                        otter_bytecode::Op::CallWithThis as u8,
-                        u64::from(dst)
-                            | (u64::from(callee) << 16)
-                            | (u64::from(this_value) << 32)
-                            | (u64::from(argc) << 48),
-                        lanes_low,
-                        lanes_high,
-                        instr.pc,
-                        byte_pc,
-                        bail,
-                        threw,
+                        dst,
+                        callee,
+                        Some(this_value),
+                        &argument_registers,
                         committed_throw,
                         fatal,
                     )?;
-                } else {
-                    dynasm!(ops ; .arch aarch64 ; b =>bail);
                 }
             }
             TemplateOp::Construct {

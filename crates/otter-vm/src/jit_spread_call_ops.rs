@@ -7,7 +7,7 @@
 //! - Synchronous full-completion siblings for frame-pushing call/construct
 //!   helpers.
 //! - Canonical `GetMethod + Call` completion for compiled method-call misses.
-//! - Packed-operand dispatch for the remaining spread/call-family stub.
+//! - Packed-operand dispatch for the spread call/construct stub.
 //!
 //! # Invariants
 //! - Calls and constructions append to the current rooted activation stack;
@@ -665,33 +665,6 @@ impl Interpreter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_call_full_regs(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
-        dst: u16,
-        callee_reg: u16,
-        this_reg: Option<u16>,
-        arg_regs: &[u16],
-    ) -> Result<(), VmError> {
-        let callee = *read_register(&stack[frame_index], callee_reg)?;
-        let this_value = match this_reg {
-            Some(reg) => *read_register(&stack[frame_index], reg)?,
-            None => Value::undefined(),
-        };
-        let mut args = SmallVec::with_capacity(arg_regs.len());
-        for &reg in arg_regs {
-            args.push(*read_register(&stack[frame_index], reg)?);
-        }
-        let result = self.run_rooted_call_values(stack, context, callee, this_value, args)?;
-        let frame = &mut stack[frame_index];
-        write_register(frame, dst, result)?;
-        frame.advance_pc()?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn run_construct_spread_full_regs(
         &mut self,
         context: &ExecutionContext,
@@ -740,8 +713,6 @@ impl Interpreter {
             opcode,
             value
                 if value == Op::CallSpread as u8
-                    || value == Op::Call as u8
-                    || value == Op::CallWithThis as u8
                     || value == Op::NewSpread as u8
                     || value == Op::SuperConstructSpread as u8
         ) {
@@ -752,20 +723,6 @@ impl Interpreter {
         }
         let saved_pc = stack[frame_index].pc;
         let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
-        // Argument registers travel as 16-bit lanes: the first four in
-        // `arg1`, the next four in `arg2`.
-        let packed_regs =
-            |low: u64, high: u64, count: usize| -> Result<SmallVec<[u16; 8]>, VmError> {
-                if count > 8 {
-                    return Err(VmError::InvalidOperand);
-                }
-                let mut regs = SmallVec::<[u16; 8]>::with_capacity(count);
-                for index in 0..count {
-                    let word = if index < 4 { low } else { high };
-                    regs.push(lane(word, index % 4));
-                }
-                Ok(regs)
-            };
         match opcode {
             value if value == Op::CallSpread as u8 => {
                 self.run_call_spread_full_regs(
@@ -776,30 +733,6 @@ impl Interpreter {
                     lane(arg0, 1),
                     lane(arg0, 2),
                     lane(arg0, 3),
-                )?;
-            }
-            value if value == Op::CallWithThis as u8 => {
-                let regs = packed_regs(arg1, arg2, lane(arg0, 3) as usize)?;
-                self.run_call_full_regs(
-                    context,
-                    stack,
-                    frame_index,
-                    lane(arg0, 0),
-                    lane(arg0, 1),
-                    Some(lane(arg0, 2)),
-                    &regs,
-                )?;
-            }
-            value if value == Op::Call as u8 => {
-                let regs = packed_regs(arg1, arg2, lane(arg0, 3) as usize)?;
-                self.run_call_full_regs(
-                    context,
-                    stack,
-                    frame_index,
-                    lane(arg0, 0),
-                    lane(arg0, 1),
-                    None,
-                    &regs,
                 )?;
             }
             value if value == Op::NewSpread as u8 || value == Op::SuperConstructSpread as u8 => {

@@ -50,8 +50,8 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-12.
-- Observed commit: the template generic-call value-transition commit (clean
-  tree at snapshot time).
+- Observed commit: the optimized-exit-profile fold commit (clean tree at
+  snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
@@ -533,12 +533,16 @@ literals, and catch regions around named-property misses. Recompilation
 never reads the recorded bail PCs, so a failed speculation is re-emitted
 until the generation is abandoned.
 
-Next work, in order: Machine lowering must consult the recorded exit PCs
-(`optimized_bail_pcs`, the analogue of JSC's per-site ExitProfile that the
-DFG queries before re-speculating) so a rebuilt generation does not repeat
-the speculation that exited — today RayTrace's `rayTrace` exits 100 times at
-one `LooseNotEqual` and Box2D exits 100 times per `Mul` site before the
-budget rebuilds an identical body; `f.apply(this, arguments)` with an
+The recorded optimized exit PCs (`optimized_bail_pcs`) are now folded into
+the baked per-instruction feedback of every snapshot, standalone or spliced
+inline, so a rebuilt generation speculates no narrower than the exit already
+refuted — the analogue of JSC's per-site ExitProfile that the DFG consults
+before re-speculating; an inlined frame's exit records the innermost PC as
+well as the root's. The rebuild still waits for the 100-exit budget (JSC's
+`osrExitCountForReoptimization`), so a site such as RayTrace's `rayTrace`
+`LooseNotEqual` pays one budget per generation.
+
+Next work, in order: `f.apply(this, arguments)` with an
 arguments object must spread the published window into a direct call
 instead of re-entering the runtime; the spread call/construct transition
 still requires a materialized frame and side-exits stack-owned callees;

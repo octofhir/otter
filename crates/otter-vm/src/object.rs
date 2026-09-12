@@ -2072,7 +2072,7 @@ const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
 impl ObjectBody {
     /// Number of live string-keyed slots.
     #[inline]
-    fn slab_len(&self) -> usize {
+    pub(crate) fn slab_len(&self) -> usize {
         self.slab_len as usize
     }
 

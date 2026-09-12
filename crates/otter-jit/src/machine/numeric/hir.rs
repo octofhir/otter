@@ -54,6 +54,8 @@
 //!   compare directly with a static nullish literal, but the node retains an
 //!   exact pre-operation state so a native-function cell can deopt for HTMLDDA
 //!   semantics.
+//! - Literal allocation keeps boxed operand spans and a precise root state;
+//!   it cannot invoke JavaScript or replay an allocation after completion.
 //! - `ArrayConstruct` accepts only zero arguments or one exact Int32 length.
 //!   The allocating operation and any required tagged decode retain the same
 //!   exact pre-construction frame state; all wider arities stay on the Template
@@ -92,6 +94,8 @@
 //!   header phi; every external entry edge is recorded for mandatory clearing.
 //! - HIR preserves source CFG edges; selection splits critical edges before
 //!   allocator move placement.
+//! - Unprotected static-native calls consume the shared VM leaf declaration,
+//!   preserving exact pre-call frame state for identity and operand misses.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -219,6 +223,13 @@ pub(super) enum NumericNode {
         value: NumericValue,
         byte_pc: u32,
     },
+    LiteralAllocation {
+        target: otter_vm::native_abi::RuntimeStubDescriptor,
+        argument_start: u32,
+        argument_count: u32,
+        logical_pc: u32,
+        byte_pc: u32,
+    },
     ArrayConstruct {
         length: NumericValue,
         byte_pc: u32,
@@ -238,6 +249,13 @@ pub(super) enum NumericNode {
         logical_pc: u32,
         byte_pc: u32,
         exceptional_edge: Option<u16>,
+    },
+    NativeLeaf {
+        source: NumericValue,
+        target: otter_vm::JitStaticNativeCall,
+        value_type: NumericType,
+        argument_start: u32,
+        byte_pc: u32,
     },
     ColdCallExit {
         kind: NumericColdCallKind,
@@ -422,7 +440,7 @@ fn generic_call_with_this_target() -> NumericDirectCallTarget {
     }
 }
 
-fn append_direct_call_arguments(
+fn append_operand_values(
     storage: &mut Vec<NumericValue>,
     arguments: impl IntoIterator<Item = NumericValue>,
 ) -> Option<(u32, u32)> {
@@ -512,6 +530,7 @@ impl NumericNode {
             | Self::GenericElementLoad { .. }
             | Self::GenericElementStore { .. }
             | Self::ArrayConstruct { .. }
+            | Self::LiteralAllocation { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::ColdCallExit { .. }
@@ -564,7 +583,7 @@ impl NumericNode {
             | Self::IntegerNotEqualImmediate(..)
             | Self::BlockParameter(NumericType::Boolean) => NumericType::Boolean,
             Self::BooleanConstant(..) => NumericType::Boolean,
-            Self::Parameter { value_type, .. } => value_type,
+            Self::Parameter { value_type, .. } | Self::NativeLeaf { value_type, .. } => value_type,
             Self::BlockParameter(NumericType::Number)
             | Self::ElementLoad {
                 access: NumericElementAccess::PackedDouble,
@@ -587,7 +606,7 @@ impl NumericNode {
     /// Authoritative selection use of an attached frame state.
     pub(super) const fn frame_state_purpose(self) -> Option<NumericFrameStatePurpose> {
         match self {
-            Self::CommittedValue { .. } | Self::Binding { .. } => {
+            Self::CommittedValue { .. } | Self::Binding { .. } | Self::LiteralAllocation { .. } => {
                 Some(NumericFrameStatePurpose::TaggedRoots)
             }
             Self::GenericElementLoad { .. } | Self::GenericElementStore { .. } => {
@@ -605,6 +624,7 @@ impl NumericNode {
             | Self::CheckedFloat64ToElementIndex { .. }
             | Self::ArrayConstruct { .. }
             | Self::DirectCall { .. }
+            | Self::NativeLeaf { .. }
             | Self::TaggedToBoolean(..)
             | Self::TaggedStrictEqual(..)
             | Self::TaggedNullishEqual { .. }
@@ -657,7 +677,8 @@ pub(super) struct NumericFunction {
     pub(super) blocks: Vec<NumericBlock>,
     pub(super) frame_states: Vec<NumericFrameState>,
     pub(super) direct_call_targets: Vec<NumericDirectCallTarget>,
-    pub(super) direct_call_arguments: Vec<NumericValue>,
+    /// Shared immutable spans for call, native-leaf and literal operands.
+    pub(super) operand_values: Vec<NumericValue>,
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
@@ -968,7 +989,7 @@ impl NumericFunction {
         let mut arithmetic_op_count = 0usize;
         let mut frame_states = Vec::new();
         let mut direct_call_targets = Vec::new();
-        let mut direct_call_arguments = Vec::new();
+        let mut operand_values = Vec::new();
         let mut requires_mixed_join = false;
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
@@ -1086,9 +1107,9 @@ impl NumericFunction {
                     &view.element_accesses,
                     &view.string_constant_cells,
                     &view.binding_hit_proofs,
-                    view.cage_base != 0,
+                    view,
                     &mut direct_call_targets,
-                    &mut direct_call_arguments,
+                    &mut operand_values,
                     instruction_semantics[pc],
                     (pc == terminal_pc)
                         .then_some(raw.exceptional_edge)
@@ -1261,7 +1282,7 @@ impl NumericFunction {
                 blocks,
                 frame_states,
                 direct_call_targets,
-                direct_call_arguments,
+                operand_values,
                 parameter_count,
                 register_count,
                 arithmetic_op_count,
@@ -1386,6 +1407,7 @@ fn packed_double_cache_loop_is_safe(
                             | NumericNode::DirectCall { .. }
                             | NumericNode::ColdCallExit { .. }
                             | NumericNode::ArrayConstruct { .. }
+                            | NumericNode::LiteralAllocation { .. }
                             | NumericNode::TaggedStringConcat(..)
                             | NumericNode::CommittedValue { .. }
                             | NumericNode::ClassSuperConstructor(..)
@@ -2392,13 +2414,14 @@ fn lower_instruction(
     element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
     string_constant_cells: &rustc_hash::FxHashMap<u32, otter_vm::jit::JitStringConstantCell>,
     binding_hit_proofs: &rustc_hash::FxHashMap<u32, otter_vm::jit::BindingHitProof>,
-    cage_available: bool,
+    view: &JitCompileSnapshot,
     direct_call_targets: &mut Vec<NumericDirectCallTarget>,
-    direct_call_arguments: &mut Vec<NumericValue>,
+    operand_values: &mut Vec<NumericValue>,
     semantics: InstructionSemantics,
     exceptional_edge: Option<usize>,
     exceptional_value: &mut Option<NumericValue>,
 ) -> Option<()> {
+    let cage_available = view.cage_base != 0;
     let op = instruction.op(code);
     let local_handler = has_local_exception_handler(code, logical_pc);
     let expects_exceptional_edge = local_handler && semantics.has_implicit_exception_side_exit(op);
@@ -2498,6 +2521,7 @@ fn lower_instruction(
             return Some(());
         }
         Op::LoadUndefined => NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+        Op::LoadHole => NumericNode::TaggedConstant(otter_vm::Value::hole().to_bits()),
         Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
         Op::LoadThis => NumericNode::This,
         Op::LoadString => {
@@ -2856,6 +2880,47 @@ fn lower_instruction(
             instruction.const_index(code, 1)?;
             NumericNode::Constant(instruction.load_number?)
         }
+        Op::NewObject | Op::NewArray => {
+            let count = if op == Op::NewArray {
+                usize::try_from(instruction.const_index(code, 1)?).ok()?
+            } else {
+                0
+            };
+            let arguments = (0..count)
+                .map(|index| read_value(registers, register(instruction, code, index + 2)?))
+                .collect::<Option<Vec<_>>>()?;
+            let (argument_start, argument_count) =
+                append_operand_values(operand_values, arguments)?;
+            let value = push(
+                nodes,
+                NumericNode::LiteralAllocation {
+                    target: if op == Op::NewArray {
+                        otter_vm::native_abi::STUB_JIT_NEW_ARRAY
+                    } else {
+                        otter_vm::native_abi::STUB_JIT_NEW_OBJECT
+                    },
+                    argument_start,
+                    argument_count,
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
         Op::ArrayConstruct => {
             let argument_count = usize::try_from(instruction.const_index(code, 1)?).ok()?;
             let length = match argument_count {
@@ -2910,6 +2975,56 @@ fn lower_instruction(
                     )
                 })
                 .collect::<Option<Vec<_>>>()?;
+            if !explicit_receiver
+                && exceptional_edge.is_none()
+                && let Some(target) = view.static_native_calls.get(&instruction.byte_pc).copied()
+                && crate::template::arm64::ic_probe::native_leaf_call_is_supported(
+                    view,
+                    target.leaf_stub_id,
+                    argument_count,
+                )
+                && super::super::native_leaf::descriptor(
+                    target,
+                    instruction.byte_pc,
+                    crate::machine::MachineRepresentation::Tagged,
+                )
+                .is_some()
+            {
+                let value_type = if super::super::native_leaf::supports_int32(target.leaf_stub_id)
+                    && arguments
+                        .iter()
+                        .all(|argument| nodes[argument.0].value_type() == NumericType::Int32)
+                {
+                    NumericType::Int32
+                } else {
+                    NumericType::Tagged
+                };
+                let (argument_start, _) = append_operand_values(operand_values, arguments)?;
+                let value = push(
+                    nodes,
+                    NumericNode::NativeLeaf {
+                        source,
+                        target,
+                        value_type,
+                        argument_start,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                );
+            }
             let direct = direct_callees.get(&instruction.byte_pc).copied();
             if direct.is_none() && !instruction.call_attempted {
                 return lower_cold_call_exit(
@@ -2959,7 +3074,7 @@ fn lower_instruction(
                 }
             };
             let (argument_start, argument_count) =
-                append_direct_call_arguments(direct_call_arguments, arguments)?;
+                append_operand_values(operand_values, arguments)?;
             let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
@@ -3040,7 +3155,7 @@ fn lower_instruction(
                 }
             };
             let (argument_start, argument_count) =
-                append_direct_call_arguments(direct_call_arguments, arguments)?;
+                append_operand_values(operand_values, arguments)?;
             let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
@@ -3154,7 +3269,7 @@ fn lower_instruction(
                 }
             };
             let (argument_start, argument_count) =
-                append_direct_call_arguments(direct_call_arguments, arguments)?;
+                append_operand_values(operand_values, arguments)?;
             let target = intern_direct_call_target(direct_call_targets, target)?;
             let value = push(
                 nodes,
@@ -4029,6 +4144,87 @@ mod tests {
         call_view_with_arguments(method, &[1])
     }
 
+    #[test]
+    fn native_leaf_selection_requires_exact_arity_and_preserves_pre_call_state() {
+        use crate::machine::{CallEffects, CallTarget, MachineOpcode, native_leaf};
+        use otter_vm::native_abi::{STUB_MATH_MAX_LEAF, STUB_PARSE_INT_I32_LEAF};
+        for (stub, argument_count) in [(STUB_PARSE_INT_I32_LEAF, 1), (STUB_MATH_MAX_LEAF, 2)] {
+            for count in 0..=3 {
+                let arguments = vec![1; count];
+                let mut view = call_view_with_arguments(false, &arguments);
+                view.native_ref_byte = 8;
+                view.seed_call_attempted_for_test(0);
+                view.static_native_calls.insert(
+                    0,
+                    otter_vm::JitStaticNativeCall {
+                        builtin_native_ref: 7,
+                        leaf_stub_id: stub.id,
+                        argument_count,
+                    },
+                );
+                let hir = NumericFunction::build(&view).expect("static-native HIR");
+                let leaf = hir
+                    .nodes
+                    .iter()
+                    .position(|node| matches!(node, NumericNode::NativeLeaf { .. }));
+                if count != usize::from(argument_count) {
+                    assert!(
+                        leaf.is_none(),
+                        "arity mismatch must retain the canonical call"
+                    );
+                    assert!(
+                        hir.nodes
+                            .iter()
+                            .any(|node| matches!(node, NumericNode::DirectCall { .. }))
+                    );
+                    continue;
+                }
+                let leaf = NumericValue(leaf.expect("exact-arity native leaf"));
+                let state = hir
+                    .frame_states
+                    .iter()
+                    .find(|state| state.point == NumericFramePoint::Node(leaf))
+                    .expect("pre-call state");
+                assert_eq!(state.byte_pc, 0);
+                assert!(
+                    !state.slots.contains(&NumericFrameSlot::Value(leaf)),
+                    "result is not defined on a miss"
+                );
+                let sequence = super::super::select_with_packed_double_view_caches(
+                    &hir,
+                    &NumericPackedDoubleViewCachePlan::default(),
+                )
+                .expect("verified native leaf Machine IR");
+                sequence.verify().expect("complete ABI verification");
+                let (instruction, descriptor) = sequence
+                    .instructions()
+                    .iter()
+                    .find_map(|instruction| {
+                        let MachineOpcode::Call(index) = instruction.opcode else {
+                            return None;
+                        };
+                        let descriptor = &sequence.call_descriptors()[index as usize];
+                        matches!(descriptor.target, CallTarget::NativeLeaf { .. })
+                            .then_some((instruction, descriptor))
+                    })
+                    .expect("selected leaf descriptor");
+                assert!(native_leaf::is_valid(descriptor, instruction));
+                let mut invalid = descriptor.clone();
+                invalid.effects = CallEffects::REENTRANT;
+                assert!(!native_leaf::is_valid(&invalid, instruction));
+                let mut invalid = instruction.clone();
+                invalid.deopt = None;
+                assert!(!native_leaf::is_valid(descriptor, &invalid));
+                invalid = instruction.clone();
+                invalid.operands.swap(0, 1);
+                assert!(
+                    !native_leaf::is_valid(descriptor, &invalid),
+                    "callee and argument ABI words cannot alias"
+                );
+            }
+        }
+    }
+
     fn array_construct_view(argument_count: u32) -> JitCompileSnapshot {
         let mut operands = vec![Operand::Register(2), Operand::ConstIndex(argument_count)];
         operands
@@ -4298,7 +4494,7 @@ mod tests {
             ],
             frame_states: Vec::new(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 1,
             register_count: 6,
             arithmetic_op_count: 0,
@@ -4761,7 +4957,7 @@ mod tests {
                 .expect("cold call node");
             assert_eq!((logical_pc, byte_pc), (0, 0));
             assert!(hir.direct_call_targets.is_empty());
-            assert!(hir.direct_call_arguments.is_empty());
+            assert!(hir.operand_values.is_empty());
 
             let state = hir
                 .frame_states
@@ -4815,7 +5011,7 @@ mod tests {
             .expect("generic plain call node");
         assert_eq!(count, 2, "receiver word plus one argument");
         assert!(matches!(
-            hir.nodes[hir.direct_call_arguments[start].0],
+            hir.nodes[hir.operand_values[start].0],
             NumericNode::TaggedConstant(bits) if bits == otter_vm::Value::undefined().to_bits()
         ));
         assert!(
@@ -4867,7 +5063,7 @@ mod tests {
         // detail. Exercise the checked aggregate representation directly.
         let mut storage = Vec::new();
         let (start, count) =
-            append_direct_call_arguments(&mut storage, std::iter::repeat_n(NumericValue(0), 300))
+            append_operand_values(&mut storage, std::iter::repeat_n(NumericValue(0), 300))
                 .expect("argc > u8 HIR metadata");
         assert_eq!((start, count, storage.len()), (0, 300, 300));
     }

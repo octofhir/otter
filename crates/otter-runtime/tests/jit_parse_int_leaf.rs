@@ -17,8 +17,8 @@
 #![cfg(target_arch = "aarch64")]
 
 use otter_runtime::{
-    JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitSelection, Runtime,
-    SourceInput,
+    JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDebugTier,
+    JitSelection, Runtime, SourceInput,
 };
 use otter_vm::{JitStaticNativeCallLoweringOutcome, JitStaticNativeCallLoweringRejectionReason};
 
@@ -109,7 +109,8 @@ for (let warm = 0; warm < 5000; warm++) {
   parseIntLeafHot((warm & 1023) - 512);
 }
 
-for (let warm = 0; warm < 32; warm++) {
+// Enter the Template caller (50 calls) so arity rejection is observable.
+for (let warm = 0; warm < 64; warm++) {
   parseIntExplicitRadix(17, 16);
 }
 
@@ -125,7 +126,8 @@ fn run(
 ) -> (String, otter_runtime::RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(4)
+        // Warm the called function itself instead of inlining it into top-level OSR.
+        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("parseInt runtime");
     let result = runtime
@@ -147,8 +149,9 @@ fn bundle_has_parse_int_leaf(bundle: &JitArtifactBundle) -> bool {
     .expect("valid code-map JSON");
     let has_region = code_map["regions"].as_array().is_some_and(|regions| {
         regions.iter().any(|region| {
-            region["kind"] == "nativeLeafCall"
-                && region["nativeLeafCall"] == "parse_int_i32_leaf"
+            ((region["kind"] == "nativeLeafCall"
+                && region["nativeLeafCall"] == "parse_int_i32_leaf")
+                || region["kind"] == "machineNativeLeafCall")
                 && region["bytePc"].is_u64()
         })
     });
@@ -183,7 +186,7 @@ fn int32_identity_and_all_tag_misses_match_the_interpreter() {
         r#"{"int32":[-2147483648,-1,0,2147483647],"string":42,"double":19,"object":31,"objectCoercions":1}"#
     );
     assert!(
-        stats.jit_generated_template_entries + stats.jit_optimized_entries > 0,
+        stats.jit_optimized_entries > 0,
         "fixture must execute generated parseInt callers: {stats:?}"
     );
 }
@@ -199,7 +202,7 @@ fn exact_bootstrap_identity_guards_observable_global_replacement() {
         r#"{"numberSharesIdentity":true,"replacementResult":1007,"replacementCalls":1,"savedBootstrap":7,"numberBootstrap":7}"#
     );
     assert!(
-        stats.jit_generated_template_entries + stats.jit_optimized_entries > 0,
+        stats.jit_optimized_entries > 0,
         "replacement must probe an installed generated caller: {stats:?}"
     );
 }
@@ -225,6 +228,7 @@ fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
         report.events().iter().any(|event| matches!(
             event,
             JitDebugEvent::StaticNativeCallLowered {
+                tier: JitDebugTier::Optimizing,
                 target: "parse_int_i32_leaf",
                 outcome: JitStaticNativeCallLoweringOutcome::Generated,
                 ..
@@ -250,7 +254,44 @@ fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
 
     let artifacts = result.jit_artifacts().expect("enabled JIT artifacts");
     assert!(
-        artifacts.bundles().iter().any(bundle_has_parse_int_leaf),
-        "one bundle must join the parseInt leaf region to its shared stub relocation: {artifacts:?}"
+        artifacts.bundles().iter().any(|bundle| {
+            bundle.manifest().tier() == JitDebugTier::Optimizing
+                && bundle_has_parse_int_leaf(bundle)
+        }),
+        "an optimizing bundle must join the parseInt leaf region to its shared stub relocation: {artifacts:?}"
     );
+}
+
+#[test]
+fn static_native_leaves_preserve_live_values_and_binary_arguments() {
+    let source = r#"
+const maximum = Math.max;
+const minimum = Math.min;
+const absolute = Math.abs;
+const floor = Math.floor;
+const squareRoot = Math.sqrt;
+function leafPressure(value, a, b, c, d, e, f, g, object) {
+  const parsed = parseInt(value);
+  return parsed + maximum(a | 0, b | 0) + minimum(c | 0, d | 0) + absolute(e | 0)
+      + floor(f) + squareRoot(g) + object.offset;
+}
+const kept = { offset: 100 };
+for (let warm = 0; warm < 5000; warm++) {
+  leafPressure(warm & 255, 2, 5, 3, 4, -7, 6, 81, kept);
+}
+let coercions = 0;
+const value = { toString() { coercions++; return "41"; } };
+JSON.stringify([
+  leafPressure(41, 2, 5, 3, 4, -7, 6, 81, kept),
+  leafPressure(value, 2, 5, 3, 4, -7, 6, 81, kept),
+  leafPressure(41, 2, 5, 3, 4, -2147483648, 6, 81, kept),
+  coercions,
+  kept.offset
+]);
+"#;
+    let (oracle, _) = run(source, JitSelection::InterpreterOnly);
+    let (compiled, stats) = run(source, JitSelection::ProductionTiered);
+    assert_eq!(oracle, "[171,171,2147483812,1,100]");
+    assert_eq!(compiled, oracle);
+    assert!(stats.jit_optimized_entries > 0, "{stats:?}");
 }

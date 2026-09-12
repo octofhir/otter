@@ -4,6 +4,7 @@
 //! - Fixed-operand descriptor operations and compile-owned variadic entries.
 //! - [`calls`] — native activation and generated-call deoptimization.
 //! - [`reentry`] — exception, coercion, and non-call reentrant completion.
+//! - [`literals`] — committed allocation from boxed-value spans.
 //! - [`vm_ops`] — typed VM operations.
 //!
 //! # Invariants
@@ -29,9 +30,11 @@ use otter_vm::{VmError, native_abi::NativeResultStatus};
 use super::JitCtx;
 
 mod calls;
+mod literals;
 mod reentry;
 mod vm_ops;
 pub(crate) use calls::*;
+pub(crate) use literals::*;
 pub(crate) use reentry::*;
 pub(crate) use vm_ops::*;
 
@@ -52,10 +55,6 @@ pub(super) fn decode_register(raw: u64) -> Result<u16, VmError> {
 
 fn complete_add(ctx: &mut JitCtx, dst: u16, lhs: u16, rhs: u16) -> Result<(), VmError> {
     ctx.runtime_call()?.add(dst, lhs, rhs)
-}
-
-fn complete_new_array(ctx: &mut JitCtx, dst: u16, source_regs: &[u16]) -> Result<(), VmError> {
-    ctx.runtime_call()?.new_array(dst, source_regs)
 }
 
 pub(super) extern "C" fn jit_add_stub(ctx: *mut JitCtx, dst: u64, lhs: u64, rhs: u64) -> u64 {
@@ -146,18 +145,5 @@ pub(super) extern "C" fn jit_make_closure_stub(
             parent_indices,
         )
     })();
-    park_result(ctx, result)
-}
-
-pub(super) extern "C" fn jit_new_array_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    source_regs: *const u16,
-    source_count: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract and immutable metadata owner.
-    let ctx = unsafe { &mut *ctx };
-    let source_regs = unsafe { std::slice::from_raw_parts(source_regs, source_count as usize) };
-    let result = (|| complete_new_array(ctx, decode_register(dst)?, source_regs))();
     park_result(ctx, result)
 }

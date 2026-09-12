@@ -8,8 +8,11 @@
 //! - Captured-upvalue closure construction for variadic `MakeClosure`.
 //! - Class constructor wrapper construction for `MakeClass`.
 //! - `Function.prototype.bind` metadata and bound-function construction.
+//! - Own callable descriptors, including accessor invocation on property loads.
 //!
 //! # Invariants
+//! - Own callable accessors run with the callable as receiver; data-only
+//!   storage reads must never substitute for descriptor dispatch.
 //! - `MakeFunction` receives already-decoded executable operands.
 //! - `MakeClosure` reads the executable operand slice because its upvalue list
 //!   is variadic.
@@ -2458,10 +2461,26 @@ impl Interpreter {
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
-        if let Some(bag) = self.callable_bag_read(owner, function_id)
-            && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
-        {
-            return Ok(v);
+        if let Some(bag) = self.callable_bag_read(owner, function_id) {
+            match object::lookup_own(bag, &self.gc_heap, name) {
+                object::PropertyLookup::Data { value, .. } => return Ok(value),
+                object::PropertyLookup::Accessor { getter, .. } => {
+                    let receiver = owner
+                        .map(Value::closure)
+                        .unwrap_or_else(|| Value::function(function_id));
+                    return match getter {
+                        Some(getter) => self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            receiver,
+                            SmallVec::new(),
+                        ),
+                        None => Ok(Value::undefined()),
+                    };
+                }
+                object::PropertyLookup::Absent => {}
+            }
         }
         if crate::interp::helpers::is_restricted_function_property(name) {
             let receiver = owner

@@ -68,7 +68,9 @@
 //! - [`crate::optimizing`] — the production Machine compilation entry.
 
 mod deopt;
+mod derived_this;
 mod frame;
+mod native_leaf;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
 mod regalloc;
@@ -521,6 +523,24 @@ pub enum DirectCallArgumentMode {
 pub enum CallTarget {
     /// VM-owned runtime entry with one statically declared ABI.
     RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
+    /// Canonical non-reentrant literal allocation from a boxed-value span.
+    /// Arguments and unrelated live roots remain allocator-visible; the result
+    /// commits once without an interpreter destination or pre-effect replay.
+    LiteralAllocation {
+        /// Shared VM-owned allocation descriptor.
+        target: otter_vm::native_abi::RuntimeStubDescriptor,
+        /// Source instruction index published before collection.
+        logical_pc: u32,
+        /// Source byte offset for allocation attribution.
+        byte_pc: u32,
+    },
+    /// Exact bootstrap-identity guarded leaf with allocator-visible ABI operands.
+    NativeLeaf {
+        /// VM-owned declaration and isolate-local bootstrap identity.
+        target: otter_vm::JitStaticNativeCall,
+        /// Source byte offset for artifacts and exact pre-call deoptimization.
+        byte_pc: u32,
+    },
     /// Effect-once JavaScript semantic completion through the fixed boxed-value
     /// ABI. The physical entry always receives two values; operands beyond the
     /// semantic arity are canonical `undefined` and are not Machine inputs.
@@ -683,6 +703,11 @@ pub enum MachineOpcode {
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
     EntryThis,
+    /// Commit an unbound stack-owned derived this, returning whether it hit.
+    TryBindDerivedThis {
+        /// Exact source byte PC for generated/cold attribution.
+        byte_pc: u32,
+    },
     /// Materialize one exact immediate tagged JavaScript value.
     TaggedConstant(u64),
     /// Guard and decode one tagged JavaScript Number.
@@ -2246,6 +2271,41 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
+                if let MachineOpcode::TryBindDerivedThis { byte_pc } = instruction.opcode {
+                    let valid = instruction.operands.len() == 2
+                        && instruction.operands[0]
+                            == MachineOperand::fixed_register_input(
+                                instruction.operands[0].value,
+                                PhysicalRegister::integer(1),
+                            )
+                        && instruction.operands[1]
+                            == MachineOperand::fixed_register_output(
+                                instruction.operands[1].value,
+                                PhysicalRegister::integer(0),
+                            )
+                        && self
+                            .representations
+                            .get(instruction.operands[0].value.0 as usize)
+                            == Some(&MachineRepresentation::Tagged)
+                        && self
+                            .representations
+                            .get(instruction.operands[1].value.0 as usize)
+                            == Some(&MachineRepresentation::Boolean)
+                        && instruction.clobbers.is_empty()
+                        && instruction.safepoint.is_none()
+                        && instruction.deopt.is_none()
+                        && instruction.control == ControlFlow::None
+                        && derived_this::probe_cfg_is_valid(
+                            self,
+                            block_index,
+                            id,
+                            byte_pc,
+                            instruction.operands[1].value,
+                        );
+                    if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
                 if let MachineOpcode::Call(descriptor_index) = instruction.opcode {
                     let Some(descriptor) = self.call_descriptors.get(descriptor_index as usize)
                     else {
@@ -2272,6 +2332,32 @@ impl InstructionSequence {
                                 && instruction.deopt.is_none()
                         }
                         CallTarget::RuntimeStub(_) => true,
+                        CallTarget::LiteralAllocation { target, .. } => {
+                            let arguments = descriptor.arguments.len();
+                            matches!(
+                                *target,
+                                otter_vm::native_abi::STUB_JIT_NEW_OBJECT
+                                    | otter_vm::native_abi::STUB_JIT_NEW_ARRAY
+                            ) && (*target != otter_vm::native_abi::STUB_JIT_NEW_OBJECT
+                                || arguments == 0)
+                                && arguments <= usize::from(u8::MAX) - 2
+                                && descriptor
+                                    .arguments
+                                    .iter()
+                                    .all(|rep| *rep == MachineRepresentation::Tagged)
+                                && descriptor.results == [MachineRepresentation::Tagged]
+                                && descriptor.effects
+                                    == CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP)
+                                && descriptor.clobbers
+                                    == TargetRegisterFile::aarch64_scalar_call_clobbers()
+                                && descriptor.exceptional == ExceptionalEdge::None
+                                && descriptor.safepoint == SafepointKind::Gc
+                                && instruction.safepoint.is_some()
+                                && instruction.deopt.is_none()
+                        }
+                        CallTarget::NativeLeaf { .. } => {
+                            native_leaf::is_valid(descriptor, instruction)
+                        }
                         CallTarget::CommittedRuntime {
                             target,
                             semantic_arity,

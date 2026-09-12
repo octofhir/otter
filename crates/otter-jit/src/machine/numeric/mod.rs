@@ -5,6 +5,12 @@
 //!   guarded property and element accesses, typed array construction, explicit
 //!   reentrant calls, and catch landing pads.
 //! - `arm64` — allocation-driven AArch64 emission.
+//! - Derived-this committed operations split into generated and cold CFG
+//!   siblings before allocation, sharing one SSA result and exception contract.
+//! - Literal allocation publishes arbitrary boxed-value spans and precise roots
+//!   through the same committed boundary as Template; holes retain their tag.
+//! - Static-native leaves share VM declarations and exact pre-call deopt state;
+//!   fixed ABI operands and call clobbers remain visible before allocation.
 //! - [`try_compile`] — the sole production optimizing-tier entry.
 //!
 //! # Invariants
@@ -121,13 +127,13 @@ use crate::{
     optimizing::{OptimizedCode, OptimizedMetadata},
 };
 
-/// Frame-wide untraced packet used by a method call's canonical final miss.
+/// Frame-wide untraced packet shared by calls and literal allocation.
 ///
 /// Packed-double caches own the raw prefix. The packet starts immediately
-/// after that prefix and is sized for the widest selected Method descriptor;
-/// descriptor arguments include the receiver in word zero.
+/// after that prefix and is sized for the widest selected span descriptor.
+/// Each descriptor owns its semantic operands; literal spans have no receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MethodValuePacketFrame {
+pub(super) struct ValuePacketFrame {
     pub(super) raw_start: u16,
     pub(super) raw_words: u16,
 }
@@ -142,9 +148,9 @@ struct BindingSelectedValues {
     status: MachineValue,
 }
 
-pub(super) fn method_value_packet_frame(
+pub(super) fn value_packet_frame(
     sequence: &InstructionSequence,
-) -> Result<MethodValuePacketFrame, Unsupported> {
+) -> Result<ValuePacketFrame, Unsupported> {
     let cache_words = u16::try_from(PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS)
         .map_err(|_| Unsupported::OperandShape("scalar raw-cache word count"))?;
     let raw_start = u16::from(sequence.packed_double_view_cache_count())
@@ -163,16 +169,16 @@ pub(super) fn method_value_packet_frame(
                         | DirectCallKind::CallWithThis
                         | DirectCallKind::Construct,
                     ..
-                }
+                } | CallTarget::LiteralAllocation { .. }
             )
         })
         .map(|descriptor| descriptor.arguments.len())
         .max()
         .map(u16::try_from)
         .transpose()
-        .map_err(|_| Unsupported::OperandShape("scalar method-value packet frame"))?
+        .map_err(|_| Unsupported::OperandShape("scalar value-span packet frame"))?
         .unwrap_or(0);
-    Ok(MethodValuePacketFrame {
+    Ok(ValuePacketFrame {
         raw_start,
         raw_words,
     })
@@ -182,6 +188,7 @@ pub(crate) fn try_compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    capture_events: bool,
     artifact_request: Option<ArtifactRequest>,
 ) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
     let hir = NumericFunction::build(view).map_err(|decline| match decline {
@@ -217,16 +224,14 @@ pub(crate) fn try_compile(
             .frame_states
             .iter()
             .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
-    let method_packet = method_value_packet_frame(&sequence)?;
+    let method_packet = value_packet_frame(&sequence)?;
     let frame = arm64::frame_layout_with_raw_slots(
         &allocation,
         machine_safepoints.root_slot_count(),
         method_packet
             .raw_start
             .checked_add(method_packet.raw_words)
-            .ok_or(Unsupported::OperandShape(
-                "scalar method-value packet frame",
-            ))?,
+            .ok_or(Unsupported::OperandShape("scalar value-span packet frame"))?,
     )?;
     let deopt_table = lower_deopt_table(
         &sequence,
@@ -392,7 +397,11 @@ pub(crate) fn try_compile(
     Ok(NativeCompileOutput {
         code,
         artifact,
-        diagnostics: Box::default(),
+        diagnostics: if capture_events {
+            super::native_leaf::diagnostics(view, &sequence)
+        } else {
+            Box::default()
+        },
     })
 }
 
@@ -890,6 +899,64 @@ fn select_with_packed_double_view_caches(
                 }
                 NumericNode::Binding { .. } => {
                     unreachable!("binding nodes select their explicit CFG before ordinary nodes")
+                }
+                NumericNode::LiteralAllocation {
+                    target,
+                    argument_start,
+                    argument_count,
+                    logical_pc,
+                    byte_pc,
+                } => {
+                    let end = argument_start
+                        .checked_add(argument_count)
+                        .ok_or(super::VerificationError::InvalidEntry)?;
+                    let inputs = hir
+                        .operand_values
+                        .get(argument_start as usize..end as usize)
+                        .ok_or(super::VerificationError::InvalidEntry)?
+                        .iter()
+                        .copied()
+                        .map(|input| {
+                            tagged_call_argument(
+                                hir,
+                                &values,
+                                &mut representations,
+                                &mut instructions,
+                                input,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        CallDescriptor {
+                            target: CallTarget::LiteralAllocation {
+                                target,
+                                logical_pc,
+                                byte_pc,
+                            },
+                            arguments: vec![MachineRepresentation::Tagged; inputs.len()],
+                            results: vec![MachineRepresentation::Tagged],
+                            effects: CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP),
+                            clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                            exceptional: ExceptionalEdge::None,
+                            safepoint: SafepointKind::Gc,
+                        },
+                    );
+                    let mut operands = inputs
+                        .iter()
+                        .copied()
+                        .map(MachineOperand::location_input)
+                        .collect::<Vec<_>>();
+                    operands.push(MachineOperand::register_output(result));
+                    append_unique_tagged_roots(&mut operands, inputs);
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        operands,
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint += 1;
+                    call
                 }
                 NumericNode::CommittedValue {
                     operation,
@@ -1723,6 +1790,74 @@ fn select_with_packed_double_view_caches(
                         .expect("bounded scalar function safepoint count");
                     call
                 }
+                NumericNode::NativeLeaf {
+                    source,
+                    target,
+                    value_type,
+                    argument_start,
+                    byte_pc,
+                } => {
+                    let descriptor = super::native_leaf::descriptor(
+                        target,
+                        byte_pc,
+                        if value_type == NumericType::Int32 {
+                            MachineRepresentation::Int32
+                        } else {
+                            MachineRepresentation::Tagged
+                        },
+                    )
+                    .ok_or(super::VerificationError::InvalidValue(result))?;
+                    let descriptor_index =
+                        intern_call_descriptor(&mut call_descriptors, descriptor);
+                    let source = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        source,
+                    );
+                    let mut operands = vec![MachineOperand::fixed_register_input(
+                        source,
+                        PhysicalRegister::integer(9),
+                    )];
+                    let start = argument_start as usize;
+                    let end = start
+                        .checked_add(usize::from(target.argument_count))
+                        .ok_or(super::VerificationError::InvalidValue(result))?;
+                    for (index, &argument) in hir
+                        .operand_values
+                        .get(start..end)
+                        .ok_or(super::VerificationError::InvalidValue(result))?
+                        .iter()
+                        .enumerate()
+                    {
+                        let argument = if value_type == NumericType::Int32 {
+                            machine_value(&values, argument)
+                        } else {
+                            tagged_call_argument(
+                                hir,
+                                &values,
+                                &mut representations,
+                                &mut instructions,
+                                argument,
+                            )
+                        };
+                        operands.push(MachineOperand::fixed_register_input(
+                            argument,
+                            PhysicalRegister::integer(index as u8 + 1),
+                        ));
+                    }
+                    operands.push(MachineOperand::fixed_register_output(
+                        result,
+                        PhysicalRegister::integer(0),
+                    ));
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        operands,
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call
+                }
                 NumericNode::DirectCall {
                     source,
                     target,
@@ -1748,7 +1883,7 @@ fn select_with_packed_double_view_caches(
                                 .checked_add(argument_count)
                                 .ok_or(super::VerificationError::InvalidValue(result))?;
                             let arguments = hir
-                                .direct_call_arguments
+                                .operand_values
                                 .get(argument_start..argument_end)
                                 .ok_or(super::VerificationError::InvalidValue(result))?
                                 .iter()
@@ -2027,6 +2162,28 @@ fn select_with_packed_double_view_caches(
         ));
     }
 
+    let derived_this_sites = hir
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            NumericNode::CommittedValue {
+                operation:
+                    semantics::CommittedValueOperation::Scalar(
+                        otter_vm::native_abi::ScalarValueOp::BindThisValue,
+                    ),
+                byte_pc,
+                ..
+            } => Some(*byte_pc),
+            _ => None,
+        })
+        .collect();
+    super::derived_this::expand(
+        &mut representations,
+        &call_descriptors,
+        &derived_this_sites,
+        &mut blocks,
+        &mut instructions,
+    )?;
     InstructionSequence::new_selected_with_packed_double_view_caches(
         selection_cfg.originals[0],
         representations,
@@ -3222,7 +3379,7 @@ mod tests {
                 ],
                 frame_states: Vec::new(),
                 direct_call_targets: Vec::new(),
-                direct_call_arguments: Vec::new(),
+                operand_values: Vec::new(),
                 parameter_count: 0,
                 register_count: 1,
                 arithmetic_op_count: 0,
@@ -3286,7 +3443,7 @@ mod tests {
                 slots: vec![hir::NumericFrameSlot::Value(value(2))],
             }],
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 0,
             register_count: 1,
             arithmetic_op_count: 0,
@@ -3372,7 +3529,7 @@ mod tests {
                     })
                     .collect(),
             }],
-            direct_call_arguments: vec![value(1)],
+            operand_values: vec![value(1)],
             parameter_count: 1,
             register_count: 3,
             arithmetic_op_count: 0,
@@ -3424,10 +3581,9 @@ mod tests {
                 kind: NumericDirectCallKind::Method,
                 candidates: Vec::new(),
             }],
-            direct_call_arguments: vec![
+            operand_values: vec![
                 value(0);
-                usize::try_from(argument_count)
-                    .expect("test argument count")
+                usize::try_from(argument_count).expect("test argument count")
             ],
             parameter_count: 1,
             register_count: 2,
@@ -3474,10 +3630,89 @@ mod tests {
                 ],
             }],
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 1,
             register_count: 3,
             arithmetic_op_count: 0,
+        }
+    }
+
+    #[test]
+    fn literal_selection_exposes_span_roots_and_rejects_invalid_contracts() {
+        use otter_vm::native_abi::{STUB_JIT_NEW_ARRAY, STUB_JIT_NEW_OBJECT};
+        for (target, count) in [
+            (STUB_JIT_NEW_OBJECT, 0),
+            (STUB_JIT_NEW_ARRAY, 0),
+            (STUB_JIT_NEW_ARRAY, 3),
+        ] {
+            let mut hir = array_construct_selection_hir();
+            hir.nodes[0] = NumericNode::TaggedConstant(otter_vm::Value::number_i32(7).to_bits());
+            hir.nodes[1] = NumericNode::LiteralAllocation {
+                target,
+                argument_start: 0,
+                argument_count: count,
+                logical_pc: 1,
+                byte_pc: 24,
+            };
+            hir.operand_values = vec![hir::NumericValue(0); count as usize];
+            let sequence = select(&hir).expect("literal Machine selection");
+            let (id, call) = sequence
+                .instructions()
+                .iter()
+                .enumerate()
+                .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(_)))
+                .expect("literal call");
+            assert!(call.deopt.is_none());
+            assert_eq!(
+                call.operands
+                    .iter()
+                    .filter(|operand| operand.purpose == OperandPurpose::Input)
+                    .count(),
+                count as usize
+            );
+            if count > 0 {
+                assert_eq!(
+                    call.operands
+                        .iter()
+                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+                        .count(),
+                    1,
+                    "aliased elements share one rewriteable root"
+                );
+            }
+            assert_eq!(
+                value_packet_frame(&sequence)
+                    .expect("literal frame")
+                    .raw_words,
+                count as u16
+            );
+            let allocation = sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .expect("literal allocation");
+            let table = lower_safepoints(&sequence, &allocation).expect("literal root table");
+            assert_eq!(table.records().len(), 1);
+            let mut invalid = sequence.clone();
+            invalid.instructions[id].safepoint = None;
+            assert!(
+                invalid.verify().is_err(),
+                "allocation cannot omit its safepoint"
+            );
+            if count > 0 {
+                let mut invalid = sequence.clone();
+                let MachineOpcode::Call(descriptor) = call.opcode else {
+                    unreachable!()
+                };
+                invalid.call_descriptors[descriptor as usize].target =
+                    CallTarget::LiteralAllocation {
+                        target: STUB_JIT_NEW_OBJECT,
+                        logical_pc: 1,
+                        byte_pc: 24,
+                    };
+                assert!(
+                    invalid.verify().is_err(),
+                    "object allocation cannot consume array elements"
+                );
+            }
         }
     }
 
@@ -3513,7 +3748,7 @@ mod tests {
                 ],
             }],
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 0,
             register_count: 2,
             arithmetic_op_count: 0,
@@ -3612,7 +3847,7 @@ mod tests {
                 ],
             }],
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 3,
             register_count: 4,
             arithmetic_op_count: 0,
@@ -5448,7 +5683,7 @@ mod tests {
         transitions: &TransitionTable,
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
-        try_compile(view, 7001, transitions, artifact_request)
+        try_compile(view, 7001, transitions, false, artifact_request)
             .expect("numeric Machine IR code generation")
     }
 
@@ -5682,7 +5917,7 @@ mod tests {
             })
             .collect(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 2,
             register_count: 3,
             arithmetic_op_count: 0,
@@ -5744,7 +5979,7 @@ mod tests {
             })
             .collect(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 2,
             register_count: 3,
             arithmetic_op_count: 0,
@@ -5815,7 +6050,7 @@ mod tests {
             })
             .collect(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 2,
             register_count: 3,
             arithmetic_op_count: 0,
@@ -5876,7 +6111,7 @@ mod tests {
             })
             .collect(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 2,
             register_count: 3,
             arithmetic_op_count: 0,
@@ -5936,7 +6171,7 @@ mod tests {
             ]
             .into(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 0,
             register_count: 3,
             arithmetic_op_count: 0,
@@ -6208,7 +6443,7 @@ mod tests {
             }],
             frame_states: Vec::new(),
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 0,
             register_count: 1,
             arithmetic_op_count: 0,
@@ -6251,7 +6486,7 @@ mod tests {
                 ],
             }],
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 1,
             register_count: 2,
             arithmetic_op_count: 0,
@@ -6427,7 +6662,7 @@ mod tests {
             }
 
             sequence.packed_double_view_cache_count = 3;
-            let packet = method_value_packet_frame(&sequence).expect("method packet frame");
+            let packet = value_packet_frame(&sequence).expect("method packet frame");
             assert_eq!(packet.raw_start, 6);
             assert_eq!(packet.raw_words, argument_count as u16 + 1);
         }
@@ -6502,6 +6737,68 @@ mod tests {
             .zip([2_u8, 3, 4, 0].map(PhysicalRegister::integer))
         {
             assert_eq!(location, AllocatedLocation::Register(register));
+        }
+    }
+
+    #[test]
+    fn derived_this_binding_splits_fast_cold_and_exception_edges_before_allocation() {
+        for local_catch in [false, true] {
+            let mut hir = committed_value_selection_hir(local_catch);
+            let NumericNode::CommittedValue {
+                operation, inputs, ..
+            } = &mut hir.nodes[3]
+            else {
+                unreachable!()
+            };
+            *operation =
+                CommittedValueOperation::Scalar(otter_vm::native_abi::ScalarValueOp::BindThisValue);
+            inputs[1] = None;
+            let sequence = select(&hir).expect("explicit derived-this Machine CFG");
+            let (probe_block, probe) = sequence
+                .blocks()
+                .iter()
+                .enumerate()
+                .find_map(|(index, block)| {
+                    sequence.instructions()[block.first.0 as usize..block.end.0 as usize]
+                        .iter()
+                        .find(|instruction| {
+                            matches!(instruction.opcode, MachineOpcode::TryBindDerivedThis { .. })
+                        })
+                        .map(|probe| (index, probe))
+                })
+                .expect("generated binding probe");
+            assert!(probe.safepoint.is_none() && probe.deopt.is_none());
+            let cold = sequence.blocks()[probe_block].successors[1].0 as usize;
+            assert_eq!(
+                super::super::derived_this::cold_byte_pc(&sequence, cold),
+                Some(48)
+            );
+            let cold_instruction =
+                &sequence.instructions()[sequence.blocks()[cold].first.0 as usize];
+            assert!(cold_instruction.safepoint.is_some());
+            assert!(
+                cold_instruction
+                    .operands
+                    .iter()
+                    .any(|operand| operand.purpose == OperandPurpose::TaggedRoot)
+            );
+            assert_eq!(
+                sequence.blocks()[cold].successors.len(),
+                if local_catch { 2 } else { 1 }
+            );
+            let allocation = sequence
+                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .expect("all SSA critical edges are split");
+            assert!(allocation.used_register_count() > 0);
+            lower_safepoints(&sequence, &allocation)
+                .expect("rebuilt safepoint order and allocated roots agree");
+            let mut malformed = sequence.clone();
+            let branch = malformed.blocks[probe_block].end.0 as usize - 1;
+            malformed.instructions[branch].opcode = MachineOpcode::BranchIf(false);
+            assert!(
+                malformed.verify().is_err(),
+                "a successful bind must bypass the cold call"
+            );
         }
     }
 
@@ -9692,6 +9989,7 @@ mod tests {
             &view,
             7003,
             &transitions,
+            false,
             Some(ArtifactRequest {
                 identity: JitArtifactIdentity {
                     function_name: "engineKernel".to_string(),
@@ -9758,6 +10056,7 @@ mod tests {
             &view,
             7004,
             &TransitionTable::resolve(),
+            false,
             Some(ArtifactRequest {
                 identity: JitArtifactIdentity {
                     function_name: "countdownKernel".to_string(),
@@ -9832,6 +10131,7 @@ mod tests {
             &view,
             7005,
             &TransitionTable::resolve(),
+            false,
             Some(ArtifactRequest {
                 identity: JitArtifactIdentity {
                     function_name: "bitwiseKernel".to_string(),
@@ -10276,6 +10576,7 @@ mod tests {
             &view,
             7006,
             &TransitionTable::resolve(),
+            false,
             Some(ArtifactRequest {
                 identity: JitArtifactIdentity {
                     function_name: "engineKernel".to_string(),
@@ -10367,6 +10668,7 @@ mod tests {
             &view,
             7007,
             &TransitionTable::resolve(),
+            false,
             Some(ArtifactRequest {
                 identity: JitArtifactIdentity {
                     function_name: "engineKernel".to_string(),
@@ -10466,6 +10768,7 @@ mod tests {
             &view,
             7008,
             &TransitionTable::resolve(),
+            false,
             Some(ArtifactRequest {
                 identity: JitArtifactIdentity {
                     function_name: "engineKernel".to_string(),
@@ -10662,7 +10965,7 @@ mod tests {
                 },
             ],
             direct_call_targets: Vec::new(),
-            direct_call_arguments: Vec::new(),
+            operand_values: Vec::new(),
             parameter_count: 0,
             register_count: 0,
             arithmetic_op_count: 0,

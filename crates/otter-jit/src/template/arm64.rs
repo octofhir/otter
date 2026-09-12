@@ -69,6 +69,7 @@ mod structural;
 mod super_access;
 mod transitions;
 mod value_load;
+mod value_packet;
 pub(crate) mod values;
 mod variadic;
 
@@ -577,9 +578,9 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     dst,
-                    threw,
+                    committed_throw,
                     fatal,
-                );
+                )?;
             }
             TemplateOp::CollectArguments { dst } => {
                 transitions::emit_collect_arguments(
@@ -614,10 +615,9 @@ pub(super) fn compile(
                     transitions,
                     dst,
                     plan.register_tail(elements),
-                    elements,
-                    threw,
+                    committed_throw,
                     fatal,
-                );
+                )?;
             }
             TemplateOp::FreshUpvalue { index } => {
                 transitions::emit_fresh_upvalue(

@@ -229,7 +229,9 @@ fn runtime(selection: JitSelection, artifacts: bool) -> Runtime {
         .jit_selection(selection)
         .jit_osr_threshold(u32::MAX);
     if artifacts {
-        builder.jit_debug(JitDebugRequest::artifacts()).build()
+        builder
+            .jit_debug(JitDebugRequest::artifacts().with_events(true))
+            .build()
     } else {
         builder.build()
     }
@@ -237,11 +239,10 @@ fn runtime(selection: JitSelection, artifacts: bool) -> Runtime {
 }
 
 fn completion(runtime: &mut Runtime, source: &str, module: &str) -> String {
-    runtime
+    let result = runtime
         .run_script(SourceInput::from_javascript(source), module)
-        .unwrap_or_else(|error| panic!("generic element script {module}: {error:?}"))
-        .completion_string()
-        .to_owned()
+        .unwrap_or_else(|error| panic!("generic element script {module}: {error:?}"));
+    result.completion_string().to_owned()
 }
 
 fn run_with_delta(runtime: &mut Runtime, source: &str, module: &str) -> (String, CounterDelta) {
@@ -307,7 +308,16 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
             "mixed function must retain {opcode}: {optimized_ir}"
         );
     }
-    for (stub_id, signature) in [(15, "ReentrantValue2"), (16, "ReentrantValue3")] {
+    for (stub_id, signature) in [
+        (
+            otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT.id,
+            "ReentrantValue2",
+        ),
+        (
+            otter_vm::native_abi::STUB_JIT_STORE_ELEMENT.id,
+            "ReentrantValue3",
+        ),
+    ] {
         assert!(
             optimized_ir.lines().any(|line| {
                 line.contains(&format!("id: {stub_id}"))

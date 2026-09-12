@@ -650,27 +650,29 @@ pub const STUB_JIT_MAKE_CLOSURE: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
     NativeResultDomain::None,
 );
-/// Ordinary object allocation.
+/// Ordinary object allocation from an empty boxed-value span. The native
+/// frame publishes roots; success returns the object without a destination.
 pub const STUB_JIT_NEW_OBJECT: RuntimeStubDescriptor = descriptor(
     23,
     RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
+    RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
     RuntimeStubEffects::allocating(true, false),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
 );
-/// Array literal allocation.
+/// Array literal allocation from boxed values, copied before collection.
+/// The span preserves holes and never denotes interpreter register indices.
 pub const STUB_JIT_NEW_ARRAY: RuntimeStubDescriptor = descriptor(
     24,
     RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
+    RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
     RuntimeStubEffects::allocating(true, false),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
 );
 /// Fresh loop-iteration upvalue cell allocation.
 pub const STUB_JIT_FRESH_UPVALUE: RuntimeStubDescriptor = descriptor(
@@ -2060,8 +2062,6 @@ mod tests {
                 STUB_JIT_LOAD_BUILTIN_ERROR,
                 STUB_JIT_MAKE_FN,
                 STUB_JIT_MAKE_CLOSURE,
-                STUB_JIT_NEW_OBJECT,
-                STUB_JIT_NEW_ARRAY,
                 STUB_JIT_FRESH_UPVALUE,
                 STUB_JIT_LOAD_REGEXP,
                 STUB_JIT_COERCE_UNARY,

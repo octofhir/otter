@@ -24,6 +24,8 @@
 //! Numeric/load/class opcode words are decoded exactly once at their ABI edge.
 //! Built-in Array spread collection accepts both materialized and stack-owned
 //! frames; observable iterator overrides bail before effects.
+//! Static stack-owned catch entry/removal use verified CodeBlock regions;
+//! committed throws select their local catch before exact continuation.
 //!
 //! # See also
 //! - `super::super::abi` — machine-visible entry context.
@@ -111,35 +113,13 @@ pub(super) fn compiled_error(ctx: &mut JitCtx, error: VmError) -> NativeResultPa
     }
 }
 
-/// Route a pure exception through a materialized local handler or propagate
+/// Route a pure exception through the activation's local handler or propagate
 /// the same boxed value unchanged. Stack-owned compiled callers never stage a
 /// pending throw between native frames.
 fn route_throw_value(ctx: &mut JitCtx, exception: Value) -> NativeResultPair {
-    let Some(activation) = ctx.checked_activation() else {
-        return compiled_fatal(ctx, VmError::InvalidOperand);
-    };
-    let frame_index = match ctx.materialized_frame_index() {
-        Ok(index) => index,
-        Err(_) => {
-            let stack_owned = unsafe { ctx.native_frame.as_ref() }.is_some_and(|frame| {
-                frame
-                    .header
-                    .flags
-                    .contains(otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS)
-            });
-            return if stack_owned {
-                NativeResultPair::throw_value(exception)
-            } else {
-                compiled_fatal(ctx, VmError::InvalidOperand)
-            };
-        }
-    };
-    let route = {
-        let vm = unsafe { &mut *activation.vm_ptr() };
-        let stack = unsafe { &mut *activation.stack_ptr() };
-        let context = unsafe { &*activation.context_ptr() };
-        vm.jit_route_throw(context, stack, frame_index, exception)
-    };
+    let route = ctx
+        .runtime_call()
+        .and_then(|mut runtime| runtime.route_throw(exception));
     match route {
         Ok(Some(pc)) => {
             let Some(native_frame) = (unsafe { ctx.native_frame.as_mut() }) else {
@@ -176,7 +156,8 @@ pub(crate) extern "C" fn jit_resolve_direct_entry_stub(
 /// Route one pure exception value returned by generated code.
 ///
 /// Materialized Template frames may consume it in a local catch/finally and
-/// side-exit at the selected PC. Stack-owned or unhandled frames publish the
+/// stack-owned Template frames in a static catch, selecting the committed
+/// landing PC. Unhandled frames publish the
 /// value as the canonical uncaught throw. Machine local landings bypass this
 /// entry and consume the exception value directly in SSA.
 pub(crate) extern "C" fn jit_route_throw_stub(
@@ -436,28 +417,17 @@ pub(crate) extern "C" fn jit_exception_op_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.materialized_frame_index() {
-        Ok(index) => index,
-        Err(_) => {
-            // This is an exact pre-effect side exit. Preserve the stamped
-            // opcode PC: the exception emitter treats `value` as a dynamic
-            // resume PC and republishes it before the shared bail epilogue.
-            // Returning zero would materialize a direct callee at function
-            // entry and replay every side effect preceding this opcode.
-            let pc = match ctx.active_frame() {
-                Ok(frame) => frame.pc(),
-                Err(err) => {
-                    park_jit_error(ctx, err);
-                    return NativeResultPair::fatal_internal();
-                }
+    let outcome = match ctx.try_runtime_call() {
+        Ok(Some(mut runtime)) => runtime.exception_op(opcode as u8, arg0, arg1, arg2),
+        Ok(None) => {
+            return match ctx.active_frame() {
+                Ok(frame) => NativeResultPair::side_exit(u64::from(frame.pc())),
+                Err(error) => compiled_fatal(ctx, error),
             };
-            return NativeResultPair::side_exit(u64::from(pc));
         }
+        Err(error) => Err(error),
     };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_exception_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
+    match outcome {
         Ok(JitExceptionOutcome::Continue) => NativeResultPair::continue_generated(),
         Ok(JitExceptionOutcome::Resume(pc)) => NativeResultPair::side_exit(u64::from(pc)),
         Ok(JitExceptionOutcome::Return(value)) => NativeResultPair::success(value),

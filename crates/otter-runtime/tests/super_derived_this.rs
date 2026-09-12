@@ -8,6 +8,8 @@
 //! - `super.x` getter / `super.x = v` setter run with `this` as receiver.
 //! - `super[expr]` evaluates `GetSuperBase` before `ToPropertyKey`.
 //! - `class C extends null` defines and its `super.x` throws TypeError.
+//! - Generated derived binding retains the first receiver when repeated
+//!   `super()` throws into a local catch after the base constructor's effects.
 //!
 //! # Invariants
 //! - Derived constructors enter with `this` in the TDZ; only the
@@ -189,4 +191,69 @@ fn class_constructor_apply_throws_type_error() {
         name;
     "#);
     assert_eq!(out, "TypeError");
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn generated_derived_binding_keeps_first_this_and_catches_repeated_super_once() {
+    use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection};
+    let source = r#"
+let baseCalls = 0;
+let catches = 0;
+let caught;
+class Base {
+  constructor(value) { baseCalls++; this.value = value; }
+}
+class Derived extends Base {
+  constructor(value, again) {
+    super(value);
+    try { if (again) super(value + 1); }
+    catch (error) { catches++; caught = error; }
+    this.after = value + 10;
+  }
+}
+function construct(value, again) { return new Derived(value, again); }
+construct(-1, true);
+for (let warm = 0; warm < 5000; warm++) construct(warm, false);
+const callsBefore = baseCalls;
+const catchesBefore = catches;
+const result = construct(41, true);
+JSON.stringify([result.value, result.after, caught.name, baseCalls - callsBefore, catches - catchesBefore]);
+"#;
+    let execute = |selection| {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .jit_osr_threshold(u32::MAX)
+            .jit_debug(JitDebugRequest::artifacts())
+            .build()
+            .expect("derived binding runtime");
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(source),
+                "generated-derived-bind.js",
+            )
+            .expect("repeated super remains catchable");
+        let generated = result.jit_artifacts().is_some_and(|batch| {
+            batch.bundles().iter().any(|bundle| {
+                bundle.manifest().function_name() == "Derived"
+                    && bundle.manifest().tier() == JitDebugTier::Optimizing
+                    && bundle
+                        .file(JitArtifactFileName::CodeMap)
+                        .is_some_and(|file| {
+                            let map = std::str::from_utf8(file.contents()).expect("code map JSON");
+                            map.contains("machineDerivedThisBindFast")
+                                && map.contains("machineDerivedThisBindCold")
+                        })
+            })
+        });
+        (result.completion_string().to_owned(), generated)
+    };
+    let (oracle, _) = execute(JitSelection::InterpreterOnly);
+    let (compiled, generated) = execute(JitSelection::ProductionTiered);
+    assert_eq!(oracle, "[41,51,\"ReferenceError\",2,1]");
+    assert_eq!(compiled, oracle);
+    assert!(
+        generated,
+        "the derived body must contain both explicit binding siblings"
+    );
 }

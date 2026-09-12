@@ -481,7 +481,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     unsigned lengths outside int32 exit to canonical Number boxing. A fixed
     TypedArray view over a resizable ArrayBuffer also guards its complete baked
     extent against the backing store's live byte length before direct element
-    access; shrink misses deopt before a load or store effect.
+    access; shrink misses enter the committed element cold sibling before a load or store
+    effect. `machineElementLoadFast` / `machineElementLoadCold` and
+    `machineElementStoreFast` / `machineElementStoreCold` expose that boundary;
+    cold completion does not deopt or replay the operation.
     Zero-argument and exact-Int32 `ArrayConstruct` inside a Machine body uses
     the `machineArrayConstruct` region at the source `bytePc` and relocates to
     the shared `array_construct_alloc` stub. Template code uses the same stub

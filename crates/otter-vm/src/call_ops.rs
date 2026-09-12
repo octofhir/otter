@@ -6,7 +6,7 @@
 //!
 //! # Contents
 //! - Ordinary call entry and shared callable invocation.
-//! - Constructor call entry and receiver/prototype setup.
+//! - Constructor call entry, receiver/prototype setup and learned slot capacity.
 //! - Spread and explicit-`this` call forms.
 //! - Stack-owned generated-call upvalue-spine initialization.
 //! - Same-stack synchronous re-entry and reusable lean callback frames.
@@ -26,6 +26,12 @@
 //! - Derived bytecode constructors enter with no receiver and preserve the
 //!   caller's stable argument window; their direct `super(...)` dispatch owns
 //!   the single prototype lookup and receiver allocation.
+//! - Receiver observations are untraced and consumed before GC movement;
+//!   no constructor profile retains an instance graph across collection.
+//! - Constructor samples contain only scalar data; the constructing closure
+//!   is resolved from a rewritten root after receiver allocation.
+//! - Forwarded-call operands are reloaded after arguments materialization;
+//!   the committed method lookup is never replayed.
 //! - Generated receiver allocation uses the same VM-planned shape/capacity
 //!   contract as the ordinary allocator; a nursery-window miss returns here
 //!   while all constructor inputs remain rooted and no effect has started.
@@ -45,6 +51,8 @@
 //! - [`crate::executable`]
 
 use std::cell::UnsafeCell;
+
+use crate::constructor_profile::ConstructorProfileSample;
 
 use crate::activation_stack::ActivationStack;
 use otter_gc::raw::RawGc;
@@ -573,19 +581,19 @@ impl Interpreter {
     /// in source order before anything can observe them. `roots.scratch_0`
     /// holds the resolved prototype and `roots.new_target` the construct's
     /// `new.target`; the returned value is also left in `roots.receiver`.
+    ///
+    /// Storage is reserved for the larger of the baked transition program and
+    /// the instance size learned from the previous receiver prepared for the
+    /// same constructor pair, so fields the body adds through a callee still
+    /// land in pre-reserved slots instead of growing the slab store by store.
     fn allocate_bytecode_constructor_receiver(
         &mut self,
         context: &ExecutionContext,
         function_id: u32,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
-        let reserved_field_count = self.prepare_constructor_field_transitions(
-            context,
-            function_id,
-            roots.new_target.get(),
-            roots.scratch_0.get(),
-            roots,
-        )?;
+        let (reserved_field_count, profile) =
+            self.constructor_receiver_reservation(context, function_id, roots)?;
         let simple_shape =
             self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), roots)?;
         let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
@@ -605,7 +613,9 @@ impl Interpreter {
                 slots.as_slice(),
                 reserved_field_count.max(field_count),
             );
-        } else if reserved_field_count != 0 {
+        } else if reserved_field_count > crate::object::INLINE_SLOT_CAP {
+            // Fields that fit the in-body words need no slab; reserving one
+            // would move every slot out of line for nothing.
             let mut receiver = roots
                 .receiver
                 .get()
@@ -619,16 +629,77 @@ impl Interpreter {
             .map_err(VmError::from)?;
             roots.receiver.set(Value::object(receiver));
         }
+        let receiver = roots
+            .receiver
+            .get()
+            .as_object()
+            .ok_or(VmError::InvalidOperand)?;
         crate::object::set_prototype_value(
-            roots
-                .receiver
-                .get()
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?,
+            receiver,
             &mut self.gc_heap,
             Some(roots.scratch_0.get()),
         );
+        self.note_constructor_receiver(profile, roots.new_target.get(), receiver);
         Ok(roots.receiver.get())
+    }
+
+    /// Slot capacity a constructor's receiver must start with: the baked
+    /// transition program folded with the instance size learned from the
+    /// previous receiver prepared by the same constructor. Returns the
+    /// profile the caller records the allocated receiver into.
+    /// `roots.new_target` and `roots.scratch_0` (the prototype) must be set.
+    fn constructor_receiver_reservation(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        roots: &SyncJsCallRoots,
+    ) -> Result<(usize, ConstructorProfileSample), VmError> {
+        let baked_field_count = self.prepare_constructor_field_transitions(
+            context,
+            function_id,
+            roots.new_target.get(),
+            roots.scratch_0.get(),
+            roots,
+        )?;
+        let sample = self.sample_constructor_profile(function_id, roots.new_target.get());
+        Ok((baked_field_count.max(sample.learned), sample))
+    }
+
+    /// Reserve storage on the bare receiver the interpreter's construct fast
+    /// path allocated for a bytecode base constructor.
+    ///
+    /// The interpreter plans no transition program of its own; it applies the
+    /// capacity an earlier generated preparation already baked for this pair
+    /// and the instance size learned from the pair's previous receivers, so
+    /// fields the body or its callees add land in reserved slots exactly as
+    /// they do for a runtime-prepared receiver. The receiver handle itself is
+    /// the root the slab allocation rewrites.
+    fn reserve_interpreter_construct_receiver(
+        &mut self,
+        function_id: u32,
+        stack: &ActivationStack,
+        callee_reg: u16,
+        mut receiver: JsObject,
+    ) -> Result<JsObject, VmError> {
+        let new_target = *read_register(&stack[stack.len() - 1], callee_reg)?;
+        let sample = self.sample_constructor_profile(function_id, new_target);
+        let baked_field_count = self
+            .constructor_field_capacity_cache
+            .get(&sample.key)
+            .copied()
+            .unwrap_or(0);
+        let reserved_field_count = baked_field_count.max(sample.learned);
+        if reserved_field_count > crate::object::INLINE_SLOT_CAP {
+            crate::object::reserve_fresh_object_slot_capacity(
+                &mut receiver,
+                &mut self.gc_heap,
+                reserved_field_count,
+            )
+            .map_err(VmError::from)?;
+        }
+        let new_target = *read_register(&stack[stack.len() - 1], callee_reg)?;
+        self.note_constructor_receiver(sample, new_target, receiver);
+        Ok(receiver)
     }
 
     /// Resolve the hidden class a conservative generated constructor can own
@@ -2708,6 +2779,37 @@ impl Interpreter {
                 return Ok(true);
             }
         }
+        // A receiver that runs a constructor body follows the shared storage
+        // contract: reserve the baked and learned slot capacity before the
+        // frame is built, so the body's own stores and those of its callees
+        // land in reserved slots.
+        let bytecode_base_function_id = current
+            .as_function()
+            .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()))
+            .filter(|&function_id| {
+                context
+                    .exec_function(function_id)
+                    .is_some_and(|function| !function.is_derived_constructor)
+            });
+        let receiver = match bytecode_base_function_id {
+            Some(function_id) => {
+                let receiver = self.reserve_interpreter_construct_receiver(
+                    function_id,
+                    stack,
+                    callee_reg,
+                    receiver,
+                )?;
+                let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
+                effective_new_target = rooted_callee;
+                current = if let Some(class) = rooted_callee.as_class_constructor() {
+                    class.ctor(&self.gc_heap)
+                } else {
+                    rooted_callee
+                };
+                receiver
+            }
+            None => receiver,
+        };
         let top_idx = stack.len() - 1;
         let frame = {
             let caller = &stack[top_idx];
@@ -3423,6 +3525,11 @@ impl Interpreter {
             return self.invoke(stack, context, &callee, this_value, forwarded, dst);
         }
         let arguments_object = self.materialize_frame_arguments_object(context, stack, top_idx)?;
+        // Materialization can move a getter-produced method and both operands.
+        // Their register slots retain the committed lookup without replaying it.
+        let method = *read_register(&stack[top_idx], method_reg)?;
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let this_value = *read_register(&stack[top_idx], this_reg)?;
         stack[top_idx].advance_pc()?;
         let args: SmallVec<[Value; 8]> = [this_value, arguments_object].into_iter().collect();
         self.invoke(stack, context, &method, callee, args, dst)

@@ -8,11 +8,14 @@
 //! - Bounded call-graph tiering for hot observed callees that need an entry
 //!   generation before the caller's stable direct-link snapshot is sealed.
 //! - Call/method target profiling and reoptimization eviction.
+//! - Cross-script recompilation resolves the defining code owner before baking.
 //!
 //! # Invariants
 //! Baked pointers (shape ids, global cells, prototype slots) must only
 //! reference permanent or non-moving allocations; anything movable goes
 //! through a runtime stub instead.
+//! Compile requests use the function's defining context, even when a later
+//! script triggered invalidation or reentry.
 //! Compiled code is published only after the registry accepts its metadata and
 //! exact isolate-epoch dependency snapshot.
 //! Eager direct-target compilation consumes an explicit depth budget, so a
@@ -434,6 +437,8 @@ impl Interpreter {
         if !hook.optimizing_tier_enabled() {
             return None;
         }
+        let owner = context.for_function(fid).ok()?;
+        let context = &*owner;
         self.prewarm_string_constant_cells(context, fid)?;
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&snapshot);
@@ -626,6 +631,10 @@ impl Interpreter {
         let Some(hook) = self.jit_hook.as_ref().cloned() else {
             return TemplateCompileOutcome::Deferred;
         };
+        let Ok(owner) = context.for_function(fid) else {
+            return TemplateCompileOutcome::Deferred;
+        };
+        let context = &*owner;
         if self.prewarm_string_constant_cells(context, fid).is_none() {
             return TemplateCompileOutcome::Deferred;
         }
@@ -2089,6 +2098,18 @@ impl Interpreter {
         new_target_function_id: u32,
     ) -> Option<jit::JitReceiverAllocationPlan> {
         let key = (base_function_id, new_target_function_id);
+        // A receiver whose learned instance size outgrows the inline words
+        // needs the runtime preparation's reserved slab; an inline allocation
+        // would hand the body storage it immediately has to grow.
+        if self
+            .constructor_instance_profiles
+            .get(&key)
+            .is_some_and(|profile| {
+                profile.learned_field_count(&self.gc_heap) > crate::object::INLINE_SLOT_CAP
+            })
+        {
+            return None;
+        }
         let Some(&capacity) = self.constructor_field_capacity_cache.get(&key) else {
             return Some(jit::JitReceiverAllocationPlan {
                 new_target_function_id,

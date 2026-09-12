@@ -2,7 +2,6 @@
 //!
 //! # Contents
 //! - Property, element and global load/store completions.
-//! - Object and array construction.
 //! - Inline-cache cell fills and the write barrier.
 //!
 //! # Invariants
@@ -499,42 +498,6 @@ impl Interpreter {
             }
             Ok(())
         })
-    }
-
-    /// Typed JIT allocation operation for `NewObject`. It uses the shared
-    /// stack-rooted allocator, so a
-    /// young-generation scavenge can rewrite live frame registers before the
-    /// object handle is published back into `dst`.
-    ///
-    /// # Errors
-    /// Propagates allocation failures.
-    pub fn jit_runtime_new_object(
-        &mut self,
-        frame: &mut crate::ActiveFrameMut<'_>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let value = self.allocate_object_literal_value()?;
-        frame.write(dst, value)
-    }
-
-    /// Typed JIT allocation operation for `NewArray`. The compiler supplies the
-    /// decoded destination and source-register list; this operation only owns
-    /// stack-rooted allocation and result publication.
-    ///
-    /// # Errors
-    /// Propagates invalid operands and allocation failures.
-    pub fn jit_runtime_new_array(
-        &mut self,
-        frame: &mut crate::ActiveFrameMut<'_>,
-        dst: u16,
-        source_regs: &[u16],
-    ) -> Result<(), VmError> {
-        let mut elements = Vec::with_capacity(source_regs.len());
-        for &register in source_regs {
-            elements.push(frame.read(register)?);
-        }
-        let value = self.allocate_array_literal_value(elements)?;
-        frame.write(dst, value)
     }
 
     /// Complete one computed `[[Set]]` from boxed values owned by generated

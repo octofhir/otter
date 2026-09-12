@@ -1259,6 +1259,7 @@ pub(crate) fn guarded_method_call_is_supported(
 /// `load_argument(ops, index, register)` materializes one argument and runs
 /// only once every guard has passed, so it may freely use `x10`–`x15`. The
 /// boxed result is left in `x0`; every miss branches to `bail`.
+/// `context_x` names the tier-owned native context register.
 pub(crate) fn emit_native_leaf_call<F>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -1266,6 +1267,7 @@ pub(crate) fn emit_native_leaf_call<F>(
     stub_id: RuntimeStubId,
     builtin_native_ref: u32,
     callee_x: u8,
+    context_x: u8,
     load_argument: F,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported>
@@ -1283,6 +1285,7 @@ where
         stub_id,
         NO_SAFEPOINT,
         declaration.argument_count,
+        context_x,
         load_argument,
         bail,
     )
@@ -1336,12 +1339,14 @@ pub(crate) fn emit_native_leaf_guard(
 /// across a miss and `load_value` may freely use `x10`–`x15`. `value_count` is
 /// how many of the family's operand words the site fills; the rest are
 /// `undefined`. The boxed result is left in `x0`; a miss branches to `bail`.
+/// The caller supplies its native context register as `context_x`.
 pub(crate) fn emit_native_entry_call<F>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     stub_id: RuntimeStubId,
     safepoint_id: SafepointId,
     value_count: u8,
+    context_x: u8,
     mut load_value: F,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported>
@@ -1370,7 +1375,7 @@ where
         };
         dynasm!(ops
             ; .arch aarch64
-            ; ldr x0, [x20, THREAD_OFFSET]
+            ; ldr x0, [X(context_x), THREAD_OFFSET]
             ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
         );
         emit_entry_values(ops, 1, last_register, value_count, &mut load_value)?;
@@ -1401,7 +1406,7 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; sub sp, sp, ALLOC_CTX_STACK_SIZE
-        ; ldr x9, [x20, THREAD_OFFSET]
+        ; ldr x9, [X(context_x), THREAD_OFFSET]
         ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
         ; movz w9, safepoint_id
         ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
@@ -1499,6 +1504,7 @@ where
         call.entry_stub_id,
         call.safepoint_id,
         value_count,
+        20,
         |ops, index, register| {
             if receiver_is_operand && index == 0 {
                 return emit_load_reg(ops, register, receiver);

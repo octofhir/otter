@@ -55,6 +55,7 @@ impl Interpreter {
         // stack on its own, so snapshot the runtime + frame roots here to keep
         // a collection at this site sound.
         let mut roots = Vec::new();
+        self.flush_constructor_observations(&self.gc_heap);
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
         let pool = self.cold_frames();
         for frame in stack.iter() {
@@ -80,6 +81,7 @@ impl Interpreter {
             return Vec::new();
         }
         let mut roots = Vec::new();
+        self.flush_constructor_observations(&self.gc_heap);
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
         self.gc_heap
             .trace_frame_root_providers(&mut |slot| roots.push(slot));
@@ -88,6 +90,7 @@ impl Interpreter {
 
     pub(crate) fn collect_runtime_roots_without_shape_runtime(&self) -> Vec<*mut RawGc> {
         let mut roots = Vec::new();
+        self.flush_constructor_observations(&self.gc_heap);
         RuntimeState::new(self).trace_roots_without_shape_runtime(&mut |slot| roots.push(slot));
         roots
     }

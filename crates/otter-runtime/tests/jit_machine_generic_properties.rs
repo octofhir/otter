@@ -653,8 +653,16 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
         .as_array()
         .expect("relocation entries");
     for (stub_id, stub, signature) in [
-        (18u64, "jit_load_property_value", "reentrantNamedLoad"),
-        (19u64, "jit_store_property_value", "reentrantNamedStore"),
+        (
+            u64::from(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY.id),
+            "jit_load_property_value",
+            "reentrantNamedLoad",
+        ),
+        (
+            u64::from(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY.id),
+            "jit_store_property_value",
+            "reentrantNamedStore",
+        ),
     ] {
         assert!(
             relocations.iter().any(|relocation| {
@@ -881,7 +889,7 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
 }
 
 #[test]
-fn default_object_prototype_adds_stay_on_one_canonical_store_per_peer() {
+fn default_object_prototype_adds_fill_and_reuse_the_guarded_transition() {
     let mut runtime = runtime(false);
     completion(&mut runtime, MIXED_SETUP, MIXED_MODULE);
 
@@ -907,11 +915,10 @@ fn default_object_prototype_adds_stay_on_one_canonical_store_per_peer() {
     assert_eq!(reuse, r#"[true,17,true,50,"anchor,added",5002]"#);
     assert_machine_entry_without_deopt(reuse_delta, "second default-prototype add");
     assert_eq!(
-        reuse_delta.runtime_property_stubs, 1,
-        "the load cell must hit while the unsupported default-prototype add executes once: \
-         {reuse_delta:?}"
+        reuse_delta.runtime_property_stubs, 0,
+        "the settled load and supported default-prototype add must both hit: {reuse_delta:?}"
     );
-    assert_eq!(reuse_delta.reentrant_stub_transitions, 1, "{reuse_delta:?}");
+    assert_eq!(reuse_delta.reentrant_stub_transitions, 0, "{reuse_delta:?}");
 }
 
 #[test]

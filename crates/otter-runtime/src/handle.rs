@@ -21,6 +21,8 @@
 //! - Script and module commands carry opaque realm ids; async settlement and
 //!   disposal are routed on the owning isolate.
 //! - Command replies carry only owned public data.
+//! - Process lifecycle listeners run inside the current diagnostics batch;
+//!   they never begin or drain a public top-level capture.
 //! - Dropping a waiting future does not drop the isolate mid-turn; the
 //!   runner observes the cancelled reply channel at the completion point.
 //! - Public commands never execute recursively. Commands received while the
@@ -3474,7 +3476,7 @@ impl IsolateRunner {
         let script = "typeof process === 'object' && typeof process.emit === 'function' \
             ? (process.emit('beforeExit', typeof process.exitCode === 'number' ? process.exitCode : 0), 0) \
             : 0";
-        match self.runtime.eval(SourceInput::from_javascript(script)) {
+        match self.run_process_lifecycle_script(script) {
             Ok(result) if result.explicit_exit() => Ok(Some(result.exit_code())),
             Ok(_) => Ok(None),
             Err(error) => Err(error),
@@ -3526,7 +3528,7 @@ impl IsolateRunner {
                 let script = format!(
                     "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, true) : {code}"
                 );
-                let final_code = match self.runtime.eval(SourceInput::from_javascript(script)) {
+                let final_code = match self.run_process_lifecycle_script(script) {
                     Ok(emit_result) => emit_result
                         .completion_string()
                         .parse::<i64>()
@@ -3549,7 +3551,7 @@ impl IsolateRunner {
         let script = format!(
             "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, false) : {code}"
         );
-        match self.runtime.eval(SourceInput::from_javascript(script)) {
+        match self.run_process_lifecycle_script(script) {
             Ok(emit_result) => {
                 // Normal completion answers the hook's final code as the
                 // completion value; a nested `process.exit(newCode)` in a
@@ -3567,6 +3569,20 @@ impl IsolateRunner {
             // Node's does.
             Err(error) => (Err(error), None),
         }
+    }
+
+    /// Execute process hooks inside the current command's capture. Public
+    /// `eval` owns a new top-level batch and cannot be used for lifecycle work.
+    fn run_process_lifecycle_script(
+        &mut self,
+        script: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.runtime
+            .run_script_with_context(
+                SourceInput::from_javascript(script.into()),
+                "<process-lifecycle>",
+            )
+            .map(|(result, _)| result)
     }
 
     fn drive_event_loop_to_idle(

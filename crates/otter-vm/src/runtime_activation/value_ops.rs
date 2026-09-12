@@ -1,5 +1,10 @@
 //! Value, binding, property, element, and allocation operations.
 //!
+//! # Contents
+//! - Register-index operations for Template and fixed-value operations for SSA.
+//! - Canonical literal allocation from owned values, without VM destinations.
+//!
+//! # Invariants
 //! Register-index methods own a short [`crate::ActiveFrameMut`] scope
 //! internally. Fixed-value methods instead use the published frame only for
 //! function/PC identity and operate on explicitly rooted boxed operands. The
@@ -355,14 +360,12 @@ impl RuntimeCall<'_> {
         self.coerce_unary(dst, src, UnaryCoercionOp::ToPrimitive { hint })
     }
 
-    /// Allocate and commit an array from decoded source registers.
-    pub fn new_array(&mut self, dst: u16, sources: &[u16]) -> Result<(), VmError> {
+    /// Allocate a literal from boxed values copied before collection.
+    pub fn new_array_value(&mut self, elements: &[Value]) -> Result<Value, VmError> {
+        // SAFETY: the branded runtime call exclusively owns VM access and its
+        // published native roots remain active through the shared allocator.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_new_array(&mut frame, dst, sources)
+        vm.allocate_array_literal_value(elements.iter().copied())
     }
 
     /// Build the activation's `arguments` object and commit it to `dst`.
@@ -421,14 +424,12 @@ impl RuntimeCall<'_> {
         )
     }
 
-    /// Allocate and commit an ordinary object.
-    pub fn new_object(&mut self, dst: u16) -> Result<(), VmError> {
+    /// Allocate an ordinary object without an interpreter destination.
+    pub fn new_object_value(&mut self) -> Result<Value, VmError> {
+        // SAFETY: as `new_array_value`; the returned handle is published by
+        // generated code before the next allocating operation.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_new_object(&mut frame, dst)
+        vm.allocate_object_literal_value()
     }
 
     /// Store a captured binding with its TDZ check.

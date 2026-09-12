@@ -126,13 +126,35 @@ path only when `new.target` is the entered function; a distinct ordinary target
 retains the canonical path. Allocation caches only the immutable plan and
 reserved capacity; a guard miss deoptimizes before the source `StoreProperty`
 starts. `machineClassSuperLoad` reads an exact
-class wrapper's live superclass, `machineDerivedThisBindFast` commits the first
-successful `super()` result, and `machineDerivedThisBindCold` owns the repeated
-bind error. `directConstructResultFast` performs base substitution and valid
+class wrapper's live superclass. `machineDerivedThisBindFast` commits the first
+successful `super()` result only in an unbound stack-owned derived frame.
+`machineDerivedThisBindCold` uses the canonical binding operation for materialized
+frames, shared lexical `this` cells, and repeated-bind errors. Both siblings and
+their SSA join are explicit before register allocation; only the cold call owns
+the safepoint and exceptional edge. A repeated `super()` preserves the first
+`this`, performs the second base constructor's effects once, and delivers the
+ReferenceError to the original catch landing without replaying construction.
+`directConstructResultFast` performs base substitution and valid
 derived selection in generated code; `directConstructResultThrow` is the cold
 primitive/uninitialized-`this` validator. Late tagged Machine roots cover fixed
 arguments across receiver preparation, so the allocator's early and late homes
 are not part of the call ABI.
+
+Literal allocation relocations `jit_new_object` and `jit_new_array` use the
+shared `reentrantValueSpan` ABI and a committed result pair. Despite the physical
+signature's name, these allocation descriptors do not permit JavaScript
+reentry. Object allocation consumes an empty span; array allocation consumes
+boxed elements, preserving holes. The runtime copies the span before collection
+and uses the canonical VM allocator. Template publishes its frame window as
+roots and commits the returned value directly to the destination. Machine
+exposes each allocation as `machineLiteralAllocation` at its source `bytePc`;
+its descriptor, operand span and precise safepoint exist before allocation of
+registers. Object and array results stay in allocated SSA homes, including
+allocations in a local catch. Every copied element comes from a published root
+home; an unrelated live object remains rooted across subsequent allocations.
+Empty spans use no packet storage, and literal allocation cannot deopt/replay
+after entering the canonical boundary. Source register indices and
+array-operand metadata addresses do not cross this ABI.
 
 Runtime and engine-benchmark snapshots expose exact receiver-allocation
 attribution. `jit-receiver-alloc-attempts` equals generated successes plus
@@ -193,16 +215,32 @@ backend's actual result: `generated`, or `rejected` with
 `arityUnsupported`, `layoutUnsupported`, or `eliminated`. A generated result
 means the backend emitted an exact native function identity guard plus either
 the declared leaf call or equivalent generated completion; it does not mean
-Rust was entered. Proven Int32 `Math.abs`, `Math.max`, and `Math.min` use the
-latter path. An extracted static call exposes a
-`nativeInt32MathIntrinsic` code-map region, while the absence of the matching
-Math leaf from `relocations.json` proves that the guarded hit stays in machine
-code. The exact bootstrap `parseInt` with one Int32 argument uses the same
-static-native plan and exposes the allocation-free `parse_int_i32_leaf` on the
-generated hit. Other tags, arities, explicit radix calls, and global
-replacement retain the canonical call before observable coercion. Separate
+Rust was entered. Guarded `Math.abs`, `Math.max`, and `Math.min` method hits
+can complete as generated Int32 operations in `machineMethodIntrinsic` regions.
+An extracted plain static call with proven Int32 arguments uses
+`machineNativeInt32MathIntrinsic` for abs/max/min, preserving Int32 SSA and
+exiting before an overflowing abs result. Other supported static calls use
+`machineNativeLeafCall`, with its `bytePc`
+and a shared runtime-stub relocation identifying the declared leaf. The callee,
+arguments, result, call clobbers, and exact pre-call deopt state are represented
+in Machine IR before allocation. These leaves allocate no objects, publish no
+GC roots, and cannot reenter JavaScript. The exact bootstrap `parseInt` with
+one Int32 argument uses `parse_int_i32_leaf`. A different tag or replaced
+callee exits before coercion; an unsupported arity, explicit receiver, or
+local exception handler retains the canonical call. Template uses the same
+identity guard and declared ABI with its own explicit context register.
+Separate
 plan and lowering events keep feedback selection distinct from emitted machine
 code.
+
+A stack-owned Template activation keeps catch-only handler state in the
+verified CodeBlock region table. `EnterTry` and `LeaveTry` do not materialize a
+cold frame. A committed getter or callee throw selects the innermost catch,
+writes its exception register, and exits at the catch PC; the source operation
+is not replayed. Exact deoptimization reconstructs only the handlers still
+active there. Finally and dynamic completion operations keep their pre-effect
+canonical continuation. Function metadata resolves through its owning context,
+including when a later script calls an earlier generated function.
 
 `generatedCallDeopt` is emitted only when an already-started generated callee
 bails into cold interpreter continuation. It records baked `callKind`, exact
@@ -344,9 +382,11 @@ empty. Calls, allocations, tagged stores, and other representation-changing
 effects make a loop ineligible, and no loaded `Value` or GC reference enters a
 view-cache slot.
 Fixed TypedArray views over resizable ArrayBuffers also compare the complete
-baked view extent with the backing store's live byte length. A shrink therefore
-exits before either reading or writing even when the requested index still fits
-the stale cached view length.
+baked view extent with the backing store's live byte length. A shrink branches
+to the committed cold sibling before reading or writing, even when the index
+still fits the retained prefix. `machineElementLoadFast` / `machineElementLoadCold`
+and `machineElementStoreFast` / `machineElementStoreCold` retain the source
+`bytePc`; the cold access completes exactly once without deoptimizing the caller.
 Captured, global-lexical, and guarded global-object accesses use the same
 `machineBindingGuard` / `machineBindingHit` / `machineBindingCold` /
 `machineBindingJoin` family. Stable-cell and slot hits stay generated; TDZ,

@@ -12,6 +12,7 @@
 //! a validated compiled Return/Throw payload across the cold reconciliation.
 //!
 //! # Invariants
+//! Bail diagnostics resolve the defining function owner across script boundaries.
 //! Every generated callee frame remains published until native return, throw,
 //! or cold deoptimization releases its entry lease and depth accounting.
 //! Every VM-side compiled entry selection requires the exact installed code
@@ -100,6 +101,8 @@ impl Interpreter {
         pc: u32,
     ) {
         self.record_jit_debug_event(|| {
+            let owner = context.for_function(fid).ok();
+            let context = owner.as_deref().unwrap_or(context);
             let function_name = context
                 .function(fid)
                 .map(|function| function.name.clone())

@@ -496,10 +496,14 @@ impl Interpreter {
             };
             let arguments_object =
                 self.materialize_frame_arguments_object(context, stack, frame_index)?;
+            // The arguments allocation may move a getter-produced method.
+            // Reload the committed lookup and operands from the traced frame.
             (
-                method,
-                callee,
-                [this_value, arguments_object].into_iter().collect(),
+                frame.read(method_reg)?,
+                frame.read(receiver_reg)?,
+                [frame.read(this_reg)?, arguments_object]
+                    .into_iter()
+                    .collect(),
             )
         };
         self.jit_runtime_stats.jit_to_rust_call_transitions = self

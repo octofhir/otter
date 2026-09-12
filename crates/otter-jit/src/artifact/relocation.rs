@@ -73,7 +73,6 @@ pub(crate) enum TemplateOperandArena {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TemplateOperandRole {
     ClosureParents,
-    NewArrayElements,
     ConstructArguments,
 }
 
@@ -1035,7 +1034,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             });
             output.push(match role {
                 TemplateOperandRole::ClosureParents => 0,
-                TemplateOperandRole::NewArrayElements => 1,
                 TemplateOperandRole::ConstructArguments => 3,
             });
             put_u32(output, *start);

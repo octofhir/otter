@@ -226,19 +226,19 @@ pub(super) fn emit_new_object(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     dst: u16,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
     fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_transition_call(
+) -> Result<(), Unsupported> {
+    super::value_packet::emit_value_packet_transition(
         ops,
         relocations,
-        table.variadic_entry(abi::STUB_JIT_NEW_OBJECT),
+        table,
         abi::STUB_JIT_NEW_OBJECT,
-        threw,
+        &[],
+        dst,
+        throw_value,
         fatal,
-    );
+    )
 }
 
 pub(super) fn emit_collect_arguments(
@@ -298,30 +298,24 @@ pub(super) fn emit_new_array(
     table: &TransitionTable,
     dst: u16,
     elements: &[u16],
-    elements_tail: TemplateTail,
-    threw: DynamicLabel,
+    throw_value: DynamicLabel,
     fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_operand_slice_address(
+) -> Result<(), Unsupported> {
+    let words = elements
+        .iter()
+        .copied()
+        .map(super::value_packet::PacketWord::Register)
+        .collect::<Vec<_>>();
+    super::value_packet::emit_value_packet_transition(
         ops,
         relocations,
-        2,
-        elements.as_ptr() as u64,
-        TemplateOperandArena::Registers,
-        TemplateOperandRole::NewArrayElements,
-        elements_tail,
-    );
-    emit_load_u64(ops, 3, elements.len() as u64);
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_NEW_ARRAY),
+        table,
         abi::STUB_JIT_NEW_ARRAY,
-        threw,
+        &words,
+        dst,
+        throw_value,
         fatal,
-    );
+    )
 }
 
 pub(super) fn emit_fresh_upvalue(

@@ -3,7 +3,7 @@
 //! # Contents
 //! - Monomorphic spread calls and constructions through shared generated
 //!   linkage.
-//! - Reentrant completion for sites without a generated target.
+//! - Reentrant completion for spread sites without a generated target.
 //! - Uniform success, throw, and committed caller-handler resumption routing.
 //!
 //! # Invariants

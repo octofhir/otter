@@ -50,8 +50,8 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-12.
-- Observed commit: the generated-frame actual-arguments commit (clean tree at
-  snapshot time).
+- Observed commit: the template generic-call value-transition commit (clean
+  tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
@@ -503,8 +503,13 @@ deopt reconstruction. Keep extending the final path; do not translate new IR
 back into deleted/legacy SSA or add an emitter-specific semantic path.
 
 Current state (measured 2026-09-12, Octane in fresh processes against node
-v24): NavierStokes 2x, Richards 19x, Splay 21x (2x noise), Box2D 65x,
-DeltaBlue 90x, EarleyBoyer 145x, RayTrace 165x, Crypto 260x behind. A
+v24): NavierStokes 2x, Richards 19x, Splay 21x (2x noise), Box2D 62x,
+DeltaBlue 90x, EarleyBoyer 122x, RayTrace 163x, Crypto 243x behind. The
+template's plain and explicit-receiver calls without a generated edge now
+complete through the callee-carrying value transition that the Machine tier
+already used, so a native call inside a stack-owned generated callee no
+longer side-exits the whole call chain (RayTrace generated-call deopts 380 →
+116 per run, bails 108 → 2; EarleyBoyer 689 → 818, Box2D 2211 → 2305). A
 generated caller now publishes every actual argument after the callee's
 register window (`NativeFrameFlags::INCOMING_ARGUMENTS`, traced with the
 registers), so a body that materializes `arguments` takes direct call and
@@ -528,19 +533,19 @@ literals, and catch regions around named-property misses. Recompilation
 never reads the recorded bail PCs, so a failed speculation is re-emitted
 until the generation is abandoned.
 
-Next work, in order: the template's monomorphic inlinable-numeric method
-path treats a receiver-guard miss as a deopt, so `color.brightness()` in
-RayTrace's `setPixel` side-exits on every call (118 generated-call deopts per
-run) and Box2D's template `CallMethodValue` sites bail 535 times — a guard
-miss must fall through to the direct-call and generic layers exactly as the
-polymorphic path already does; `f.apply(this, arguments)` with an
+Next work, in order: Machine lowering must consult the recorded exit PCs
+(`optimized_bail_pcs`, the analogue of JSC's per-site ExitProfile that the
+DFG queries before re-speculating) so a rebuilt generation does not repeat
+the speculation that exited — today RayTrace's `rayTrace` exits 100 times at
+one `LooseNotEqual` and Box2D exits 100 times per `Mul` site before the
+budget rebuilds an identical body; `f.apply(this, arguments)` with an
 arguments object must spread the published window into a direct call
-instead of re-entering the runtime; admit `Throw`/`NewError`, closures with
-captured cells, and object/array literals into the Machine HIR with
-committed cold paths where no fast path is proven yet, measuring the decline
-histogram on Octane after each family; read `optimized_bail_pcs` during
-lowering so a recompile does not repeat the exited speculation (Box2D's
-Machine `Mul` exits 300 times per run); then the sequence below.
+instead of re-entering the runtime; the spread call/construct transition
+still requires a materialized frame and side-exits stack-owned callees;
+admit `Throw`/`NewError`, closures with captured cells, and object/array
+literals into the Machine HIR with committed cold paths where no fast path
+is proven yet, measuring the decline histogram on Octane after each family;
+then the sequence below.
 
 Active sequence:
 

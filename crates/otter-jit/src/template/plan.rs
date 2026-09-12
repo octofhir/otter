@@ -521,8 +521,8 @@ pub(crate) enum TemplateOp {
         method: u64,
         packed_args: u64,
     },
-    /// Complete spread calls/constructions and explicit-receiver calls
-    /// through the shared synchronous VM transition.
+    /// Complete spread calls/constructions through the shared synchronous VM
+    /// transition.
     /// `TailCall` is intentionally excluded — its interpreter completion
     /// discards the caller frame for true tail-call stack reuse, which the
     /// compiled call helper cannot reproduce, so it stays an exact side exit.

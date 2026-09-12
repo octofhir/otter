@@ -515,10 +515,21 @@ these are overlapping inclusive sample weights, not operation counts.
 Source inspection confirms a boxed root provider plus entry-Vec allocation
 before each property IC probe. All diagnostic suites complete successfully.
 
-Next: remove per-entry allocation for bounded property operands through the
-existing GC root boundary, preserving stable provider/slot addresses, nested
-reentry, unwinding and moved-operand reload before cell fill. The 601-sample
-store-recipe hotspot also requires site/key/miss-reason attribution before
+Property operands now use the existing `HandleScopeFrame` and `HandleArena`:
+no per-entry Box or root-entry Vec, no parallel provider or new unsafe code.
+GC traces the live arena buffer; handles retain indices across arena growth.
+Store hits reload the moved receiver before cell fill, and rejected transition
+capture reloads both operands before canonical fallback. Scope cleanup uses
+the shared RAII owner across return, exception and panic.
+
+Validation: 17 focused tests, both property/reentry tests at every GC stress
+stride 1..16 with verification, scoped clippy and three release differential
+cases. A single release build supplied five valid RayTrace samples: 939 ± 2
+became 1322 ± 7 (+40.79%), same program hash, median RSS unchanged. Report:
+`benchmarks/results/s1-20260913-property-handles/README.md`. No full gate or
+comparison-engine baseline was repeated, and no engine-wide win is claimed.
+
+Next: attribute the remaining store recipes by site/key/miss reason before
 expanding generated-way coverage; compile snapshot events are not frequency
 counters. Forwarded generated calls, spread packets, Machine coverage and root
 scanning follow the handoff order. Reuse successful checks and recorded

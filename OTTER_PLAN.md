@@ -50,8 +50,8 @@ claim.
 ## Live snapshot
 
 - Snapshot date: 2026-09-12.
-- Observed commit: the construct-prepare GC-counter fix (clean tree at
-  snapshot time).
+- Observed commit: the `apply(this, arguments)` forwarding commit (clean
+  tree at snapshot time).
 - The checkout may change in parallel. Re-snapshot touched files immediately
   before each edit and merge with concurrent work; never reset or overwrite it.
 - Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
@@ -504,7 +504,14 @@ back into deleted/legacy SSA or add an emitter-specific semantic path.
 
 Current state (measured 2026-09-12, Octane in fresh processes against node
 v24): NavierStokes 2x, Richards 19x, Splay 27x (2x noise), Box2D 61x,
-DeltaBlue 86x, EarleyBoyer 96x, RayTrace 137x, Crypto 248x behind. The
+DeltaBlue 86x, EarleyBoyer 96x, RayTrace 94x, Crypto 248x behind. A body
+whose every use of `arguments` is `callee.apply(x, arguments)` now compiles
+to `Op::CallForwardArguments` and skips the prologue's arguments object: the
+interpreter and generated code forward the activation's actual arguments
+when the observably read `apply` is the intrinsic (JSC's ForwardVarargs,
+V8's CallWithArrayLike with arguments elision), and any other method
+receives a per-activation arguments object materialized on first use
+(RayTrace 676 → 984). The
 generated construct-prepare transition sampled the collector's cycle counts
 through `gc_stats()`, which re-aggregates the whole per-type table; two such
 calls per construct were the hottest leaf in RayTrace (17% of the main
@@ -547,9 +554,11 @@ well as the root's. The rebuild still waits for the 100-exit budget (JSC's
 `osrExitCountForReoptimization`), so a site such as RayTrace's `rayTrace`
 `LooseNotEqual` pays one budget per generation.
 
-Next work, in order: `f.apply(this, arguments)` with an
-arguments object must spread the published window into a direct call
-instead of re-entering the runtime; the spread call/construct transition
+Next work, in order: `Op::CallForwardArguments` still enters the callee
+through the runtime call boundary — the direct-call linkage must accept the
+published incoming window as its argument source so the forward becomes a
+generated call and the Machine tier can admit the opcode; the spread
+call/construct transition
 still requires a materialized frame and side-exits stack-owned callees;
 admit `Throw`/`NewError`, closures with captured cells, and object/array
 literals into the Machine HIR with committed cold paths where no fast path

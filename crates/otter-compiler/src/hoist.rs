@@ -731,6 +731,144 @@ pub(crate) fn body_references_arguments(
     finder.found
 }
 
+/// `true` when the body names `arguments` and every such reference is the
+/// forwarded argument list of `<callee>.apply(<this>, arguments)`: a plain
+/// call with exactly those two arguments, no spread, not an optional
+/// chain, and not inside an arrow (an arrow forwards the enclosing
+/// activation's object, not its own). Parameter defaults never qualify.
+/// Nested non-arrow functions and class bodies own their own `arguments`
+/// and are skipped, mirroring [`body_references_arguments`].
+///
+/// Such a body needs no materialized arguments object on the fast path:
+/// each forward hands the activation's actual arguments straight to the
+/// callee when `apply` resolves to the intrinsic.
+pub(crate) fn arguments_uses_are_forwarded(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+) -> bool {
+    use oxc_ast::ast::{Argument, Expression};
+    use oxc_ast_visit::Visit;
+    #[derive(Default)]
+    struct ForwardFinder {
+        nested_function_depth: u32,
+        arrow_depth: u32,
+        forwarded: u32,
+        plain: bool,
+    }
+    fn is_forwarded_apply(call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+        if call.optional || call.arguments.len() != 2 {
+            return false;
+        }
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return false;
+        };
+        if member.optional || member.property.name.as_str() != "apply" {
+            return false;
+        }
+        !matches!(&call.arguments[0], Argument::SpreadElement(_))
+            && matches!(
+                &call.arguments[1],
+                Argument::Identifier(id) if id.name.as_str() == "arguments"
+            )
+    }
+    impl<'a> Visit<'a> for ForwardFinder {
+        fn visit_function(
+            &mut self,
+            it: &oxc_ast::ast::Function<'a>,
+            flags: oxc_syntax::scope::ScopeFlags,
+        ) {
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_function(self, it, flags);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_class_body(&mut self, it: &oxc_ast::ast::ClassBody<'a>) {
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_class_body(self, it);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_arrow_function_expression(
+            &mut self,
+            it: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+            self.arrow_depth += 1;
+            oxc_ast_visit::walk::walk_arrow_function_expression(self, it);
+            self.arrow_depth -= 1;
+        }
+        fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+            if self.nested_function_depth == 0 && self.arrow_depth == 0 && is_forwarded_apply(it) {
+                self.forwarded += 1;
+                let Expression::StaticMemberExpression(member) = &it.callee else {
+                    unreachable!("forwarded apply has a static member callee");
+                };
+                self.visit_expression(&member.object);
+                self.visit_argument(&it.arguments[0]);
+                return;
+            }
+            oxc_ast_visit::walk::walk_call_expression(self, it);
+        }
+        fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
+            if self.nested_function_depth == 0 && id.name.as_str() == "arguments" {
+                self.plain = true;
+            }
+        }
+    }
+    let mut finder = ForwardFinder::default();
+    for p in &params.items {
+        if let Some(init) = p.initializer.as_deref() {
+            let mut defaults = ForwardFinder::default();
+            defaults.visit_expression(init);
+            if defaults.plain || defaults.forwarded != 0 {
+                return false;
+            }
+        }
+    }
+    if let Some(rest) = &params.rest {
+        let mut defaults = ForwardFinder::default();
+        defaults.visit_binding_rest_element(&rest.rest);
+        if defaults.plain || defaults.forwarded != 0 {
+            return false;
+        }
+    }
+    if let Some(b) = body {
+        for stmt in &b.statements {
+            finder.visit_statement(stmt);
+        }
+    }
+    finder.forwarded != 0 && !finder.plain
+}
+
+/// `true` when a formal parameter, a hoisted `var`, a body-level lexical
+/// declaration, or a body-level function declaration binds `name`, so an
+/// identifier of that name in the body resolves to the own binding rather
+/// than to an implicit function-scope binding such as `arguments`.
+pub(crate) fn function_declares_name(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+    name: &str,
+) -> bool {
+    let mut names = Vec::new();
+    for param in &params.items {
+        collect_pattern_var_names(&param.pattern, &mut names);
+    }
+    if let Some(rest) = &params.rest {
+        collect_pattern_var_names(&rest.rest.argument, &mut names);
+    }
+    if let Some(body) = body {
+        hoist_var_names(&body.statements, &mut names);
+        let mut lexical = Vec::new();
+        hoist_lexical_names(&body.statements, &mut lexical);
+        names.extend(lexical.into_iter().map(|(name, _)| name));
+        for stmt in &body.statements {
+            if let Statement::FunctionDeclaration(function) = stmt
+                && let Some(id) = &function.id
+            {
+                names.push(id.name.to_string());
+            }
+        }
+    }
+    names.iter().any(|candidate| candidate == name)
+}
+
 /// `true` when the body may observe `arguments.callee`: a literal
 /// `.callee` member or any computed member access on the `arguments`
 /// identifier (the key is a runtime value, so it may be "callee").

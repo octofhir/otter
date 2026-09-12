@@ -157,8 +157,13 @@ pub struct ColdFrame {
     pub rest_args: SmallVec<[Value; 4]>,
     /// Full incoming-argument list captured at call entry. Populated
     /// only when the callee was compiled with `needs_arguments`;
-    /// consumed by `Op::CollectArguments`.
+    /// consumed by `Op::CollectArguments` and `Op::CallForwardArguments`.
     pub incoming_args: SmallVec<[Value; 4]>,
+    /// The activation's arguments exotic object once materialized. A body
+    /// that only forwards `arguments` builds it lazily, and only when the
+    /// resolved `apply` is not the intrinsic; every later use in the same
+    /// activation observes the same object.
+    pub arguments_object: Option<Value>,
     /// Active try-handler stack. Pushed by `Op::EnterTry`, popped by
     /// `Op::LeaveTry` or by exception unwind landing on a matching
     /// catch / finally. Innermost handler on top.
@@ -226,6 +231,9 @@ impl ColdFrame {
         for value in &self.incoming_args {
             crate::code_liveness::visit_value(value, visitor);
         }
+        if let Some(value) = &self.arguments_object {
+            crate::code_liveness::visit_value(value, visitor);
+        }
         for (value, _) in &self.active_iterator_closers {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -246,6 +254,7 @@ impl ColdFrame {
             && self.new_target.is_none()
             && self.rest_args.is_empty()
             && self.incoming_args.is_empty()
+            && self.arguments_object.is_none()
             && self.handlers.is_empty()
             && self.active_iterator_closers.is_empty()
             && !self.is_derived_constructor
@@ -279,6 +288,7 @@ impl ColdFrame {
             new_target,
             rest_args,
             incoming_args,
+            arguments_object,
             handlers,
             active_iterator_closers,
             is_derived_constructor,
@@ -290,6 +300,7 @@ impl ColdFrame {
             new_target,
             rest_args,
             incoming_args,
+            arguments_object,
             is_derived_constructor,
             derived_this_cell,
         );
@@ -359,6 +370,9 @@ impl ColdFrame {
             v.trace_value_slots(visitor);
         }
         for v in &self.incoming_args {
+            v.trace_value_slots(visitor);
+        }
+        if let Some(v) = &self.arguments_object {
             v.trace_value_slots(visitor);
         }
         for (v, _) in &self.active_iterator_closers {

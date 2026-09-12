@@ -1591,6 +1591,23 @@ pub const STUB_JIT_COLLECT_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
+/// Complete `CallForwardArguments` against the published frame: forward the
+/// activation's actual arguments to the callee when the resolved method is
+/// %Function.prototype.apply%, otherwise call that method with the frame's
+/// arguments object. A stack-owned frame whose method is not the intrinsic
+/// reports a pre-effect side exit so the interpreter materializes the object
+/// once per activation.
+pub const STUB_JIT_CALL_FORWARD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
+    94,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+    NativeResultDomain::None,
+);
+
 /// Complete the exact published schema-owned binding operation from two boxed
 /// values. Function/PC identity selects the semantic family and operand roles
 /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
@@ -1750,6 +1767,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         91 => "jit_call_with_this_value",
         92 => "jit_construct_value",
         93 => "jit_collect_arguments",
+        94 => "jit_call_forward_arguments",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1849,6 +1867,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CALL_WITH_THIS_VALUE,
     STUB_JIT_CONSTRUCT_VALUE,
     STUB_JIT_COLLECT_ARGUMENTS,
+    STUB_JIT_CALL_FORWARD_ARGUMENTS,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -2279,6 +2298,23 @@ mod tests {
         assert_eq!(
             STUB_JIT_COLLECT_ARGUMENTS.result_abi,
             RuntimeStubResultAbi::StatusWord
+        );
+    }
+
+    #[test]
+    fn call_forward_arguments_entry_is_a_reentrant_status_word_transition() {
+        assert_eq!(STUB_JIT_CALL_FORWARD_ARGUMENTS.id, 94);
+        assert_eq!(
+            STUB_JIT_CALL_FORWARD_ARGUMENTS.class,
+            RuntimeStubClass::Reentrant
+        );
+        assert_eq!(
+            STUB_JIT_CALL_FORWARD_ARGUMENTS.result_abi,
+            RuntimeStubResultAbi::StatusWord
+        );
+        assert_eq!(
+            runtime_stub_name(STUB_JIT_CALL_FORWARD_ARGUMENTS.id),
+            "jit_call_forward_arguments"
         );
     }
 

@@ -402,6 +402,38 @@ impl Interpreter {
                     }
                     continue;
                 }
+                Op::CallForwardArguments => {
+                    if jit_installed {
+                        self.record_call_attempt_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                        );
+                    }
+                    let depth_before = stack.len();
+                    self.do_call_forward_arguments_exec(stack, context, function, instr)?;
+                    let bytecode_pushed = stack.len() > depth_before;
+                    if jit_installed && bytecode_pushed {
+                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(
+                            stack[stack.len() - 1].function_id,
+                        );
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                    }
+                    if jit_installed
+                        && bytecode_pushed
+                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
+                    {
+                        return Ok(value);
+                    }
+                    continue;
+                }
                 Op::CallMethodValue => {
                     if jit_installed {
                         self.record_call_attempt_feedback(

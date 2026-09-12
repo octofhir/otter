@@ -1046,6 +1046,7 @@ opcode_schema! {
     (Op::EvalRestoreBinding, 0xB9),
     (Op::StorePropertyStrict, 0xBA),
     (Op::StoreElementStrict, 0xBB),
+    (Op::CallForwardArguments, 0xBC),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1201,6 +1202,7 @@ const JUMP: &[OperandSpec] = &[IMM];
 const BRANCH: &[OperandSpec] = &[IMM, R];
 const CALL_PREFIX: &[OperandSpec] = &[W, R, CONST];
 const CALL_WITH_THIS_PREFIX: &[OperandSpec] = &[W, R, R, CONST];
+const CALL_FORWARD_ARGUMENTS: &[OperandSpec] = &[W, R, R, R];
 const COUNTED_VALUES_PREFIX: &[OperandSpec] = &[W, CONST];
 const METHOD_CALL_PREFIX: &[OperandSpec] = &[W, R, CONST, CONST];
 const NAMESPACE_CALL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
@@ -1276,6 +1278,7 @@ const fn operand_shape(op: Op) -> OperandShape {
             count_operand_index: 3,
             tail: R,
         },
+        Op::CallForwardArguments => OperandShape::Fixed(CALL_FORWARD_ARGUMENTS),
         Op::Throw => OperandShape::Fixed(&[R]),
         Op::EnterTry => OperandShape::Fixed(ENTER_TRY),
         Op::EndFinally => OperandShape::Fixed(EMPTY),
@@ -1529,6 +1532,7 @@ const fn control_flow(op: Op) -> ControlFlow {
         Op::Await | Op::Yield | Op::YieldDelegate | Op::GeneratorStart => ControlFlow::Suspend,
         Op::Call
         | Op::CallWithThis
+        | Op::CallForwardArguments
         | Op::CallMethodValue
         | Op::CallSpread
         | Op::New
@@ -1706,6 +1710,7 @@ const fn feedback(op: Op) -> FeedbackKind {
         | Op::ArrayLength => FeedbackKind::Element,
         Op::Call
         | Op::CallWithThis
+        | Op::CallForwardArguments
         | Op::CallMethodValue
         | Op::CallSpread
         | Op::TailCall
@@ -1792,6 +1797,7 @@ const fn baseline_support(op: Op) -> TierSupport {
         | Op::ArrayLength
         | Op::Call
         | Op::CallWithThis
+        | Op::CallForwardArguments
         | Op::CallMethodValue
         | Op::Return
         | Op::ReturnValue
@@ -1865,6 +1871,10 @@ mod tests {
             Op::DeleteDynamic,
             Op::StoreShadowedUpvalueChecked,
             Op::DeleteShadowedUpvalue,
+            Op::LoadShadowedUpvalueSnap,
+            Op::StoreShadowedUpvalueCheckedSnap,
+            Op::EvalBindingSeq,
+            Op::EvalRestoreBinding,
         ]);
         let actual = OPCODE_SCHEMA
             .iter()
@@ -2000,6 +2010,11 @@ mod tests {
                     assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
                     assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
                     assert_operand(schema, policy, OperandKind::Imm32, RegisterAccess::None);
+                }
+                BindingSemantics::Read(BindingRead::EvalBindingSeq { .. }) => {}
+                BindingSemantics::Write(BindingWrite::ShadowedRestore { name, index }) => {
+                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
                 }
             }
         }

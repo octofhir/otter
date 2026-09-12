@@ -1032,7 +1032,7 @@ impl BaselinePlan {
                         third,
                     })
                 }
-                Op::CallSpread => LoweredOperands::Quad(QuadOperands {
+                Op::CallSpread | Op::CallForwardArguments => LoweredOperands::Quad(QuadOperands {
                     first: reg(operands, 0)?,
                     second: reg(operands, 1)?,
                     third: reg(operands, 2)?,

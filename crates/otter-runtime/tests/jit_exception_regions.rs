@@ -5,6 +5,7 @@
 //! - Throw and abrupt return completion through nested finally bodies.
 //! - Break/continue crossing finally, including replacement of parked state.
 //! - A direct compiled callee throw caught by its compiled caller.
+//! - Stack-owned nested catch entry and committed getter throws across scripts.
 //!
 //! # Invariants
 //! - Loop OSR is disabled for the fixture, so exception-bearing functions must
@@ -144,5 +145,62 @@ fn exception_regions_complete_from_whole_function_entries() {
     assert!(
         direct_calls > 0,
         "throw propagation must cross a compiled direct-call boundary"
+    );
+}
+
+#[test]
+fn stack_owned_nested_catch_routes_committed_getter_throw_once() {
+    let setup = r#"
+let entered = 0;
+let inner = 0;
+let outer = 0;
+let getters = 0;
+function catchProperty(receiver) {
+  entered++;
+  try {
+    try { return receiver.value; }
+    catch (error) { inner++; throw error; }
+  } catch (error) { outer++; return error.marker; }
+}
+function callCatch(fn, receiver) { return fn(receiver); }
+const good = { value: 42 };
+for (let i = 0; i < 80; i++) catchProperty(good);
+for (let i = 0; i < 80; i++) callCatch(catchProperty, good);
+"#;
+    let probe = r#"
+const before = entered;
+const bad = { get value() { getters++; throw { marker: 73 }; } };
+JSON.stringify([callCatch(catchProperty, bad), entered - before, inner, outer, getters]);
+"#;
+    let execute = |selection| {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .jit_osr_threshold(u32::MAX)
+            .build()
+            .expect("catch runtime");
+        runtime
+            .run_script(SourceInput::from_javascript(setup), "static-catch-setup.js")
+            .expect("warm catch endpoints");
+        let before = runtime.execution_stats();
+        let result = runtime
+            .run_script(SourceInput::from_javascript(probe), "static-catch-probe.js")
+            .expect("committed getter throw reaches nested catches");
+        let completion = result.completion_string().to_owned();
+        let after = result.stats();
+        (completion, before, after)
+    };
+    let (oracle, _, _) = execute(JitSelection::InterpreterOnly);
+    let (compiled, before, after) = execute(JitSelection::Template);
+    assert_eq!(oracle, "[73,1,1,1,1]");
+    assert_eq!(compiled, oracle);
+    assert_eq!(
+        before.jit_generated_call_deopts, 0,
+        "normal catch entry must stay generated"
+    );
+    assert!(after.jit_generated_calls > before.jit_generated_calls);
+    assert_eq!(
+        after.jit_generated_call_deopts - before.jit_generated_call_deopts,
+        1,
+        "one committed catch landing must materialize without replaying the getter"
     );
 }

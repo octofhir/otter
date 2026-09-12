@@ -127,6 +127,8 @@ impl Interpreter {
             .retain(|id, _| outside(id));
         self.constructor_field_capacity_cache
             .retain(|(id, _), _| outside(id));
+        self.constructor_instance_profiles
+            .retain(|(id, _), _| outside(id));
         self.constructor_prototype_shape_cache
             .retain(|(id, _), _| outside(id));
         self.global_lexical_load_ic.retain(|(id, _), _| outside(id));
@@ -153,6 +155,7 @@ impl Interpreter {
     /// Mutable borrow of the per-isolate GC heap.
     #[must_use]
     pub fn gc_heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+        self.flush_constructor_observations(&self.gc_heap);
         &mut self.gc_heap
     }
 

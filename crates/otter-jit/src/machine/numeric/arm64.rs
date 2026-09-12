@@ -5,6 +5,7 @@
 //! - Exact JavaScript Number decode, scalar coercion leaves, canonical boxing,
 //!   and shared cold exits.
 //! - regalloc2 edit emission between selected instructions.
+//! - `value_span` — shared rooted packet emission for calls and literals.
 //!
 //! # Invariants
 //! - Callee-saved `x19` retains the entry context; allocated `x20..x28` and
@@ -63,8 +64,15 @@
 //! - OSR trampolines decode only live loop-header inputs into the exact
 //!   late-use locations selected by regalloc2; rejection never mutates VM slots.
 //! - Successful results use the VM's canonical tagged representation.
+//! - Static-native calls use the shared bootstrap identity guard and leaf ABI;
+//!   x9 owns the callee, x1/x2 the boxed arguments, and x0 the boxed result.
+//!   A non-success leaf status exits at the exact pre-call state without roots
+//!   or reentry, with every ABI clobber declared before allocation.
 //! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
+//! - Derived-this binding has explicit fast/cold Machine blocks. The fast
+//!   probe writes only an unbound stack-owned derived frame; the committed
+//!   cold call owns materialized state, duplicate-bind errors and local catches.
 //! - Plain, guarded-method, and fixed-arity base/derived/super JavaScript calls
 //!   reuse the shared generated linkage emitter; the allocator supplies only
 //!   location-aware loads, stores, root reloads, and landing-pad result homes.
@@ -78,6 +86,9 @@
 // dynasm's dynamic-register expansion calls `.into()` on the required u8
 // register encoding. Clippy sees the macro expansion as an identity conversion.
 #![allow(clippy::useless_conversion)]
+
+mod value_span;
+use value_span::emit_value_span_arguments;
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_bytecode::opcode_schema::{
@@ -702,22 +713,43 @@ fn emit_committed_runtime_call(
     throw_value: DynamicLabel,
     fatal_exit: DynamicLabel,
 ) -> Result<u32, Unsupported> {
-    let CallTarget::CommittedRuntime {
-        target,
-        logical_pc,
-        byte_pc,
-        semantic_arity,
-    } = &descriptor.target
-    else {
-        return Err(Unsupported::OperandShape("scalar committed runtime target"));
+    let (target, logical_pc, byte_pc, semantic_arity, literal) = match &descriptor.target {
+        CallTarget::CommittedRuntime {
+            target,
+            logical_pc,
+            byte_pc,
+            semantic_arity,
+        } => {
+            if *semantic_arity > 2 || target.signature != RuntimeStubSignature::CommittedValue2 {
+                return Err(Unsupported::OperandShape("scalar committed runtime ABI"));
+            }
+            (
+                *target,
+                *logical_pc,
+                *byte_pc,
+                usize::from(*semantic_arity),
+                false,
+            )
+        }
+        CallTarget::LiteralAllocation {
+            target,
+            logical_pc,
+            byte_pc,
+        } => {
+            if target.signature != RuntimeStubSignature::ReentrantValueSpan {
+                return Err(Unsupported::OperandShape("scalar literal allocation ABI"));
+            }
+            (
+                *target,
+                *logical_pc,
+                *byte_pc,
+                descriptor.arguments.len(),
+                true,
+            )
+        }
+        _ => return Err(Unsupported::OperandShape("scalar committed runtime target")),
     };
-    let target = *target;
-    let logical_pc = *logical_pc;
-    let byte_pc = *byte_pc;
-    let semantic_arity = usize::from(*semantic_arity);
-    if semantic_arity > 2
-        || target.signature != RuntimeStubSignature::CommittedValue2
-        || target.result_abi != RuntimeStubResultAbi::NativePair
+    if target.result_abi != RuntimeStubResultAbi::NativePair
         || target.result_domain != NativeResultDomain::Committed
         || descriptor.arguments.len() != semantic_arity
         || descriptor.results != [MachineRepresentation::Tagged]
@@ -762,18 +794,22 @@ fn emit_committed_runtime_call(
     emit_clear_packed_double_view_caches(ops, frame, sequence.packed_double_view_cache_count())?;
     emit_save_safepoint_roots(ops, frame, site)?;
     emit_publish_machine_roots(ops, frame, site)?;
-    emit_load_u64(ops, 1, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch aarch64 ; mov x2, x1);
-    for (index, value) in arguments.iter().copied().enumerate() {
-        emit_load_safepoint_root(
-            ops,
-            frame,
-            site,
-            value,
-            u8::try_from(index + 1)
-                .map_err(|_| Unsupported::OperandShape("scalar committed runtime argument"))?,
-            MACHINE_ROOT_RECORD_SIZE,
-        )?;
+    if literal {
+        emit_value_span_arguments(ops, sequence, frame, site, arguments.iter().copied())?;
+    } else {
+        emit_load_u64(ops, 1, VALUE_UNDEFINED);
+        dynasm!(ops ; .arch aarch64 ; mov x2, x1);
+        for (index, value) in arguments.iter().copied().enumerate() {
+            emit_load_safepoint_root(
+                ops,
+                frame,
+                site,
+                value,
+                u8::try_from(index + 1)
+                    .map_err(|_| Unsupported::OperandShape("scalar committed runtime argument"))?,
+                MACHINE_ROOT_RECORD_SIZE,
+            )?;
+        }
     }
     emit_load_u64(ops, 15, u64::from(logical_pc));
     dynasm!(ops
@@ -831,6 +867,11 @@ fn emit_committed_runtime_call(
             emit_clear_machine_roots(ops);
             emit_reload_safepoint_roots(ops, frame, site)?;
             dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
+        }
+        ExceptionalEdge::None if literal => {
+            // Literal allocation cannot throw JavaScript. An unexpected status
+            // remains structural and cannot enter a source-level catch.
+            dynasm!(ops ; .arch aarch64 ; b =>fatal);
         }
         ExceptionalEdge::None => {
             return Err(Unsupported::OperandShape(
@@ -1412,6 +1453,39 @@ pub(super) fn emit(
                     ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
                     ; ldr X(destination), [x16, NATIVE_FRAME_THIS_OFFSET]
                 );
+            }
+            MachineOpcode::TryBindDerivedThis { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let flags = otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS
+                    | otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
+                dynasm!(ops ; .arch aarch64
+                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                    ; ldrb w15, [x16, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
+                    ; movz w17, flags as u32
+                    ; and w15, w15, w17
+                    ; cmp w15, w17
+                    ; b.ne =>miss
+                    ; ldr x15, [x16, NATIVE_FRAME_THIS_OFFSET]
+                );
+                emit_load_u64(&mut ops, 17, Value::hole().to_bits());
+                dynasm!(ops ; .arch aarch64
+                    ; cmp x15, x17
+                    ; b.ne =>miss
+                    ; str x1, [x16, NATIVE_FRAME_THIS_OFFSET]
+                    ; movz w0, #1
+                    ; b =>done
+                    ; =>miss
+                    ; movz w0, #0
+                    ; =>done
+                );
+                structural_regions.push((
+                    "machineDerivedThisBindFast",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::StringConstantCellLoad { byte_pc, target } => {
                 let start = ops.offset().0;
@@ -3052,76 +3126,21 @@ pub(super) fn emit(
                         };
                         if *argument_mode == DirectCallArgumentMode::Fixed {
                             let generic_start = ops.offset().0;
-                            let packet = super::method_value_packet_frame(sequence)?;
-                            let value_count = u16::try_from(result_index).map_err(|_| {
-                                Unsupported::OperandShape(
-                                    "scalar generic method packet value count",
-                                )
-                            })?;
-                            if value_count == 0 || value_count > packet.raw_words {
-                                return Err(Unsupported::OperandShape(
-                                    "scalar generic method packet capacity",
-                                ));
-                            }
-                            let packet_end = packet.raw_start.checked_add(value_count).ok_or(
-                                Unsupported::OperandShape("scalar generic method packet end"),
+                            emit_value_span_arguments(
+                                &mut ops,
+                                sequence,
+                                frame,
+                                site,
+                                instruction.operands[..result_index]
+                                    .iter()
+                                    .map(|operand| operand.value),
                             )?;
-                            if packet_end > frame.raw_slots() {
-                                return Err(Unsupported::OperandShape(
-                                    "scalar generic method packet frame",
-                                ));
-                            }
-
-                            // The packet itself is deliberately untraced. Each
-                            // copied value remains live in its canonical,
-                            // published safepoint home for the whole runtime
-                            // call, and the runtime copies the packet before it
-                            // can allocate or reenter JavaScript.
-                            for packet_index in 0..value_count {
-                                let missing_operand = Unsupported::OperandShape(
-                                    "scalar generic method packet operand",
-                                );
-                                let operand = instruction
-                                    .operands
-                                    .get(usize::from(packet_index))
-                                    .ok_or(missing_operand)?;
-                                emit_load_safepoint_root(
-                                    &mut ops,
-                                    frame,
-                                    site,
-                                    operand.value,
-                                    16,
-                                    MACHINE_ROOT_RECORD_SIZE,
-                                )?;
-                                let raw_slot = packet.raw_start.checked_add(packet_index).ok_or(
-                                    Unsupported::OperandShape(
-                                        "scalar generic method packet raw slot",
-                                    ),
-                                )?;
-                                let packet_offset = raw_offset(frame, raw_slot)?
-                                    .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                                    .ok_or(Unsupported::OperandShape(
-                                        "scalar generic method packet offset",
-                                    ))?;
-                                emit_sp_str_x(&mut ops, 16, packet_offset);
-                            }
-                            let packet_offset = raw_offset(frame, packet.raw_start)?
-                                .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                                .ok_or(Unsupported::OperandShape(
-                                    "scalar generic method packet base",
-                                ))?;
                             emit_load_u64(&mut ops, 15, u64::from(*logical_pc));
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
                                 ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
                                 ; mov x0, x19
-                            );
-                            emit_sp_address_x9(&mut ops, packet_offset);
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; mov x1, x9
-                                ; movz w2, u32::from(value_count)
                             );
                             emit_load_symbolic_u64(
                                 &mut ops,
@@ -3204,6 +3223,56 @@ pub(super) fn emit(
                     }
                     dynasm!(ops ; .arch aarch64 ; =>direct_done);
                 } else {
+                    if let CallTarget::NativeLeaf { target, byte_pc } = &descriptor.target {
+                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let start = ops.offset().0;
+                        let int32 = descriptor.results == [MachineRepresentation::Int32];
+                        if int32 {
+                            crate::template::arm64::ic_probe::emit_native_leaf_guard(
+                                &mut ops,
+                                view,
+                                target.builtin_native_ref,
+                                9,
+                                deopt,
+                            )?;
+                            super::super::native_leaf::arm64::emit_int32(
+                                &mut ops,
+                                target.leaf_stub_id,
+                                deopt,
+                            )?;
+                        } else {
+                            crate::template::arm64::ic_probe::emit_native_leaf_call(
+                                &mut ops,
+                                &mut relocations,
+                                view,
+                                target.leaf_stub_id,
+                                target.builtin_native_ref,
+                                9,
+                                19,
+                                |_ops, _index, _register| Ok(()),
+                                deopt,
+                            )?;
+                        }
+                        structural_regions.push((
+                            if int32 {
+                                "machineNativeInt32MathIntrinsic"
+                            } else {
+                                "machineNativeLeafCall"
+                            },
+                            Some(*byte_pc),
+                            start,
+                            ops.offset().0,
+                        ));
+                        if !is_terminator {
+                            emit_edits(
+                                &mut ops,
+                                allocation.edits(),
+                                AllocationPoint::After(id),
+                                frame,
+                            )?;
+                        }
+                        continue;
+                    }
                     if let CallTarget::ColdCallExit { byte_pc, .. } = &descriptor.target {
                         let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                         let start = ops.offset().0;
@@ -3246,7 +3315,10 @@ pub(super) fn emit(
                         }
                         continue;
                     }
-                    if matches!(&descriptor.target, CallTarget::CommittedRuntime { .. }) {
+                    if matches!(
+                        &descriptor.target,
+                        CallTarget::CommittedRuntime { .. } | CallTarget::LiteralAllocation { .. }
+                    ) {
                         let start = ops.offset().0;
                         let byte_pc = emit_committed_runtime_call(
                             &mut ops,
@@ -3264,8 +3336,22 @@ pub(super) fn emit(
                             throw_value,
                             fatal,
                         )?;
+                        if super::super::derived_this::cold_byte_pc(sequence, block_index)
+                            == Some(byte_pc)
+                        {
+                            structural_regions.push((
+                                "machineDerivedThisBindCold",
+                                Some(byte_pc),
+                                start,
+                                ops.offset().0,
+                            ));
+                        }
                         structural_regions.push((
-                            "machineCommittedValueEffect",
+                            if matches!(descriptor.target, CallTarget::LiteralAllocation { .. }) {
+                                "machineLiteralAllocation"
+                            } else {
+                                "machineCommittedValueEffect"
+                            },
                             Some(byte_pc),
                             start,
                             ops.offset().0,
@@ -3489,10 +3575,12 @@ pub(super) fn emit(
                             }
                             (*target, array_construct_entry, 3, true)
                         }
+                        CallTarget::NativeLeaf { .. } => unreachable!("handled native leaf above"),
                         CallTarget::RuntimeStub(_) => {
                             return Err(Unsupported::OperandShape("scalar runtime call target"));
                         }
-                        CallTarget::CommittedRuntime { .. } => {
+                        CallTarget::CommittedRuntime { .. }
+                        | CallTarget::LiteralAllocation { .. } => {
                             unreachable!("handled committed runtime call above")
                         }
                         CallTarget::Direct { .. } => unreachable!("handled direct call above"),
@@ -3782,11 +3870,12 @@ pub(super) fn emit(
     } else {
         0
     };
-    let committed_runtime_cold_bytes = if sequence
-        .call_descriptors()
-        .iter()
-        .any(|descriptor| matches!(&descriptor.target, CallTarget::CommittedRuntime { .. }))
-    {
+    let committed_runtime_cold_bytes = if sequence.call_descriptors().iter().any(|descriptor| {
+        matches!(
+            &descriptor.target,
+            CallTarget::CommittedRuntime { .. } | CallTarget::LiteralAllocation { .. }
+        )
+    }) {
         MACHINE_ROOT_RECORD_SIZE
     } else {
         0

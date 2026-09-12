@@ -881,7 +881,7 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
                     .file(JitArtifactFileName::CodeMap)
                     .is_some_and(|file| {
                         std::str::from_utf8(file.contents())
-                            .is_ok_and(|text| text.contains("directCallNativeEntry"))
+                            .is_ok_and(|text| text.contains("machineDirectMethodCandidate"))
                     })
         })
     });
@@ -903,7 +903,8 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         || artifact_has("\"argumentMode\":\"spread\"", false);
     let used_machine_constructor_field = code_map_has("machineConstructorFieldTransition");
     let used_machine_class_super_load = code_map_has("machineClassSuperLoad");
-    let used_machine_derived_this_bind = code_map_has("machineDerivedThisBindFast");
+    let used_machine_derived_this_bind =
+        code_map_has("machineDerivedThisBindFast") && code_map_has("machineDerivedThisBindCold");
     let used_direct_construct_result_fast = code_map_has("directConstructResultFast");
     let used_direct_construct_result_throw = code_map_has("directConstructResultThrow");
     let compile_diagnostics = result
@@ -993,7 +994,8 @@ fn assert_machine_direct_call(result: &RunResult) {
     );
     assert!(
         result.used_machine_direct_call,
-        "fixture must publish a Machine IR body containing direct linkage"
+        "fixture must publish a Machine IR body containing direct linkage: {:?}",
+        result.compile_diagnostics
     );
 }
 
@@ -1551,7 +1553,8 @@ fn method_throw_enters_explicit_machine_landing_pad() {
     assert_machine_method_call(&compiled);
     assert!(
         compiled.used_machine_method_landing_ack,
-        "landingCaller must own the generated method linkage and its dedicated caught-throw acknowledgement"
+        "landingCaller must own the generated method linkage and its dedicated caught-throw acknowledgement: {:?}",
+        compiled.compile_diagnostics
     );
 }
 

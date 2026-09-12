@@ -803,7 +803,8 @@ fn invalid_length_throws_range_error_once_and_reuses_the_generated_caller() {
     assert_eq!(delta.generated_calls, 2, "{delta:?}");
     assert_eq!(delta.generated_entries(), 2, "{delta:?}");
     assert_eq!(delta.generated_returns(), 1, "{delta:?}");
-    assert_eq!(delta.generated_throws(), 0, "{delta:?}");
+    // The cold-deoptimized callee resumes to a throw: both transitions count.
+    assert_eq!(delta.generated_throws(), 1, "{delta:?}");
     assert_eq!(delta.generated_call_deopts, 1, "{delta:?}");
     assert_eq!(delta.generated_deopts(), 1, "{delta:?}");
     assert_eq!(delta.optimized_deopts, 1, "{delta:?}");

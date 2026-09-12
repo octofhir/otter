@@ -5,14 +5,6 @@
 //! — for [`otter_gc::GcHeap::collect_full`] to consume during a
 //! full GC pause.
 //!
-//! Phase 1 is the scaffolding pass: every type that will move
-//! to a `Gc<…>` slot in tasks 76–83 already implements
-//! [`crate::gc_trace::GcTrace`] (with empty bodies today).
-//! [`Self::trace_roots`] enumerates the right set of roots
-//! against those stubs. As each migration task lands, the
-//! stub bodies fill in and this walker starts visiting real
-//! slots — **without any change to the wiring**.
-//!
 //! # Contents
 //!
 //! - [`RuntimeState`] — borrowed view over an
@@ -35,7 +27,7 @@
 //!
 //! - GC architecture plan §4.2 (root sources), §4.3
 //!   (pseudocode).
-//! - Task 75 — root enumeration.
+//! - `constructor_profile` for observations discarded before tracing.
 
 use crate::Interpreter;
 use crate::gc_trace::{GcRootVisitor, GcTrace};
@@ -60,13 +52,11 @@ impl<'a> RuntimeState<'a> {
     ///
     /// Per §4.2, roots are:
     /// - shared `globalThis` object;
-    /// - intrinsics (Phase 1: not yet a distinct root —
-    ///   tracked as a stub for future migrations);
+    /// - realm intrinsic prototypes;
     /// - module-environment registry;
     /// - active call frames (locals + register window +
     ///   accumulator + `this` + bytecode-module reference);
-    /// - parked async / generator frames in promise reactions
-    ///   (Phase 1: covered by the per-frame stub);
+    /// - parked async / generator frames in promise reactions;
     /// - microtask queue;
     /// - dynamic-import registry and module evaluation error cache;
     /// - symbol registry + well-known symbols;

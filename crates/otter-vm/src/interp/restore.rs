@@ -139,6 +139,8 @@ impl Interpreter {
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             constructor_field_transition_cache: rustc_hash::FxHashMap::default(),
             constructor_field_capacity_cache: rustc_hash::FxHashMap::default(),
+            constructor_instance_profiles: rustc_hash::FxHashMap::default(),
+            pending_constructor_samples: std::cell::RefCell::new(Vec::new()),
             constructor_prototype_shape_cache: rustc_hash::FxHashMap::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,

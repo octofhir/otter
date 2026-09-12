@@ -18,11 +18,11 @@
 //! - Every public `alloc<T>` records `T::TYPE_TAG` on the
 //!   [`crate::header::GcHeader`]; full GC dispatches through the
 //!   trace table by tag.
+//! - Registered observation prologues run before nursery movement, each
+//!   incremental marking step or sweep; observations cannot become strong roots.
 //! - Black allocation: when a marking cycle is in progress
 //!   (`marking.is_marking() == true`), new objects start black so
-//!   the marker doesn't have to re-discover them. Phase-1 STW
-//!   marker never observes the flag set during the mutator phase
-//!   so the fast path costs one branch.
+//!   the marker doesn't have to re-discover them.
 //! - Pages live forever inside the heap or are returned to the
 //!   cage on full-GC sweep. Pages are never leaked across heap
 //!   drops.
@@ -1729,10 +1729,22 @@ impl GcHeap {
         self.collect_minor_internal(external_visit)
     }
 
+    fn prepare_collection_observations(&self) {
+        for (index, source) in self.extra_roots.iter().enumerate() {
+            if !self.extra_roots[..index]
+                .iter()
+                .any(|prior| prior.same_source(source))
+            {
+                source.prepare_collection(self);
+            }
+        }
+    }
+
     fn collect_minor_internal(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        self.prepare_collection_observations();
         // Combine the caller's external_visit with the heap's
         // own handle-stack and global-handles walk.
         let handle_stack: *const HandleStack = &*self.handle_stack;
@@ -2010,6 +2022,7 @@ impl GcHeap {
         if !self.marking.is_marking() {
             return 0;
         }
+        self.prepare_collection_observations();
         // SAFETY: every header on the worklist was pushed while
         // alive. New old-gen allocations during the cycle are
         // black-at-birth so they never enter the worklist; the
@@ -2027,6 +2040,7 @@ impl GcHeap {
     /// [`Self::sweep_phase`]), every reachable old-gen object is
     /// black, and the worklist is empty.
     pub fn finish_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        self.prepare_collection_observations();
         // Re-shade roots — the mutator may have rewritten handles
         // or globals between mark steps. The barrier covered every
         // *new* white-child publication, but a slot whose pointer
@@ -2141,6 +2155,7 @@ impl GcHeap {
     }
 
     fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
+        self.prepare_collection_observations();
         self.prune_ephemeron_registry_to_marked();
         self.prune_weak_finalization_registry_to_marked();
 

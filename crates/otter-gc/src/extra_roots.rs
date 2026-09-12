@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //!
-//! - [`ExtraRootSource`] — safe trait implemented by runtime owners of roots.
+//! - [`ExtraRootSource`] — root owners and pre-collection observation hooks.
 //! - [`ExtraRoots`] — raw-pointer trampoline stored by [`crate::heap::GcHeap`].
 //! - [`ExtraRootsGuard`] — RAII registration removed on return or unwind.
 //!
@@ -27,6 +27,16 @@ use crate::heap::GcHeap;
 /// Safe callback surface for owner-managed root slots not stored in the heap's
 /// handle stack or global handle table.
 pub trait ExtraRootSource {
+    /// Discard or summarize ephemeral observations before the collector moves
+    /// or sweeps any object. This hook is distinct from root enumeration,
+    /// which may run after some objects have already moved.
+    ///
+    /// The hook must not allocate in the GC heap, reenter JavaScript, mutate
+    /// registrations or retain the heap reference. Read-only heap access and
+    /// owner-managed scalar/cache updates are permitted. Repeated calls are
+    /// allowed, including at incremental-mark steps and sweep boundaries.
+    fn prepare_collection(&self, _heap: &GcHeap) {}
+
     /// Visit every mutable raw root slot owned by this source.
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc));
 }
@@ -36,6 +46,7 @@ pub trait ExtraRootSource {
 pub struct ExtraRoots {
     data: *const (),
     thunk: unsafe fn(*const (), &mut dyn FnMut(*mut RawGc)),
+    prepare: unsafe fn(*const (), &GcHeap),
 }
 
 impl ExtraRoots {
@@ -49,10 +60,23 @@ impl ExtraRoots {
             unsafe { (&*(data as *const S)).visit_extra_roots(visitor) };
         }
 
+        unsafe fn prepare<S: ExtraRootSource>(data: *const (), heap: &GcHeap) {
+            // SAFETY: the same source lifetime and concrete type as the root thunk.
+            unsafe { (&*(data as *const S)).prepare_collection(heap) };
+        }
+
         Self {
             data: source as *const S as *const (),
             thunk: thunk::<S>,
+            prepare: prepare::<S>,
         }
+    }
+
+    /// Prepare registered owner observations before any collection work.
+    /// Composite sources must forward this hook as well as [`Self::visit`].
+    pub fn prepare_collection(self, heap: &GcHeap) {
+        // SAFETY: the registered source is live throughout this GC pause.
+        unsafe { (self.prepare)(self.data, heap) };
     }
 
     /// Visit the source's roots. Public so a composite
@@ -114,6 +138,86 @@ mod tests {
 
     impl ExtraRootSource for EmptySource {
         fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {}
+    }
+
+    #[test]
+    fn observation_preparation_precedes_minor_mark_and_sweep_work() {
+        use crate::{Gc, test_support::OpaqueLeaf};
+        use std::cell::Cell;
+
+        struct Observations {
+            pending: Cell<Option<Gc<OpaqueLeaf>>>,
+            observed: Cell<u64>,
+            preparations: Cell<usize>,
+        }
+        impl ExtraRootSource for Observations {
+            fn prepare_collection(&self, heap: &GcHeap) {
+                self.preparations.set(self.preparations.get() + 1);
+                if let Some(handle) = self.pending.take() {
+                    self.observed
+                        .set(heap.read_payload(handle, |body| body.payload));
+                }
+            }
+            fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {
+                assert!(
+                    self.pending.get().is_none(),
+                    "observations must not enter tracing"
+                );
+            }
+        }
+        let mut heap = GcHeap::new().expect("heap");
+        let source = Observations {
+            pending: Cell::new(Some(
+                heap.alloc(OpaqueLeaf { payload: 11 }).expect("sample"),
+            )),
+            observed: Cell::new(0),
+            preparations: Cell::new(0),
+        };
+        struct Composite(ExtraRoots);
+        impl ExtraRootSource for Composite {
+            fn prepare_collection(&self, heap: &GcHeap) {
+                self.0.prepare_collection(heap);
+            }
+            fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+                self.0.visit(visitor);
+            }
+        }
+        let composite = Composite(ExtraRoots::new(&source));
+        let _first = heap.register_extra_roots(ExtraRoots::new(&composite));
+        let _duplicate = heap.register_extra_roots(ExtraRoots::new(&composite));
+        let mut external = |_visitor: &mut dyn FnMut(*mut RawGc)| {
+            assert!(
+                source.pending.get().is_none(),
+                "prepare before external roots can move"
+            );
+        };
+        heap.collect_minor_with_roots(&mut external)
+            .expect("minor collection");
+        assert_eq!(source.observed.get(), 11);
+        assert_eq!(source.preparations.get(), 1, "one preparation per owner");
+        source.pending.set(Some(
+            heap.alloc(OpaqueLeaf { payload: 22 }).expect("sample"),
+        ));
+        heap.start_incremental_mark_phase(&mut external)
+            .expect("mark start");
+        assert_eq!(source.observed.get(), 22);
+        source.pending.set(Some(
+            heap.alloc(OpaqueLeaf { payload: 30 }).expect("sample"),
+        ));
+        let _ = heap.incremental_mark_step(1);
+        assert_eq!(source.observed.get(), 30);
+        source.pending.set(Some(
+            heap.alloc(OpaqueLeaf { payload: 33 }).expect("sample"),
+        ));
+        heap.finish_incremental_mark_phase(&mut external);
+        assert_eq!(source.observed.get(), 33);
+        source.pending.set(Some(
+            heap.alloc_old_diagnostic(OpaqueLeaf { payload: 44 })
+                .expect("sample"),
+        ));
+        heap.sweep_phase();
+        assert_eq!(source.observed.get(), 44);
+        assert!(source.pending.get().is_none());
     }
 
     #[test]

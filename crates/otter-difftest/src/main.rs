@@ -7,7 +7,10 @@
 //!
 //! # Invariants
 //! - Interpreter-only is the semantic oracle.
+//! - The template candidate explicitly selects `--jitless`; environment
+//!   hotness thresholds cannot substitute for a tier selection.
 //! - Every candidate has a wall-clock cap and is killed on timeout.
+//! - Empty corpora, timeouts and signal termination cannot count as agreement.
 //! - GC-stress candidates also enable slot verification; any stale heap/root
 //!   edge becomes a differential failure even when observable output survives.
 //! - Corpus programs make otherwise-hidden final globals/effects part of their
@@ -44,7 +47,7 @@ struct Args {
 enum Mode {
     InterpreterOnly,
     NormalTiering,
-    ForcedBaseline,
+    TemplateBaseline,
     GcStress { stride: u32 },
 }
 
@@ -108,8 +111,8 @@ fn run(otter: &Path, source: &str, case: &str, mode: &Mode, timeout: Duration) -
             command.arg("--interpreter");
         }
         Mode::NormalTiering => {}
-        Mode::ForcedBaseline => {
-            command.env("OTTER_JIT_OSR_THRESHOLD", "1");
+        Mode::TemplateBaseline => {
+            command.arg("--jitless");
         }
         Mode::GcStress { stride } => {
             command
@@ -154,21 +157,41 @@ fn corpus_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn mismatch(oracle: &Observation, candidates: &[(Mode, Observation)]) -> Option<String> {
+    if oracle.timed_out || oracle.exit_code.is_none() {
+        return Some(format!("Interpreter oracle did not complete: {oracle:?}"));
+    }
+    candidates.iter().find_map(|(mode, observation)| {
+        if observation.timed_out || observation.exit_code.is_none() {
+            Some(format!("{mode:?} did not complete: {observation:?}"))
+        } else if observation != oracle {
+            Some(format!("{mode:?} diverged: {observation:?}"))
+        } else {
+            None
+        }
+    })
+}
+
 fn main() {
     let args = Args::parse();
     let otter = args
         .otter
         .unwrap_or_else(|| PathBuf::from("target/release/otter"));
     let timeout = Duration::from_millis(args.timeout_ms);
-    let mut modes = vec![Mode::NormalTiering, Mode::ForcedBaseline];
+    let mut modes = vec![Mode::NormalTiering, Mode::TemplateBaseline];
     modes.extend(
         args.gc_strides
             .into_iter()
             .map(|stride| Mode::GcStress { stride }),
     );
 
+    let files = corpus_files(&args.corpus);
+    if files.is_empty() {
+        eprintln!("no JavaScript corpus files in {}", args.corpus.display());
+        std::process::exit(2);
+    }
     let mut cases = Vec::new();
-    for path in corpus_files(&args.corpus) {
+    for path in files {
         let source = fs::read_to_string(&path).expect("read corpus source");
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let oracle = run(&otter, &source, &name, &Mode::InterpreterOnly, timeout);
@@ -180,10 +203,7 @@ fn main() {
                 (mode, observation)
             })
             .collect();
-        let mismatch = candidates
-            .iter()
-            .find(|(_, observation)| observation != &oracle)
-            .map(|(mode, observation)| format!("{mode:?} diverged: {observation:?}"));
+        let mismatch = mismatch(&oracle, &candidates);
         cases.push(CaseResult {
             case: name,
             passed: mismatch.is_none(),
@@ -204,5 +224,49 @@ fn main() {
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
     if failed != 0 {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(exit_code: Option<i32>, timed_out: bool) -> Observation {
+        Observation {
+            exit_code,
+            timed_out,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn identical_timeouts_or_signal_terminations_do_not_pass() {
+        for oracle in [observation(Some(0), true), observation(None, false)] {
+            let candidates = vec![(Mode::NormalTiering, oracle.clone())];
+            assert!(mismatch(&oracle, &candidates).is_some());
+        }
+    }
+
+    #[test]
+    fn candidate_failure_and_output_divergence_do_not_pass() {
+        let oracle = observation(Some(0), false);
+        let mut different_output = oracle.clone();
+        different_output.stdout = "different result".into();
+        for candidate in [
+            observation(Some(0), true),
+            observation(None, false),
+            different_output,
+        ] {
+            assert!(mismatch(&oracle, &[(Mode::TemplateBaseline, candidate)]).is_some());
+        }
+    }
+
+    #[test]
+    fn matching_normal_and_thrown_completions_pass() {
+        for exit_code in [0, 1] {
+            let oracle = observation(Some(exit_code), false);
+            assert!(mismatch(&oracle, &[(Mode::TemplateBaseline, oracle.clone())]).is_none());
+        }
     }
 }

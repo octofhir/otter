@@ -294,29 +294,6 @@ pub(crate) extern "C" fn jit_load_element_stub(
     committed_vm_result(ctx, result)
 }
 
-/// Runtime stub: allocate an ordinary object for `NewObject` from compiled code.
-/// Uses the VM's stack-rooted allocator so moving young-GC semantics match the
-/// interpreter path.
-pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let mut runtime = match ctx.runtime_call() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return NativeResultStatus::Throw as u64;
-        }
-    };
-    let result = runtime.new_object(dst as u16);
-    match result {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
-}
-
 /// Runtime stub: build the activation's `arguments` object for
 /// `CollectArguments` from compiled code. A stack-owned frame reads the actual
 /// arguments its generated caller published; a materialized activation reads

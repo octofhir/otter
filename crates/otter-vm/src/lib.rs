@@ -77,6 +77,7 @@ pub mod collections_prototype;
 pub mod console;
 mod constant_ops;
 mod constructor_fast_path;
+mod constructor_profile;
 mod conversion;
 mod cpu_profile;
 pub mod date;
@@ -1019,6 +1020,15 @@ pub struct Interpreter {
     constructor_field_capacity_cache: rustc_hash::FxHashMap<(u32, u32), usize>,
     /// Ordinary prototype-chain shapes for each planned class allocation.
     constructor_prototype_shape_cache: rustc_hash::FxHashMap<(u32, u32), Vec<object::ShapeId>>,
+    /// Instance size learned per exact constructor / `new.target` pair from
+    /// the receivers the runtime prepared for it, so a body that grows its
+    /// receiver outside the baked transition program (an `initialize` reached
+    /// through `apply`, a helper called from the constructor) still receives
+    /// storage for every field before its first store.
+    constructor_instance_profiles:
+        rustc_hash::FxHashMap<(u32, u32), constructor_profile::ConstructorInstanceProfile>,
+    pending_constructor_samples:
+        std::cell::RefCell<Vec<constructor_profile::PendingConstructorSample>>,
     /// Final hidden class of an arguments object, keyed by argument count and
     /// mapped-ness. Same tracing contract as the constructor cache above.
     arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool), object::ShapeHandle>,
@@ -1880,6 +1890,9 @@ impl Interpreter {
 }
 
 impl otter_gc::ExtraRootSource for Interpreter {
+    fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
+        self.flush_constructor_observations(heap);
+    }
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);
     }

@@ -282,7 +282,7 @@ pub fn compile_optimized(
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
     let transitions = TransitionTable::resolve();
-    compile_optimized_with_artifacts(view, code_object_id, &transitions, None)
+    compile_optimized_with_artifacts(view, code_object_id, &transitions, false, None)
         .map(|output| output.code)
 }
 
@@ -291,9 +291,16 @@ pub(crate) fn compile_optimized_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    capture_events: bool,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
-    crate::machine::numeric::try_compile(view, code_object_id, transitions, artifact_request)
+    crate::machine::numeric::try_compile(
+        view,
+        code_object_id,
+        transitions,
+        capture_events,
+        artifact_request,
+    )
 }
 
 /// Non-arm64 stub: the first optimizing backend is arm64-only.

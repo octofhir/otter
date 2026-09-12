@@ -562,7 +562,6 @@ fn operand_arena_name(arena: TemplateOperandArena) -> &'static str {
 fn operand_role_name(role: TemplateOperandRole) -> &'static str {
     match role {
         TemplateOperandRole::ClosureParents => "closureParents",
-        TemplateOperandRole::NewArrayElements => "newArrayElements",
         TemplateOperandRole::ConstructArguments => "constructArguments",
     }
 }

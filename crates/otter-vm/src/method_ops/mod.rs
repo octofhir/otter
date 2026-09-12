@@ -16,6 +16,8 @@
 //! - Callback receivers, elements, accumulators, and results stay in traced
 //!   anchors across moving GC; nested calls share the current activation stack.
 //! - Ordinary method lookup still funnels into `Interpreter::invoke`.
+//! - Composite root scopes forward pre-collection observation flushing before
+//!   any receiver, argument or interpreter root can move.
 //!
 //! # See also
 //! - [`crate::call_ops`]
@@ -51,6 +53,10 @@ struct ArrayFastDispatchRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
+    fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
+        self.interp_roots.prepare_collection(heap);
+    }
+
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         self.interp_roots.visit(visitor);
         self.recv.trace_value_slots(visitor);
@@ -72,6 +78,10 @@ struct CollectionFastDispatchRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
+    fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
+        self.interp_roots.prepare_collection(heap);
+    }
+
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         self.interp_roots.visit(visitor);
         self.recv.trace_value_slots(visitor);

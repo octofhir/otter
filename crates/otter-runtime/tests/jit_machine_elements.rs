@@ -219,6 +219,7 @@ struct FinalRun {
     optimized_deopts: u64,
     compile_attempts: u64,
     code_generations: u64,
+    reentrant_transitions: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -233,7 +234,9 @@ fn runtime(selection: JitSelection) -> Runtime {
         .jit_selection(selection)
         .jit_osr_threshold(u32::MAX);
     if matches!(selection, JitSelection::ProductionTiered) {
-        builder.jit_debug(JitDebugRequest::artifacts()).build()
+        builder
+            .jit_debug(JitDebugRequest::artifacts().with_events(true))
+            .build()
     } else {
         builder.build()
     }
@@ -312,13 +315,28 @@ fn assert_machine_element_artifact(
             );
         }
     }
+    if matches!(shape, MachineArtifactShape::GenericElements) {
+        for kind in [
+            "machineElementLoadFast",
+            "machineElementLoadCold",
+            "machineElementStoreFast",
+            "machineElementStoreCold",
+        ] {
+            assert!(
+                regions
+                    .iter()
+                    .any(|region| region["kind"] == kind && region["bytePc"].is_u64()),
+                "{function_name} must expose its committed fast/cold access: {code_map}"
+            );
+        }
+    }
     if matches!(
         shape,
         MachineArtifactShape::PackedDoubleElementsAroundConstructCapture
     ) {
         let upvalue_loads = regions
             .iter()
-            .filter(|region| region["kind"] == "machineUpvalueLoad")
+            .filter(|region| region["kind"] == "machineBindingHit")
             .collect::<Vec<_>>();
         assert!(
             !upvalue_loads.is_empty()
@@ -403,11 +421,30 @@ fn run_fixture(
     drop(setup_result);
 
     let before = runtime.execution_stats();
-    let completion = runtime
+    let result = runtime
         .run_script(SourceInput::from_javascript(final_source), final_module)
-        .unwrap_or_else(|error| panic!("Machine element final call {final_module}: {error:?}"))
-        .completion_string()
-        .to_owned();
+        .unwrap_or_else(|error| panic!("Machine element final call {final_module}: {error:?}"));
+    if let Some(report) = result.jit_debug_report() {
+        for event in report.events() {
+            if let otter_runtime::JitDebugEvent::Bail {
+                function_name,
+                op_debug,
+                operands_debug,
+                ..
+            } = event
+            {
+                assert_ne!(
+                    function_name, "<unknown>",
+                    "cross-script bail must retain its defining owner"
+                );
+                assert!(
+                    op_debug.is_some() && operands_debug.is_some(),
+                    "cross-script bail must decode its instruction"
+                );
+            }
+        }
+    }
+    let completion = result.completion_string().to_owned();
     let after = runtime.execution_stats();
     FinalRun {
         completion,
@@ -415,6 +452,8 @@ fn run_fixture(
         optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
         compile_attempts: after.jit_compile_attempts - before.jit_compile_attempts,
         code_generations: after.jit_code_generations - before.jit_code_generations,
+        reentrant_transitions: after.jit_reentrant_stub_transitions
+            - before.jit_reentrant_stub_transitions,
     }
 }
 
@@ -522,7 +561,7 @@ fn hole_transition_reads_the_prototype_and_recompiles_without_a_deopt_storm() {
 }
 
 #[test]
-fn fixed_typed_view_shrink_deopts_load_and_store_before_effects() {
+fn fixed_typed_view_shrink_commits_cold_load_and_store_without_replay() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         FIXED_RAB_SETUP,
@@ -549,8 +588,12 @@ fn fixed_typed_view_shrink_deopts_load_and_store_before_effects() {
         "both fixed-view misses must enter the Machine body: {compiled:?}"
     );
     assert_eq!(
-        compiled.optimized_deopts, 2,
-        "load and store must each exact-deopt before touching the OOB fixed view: {compiled:?}"
+        compiled.optimized_deopts, 0,
+        "fixed-view guard misses must complete through committed cold siblings: {compiled:?}"
+    );
+    assert_eq!(
+        compiled.reentrant_transitions, 3,
+        "one load plus the store branch's store/load must each complete once: {compiled:?}"
     );
 }
 

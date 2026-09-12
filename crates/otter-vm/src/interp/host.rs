@@ -559,6 +559,7 @@ impl Interpreter {
     /// Propagates [`otter_gc::ImageError`]; a build leaves the nursery
     /// empty, so a capture taken right after one succeeds.
     pub(crate) fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
+        self.flush_constructor_observations(&self.gc_heap);
         self.gc_heap.capture_old_space()
     }
 

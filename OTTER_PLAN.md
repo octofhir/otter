@@ -49,29 +49,27 @@ claim.
 
 ## Live snapshot
 
-- Snapshot date: 2026-09-12.
-- Observed commit: the `apply(this, arguments)` forwarding commit (clean
-  tree at snapshot time).
-- The checkout may change in parallel. Re-snapshot touched files immediately
-  before each edit and merge with concurrent work; never reset or overwrite it.
-- Checkpoint gates passed on this commit: `otter-vm --lib`, `otter-jit`
-  full suite, the `otter-runtime` JIT integration suites touched by this
-  lane (every `otter-runtime` `jit_*` suite, run with `--no-fail-fast`),
-  `clippy --all-targets --all-features -D warnings` on `otter-jit`,
-  `otter-vm`, and `otter-runtime`, `otter-difftest` 24/24 with the
-  interpreter oracle (`--interpreter`), and `OTTER_GC_STRESS` 1/3/5 with
-  `OTTER_GC_VERIFY` on the generated-arguments corpus entry. Failures that
-  predate this lane and that `gate.sh` never runs: `otter-runtime`
-  `jit_artifacts` (2), `jit_debug_events` (4), `jit_machine_call_chain` (3),
-  `jit_machine_direct_call` (3), `jit_machine_elements` (3),
-  `jit_machine_generic_elements`, `jit_machine_generic_properties` (2),
-  `jit_parse_int_leaf`, and `jit_stack_owned_array_construct::invalid_length`;
-  all are diagnostic-count assertions, every completion matches the
-  interpreter oracle. These are local observations, not a publishable
-  clean-tree baseline.
-- `ES_CONFORMANCE.md` and `docs/site/public/conformance/data.json` are current
-  as of this commit: 99.98%, 12 fails of 53575, no crashes or timeouts.
-- No performance result from this dirty snapshot is eligible for publication.
+- Snapshot date: 2026-09-13. Validation starts from `a7aa87ab` plus the S0
+  repair patch recorded in the benchmark metadata; the signed checkpoint
+  contains the validated engine source.
+- The final source gate passed 1665 tests: runtime 216, GC/VM units 997,
+  bytecode/compiler/JIT 452. Scoped all-target/all-feature clippy passed.
+- The corrected differential runner explicitly selects `--jitless` for
+  Template and rejects common timeouts or signal termination. Runner clippy
+  and 3 unit tests passed; release corpus 27/27 and affected-corpus GC
+  strides 1..16 passed. Do not repeat these successful gates.
+- Five fresh processes for each of seven Octane suites on Otter, Node/V8 and
+  Bun produced 105 valid runs. Report, exact programs, binary hash, source
+  identity, commands, medians/MAD and process memory are in
+  `benchmarks/results/s0-20260913-global-script/README.md`.
+- The measurement uses identical global Script semantics. The incomplete
+  sibling file-mode run is marked abandoned and excluded from comparisons.
+  Historical multi-file scores are not a valid before/after baseline.
+- `ES_CONFORMANCE.md` still records the 2026-08-30 Test262 baseline:
+  99.98%, 12 failures, zero crashes/timeouts. No new full Test262 or
+  cross-platform acceptance is claimed by this ARM64 JIT slice.
+- Production readiness and engine-wide performance leadership remain goals;
+  these seven workloads still show a substantial gap to Node/V8 and Bun.
 
 ## Program scorecard
 
@@ -481,6 +479,29 @@ where licensing and determinism permit, established ECMAScript engines.
 ## J — JIT, portability, and throughput
 
 ### J1. One compiled pipeline
+
+Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
+S0 source, release and measurement validation is complete. Shared fixes cover
+committed apply lookup, cross-script compilation ownership, generated catch
+routing, explicit derived-this CFG, native leaves and boxed literal allocation
+with precise moving roots. Constructor observations flush into bounded scalar
+maxima before GC instead of retaining instance graphs; the profile module owns
+sampling, recording and deferred invalidation.
+
+Evidence: `/tmp/otter-jit-s0-final-gate.json`,
+`/tmp/otter-jit-s0-release-gate.json` and the global-Script benchmark report
+above. All initial 20 failures and the additional constructor-retention defect
+are resolved. No failures are allowlisted, and no gate restart or bisect was
+used. Source/release checks are reusable evidence for the unchanged code.
+
+Next: S1 attribution of runtime property-store cost by site, key and miss
+reason. `jit_runtime_store_property_value` resolves `[[Set]]` before probing an
+installed store IC; measure its contribution and audit the IC's complete guard
+proof before changing that order. Preserve setters, non-writable descriptors,
+prototype mutation, exotic receivers, moving roots and exactly-once effects.
+Use focused tests while changing this path; do not restart the completed S0
+gates for profiling or documentation changes. Forwarded generated calls,
+spread packets, Machine coverage and root scanning follow the handoff order.
 
 The intended replacement path remains:
 

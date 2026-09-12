@@ -179,7 +179,7 @@ fn classify_instruction(
             {
                 EFFECTS_NONE
             }
-            Op::ArrayConstruct => EFFECTS_ALLOCATING,
+            Op::ArrayConstruct | Op::NewObject | Op::NewArray => EFFECTS_ALLOCATING,
             Op::Add
                 if instruction
                     .arith_feedback()

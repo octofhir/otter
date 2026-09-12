@@ -215,6 +215,16 @@ pub struct JsClosureBody {
     /// closure still walks the realm's `%Function.prototype%`; a
     /// stored `Value::null()` is an explicit null prototype.
     pub proto_override: Option<Value>,
+    /// Largest property count reached by a receiver this closure constructed,
+    /// learned at the next construct or before collection.
+    /// Sibling closures of one template construct unrelated classes, so the
+    /// profile lives per function object like JSC's allocation profile.
+    pub learned_instance_fields: std::cell::Cell<u16>,
+    /// The receiver most recently prepared for this constructor, sampled at
+    /// the next preparation for the size it grew to. This is not a strong
+    /// edge: the observation ledger clears it before collection. Tracing also
+    /// clears it defensively so heap-image relocation never preserves a sample.
+    pub last_instance: std::cell::Cell<Option<JsObject>>,
 }
 
 impl otter_gc::SafeTraceable for JsClosureBody {
@@ -236,6 +246,7 @@ impl otter_gc::SafeTraceable for JsClosureBody {
             visitor(p);
         }
         self.refresh_upvalue_base();
+        self.last_instance.set(None);
 
         self.bound_this.pelt_trace(visitor);
         self.bound_new_target.pelt_trace(visitor);
@@ -336,6 +347,8 @@ impl JsClosureBody {
             length_deleted: false,
             non_extensible: false,
             proto_override: None,
+            learned_instance_fields: std::cell::Cell::new(0),
+            last_instance: std::cell::Cell::new(None),
         }
     }
 

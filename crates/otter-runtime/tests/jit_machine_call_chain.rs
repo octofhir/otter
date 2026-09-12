@@ -4,7 +4,7 @@
 //! - Four guarded method candidates at one source site, including two receiver
 //!   shapes that share a function id but require different `this` values.
 //! - Already-started candidate overflow/throw completion without call replay.
-//! - A fifth receiver shape that exact-deopts and drives a replacement code
+//! - A fifth receiver shape that completes generically while retaining the caller
 //!   generation without duplicating the method effect.
 //! - Never-taken plain and method calls represented as exact cold exits, plus a
 //!   warmed bootstrap `parseInt(Int32)` control that remains a generated leaf.
@@ -548,9 +548,15 @@ fn assert_parse_int_leaf_is_not_a_cold_exit(
             .iter()
             .filter(|region| region["kind"] == "machineColdCallExit")
             .count();
-        let parse_leaf = regions.iter().any(|region| {
-            region["kind"] == "nativeLeafCall" && region["nativeLeafCall"] == "parse_int_i32_leaf"
-        });
+        let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
+        let parse_leaf = relocations["relocations"]
+            .as_array()
+            .expect("relocation array")
+            .iter()
+            .any(|relocation| {
+                relocation["target"]["kind"] == "runtimeStub"
+                    && relocation["target"]["name"] == "parse_int_i32_leaf"
+            });
         observed.push((cold_exits, parse_leaf));
         if cold_exits != 0 || !parse_leaf {
             continue;
@@ -646,7 +652,7 @@ fn four_shape_chain_stays_generated_and_abrupt_candidates_do_not_replay() {
 }
 
 #[test]
-fn fifth_shape_exact_deopts_once_and_recompiles_without_replay() {
+fn fifth_shape_completes_generically_without_replacing_the_caller() {
     let oracle = run_oracle_sequence(
         METHOD_CHAIN_SETUP,
         &[
@@ -695,8 +701,8 @@ fn fifth_shape_exact_deopts_once_and_recompiles_without_replay() {
     assert_eq!(first, oracle[0]);
     assert_eq!(first, "[505,1]");
     assert_eq!(
-        first_delta.optimized_deopts, 1,
-        "the unseen fifth guard must exact-deopt before invoking the method: {first_delta:?}"
+        first_delta.optimized_deopts, 0,
+        "the unseen fifth guard must complete via the committed generic sibling: {first_delta:?}"
     );
 
     let rebuild_result = compiled
@@ -720,8 +726,8 @@ fn fifth_shape_exact_deopts_once_and_recompiles_without_replay() {
     assert!(rebuild_delta.compile_attempts > 0, "{rebuild_delta:?}");
     assert!(rebuild_delta.code_generations > 0, "{rebuild_delta:?}");
     assert!(
-        first_recompiled_caller || second_recompiled_caller,
-        "the replacement artifact must belong to machineMethodChain, not only its fifth callee"
+        !first_recompiled_caller && !second_recompiled_caller,
+        "the generic fifth target must preserve the caller's four generated candidates"
     );
     assert_eq!(
         post_first_delta.optimized_deopts, 0,
@@ -906,10 +912,21 @@ fn compiled_generic_method_attempt_is_not_refrozen_as_a_cold_exit() {
         !optimizing.is_empty(),
         "fixture must reach optimizing compilation: {artifacts:?}"
     );
-    assert!(
-        optimizing.iter().all(|bundle| !bundle
-            .file(JitArtifactFileName::OptimizedIr)
-            .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))),
-        "a method already attempted through compiled generic completion must not be refrozen as a Machine cold exit"
-    );
+    for bundle in optimizing {
+        let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
+        let regions = code_map["regions"].as_array().expect("code-map regions");
+        assert!(
+            regions
+                .iter()
+                .all(|region| region["kind"] != "machineColdCallExit"),
+            "an attempted method must not be refrozen as a cold exit: {code_map}"
+        );
+        assert!(
+            regions
+                .iter()
+                .any(|region| region["kind"] == "machineGenericMethodCall"
+                    && region["bytePc"].is_u64()),
+            "the attempted method must retain its committed generic call: {code_map}"
+        );
+    }
 }

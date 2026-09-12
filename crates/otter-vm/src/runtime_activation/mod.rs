@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - [`RuntimeCall`] is the short-lived JIT-to-VM semantic boundary.
+//! - `exceptions` resolves static catch-only handlers for stack-owned frames
+//!   through the same CodeBlock metadata used by exact deoptimization.
 //! - A private frame identity distinguishes an interpreter-owned root from a
 //!   generated stack-owned activation.
 //! - Focused `control` and `value_ops` implementations expose typed
@@ -34,6 +36,7 @@ mod bindings;
 mod class_ops;
 mod committed_values;
 mod control;
+mod exceptions;
 mod iterators;
 mod value_loads;
 mod value_ops;

@@ -36,6 +36,8 @@
 
 use std::collections::BTreeMap;
 
+use super::value_packet::{PacketWord, emit_value_packet_transition};
+
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 use otter_vm::{
@@ -983,6 +985,7 @@ pub(super) fn emit_call_with_receiver(
                 stub_id,
                 target.builtin_native_ref,
                 9,
+                20,
                 |ops, index, register| {
                     let source = argument_registers
                         .get(usize::from(index))
@@ -1163,73 +1166,6 @@ pub(super) fn emit_call_with_receiver(
         throw_value,
         fatal,
     )
-}
-
-/// One word of a boxed-value packet handed to a reentrant value transition.
-#[derive(Debug, Clone, Copy)]
-enum PacketWord {
-    /// A live interpreter-compatible register of the compiled frame.
-    Register(u16),
-    /// The `undefined` constant.
-    Undefined,
-}
-
-/// Build one contiguous boxed-value packet on the machine stack, complete it
-/// through `descriptor`, and commit the returned value to `dst`.
-///
-/// The packet lives below `sp` only for the duration of the transition; the
-/// VM copies it before any allocation, so no packet word is a collector root.
-/// Success falls through with `dst` written, a JavaScript exception reaches
-/// `throw_value`, and a structural failure reaches `fatal`. The transition
-/// never requests a side exit or a replay.
-#[allow(clippy::too_many_arguments)]
-fn emit_value_packet_transition(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    descriptor: abi::RuntimeStubDescriptor,
-    words: &[PacketWord],
-    dst: u16,
-    throw_value: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let packet_words = u32::try_from(words.len())
-        .ok()
-        .filter(|words| *words != 0)
-        .ok_or(Unsupported::OperandShape(
-            "template value-packet word count",
-        ))?;
-    let packet_bytes = packet_words
-        .checked_mul(8)
-        .and_then(|bytes| bytes.checked_add(15))
-        .map(|bytes| bytes & !15)
-        .filter(|bytes| *bytes <= 4_080)
-        .ok_or(Unsupported::OperandShape("template value-packet frame"))?;
-    dynasm!(ops ; .arch aarch64 ; sub sp, sp, packet_bytes);
-    for (index, word) in words.iter().enumerate() {
-        match *word {
-            PacketWord::Register(register) => emit_load_reg(ops, 9, register)?,
-            PacketWord::Undefined => emit_load_u64(ops, 9, VALUE_UNDEFINED),
-        }
-        let offset = u32::try_from(index)
-            .ok()
-            .and_then(|word| word.checked_mul(8))
-            .ok_or(Unsupported::OperandShape("template value-packet offset"))?;
-        dynasm!(ops ; .arch aarch64 ; str x9, [sp, offset]);
-    }
-    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; mov x1, sp ; movz w2, packet_words);
-    emit_load_runtime_stub(ops, relocations, 16, table.entry(descriptor), descriptor);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; add sp, sp, packet_bytes
-        ; cbz x1, >completed
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>throw_value
-        ; b =>fatal
-        ; completed:
-    );
-    emit_store_reg(ops, 0, dst)
 }
 
 /// Complete `Op::Call` / `Op::CallWithThis` through the callee-carrying value

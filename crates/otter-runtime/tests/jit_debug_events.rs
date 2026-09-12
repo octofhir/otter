@@ -224,10 +224,11 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
             JitDebugEvent::StaticNativeCallLowered {
                 tier: JitDebugTier::Optimizing,
                 target: "math_abs_leaf",
+                outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
                 ..
             }
         )),
-        "the stable body must report the guarded static-native plan: {:?}",
+        "the stable body must report generated guarded static-native lowering: {:?}",
         report.events()
     );
 }

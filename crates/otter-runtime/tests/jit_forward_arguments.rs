@@ -132,3 +132,78 @@ fn intrinsic_forwards_complete_in_generated_code_without_side_exits() {
         );
     }
 }
+
+#[test]
+fn apply_lookup_precedes_uninitialized_derived_this() {
+    let source = r#"
+let reads = 0;
+function target() {}
+Object.defineProperty(target, "apply", {
+  get() { reads++; throw new Error("lookup"); }
+});
+class Base {}
+class Derived extends Base {
+  constructor() { target.apply(this, arguments); }
+}
+let result = "";
+try { new Derived(); } catch (error) { result = error.message; }
+reads + "|" + result;
+"#;
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(source.to_owned()),
+                "apply-order.js",
+            )
+            .expect("caught lookup");
+        assert_eq!(result.completion_string(), "1|lookup", "{selection:?}");
+    }
+}
+
+#[test]
+fn overridden_apply_getter_runs_once_per_generated_forward() {
+    let source = r#"
+let reads = 0;
+let calls = 0;
+function target() {}
+Object.defineProperty(target, "apply", {
+  get() {
+    reads++;
+    return function(receiver, args) { calls++; return args[0]; };
+  }
+});
+function forward(value) { return target.apply(null, arguments); }
+let sum = 0;
+for (let i = 0; i < 6000; i++) sum += forward(i);
+reads + "|" + calls + "|" + sum;
+"#;
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(source.to_owned()),
+                "apply-once.js",
+            )
+            .unwrap_or_else(|error| panic!("{selection:?}: {error:?}"));
+        assert_eq!(
+            result.completion_string(),
+            "6000|6000|17997000",
+            "{selection:?}"
+        );
+    }
+}

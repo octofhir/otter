@@ -220,6 +220,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             &request.snapshot,
             request.code_object_id,
             &self.transitions,
+            request.debug.events_enabled(),
             artifact_request,
         );
         #[cfg(not(target_arch = "aarch64"))]

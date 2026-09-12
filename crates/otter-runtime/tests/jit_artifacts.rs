@@ -645,8 +645,8 @@ fn optimizing_math_artifact_inlines_guarded_int32_abs() {
     assert_eq!(result.completion_string(), "2544");
     let optimized_ir = optimized_ir.expect("optimizing Math IR is UTF-8");
     assert!(
-        optimized_ir.starts_with("; otter optimized unit\n"),
-        "optimizing Math must retain the general optimized unit: {}",
+        optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"),
+        "optimizing Math must use the current Machine pipeline: {}",
         optimized_ir.lines().next().unwrap_or("<empty>")
     );
     assert!(

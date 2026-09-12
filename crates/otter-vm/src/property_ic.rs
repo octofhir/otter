@@ -450,7 +450,8 @@ mod tests {
         assert!(object::delete(proto, &mut heap, "y"));
 
         assert_eq!(
-            ic.run_store(second, &mut heap, key("x"), &Value::null()),
+            ic.run_store(second, &mut heap, key("x"), &Value::null())
+                .expect("store allocation"),
             None
         );
         assert_eq!(object::get_own(second, &heap, "x"), None);

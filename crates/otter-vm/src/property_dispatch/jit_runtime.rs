@@ -7,6 +7,11 @@
 //! # Invariants
 //! - Every entry completes the whole observable operation, so a miss never
 //!   leaves a half-performed effect for the interpreter to finish.
+//! - Validated store IC hits commit directly; canonical `[[Set]]` resolution
+//!   runs only on a miss. Allocation failure is fatal to the current probe.
+//!
+//! # See also
+//! - `cache_ir` and `object::shape_transition` own the complete store guards.
 
 use crate::activation_stack::ActivationStack;
 use crate::{
@@ -211,24 +216,6 @@ impl Interpreter {
             )?;
             return Ok(None);
         }
-        // A shape token is useful only after canonical `[[Set]]` has selected
-        // an ordinary data assignment. Inherited setters, non-writable data,
-        // proxies/exotic parents, and non-extensible receivers retain the full
-        // value-level implementation (and strict-mode throwing behavior).
-        if !matches!(
-            object::resolve_set_atomized(obj, &self.gc_heap, atomized_key),
-            object::SetOutcome::AssignData
-        ) {
-            self.store_property_value(
-                context,
-                stack,
-                receiver,
-                atomized_key.name(),
-                value,
-                strict,
-            )?;
-            return Ok(None);
-        }
         if let Some(entries_len) = self
             .feedback_directory
             .property_entry_count(site, PropertyIcKind::Store)
@@ -243,7 +230,7 @@ impl Interpreter {
                 &mut self.gc_heap,
                 atomized_key,
                 &value,
-            ) {
+            )? {
                 self.feedback_directory
                     .record_property_hit(PropertyIcKind::Store);
                 let current_obj = receiver.as_object().ok_or(VmError::InvalidOperand)?;
@@ -263,6 +250,24 @@ impl Interpreter {
             }
         }
 
+        // An uncached store needs canonical `[[Set]]` resolution before a
+        // new shape program can be installed. Inherited setters, non-writable data,
+        // proxies/exotic parents, and non-extensible receivers retain the full
+        // value-level implementation (and strict-mode throwing behavior).
+        if !matches!(
+            object::resolve_set_atomized(obj, &self.gc_heap, atomized_key),
+            object::SetOutcome::AssignData
+        ) {
+            self.store_property_value(
+                context,
+                stack,
+                receiver,
+                atomized_key.name(),
+                value,
+                strict,
+            )?;
+            return Ok(None);
+        }
         // Canonical resolution above proved an ordinary data assignment. Only
         // now may the cache install a writable existing slot or capture the
         // first add as its authoritative transition sample; the very next peer
@@ -278,7 +283,7 @@ impl Interpreter {
                 &self.gc_heap,
                 atomized_key,
             ) && ic
-                .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)
+                .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)?
                 .is_some()
             {
                 self.feedback_directory

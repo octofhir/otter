@@ -7,6 +7,11 @@
 //! # Invariants
 //! - A driver returns `true` only when it fully completed the tick, including
 //!   the PC advance; `false` leaves the operation to the caller.
+//! - Store IC allocation failures propagate before fallback or PC advancement;
+//!   ordinary guard misses leave receiver and operands unchanged.
+//!
+//! # See also
+//! - `cache_ir` for guarded store completion and allocation-failure handling.
 
 use smallvec::SmallVec;
 
@@ -921,7 +926,7 @@ impl Interpreter {
                 &mut self.gc_heap,
                 atomized_key,
                 &value,
-            ) {
+            )? {
                 self.feedback_directory
                     .record_property_hit(PropertyIcKind::Store);
                 Self::advance_property_fast_path(&mut stack[top_idx])?;

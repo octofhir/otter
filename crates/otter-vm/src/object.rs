@@ -7004,7 +7004,8 @@ mod tests {
                 key,
                 &transition,
                 &Value::null(),
-            ),
+            )
+            .expect("transition replay allocation"),
             Some(())
         );
 
@@ -7231,7 +7232,8 @@ mod tests {
                 key,
                 &transition,
                 &Value::boolean(false),
-            ),
+            )
+            .expect("transition replay allocation"),
             None
         );
         assert_eq!(get_own(second, &heap, "x"), None);
@@ -7263,7 +7265,8 @@ mod tests {
                 key,
                 &transition,
                 &Value::number_f64(1.25),
-            ),
+            )
+            .expect("transition replay allocation"),
             None
         );
         assert_eq!(
@@ -7299,7 +7302,8 @@ mod tests {
                 key,
                 &transition,
                 &Value::boolean(false),
-            ),
+            )
+            .expect("transition replay allocation"),
             None
         );
     }
@@ -7327,7 +7331,8 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),),
+            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),)
+                .expect("transition replay allocation"),
             None
         );
         assert_eq!(get_own(second, &heap, "x"), None);
@@ -7359,7 +7364,8 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),),
+            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),)
+                .expect("transition replay allocation"),
             None
         );
     }

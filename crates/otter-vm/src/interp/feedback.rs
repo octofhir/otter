@@ -17,6 +17,8 @@
 //!   a live chunk. Tombstoned ranges remain reserved and hold no slot address
 //!   or executable IC state.
 //! - Generated-call plans remain separate from observational feedback.
+//! - Store banks stop on allocation failure; only allocation-free guard misses
+//!   may advance to another recipe with the same receiver handle.
 //!
 //! # See also
 //! - [`crate::feedback::FeedbackVector`]
@@ -165,13 +167,16 @@ impl FeedbackDirectory {
         heap: &mut otter_gc::GcHeap,
         key: crate::property_atom::AtomizedPropertyKey<'_>,
         value: &crate::Value,
-    ) -> bool {
-        self.property_stubs(site, PropertyIcKind::Store)
-            .is_some_and(|stubs| {
-                stubs
-                    .iter()
-                    .any(|stub| stub.run_store(obj, heap, key, value).is_some())
-            })
+    ) -> Result<bool, otter_gc::OutOfMemory> {
+        let Some(stubs) = self.property_stubs(site, PropertyIcKind::Store) else {
+            return Ok(false);
+        };
+        for stub in stubs {
+            if stub.run_store(obj, heap, key, value)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Every settled own-slot program installed at a site, in install order.

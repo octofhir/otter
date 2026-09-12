@@ -60,6 +60,15 @@ pub(crate) fn compile_function_full(
         || contains_direct_eval
         || legacy_arguments_observable;
     let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
+    // A body that only ever forwards `arguments` through `apply` keeps the
+    // incoming argument list but never needs the object on its fast path.
+    // A direct eval or a `fn.arguments` reader may still observe the
+    // object, and an own binding named `arguments` shadows it entirely.
+    let arguments_forward_only = needs_arguments
+        && !contains_direct_eval
+        && !legacy_arguments_observable
+        && !crate::hoist::function_declares_name(params, body.as_deref(), "arguments")
+        && crate::hoist::arguments_uses_are_forwarded(params, body.as_deref());
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
     let active_with_envs = parent.active_with_envs.clone();
     let mut child = FunctionContext::new(Rc::clone(&module))
@@ -127,6 +136,7 @@ pub(crate) fn compile_function_full(
         }
     }
     child.contains_direct_eval = contains_direct_eval;
+    child.arguments_forward_only = arguments_forward_only;
     if uses_mapped_arguments {
         child.mapped_argument_names = simple_formal_names(params).into_iter().collect();
     }
@@ -198,7 +208,7 @@ pub(crate) fn compile_function_full(
     // IteratorBindingInitialization (step 24), so a parameter
     // default expression like `x = arguments[0]` resolves the
     // arguments object. Skip if a formal named `arguments` exists.
-    if needs_arguments && parent.lookup_binding("arguments").is_none() {
+    if needs_arguments && !arguments_forward_only && parent.lookup_binding("arguments").is_none() {
         let storage = parent.declare_binding("arguments", false, span)?;
         parent.mark_param("arguments");
         let tmp = parent.alloc_scratch();

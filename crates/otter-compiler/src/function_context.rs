@@ -64,6 +64,13 @@ pub(crate) struct FunctionContext {
     /// only when a parameter / body `var` / body lexical / body
     /// function declaration introduces the name.
     pub(crate) binds_arguments: bool,
+    /// `true` when every `arguments` reference in this body is the
+    /// forwarded list of `<callee>.apply(<this>, arguments)`. The prologue
+    /// then materializes no arguments object; each such call lowers to
+    /// `Op::CallForwardArguments`, which forwards the activation's actual
+    /// arguments directly and builds the object only for a non-intrinsic
+    /// `apply`.
+    pub(crate) arguments_forward_only: bool,
     /// `true` when the compilation unit reads a `.arguments` property
     /// somewhere, so a sloppy ordinary function's arguments object may be
     /// observed through the legacy `fn.arguments` accessor and has to be
@@ -232,6 +239,7 @@ impl FunctionContext {
             eval_sites: Vec::new(),
             default_function_hoisted: false,
             captured_names: HashSet::new(),
+            arguments_forward_only: false,
             mapped_argument_names: HashSet::new(),
             reserved_own_upvalues: HashMap::new(),
             own_upvalue_count: 0,

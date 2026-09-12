@@ -591,6 +591,22 @@ pub(super) fn compile(
                     fatal,
                 );
             }
+            TemplateOp::CallForwardArguments {
+                dst,
+                method,
+                receiver,
+                this_value,
+            } => {
+                transitions::emit_call_forward_arguments(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    [dst, method, receiver, this_value],
+                    bail,
+                    committed_throw,
+                    fatal,
+                );
+            }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
                     &mut ops,

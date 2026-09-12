@@ -322,6 +322,17 @@ pub enum Op {
     /// `dst, callee, this, argc, args...`. Used by
     /// `Function.prototype.call` / `apply` lowering.
     CallWithThis,
+    /// `callee.apply(thisArg, arguments)` where `arguments` is the
+    /// function's own object and every use of it in the body is such a
+    /// forward. Operands: `dst, method, callee, this_arg`. `method` holds
+    /// the observable `GetV(callee, "apply")` result. When it is
+    /// %Function.prototype.apply%, the activation's actual arguments are
+    /// forwarded to `callee` without materializing an arguments object;
+    /// otherwise `method` is called with `callee` as receiver and
+    /// `[this_arg, arguments]`, the arguments object being created once
+    /// per activation. Emitted only for bodies whose prologue therefore
+    /// skips [`Op::CollectArguments`].
+    CallForwardArguments,
     /// `r<dst> = bound function`. Operands:
     /// `dst, callee, this, argc, args...`. Builds a
     /// `Value::BoundFunction` that, when invoked, forwards to
@@ -1405,6 +1416,7 @@ impl Op {
             Op::GetStringIndex => "GET_STRING_INDEX",
             Op::CallMethodValue => "CALL_METHOD_VALUE",
             Op::CallWithThis => "CALL_WITH_THIS",
+            Op::CallForwardArguments => "CALL_FORWARD_ARGUMENTS",
             Op::BindFunction => "BIND_FUNCTION",
             Op::LoadThis => "LOAD_THIS",
             Op::LoadNewTarget => "LOAD_NEW_TARGET",
@@ -1762,6 +1774,8 @@ impl Op {
             Op::MakeClass => 5, // dst, ctor, prototype, statics, parent
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,
+            // dst, method, callee, this_arg.
+            Op::CallForwardArguments => 4,
             // catch_offset, finally_offset, exc_dst.
             Op::EnterTry => 3,
             // `MakeClosure` is variadic: `dst, function_const,

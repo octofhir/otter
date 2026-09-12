@@ -3375,6 +3375,59 @@ impl Interpreter {
         self.invoke(stack, context, &callee, this_value, args, dst)
     }
 
+    /// Handle `Op::CallForwardArguments`: `callee.apply(this_arg, arguments)`
+    /// for a body whose every use of `arguments` is such a forward.
+    ///
+    /// `method` already holds the observable `GetV(callee, "apply")`. When it
+    /// is %Function.prototype.apply%, the activation's incoming arguments are
+    /// forwarded to `callee` directly — the arguments object is never built.
+    /// Any other method value receives the activation's arguments object,
+    /// materialized once per frame, exactly as a materialized `arguments`
+    /// binding would have supplied it.
+    pub(crate) fn do_call_forward_arguments_exec(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        let dst = function
+            .register(instruction, 0)
+            .ok_or(VmError::InvalidOperand)?;
+        let method_reg = function
+            .register(instruction, 1)
+            .ok_or(VmError::InvalidOperand)?;
+        let callee_reg = function
+            .register(instruction, 2)
+            .ok_or(VmError::InvalidOperand)?;
+        let this_reg = function
+            .register(instruction, 3)
+            .ok_or(VmError::InvalidOperand)?;
+        let top_idx = stack.len() - 1;
+        let method = *read_register(&stack[top_idx], method_reg)?;
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let this_value = *read_register(&stack[top_idx], this_reg)?;
+        if crate::method_ops::is_function_prototype_intrinsic_value(
+            method,
+            &self.gc_heap,
+            crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply,
+        ) {
+            if !self.is_callable_runtime(&callee) {
+                return Err(VmError::NotCallable);
+            }
+            let forwarded: SmallVec<[Value; 8]> = self
+                .frame_cold(&stack[top_idx])
+                .map(|cold| cold.incoming_args.iter().copied().collect())
+                .unwrap_or_default();
+            stack[top_idx].advance_pc()?;
+            return self.invoke(stack, context, &callee, this_value, forwarded, dst);
+        }
+        let arguments_object = self.materialize_frame_arguments_object(context, stack, top_idx)?;
+        stack[top_idx].advance_pc()?;
+        let args: SmallVec<[Value; 8]> = [this_value, arguments_object].into_iter().collect();
+        self.invoke(stack, context, &method, callee, args, dst)
+    }
+
     /// Handle `Op::CallWithThis`: same as `do_call` but the call
     /// site supplies an explicit `this` register. Used by
     /// `Function.prototype.call` lowering and the array-literal

@@ -152,7 +152,7 @@ fn function_prototype_intrinsic(name: &str) -> VmIntrinsicFunction {
     }
 }
 
-fn is_function_prototype_intrinsic_value(
+pub(crate) fn is_function_prototype_intrinsic_value(
     value: Value,
     heap: &otter_gc::GcHeap,
     intrinsic: VmIntrinsicFunction,

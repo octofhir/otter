@@ -628,6 +628,9 @@ pub(crate) fn compile_method_call(
     }
     if let Expression::StaticMemberExpression(member) = callee {
         let method_name = member.property.name.as_str();
+        if let Some(dst) = try_compile_forwarded_apply(cx, call, member, span)? {
+            return Ok(dst);
+        }
         if let Some(dst) =
             try_compile_function_method(cx, &member.object, method_name, &call.arguments, span)?
         {
@@ -1048,6 +1051,64 @@ pub(crate) fn compile_spread_call(
         span,
     );
     Ok(dst)
+}
+
+/// Lower `<callee>.apply(<this>, arguments)` to [`Op::CallForwardArguments`]
+/// in a body whose every `arguments` reference is such a forward.
+///
+/// The method read stays an observable `LoadProperty` before the `this`
+/// argument evaluates (§13.3.6.1); the call itself forwards the
+/// activation's actual arguments when that read produced the intrinsic and
+/// otherwise calls the resolved method with a lazily built arguments object.
+fn try_compile_forwarded_apply(
+    cx: &mut Compiler,
+    call: &oxc_ast::ast::CallExpression<'_>,
+    member: &oxc_ast::ast::StaticMemberExpression<'_>,
+    span: (u32, u32),
+) -> Result<Option<u16>, CompileError> {
+    use oxc_ast::ast::Argument;
+    if call.optional
+        || member.optional
+        || member.property.name.as_str() != "apply"
+        || call.arguments.len() != 2
+        || !cx.top_mut().arguments_forward_only
+        || cx.lookup_binding("arguments").is_some()
+    {
+        return Ok(None);
+    }
+    let (Some(this_argument), Some(Argument::Identifier(forwarded))) =
+        (call.arguments[0].as_expression(), Some(&call.arguments[1]))
+    else {
+        return Ok(None);
+    };
+    if forwarded.name.as_str() != "arguments" {
+        return Ok(None);
+    }
+    let receiver_reg = compile_expr(cx, &member.object, span)?;
+    let method_reg = cx.alloc_scratch();
+    let name_idx = cx.intern_string_constant("apply");
+    cx.emit(
+        Op::LoadProperty,
+        vec![
+            Operand::Register(method_reg),
+            Operand::Register(receiver_reg),
+            Operand::ConstIndex(name_idx),
+        ],
+        span,
+    );
+    let this_reg = compile_expr(cx, this_argument, span)?;
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::CallForwardArguments,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(method_reg),
+            Operand::Register(receiver_reg),
+            Operand::Register(this_reg),
+        ],
+        span,
+    );
+    Ok(Some(dst))
 }
 
 /// Legacy hook for syntactic `<expr>.call/apply/bind(...)` lowering.

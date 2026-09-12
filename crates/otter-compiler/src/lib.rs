@@ -195,6 +195,42 @@ mod tests {
     }
 
     #[test]
+    fn apply_forwarding_skips_the_arguments_object_only_when_every_use_forwards() {
+        let module = compile_script_src(
+            "function trampoline() { this.initialize.apply(this, arguments); }\n\
+             function plain(a) { return arguments[0] + a; }\n\
+             function nested() { const f = () => target.apply(null, arguments); return f(); }\n\
+             function shadowed() { var arguments = [1]; return target.apply(null, arguments); }\n\
+             function optional() { return target?.apply(null, arguments); }\n\
+             function target() {}",
+        );
+        let ops = |name: &str| -> Vec<Op> {
+            module
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("function {name}"))
+                .code
+                .iter()
+                .map(|instruction| instruction.op)
+                .collect()
+        };
+        let trampoline = ops("trampoline");
+        assert!(trampoline.contains(&Op::CallForwardArguments));
+        assert!(!trampoline.contains(&Op::CollectArguments));
+        for name in ["plain", "nested", "shadowed", "optional"] {
+            let code = ops(name);
+            assert!(
+                !code.contains(&Op::CallForwardArguments),
+                "{name} must keep the ordinary lowering: {code:?}"
+            );
+        }
+        for name in ["plain", "nested", "optional"] {
+            assert!(ops(name).contains(&Op::CollectArguments), "{name}");
+        }
+    }
+
+    #[test]
     fn register_var_hoist_reuses_undefined_frame_initialization() {
         let module = compile_script_src("function f() { return value; var value; }");
         let function = module

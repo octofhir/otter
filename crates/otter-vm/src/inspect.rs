@@ -820,6 +820,7 @@ mod tests {
         Op::TailCall,
         Op::IsEvalIntrinsic,
         Op::CallWithThis,
+        Op::CallForwardArguments,
         Op::BindFunction,
         Op::LoadThis,
         Op::LoadNewTarget,

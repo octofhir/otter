@@ -337,6 +337,7 @@ pub(crate) const fn opcode_reductions(op: Op) -> u8 {
     match op {
         Op::Call
         | Op::CallWithThis
+        | Op::CallForwardArguments
         | Op::CallMethodValue
         | Op::CallSpread
         | Op::New

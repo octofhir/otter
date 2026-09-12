@@ -356,6 +356,28 @@ impl Interpreter {
         frame_index: usize,
         dst: u16,
     ) -> Result<(), VmError> {
+        let value = self.materialize_frame_arguments_object(context, stack, frame_index)?;
+        let frame = &mut stack[frame_index];
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// The interpreter frame's arguments exotic object, built on first use
+    /// and kept in the cold record so every later use in the activation
+    /// observes the same object.
+    pub(crate) fn materialize_frame_arguments_object(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+    ) -> Result<Value, VmError> {
+        if let Some(existing) = self
+            .frame_cold(&stack[frame_index])
+            .and_then(|cold| cold.arguments_object)
+        {
+            return Ok(existing);
+        }
         let (elements, kind, mapped_entries, callee) = {
             let function_id = stack[frame_index].function_id;
             let function = context
@@ -364,8 +386,7 @@ impl Interpreter {
             let frame = &mut stack[frame_index];
             // The cold record keeps its copy: §B.3.6.2 `fn.arguments` reads
             // the same incoming values from a frame that has already built
-            // its own arguments object, and a second `Op::CollectArguments`
-            // in one frame must see them too.
+            // its own arguments object.
             let elements: SmallVec<[Value; 4]> = self
                 .frame_cold_mut(frame)
                 .map(|cold| cold.incoming_args.clone())
@@ -381,10 +402,9 @@ impl Interpreter {
             )
         };
         let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
-        let frame = &mut stack[frame_index];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        self.frame_ensure_cold(&mut stack[frame_index])
+            .arguments_object = Some(value);
+        Ok(value)
     }
 
     /// §10.4.4 Arguments exotic object construction for a compiled activation.
@@ -424,6 +444,71 @@ impl Interpreter {
         let kind = function.arguments_object_kind;
         let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
         frame.write(dst, value)
+    }
+
+    /// `CallForwardArguments` for a compiled activation.
+    ///
+    /// The intrinsic `apply` forwards the activation's actual arguments —
+    /// the published window of a stack-owned frame or the cold record of a
+    /// materialized one — straight to the callee. Any other method receives
+    /// the activation's arguments object; only a materialized frame can own
+    /// that object across the activation, so a stack-owned frame reports
+    /// `Ok(false)` and the interpreter completes the instruction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn jit_runtime_call_forward_arguments(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame: &mut crate::ActiveFrameMut<'_>,
+        materialized_frame_index: Option<usize>,
+        dst: u16,
+        method_reg: u16,
+        receiver_reg: u16,
+        this_reg: u16,
+    ) -> Result<bool, VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        let method = frame.read(method_reg)?;
+        let callee = frame.read(receiver_reg)?;
+        let this_value = frame.read(this_reg)?;
+        let intrinsic_apply = crate::method_ops::is_function_prototype_intrinsic_value(
+            method,
+            &self.gc_heap,
+            crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply,
+        );
+        let (target, receiver, args): (Value, Value, SmallVec<[Value; 8]>) = if intrinsic_apply {
+            if !self.is_callable_runtime(&callee) {
+                return Err(VmError::NotCallable);
+            }
+            let forwarded = match (frame.incoming_argument_count(), materialized_frame_index) {
+                (Some(count), _) => (0..count)
+                    .map(|index| frame.incoming_argument(index))
+                    .collect::<Result<_, _>>()?,
+                (None, Some(frame_index)) => self
+                    .frame_cold(stack.get(frame_index).ok_or(VmError::InvalidOperand)?)
+                    .map(|cold| cold.incoming_args.iter().copied().collect())
+                    .unwrap_or_default(),
+                (None, None) => return Err(VmError::InvalidOperand),
+            };
+            (callee, this_value, forwarded)
+        } else {
+            let Some(frame_index) = materialized_frame_index else {
+                return Ok(false);
+            };
+            let arguments_object =
+                self.materialize_frame_arguments_object(context, stack, frame_index)?;
+            (
+                method,
+                callee,
+                [this_value, arguments_object].into_iter().collect(),
+            )
+        };
+        self.jit_runtime_stats.jit_to_rust_call_transitions = self
+            .jit_runtime_stats
+            .jit_to_rust_call_transitions
+            .saturating_add(1);
+        let result = self.run_rooted_call_values(stack, context, target, receiver, args)?;
+        frame.write(dst, result)?;
+        Ok(true)
     }
 
     /// Parameter bindings that alias the arguments object's indexed entries,

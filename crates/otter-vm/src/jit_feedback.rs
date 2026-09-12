@@ -465,6 +465,7 @@ impl TypedFeedbackSlot {
             Op::CallMethodValue => Self::Method,
             Op::Call
             | Op::CallWithThis
+            | Op::CallForwardArguments
             | Op::CallSpread
             | Op::New
             | Op::NewSpread

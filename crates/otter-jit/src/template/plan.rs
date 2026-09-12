@@ -258,6 +258,15 @@ pub(crate) enum TemplateOp {
     NewObject { dst: u16 },
     /// `r<dst> = arguments` built from the activation's actual arguments.
     CollectArguments { dst: u16 },
+    /// `r<dst> = r<receiver>.apply(r<this_value>, arguments)` with `r<method>`
+    /// holding the already-read `apply`; forwards the activation's actual
+    /// arguments when it is the intrinsic.
+    CallForwardArguments {
+        dst: u16,
+        method: u16,
+        receiver: u16,
+        this_value: u16,
+    },
     /// `r<dst> = [elements…]` from the plan-owned register tail.
     NewArray { dst: u16, elements: TemplateTail },
     /// Refresh the captured binding cell at `index` (per-iteration bindings).
@@ -1126,6 +1135,15 @@ impl TemplatePlan {
                 Op::CollectArguments => TemplateOp::CollectArguments {
                     dst: lowered.destination_operands()?.dst,
                 },
+                Op::CallForwardArguments => {
+                    let operands = lowered.quad_operands()?;
+                    TemplateOp::CallForwardArguments {
+                        dst: operands.first,
+                        method: operands.second,
+                        receiver: operands.third,
+                        this_value: operands.fourth,
+                    }
+                }
                 Op::New => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;

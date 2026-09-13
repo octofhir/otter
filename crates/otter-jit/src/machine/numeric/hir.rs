@@ -737,36 +737,9 @@ struct NumericNaturalLoop {
 
 type PhiTypeOverrides = BTreeMap<(usize, u16), NumericType>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NumericFrameSlot {
-    Value(NumericValue),
-    Undefined,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct NumericFrameState {
-    pub(super) point: NumericFramePoint,
-    pub(super) function_id: u32,
-    pub(super) byte_pc: u32,
-    pub(super) slots: Vec<NumericFrameSlot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum NumericFramePoint {
-    Node(NumericValue),
-    Backedge { predecessor: usize, edge: usize },
-}
-
-/// How selection consumes a HIR frame state attached to one node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NumericFrameStatePurpose {
-    /// A reachable pre-effect exact-deopt exit reconstructs the VM window.
-    ExactDeopt,
-    /// A committed effect needs complete live tagged roots but no deopt.
-    TaggedRoots,
-    /// An effect-once emitter uses the state only to publish source identity.
-    RuntimeMetadata,
-}
+pub(super) use super::frame_state::{
+    NumericFramePoint, NumericFrameSlot, NumericFrameState, NumericFrameStatePurpose,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum RawTerminator {
@@ -1287,19 +1260,25 @@ impl NumericFunction {
                 }
                 frame_states.push(NumericFrameState {
                     point: NumericFramePoint::Backedge { predecessor, edge },
-                    function_id: code.id,
-                    byte_pc: view.instructions.get(raw_blocks[successor].start)?.byte_pc,
-                    slots: out_states[predecessor]
-                        .iter()
-                        .copied()
-                        .zip(live_in[successor].iter().copied())
-                        .map(|(state, live)| match (state, live) {
-                            (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
-                            (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
-                                NumericFrameSlot::Undefined
-                            }
-                        })
-                        .collect(),
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: code.id,
+                        byte_pc: view.instructions.get(raw_blocks[successor].start)?.byte_pc,
+                        entry: None,
+                        slots: (out_states[predecessor]
+                            .iter()
+                            .copied()
+                            .zip(live_in[successor].iter().copied())
+                            .map(|(state, live)| match (state, live) {
+                                (RegisterState::Value(value), true) => {
+                                    NumericFrameSlot::Value(value)
+                                }
+                                (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
+                                    NumericFrameSlot::Undefined
+                                }
+                            })
+                            .collect::<Vec<_>>())
+                        .into(),
+                    }]),
                 });
             }
         }
@@ -3897,19 +3876,23 @@ fn push_frame_state(
 ) {
     frame_states.push(NumericFrameState {
         point,
-        function_id,
-        byte_pc,
-        slots: registers
-            .iter()
-            .copied()
-            .zip(live_in.iter().copied())
-            .map(|(state, live)| match (state, live) {
-                (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
-                (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
-                    NumericFrameSlot::Undefined
-                }
-            })
-            .collect(),
+        frames: Box::new([otter_vm::deopt::DeoptFrame {
+            function_id,
+            byte_pc,
+            entry: None,
+            slots: (registers
+                .iter()
+                .copied()
+                .zip(live_in.iter().copied())
+                .map(|(state, live)| match (state, live) {
+                    (RegisterState::Value(value), true) => NumericFrameSlot::Value(value),
+                    (RegisterState::Unset, _) | (RegisterState::Value(_), false) => {
+                        NumericFrameSlot::Undefined
+                    }
+                })
+                .collect::<Vec<_>>())
+            .into(),
+        }]),
     });
 }
 
@@ -4272,9 +4255,11 @@ mod tests {
                     .iter()
                     .find(|state| state.point == NumericFramePoint::Node(leaf))
                     .expect("pre-call state");
-                assert_eq!(state.byte_pc, 0);
+                assert_eq!(state.frames[0].byte_pc, 0);
                 assert!(
-                    !state.slots.contains(&NumericFrameSlot::Value(leaf)),
+                    !state.frames[0]
+                        .slots
+                        .contains(&NumericFrameSlot::Value(leaf)),
                     "result is not defined on a miss"
                 );
                 let sequence = super::super::select_with_packed_double_view_caches(
@@ -5069,9 +5054,9 @@ mod tests {
                     _ => None,
                 })
                 .expect("argument parameter");
-            assert_eq!(state.slots[0], NumericFrameSlot::Value(receiver));
-            assert_eq!(state.slots[1], NumericFrameSlot::Value(argument));
-            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+            assert_eq!(state.frames[0].slots[0], NumericFrameSlot::Value(receiver));
+            assert_eq!(state.frames[0].slots[1], NumericFrameSlot::Value(argument));
+            assert_eq!(state.frames[0].slots[2], NumericFrameSlot::Undefined);
         }
     }
 
@@ -5237,6 +5222,7 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(construct))
                 .expect("exact zero-argument construction state")
+                .frames[0]
                 .byte_pc,
             0
         );
@@ -5259,9 +5245,9 @@ mod tests {
             .iter()
             .find(|state| state.point == NumericFramePoint::Node(construct))
             .expect("exact one-argument construction state");
-        assert_eq!(state.byte_pc, 0);
-        assert_eq!(state.slots[0], NumericFrameSlot::Value(length));
-        assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+        assert_eq!(state.frames[0].byte_pc, 0);
+        assert_eq!(state.frames[0].slots[0], NumericFrameSlot::Value(length));
+        assert_eq!(state.frames[0].slots[2], NumericFrameSlot::Undefined);
 
         assert!(
             NumericFunction::build(&array_construct_view(2)).is_err(),
@@ -5304,9 +5290,9 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(point))
                 .expect("exact pre-construction state");
-            assert_eq!(state.byte_pc, 8);
-            assert_eq!(state.slots[1], NumericFrameSlot::Value(property));
-            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+            assert_eq!(state.frames[0].byte_pc, 8);
+            assert_eq!(state.frames[0].slots[1], NumericFrameSlot::Value(property));
+            assert_eq!(state.frames[0].slots[2], NumericFrameSlot::Undefined);
         }
     }
 
@@ -5366,9 +5352,9 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(global))
                 .expect("exact pre-binding GC state");
-            assert_eq!(state.byte_pc, 24);
-            assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
-            assert_eq!(state.slots[1], NumericFrameSlot::Undefined);
+            assert_eq!(state.frames[0].byte_pc, 24);
+            assert_eq!(state.frames[0].slots[0], NumericFrameSlot::Value(parameter));
+            assert_eq!(state.frames[0].slots[1], NumericFrameSlot::Undefined);
         }
     }
 
@@ -5749,9 +5735,9 @@ mod tests {
                         .iter()
                         .find(|state| state.point == NumericFramePoint::Node(comparison))
                         .expect("exact pre-nullish-comparison state");
-                    assert_eq!(state.byte_pc, 8);
-                    assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
-                    assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+                    assert_eq!(state.frames[0].byte_pc, 8);
+                    assert_eq!(state.frames[0].slots[0], NumericFrameSlot::Value(parameter));
+                    assert_eq!(state.frames[0].slots[2], NumericFrameSlot::Undefined);
                 }
             }
         }
@@ -6003,9 +5989,9 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(decode))
                 .expect("exact pre-comparison decode state");
-            assert_eq!(state.byte_pc, 24);
-            assert_eq!(state.slots[0], NumericFrameSlot::Value(parameter));
-            assert_eq!(state.slots[1], NumericFrameSlot::Undefined);
+            assert_eq!(state.frames[0].byte_pc, 24);
+            assert_eq!(state.frames[0].slots[0], NumericFrameSlot::Value(parameter));
+            assert_eq!(state.frames[0].slots[1], NumericFrameSlot::Undefined);
         }
     }
 
@@ -6050,10 +6036,16 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(decode))
                 .expect("exact pre-division decode state");
-            assert_eq!(state.byte_pc, 40);
-            assert_eq!(state.slots[0], NumericFrameSlot::Value(parameters[0]));
-            assert_eq!(state.slots[1], NumericFrameSlot::Value(parameters[1]));
-            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
+            assert_eq!(state.frames[0].byte_pc, 40);
+            assert_eq!(
+                state.frames[0].slots[0],
+                NumericFrameSlot::Value(parameters[0])
+            );
+            assert_eq!(
+                state.frames[0].slots[1],
+                NumericFrameSlot::Value(parameters[1])
+            );
+            assert_eq!(state.frames[0].slots[2], NumericFrameSlot::Undefined);
         }
     }
 
@@ -6105,8 +6097,8 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(point))
                 .expect("exact pre-element Number-index state");
-            assert_eq!(state.byte_pc, byte_pc);
-            assert_eq!(state.slots[3], NumericFrameSlot::Value(product));
+            assert_eq!(state.frames[0].byte_pc, byte_pc);
+            assert_eq!(state.frames[0].slots[3], NumericFrameSlot::Value(product));
         }
     }
 
@@ -6163,8 +6155,8 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(check))
                 .expect("exact pre-element index conversion state");
-            assert_eq!(state.byte_pc, byte_pc);
-            assert_eq!(state.slots[3], NumericFrameSlot::Value(product));
+            assert_eq!(state.frames[0].byte_pc, byte_pc);
+            assert_eq!(state.frames[0].slots[3], NumericFrameSlot::Value(product));
         }
 
         let load = hir
@@ -6246,7 +6238,7 @@ mod tests {
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(point))
                 .expect("generic element pre-operation state");
-            assert_eq!(state.byte_pc, byte_pc);
+            assert_eq!(state.frames[0].byte_pc, byte_pc);
         }
 
         let mut caught = catch_liveness_view();
@@ -6995,20 +6987,32 @@ mod tests {
             .iter()
             .find(|state| state.point == NumericFramePoint::Node(load))
             .expect("exact pre-load state");
-        assert_eq!(load_state.byte_pc, 8);
-        assert_eq!(load_state.slots[0], NumericFrameSlot::Value(receiver));
-        assert_eq!(load_state.slots[2], NumericFrameSlot::Undefined);
+        assert_eq!(load_state.frames[0].byte_pc, 8);
+        assert_eq!(
+            load_state.frames[0].slots[0],
+            NumericFrameSlot::Value(receiver)
+        );
+        assert_eq!(load_state.frames[0].slots[2], NumericFrameSlot::Undefined);
 
         let store_state = hir
             .frame_states
             .iter()
             .find(|state| state.point == NumericFramePoint::Node(store))
             .expect("exact pre-store state");
-        assert_eq!(store_state.byte_pc, 24);
-        assert_eq!(store_state.slots[0], NumericFrameSlot::Value(receiver));
-        assert_eq!(store_state.slots[1], NumericFrameSlot::Value(stored));
-        assert_eq!(store_state.slots[2], NumericFrameSlot::Value(load));
-        assert_eq!(store_state.slots[3], NumericFrameSlot::Undefined);
+        assert_eq!(store_state.frames[0].byte_pc, 24);
+        assert_eq!(
+            store_state.frames[0].slots[0],
+            NumericFrameSlot::Value(receiver)
+        );
+        assert_eq!(
+            store_state.frames[0].slots[1],
+            NumericFrameSlot::Value(stored)
+        );
+        assert_eq!(
+            store_state.frames[0].slots[2],
+            NumericFrameSlot::Value(load)
+        );
+        assert_eq!(store_state.frames[0].slots[3], NumericFrameSlot::Undefined);
     }
 
     #[test]

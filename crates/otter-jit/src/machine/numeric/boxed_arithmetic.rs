@@ -327,12 +327,16 @@ mod tests {
                 .into_iter()
                 .map(|index| NumericFrameState {
                     point: NumericFramePoint::Node(NumericValue(index)),
-                    function_id: 1,
-                    byte_pc: 8,
-                    slots: vec![
-                        NumericFrameSlot::Value(NumericValue(0)),
-                        NumericFrameSlot::Undefined,
-                    ],
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: 1,
+                        byte_pc: 8,
+                        entry: None,
+                        slots: (vec![
+                            NumericFrameSlot::Value(NumericValue(0)),
+                            NumericFrameSlot::Undefined,
+                        ])
+                        .into(),
+                    }]),
                 })
                 .collect(),
             direct_call_targets: vec![],

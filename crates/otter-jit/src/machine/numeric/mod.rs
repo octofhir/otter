@@ -4,6 +4,7 @@
 //! - `hir` — typed scalar semantic graph with direct captured-binding reads,
 //!   guarded property and element accesses, typed array construction, explicit
 //!   reentrant calls, and catch landing pads.
+//! - `frame_state` — source-owned activation chains and complete SSA liveness.
 //! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - Derived-this committed operations split into generated and cold CFG
@@ -90,6 +91,7 @@
 
 mod arm64;
 mod boxed_arithmetic;
+mod frame_state;
 mod hir;
 mod semantics;
 
@@ -255,15 +257,17 @@ pub(crate) fn try_compile(
         .filter(|state| frame_state_requires_deopt(&hir, state))
         .enumerate()
     {
-        let logical_pc = view
-            .instructions
+        let resume_pcs = state
+            .frames
             .iter()
-            .position(|instruction| instruction.byte_pc == state.byte_pc)
-            .and_then(|pc| u32::try_from(pc).ok())
-            .ok_or(Unsupported::OperandShape("scalar deopt resume PC"))?;
+            .map(|frame| {
+                frame_state::resume_pc(view, frame.function_id, frame.byte_pc)
+                    .ok_or(Unsupported::OperandShape("scalar deopt source function/PC"))
+            })
+            .collect::<Result<_, _>>()?;
         exits.push(DeoptExitDescriptor {
             state: DeoptExitId(index as u32),
-            resume_pcs: vec![logical_pc].into_boxed_slice(),
+            resume_pcs,
         });
     }
     let deopt_runtime = Box::new(DeoptRuntime {
@@ -2926,7 +2930,7 @@ fn attach_frame_state(
 ) {
     let state = &hir.frame_states[state_index];
     let mut values_at_exit = BTreeSet::new();
-    for slot in &state.slots {
+    for slot in state.frame_slots() {
         let hir::NumericFrameSlot::Value(value) = slot else {
             continue;
         };
@@ -2948,7 +2952,7 @@ fn attach_frame_state_tagged_roots(
     let state = &hir.frame_states[state_index];
     append_unique_tagged_roots(
         &mut instruction.operands,
-        state.slots.iter().filter_map(|slot| {
+        state.frame_slots().filter_map(|slot| {
             let hir::NumericFrameSlot::Value(value) = *slot else {
                 return None;
             };
@@ -2969,27 +2973,37 @@ fn frame_state_requires_deopt(hir: &NumericFunction, state: &hir::NumericFrameSt
 }
 
 fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
+    fn slot(slot: &hir::NumericFrameSlot) -> super::MachineFrameSlot {
+        match slot {
+            hir::NumericFrameSlot::Value(value) => {
+                super::MachineFrameSlot::Value(MachineValue(value.0 as u32))
+            }
+            hir::NumericFrameSlot::Undefined => super::undefined_slot(),
+        }
+    }
     hir.frame_states
         .iter()
         .filter(|state| frame_state_requires_deopt(hir, state))
         .enumerate()
         .map(|(index, state)| super::MachineFrameState {
             id: DeoptId(index as u32),
-            frames: Box::new([otter_vm::deopt::DeoptFrame {
-                function_id: state.function_id,
-                entry: None,
-                byte_pc: state.byte_pc,
-                slots: state
-                    .slots
-                    .iter()
-                    .map(|slot| match slot {
-                        hir::NumericFrameSlot::Value(value) => {
-                            super::MachineFrameSlot::Value(MachineValue(value.0 as u32))
-                        }
-                        hir::NumericFrameSlot::Undefined => super::undefined_slot(),
-                    })
-                    .collect(),
-            }]),
+            frames: state
+                .frames
+                .iter()
+                .map(|frame| otter_vm::deopt::DeoptFrame {
+                    function_id: frame.function_id,
+                    byte_pc: frame.byte_pc,
+                    entry: frame
+                        .entry
+                        .as_ref()
+                        .map(|entry| otter_vm::deopt::DeoptFrameEntry {
+                            return_register: entry.return_register,
+                            this: slot(&entry.this),
+                            closure: slot(&entry.closure),
+                        }),
+                    slots: frame.slots.iter().map(slot).collect(),
+                })
+                .collect(),
         })
         .collect()
 }
@@ -3309,6 +3323,100 @@ fn machine_value(values: &[MachineValue], value: hir::NumericValue) -> MachineVa
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inline_frame_only_values_survive_selection_and_allocation() {
+        use hir::{NumericBlock, NumericFrameSlot, NumericFrameState, NumericValue};
+        use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry};
+        let value = NumericValue;
+        let hir = NumericFunction {
+            function_id: 1,
+            parameter_count: 2,
+            register_count: 2,
+            arithmetic_op_count: 0,
+            nodes: vec![
+                NumericNode::Parameter {
+                    register: 0,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::Parameter {
+                    register: 1,
+                    value_type: NumericType::Tagged,
+                },
+                NumericNode::TaggedToInt32(value(0)),
+            ],
+            blocks: vec![NumericBlock {
+                logical_pc: 0,
+                osr_entry_allowed: false,
+                predecessors: vec![],
+                successors: vec![],
+                parameters: vec![],
+                parameter_registers: vec![],
+                successor_arguments: vec![],
+                nodes: vec![value(0), value(1), value(2)],
+                terminator: NumericTerminator::Return(value(2)),
+            }],
+            frame_states: vec![NumericFrameState {
+                point: NumericFramePoint::Node(value(2)),
+                frames: Box::new([
+                    DeoptFrame {
+                        function_id: 1,
+                        byte_pc: 16,
+                        entry: None,
+                        slots: Box::new([
+                            NumericFrameSlot::Value(value(0)),
+                            NumericFrameSlot::Undefined,
+                        ]),
+                    },
+                    DeoptFrame {
+                        function_id: 2,
+                        byte_pc: 8,
+                        entry: Some(DeoptFrameEntry {
+                            return_register: 1,
+                            this: NumericFrameSlot::Value(value(0)),
+                            closure: NumericFrameSlot::Value(value(1)),
+                        }),
+                        slots: Box::new([NumericFrameSlot::Value(value(0))]),
+                    },
+                ]),
+            }],
+            direct_call_targets: vec![],
+            operand_values: vec![],
+        };
+        let sequence = select_with_packed_double_view_caches(&hir, &Default::default()).unwrap();
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .unwrap();
+        let layout = crate::machine::MachineFrameLayout::new(&allocation, 0, 16, 16).unwrap();
+        let table = lower_deopt_table(
+            &sequence,
+            &allocation,
+            layout,
+            16,
+            8,
+            &machine_frame_states(&hir),
+        )
+        .unwrap();
+        let frames = &table.entries()[0].frames;
+        assert_eq!(frames.len(), 2);
+        let entry = frames[1].entry.as_ref().unwrap();
+        assert_eq!(entry.this, frames[0].slots[0]);
+        assert_ne!(entry.closure.location, entry.this.location);
+        assert_eq!(entry.closure.repr, otter_vm::deopt::DeoptRepr::Tagged);
+        let mut root_carrier = MachineInstruction::plain(MachineOpcode::Return, vec![]);
+        attach_frame_state_tagged_roots(
+            &hir,
+            &[MachineValue(0), MachineValue(1), MachineValue(2)],
+            0,
+            &mut root_carrier,
+        );
+        assert!(
+            root_carrier
+                .operands
+                .contains(&MachineOperand::tagged_root(MachineValue(1))),
+            "the closure is live only through the nested activation entry"
+        );
+    }
+
     use otter_bytecode::opcode_schema::{
         BindingRead, BindingSemantics, OPCODE_SCHEMA, OperandKind, RegisterAccess,
     };
@@ -3466,9 +3574,12 @@ mod tests {
                     predecessor: 2,
                     edge: 0,
                 },
-                function_id: 176,
-                byte_pc: 16,
-                slots: vec![hir::NumericFrameSlot::Value(value(2))],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 176,
+                    byte_pc: 16,
+                    entry: None,
+                    slots: (vec![hir::NumericFrameSlot::Value(value(2))]).into(),
+                }]),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -3530,13 +3641,17 @@ mod tests {
             }],
             frame_states: vec![hir::NumericFrameState {
                 point: NumericFramePoint::Node(value(2)),
-                function_id: 150,
-                byte_pc: 32,
-                slots: vec![
-                    hir::NumericFrameSlot::Value(value(0)),
-                    hir::NumericFrameSlot::Value(value(1)),
-                    hir::NumericFrameSlot::Undefined,
-                ],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 150,
+                    byte_pc: 32,
+                    entry: None,
+                    slots: (vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Undefined,
+                    ])
+                    .into(),
+                }]),
             }],
             direct_call_targets: vec![NumericDirectCallTarget {
                 kind: NumericDirectCallKind::Method,
@@ -3598,12 +3713,16 @@ mod tests {
             }],
             frame_states: vec![hir::NumericFrameState {
                 point: NumericFramePoint::Node(value(1)),
-                function_id: 152,
-                byte_pc: 48,
-                slots: vec![
-                    hir::NumericFrameSlot::Value(value(0)),
-                    hir::NumericFrameSlot::Undefined,
-                ],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 152,
+                    byte_pc: 48,
+                    entry: None,
+                    slots: (vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Undefined,
+                    ])
+                    .into(),
+                }]),
             }],
             direct_call_targets: vec![NumericDirectCallTarget {
                 kind: NumericDirectCallKind::Method,
@@ -3649,13 +3768,17 @@ mod tests {
             }],
             frame_states: vec![hir::NumericFrameState {
                 point: NumericFramePoint::Node(value(2)),
-                function_id: 151,
-                byte_pc: 40,
-                slots: vec![
-                    hir::NumericFrameSlot::Value(value(0)),
-                    hir::NumericFrameSlot::Value(value(1)),
-                    hir::NumericFrameSlot::Undefined,
-                ],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 151,
+                    byte_pc: 40,
+                    entry: None,
+                    slots: (vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Undefined,
+                    ])
+                    .into(),
+                }]),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -3768,12 +3891,16 @@ mod tests {
             }],
             frame_states: vec![hir::NumericFrameState {
                 point: NumericFramePoint::Node(value(1)),
-                function_id: 152,
-                byte_pc: 24,
-                slots: vec![
-                    hir::NumericFrameSlot::Value(value(0)),
-                    hir::NumericFrameSlot::Undefined,
-                ],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 152,
+                    byte_pc: 24,
+                    entry: None,
+                    slots: (vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Undefined,
+                    ])
+                    .into(),
+                }]),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -3865,14 +3992,18 @@ mod tests {
             blocks,
             frame_states: vec![hir::NumericFrameState {
                 point: NumericFramePoint::Node(value(3)),
-                function_id: 153,
-                byte_pc: 48,
-                slots: vec![
-                    hir::NumericFrameSlot::Value(value(0)),
-                    hir::NumericFrameSlot::Value(value(1)),
-                    hir::NumericFrameSlot::Value(value(2)),
-                    hir::NumericFrameSlot::Undefined,
-                ],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 153,
+                    byte_pc: 48,
+                    entry: None,
+                    slots: (vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Value(value(2)),
+                        hir::NumericFrameSlot::Undefined,
+                    ])
+                    .into(),
+                }]),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -5936,12 +6067,16 @@ mod tests {
             .into_iter()
             .map(|(point, byte_pc, slots)| hir::NumericFrameState {
                 point: NumericFramePoint::Node(point),
-                function_id: 93,
-                byte_pc,
-                slots: slots
-                    .into_iter()
-                    .map(hir::NumericFrameSlot::Value)
-                    .collect(),
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 93,
+                    byte_pc: byte_pc,
+                    entry: None,
+                    slots: (slots
+                        .into_iter()
+                        .map(hir::NumericFrameSlot::Value)
+                        .collect::<Vec<_>>())
+                    .into(),
+                }]),
             })
             .collect(),
             direct_call_targets: Vec::new(),
@@ -5998,12 +6133,16 @@ mod tests {
             .into_iter()
             .map(|(point, byte_pc, slots)| hir::NumericFrameState {
                 point: NumericFramePoint::Node(point),
-                function_id: 96,
-                byte_pc,
-                slots: slots
-                    .into_iter()
-                    .map(hir::NumericFrameSlot::Value)
-                    .collect(),
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 96,
+                    byte_pc: byte_pc,
+                    entry: None,
+                    slots: (slots
+                        .into_iter()
+                        .map(hir::NumericFrameSlot::Value)
+                        .collect::<Vec<_>>())
+                    .into(),
+                }]),
             })
             .collect(),
             direct_call_targets: Vec::new(),
@@ -6069,12 +6208,16 @@ mod tests {
             .into_iter()
             .map(|(point, byte_pc, slots)| hir::NumericFrameState {
                 point: NumericFramePoint::Node(point),
-                function_id: 94,
-                byte_pc,
-                slots: slots
-                    .into_iter()
-                    .map(hir::NumericFrameSlot::Value)
-                    .collect(),
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 94,
+                    byte_pc: byte_pc,
+                    entry: None,
+                    slots: (slots
+                        .into_iter()
+                        .map(hir::NumericFrameSlot::Value)
+                        .collect::<Vec<_>>())
+                    .into(),
+                }]),
             })
             .collect(),
             direct_call_targets: Vec::new(),
@@ -6130,12 +6273,16 @@ mod tests {
             .into_iter()
             .map(|(point, byte_pc, slots)| hir::NumericFrameState {
                 point: NumericFramePoint::Node(point),
-                function_id: 95,
-                byte_pc,
-                slots: slots
-                    .into_iter()
-                    .map(hir::NumericFrameSlot::Value)
-                    .collect(),
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 95,
+                    byte_pc: byte_pc,
+                    entry: None,
+                    slots: (slots
+                        .into_iter()
+                        .map(hir::NumericFrameSlot::Value)
+                        .collect::<Vec<_>>())
+                    .into(),
+                }]),
             })
             .collect(),
             direct_call_targets: Vec::new(),
@@ -6178,23 +6325,31 @@ mod tests {
             frame_states: [
                 hir::NumericFrameState {
                     point: NumericFramePoint::Node(value(2)),
-                    function_id: 94,
-                    byte_pc: 24,
-                    slots: vec![
-                        hir::NumericFrameSlot::Value(value(0)),
-                        hir::NumericFrameSlot::Value(value(1)),
-                        hir::NumericFrameSlot::Undefined,
-                    ],
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: 94,
+                        byte_pc: 24,
+                        entry: None,
+                        slots: (vec![
+                            hir::NumericFrameSlot::Value(value(0)),
+                            hir::NumericFrameSlot::Value(value(1)),
+                            hir::NumericFrameSlot::Undefined,
+                        ])
+                        .into(),
+                    }]),
                 },
                 hir::NumericFrameState {
                     point: NumericFramePoint::Node(value(3)),
-                    function_id: 94,
-                    byte_pc: 40,
-                    slots: vec![
-                        hir::NumericFrameSlot::Value(value(0)),
-                        hir::NumericFrameSlot::Value(value(1)),
-                        hir::NumericFrameSlot::Value(value(2)),
-                    ],
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: 94,
+                        byte_pc: 40,
+                        entry: None,
+                        slots: (vec![
+                            hir::NumericFrameSlot::Value(value(0)),
+                            hir::NumericFrameSlot::Value(value(1)),
+                            hir::NumericFrameSlot::Value(value(2)),
+                        ])
+                        .into(),
+                    }]),
                 },
             ]
             .into(),
@@ -6506,12 +6661,16 @@ mod tests {
             }],
             frame_states: vec![hir::NumericFrameState {
                 point: NumericFramePoint::Node(value(1)),
-                function_id: 96,
-                byte_pc: 24,
-                slots: vec![
-                    hir::NumericFrameSlot::Value(value(0)),
-                    hir::NumericFrameSlot::Undefined,
-                ],
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 96,
+                    byte_pc: 24,
+                    entry: None,
+                    slots: (vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Undefined,
+                    ])
+                    .into(),
+                }]),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -8137,7 +8296,7 @@ mod tests {
             ) {
                 continue;
             }
-            for slot in &mut state.slots {
+            for slot in state.frames.iter_mut().flat_map(|frame| &mut frame.slots) {
                 if matches!(
                     *slot,
                     hir::NumericFrameSlot::Value(hir::NumericValue(1) | hir::NumericValue(5))
@@ -10486,7 +10645,7 @@ mod tests {
             .iter()
             .find(|state| matches!(state.point, NumericFramePoint::Backedge { .. }))
             .expect("uint32 backedge FrameState");
-        let uint_value = match poll_state.slots[0] {
+        let uint_value = match poll_state.frames[0].slots[0] {
             hir::NumericFrameSlot::Value(value) => value,
             hir::NumericFrameSlot::Undefined => panic!("uint32 loop value is live"),
         };
@@ -11007,18 +11166,24 @@ mod tests {
                         predecessor: 3,
                         edge: 0,
                     },
-                    function_id: 190,
-                    byte_pc: 16,
-                    slots: Vec::new(),
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: 190,
+                        byte_pc: 16,
+                        entry: None,
+                        slots: (Vec::new()).into(),
+                    }]),
                 },
                 hir::NumericFrameState {
                     point: NumericFramePoint::Backedge {
                         predecessor: 4,
                         edge: 0,
                     },
-                    function_id: 190,
-                    byte_pc: 8,
-                    slots: Vec::new(),
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: 190,
+                        byte_pc: 8,
+                        entry: None,
+                        slots: (Vec::new()).into(),
+                    }]),
                 },
             ],
             direct_call_targets: Vec::new(),

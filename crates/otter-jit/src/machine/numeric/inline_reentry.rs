@@ -1,8 +1,8 @@
-//! Inline activation recipes from cold SSA inputs to code-owned root homes.
+//! Inline activation recipes from cold SSA inputs to code-owned safepoint homes.
 //!
 //! # Contents
 //! - Cold-only boxing and explicit tagged-root operands before allocation.
-//! - Post-allocation property-cell recipes using the shared VM frame schema.
+//! - Post-allocation safepoint recipes using the shared VM frame schema.
 //!
 //! # Invariants
 //! - The caller's register window is never copied; it stays natively published.
@@ -53,40 +53,22 @@ pub(super) fn select_frames(
     append_unique_tagged_roots(&mut call.operands, boxed.into_values());
 }
 
-pub(super) fn prepare_property_cells(
+pub(super) fn prepare_safepoints(
     view: &JitCompileSnapshot,
     sequence: &InstructionSequence,
-    safepoints: &super::super::MachineSafepointTable,
-    code_object_id: u64,
-    cells: &mut [crate::entry::WhiskerIcCell],
+    safepoints: &mut super::super::MachineSafepointTable,
 ) -> Result<(), Unsupported> {
-    let probes = sequence
-        .instructions()
-        .iter()
-        .filter(|instruction| matches!(instruction.opcode, MachineOpcode::PropertyLoad { .. }));
-    for (probe, cell) in probes.zip(cells) {
-        let cell_value = probe.operands[3].value;
-        let Some((index, cold)) =
-            sequence
-                .instructions()
-                .iter()
-                .enumerate()
-                .find(|(_, instruction)| {
-                    !instruction.inline_frames.is_empty()
-                        && instruction
-                            .operands
-                            .get(1)
-                            .is_some_and(|operand| operand.value == cell_value)
-                })
-        else {
+    for (index, cold) in sequence.instructions().iter().enumerate() {
+        if cold.inline_frames.is_empty() {
             continue;
-        };
+        }
         if cold.inline_frames[0].function_id != view.code_block.id {
             return Err(Unsupported::OperandShape("inline caller source owner"));
         }
         let safepoint = safepoints
             .site(MachineInstructionId(index as u32))
-            .ok_or(Unsupported::OperandShape("inline property safepoint"))?;
+            .ok_or(Unsupported::OperandShape("inline reentry safepoint"))?;
+        let safepoint_id = safepoint.id.0;
         let slot = |source: &Option<MachineValue>| -> Result<Option<u16>, Unsupported> {
             source
                 .map(|value| {
@@ -127,7 +109,11 @@ pub(super) fn prepare_property_cells(
                 })
             })
             .collect::<Result<Box<[_]>, Unsupported>>()?;
-        cell.set_inline_frames(code_object_id, safepoint.id.0, frames);
+        let record = safepoints
+            .records_mut()
+            .get_mut(safepoint_id as usize)
+            .ok_or(Unsupported::OperandShape("inline reentry record"))?;
+        record.inline_frames = frames;
     }
     Ok(())
 }

@@ -534,6 +534,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - Optimizing plain/method scalar/named-load splices use the same HIR and allocator.
     The caller owns the identity/this guard; named accesses retain the callee's
     source program and cold activation recipes in `optimized-ir.txt`.
+    Property and global-read cold calls resolve one code-owned safepoint recipe
+    through the active registry generation. `safepoints.json` exposes
+    `inlineFrames`: slots and entry this/closure are spill-root indices, with
+    null meaning undefined. IC cells own property source/programs only.
+    Suspended outer root records never supply a callee's recipe; getter/error
+    normalization runs before inline frames are removed.
     `deopt.json` records the complete outermost-first caller/callee chain.
     `machineInlineMethodGuard` reuses the shared receiver/prototype/slot proof,
     returns the current callable and rejects bound-this/runtime-setup/eval-env

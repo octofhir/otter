@@ -2702,6 +2702,7 @@ mod tests {
         let map = collections::alloc_map(&mut heap).expect("map");
         let mut slots = [Value::map(map).to_abi_bits(), n(7).to_abi_bits()];
         let safepoint = SafepointRecord {
+            inline_frames: Box::default(),
             id: 12,
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::frame_slot(0), TaggedLocation::frame_slot(1)],
@@ -2763,6 +2764,7 @@ mod tests {
         let mut slots = [Value::undefined().to_abi_bits()];
         let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &[], 1);
         let no_safepoint = SafepointRecord {
+            inline_frames: Box::default(),
             id: NO_SAFEPOINT,
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::frame_slot(0)],
@@ -2808,6 +2810,7 @@ mod tests {
         );
 
         let unsupported = SafepointRecord {
+            inline_frames: Box::default(),
             id: 3,
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::machine_register(0)],
@@ -2992,6 +2995,7 @@ mod tests {
         let mut frame = [n(3).to_abi_bits()];
         let mut spill = [obj.to_abi_bits()];
         let record = SafepointRecord {
+            inline_frames: Box::default(),
             id: 1,
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::spill_slot(0)],
@@ -3023,6 +3027,7 @@ mod tests {
             Err(AllocSafepointRootError::MissingSpillSlots)
         );
         let reg_record = SafepointRecord {
+            inline_frames: Box::default(),
             id: 1,
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::machine_register(0)],

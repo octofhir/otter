@@ -642,22 +642,24 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct Point {
+    struct Point<'a> {
         id: u32,
         frame_state: u32,
         native_return_offset: Option<u64>,
         tagged_locations: Vec<Location>,
+        inline_frames: &'a [otter_vm::deopt::DeoptFrame<Option<u16>>],
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct Document {
-        safepoints: Vec<Point>,
+    struct Document<'a> {
+        safepoints: Vec<Point<'a>>,
     }
 
     let safepoints = records
         .iter()
         .map(|record| Point {
+            inline_frames: &record.inline_frames,
             id: record.id,
             frame_state: record.frame_state,
             // Native correlation is added by the relocation/safepoint-site

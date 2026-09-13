@@ -22,6 +22,8 @@
 //! receive only boxed values; the published function/PC selects a typed
 //! operation before semantics begin. Their JavaScript throws return as pure
 //! exception values, while only structural `Fatal` failures remain parked.
+//! Inlined global reads publish safepoint-owned callee frames and normalize
+//! semantic errors before removing that scope.
 //! Numeric/load/class opcode words are decoded exactly once at their ABI edge.
 //! Built-in Array spread collection accepts both materialized and stack-owned
 //! frames; observable iterator overrides bail before effects.
@@ -966,13 +968,26 @@ pub(crate) extern "C" fn jit_binding_value_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx
-        .runtime_call()
-        .map_err(CommittedValueError::Fatal)
-        .and_then(|mut runtime| {
-            runtime.binding_values(Value::from_bits(value0_bits), Value::from_bits(value1_bits))
-        });
-    committed_value_result(ctx, result)
+    let result = (|| {
+        let mut frames = super::inline_frames::decode(ctx)?;
+        let mut runtime = ctx.runtime_call()?;
+        runtime.with_inline_activations(&mut frames, |runtime| {
+            match runtime.binding_values(
+                Value::from_bits(value0_bits),
+                Value::from_bits(value1_bits),
+            ) {
+                Ok(value) => Ok(NativeResultPair::success(value)),
+                Err(CommittedValueError::JavaScript(error)) => runtime
+                    .take_js_throw(error)
+                    .map(NativeResultPair::throw_value),
+                Err(CommittedValueError::Fatal(error)) => Err(error),
+            }
+        })?
+    })();
+    match result {
+        Ok(pair) => pair,
+        Err(error) => super::committed_vm_result(ctx, Err(error)),
+    }
 }
 
 /// Complete the exact published schema-owned global declaration or

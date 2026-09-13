@@ -10,6 +10,8 @@
 //! - Machine code publishes only `(code_object_id, safepoint_id)`; it never
 //!   supplies a raw metadata-table pointer.
 //! - Every live tagged value is named exactly once by a frame or spill map.
+//! - Inline activation recipes use the same spill slots and code generation;
+//!   they own no moving values or alternate runtime frame layout.
 //! - Machine-register roots are saved to mapped spill slots before an
 //!   allocating or reentrant call.
 //!
@@ -172,6 +174,9 @@ pub struct SafepointRecord {
     pub frame_state: FrameStateId,
     /// Tagged values visible to the moving collector.
     pub tagged_locations: Vec<TaggedLocation>,
+    /// Cold inline descendants, with values indexed into the precise spill map.
+    /// The owning code generation and this record's id select the recipe.
+    pub inline_frames: Box<[crate::deopt::DeoptFrame<Option<u16>>]>,
 }
 
 impl SafepointRecord {
@@ -183,6 +188,7 @@ impl SafepointRecord {
         register_count: u16,
     ) -> Self {
         Self {
+            inline_frames: Box::default(),
             id,
             frame_state,
             tagged_locations: (0..register_count)
@@ -217,10 +223,20 @@ impl SafepointRecord {
             .map(TaggedLocation::frame_slot)
             .collect();
         Some(Self {
+            inline_frames: Box::default(),
             id: frame_map.id,
             frame_state,
             tagged_locations,
         })
+    }
+
+    /// Heap storage retained by inline activation recipes (excluding this record).
+    #[must_use]
+    pub fn inline_retained_bytes(&self) -> u64 {
+        self.inline_frames.iter().fold(
+            std::mem::size_of_val(self.inline_frames.as_ref()) as u64,
+            |bytes, frame| bytes.saturating_add(std::mem::size_of_val(frame.slots.as_ref()) as u64),
+        )
     }
 
     /// Whether this map can reconstruct interpreter-visible state.

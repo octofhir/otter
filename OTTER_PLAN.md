@@ -512,9 +512,24 @@ all moving roots. Local catches receive its pure Throw payload through a split
 SSA edge, without deopt or repeated getter effects.144 numeric tests,16 runtime
 tests,23 existing committed-contract tests and scoped JIT clippy pass (overlap;
 do not sum). Four generic-property tests also pass at GC stress+verify1/4/16
-using the same binary. No release build or timing. Named-store cold CFG and
-inline activation publication remain open; property callees are not yet spliced. Next: operation ownership for source-dependent callee facts,
-then dot-like property helpers and complete temporary-object arithmetic chains.
+using the same binary. No release build or timing.
+
+The VM cold boundary now has scoped inline activation publication. Boxed
+DeoptFrame<Value> recipes publish descendants through the existing NativeFrame
+inventory, preserving the caller and returning without interpreter execution.
+The scope validates source PCs, exact closure identity, capture layout and entry
+bounds before effects; moving roots, this/SELF, nested publication, error stacks
+and unwind cleanup use the existing owners. Three focused VM tests pass, also
+at GC stress+verify1/4/16 on one binary; scoped VM clippy passes. This boundary
+is not yet called by generated property cold sites. No additional support for
+obsolete Function.caller/arguments properties or compatibility layer is added.
+
+Next: attach boxed inline frame operands to Machine property cold safepoints,
+resolve their allocator root homes into code-owned recipes, and call the scoped
+boundary while normalizing the committed exception. Publish the outer caller's
+call PC, not the callee's source PC. Then admit source-owned dot-like property
+callees and prove their emitted body and effect-once getter/throw behavior.
+Named-store cold CFG, method splices and temporary-object elimination remain open.
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not
 addressed by repeatedly chasing1–2% local changes. The current boxed-arithmetic

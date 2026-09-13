@@ -2104,9 +2104,9 @@ impl Interpreter {
         })
     }
 
-    /// Bake the already-observed class allocation program for one construct
-    /// edge. Handles are resolved only at compile time; the generated program
-    /// guards the live class prototype chain before carving a receiver.
+    /// Bake the allocation program for one construct edge. Class wrappers use
+    /// the template-wide capacity proof; ordinary closures additionally guard
+    /// their current weak sample and per-instance capacity before allocation.
     fn bake_receiver_allocation_plan(
         &self,
         base_function_id: u32,
@@ -2116,18 +2116,22 @@ impl Interpreter {
         // A receiver whose learned instance size outgrows the inline words
         // needs the runtime preparation's reserved slab; an inline allocation
         // would hand the body storage it immediately has to grow.
-        if self
-            .constructor_instance_profiles
+        let class_allocation =
+            !self
+                .constructor_instance_profiles
+                .get(&key)
+                .is_some_and(|profile| {
+                    profile.learned_field_count(&self.gc_heap) > crate::object::INLINE_SLOT_CAP
+                });
+        let capacity = self
+            .constructor_field_capacity_cache
             .get(&key)
-            .is_some_and(|profile| {
-                profile.learned_field_count(&self.gc_heap) > crate::object::INLINE_SLOT_CAP
-            })
-        {
-            return None;
-        }
-        let Some(&capacity) = self.constructor_field_capacity_cache.get(&key) else {
+            .copied()
+            .unwrap_or(0);
+        if capacity == 0 {
             return Some(jit::JitReceiverAllocationPlan {
                 new_target_function_id,
+                class_allocation,
                 receiver_shape: self.shape_root().offset(),
                 initial_field_count: 0,
                 reserved_capacity: 0,
@@ -2159,6 +2163,7 @@ impl Interpreter {
         };
         Some(jit::JitReceiverAllocationPlan {
             new_target_function_id,
+            class_allocation,
             receiver_shape,
             initial_field_count,
             reserved_capacity: u8::try_from(capacity).ok()?,

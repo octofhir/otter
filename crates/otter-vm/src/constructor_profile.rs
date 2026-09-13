@@ -124,7 +124,10 @@ impl Interpreter {
         let learned = match closure {
             Some(handle) => {
                 let (learned, last) = self.gc_heap.read_payload(handle, |body| {
-                    (body.learned_instance_fields.get(), body.last_instance.get())
+                    (
+                        body.construct.learned_instance_fields.get(),
+                        body.construct.observed_receiver(),
+                    )
                 });
                 ConstructorInstanceProfile::learned_from(usize::from(learned), last, &self.gc_heap)
             }
@@ -139,8 +142,8 @@ impl Interpreter {
 
     /// Record the receiver just prepared so the next preparation can sample
     /// the size it grows to. The function-keyed entry keeps the largest size
-    /// any closure of the template reached, which decides whether an inline
-    /// allocation plan may still be baked for it.
+    /// any closure of the template reached, which governs class-wrapper inline
+    /// allocation. Ordinary closures guard their own live size independently.
     pub(crate) fn note_constructor_receiver(
         &mut self,
         sample: ConstructorProfileSample,
@@ -159,12 +162,13 @@ impl Interpreter {
             .map(|closure| closure.handle);
         if let Some(handle) = closure {
             self.gc_heap.with_payload(handle, |body| {
-                body.learned_instance_fields.set(
-                    body.learned_instance_fields
+                body.construct.learned_instance_fields.set(
+                    body.construct
+                        .learned_instance_fields
                         .get()
                         .max(u16::try_from(learned).unwrap_or(u16::MAX)),
                 );
-                if body.last_instance.replace(Some(receiver)).is_none() {
+                if body.construct.last_instance.replace(receiver).is_null() {
                     self.pending_constructor_samples
                         .borrow_mut()
                         .push(PendingConstructorSample {
@@ -202,11 +206,11 @@ impl Interpreter {
             let learned = if let Some(closure) = sample.closure {
                 heap.read_payload(closure, |body| {
                     let learned = ConstructorInstanceProfile::learned_from(
-                        usize::from(body.learned_instance_fields.get()),
-                        body.last_instance.take(),
+                        usize::from(body.construct.learned_instance_fields.get()),
+                        body.construct.take_receiver(),
                         heap,
                     );
-                    body.learned_instance_fields.set(learned as u16);
+                    body.construct.learned_instance_fields.set(learned as u16);
                     learned
                 })
             } else {

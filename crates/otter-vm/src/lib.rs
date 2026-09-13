@@ -67,6 +67,7 @@ pub mod boolean;
 mod call_feedback;
 mod call_ops;
 pub mod closure;
+mod closure_construct;
 mod code_liveness;
 mod code_space;
 mod coerce;

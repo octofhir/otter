@@ -4,6 +4,7 @@
 //! - `hir` — typed scalar semantic graph with direct captured-binding reads,
 //!   guarded property and element accesses, typed array construction, explicit
 //!   reentrant calls, and catch landing pads.
+//! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - Derived-this committed operations split into generated and cold CFG
 //!   siblings before allocation, sharing one SSA result and exception contract.
@@ -88,6 +89,7 @@
 //!   instead of a pending VM exception side channel.
 
 mod arm64;
+mod boxed_arithmetic;
 mod hir;
 mod semantics;
 

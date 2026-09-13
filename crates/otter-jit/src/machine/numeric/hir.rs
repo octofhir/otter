@@ -20,7 +20,9 @@
 //!   keeps tagged inputs and performs an exact pre-operation numeric decode;
 //!   a non-number resumes the canonical bytecode before observable effects.
 //!   Later Int32 feedback may narrow a still-tagged input guard, but never an
-//!   established Number or Uint32 SSA value.
+//!   established Number or Uint32 SSA value. Isolated immediate arithmetic whose
+//!   consumers need only boxing retains Number decoding even after Int32 feedback;
+//!   integer consumers and CFG joins preserve their original representation.
 //! - Tagged values produced inside the function may enter numeric-only regions
 //!   through an exact pre-operation guarded decode. A failed decode resumes the
 //!   original bytecode before any observable effect can be replayed.
@@ -797,12 +799,13 @@ impl NumericFunction {
         let mut phi_types = PhiTypeOverrides::new();
         let mut decline = None;
         for _ in 0..MAX_FUNCTION_INSTRUCTIONS {
-            let Some((function, next_phi_types, retry)) =
+            let Some((mut function, next_phi_types, retry)) =
                 Self::build_attempt(view, &phi_types, &mut decline)
             else {
                 return Err(decline.unwrap_or(HirDecline::Structural("Machine HIR lowering")));
             };
             if !retry {
+                super::boxed_arithmetic::relax(&mut function, view);
                 return Ok(function);
             }
             if next_phi_types == phi_types {

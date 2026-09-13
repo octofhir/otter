@@ -531,12 +531,14 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     frame, publishes no VM PC, and never round-trips through the interpreter
     window. The canonical frame-building generic miss is the cold sibling
     outside that region.
-  - Optimizing plain scalar/named-load splices use the same HIR and allocator.
+  - Optimizing plain/method scalar/named-load splices use the same HIR and allocator.
     The caller owns the identity/this guard; named accesses retain the callee's
     source program and cold activation recipes in `optimized-ir.txt`.
     `deopt.json` records the complete outermost-first caller/callee chain.
-    Method-body splicing remains unfinished; generated method calls and method
-    intrinsic hits retain their existing guards and boundaries. Loop-invariant global-object reads and
+    `machineInlineMethodGuard` reuses the shared receiver/prototype/slot proof,
+    returns the current callable and rejects bound-this/runtime-setup/eval-env
+    closures before effects. Its receiver supplies the inlined this value.
+    Nested body splicing remains unfinished. Loop-invariant global-object reads and
     method guards keep their full proofs on the first iteration and use
     independent native-stack caches on later iterations. A cached global slot
     makes its loaded builtin namespace receiver activation-invariant; other

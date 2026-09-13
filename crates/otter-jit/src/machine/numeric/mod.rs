@@ -979,6 +979,30 @@ fn select_with_packed_double_view_caches(
                         vec![MachineOperand::register_input(tagged), output],
                     )
                 }
+                NumericNode::InlineMethodGuard { source, target } => {
+                    let invalid = || super::VerificationError::OpcodeSignatureMismatch(
+                        MachineInstructionId(instructions.len() as u32),
+                    );
+                    let target = hir.direct_call_targets.get(target as usize).ok_or_else(invalid)?;
+                    let [candidate] = target.candidates.as_slice() else {
+                        return Err(invalid());
+                    };
+                    let program = candidate.guard.as_ref().ok_or_else(invalid)?;
+                    if target.kind != NumericDirectCallKind::Method
+                        || program.method_fid != candidate.callee.plan.function_id
+                    {
+                        return Err(invalid());
+                    }
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::InlineMethodGuard { guard: Box::new(program.clone()) },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    guard.clobbers = (9..=15).map(PhysicalRegister::integer).collect();
+                    guard
+                }
                 NumericNode::InlineCallGuard {
                     source,
                     function_id,

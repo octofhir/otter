@@ -556,15 +556,15 @@ the exact native entry and its validated materialized owner, retaining actuals,
 rest/arguments-object state, live upvalues and new.target before dispatch. A hot
 factory and fresh construct site both exercise real two-frame numeric exits and
 preserve forwarded arguments, receiver substitution and single coercion effects.
-This fixes current-engine reconstruction; constructor splicing and virtual
-allocation elimination remain the next structural work, with no speed claim.
+This fixes current-engine reconstruction. Base-constructor splicing now uses
+the receiver recipe below; virtual allocation elimination remains open.
 Named stores now use explicit probe/hit/cold/status/join CFG, with roots only at
 the committed cold call; the emitter-hidden runtime path is removed. Unprotected
 field-initializer helpers splice into caller SSA. Setter return/throw and strict
 read-only TypeError preserve source stacks; a later arithmetic deopt reconstructs
 the callee without repeating the store. Existing transition/value barriers remain.
-Protected stores still require HIR exception-operand admission. Actual constructor
-entry/allocation and argument forwarding are still separate A2 barriers.
+Protected stores still require HIR exception-operand admission. Argument
+forwarding remains a separate A2 barrier after base-constructor entry/allocation.
 Evidence: benchmarks/results/a2-20260913-inline-stores/README.md.
 The shared DeoptFrame entry now carries new.target through HIR liveness,
 allocator lowering, safepoint-root recipes, runtime decoding and artifact output.
@@ -572,14 +572,20 @@ The separate JitDeoptFrame and artifact frame/entry DTOs are removed. VM inline
 materialization validates byte PCs and restores base receiver results; cold
 inline scopes trace/rewrite new.target. A reproduced constructor-created-arrow
 exit returned its owner instead of7; lexical new.target now retains ordinary
-arrow return semantics. Constructor allocation is not yet spliced.
-Next: fixed-arity base constructor receiver probe using the existing guarded
-nursery program. Miss/space exhaustion must take the original construct-call
-CFG sibling, not a recurring deopt; a hit enters the body with an allocated
-receiver/new.target recipe and constructor result selection. Then extend actual
-argument recipes and specialize initialize.apply before virtual-object escape
-analysis/materialization. No second allocator or hidden runtime fallback.
+arrow return semantics.
+Fixed-arity ordinary and class base constructors now splice into caller SSA.
+Their identity guard unwraps the current class callable; the shared nursery
+program returns a complete receiver or a pre-effect miss. Misses take the full
+construct-call sibling, while hits enter the body with this/closure/new.target.
+Parameter and body exits reconstruct that same receiver. Constructor field
+programs are source-owned; base object-return selection and the cold-call result
+join in SSA. No second allocator or emitter-hidden runtime call is introduced.
+Next: allow the enclosing helper to splice across that explicit cold construct
+call with correct source/argument ownership; add incoming-argument recipes and
+contextual initialize.apply specialization, then alias-preserving virtual-object
+materialization and escape analysis. No allocation-elimination or speed claim.
 Evidence: benchmarks/results/a2-20260913-construct-frames/README.md.
+Current constructor slice: benchmarks/results/a2-20260913-constructor-splice/README.md.
 Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.
 
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
@@ -894,7 +900,7 @@ The current AArch64 Machine path already owns substantial scalar CFG, OSR,
 typed values, direct calls/constructs, exact leaves, GC-aware allocation,
 element/property/binding access, string constants, intrinsics, exceptions, and
 deopt reconstruction. Keep extending the final path; do not translate new IR
-back into deleted/legacy SSA or add an emitter-specific semantic path.
+back into a second SSA implementation or add an emitter-specific semantic path.
 
 Historical state (measured 2026-09-12; superseded where the current S2
 checkpoint above says otherwise, Octane in fresh processes against node

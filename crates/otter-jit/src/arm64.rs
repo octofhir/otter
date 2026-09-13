@@ -34,8 +34,8 @@ pub(crate) const GENERATED_POLL_BATCH: u32 = 16;
 
 pub(crate) use direct_call::{
     DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,
-    emit_direct_call_with_access, emit_runtime_forward,
-    target_is_supported as direct_call_target_is_supported,
+    emit_direct_call_with_access, emit_object_type_branch, emit_receiver_probe,
+    emit_runtime_forward, target_is_supported as direct_call_target_is_supported,
 };
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,

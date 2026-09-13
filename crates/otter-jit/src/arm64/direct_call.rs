@@ -58,6 +58,7 @@
 mod completion;
 mod receiver_allocation;
 use receiver_allocation::emit_generated_receiver_allocation;
+pub(crate) use receiver_allocation::emit_receiver_probe;
 mod forward_bindings;
 mod layout;
 mod runtime_forward;
@@ -271,7 +272,7 @@ fn emit_fatal_pair(ops: &mut Assembler) {
 /// value. Function-id immediates and every non-primitive GC body are Objects;
 /// strings, symbols, and bigints are the only primitive cell families. The
 /// three scratch registers are clobbered; `value` is preserved.
-fn emit_object_type_branch(
+pub(crate) fn emit_object_type_branch(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,

@@ -537,7 +537,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     source program and cold activation recipes in `optimized-ir.txt`.
     Property and global-read cold calls resolve one code-owned safepoint recipe
     through the active registry generation. `safepoints.json` exposes
-    `inlineFrames`: slots and entry this/closure are spill-root indices, with
+    `inlineFrames`: slots and entry this/closure/newTarget are spill-root indices, with
     null meaning undefined. IC cells own property source/programs only.
     Suspended outer root records never supply a callee's recipe; getter/error
     normalization runs before inline frames are removed.
@@ -561,6 +561,18 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Entry and OSR caches are distinct activations and start empty. Inner loops
     are never selected in isolation; their sites require the complete
     enclosing outermost loop to satisfy the cache contract.
+  - Fixed-arity ordinary and class base-constructor bodies can splice into the
+    caller's SSA. `InlineConstructGuard` proves the live underlying callable;
+    `machineConstructReceiver` probes the shared nursery allocator at the call's
+    byte PC. A hit supplies the callee's this and newTarget entry recipe. A
+    pre-effect allocation miss branches to the existing full construct call,
+    so nursery refills do not repeatedly deopt the caller. Parameter guards
+    run after successful allocation and resume that same receiver on failure.
+    `BaseConstructResult` selects an object return or the base receiver and
+    joins with the full-call result. Constructor field transitions own their
+    source program through HIR remapping and Machine selection; emission never
+    looks them up in the outer caller snapshot. Derived/spread/arguments bodies
+    and enclosing splices with residual construct calls remain separate work.
   - Side-effect-free optimizing loops may version invariant property reads.
     Activation requires every site to produce an own-data Number IC hit in one
     complete iteration. Any miss, accessor/proxy path, or non-number keeps the

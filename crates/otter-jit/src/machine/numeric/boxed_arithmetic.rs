@@ -165,9 +165,16 @@ fn visit_inputs(
             visit(value, true);
         }
         PropertyLoad { receiver, .. } => visit(receiver, true),
-        InlineCallGuard { source, .. } | InlineMethodGuard { source, .. } | BoxTagged(source) => {
-            visit(source, true)
+        BaseConstructResult { result, receiver } => {
+            visit(result, true);
+            visit(receiver, true);
         }
+        ConstructReceiver { source, .. }
+        | ConstructReceiverHit(source)
+        | InlineConstructGuard { source, .. }
+        | InlineCallGuard { source, .. }
+        | InlineMethodGuard { source, .. }
+        | BoxTagged(source) => visit(source, true),
         ElementLoad {
             receiver, index, ..
         } => {
@@ -311,6 +318,7 @@ mod tests {
         ];
         NumericFunction {
             property_sites: Default::default(),
+            constructor_field_sites: Default::default(),
             function_id: 1,
             parameter_count: 1,
             register_count: 2,

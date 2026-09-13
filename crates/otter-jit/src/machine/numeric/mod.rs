@@ -20,7 +20,10 @@
 //! # Invariants
 //! - Bytecode is inspected only while building HIR; Machine IR and the emitter
 //!   contain no bytecode operations.
-//! - Parameter guards bail at logical PC zero before observable effects.
+//! - Root parameter guards bail at logical PC zero before observable effects.
+//!   Spliced constructor guards retain their already allocated receiver.
+//! - Constructor field programs are owned by the source HIR node and selected
+//!   against its innermost frame, independently of the caller snapshot.
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
 //! - Reducible loop headers outside active exception regions publish one
 //!   representation-checked OSR trampoline that fills only live block
@@ -1060,6 +1063,63 @@ fn select_with_packed_double_view_caches(
                     guard.clobbers = [9, 10, 11, 12, 14].map(PhysicalRegister::integer).to_vec();
                     guard
                 }
+                NumericNode::InlineConstructGuard {
+                    source,
+                    function_id,
+                } => {
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::InlineConstructGuard { function_id },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    guard.clobbers = [9, 10, 11, 12, 14].map(PhysicalRegister::integer).to_vec();
+                    guard
+                }
+                NumericNode::ConstructReceiver {
+                    source,
+                    plan,
+                    byte_pc,
+                } => {
+                    let mut probe = MachineInstruction::plain(
+                        MachineOpcode::ConstructReceiver { plan, byte_pc },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    probe.clobbers = [0, 2, 4, 9, 10, 11, 12, 13, 14, 15, 16]
+                        .map(PhysicalRegister::integer)
+                        .to_vec();
+                    probe
+                }
+                NumericNode::ConstructReceiverHit(receiver) => {
+                    let mut test = MachineInstruction::plain(
+                        MachineOpcode::ConstructReceiverHit,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, receiver)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    test.clobbers = [9, 10].map(PhysicalRegister::integer).to_vec();
+                    test
+                }
+                NumericNode::BaseConstructResult {
+                    result: returned,
+                    receiver,
+                } => {
+                    let mut select = MachineInstruction::plain(
+                        MachineOpcode::BaseConstructResult,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, returned)),
+                            MachineOperand::register_input(machine_value(&values, receiver)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    select.clobbers = [0, 9, 10, 11].map(PhysicalRegister::integer).to_vec();
+                    select
+                }
                 NumericNode::BoxTagged(source) => MachineInstruction::plain(
                     match hir.nodes[source.0].value_type() {
                         NumericType::Int32 => MachineOpcode::BoxInt32,
@@ -1298,8 +1358,29 @@ fn select_with_packed_double_view_caches(
                         &mut instructions,
                         value,
                     );
+                    let invalid = || {
+                        super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
+                            instructions.len() as u32,
+                        ))
+                    };
+                    let (owner, transition) = hir
+                        .constructor_field_sites
+                        .get(&node_value)
+                        .ok_or_else(invalid)?;
+                    let state = hir
+                        .frame_states
+                        .iter()
+                        .find(|state| state.point == NumericFramePoint::Node(node_value))
+                        .and_then(|state| state.frames.last())
+                        .ok_or_else(invalid)?;
+                    if state.function_id != *owner || state.byte_pc != byte_pc {
+                        return Err(invalid());
+                    }
                     let mut store = MachineInstruction::plain(
-                        MachineOpcode::ConstructorFieldStore(byte_pc),
+                        MachineOpcode::ConstructorFieldStore {
+                            byte_pc,
+                            transition: Box::new(transition.clone()),
+                        },
                         vec![
                             MachineOperand::register_input(object),
                             MachineOperand::register_input(value),
@@ -3560,6 +3641,7 @@ mod tests {
         let value = NumericValue;
         let hir = NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 1,
             parameter_count: 2,
             register_count: 2,
@@ -3720,6 +3802,7 @@ mod tests {
         (
             NumericFunction {
                 property_sites: BTreeMap::new(),
+                constructor_field_sites: BTreeMap::new(),
                 function_id: 175,
                 nodes,
                 blocks: vec![
@@ -3762,6 +3845,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 176,
             nodes: vec![
                 NumericNode::TaggedConstant(Value::undefined().to_bits()),
@@ -3847,6 +3931,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 150,
             nodes: vec![
                 NumericNode::Parameter {
@@ -3918,6 +4003,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 152,
             nodes: vec![
                 NumericNode::Parameter {
@@ -3978,6 +4064,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 151,
             nodes: vec![
                 NumericNode::Parameter {
@@ -4108,6 +4195,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 152,
             nodes: vec![
                 NumericNode::IntegerConstant(7),
@@ -4226,6 +4314,7 @@ mod tests {
         };
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 153,
             nodes,
             blocks,
@@ -6260,6 +6349,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 93,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6331,6 +6421,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6398,6 +6489,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 94,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6474,6 +6566,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 95,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6539,6 +6632,7 @@ mod tests {
     pub(super) fn property_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            constructor_field_sites: BTreeMap::new(),
             property_sites: [
                 (
                     value(2),
@@ -6899,6 +6993,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![NumericNode::StringConstantCell {
                 byte_pc: 24,
@@ -6928,6 +7023,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![
                 NumericNode::Parameter {
@@ -7022,6 +7118,44 @@ mod tests {
             }],
         );
         view
+    }
+
+    #[test]
+    fn constructor_fields_select_the_owned_source_program() {
+        let mut hir = property_selection_hir();
+        let site = hir::NumericValue(3);
+        hir.nodes[site.0] = NumericNode::ConstructorFieldStore {
+            object: hir::NumericValue(0),
+            value: hir::NumericValue(1),
+            byte_pc: 40,
+        };
+        let transition = otter_vm::jit::JitConstructorFieldTransition {
+            from_shape: 7,
+            to_shape: 11,
+            prototype_shapes: vec![13],
+            slot: 0,
+        };
+        hir.constructor_field_sites
+            .insert(site, (94, transition.clone()));
+        let sequence = select(&hir).expect("source-owned field program");
+        hir.constructor_field_sites
+            .get_mut(&site)
+            .unwrap()
+            .1
+            .to_shape = 17;
+        assert!(
+            sequence
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(&instruction.opcode,
+            MachineOpcode::ConstructorFieldStore { byte_pc: 40, transition: selected }
+                if **selected == transition))
+        );
+        hir.constructor_field_sites.get_mut(&site).unwrap().0 = 95;
+        assert!(
+            select(&hir).is_err(),
+            "a foreign source cannot supply the field program"
+        );
     }
 
     #[test]
@@ -11483,6 +11617,7 @@ mod tests {
         };
         let hir = NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 190,
             nodes: vec![
                 NumericNode::TaggedConstant(Value::undefined().to_bits()),

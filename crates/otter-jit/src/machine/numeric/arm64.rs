@@ -64,6 +64,9 @@
 //! - OSR trampolines decode only live loop-header inputs into the exact
 //!   late-use locations selected by regalloc2; rejection never mutates VM slots.
 //! - Successful results use the VM's canonical tagged representation.
+//! - SSA constructor probes reuse the shared nursery allocator without reentry;
+//!   a miss produces undefined for the explicit full-call sibling. Base result
+//!   selection reuses the exact Object/primitive classifier.
 //! - Static-native calls use the shared bootstrap identity guard and leaf ABI;
 //!   x9 owns the callee, x1/x2 the boxed arguments, and x0 the boxed result.
 //!   A non-success leaf status exits at the exact pre-call state without roots
@@ -1625,6 +1628,62 @@ pub(super) fn emit(
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 12, 0)?;
                 structural_regions.push(("machineInlineCallGuard", None, start, ops.offset().0));
             }
+            MachineOpcode::InlineConstructGuard { function_id } => {
+                let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let callable = ops.new_dynamic_label();
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                crate::template::arm64::values::emit_cell_test(
+                    &mut ops,
+                    9,
+                    10,
+                    crate::template::arm64::values::CellTest::IsNotCell,
+                    callable,
+                );
+                dynasm!(ops ; .arch aarch64
+                    ; ldrb w11, [x9]
+                    ; cmp w11, view.class_constructor_layout.type_tag as u32
+                    ; b.ne =>callable
+                    ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
+                    ; =>callable);
+                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+            }
+            MachineOpcode::ConstructReceiver { plan, byte_pc } => {
+                let start = ops.offset().0;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 2, 0)?;
+                crate::arm64::emit_receiver_probe(&mut ops, &mut relocations, view, plan, 19);
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                structural_regions.push((
+                    "machineConstructReceiver",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::ConstructReceiverHit => {
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
+                let output = integer_register(locations[1])?;
+                dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; cset W(output), ne);
+            }
+            MachineOpcode::BaseConstructResult => {
+                let ready = ops.new_dynamic_label();
+                let primitive = ops.new_dynamic_label();
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 17, 0)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 0, 0)?;
+                crate::arm64::emit_object_type_branch(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    0,
+                    [9, 10, 11],
+                    ready,
+                    primitive,
+                );
+                dynasm!(ops ; .arch aarch64 ; =>primitive);
+                dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; =>ready);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 0, 0)?;
+            }
             MachineOpcode::DecodeNumber => {
                 let miss = if instruction.deopt.is_some() {
                     instruction_deopt_label(instruction.deopt, &deopt_labels)?
@@ -2601,11 +2660,10 @@ pub(super) fn emit(
                     cold_end,
                 ));
             }
-            MachineOpcode::ConstructorFieldStore(byte_pc) => {
-                let transition = view
-                    .constructor_field_transitions
-                    .get(&byte_pc)
-                    .ok_or(Unsupported::OperandShape("constructor field transition"))?;
+            MachineOpcode::ConstructorFieldStore {
+                byte_pc,
+                ref transition,
+            } => {
                 let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                 let start = ops.offset().0;
                 // x9-x16 are emitter scratch registers, and regalloc may also

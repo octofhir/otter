@@ -7,7 +7,8 @@
 //! # Invariants
 //! - Scalar, global-read and named-property bodies, including bounded fully spliced helper
 //!   chains, are admitted. Base construction probes the shared nursery allocator;
-//!   misses retain full construct linkage in an explicit sibling. Other allocations
+//!   misses retain full construct linkage in an explicit sibling. Enclosing helpers
+//!   retain that sibling with source-owned arguments and native parent publication. Other allocations
 //!   and residual JavaScript calls retain ordinary call linkage. Named-property cold
 //!   calls publish exact inline frames without replaying completed effects.
 //! - Identity guards precede allocation. Constructor parameter guards run after
@@ -125,6 +126,18 @@ fn splice_tree(
                     && map_body_node(node, &|v| v).is_none()
             }) {
                 return Err(format!("unsupported callee operation: {node:?}"));
+            }
+            if body.nodes.iter().any(|node| match node {
+                NumericNode::DirectCall { target, .. } => body
+                    .direct_call_targets
+                    .get(*target as usize)
+                    .is_none_or(|target| {
+                        target.kind != NumericDirectCallKind::Construct
+                            || target.candidates.len() != 1
+                    }),
+                _ => false,
+            }) {
+                return Err("residual call requires inline activation publication".into());
             }
             if body.blocks.iter().enumerate().any(|(i, b)| {
                 b.successors.iter().any(|&s| s <= i)
@@ -402,13 +415,33 @@ fn splice_one(
     hir.direct_call_targets
         .extend(body.direct_call_targets.iter().cloned());
     let map = |value: NumericValue| mapping[value.0];
+    let operand_base = u32::try_from(hir.operand_values.len()).ok()?;
+    u32::try_from(
+        hir.operand_values
+            .len()
+            .checked_add(body.operand_values.len())?,
+    )
+    .ok()?;
+    hir.operand_values
+        .extend(body.operand_values.iter().copied().map(map));
     for (index, &node) in body.nodes.iter().enumerate() {
         if !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
             && !(construct && is_new_target(node))
         {
             let mut mapped = map_body_node(node, &map)?;
-            if let NumericNode::InlineMethodGuard { target, .. } = &mut mapped {
-                *target = target.checked_add(target_base)?;
+            match &mut mapped {
+                NumericNode::InlineMethodGuard { target, .. } => {
+                    *target = target.checked_add(target_base)?
+                }
+                NumericNode::DirectCall {
+                    target,
+                    arguments: NumericDirectCallArguments::Fixed { start, .. },
+                    ..
+                } => {
+                    *target = target.checked_add(target_base)?;
+                    *start = start.checked_add(operand_base)?;
+                }
+                _ => {}
             }
             hir.nodes[mapping[index].0] = mapped;
         }
@@ -644,6 +677,42 @@ fn map_body_node(
             semantics,
             inputs: inputs.map(|input| input.map(map)),
             target,
+            logical_pc,
+            byte_pc,
+            exceptional_edge: None,
+        },
+        InlineConstructGuard {
+            source,
+            function_id,
+        } => InlineConstructGuard {
+            source: map(source),
+            function_id,
+        },
+        ConstructReceiver {
+            source,
+            plan,
+            byte_pc,
+        } => ConstructReceiver {
+            source: map(source),
+            plan,
+            byte_pc,
+        },
+        ConstructReceiverHit(value) => ConstructReceiverHit(map(value)),
+        BaseConstructResult { result, receiver } => BaseConstructResult {
+            result: map(result),
+            receiver: map(receiver),
+        },
+        DirectCall {
+            source,
+            target,
+            arguments: arguments @ NumericDirectCallArguments::Fixed { .. },
+            logical_pc,
+            byte_pc,
+            exceptional_edge: None,
+        } => DirectCall {
+            source: map(source),
+            target,
+            arguments,
             logical_pc,
             byte_pc,
             exceptional_edge: None,

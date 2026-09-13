@@ -58,7 +58,7 @@ fn decode_published_frames(
     record: &SafepointRecord,
     roots: &JitMachineRootRecord,
 ) -> Result<Box<[DeoptFrame<Value>]>, VmError> {
-    if record.inline_frames.is_empty() {
+    if record.inline_frames_published || record.inline_frames.is_empty() {
         return Ok(Box::default());
     }
     if roots.root_count != 0 && roots.root_base.is_null() {
@@ -130,6 +130,7 @@ mod tests {
             safepoint_id: 3,
         };
         let mut record = SafepointRecord {
+            inline_frames_published: false,
             id: 3,
             frame_state: otter_vm::native_abi::NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::spill_slot(0), TaggedLocation::spill_slot(1)],
@@ -185,6 +186,10 @@ mod tests {
         assert!(decode_from_registry(&registry, &roots).is_err());
         record.tagged_locations.push(TaggedLocation::spill_slot(1));
         roots.root_base = std::ptr::null_mut();
+        assert!(decode_from_registry(&registry, &roots).is_err());
+        record.inline_frames_published = true;
+        assert!(decode_from_registry(&registry, &roots).unwrap().is_empty());
+        roots.code_object_id = 10;
         assert!(decode_from_registry(&registry, &roots).is_err());
     }
 }

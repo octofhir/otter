@@ -76,6 +76,7 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         self.note_generated_call_deopt(
+            context,
             caller_function_id,
             caller_call_pc,
             caller_code_object_id,

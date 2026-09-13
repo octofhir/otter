@@ -197,6 +197,7 @@ pub fn lower_safepoints(
         let frame_state = instruction.deopt.map_or(NO_FRAME_STATE, |deopt| deopt.0);
         records.push(SafepointRecord {
             inline_frames: Box::default(),
+            inline_frames_published: false,
             id: id.0,
             frame_state,
             tagged_locations: (0..site_root_count)

@@ -11,7 +11,8 @@
 //!   supplies a raw metadata-table pointer.
 //! - Every live tagged value is named exactly once by a frame or spill map.
 //! - Inline activation recipes use the same spill slots and code generation;
-//!   they own no moving values or alternate runtime frame layout.
+//!   they own no moving values or alternate runtime frame layout. A publication
+//!   flag distinguishes generated native parents from runtime-published recipes.
 //! - Machine-register roots are saved to mapped spill slots before an
 //!   allocating or reentrant call.
 //!
@@ -177,6 +178,9 @@ pub struct SafepointRecord {
     /// Cold inline descendants, with values indexed into the precise spill map.
     /// The owning code generation and this record's id select the recipe.
     pub inline_frames: Box<[crate::deopt::DeoptFrame<Option<u16>>]>,
+    /// Generated linkage has already published these descendants as NativeFrames.
+    /// Cold runtime entries must not reconstruct the same activations again.
+    pub inline_frames_published: bool,
 }
 
 impl SafepointRecord {
@@ -189,6 +193,7 @@ impl SafepointRecord {
     ) -> Self {
         Self {
             inline_frames: Box::default(),
+            inline_frames_published: false,
             id,
             frame_state,
             tagged_locations: (0..register_count)
@@ -224,6 +229,7 @@ impl SafepointRecord {
             .collect();
         Some(Self {
             inline_frames: Box::default(),
+            inline_frames_published: false,
             id: frame_map.id,
             frame_state,
             tagged_locations,

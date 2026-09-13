@@ -12,6 +12,8 @@
 //!   retained [`crate::native_abi::CodeEntryCell`] generation.
 //! - The published stack-owned frame must agree with that generation before
 //!   diagnostics or policy state changes.
+//! - An inline caller is checked against its owning generation's exact safepoint
+//!   and the physical parent immediately preceding the bailed callee.
 //! - Aggregate deopt pressure is applied once per still-linked generation;
 //!   later deopts from already-active callers cannot consume more recompile
 //!   budget after invalidation unlinks the cell.
@@ -23,16 +25,99 @@
 //! - [`crate::jit_registry`] — owns retained exact-generation entry cells.
 
 use crate::{
-    Interpreter, VmError,
+    ExecutionContext, Interpreter, VmError,
     jit::JitDirectCallKind,
     jit_debug::{JitDebugEvent, JitDebugTier},
     native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind},
 };
 
 impl Interpreter {
+    /// A source caller may be an inline descendant of the active generation.
+    /// In that case both its exact safepoint and published parent must agree.
+    fn generated_caller_matches(
+        &self,
+        context: &ExecutionContext,
+        function_id: u32,
+        call_pc: u32,
+        code_object_id: u64,
+        callee: &NativeFrame,
+    ) -> bool {
+        let Some(owner) = self
+            .jit_code_registry
+            .generation_function_id(code_object_id)
+        else {
+            return false;
+        };
+        if owner == function_id {
+            return true;
+        }
+        // SAFETY: generated linkage retains the caller root record until after
+        // this non-reentrant check. The callee has already left its Machine body.
+        let Some(roots) = (unsafe {
+            (self.jit_machine_roots as *const crate::jit::JitMachineRootRecord).as_ref()
+        }) else {
+            return false;
+        };
+        if roots.code_object_id != code_object_id {
+            return false;
+        }
+        let Some(record) = self
+            .jit_code_registry
+            .safepoint_record(code_object_id, roots.safepoint_id)
+        else {
+            return false;
+        };
+        if !record.inline_frames_published || record.id != roots.safepoint_id {
+            return false;
+        }
+        let Some(source) = record.inline_frames.last() else {
+            return false;
+        };
+        if source.function_id != function_id || self.jit_native_activation_top < 2 {
+            return false;
+        }
+        let active = &self.jit_native_activations[..self.jit_native_activation_top];
+        if !std::ptr::eq(active[active.len() - 1].frame, callee) {
+            return false;
+        }
+        let Some(base) = active.len().checked_sub(record.inline_frames.len() + 2) else {
+            return false;
+        };
+        // SAFETY: the published activation array owns live canonical frame pointers.
+        let Some(root) = (unsafe { active[base].frame.as_ref() }) else {
+            return false;
+        };
+        if root.header.function_id != owner {
+            return false;
+        }
+        for (index, source) in record.inline_frames.iter().enumerate() {
+            // SAFETY: all published parents remain live throughout the cold check.
+            let Some(parent) = (unsafe { active[base + 1 + index].frame.as_ref() }) else {
+                return false;
+            };
+            let Some(function) = context.exec_function(source.function_id) else {
+                return false;
+            };
+            if parent.header.function_id != source.function_id
+                || function.instruction_byte_pc(parent.header.pc as usize) != Some(source.byte_pc)
+                || parent.header.register_count != function.register_count
+                || usize::from(parent.header.register_count) != source.slots.len()
+                || !parent
+                    .header
+                    .flags
+                    .contains(NativeFrameFlags::STACK_REGISTERS)
+                || (index + 1 == record.inline_frames.len() && parent.header.pc != call_pc)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Record one exact generated-call deopt and apply baseline bail policy.
     pub(super) fn note_generated_call_deopt(
         &mut self,
+        context: &ExecutionContext,
         caller_function_id: u32,
         caller_call_pc: u32,
         caller_code_object_id: u64,
@@ -49,11 +134,13 @@ impl Interpreter {
         {
             return Err(VmError::InvalidOperand);
         }
-        if self
-            .jit_code_registry
-            .generation_function_id(caller_code_object_id)
-            != Some(caller_function_id)
-        {
+        if !self.generated_caller_matches(
+            context,
+            caller_function_id,
+            caller_call_pc,
+            caller_code_object_id,
+            callee,
+        ) {
             return Err(VmError::InvalidOperand);
         }
 

@@ -1593,21 +1593,19 @@ pub const STUB_JIT_COLLECT_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
-/// Complete `CallForwardArguments` against the published frame: forward the
-/// activation's actual arguments to the callee when the resolved method is
-/// %Function.prototype.apply%, otherwise call that method with the frame's
-/// arguments object. A stack-owned frame whose method is not the intrinsic
-/// reports a pre-effect side exit so the interpreter materializes the object
-/// once per activation.
+/// Complete an admitted forwarding source from method/callee/receiver and
+/// current register-alias values. The separate source probe rejects required
+/// stack-owned caller materialization before effects. This entry commits once
+/// and returns a pure value/exception, never a destination or replay status.
 pub const STUB_JIT_CALL_FORWARD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     94,
     RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
+    RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
 );
 
 /// Probe the already-resolved apply and count an elided live argument window.
@@ -1644,6 +1642,19 @@ pub const STUB_JIT_FORWARD_CALL_PLAN: RuntimeStubDescriptor = descriptor(
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     3,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+    NativeResultDomain::None,
+);
+
+/// Probe whether a forwarding source can complete without materializing a
+/// stack-owned caller first. Returns one for admitted sources, zero otherwise.
+pub const STUB_JIT_FORWARD_SOURCE_READY: RuntimeStubDescriptor = descriptor(
+    98,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    1,
     RuntimeStubEffects::none(),
     RuntimeStubException::Never,
     RuntimeStubResultAbi::ValueWord,
@@ -1813,6 +1824,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         95 => "jit_forward_argument_count",
         96 => "jit_copy_forwarded_arguments",
         97 => "jit_forward_call_plan",
+        98 => "jit_forward_source_ready",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1916,6 +1928,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_FORWARD_ARGUMENT_COUNT,
     STUB_JIT_COPY_FORWARDED_ARGUMENTS,
     STUB_JIT_FORWARD_CALL_PLAN,
+    STUB_JIT_FORWARD_SOURCE_READY,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.
@@ -2348,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn call_forward_arguments_entry_is_a_reentrant_status_word_transition() {
+    fn call_forward_arguments_entry_is_a_committed_value_span() {
         assert_eq!(STUB_JIT_CALL_FORWARD_ARGUMENTS.id, 94);
         assert_eq!(
             STUB_JIT_CALL_FORWARD_ARGUMENTS.class,
@@ -2356,7 +2369,15 @@ mod tests {
         );
         assert_eq!(
             STUB_JIT_CALL_FORWARD_ARGUMENTS.result_abi,
-            RuntimeStubResultAbi::StatusWord
+            RuntimeStubResultAbi::NativePair
+        );
+        assert_eq!(
+            STUB_JIT_CALL_FORWARD_ARGUMENTS.signature,
+            RuntimeStubSignature::ReentrantValueSpan
+        );
+        assert_eq!(
+            STUB_JIT_CALL_FORWARD_ARGUMENTS.result_domain,
+            NativeResultDomain::Committed
         );
         assert_eq!(
             runtime_stub_name(STUB_JIT_CALL_FORWARD_ARGUMENTS.id),

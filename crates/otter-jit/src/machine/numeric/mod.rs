@@ -167,6 +167,7 @@ pub(super) fn value_packet_frame(
                 CallTarget::Direct {
                     kind: DirectCallKind::Method
                         | DirectCallKind::CallWithThis
+                        | DirectCallKind::Forward
                         | DirectCallKind::Construct,
                     ..
                 } | CallTarget::LiteralAllocation { .. }
@@ -2660,6 +2661,7 @@ fn direct_call_descriptor(
             kind: match target.kind {
                 NumericDirectCallKind::Plain => DirectCallKind::Plain,
                 NumericDirectCallKind::CallWithThis => DirectCallKind::CallWithThis,
+                NumericDirectCallKind::Forward => DirectCallKind::Forward,
                 NumericDirectCallKind::Method => DirectCallKind::Method,
                 NumericDirectCallKind::Construct => DirectCallKind::Construct,
                 NumericDirectCallKind::DerivedConstruct => DirectCallKind::DerivedConstruct,

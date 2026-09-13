@@ -289,37 +289,6 @@ pub(crate) extern "C" fn jit_collect_arguments_stub(ctx: *mut JitCtx, dst: u64) 
     }
 }
 
-/// Runtime stub: complete `CallForwardArguments` from compiled code. The
-/// intrinsic `apply` forwards the frame's actual arguments; a non-intrinsic
-/// method on a stack-owned frame reports a pre-effect side exit so the
-/// interpreter materializes the activation's arguments object once.
-pub(crate) extern "C" fn jit_call_forward_arguments_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    method: u64,
-    receiver: u64,
-    this_value: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = ctx.runtime_call().and_then(|mut runtime| {
-        runtime.call_forward_arguments(
-            dst as u16,
-            method as u16,
-            receiver as u16,
-            this_value as u16,
-        )
-    });
-    match result {
-        Ok(true) => NativeResultStatus::Success as u64,
-        Ok(false) => NativeResultStatus::SideExit as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
-}
-
 /// Materialize a regex literal (`Op::LoadRegExp`) into the frame's
 /// destination register. Allocating; a bad pattern reports `Throw`.
 pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {

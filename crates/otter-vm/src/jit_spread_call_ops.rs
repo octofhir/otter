@@ -437,96 +437,6 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// `CallForwardArguments` for a compiled activation.
-    ///
-    /// The intrinsic `apply` forwards the activation's actual arguments —
-    /// the published window of a stack-owned frame or the cold record of a
-    /// materialized one — straight to the callee. Any other method receives
-    /// the activation's arguments object; only a materialized frame can own
-    /// that object across the activation, so a stack-owned frame reports
-    /// `Ok(false)` and the interpreter completes the instruction.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn jit_runtime_call_forward_arguments(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame: &mut crate::ActiveFrameMut<'_>,
-        materialized_frame_index: Option<usize>,
-        dst: u16,
-        method_reg: u16,
-        receiver_reg: u16,
-        this_reg: u16,
-    ) -> Result<bool, VmError> {
-        let function_id = frame.function_id();
-        let call_pc = frame.pc();
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // The apply lookup is already committed. Mark this attempt before any
-        // arguments-object getter or materialization can throw or reenter.
-        self.record_call_attempt_feedback(function, call_pc, function_id);
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let method = frame.read(method_reg)?;
-        let callee = frame.read(receiver_reg)?;
-        let intrinsic_apply = crate::method_ops::is_function_prototype_intrinsic_value(
-            method,
-            &self.gc_heap,
-            crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply,
-        );
-        let (target, receiver, args): (Value, Value, SmallVec<[Value; 8]>) = if intrinsic_apply {
-            if !self.is_callable_runtime(&callee) {
-                return Err(VmError::NotCallable);
-            }
-            let existing = materialized_frame_index
-                .and_then(|index| stack.get(index))
-                .and_then(|frame| self.frame_cold(frame))
-                .and_then(|cold| cold.arguments_object);
-            let forwarded = if let Some(arguments) = existing {
-                self.create_list_from_array_like(stack, context, arguments)?
-            } else {
-                let mut forwarded =
-                    match (frame.incoming_argument_count(), materialized_frame_index) {
-                        (Some(count), _) => (0..count)
-                            .map(|index| frame.incoming_argument(index))
-                            .collect::<Result<SmallVec<[Value; 8]>, _>>()?,
-                        (None, Some(frame_index)) => self
-                            .frame_cold(stack.get(frame_index).ok_or(VmError::InvalidOperand)?)
-                            .map(|cold| cold.incoming_args.iter().copied().collect())
-                            .unwrap_or_default(),
-                        (None, None) => return Err(VmError::InvalidOperand),
-                    };
-                self.refresh_mapped_argument_values(function, &frame.as_ref(), &mut forwarded)?;
-                forwarded
-            };
-            // Array-like length/index getters can collect or reenter. Keep the
-            // committed callee lookup and receiver in their traced frame slots.
-            (frame.read(receiver_reg)?, frame.read(this_reg)?, forwarded)
-        } else {
-            let Some(frame_index) = materialized_frame_index else {
-                return Ok(false);
-            };
-            let arguments_object =
-                self.materialize_frame_arguments_object(context, stack, frame_index)?;
-            // The arguments allocation may move a getter-produced method.
-            // Reload the committed lookup and operands from the traced frame.
-            (
-                frame.read(method_reg)?,
-                frame.read(receiver_reg)?,
-                [frame.read(this_reg)?, arguments_object]
-                    .into_iter()
-                    .collect(),
-            )
-        };
-        self.jit_runtime_stats.jit_to_rust_call_transitions = self
-            .jit_runtime_stats
-            .jit_to_rust_call_transitions
-            .saturating_add(1);
-        self.record_resolved_bytecode_call_feedback(function, call_pc, function_id, target);
-        let result = self.run_rooted_call_values(stack, context, target, receiver, args)?;
-        frame.write(dst, result)?;
-        Ok(true)
-    }
-
     /// Parameter bindings that alias the arguments object's indexed entries,
     /// resolved against the activation's capture cells.
     fn mapped_argument_entries(
@@ -684,7 +594,7 @@ impl Interpreter {
         ))
     }
 
-    fn run_rooted_call_values(
+    pub(crate) fn run_rooted_call_values(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,

@@ -388,42 +388,6 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_collect_arguments(context, stack, &mut frame, materialized, dst)
     }
 
-    /// Complete `CallForwardArguments` for the published activation.
-    ///
-    /// Returns `Ok(false)` when the resolved method is not the intrinsic
-    /// `apply` and the frame is stack-owned: the interpreter must run the
-    /// instruction so the activation's arguments object is materialized
-    /// exactly once. Nothing has been committed in that case.
-    pub fn call_forward_arguments(
-        &mut self,
-        dst: u16,
-        method: u16,
-        receiver: u16,
-        this_value: u16,
-    ) -> Result<bool, VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        let materialized = match self.identity {
-            super::RuntimeFrameIdentity::Materialized(index) => Some(index),
-            super::RuntimeFrameIdentity::StackOwned => None,
-        };
-        vm.jit_runtime_call_forward_arguments(
-            context,
-            stack,
-            &mut frame,
-            materialized,
-            dst,
-            method,
-            receiver,
-            this_value,
-        )
-    }
-
     /// Allocate an ordinary object without an interpreter destination.
     pub fn new_object_value(&mut self) -> Result<Value, VmError> {
         // SAFETY: as `new_array_value`; the returned handle is published by

@@ -7,7 +7,9 @@
 //! - [`NumericNode`] — tagged/scalar parameters, constants, the schema-owned
 //!   binding family, guarded coercions, ordinary properties,
 //!   indexed elements, arithmetic, comparison, typed array construction, and
-//!   typed plain/method calls.
+//!   typed plain/method/forwarded calls.
+//! - Forwarding carries method, callee, receiver and mapped register values as
+//!   explicit SSA operands; captured aliases remain live activation cells.
 //! - [`NumericPackedDoubleViewCachePlan`] — bounded natural-loop sharing of
 //!   raw packed-array base/length proofs.
 //!
@@ -324,6 +326,8 @@ pub(super) enum NumericDirectCallKind {
     /// Explicit receiver in argument word zero; at most one identity-guarded
     /// candidate, otherwise the generic value call.
     CallWithThis,
+    /// Method/callee/receiver plus mapped bindings; actual arity stays dynamic.
+    Forward,
     Method,
     Construct,
     DerivedConstruct,
@@ -2454,6 +2458,7 @@ fn lower_instruction(
             op,
             Op::Call
                 | Op::CallWithThis
+                | Op::CallForwardArguments
                 | Op::CallSpread
                 | Op::CallMethodValue
                 | Op::New
@@ -2973,6 +2978,52 @@ fn lower_instruction(
                 RegisterState::Value(value),
             )?;
             return Some(());
+        }
+        Op::CallForwardArguments => {
+            let source = read_value(registers, register(instruction, code, 1)?)?;
+            let mut arguments = vec![
+                read_value(registers, register(instruction, code, 2)?)?,
+                read_value(registers, register(instruction, code, 3)?)?,
+            ];
+            for (_, storage) in code.forwarded_argument_bindings() {
+                if let otter_bytecode::ArgumentBindingStorage::Register { reg } = storage {
+                    arguments.push(read_value(registers, reg)?);
+                }
+            }
+            let (start, count) = append_operand_values(operand_values, arguments)?;
+            let target = intern_direct_call_target(
+                direct_call_targets,
+                NumericDirectCallTarget {
+                    kind: NumericDirectCallKind::Forward,
+                    candidates: Vec::new(),
+                },
+            )?;
+            let value = push(
+                nodes,
+                NumericNode::DirectCall {
+                    source,
+                    target,
+                    arguments: NumericDirectCallArguments::Fixed { start, count },
+                    logical_pc,
+                    byte_pc: instruction.byte_pc,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
+            return write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            );
         }
         Op::Call | Op::CallWithThis => {
             let explicit_receiver = op == Op::CallWithThis;

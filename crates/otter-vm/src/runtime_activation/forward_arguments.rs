@@ -1,12 +1,14 @@
-//! Non-reentrant argument forwarding from a published compiled caller.
+//! Argument forwarding from a published compiled caller.
 //!
 //! # Contents
 //! - Eligibility/count probe for an already-resolved intrinsic apply.
 //! - Runtime-selected ordinary target admission and current generation lookup.
 //! - Complete live-argument copy into an unpublished generated callee.
+//! - Committed boxed-value completion with pure exception results.
 //!
 //! # Invariants
-//! - These operations neither allocate in the GC heap nor invoke JavaScript.
+//! - Probes and native-window copies never allocate or invoke JavaScript.
+//! - Committed completion roots explicit operands before allocation or reentry.
 //! - Frame and window pointers remain engine-private and are validated before use.
 //! - A rejected probe or copy leaves all JavaScript effects to canonical completion.
 //!
@@ -37,6 +39,55 @@ impl RuntimeCall<'_> {
             RuntimeFrameIdentity::StackOwned => None,
         };
         vm.elided_forward_argument_count(stack, &frame, materialized)
+    }
+
+    /// Whether the committed value boundary can complete this source without
+    /// first materializing a stack-owned caller. This probe has no JS effects.
+    pub fn forward_call_can_complete(&self, method: crate::Value) -> bool {
+        matches!(self.identity, RuntimeFrameIdentity::Materialized(_))
+            || self.forward_argument_count(method).is_some()
+    }
+
+    /// Complete one forwarded call from `[method, callee, receiver, bindings…]`.
+    /// Register bindings follow the immutable CodeBlock mapping order; captured
+    /// aliases remain live cells. No interpreter destination crosses this API.
+    pub fn call_forward_values(
+        &mut self,
+        values: &[crate::Value],
+    ) -> Result<crate::Value, crate::VmError> {
+        // SAFETY: the bound activation owns the context and published frame;
+        // the checked source borrows no managed slice across reentrant work.
+        let context = unsafe { self.context.as_ref() };
+        let function = context
+            .exec_function(self.function_id())
+            .ok_or(crate::VmError::InvalidOperand)?;
+        let instruction = function
+            .instr_at_index(self.pc() as usize)
+            .ok_or(crate::VmError::InvalidOperand)?;
+        let bindings = function
+            .forwarded_argument_bindings()
+            .filter(|(_, storage)| {
+                matches!(
+                    storage,
+                    otter_bytecode::ArgumentBindingStorage::Register { .. }
+                )
+            })
+            .count();
+        if function.op(instruction) != otter_bytecode::Op::CallForwardArguments
+            || values.len() != bindings + 3
+            || !self.forward_call_can_complete(values[0])
+        {
+            return Err(crate::VmError::InvalidOperand);
+        }
+        let materialized = match self.identity {
+            RuntimeFrameIdentity::Materialized(index) => Some(index),
+            RuntimeFrameIdentity::StackOwned => None,
+        };
+        let source = unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }
+            .map_err(|_| crate::VmError::InvalidOperand)?;
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        vm.jit_runtime_forward_values(context, stack, &source, materialized, values)
     }
 
     /// Resolve a runtime-selected ordinary bytecode target without allocation.

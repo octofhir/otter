@@ -111,6 +111,10 @@ pub struct CodeEntryCell {
     /// immutable for this generation. Packing them once removes per-entry
     /// metadata decoding from generated call linkage.
     pub native_frame_header: VmFrameHeader,
+    /// Whether this baseline generation may request optimizing compilation.
+    /// Cold policy clears it after a cached compile outcome; a replacement
+    /// generation starts fresh. Optimizing generations never request promotion.
+    pub generated_tiering_enabled: Cell<u32>,
     /// Generated native entries observed for tiering/introspection. Normal
     /// returns are derived as `entries - deopts - throws` during cold
     /// reconciliation, so the hot path owns no redundant return counter.
@@ -171,6 +175,9 @@ impl CodeEntryCell {
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
             generated_throws: Cell::new(0),
+            generated_tiering_enabled: Cell::new(u32::from(
+                flags & CODE_ENTRY_OPTIMIZING_TIER == 0,
+            )),
         }
     }
 
@@ -276,6 +283,7 @@ const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
 
 const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 44] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];

@@ -261,37 +261,6 @@ pub(super) fn emit_collect_arguments(
     );
 }
 
-/// `dst = receiver.apply(this_value, arguments)` through the reentrant
-/// forwarding transition; a side exit hands the instruction to the
-/// interpreter before any effect.
-pub(super) fn emit_call_forward_arguments(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    [dst, method, receiver, this_value]: [u16; 4],
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x1, dst as u32
-        ; movz x2, method as u32
-        ; movz x3, receiver as u32
-        ; movz x4, this_value as u32
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.variadic_entry(abi::STUB_JIT_CALL_FORWARD_ARGUMENTS),
-        abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
-    );
-    dynasm!(ops ; .arch aarch64 ; blr x16);
-    emit_status_word_result(ops, Some(bail), threw, fatal);
-}
-
 pub(super) fn emit_new_array(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

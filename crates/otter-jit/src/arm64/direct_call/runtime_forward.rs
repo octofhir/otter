@@ -302,18 +302,9 @@ where
         ; ldr x16, [sp, layout.entry_addr]
     );
     let entry_start = ops.offset().0;
-    emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_ENTRIES_OFFSET);
-    let cold_callee = ops.new_dynamic_label();
+    tiering::emit_entry(ops, context_register);
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x14, otter_vm::tier_policy::OPTIMIZING_HOTNESS_THRESHOLD
-        ; b.lo =>cold_callee
-        ; ldr x14, [X(context_register), THREAD_OFFSET]
-        ; ldr x14, [x14, VM_THREAD_CODE_REGISTRY_OFFSET]
-        ; ldr w15, [sp, std::mem::offset_of!(abi::NativeFrame, header) as u32 + std::mem::offset_of!(abi::VmFrameHeader, function_id) as u32]
-        ; add x15, x15, #1
-        ; str x15, [x14, CODE_REGISTRY_VIEW_HOT_FUNCTION_OFFSET]
-        ; =>cold_callee
         ; str xzr, [X(context_register), GENERATED_FEEDBACK_CLEAN_OFFSET]
         ; mov x0, X(context_register)
         ; blr x16

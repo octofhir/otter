@@ -291,6 +291,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_collect_arguments_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_FORWARD_SOURCE_READY,
+            jit_forward_source_ready_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
             jit_call_forward_arguments_stub as *const () as usize,
         ),

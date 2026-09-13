@@ -1571,6 +1571,25 @@ pub(super) fn emit(
             MachineOpcode::TaggedConstant(bits) => {
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
             }
+            MachineOpcode::InlineCallGuard {
+                function_id,
+                this_mode,
+            } => {
+                let start = ops.offset().0;
+                let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
+                crate::arm64::inline_guard::emit_inline_this(
+                    &mut ops,
+                    view,
+                    this_mode,
+                    &mut relocations,
+                    19,
+                    miss,
+                );
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 12, 0)?;
+                structural_regions.push(("machineInlineCallGuard", None, start, ops.offset().0));
+            }
             MachineOpcode::DecodeNumber => {
                 let miss = if instruction.deopt.is_some() {
                     instruction_deopt_label(instruction.deopt, &deopt_labels)?

@@ -710,6 +710,13 @@ pub enum MachineOpcode {
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
     EntryThis,
+    /// Prove a plain inline callable and produce its exact this binding.
+    InlineCallGuard {
+        /// Canonical bytecode target identity.
+        function_id: u32,
+        /// Ordinary call this-binding policy.
+        this_mode: otter_vm::JitDirectCallThisMode,
+    },
     /// Commit an unbound stack-owned derived this, returning whether it hit.
     TryBindDerivedThis {
         /// Exact source byte PC for generated/cold attribution.
@@ -1745,6 +1752,27 @@ impl InstructionSequence {
                     }
                 }
                 match &instruction.opcode {
+                    MachineOpcode::InlineCallGuard { .. } => {
+                        let [input, output, late @ ..] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if late
+                            .iter()
+                            .any(|operand| *operand != MachineOperand::deopt(operand.value))
+                            || *input != MachineOperand::register_input(input.value)
+                            || *output != MachineOperand::register_output(output.value)
+                            || [input, output].iter().any(|operand| {
+                                self.representations[operand.value.0 as usize]
+                                    != MachineRepresentation::Tagged
+                            })
+                            || instruction.clobbers
+                                != [9, 10, 11, 12, 14].map(PhysicalRegister::integer)
+                            || instruction.deopt.is_none()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
                     MachineOpcode::TruthinessProbe | MachineOpcode::LooseEqualityProbe { .. } => {
                         let (input_count, result_type) =
                             if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {

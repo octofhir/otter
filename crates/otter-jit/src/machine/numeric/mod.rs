@@ -5,6 +5,7 @@
 //!   guarded property and element accesses, typed array construction, explicit
 //!   reentrant calls, and catch landing pads.
 //! - `frame_state` — source-owned activation chains and complete SSA liveness.
+//! - `inlining` — guarded scalar callee CFG splicing before selection/allocation.
 //! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - Derived-this committed operations split into generated and cold CFG
@@ -93,6 +94,7 @@ mod arm64;
 mod boxed_arithmetic;
 mod frame_state;
 mod hir;
+mod inlining;
 mod semantics;
 
 use otter_vm::{
@@ -199,12 +201,13 @@ pub(crate) fn try_compile(
     capture_events: bool,
     artifact_request: Option<ArtifactRequest>,
 ) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
-    let hir = NumericFunction::build(view).map_err(|decline| match decline {
+    let mut hir = NumericFunction::build(view).map_err(|decline| match decline {
         hir::HirDecline::Structural(constraint) => Unsupported::OperandShape(constraint),
         hir::HirDecline::Instruction { op, constraint, .. } => {
             Unsupported::Constraint { op, constraint }
         }
     })?;
+    let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
     let packed_double_view_caches = hir.plan_packed_double_view_caches(view);
     let sequence = select_with_packed_double_view_caches(&hir, &packed_double_view_caches)
         .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
@@ -408,7 +411,10 @@ pub(crate) fn try_compile(
         code,
         artifact,
         diagnostics: if capture_events {
-            super::native_leaf::diagnostics(view, &sequence)
+            inline_diagnostics
+                .into_iter()
+                .chain(super::native_leaf::diagnostics(view, &sequence))
+                .collect()
         } else {
             Box::default()
         },
@@ -855,6 +861,41 @@ fn select_with_packed_double_view_caches(
                         vec![MachineOperand::register_input(tagged), output],
                     )
                 }
+                NumericNode::InlineCallGuard {
+                    source,
+                    function_id,
+                    this_mode,
+                } => {
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::InlineCallGuard {
+                            function_id,
+                            this_mode,
+                        },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    guard.clobbers = [9, 10, 11, 12, 14].map(PhysicalRegister::integer).to_vec();
+                    guard
+                }
+                NumericNode::BoxTagged(source) => MachineInstruction::plain(
+                    match hir.nodes[source.0].value_type() {
+                        NumericType::Int32 => MachineOpcode::BoxInt32,
+                        NumericType::Uint32 => MachineOpcode::BoxUint32,
+                        NumericType::Number => MachineOpcode::BoxNumber,
+                        NumericType::Boolean => MachineOpcode::BoxBoolean,
+                        NumericType::Tagged => {
+                            return Err(super::VerificationError::OpcodeSignatureMismatch(
+                                MachineInstructionId(instructions.len() as u32),
+                            ));
+                        }
+                    },
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
+                    ],
+                ),
                 NumericNode::TaggedToNumber(source) => MachineInstruction::plain(
                     MachineOpcode::DecodeNumber,
                     vec![

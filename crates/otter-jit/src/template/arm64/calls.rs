@@ -40,10 +40,7 @@ use super::value_packet::{PacketWord, emit_value_packet_transition};
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
-use otter_vm::{
-    JitCompileSnapshot, JitInlineCallee, JitInlineMethod, closure::JS_CLOSURE_BODY_TYPE_TAG,
-    value::tag as value_tag,
-};
+use otter_vm::{JitCompileSnapshot, JitInlineCallee, JitInlineMethod};
 
 use super::ic_probe::{
     emit_guarded_method_call, emit_native_leaf_call, guarded_method_call_is_supported,
@@ -51,9 +48,8 @@ use super::ic_probe::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    CellTest, emit_box_double, emit_box_int32, emit_box_number, emit_cell_test, emit_load_reg,
-    emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_num_to_double,
-    emit_slab_base, emit_store_reg,
+    emit_box_double, emit_box_int32, emit_box_number, emit_load_reg, emit_load_runtime_stub,
+    emit_load_symbol_u64, emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{
     DirectCallArguments, DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
@@ -783,57 +779,9 @@ fn try_emit_inline_numeric_callee(
         byte_pc: call_byte_pc,
         has_receiver_property: false,
     };
-    let guarded = ops.new_dynamic_label();
     let guard_start = ops.offset().0;
-
     emit_load_reg(ops, 9, callee_register)?;
-    emit_load_u64(ops, 10, value_tag::box_function_id(callee.function_id()));
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x9, x10
-        ; b.eq =>guarded
-        ; cbz x9, =>bail
-    );
-    emit_cell_test(ops, 9, 10, CellTest::IsNotCell, bail);
-    dynasm!(ops
-        ; .arch aarch64
-        // Heap-cell Values already carry the full pointer. No cage relocation
-        // belongs on this path.
-        ; ldrb w11, [x9]
-        ; cmp w11, JS_CLOSURE_BODY_TYPE_TAG as u32
-        ; b.ne =>bail
-    );
-    let closure_flags_byte = view.closure_call_layout.flags_byte;
-    let closure_fid_byte = view.closure_call_layout.function_id_byte;
-    if view.closure_call_layout.runtime_setup_flags != 0 {
-        dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_flags_byte]);
-        emit_load_u64(
-            ops,
-            12,
-            u64::from(view.closure_call_layout.runtime_setup_flags),
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; tst w11, w12
-            ; b.ne =>bail
-        );
-    }
-    // Frameless leaf inlining has no callee NativeFrame slot to carry a
-    // closure's dynamic eval chain. A generated call can propagate this
-    // handle; an inline candidate must prove it null before entering.
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w11, [x9, view.closure_call_layout.eval_env_byte]
-        ; cbnz w11, =>bail
-    );
-    dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_fid_byte]);
-    emit_load_u64(ops, 12, u64::from(callee.function_id()));
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp w11, w12
-        ; b.ne =>bail
-        ; =>guarded
-    );
+    crate::arm64::inline_guard::emit_inline_identity(ops, view, callee.function_id(), bail);
 
     let guard_end = ops.offset().0;
     if let Some(code_map) = code_map.as_deref_mut() {

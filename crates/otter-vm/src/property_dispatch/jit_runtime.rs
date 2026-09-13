@@ -185,163 +185,217 @@ impl Interpreter {
         receiver: Value,
         value: Value,
     ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+        if self.jit_debug_request().events_enabled() {
+            self.complete_named_store::<true>(
+                stack,
+                context,
+                function_id,
+                instruction_pc,
+                receiver,
+                value,
+            )
+        } else {
+            self.complete_named_store::<false>(
+                stack,
+                context,
+                function_id,
+                instruction_pc,
+                receiver,
+                value,
+            )
+        }
+    }
+
+    /// One store implementation; constant capture removes observation state
+    /// and post-result bookkeeping from the ordinary execution body.
+    fn complete_named_store<const CAPTURE: bool>(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function_id: u32,
+        instruction_pc: u32,
+        receiver: Value,
+        value: Value,
+    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
         let (atomized_key, site) =
             named_property_site(context, function_id, instruction_pc, Op::StoreProperty)?;
         self.record_jit_runtime_property_stub();
         let strict = context.function_is_strict(function_id);
-        let scope_frame = crate::handles::HandleScopeFrame::enter(self);
-        let scope = scope_frame.token();
-        let receiver_root = self.scoped_value(&scope, receiver);
-        let value_root = self.scoped_value(&scope, value);
-        let Some(obj) = receiver.as_object() else {
-            self.store_property_value(
-                context,
-                stack,
-                receiver,
-                atomized_key.name(),
-                value,
-                strict,
-            )?;
-            return Ok(None);
-        };
-        if !object::supports_fast_property_ic(obj, &self.gc_heap) {
-            self.store_property_value(
-                context,
-                stack,
-                receiver,
-                atomized_key.name(),
-                value,
-                strict,
-            )?;
-            return Ok(None);
-        }
-        if let Some(entries_len) = self
-            .feedback_directory
-            .property_entry_count(site, PropertyIcKind::Store)
-        {
-            // An installed stub's guards are the authority for its own outcome
-            // — an own writable data slot or a captured add-transition — so a
-            // probe hit needs no semantic resolution, exactly as on the
-            // interpreter's store path.
-            if self.feedback_directory.probe_store(
-                site,
-                obj,
-                &mut self.gc_heap,
-                atomized_key,
-                &value,
-            )? {
-                self.feedback_directory
-                    .record_property_hit(PropertyIcKind::Store);
-                let current_obj = self
-                    .escape_scoped(receiver_root)
-                    .as_object()
-                    .ok_or(VmError::InvalidOperand)?;
-                return Ok(self.whisker_store_cell_fill(
-                    site,
-                    current_obj,
-                    &self.gc_heap,
-                    atomized_key,
-                ));
+        use crate::jit_debug::JitPropertyStorePath as Path;
+        let mut path = Path::UncachedData;
+        let result = (|| {
+            let scope_frame = crate::handles::HandleScopeFrame::enter(self);
+            let scope = scope_frame.token();
+            let receiver_root = self.scoped_value(&scope, receiver);
+            let value_root = self.scoped_value(&scope, value);
+            let Some(obj) = receiver.as_object() else {
+                path = Path::NonObject;
+                self.store_property_value(
+                    context,
+                    stack,
+                    receiver,
+                    atomized_key.name(),
+                    value,
+                    strict,
+                )?;
+                return Ok(None);
+            };
+            if !object::supports_fast_property_ic(obj, &self.gc_heap) {
+                path = Path::UnsupportedReceiver;
+                self.store_property_value(
+                    context,
+                    stack,
+                    receiver,
+                    atomized_key.name(),
+                    value,
+                    strict,
+                )?;
+                return Ok(None);
             }
-            if entries_len > 0 {
-                self.feedback_directory
-                    .record_property_guard_miss(site, PropertyIcKind::Store);
-            } else {
-                self.feedback_directory
-                    .record_property_uncached_miss(site, PropertyIcKind::Store);
-            }
-        }
-
-        // An uncached store needs canonical `[[Set]]` resolution before a
-        // new shape program can be installed. Inherited setters, non-writable data,
-        // proxies/exotic parents, and non-extensible receivers retain the full
-        // value-level implementation (and strict-mode throwing behavior).
-        if !matches!(
-            object::resolve_set_atomized(obj, &self.gc_heap, atomized_key),
-            object::SetOutcome::AssignData
-        ) {
-            self.store_property_value(
-                context,
-                stack,
-                receiver,
-                atomized_key.name(),
-                value,
-                strict,
-            )?;
-            return Ok(None);
-        }
-        // Canonical resolution above proved an ordinary data assignment. Only
-        // now may the cache install a writable existing slot or capture the
-        // first add as its authoritative transition sample; the very next peer
-        // receiver can then stay entirely in generated code.
-        let current_obj = self
-            .escape_scoped(receiver_root)
-            .as_object()
-            .ok_or(VmError::InvalidOperand)?;
-        if self
-            .feedback_directory
-            .property_is_megamorphic(site, PropertyIcKind::Store)
-            == Some(false)
-        {
-            if let Some(ic) = cache_ir::CacheStub::install_store_existing(
-                current_obj,
-                &self.gc_heap,
-                atomized_key,
-            ) && ic
-                .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)?
-                .is_some()
+            if let Some(entries_len) = self
+                .feedback_directory
+                .property_entry_count(site, PropertyIcKind::Store)
             {
-                self.feedback_directory
-                    .install_property_stub(site, PropertyIcKind::Store, ic);
-                return Ok(self.whisker_store_cell_fill(
+                // An installed stub's guards are the authority for its own outcome
+                // — an own writable data slot or a captured add-transition — so a
+                // probe hit needs no semantic resolution, exactly as on the
+                // interpreter's store path.
+                path = Path::Cached;
+                if self.feedback_directory.probe_store(
                     site,
+                    obj,
+                    &mut self.gc_heap,
+                    atomized_key,
+                    &value,
+                )? {
+                    self.feedback_directory
+                        .record_property_hit(PropertyIcKind::Store);
+                    let current_obj = self
+                        .escape_scoped(receiver_root)
+                        .as_object()
+                        .ok_or(VmError::InvalidOperand)?;
+                    return Ok(self.whisker_store_cell_fill(
+                        site,
+                        current_obj,
+                        &self.gc_heap,
+                        atomized_key,
+                    ));
+                }
+                if entries_len > 0 {
+                    self.feedback_directory
+                        .record_property_guard_miss(site, PropertyIcKind::Store);
+                } else {
+                    self.feedback_directory
+                        .record_property_uncached_miss(site, PropertyIcKind::Store);
+                }
+            }
+
+            // An uncached store needs canonical `[[Set]]` resolution before a
+            // new shape program can be installed. Inherited setters, non-writable data,
+            // proxies/exotic parents, and non-extensible receivers retain the full
+            // value-level implementation (and strict-mode throwing behavior).
+            if !matches!(
+                object::resolve_set_atomized(obj, &self.gc_heap, atomized_key),
+                object::SetOutcome::AssignData
+            ) {
+                path = Path::SetSemantics;
+                self.store_property_value(
+                    context,
+                    stack,
+                    receiver,
+                    atomized_key.name(),
+                    value,
+                    strict,
+                )?;
+                return Ok(None);
+            }
+            // Canonical resolution above proved an ordinary data assignment. Only
+            // now may the cache install a writable existing slot or capture the
+            // first add as its authoritative transition sample; the very next peer
+            // receiver can then stay entirely in generated code.
+            let current_obj = self
+                .escape_scoped(receiver_root)
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            if self
+                .feedback_directory
+                .property_is_megamorphic(site, PropertyIcKind::Store)
+                == Some(false)
+            {
+                if let Some(ic) = cache_ir::CacheStub::install_store_existing(
                     current_obj,
                     &self.gc_heap,
                     atomized_key,
-                ));
-            }
+                ) && ic
+                    .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)?
+                    .is_some()
+                {
+                    path = Path::InstallExisting;
+                    self.feedback_directory
+                        .install_property_stub(site, PropertyIcKind::Store, ic);
+                    return Ok(self.whisker_store_cell_fill(
+                        site,
+                        current_obj,
+                        &self.gc_heap,
+                        atomized_key,
+                    ));
+                }
 
-            // Shape interning and slab preparation may collect. The helper
-            // roots the complete stack plus receiver/value and commits the
-            // property exactly once when it returns a transition.
-            if let Some(transition) = self.capture_store_property_transition_with_stack_roots(
-                stack,
-                current_obj,
-                atomized_key,
-                &value,
-            )? {
-                self.feedback_directory.install_property_stub(
-                    site,
-                    PropertyIcKind::Store,
-                    cache_ir::CacheStub::store_transition(transition),
-                );
-                let current_obj = self
-                    .escape_scoped(receiver_root)
-                    .as_object()
-                    .ok_or(VmError::InvalidOperand)?;
-                return Ok(self.whisker_store_cell_fill(
-                    site,
+                // Shape interning and slab preparation may collect. The helper
+                // roots the complete stack plus receiver/value and commits the
+                // property exactly once when it returns a transition.
+                path = Path::InstallTransition;
+                if let Some(transition) = self.capture_store_property_transition_with_stack_roots(
+                    stack,
                     current_obj,
-                    &self.gc_heap,
                     atomized_key,
-                ));
+                    &value,
+                )? {
+                    self.feedback_directory.install_property_stub(
+                        site,
+                        PropertyIcKind::Store,
+                        cache_ir::CacheStub::store_transition(transition),
+                    );
+                    let current_obj = self
+                        .escape_scoped(receiver_root)
+                        .as_object()
+                        .ok_or(VmError::InvalidOperand)?;
+                    return Ok(self.whisker_store_cell_fill(
+                        site,
+                        current_obj,
+                        &self.gc_heap,
+                        atomized_key,
+                    ));
+                }
             }
-        }
 
-        // A rejected transition attempt may have collected while interning its
-        // child shape, so never reuse the pre-attempt raw object handle.
-        let current_obj = self
-            .escape_scoped(receiver_root)
-            .as_object()
-            .ok_or(VmError::InvalidOperand)?;
-        let value = self.escape_scoped(value_root);
-        if !self.ordinary_set_data_property(current_obj, atomized_key.name(), value)? {
-            self.failed_set_result(
-                strict,
-                format!("Cannot assign to property '{}'", atomized_key.name()),
-            )?;
+            // A rejected transition attempt may have collected while interning its
+            // child shape, so never reuse the pre-attempt raw object handle.
+            let current_obj = self
+                .escape_scoped(receiver_root)
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            path = Path::UncachedData;
+            let value = self.escape_scoped(value_root);
+            if !self.ordinary_set_data_property(current_obj, atomized_key.name(), value)? {
+                self.failed_set_result(
+                    strict,
+                    format!("Cannot assign to property '{}'", atomized_key.name()),
+                )?;
+            }
+            Ok(None)
+        })();
+        if CAPTURE {
+            self.jit_debug.record_property_store(
+                function_id,
+                instruction_pc,
+                path,
+                result.is_err(),
+                matches!(result, Ok(Some(_))),
+                || atomized_key.name().to_owned(),
+            );
         }
-        Ok(None)
+        result
     }
 
     /// This load site's cache program lowered for inline execution, or `None`

@@ -44,6 +44,25 @@ that fires before the isolate replies may have no partial batch to write.
 
 ## Structured events
 
+`propertyStoreRuntime` aggregates generated named-store runtime entries by
+`functionId`, logical `instructionPc`, selected `path`, `failed`, and
+`nativeWay`. `propertyName` is the owned executable spelling; `count` is the
+number of matching observations in this capture batch. Paths distinguish an
+installed cache recipe, existing-slot installation, transition capture,
+canonical Set semantics, uncached data assignment, and unsupported receivers.
+`failed` records an error return, including throws after prior effects;
+`nativeWay` means the runtime offered a native IC program, not that a caller
+installed or reused it. Fully generated hits never enter this counter.
+
+A counter occupies one event slot at its first observation and updates in
+place. It is an aggregate, not a chronological per-call event. The shared
+16,384-event cap still applies: existing counters continue updating when full,
+while unseen site/path observations increase `droppedEvents` without building
+names or growing the index. Drain, reset, and disabling capture clear the
+batch-local indices. Capture remains default-off and allocates no names or
+counter storage while disabled. These counters identify hot runtime sites;
+a missing native way alone does not identify its exact lowering rejection.
+
 `compilePrepared.bindingSites` counts all schema-typed binding accesses.
 `bindingHitProofs` counts permanent global-declarative cells and guarded
 global-object slots available for generated reads or writes.

@@ -42,6 +42,9 @@
 //!   register the frame defines, in register-index order, matching the windowed
 //!   register numbering the frame ABI fixes. Its frames are ordered outermost
 //!   first and retain their own function identity and exact resume PC.
+//! - The same frame and entry schema carries SSA inputs before allocation and
+//!   concrete recipes afterwards. Every nested entry preserves this and closure;
+//!   both obey the same bounds as register-window slots.
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
@@ -116,6 +119,18 @@ pub enum DeoptVerifyError {
     },
     /// An exit rebuilds no frames at all.
     EmptyFrameChain,
+    /// Only the outermost frame may omit its call-entry bindings.
+    InvalidFrameEntry {
+        /// Index in the outermost-first chain.
+        frame_index: usize,
+    },
+    /// A nested result destination lies outside its caller's register window.
+    InvalidReturnRegister {
+        /// Index of the returning callee in the chain.
+        frame_index: usize,
+        /// Destination outside the caller register window.
+        register: u16,
+    },
 }
 
 impl std::fmt::Display for DeoptVerifyError {
@@ -191,11 +206,13 @@ pub struct DeoptSlot {
 /// call instruction, so the binding a call would have established has to be
 /// described here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeoptFrameEntry {
+pub struct DeoptFrameEntry<Slot = DeoptSlot> {
     /// Caller register the frame's return value is written to.
     pub return_register: u16,
     /// Where the frame's `this` binding lives at this exit.
-    pub this: DeoptSlot,
+    pub this: Slot,
+    /// Exact callable whose captured cells and self binding the activation owns.
+    pub closure: Slot,
 }
 
 /// One interpreter frame to rebuild at a deopt point.
@@ -204,17 +221,17 @@ pub struct DeoptFrameEntry {
 /// its location, [`DeoptRepr::reconstitute`]) into the interpreter register of
 /// the same index, and resuming that frame at `byte_pc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeoptFrame {
+pub struct DeoptFrame<Slot = DeoptSlot> {
     /// VM function id whose body this frame runs.
     pub function_id: u32,
     /// Interpreter byte-PC this frame resumes at.
     pub byte_pc: u32,
     /// How this frame was entered; `None` only for the outermost frame, which
     /// the compiled entry itself owns.
-    pub entry: Option<DeoptFrameEntry>,
+    pub entry: Option<DeoptFrameEntry<Slot>>,
     /// One slot per interpreter virtual register the frame defines, in
     /// register-index order.
-    pub slots: Box<[DeoptSlot]>,
+    pub slots: Box<[Slot]>,
 }
 
 /// The interpreter-state reconstruction record for one deopt point.
@@ -229,15 +246,15 @@ pub struct DeoptFrame {
 /// call, and the register the call writes is left to the ordinary return
 /// protocol rather than restored here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameState {
+pub struct FrameState<Slot = DeoptSlot> {
     /// Frames to rebuild, outermost first and innermost last. Never empty.
-    pub frames: Box<[DeoptFrame]>,
+    pub frames: Box<[DeoptFrame<Slot>]>,
 }
 
-impl FrameState {
+impl<Slot> FrameState<Slot> {
     /// The outermost frame — the compiled function's own.
     #[must_use]
-    pub fn outermost(&self) -> &DeoptFrame {
+    pub fn outermost(&self) -> &DeoptFrame<Slot> {
         self.frames
             .first()
             .expect("a frame state always rebuilds at least its own frame")
@@ -245,7 +262,7 @@ impl FrameState {
 
     /// The frame optimized code was executing when it exited.
     #[must_use]
-    pub fn innermost(&self) -> &DeoptFrame {
+    pub fn innermost(&self) -> &DeoptFrame<Slot> {
         self.frames
             .last()
             .expect("a frame state always rebuilds at least its own frame")
@@ -274,7 +291,18 @@ impl FrameState {
         if self.frames.is_empty() {
             return Err(DeoptVerifyError::EmptyFrameChain);
         }
-        for frame in &self.frames {
+        for (index, frame) in self.frames.iter().enumerate() {
+            if frame.entry.is_some() != (index != 0) {
+                return Err(DeoptVerifyError::InvalidFrameEntry { frame_index: index });
+            }
+            if let Some(entry) = &frame.entry
+                && usize::from(entry.return_register) >= self.frames[index - 1].slots.len()
+            {
+                return Err(DeoptVerifyError::InvalidReturnRegister {
+                    frame_index: index,
+                    register: entry.return_register,
+                });
+            }
             frame.verify(limits)?;
         }
         Ok(())
@@ -299,7 +327,13 @@ impl DeoptFrame {
             });
         }
 
-        for (slot_index, slot) in self.slots.iter().enumerate() {
+        // Activation-only operands obey exactly the same location bounds as
+        // register slots. Diagnostic indices append this/closure after the window.
+        let entry_slots = self
+            .entry
+            .iter()
+            .flat_map(|entry| [&entry.this, &entry.closure]);
+        for (slot_index, slot) in self.slots.iter().chain(entry_slots).enumerate() {
             match slot.location {
                 DeoptLocation::Register(register) if register >= limits.machine_register_count => {
                     return Err(DeoptVerifyError::MachineRegisterOutOfRange {
@@ -650,6 +684,69 @@ mod tests {
     }
 
     #[test]
+    fn verifies_inline_entry_operands_and_chain_topology() {
+        let slot = DeoptSlot {
+            location: DeoptLocation::Literal(0),
+            repr: DeoptRepr::Tagged,
+        };
+        let outer = DeoptFrame {
+            function_id: 0,
+            byte_pc: 8,
+            entry: None,
+            slots: Box::new([slot]),
+        };
+        let inner = DeoptFrame {
+            function_id: 1,
+            byte_pc: 0,
+            entry: Some(DeoptFrameEntry {
+                return_register: 0,
+                this: slot,
+                closure: slot,
+            }),
+            slots: Box::new([slot]),
+        };
+        let valid = FrameState {
+            frames: Box::new([outer, inner]),
+        };
+        assert_eq!(valid.verify(verify_limits()), Ok(()));
+        for closure in [false, true] {
+            let mut invalid = valid.clone();
+            let entry = invalid.frames[1].entry.as_mut().unwrap();
+            let operand = if closure {
+                &mut entry.closure
+            } else {
+                &mut entry.this
+            };
+            operand.location = DeoptLocation::Register(u16::MAX);
+            assert!(matches!(
+                invalid.verify(verify_limits()),
+                Err(DeoptVerifyError::MachineRegisterOutOfRange { .. })
+            ));
+        }
+        let mut invalid = valid.clone();
+        invalid.frames[1].entry = None;
+        assert_eq!(
+            invalid.verify(verify_limits()),
+            Err(DeoptVerifyError::InvalidFrameEntry { frame_index: 1 })
+        );
+        let mut invalid = valid.clone();
+        invalid.frames[0].entry = valid.frames[1].entry;
+        assert_eq!(
+            invalid.verify(verify_limits()),
+            Err(DeoptVerifyError::InvalidFrameEntry { frame_index: 0 })
+        );
+        let mut invalid = valid;
+        invalid.frames[1].entry.as_mut().unwrap().return_register = 1;
+        assert_eq!(
+            invalid.verify(verify_limits()),
+            Err(DeoptVerifyError::InvalidReturnRegister {
+                frame_index: 1,
+                register: 1
+            })
+        );
+    }
+
+    #[test]
     fn an_inlined_chain_shares_locations_across_frames() {
         // A callee's parameter is the caller's argument value, so both frames
         // read it from the same immutable machine-state snapshot.
@@ -669,8 +766,9 @@ mod tests {
                     function_id: 9,
                     byte_pc: 0,
                     entry: Some(DeoptFrameEntry {
-                        return_register: 1,
+                        return_register: 0,
                         this: shared,
+                        closure: shared,
                     }),
                     slots: vec![shared].into(),
                 },

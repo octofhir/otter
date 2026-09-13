@@ -692,11 +692,39 @@ fn render_deopt(table: &DeoptTable) -> String {
         representation: &'static str,
     }
 
+    fn render_slot(slot: &otter_vm::deopt::DeoptSlot) -> Slot {
+        let (location_kind, location_value) = match slot.location {
+            DeoptLocation::Register(register) => ("register", register.to_string()),
+            DeoptLocation::StackSlot(offset) => ("stackSlot", offset.to_string()),
+            DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
+        };
+        Slot {
+            location_kind,
+            location_value,
+            representation: match slot.repr {
+                DeoptRepr::Tagged => "tagged",
+                DeoptRepr::Int32 => "int32",
+                DeoptRepr::Boolean => "boolean",
+                DeoptRepr::Uint32 => "uint32",
+                DeoptRepr::Float64 => "float64",
+            },
+        }
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        return_register: u16,
+        this: Slot,
+        closure: Slot,
+    }
+
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Frame {
         function_id: u32,
         byte_pc: u32,
+        entry: Option<Entry>,
         slots: Vec<Slot>,
     }
 
@@ -725,32 +753,12 @@ fn render_deopt(table: &DeoptTable) -> String {
                 .map(|frame| Frame {
                     function_id: frame.function_id,
                     byte_pc: frame.byte_pc,
-                    slots: frame
-                        .slots
-                        .iter()
-                        .map(|slot| {
-                            let (location_kind, location_value) = match slot.location {
-                                DeoptLocation::Register(register) => {
-                                    ("register", register.to_string())
-                                }
-                                DeoptLocation::StackSlot(offset) => {
-                                    ("stackSlot", offset.to_string())
-                                }
-                                DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
-                            };
-                            Slot {
-                                location_kind,
-                                location_value,
-                                representation: match slot.repr {
-                                    DeoptRepr::Tagged => "tagged",
-                                    DeoptRepr::Int32 => "int32",
-                                    DeoptRepr::Boolean => "boolean",
-                                    DeoptRepr::Uint32 => "uint32",
-                                    DeoptRepr::Float64 => "float64",
-                                },
-                            }
-                        })
-                        .collect(),
+                    entry: frame.entry.as_ref().map(|entry| Entry {
+                        return_register: entry.return_register,
+                        this: render_slot(&entry.this),
+                        closure: render_slot(&entry.closure),
+                    }),
+                    slots: frame.slots.iter().map(render_slot).collect(),
                 })
                 .collect(),
         })
@@ -763,6 +771,48 @@ fn render_deopt(table: &DeoptTable) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deopt_artifact_preserves_inline_entry_recipes() {
+        use otter_vm::deopt::{
+            DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
+            FrameState,
+        };
+        let slot = DeoptSlot {
+            location: DeoptLocation::Register(3),
+            repr: DeoptRepr::Tagged,
+        };
+        let table = DeoptTable::from_states(vec![FrameState {
+            frames: Box::new([
+                DeoptFrame {
+                    function_id: 1,
+                    byte_pc: 16,
+                    entry: None,
+                    slots: Box::new([slot]),
+                },
+                DeoptFrame {
+                    function_id: 2,
+                    byte_pc: 8,
+                    entry: Some(DeoptFrameEntry {
+                        return_register: 0,
+                        this: slot,
+                        closure: DeoptSlot {
+                            location: DeoptLocation::StackSlot(32),
+                            repr: DeoptRepr::Tagged,
+                        },
+                    }),
+                    slots: Box::new([slot]),
+                },
+            ]),
+        }]);
+        let json: serde_json::Value = serde_json::from_str(&super::render_deopt(&table)).unwrap();
+        let frames = &json["exits"][0]["frames"];
+        assert!(frames[0]["entry"].is_null());
+        assert_eq!(frames[1]["entry"]["returnRegister"], 0);
+        assert_eq!(frames[1]["entry"]["this"]["locationValue"], "3");
+        assert_eq!(frames[1]["entry"]["closure"]["locationKind"], "stackSlot");
+        assert_eq!(frames[1]["entry"]["closure"]["locationValue"], "32");
+    }
+
     use otter_bytecode::{Op, Operand};
     use otter_vm::jit::JitTestInstruction;
 

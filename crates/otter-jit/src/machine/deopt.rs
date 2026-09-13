@@ -1,21 +1,22 @@
 //! Allocator-driven lowering of Machine IR frame states.
 //!
 //! # Contents
-//! - [`MachineFrameState`] — one exact interpreter-register snapshot.
+//! - [`MachineFrameState`] — one exact chain of interpreter-register snapshots.
 //! - [`MachineFrameSlot`] — allocated value or compile-time literal recipe.
 //! - [`lower_deopt_table`] — conversion into the VM's one current [`DeoptTable`].
 //!
 //! # Invariants
 //! - Value slots resolve only through late deopt operands retained by regalloc2.
 //! - Integer, floating-point, and spill namespaces are unified deterministically.
+//! - Caller/callee registers, this and closure use the same allocator locations.
 //! - Every output frame is register-count wide and every deopt id is dense.
 //! - Target emitters consume the same locations; no pre-allocation fallback exists.
 
 use otter_vm::{
     Value,
     deopt::{
-        DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable, DeoptVerifyError,
-        DeoptVerifyLimits, FrameState,
+        DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
+        DeoptVerifyError, DeoptVerifyLimits, FrameState,
     },
 };
 
@@ -33,17 +34,13 @@ pub enum MachineFrameSlot {
     TaggedLiteral(u64),
 }
 
-/// Exact single-frame interpreter state for one Machine IR deopt exit.
+/// Exact outermost-first frame chain for one Machine IR deopt exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineFrameState {
     /// Dense exit identity attached to the owning instruction.
     pub id: DeoptId,
-    /// VM function whose register window is rebuilt.
-    pub function_id: u32,
-    /// Exact encoded byte-PC at which interpretation resumes.
-    pub byte_pc: u32,
-    /// One recipe per VM register, in register order.
-    pub slots: Vec<MachineFrameSlot>,
+    /// VM-owned frame schema with allocator inputs instead of concrete recipes.
+    pub frames: Box<[DeoptFrame<MachineFrameSlot>]>,
 }
 
 /// Failure to lower allocator locations into VM deopt metadata.
@@ -96,21 +93,35 @@ pub fn lower_deopt_table(
                 actual: state.id.0,
             });
         }
-        let slots = state
-            .slots
+        let frames = state
+            .frames
             .iter()
-            .copied()
-            .map(|slot| lower_slot(sequence, allocation, layout, gpr_budget, state.id, slot))
-            .collect::<Result<Vec<_>, _>>()?;
-        lowered.push(FrameState {
-            frames: vec![DeoptFrame {
-                function_id: state.function_id,
-                byte_pc: state.byte_pc,
-                entry: None,
-                slots: slots.into_boxed_slice(),
-            }]
-            .into_boxed_slice(),
-        });
+            .map(|frame| {
+                let lower =
+                    |slot| lower_slot(sequence, allocation, layout, gpr_budget, state.id, slot);
+                Ok(DeoptFrame {
+                    function_id: frame.function_id,
+                    byte_pc: frame.byte_pc,
+                    entry: frame
+                        .entry
+                        .map(|entry| -> Result<_, MachineDeoptError> {
+                            Ok(DeoptFrameEntry {
+                                return_register: entry.return_register,
+                                this: lower(entry.this)?,
+                                closure: lower(entry.closure)?,
+                            })
+                        })
+                        .transpose()?,
+                    slots: frame
+                        .slots
+                        .iter()
+                        .copied()
+                        .map(lower)
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect::<Result<_, MachineDeoptError>>()?;
+        lowered.push(FrameState { frames });
     }
     let table = DeoptTable::from_states(lowered);
     let max_stack_offset = if allocation.spill_slots() == 0 {
@@ -127,7 +138,7 @@ pub fn lower_deopt_table(
         .verify(DeoptVerifyLimits {
             max_frame_slots: states
                 .iter()
-                .map(|state| state.slots.len())
+                .flat_map(|state| state.frames.iter().map(|frame| frame.slots.len()))
                 .max()
                 .unwrap_or(0),
             machine_register_count: gpr_budget
@@ -273,6 +284,55 @@ mod tests {
     }
 
     #[test]
+    fn lowers_caller_callee_and_entry_from_one_allocation() {
+        let (sequence, allocation, layout) = allocated_exit();
+        let integer = MachineFrameSlot::Value(MachineValue(0));
+        let float = MachineFrameSlot::Value(MachineValue(1));
+        let frames = Box::new([
+            DeoptFrame {
+                function_id: 71,
+                byte_pc: 24,
+                entry: None,
+                slots: Box::new([integer, float]),
+            },
+            DeoptFrame {
+                function_id: 72,
+                byte_pc: 8,
+                entry: Some(DeoptFrameEntry {
+                    return_register: 1,
+                    this: float,
+                    closure: integer,
+                }),
+                slots: Box::new([float, integer]),
+            },
+        ]);
+        let table = lower_deopt_table(
+            &sequence,
+            &allocation,
+            layout,
+            16,
+            8,
+            &[MachineFrameState {
+                id: DeoptId(0),
+                frames,
+            }],
+        )
+        .unwrap();
+        let state = table.lookup(DeoptExitId(0)).unwrap();
+        assert_eq!(state.frames.len(), 2);
+        let caller = state.outermost();
+        let callee = state.innermost();
+        assert_eq!(callee.function_id, 72);
+        assert_eq!(callee.byte_pc, 8);
+        assert_eq!(callee.slots[0], caller.slots[1]);
+        assert_eq!(callee.slots[1], caller.slots[0]);
+        let entry = callee.entry.unwrap();
+        assert_eq!(entry.return_register, 1);
+        assert_eq!(entry.this, caller.slots[1]);
+        assert_eq!(entry.closure, caller.slots[0]);
+    }
+
+    #[test]
     fn lowers_exact_allocator_locations_and_literal_slots() {
         let (sequence, allocation, layout) = allocated_exit();
         let table = lower_deopt_table(
@@ -283,13 +343,17 @@ mod tests {
             8,
             &[MachineFrameState {
                 id: DeoptId(0),
-                function_id: 71,
-                byte_pc: 24,
-                slots: vec![
-                    MachineFrameSlot::Value(MachineValue(0)),
-                    MachineFrameSlot::Value(MachineValue(1)),
-                    undefined_slot(),
-                ],
+                frames: Box::new([DeoptFrame {
+                    function_id: 71,
+                    byte_pc: 24,
+                    entry: None,
+                    slots: vec![
+                        MachineFrameSlot::Value(MachineValue(0)),
+                        MachineFrameSlot::Value(MachineValue(1)),
+                        undefined_slot(),
+                    ]
+                    .into_boxed_slice(),
+                }]),
             }],
         )
         .expect("allocator-driven deopt table");

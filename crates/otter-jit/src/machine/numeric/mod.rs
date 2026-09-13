@@ -2975,18 +2975,21 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
         .enumerate()
         .map(|(index, state)| super::MachineFrameState {
             id: DeoptId(index as u32),
-            function_id: state.function_id,
-            byte_pc: state.byte_pc,
-            slots: state
-                .slots
-                .iter()
-                .map(|slot| match slot {
-                    hir::NumericFrameSlot::Value(value) => {
-                        super::MachineFrameSlot::Value(MachineValue(value.0 as u32))
-                    }
-                    hir::NumericFrameSlot::Undefined => super::undefined_slot(),
-                })
-                .collect(),
+            frames: Box::new([otter_vm::deopt::DeoptFrame {
+                function_id: state.function_id,
+                entry: None,
+                byte_pc: state.byte_pc,
+                slots: state
+                    .slots
+                    .iter()
+                    .map(|slot| match slot {
+                        hir::NumericFrameSlot::Value(value) => {
+                            super::MachineFrameSlot::Value(MachineValue(value.0 as u32))
+                        }
+                        hir::NumericFrameSlot::Undefined => super::undefined_slot(),
+                    })
+                    .collect(),
+            }]),
         })
         .collect()
 }

@@ -484,10 +484,13 @@ Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
 
 Current priority: actual Machine SSA inlining, then contextual construction and
 allocation elimination. The active scalar backend currently compiles one function
-at a time and does not consume the VM's prepared inline candidates. Its Machine
-deopt state reconstructs only one frame. Candidate preparation and compilation
-admission must not be described as optimizing inlining. Replace that limitation
-through the existing VM frame-chain contract and one HIR/allocator/emitter.
+at a time and does not consume the VM's prepared inline candidates. Machine
+deopt lowering now accepts the VM-owned frame chain, including exact this and
+closure recipes; verification covers nested entries and caller destinations.
+Runtime materialization supports both native entry modes, and artifacts expose
+entry recipes. HIR still emits one frame: candidate preparation and compilation
+admission must not be described as optimizing inlining. Connect callee CFG and
+complete caller/callee liveness through the one HIR/allocator/emitter next.
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not
 addressed by repeatedly chasing1–2% local changes. The current boxed-arithmetic

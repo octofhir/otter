@@ -20,7 +20,9 @@
 //!   without reentry; uncertain shapes reach the observable lookup, and no
 //!   post-effect rejection can replay `New`.
 //! - Callee registers published by the copied frame header are initialized
-//!   tagged slots on the machine stack. Safepoint-free scalar generations may
+//!   tagged slots on the machine stack. The register-base field locates them;
+//!   fixed control slots and the upvalue spine precede the tagged windows.
+//!   Safepoint-free scalar generations may
 //!   publish only their parameter prefix; every cold exit expands it before
 //!   VM reentry. Moving GC therefore sees exactly the initialized window.
 //! - A spread call copies only the target's declared parameter prefix from the
@@ -47,6 +49,10 @@
 //! - `otter-vm/src/native_abi/code_entry.rs` — stable generation leases.
 //! - `otter-vm/src/native_abi/frame.rs` — stack-register root ownership.
 
+mod layout;
+
+use layout::StackLayout;
+
 use crate::template::arm64::values::{CellTest, emit_cell_test};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
@@ -70,7 +76,7 @@ use crate::{
         GC_PAGE_SIZE, GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
         NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
-        NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NEW_FROM_SPACE_KIND,
         OBJECT_BODY_TYPE_TAG, PAGE_ALLOCATED_BYTES_OFFSET, PAGE_BUMP_CURSOR_OFFSET,
         PAGE_SPACE_OFFSET, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
@@ -380,62 +386,6 @@ pub(crate) enum DirectCallArguments<'a> {
     Spread(u16),
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StackLayout {
-    /// Start of the published actual-argument window, directly after the
-    /// callee's register window. Meaningful only when `incoming_count != 0`
-    /// or the target publishes an empty window.
-    incoming_base: u32,
-    /// Actual arguments published after the register window; zero when the
-    /// target does not materialize `arguments`.
-    incoming_count: u32,
-    upvalue_base: u32,
-    saved_x25: u32,
-    entry_addr: u32,
-    caller_frame: u32,
-    caller_code_object_id: u32,
-    target_cell: u32,
-    frame_bytes: u32,
-}
-
-impl StackLayout {
-    /// Layout for a site passing `argument_count` fixed actual arguments.
-    ///
-    /// A target that materializes `arguments` receives every actual argument
-    /// in a tagged window after its register window; every other target only
-    /// receives its declared parameter prefix, so the window is empty.
-    fn for_site(target: &JitDirectCallee, argument_count: u32) -> Option<Self> {
-        let register_bytes = u32::from(target.plan.register_count).checked_mul(8)?;
-        let incoming_base = NATIVE_FRAME_STACK_SIZE.checked_add(register_bytes)?;
-        let incoming_count = if target.plan.needs_incoming_arguments {
-            argument_count
-        } else {
-            0
-        };
-        let upvalue_base = incoming_base.checked_add(incoming_count.checked_mul(8)?)?;
-        let upvalue_count = u32::from(target.plan.own_upvalue_count)
-            .checked_add(u32::from(target.plan.inherited_upvalue_count))?;
-        let upvalue_bytes = upvalue_count.checked_mul(4)?;
-        let spill = upvalue_base.checked_add(upvalue_bytes)?.checked_add(7)? & !7;
-        target
-            .plan
-            .generated_stack_frame_bytes
-            .filter(|bytes| *bytes != 0)?;
-        let frame_bytes = spill.checked_add(40)?.checked_add(15)? & !15;
-        (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
-            incoming_base,
-            incoming_count,
-            upvalue_base,
-            saved_x25: spill,
-            entry_addr: spill + 8,
-            caller_frame: spill + 16,
-            caller_code_object_id: spill + 24,
-            target_cell: spill + 32,
-            frame_bytes,
-        })
-    }
-}
-
 /// Whether a baked target fits the bounded generated stack-call layout.
 #[must_use]
 pub(crate) fn target_is_supported(target: &JitDirectCallee) -> bool {
@@ -592,7 +542,7 @@ where
         }
         load(ops, source, 15, layout.frame_bytes)?;
         if in_prefix {
-            let destination_offset = NATIVE_FRAME_STACK_SIZE + index * 8;
+            let destination_offset = layout.register_base + index * 8;
             dynasm!(ops ; .arch aarch64 ; str x15, [sp, destination_offset]);
         }
         if in_window {
@@ -604,11 +554,16 @@ where
 }
 
 /// Initialize one compile-time register range in the stack-owned callee frame.
-fn emit_initialize_register_range(ops: &mut Assembler, start: usize, count: usize) {
+fn emit_initialize_register_range(
+    ops: &mut Assembler,
+    layout: &StackLayout,
+    start: usize,
+    count: usize,
+) {
     if count == 0 {
         return;
     }
-    let start_offset = NATIVE_FRAME_STACK_SIZE + start as u32 * 8;
+    let start_offset = layout.register_base + start as u32 * 8;
     let pair_count = count / 2;
     emit_load_u64(ops, 15, VALUE_UNDEFINED);
     dynasm!(ops
@@ -1323,13 +1278,14 @@ where
         ; str w14, [sp, 8]
         ; movz w13, layout.incoming_count
         ; str w13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
-        ; add x14, sp, NATIVE_FRAME_STACK_SIZE
+        ; add x14, sp, layout.register_base
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
 
     let param_count = usize::from(site.target.plan.param_count);
     emit_initialize_register_range(
         ops,
+        &layout,
         copied_argument_count,
         param_count.saturating_sub(copied_argument_count),
     );
@@ -1341,7 +1297,7 @@ where
             ; ldr w13, [x25, CODE_ENTRY_FLAGS_OFFSET]
             ; tbnz w13, #PARAMETER_PREFIX_FLAG_BIT, =>locals_ready
         );
-        emit_initialize_register_range(ops, param_count, local_count);
+        emit_initialize_register_range(ops, &layout, param_count, local_count);
         dynasm!(ops ; .arch aarch64 ; =>locals_ready);
     }
 

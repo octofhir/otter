@@ -1,4 +1,4 @@
-//! Typed, allocation-free access to one compiled VM activation.
+//! Typed access to one compiled VM activation and its inlined descendants.
 //!
 //! # Contents
 //! - [`RuntimeCall`] is the short-lived JIT-to-VM semantic boundary.
@@ -8,6 +8,8 @@
 //!   generated stack-owned activation.
 //! - Focused `control` and `value_ops` implementations expose typed
 //!   operations instead of raw interpreter, stack, context, or frame handles.
+//! - `inline_activations` publishes boxed callee recipes only for committed
+//!   cold reentry and returns to the same compiled body without interpretation.
 //!
 //! # Invariants
 //! - Construction reads and validates scalar descriptors from the published
@@ -26,7 +28,9 @@
 //!   representation.
 //! - Register/upvalue windows stay published across allocating operations;
 //!   slot access remains checked and scoped through [`ActiveFrameMut`].
-//! - The boundary allocates no wrapper, lock, side table, or thread-local state.
+//! - Binding allocates no wrapper, lock, side table, or thread-local state.
+//!   Scoped inline reentry owns temporary native records and captured spines;
+//!   every such record is removed before its storage is released.
 //!
 //! # See also
 //! - [`crate::jit::VmRuntimeActivation`] owns the opaque entry-lifetime record.
@@ -38,6 +42,7 @@ mod committed_values;
 mod control;
 mod exceptions;
 mod forward_arguments;
+mod inline_activations;
 mod iterators;
 mod value_loads;
 mod value_ops;

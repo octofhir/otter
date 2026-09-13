@@ -852,6 +852,7 @@ const _: [(); 0] = [(); std::mem::offset_of!(JitPropertyIcWay, receiver_shape)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitPropertyIcWay, holder_shape)];
 const _: [(); 8] = [(); std::mem::offset_of!(JitPropertyIcWay, value_byte)];
 const _: [(); 12] = [(); std::mem::offset_of!(JitPropertyIcWay, transition_shape)];
+const _: [(); 16] = [(); std::mem::offset_of!(JitPropertyIcWay, chain_shape)];
 
 /// One monomorphic native leaf call selected from ordinary-call feedback.
 ///

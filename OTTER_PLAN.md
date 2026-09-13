@@ -552,6 +552,14 @@ or rebuilt baseline. Next: complete and test the native writable-prototype
 transition proof, then follow the handoff order for forwarded generated calls,
 spread packets, Machine coverage and root scanning.
 
+The native-transition prerequisite removes the duplicate JIT-side IC-way
+carrier: cells now store VM-owned `JitPropertyIcWay`, derive stride from that
+type and check every field offset. The existing 20-byte representation stays
+intact. The cell-fill unit and scoped JIT clippy pass; no release rebuild or
+benchmark repeat is needed. The handoff records the complete writable-data
+prototype proof, descriptor invalidation requirements and scratch-register
+contract before enabling the new native path.
+
 The intended replacement path remains:
 
 ```text

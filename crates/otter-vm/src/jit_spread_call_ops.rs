@@ -17,6 +17,8 @@
 //! - A compiled generic method call records its attempt before receiver or
 //!   method lookup, matching interpreter dispatch and invalidating any stale
 //!   cold-exit snapshot even when lookup throws.
+//! - Resolved explicit-receiver and forwarded targets use the same bounded
+//!   CodeBlock feedback and invalidate stale caller generations on target growth.
 //! - Spread validation order matches interpreter dispatch.
 //! - Elided mapped arguments read live parameter cells; after materialization,
 //!   forwarding reads the actual arguments object through CreateListFromArrayLike.
@@ -203,20 +205,7 @@ impl Interpreter {
             .jit_runtime_stats
             .jit_to_rust_call_transitions
             .saturating_add(1);
-        if let Some(target_function_id) = callee.as_function().or_else(|| {
-            callee
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.function_id())
-        }) {
-            let transition = self.record_ordinary_call_feedback(
-                function,
-                call_pc,
-                crate::feedback::OrdinaryCallTarget::Bytecode(target_function_id),
-            );
-            if transition.evict_for_reopt() {
-                self.evict_compiled_for_reopt(function_id);
-            }
-        }
+        self.record_resolved_bytecode_call_feedback(function, call_pc, function_id, callee);
         self.run_rooted_call_values(stack, context, callee, receiver, args)
     }
 
@@ -468,6 +457,14 @@ impl Interpreter {
         receiver_reg: u16,
         this_reg: u16,
     ) -> Result<bool, VmError> {
+        let function_id = frame.function_id();
+        let call_pc = frame.pc();
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        // The apply lookup is already committed. Mark this attempt before any
+        // arguments-object getter or materialization can throw or reenter.
+        self.record_call_attempt_feedback(function, call_pc, function_id);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let method = frame.read(method_reg)?;
         let callee = frame.read(receiver_reg)?;
@@ -498,9 +495,6 @@ impl Interpreter {
                             .unwrap_or_default(),
                         (None, None) => return Err(VmError::InvalidOperand),
                     };
-                let function = context
-                    .exec_function(frame.function_id())
-                    .ok_or(VmError::InvalidOperand)?;
                 self.refresh_mapped_argument_values(function, &frame.as_ref(), &mut forwarded)?;
                 forwarded
             };
@@ -527,6 +521,7 @@ impl Interpreter {
             .jit_runtime_stats
             .jit_to_rust_call_transitions
             .saturating_add(1);
+        self.record_resolved_bytecode_call_feedback(function, call_pc, function_id, target);
         let result = self.run_rooted_call_values(stack, context, target, receiver, args)?;
         frame.write(dst, result)?;
         Ok(true)

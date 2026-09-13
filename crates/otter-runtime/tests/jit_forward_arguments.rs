@@ -8,6 +8,7 @@
 //! - An arrow referencing the enclosing activation's `arguments`.
 //! - Live mapped parameters and mutated/materialized argument lists, including
 //!   allocating length coercion and index getters.
+//! - Target growth after tier-up invalidates and replans forwarding feedback.
 //!
 //! # Invariants
 //! - Bodies that only forward `arguments` never materialize the object on
@@ -229,6 +230,74 @@ fn forwarded_arguments_read_live_mappings_and_materialized_objects() {
             result.completion_string(),
             "[210000,[\"42\",\"1,9,3\",\"1\",\"1\",\"1\",\"43,99\"],64,128,64,64,0]",
             "{selection:?}"
+        );
+    }
+}
+
+#[test]
+fn generated_forwarding_replans_when_the_resolved_target_changes() {
+    let source = r#"
+function first(value) { return value + 1; }
+function second(value) { return value + 2; }
+let selected = first;
+function forward(value) { return selected.apply(null, arguments); }
+let sum = 0;
+for (let i = 0; i < 5000; i++) sum += forward(i);
+selected = second;
+for (let i = 0; i < 5000; i++) sum += forward(i);
+sum;
+"#;
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .jit_debug(JitDebugRequest::events())
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(source.to_owned()),
+                "forward-target-growth.js",
+            )
+            .expect("forwarded target switch");
+        assert_eq!(result.completion_string(), "25010000", "{selection:?}");
+        let report = result.jit_debug_report().expect("events");
+        let forward_id = report
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                JitDebugEvent::CompilePrepared {
+                    function_id,
+                    function_name,
+                    ..
+                } if function_name == "forward" => Some(*function_id),
+                _ => None,
+            })
+            .expect("forward must enter generated code before the target changes");
+        let mut monomorphic = false;
+        let mut grew_after_compile = false;
+        for event in report.events() {
+            if let JitDebugEvent::InlineCandidate {
+                caller_function_id,
+                callee_function_id,
+                bake_rejection,
+                ..
+            } = event
+                && *caller_function_id == forward_id
+            {
+                if callee_function_id.is_some() {
+                    monomorphic = true;
+                }
+                if matches!(
+                    bake_rejection,
+                    Some(otter_runtime::JitInlineRejectionReason::Polymorphic)
+                ) {
+                    grew_after_compile |= monomorphic;
+                }
+            }
+        }
+        assert!(
+            grew_after_compile,
+            "{selection:?}: compiled forwarding must publish its new target and replan the monomorphic snapshot"
         );
     }
 }

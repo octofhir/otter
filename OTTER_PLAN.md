@@ -593,6 +593,17 @@ This is the S2 semantic prerequisite; the generated direct-forward path remains
 open and must handle the measured polymorphic target and the full live argument
 span, preserving the already-committed apply lookup.
 
+Forwarding now also publishes the resolved bytecode target at the canonical
+instruction PC. The shared ordinary-call policy invalidates an installed caller
+on every bounded target-population transition, including saturation; repeated
+hits remain inert. A regression fails before this change and proves the
+monomorphic-to-polymorphic compile transition after a late target switch in both
+generated tiers. Six forwarding tests, GC+verify1/4/16, five feedback units and
+23 affected Machine direct-call tests pass; scoped VM clippy passes. Evidence:
+`benchmarks/results/s2-20260913-forward-feedback/README.md`. Release validation
+is deferred to the coherent generated-forwarding implementation; no new release
+build or performance claim accompanies this prerequisite.
+
 The intended replacement path remains:
 
 ```text

@@ -675,6 +675,15 @@ capture GC, and the committed cold sibling returns a pure exception value.
 Evidence: `benchmarks/results/s2-20260913-machine-forward-liveness/README.md`.
 No release or benchmark was repeated for this prerequisite.
 
+Shared forwarding now separates the incoming/captured leaf copy from generated
+mapped-register stores. The latter read current homes after capture allocation,
+using a caller base recovered from existing linkage controls even with dynamic
+SP. Both Template dispatch forms use this path; no temporary value packet or
+stale NativeFrame-register fallback. Forwarding10/10, an executed AArch64
+fixed/dynamic-base test, saturation GC1/4/16 and scoped VM/JIT clippy pass.
+Machine HIR/root/cold-value integration remains open. Evidence:
+`benchmarks/results/s2-20260913-forward-register-homes/README.md`.
+
 The intended replacement path remains:
 
 ```text

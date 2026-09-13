@@ -143,6 +143,11 @@ pub(super) fn emit_spread_call_op(
             |_| Ok(()),
             |ops, source, _| emit_store_reg(ops, source, dst),
             |_, _| Ok(()),
+            |_, _, _| {
+                Err(Unsupported::OperandShape(
+                    "forward bindings outside forwarding site",
+                ))
+            },
         )?;
         if let Some(events) = direct_call_events {
             events.insert(

@@ -77,36 +77,36 @@ impl RuntimeCall<'_> {
         vm.current_direct_callee_plan(function)
     }
 
-    /// Copy the caller's live argument values into a private generated callee.
+    /// Copy incoming actuals and live captured aliases into a private callee.
+    /// Returns the actual count; generated code must still patch register aliases
+    /// from its current value homes before publishing the callee.
     ///
     /// # Safety
     /// `destination` and its complete initialized register/argument windows must
     /// be exclusively owned by generated linkage, disjoint from the caller and
     /// live for this non-allocating call. The callee must not yet be published.
-    pub unsafe fn copy_forwarded_arguments(
+    pub unsafe fn copy_forwarded_argument_window(
         &self,
         destination: *mut NativeFrame,
         parameter_count: u16,
-    ) -> bool {
+    ) -> Option<u32> {
         // SAFETY: the bound caller and the caller-owned private destination are
         // live and disjoint; checked views retain no Rust slice across VM work.
         let vm = unsafe { self.vm.as_ref() };
         let stack = unsafe { self.stack.as_ref() };
         let context = unsafe { self.context.as_ref() };
         let Ok(source) = (unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }) else {
-            return false;
+            return None;
         };
         let Ok(mut destination) = (unsafe { ActiveFrameMut::from_native_ptr(destination) }) else {
-            return false;
+            return None;
         };
-        let Some(function) = context.exec_function(source.function_id()) else {
-            return false;
-        };
+        let function = context.exec_function(source.function_id())?;
         let materialized = match self.identity {
             RuntimeFrameIdentity::Materialized(index) => Some(index),
             RuntimeFrameIdentity::StackOwned => None,
         };
-        vm.copy_live_forwarded_arguments(
+        vm.copy_forwarded_argument_window(
             function,
             stack,
             &source,
@@ -114,6 +114,7 @@ impl RuntimeCall<'_> {
             &mut destination,
             parameter_count,
         )
-        .unwrap_or(false)
+        .ok()
+        .flatten()
     }
 }

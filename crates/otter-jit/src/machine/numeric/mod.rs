@@ -3178,6 +3178,7 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
                         .entry
                         .as_ref()
                         .map(|entry| otter_vm::deopt::DeoptFrameEntry {
+                            new_target: slot(&entry.new_target),
                             return_register: entry.return_register,
                             this: slot(&entry.this),
                             closure: slot(&entry.closure),
@@ -3601,6 +3602,7 @@ mod tests {
                         function_id: 2,
                         byte_pc: 8,
                         entry: Some(DeoptFrameEntry {
+                            new_target: NumericFrameSlot::Undefined,
                             return_register: 1,
                             this: NumericFrameSlot::Value(value(0)),
                             closure: NumericFrameSlot::Value(value(1)),

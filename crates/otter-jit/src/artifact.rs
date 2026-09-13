@@ -715,26 +715,9 @@ fn render_deopt(table: &DeoptTable) -> String {
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct Entry {
-        return_register: u16,
-        this: Slot,
-        closure: Slot,
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Frame {
-        function_id: u32,
-        byte_pc: u32,
-        entry: Option<Entry>,
-        slots: Vec<Slot>,
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
     struct Exit {
         id: u32,
-        frames: Vec<Frame>,
+        frames: Vec<otter_vm::deopt::DeoptFrame<Slot>>,
     }
 
     #[derive(Serialize)]
@@ -752,14 +735,18 @@ fn render_deopt(table: &DeoptTable) -> String {
             frames: state
                 .frames
                 .iter()
-                .map(|frame| Frame {
+                .map(|frame| otter_vm::deopt::DeoptFrame {
                     function_id: frame.function_id,
                     byte_pc: frame.byte_pc,
-                    entry: frame.entry.as_ref().map(|entry| Entry {
-                        return_register: entry.return_register,
-                        this: render_slot(&entry.this),
-                        closure: render_slot(&entry.closure),
-                    }),
+                    entry: frame
+                        .entry
+                        .as_ref()
+                        .map(|entry| otter_vm::deopt::DeoptFrameEntry {
+                            return_register: entry.return_register,
+                            this: render_slot(&entry.this),
+                            closure: render_slot(&entry.closure),
+                            new_target: render_slot(&entry.new_target),
+                        }),
                     slots: frame.slots.iter().map(render_slot).collect(),
                 })
                 .collect(),
@@ -795,6 +782,12 @@ mod tests {
                     function_id: 2,
                     byte_pc: 8,
                     entry: Some(DeoptFrameEntry {
+                        new_target: DeoptSlot {
+                            location: DeoptLocation::Literal(
+                                otter_vm::Value::function(99).to_bits(),
+                            ),
+                            repr: DeoptRepr::Tagged,
+                        },
                         return_register: 0,
                         this: slot,
                         closure: DeoptSlot {
@@ -813,6 +806,11 @@ mod tests {
         assert_eq!(frames[1]["entry"]["this"]["locationValue"], "3");
         assert_eq!(frames[1]["entry"]["closure"]["locationKind"], "stackSlot");
         assert_eq!(frames[1]["entry"]["closure"]["locationValue"], "32");
+        assert_eq!(frames[1]["entry"]["newTarget"]["locationKind"], "literal");
+        assert_eq!(
+            frames[1]["entry"]["newTarget"]["locationValue"],
+            format!("0x{:016x}", otter_vm::Value::function(99).to_bits())
+        );
     }
 
     use otter_bytecode::{Op, Operand};

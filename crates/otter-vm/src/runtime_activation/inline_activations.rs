@@ -50,6 +50,7 @@ impl Drop for InlinePublication {
             let entry = recipe.entry.as_mut().expect("validated inline entry");
             entry.this = native.this_value();
             entry.closure = native.self_value();
+            entry.new_target = native.new_target();
         }
         while vm.jit_native_activation_top > self.base {
             vm.jit_pop_native_activation();
@@ -105,6 +106,10 @@ impl RuntimeCall<'_> {
                 || function.own_upvalue_count != 0
                 || function.needs_arguments
                 || function.contains_direct_eval
+                || (!entry.new_target.is_undefined()
+                    && !function.is_arrow
+                    && !function.is_derived_constructor
+                    && entry.this.as_object().is_none())
             {
                 return Err(VmError::InvalidOperand);
             }
@@ -139,6 +144,10 @@ impl RuntimeCall<'_> {
                 entry.closure,
                 entry.this,
             );
+            native.set_new_target(entry.new_target);
+            if !entry.new_target.is_undefined() && function.is_derived_constructor {
+                native.set_derived_constructor();
+            }
             native.set_stack_registers();
             native.set_upvalue_window(upvalues.as_ptr() as u64, upvalues.len() as u32);
             spines.push(upvalues);
@@ -167,7 +176,7 @@ impl RuntimeCall<'_> {
         };
         let result = operation(&mut inner);
         // The collector rewrites registers in place; the guard returns current
-        // this/SELF to the recipe owner before unpublishing the native frames.
+        // this/SELF/new.target to the recipe owner before unpublishing the native frames.
         drop(publication);
         Ok(result)
     }

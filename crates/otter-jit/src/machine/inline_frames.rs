@@ -77,7 +77,7 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
             for value in frame
                 .slots
                 .iter()
-                .chain([&entry.this, &entry.closure])
+                .chain([&entry.this, &entry.closure, &entry.new_target])
                 .flatten()
             {
                 if sequence.representations.get(value.0 as usize)

@@ -66,6 +66,7 @@ fn recipe(context: &ExecutionContext, function_id: u32, value: Value) -> DeoptFr
             .instruction_byte_pc(0)
             .unwrap(),
         entry: Some(DeoptFrameEntry {
+            new_target: Value::undefined(),
             return_register: 0,
             this: value,
             closure: Value::function(function_id),
@@ -295,5 +296,47 @@ fn inline_activation_nested_scopes_restore_the_same_parent() {
     assert_eq!(call.function_id(), 0);
     assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
     drop(call);
+    vm.jit_pop_native_activation();
+}
+
+#[test]
+fn inline_constructor_new_target_is_a_moving_root() {
+    let context = context();
+    let mut vm = Interpreter::new();
+    let mut stack = ActivationStack::new();
+    let mut registers = [Value::undefined()];
+    let mut root = native(0, &mut registers);
+    // SAFETY: the frame and window remain stationary until the matching pop.
+    unsafe {
+        vm.jit_push_native_frame(&mut root).unwrap();
+    }
+    vm.with_runtime_turn(&mut stack, |turn| {
+        let (vm, stack) = turn.into_parts();
+        let receiver = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
+        root.set_this_value(Value::object(receiver));
+        let target =
+            crate::closure::alloc_closure(&mut vm.gc_heap, 2, vec![], None, None, None, None)
+                .unwrap();
+        registers[0] = Value::closure(target);
+        let mut recipes = [recipe(&context, 1, root.this_value())];
+        recipes[0].entry.as_mut().unwrap().new_target = registers[0];
+        let vm_ptr = std::ptr::from_mut(vm);
+        let mut activation = VmRuntimeActivation::new(vm, stack, &context, 0);
+        // SAFETY: rooted turn and native caller outlive this cold scope.
+        let mut call =
+            unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut root)) }
+                .unwrap();
+        call.with_inline_activations(&mut recipes, |inner| {
+            // SAFETY: services are accessed only under this exclusive runtime operation.
+            let vm = unsafe { &mut *vm_ptr };
+            vm.force_gc().unwrap();
+            // SAFETY: the callee remains published and root-rewritten through the scope.
+            let target = unsafe { inner.frame.as_ref() }.new_target();
+            assert_eq!(target.as_closure(&vm.gc_heap).unwrap().function_id(), 2);
+            assert!(!unsafe { inner.frame.as_ref() }.is_derived_constructor());
+        })
+        .unwrap();
+        assert_eq!(recipes[0].entry.as_ref().unwrap().new_target, registers[0]);
+    });
     vm.jit_pop_native_activation();
 }

@@ -566,6 +566,20 @@ the callee without repeating the store. Existing transition/value barriers remai
 Protected stores still require HIR exception-operand admission. Actual constructor
 entry/allocation and argument forwarding are still separate A2 barriers.
 Evidence: benchmarks/results/a2-20260913-inline-stores/README.md.
+The shared DeoptFrame entry now carries new.target through HIR liveness,
+allocator lowering, safepoint-root recipes, runtime decoding and artifact output.
+The separate JitDeoptFrame and artifact frame/entry DTOs are removed. VM inline
+materialization validates byte PCs and restores base receiver results; cold
+inline scopes trace/rewrite new.target. A reproduced constructor-created-arrow
+exit returned its owner instead of7; lexical new.target now retains ordinary
+arrow return semantics. Constructor allocation is not yet spliced.
+Next: fixed-arity base constructor receiver probe using the existing guarded
+nursery program. Miss/space exhaustion must take the original construct-call
+CFG sibling, not a recurring deopt; a hit enters the body with an allocated
+receiver/new.target recipe and constructor result selection. Then extend actual
+argument recipes and specialize initialize.apply before virtual-object escape
+analysis/materialization. No second allocator or hidden runtime fallback.
+Evidence: benchmarks/results/a2-20260913-construct-frames/README.md.
 Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.
 
 The handoff's structural A1–A3 order supersedes the chronological next steps below.

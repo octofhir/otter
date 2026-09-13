@@ -90,6 +90,7 @@ fn decode_published_frames(
                 function_id: frame.function_id,
                 byte_pc: frame.byte_pc,
                 entry: Some(DeoptFrameEntry {
+                    new_target: slot(&entry.new_target)?,
                     return_register: entry.return_register,
                     this: slot(&entry.this)?,
                     closure: slot(&entry.closure)?,
@@ -136,6 +137,7 @@ mod tests {
                 function_id: 7,
                 byte_pc: 24,
                 entry: Some(DeoptFrameEntry {
+                    new_target: None,
                     return_register: 1,
                     this: Some(1),
                     closure: Some(0),

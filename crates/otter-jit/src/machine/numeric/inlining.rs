@@ -260,6 +260,7 @@ fn splice_one(
     parent.byte_pc = after_pc;
     *parent.slots.get_mut(usize::from(destination))? = NumericFrameSlot::Undefined;
     let entry = DeoptFrameEntry {
+        new_target: NumericFrameSlot::Undefined,
         return_register: destination,
         this: NumericFrameSlot::Value(this),
         closure: NumericFrameSlot::Value(callable),
@@ -360,7 +361,11 @@ fn splice_one(
                 frame.entry = Some(entry);
             } else {
                 let nested = frame.entry.as_mut()?;
-                for slot in [&mut nested.this, &mut nested.closure] {
+                for slot in [
+                    &mut nested.this,
+                    &mut nested.closure,
+                    &mut nested.new_target,
+                ] {
                     if let NumericFrameSlot::Value(value) = slot {
                         *value = map(*value);
                     }

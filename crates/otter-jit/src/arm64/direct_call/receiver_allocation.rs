@@ -3,6 +3,7 @@
 //! # Contents
 //! - Class-wrapper and ordinary-closure prototype resolution before effects.
 //! - Existing nursery, accounting and complete object initialization program.
+//! - SSA probe completion with separately counted pre-effect misses.
 //!
 //! # Invariants
 //! - Ordinary closure probes require an active weak-observation ledger entry;
@@ -239,4 +240,37 @@ pub(super) fn emit_generated_receiver_allocation(
     );
     emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GENERATED_OFFSET);
     dynasm!(ops ; .arch aarch64 ; mov x0, x16 ; b =>ready);
+}
+
+/// Complete a Machine receiver probe with undefined on either pre-effect miss.
+/// The allocation program, initialization and accounting remain shared with
+/// full construct linkage. x2 is the new.target input; x0 is the tagged result.
+pub(crate) fn emit_receiver_probe(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    context_register: u8,
+) {
+    let guard_miss = ops.new_dynamic_label();
+    let space_miss = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    emit_generated_receiver_allocation(
+        ops,
+        relocations,
+        view,
+        plan,
+        context_register,
+        guard_miss,
+        space_miss,
+        ready,
+    );
+    dynasm!(ops ; .arch aarch64 ; =>guard_miss);
+    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GUARD_MISSES_OFFSET);
+    dynasm!(ops ; .arch aarch64 ; b =>miss ; =>space_miss);
+    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_SPACE_MISSES_OFFSET);
+    dynasm!(ops ; .arch aarch64 ; =>miss);
+    emit_load_u64(ops, 0, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; =>ready);
 }

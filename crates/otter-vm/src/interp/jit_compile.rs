@@ -8,7 +8,8 @@
 //! - Bounded call-graph tiering for hot observed callees that need an entry
 //!   generation before the caller's stable direct-link snapshot is sealed.
 //! - Call/method target profiling and reoptimization eviction.
-//! - Plain and method candidate snapshots share one bounded ancestry tree.
+//! - Plain, method and optimizing base-constructor snapshots share one bounded
+//!   ancestry tree. Template construction keeps generated call linkage.
 //! - Cross-script recompilation resolves the defining code owner before baking.
 //!
 //! # Invariants
@@ -1634,7 +1635,11 @@ impl Interpreter {
         eager_direct_target_depth: u8,
     ) {
         self.bake_call_site_plans(
-            view, context, fid, tier, eager_direct_target_depth,
+            view,
+            context,
+            fid,
+            tier,
+            eager_direct_target_depth,
             &mut InlineSnapshotBudget::new(fid),
         );
     }
@@ -1874,7 +1879,13 @@ impl Interpreter {
                     target_count,
                     direct_call_outcome,
                 );
-                if is_construct || op == Op::CallSpread {
+                if (is_construct
+                    && (tier != jit_debug::JitDebugTier::Optimizing
+                        || op != Op::New
+                        || callee.is_derived_constructor
+                        || callee.is_arrow))
+                    || op == Op::CallSpread
+                {
                     continue;
                 }
                 if inline_ineligible || target_count != 1 {

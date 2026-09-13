@@ -727,6 +727,11 @@ pub enum MachineOpcode {
         /// One source-owned immutable method identity program.
         guard: Box<otter_vm::jit::JitMethodGuard>,
     },
+    /// Unwrap a class when present, prove constructor identity, and return its callable.
+    InlineConstructGuard {
+        /// Canonical bytecode target identity.
+        function_id: u32,
+    },
     /// Prove a plain inline callable and produce its exact this binding.
     InlineCallGuard {
         /// Canonical bytecode target identity.
@@ -734,6 +739,17 @@ pub enum MachineOpcode {
         /// Ordinary call this-binding policy.
         this_mode: otter_vm::JitDirectCallThisMode,
     },
+    /// Probe the shared nursery allocator; undefined means no committed allocation.
+    ConstructReceiver {
+        /// Source byte PC for generated allocation attribution.
+        byte_pc: u32,
+        /// One immutable live-prototype/shape allocation program.
+        plan: otter_vm::jit::JitReceiverAllocationPlan,
+    },
+    /// Test the successful receiver result of a nursery probe.
+    ConstructReceiverHit,
+    /// Return an object result, or substitute the allocated base receiver.
+    BaseConstructResult,
     /// Commit an unbound stack-owned derived this, returning whether it hit.
     TryBindDerivedThis {
         /// Exact source byte PC for generated/cold attribution.
@@ -951,7 +967,12 @@ pub enum MachineOpcode {
         value_is_non_cell: bool,
     },
     /// Apply one VM-baked constructor-owned add-property transition.
-    ConstructorFieldStore(u32),
+    ConstructorFieldStore {
+        /// Source operation within the innermost activation.
+        byte_pc: u32,
+        /// Source-owned transition, independent of the outer compilation snapshot.
+        transition: Box<otter_vm::jit::JitConstructorFieldTransition>,
+    },
     /// Target ABI call through a call descriptor.
     Call(u32),
     /// Interpreter-to-native loop-header entry marker. Its late-use operands
@@ -1777,7 +1798,52 @@ impl InstructionSequence {
                     }
                 }
                 match &instruction.opcode {
+                    MachineOpcode::ConstructReceiver { .. }
+                    | MachineOpcode::ConstructReceiverHit
+                    | MachineOpcode::BaseConstructResult => {
+                        let (inputs, result, scratch): (_, _, &[u8]) = match instruction.opcode {
+                            MachineOpcode::ConstructReceiver { .. } => (
+                                1,
+                                MachineRepresentation::Tagged,
+                                &[0, 2, 4, 9, 10, 11, 12, 13, 14, 15, 16],
+                            ),
+                            MachineOpcode::ConstructReceiverHit => {
+                                (1, MachineRepresentation::Boolean, &[9, 10])
+                            }
+                            _ => (2, MachineRepresentation::Tagged, &[0, 9, 10, 11]),
+                        };
+                        if instruction.operands.len() != inputs + 1
+                            || !instruction
+                                .operands
+                                .iter()
+                                .enumerate()
+                                .all(|(index, operand)| {
+                                    *operand
+                                        == if index < inputs {
+                                            MachineOperand::register_input(operand.value)
+                                        } else {
+                                            MachineOperand::register_output(operand.value)
+                                        }
+                                        && self.representations[operand.value.0 as usize]
+                                            == if index < inputs {
+                                                MachineRepresentation::Tagged
+                                            } else {
+                                                result
+                                            }
+                                })
+                            || !instruction
+                                .clobbers
+                                .iter()
+                                .copied()
+                                .eq(scratch.iter().copied().map(PhysicalRegister::integer))
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
                     MachineOpcode::InlineCallGuard { .. }
+                    | MachineOpcode::InlineConstructGuard { .. }
                     | MachineOpcode::InlineMethodGuard { .. } => {
                         let [input, output, late @ ..] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));

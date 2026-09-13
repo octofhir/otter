@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks and
-//!   per-node source-owned property programs.
+//!   per-node source-owned property and constructor transition programs.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, the schema-owned
@@ -15,6 +15,8 @@
 //!   raw packed-array base/length proofs.
 //!
 //! # Invariants
+//! - Constructor receiver probes and base-result selection are explicit SSA nodes;
+//!   only the full-call miss may allocate through a safepoint.
 //! - Parameters remain tagged unless their uses prove a numeric representation;
 //!   inferred Number/Int32 parameters are guarded before effects.
 //! - Empty arithmetic feedback never proves that a site is cold. Such a site
@@ -174,10 +176,25 @@ pub(super) enum NumericNode {
         source: NumericValue,
         target: u16,
     },
+    InlineConstructGuard {
+        source: NumericValue,
+        function_id: u32,
+    },
     InlineCallGuard {
         source: NumericValue,
         function_id: u32,
         this_mode: otter_vm::JitDirectCallThisMode,
+    },
+    /// Complete nursery receiver, or undefined when no allocation was committed.
+    ConstructReceiver {
+        source: NumericValue,
+        plan: otter_vm::jit::JitReceiverAllocationPlan,
+        byte_pc: u32,
+    },
+    ConstructReceiverHit(NumericValue),
+    BaseConstructResult {
+        result: NumericValue,
+        receiver: NumericValue,
     },
     BoxTagged(NumericValue),
     Binding {
@@ -542,6 +559,9 @@ impl NumericNode {
     pub(super) const fn value_type(self) -> NumericType {
         match self {
             Self::TaggedConstant(..)
+            | Self::ConstructReceiver { .. }
+            | Self::BaseConstructResult { .. }
+            | Self::InlineConstructGuard { .. }
             | Self::InlineCallGuard { .. }
             | Self::InlineMethodGuard { .. }
             | Self::BoxTagged(..)
@@ -587,7 +607,8 @@ impl NumericNode {
             Self::IntegerShiftRightLogical(..)
             | Self::CheckedFloat64ToElementIndex { .. }
             | Self::BlockParameter(NumericType::Uint32) => NumericType::Uint32,
-            Self::LessThan(..)
+            Self::ConstructReceiverHit(..)
+            | Self::LessThan(..)
             | Self::Equal(..)
             | Self::NotEqual(..)
             | Self::LessEqual(..)
@@ -643,6 +664,7 @@ impl NumericNode {
                 Some(NumericFrameStatePurpose::RuntimeMetadata)
             }
             Self::ColdCallExit { .. }
+            | Self::InlineConstructGuard { .. }
             | Self::InlineCallGuard { .. }
             | Self::InlineMethodGuard { .. }
             | Self::TaggedToNumber(..)
@@ -707,6 +729,8 @@ pub(super) struct NumericFunction {
     pub(super) function_id: u32,
     pub(super) nodes: Vec<NumericNode>,
     pub(super) property_sites: BTreeMap<NumericValue, super::super::MachinePropertySite>,
+    pub(super) constructor_field_sites:
+        BTreeMap<NumericValue, (u32, otter_vm::jit::JitConstructorFieldTransition)>,
     pub(super) blocks: Vec<NumericBlock>,
     pub(super) frame_states: Vec<NumericFrameState>,
     pub(super) direct_call_targets: Vec<NumericDirectCallTarget>,
@@ -1306,6 +1330,21 @@ impl NumericFunction {
         Some((
             Self {
                 function_id: code.id,
+                constructor_field_sites: nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, node)| {
+                        let NumericNode::ConstructorFieldStore { byte_pc, .. } = node else {
+                            return None;
+                        };
+                        Some(
+                            view.constructor_field_transitions
+                                .get(byte_pc)
+                                .cloned()
+                                .map(|program| (NumericValue(index), (code.id, program))),
+                        )
+                    })
+                    .collect::<Option<BTreeMap<_, _>>>()?,
                 property_sites: nodes
                     .iter()
                     .enumerate()
@@ -4551,6 +4590,7 @@ mod tests {
         let backedge_receiver = if varying_receiver { value(2) } else { value(1) };
         let function = NumericFunction {
             property_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
             function_id: 150,
             nodes,
             blocks: vec![

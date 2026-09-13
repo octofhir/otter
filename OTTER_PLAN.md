@@ -481,6 +481,18 @@ where licensing and determinism permit, established ECMAScript engines.
 ### J1. One compiled pipeline
 
 Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
+
+Current priority: actual Machine SSA inlining, then contextual construction and
+allocation elimination. The active scalar backend currently compiles one function
+at a time and does not consume the VM's prepared inline candidates. Its Machine
+deopt state reconstructs only one frame. Candidate preparation and compilation
+admission must not be described as optimizing inlining. Replace that limitation
+through the existing VM frame-chain contract and one HIR/allocator/emitter.
+The handoff's structural A1–A3 order supersedes the chronological next steps below.
+Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not
+addressed by repeatedly chasing1–2% local changes. The current boxed-arithmetic
+correctness checkpoint has six valid release comparisons and no new timing claim.
+
 S0 source, release and measurement validation is complete. Shared fixes cover
 committed apply lookup, cross-script compilation ownership, generated catch
 routing, explicit derived-this CFG, native leaves and boxed literal allocation
@@ -992,8 +1004,9 @@ execution profiles without introducing a second execution ABI.
 Every substantial slice defines its affected subset of these gates before
 implementation:
 
-- **Correctness:** focused unit/integration tests, no new panic or timeout, then
-  `bash scripts/gate.sh` when the focused loop is green.
+- **Correctness:** focused unit/integration tests, no new panic or timeout.
+  Reuse accepted evidence; do not run a full gate merely because focused tests
+  passed. Broaden only for a concrete newly affected boundary or release acceptance.
 - **GC:** exact rooting and `OTTER_GC_STRESS=1..16` for multi-allocation native
   paths; no conservative scan or stale raw `Value` across allocation.
 - **Conformance:** focused Test262 before/after and a full reproducible run for
@@ -1002,8 +1015,9 @@ implementation:
   denial occurs before the external effect.
 - **Resources:** named counter, limit, rejection semantics, cancellation, and
   adversarial recovery-to-baseline test.
-- **Performance:** fresh-process release A/B, unchanged checksum, predeclared
-  regression threshold, and clean-tree baseline before publication.
+- **Performance:** establish a structural effect before fresh-process release
+  measurements; unchanged checksum and recorded source/binary identity. Reuse
+  the saved baseline, never rebuild an old HEAD or time every small prerequisite.
 - **API/extensibility:** owned boundary DTOs, no VM/GC carriers, and updated
   declarations/docs/tests where JS-visible behavior changes.
 - **Architecture:** one final path; remove any replaced shim, registry, schema,

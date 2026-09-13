@@ -147,6 +147,7 @@ mod array_from_async;
 mod async_from_sync_iterator;
 mod forward_arguments;
 mod jit_call_admission;
+mod jit_forward_call;
 mod jit_global_ops;
 mod jit_iterator_ops;
 mod jit_module_ops;

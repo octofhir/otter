@@ -34,12 +34,10 @@ pub struct CodeRegistryView {
     pub context: u64,
     /// Address of a [`SafepointResolverFn`].
     pub resolve_safepoint: u64,
-    /// Bytecode function identity plus one of the most recent generated
-    /// callee whose current generation has reached the optimizing-tier
-    /// hotness threshold, or zero. Generated call linkage writes it without a
-    /// runtime call on every such entry; the VM drains it at its own safe
-    /// boundaries, so a callee that is only ever entered through generated
-    /// linkage still reaches the promotion policy.
+    /// One pending generated tier-up request: function identity plus one, or
+    /// zero. Nested callees never overwrite it. Cold policy suppresses further
+    /// requests from a generation after caching its compilation outcome, so a
+    /// rejected inner callee cannot starve its hot callers or siblings.
     pub hot_function: u64,
 }
 

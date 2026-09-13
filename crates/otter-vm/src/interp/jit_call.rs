@@ -793,8 +793,7 @@ impl Interpreter {
         Some(outcome)
     }
 
-    /// Run the promotion policy for the callee generated linkage most recently
-    /// reported hot.
+    /// Run promotion policy for the first pending generated callee request.
     ///
     /// Generated direct calls never enter through the interpreter, so their
     /// callee's entry counter would stay cold forever; the linkage instead
@@ -811,6 +810,9 @@ impl Interpreter {
             return;
         };
         let _ = self.resolve_optimized_code_for_fid(&owner, fid);
+        if self.jit_optimized_code.contains_key(&fid) {
+            self.jit_code_registry.suppress_generated_tiering(fid);
+        }
     }
 
     /// Resolve the current optimizing body, replacing the baseline generation

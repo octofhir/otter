@@ -660,29 +660,40 @@ Five valid RayTrace processes score2035 +/-4 (range2010–2043), +18.87% against
 accepted1712 +/-6; median peak RSS grows0.39%. Evidence:
 `benchmarks/results/s2-20260913-runtime-forwarding/README.md`.
 
-Next: Machine forwarding requires explicit call CFG, operand/clobber/root liveness and
-exception landing before register allocation. No larger target cap, duplicate
-frame/registry, full gate, bisect or new other-engine benchmark baseline.
+Machine forwarding now uses explicit method/callee/receiver and mapped-register
+SSA inputs in the existing DirectCall descriptor, with precise roots, clobbers,
+result/exception edges and current-home loads after capture GC. The shared native
+entry handles runtime-selected targets and dynamic actuals. Cold stub94 was
+replaced in place with one committed boxed-value/NativeResultPair boundary used
+by both tiers; no register-window replay path remains. A separate leaf probe
+handles source materialization before effects.
+
+Generated tier-up preserves the first pending request instead of allowing nested
+callees to overwrite it. Cold policy suppresses resubmission after a cached
+compile outcome; eligibility belongs to each generation and occupies existing
+entry-cell padding. Thresholds and feedback-stability policy are unchanged.
+
+Runtime forwarding12/12 and selected Machine/native/cold-throw/materialized-getter
+cases under GC+verify1/4/16 pass, as do executable tier-request and registry
+lifecycle units, the committed descriptor unit and scoped VM/JIT clippy.
+Tests require actual Machine compilation and settled native entry counters.
+Reading `.apply` inside a local catch remains a property-CFG limitation; the
+exception regression catches through an independently optimized caller.
+
+First release candidate passed18 affected comparisons and compiled real
+RayTrace function535 into Machine, but five samples1966 +/-12 regressed3.39%.
+Moving redundant readiness checking from native hits to cold completion recovers
+1.83%: corrected release6/6, five RayTrace samples2002 +/-10, range1975–2012,
+RSS151420928 (-0.55%). Custom-apply and Machine exception tests pass, including
+GC1/4/16. This semantically verified checkpoint remains1.62% below the best
+2035 +/-4 baseline; performance debt stays open. Current release binary is the
+2002 candidate. Next source work targets observed Throw/NewError declines in
+subtract/renderScene through existing Machine/value contracts.
+No full gate, bisect, second build tree or repeated
+other-engine baseline. Evidence:
+`benchmarks/results/s2-20260913-machine-forwarding/README.md`.
 The authoritative handoff is `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`;
 superseded history stays in `scratchpad/JIT_LANE_HISTORY_2026_09_13.md`.
-
-Machine forwarding preparation now preserves implicit mapped-register inputs in
-instruction liveness, including destination aliasing, using the CodeBlock's exact
-argument/storage map. A focused mapped/unmapped/captured unit and scoped VM/JIT
-clippy pass. HIR admission remains closed until those values are explicit call
-operands and roots, the dynamic frame uses stable caller-home addressing after
-capture GC, and the committed cold sibling returns a pure exception value.
-Evidence: `benchmarks/results/s2-20260913-machine-forward-liveness/README.md`.
-No release or benchmark was repeated for this prerequisite.
-
-Shared forwarding now separates the incoming/captured leaf copy from generated
-mapped-register stores. The latter read current homes after capture allocation,
-using a caller base recovered from existing linkage controls even with dynamic
-SP. Both Template dispatch forms use this path; no temporary value packet or
-stale NativeFrame-register fallback. Forwarding10/10, an executed AArch64
-fixed/dynamic-base test, saturation GC1/4/16 and scoped VM/JIT clippy pass.
-Machine HIR/root/cold-value integration remains open. Evidence:
-`benchmarks/results/s2-20260913-forward-register-homes/README.md`.
 
 The intended replacement path remains:
 

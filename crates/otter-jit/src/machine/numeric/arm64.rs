@@ -87,6 +87,7 @@
 // register encoding. Clippy sees the macro expansion as an identity conversion.
 #![allow(clippy::useless_conversion)]
 
+mod forward_call;
 mod value_span;
 use value_span::emit_value_span_arguments;
 
@@ -2863,6 +2864,33 @@ pub(super) fn emit(
                         1
                     };
                     let call_with_this_guard_miss = ops.new_dynamic_label();
+                    if *kind == DirectCallKind::Forward {
+                        let start = ops.offset().0;
+                        forward_call::emit(
+                            &mut ops,
+                            &mut relocations,
+                            view,
+                            transitions,
+                            instruction,
+                            frame,
+                            site,
+                            locations,
+                            result_index,
+                            *logical_pc,
+                            *byte_pc,
+                            call_with_this_guard_miss,
+                            finish_error,
+                            direct_threw,
+                            fatal,
+                            direct_done,
+                        )?;
+                        structural_regions.push((
+                            "machineForwardCall",
+                            Some(*byte_pc),
+                            start,
+                            ops.offset().0,
+                        ));
+                    }
                     let arguments = (first_argument..result_index)
                         .map(|index| {
                             u16::try_from(index).map_err(|_| {
@@ -2882,6 +2910,11 @@ pub(super) fn emit(
                         let method_guard_miss =
                             next_method_candidate.unwrap_or(final_method_guard_miss);
                         let form = match kind {
+                            DirectCallKind::Forward => {
+                                return Err(Unsupported::OperandShape(
+                                    "forward call has no baked candidates",
+                                ));
+                            }
                             DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
                             DirectCallKind::CallWithThis => DirectCallForm::CallWithThis {
                                 callable: 0,
@@ -3092,12 +3125,19 @@ pub(super) fn emit(
                             dynasm!(ops ; .arch aarch64 ; =>next_method_candidate);
                         }
                     }
-                    if matches!(kind, DirectCallKind::Method | DirectCallKind::CallWithThis)
-                        || (*kind == DirectCallKind::Construct && candidates.is_empty())
+                    if matches!(
+                        kind,
+                        DirectCallKind::Method
+                            | DirectCallKind::CallWithThis
+                            | DirectCallKind::Forward
+                    ) || (*kind == DirectCallKind::Construct && candidates.is_empty())
                     {
                         if *kind == DirectCallKind::Method {
                             dynasm!(ops ; .arch aarch64 ; =>final_method_guard_miss);
-                        } else if *kind == DirectCallKind::CallWithThis {
+                        } else if matches!(
+                            kind,
+                            DirectCallKind::CallWithThis | DirectCallKind::Forward
+                        ) {
                             // A candidate reaches the loop's end with its
                             // roots still published. The linkage's guard miss
                             // restored the allocator registers and cleared
@@ -3113,7 +3153,24 @@ pub(super) fn emit(
                             emit_publish_machine_roots(&mut ops, frame, site)?;
                             dynasm!(ops ; .arch aarch64 ; =>generic_ready);
                         }
+                        if *kind == DirectCallKind::Forward {
+                            forward_call::emit_cold_source_admission(
+                                &mut ops,
+                                &mut relocations,
+                                transitions,
+                                instruction,
+                                frame,
+                                site,
+                                direct_bail,
+                            )?;
+                        }
                         let (generic_entry, generic_stub, generic_region) = match kind {
+                            DirectCallKind::Forward => (
+                                transitions
+                                    .entry(otter_vm::native_abi::STUB_JIT_CALL_FORWARD_ARGUMENTS),
+                                otter_vm::native_abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
+                                "machineGenericForwardCall",
+                            ),
                             DirectCallKind::Method => (
                                 call_method_value_entry,
                                 STUB_JIT_CALL_METHOD_VALUE,

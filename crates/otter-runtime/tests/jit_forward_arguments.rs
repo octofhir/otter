@@ -512,3 +512,188 @@ nativeSum;
         );
     }
 }
+
+#[test]
+fn machine_forwarding_keeps_saturated_native_hits_and_live_bindings() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .build()
+        .expect("runtime");
+    runtime
+        .run_script(
+            SourceInput::from_javascript(include_str!(
+                "../../otter-difftest/corpus/forward_arguments_saturated.js"
+            )),
+            "machine-forward-setup.js",
+        )
+        .expect("warm saturated callables");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var machineSum = 0;
+for (var machineI = 0; machineI < 16000; machineI++) {
+  selected = targets[machineI % targets.length];
+  machineSum += forward(machineI, 2, {value: 7});
+}
+machineSum;
+"#,
+            ),
+            "machine-forward-hot.js",
+        )
+        .expect("Machine forwards");
+    assert_eq!(result.completion_string(), "128164432");
+    let compiled = result
+        .jit_artifacts()
+        .expect("artifacts")
+        .bundles()
+        .iter()
+        .any(|bundle| {
+            bundle.manifest().function_name() == "forward"
+                && bundle
+                    .file(otter_runtime::JitArtifactFileName::OptimizedIr)
+                    .is_some()
+                && bundle
+                    .file(otter_runtime::JitArtifactFileName::CodeMap)
+                    .is_some_and(|file| {
+                        std::str::from_utf8(file.contents())
+                            .expect("code map")
+                            .contains("machineForwardCall")
+                    })
+        });
+    assert!(
+        compiled,
+        "forward must reach Machine: {:?}",
+        result.jit_debug_report()
+    );
+    let before = runtime.execution_stats();
+    let probe = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var settledMachineSum = 0;
+for (var settledI = 0; settledI < 512; settledI++) {
+  selected = targets[settledI % targets.length];
+  settledMachineSum += forward(settledI, 2, {value: 7});
+}
+settledMachineSum;
+"#,
+            ),
+            "machine-forward-settled.js",
+        )
+        .expect("settled Machine forwards");
+    assert_eq!(probe.completion_string(), "136324");
+    let after = runtime.execution_stats();
+    let native = after.jit_generated_calls - before.jit_generated_calls;
+    let rooted = after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
+    assert!(native >= 512, "native={native}");
+    assert!(rooted < 64, "rooted={rooted}");
+    let custom = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var customApplyCalls = 0;
+selected = targets[0];
+selected.apply = function(receiver, list) {
+  customApplyCalls++;
+  return list[0] + list[2].value + list.length;
+};
+function customCaller(i) { return forward(i, 2, {value: 7}); }
+var customSum = 0;
+for (var customI = 0; customI < 128; customI++) customSum += customCaller(customI);
+JSON.stringify([customSum, customApplyCalls]);
+"#,
+            ),
+            "machine-forward-custom-apply.js",
+        )
+        .expect("materialize before custom apply");
+    assert_eq!(custom.completion_string(), "[9536,128]");
+}
+
+#[test]
+fn machine_forwarding_commits_native_and_cold_throws_into_machine_caller() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .build()
+        .expect("runtime");
+    let warm = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var thrownToken = {name: "forward-error"};
+var callEffects = 0;
+function throwTarget(x) {
+  callEffects++;
+  if (x < 0) throw thrownToken;
+  return x + 1;
+}
+var throwSelected = throwTarget;
+function throwingForward(x) { return throwSelected.apply(null, arguments); }
+function catchingForward(x) {
+  try { return throwingForward(x); }
+  catch (error) { return error === thrownToken ? 1000 : -1; }
+}
+// Nested generated callees each need stable samples at the 4096-backedge poll.
+var warmResult = 0;
+for (var warmI = 0; warmI < 56000; warmI++) warmResult += catchingForward(warmI);
+warmResult;
+"#,
+            ),
+            "machine-forward-catch-warm.js",
+        )
+        .expect("warm catch forwarder");
+    assert_eq!(warm.completion_string(), "1568028000");
+    assert!(
+        warm.jit_artifacts()
+            .expect("artifacts")
+            .bundles()
+            .iter()
+            .any(
+                |bundle| bundle.manifest().function_name() == "throwingForward"
+                    && bundle
+                        .file(otter_runtime::JitArtifactFileName::OptimizedIr)
+                        .is_some()
+                    && bundle
+                        .file(otter_runtime::JitArtifactFileName::CodeMap)
+                        .is_some_and(|file| std::str::from_utf8(file.contents())
+                            .expect("code map")
+                            .contains("machineForwardCall"))
+            ),
+        "throwing forwarder must reach Machine: {:?}",
+        warm.jit_debug_report()
+    );
+    assert!(
+        warm.jit_artifacts()
+            .expect("artifacts")
+            .bundles()
+            .iter()
+            .any(
+                |bundle| bundle.manifest().function_name() == "catchingForward"
+                    && bundle
+                        .file(otter_runtime::JitArtifactFileName::OptimizedIr)
+                        .is_some()
+            ),
+        "catching caller must reach Machine: {:?}",
+        warm.jit_debug_report()
+    );
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var caughtSum = 0;
+for (var throwI = 0; throwI < 512; throwI++) caughtSum += catchingForward(-1);
+if (callEffects !== 56512 || caughtSum !== 512000) throw new Error("native throw replay");
+throwSelected = Math.max;
+var coercionEffects = 0;
+var throwingNumber = {valueOf: function() {coercionEffects++; throw thrownToken;}};
+for (var coldI = 0; coldI < 128; coldI++) caughtSum += catchingForward(throwingNumber);
+JSON.stringify([caughtSum, coercionEffects, callEffects]);
+"#,
+            ),
+            "machine-forward-catch-probe.js",
+        )
+        .expect("native/cold catch completion");
+    assert_eq!(result.completion_string(), "[640000,128,56512]");
+}

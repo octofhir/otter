@@ -340,6 +340,14 @@ impl JitCodeRegistry {
             .map_or(0, |cell| cell.generated_entries.get())
     }
 
+    /// A cached compile outcome makes repeated requests from this generation
+    /// redundant. A future replacement owns its own fresh eligibility bit.
+    pub(crate) fn suppress_generated_tiering(&self, function_id: u32) {
+        if let Some((_, generation)) = self.published_function_entry(function_id) {
+            generation.generated_tiering_enabled.set(0);
+        }
+    }
+
     /// Resolve one stable function entry into the complete tier-neutral
     /// direct-call plan consumed by generated frame construction.
     ///
@@ -975,6 +983,45 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
+    }
+
+    #[test]
+    fn generated_tiering_suppression_belongs_to_one_generation() {
+        let mut registry = JitCodeRegistry::new_boxed();
+        for (id, tier, expected) in [
+            (301, NativeFrameKind::Baseline, 1),
+            (302, NativeFrameKind::Baseline, 1),
+            (303, NativeFrameKind::Optimizing, 0),
+        ] {
+            let code: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+                id,
+                function_id: 7,
+                tier,
+                native_frame_bytes: 64,
+                parameter_prefix_entry: false,
+            });
+            assert!(registry.register_generation(id, code, 0, 4));
+            assert_eq!(
+                registry
+                    .published_function_entry(7)
+                    .unwrap()
+                    .1
+                    .generated_tiering_enabled
+                    .get(),
+                expected
+            );
+            registry.suppress_generated_tiering(7);
+            assert_eq!(
+                registry
+                    .published_function_entry(7)
+                    .unwrap()
+                    .1
+                    .generated_tiering_enabled
+                    .get(),
+                0
+            );
+        }
+        registry.suppress_generated_tiering(999);
     }
 
     #[test]

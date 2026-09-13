@@ -3,13 +3,13 @@
 //! # Contents
 //! - Intrinsic-apply/live-argument probes before native target admission.
 //! - Bounded exact identity selection and general current-generation dispatch.
-//! - Committed runtime completion for every pre-entry miss.
+//! - Source-materialization exits and committed value completion.
 //!
 //! # Invariants
 //! - x8 retains the probed actual count across identity selection. The shared
 //!   plain-call proof uses other scratch registers and saves the count before GC.
-//! - No source lookup or getter is replayed. Every direct rejection joins the
-//!   existing committed forwarding boundary with the original operands intact.
+//! - An admitted source completes native misses through one pure-value boundary.
+//!   A stack-owned source needing materialization exits before the call effect.
 //! - Saturation or a bounded miss still permits general native target admission;
 //!   both paths share entry cells, native frames, roots and completion contracts.
 //!
@@ -22,7 +22,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::{JitCompileSnapshot, JitCompilerDiagnostic, native_abi as abi};
 
 use super::{
-    calls, transitions,
+    calls,
     values::{
         CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_u64,
         emit_store_reg,
@@ -209,15 +209,44 @@ pub(super) fn emit_forward_call(
         |ops, reg, _| emit_load_reg(ops, 14, reg),
     )?;
     dynasm!(ops ; .arch aarch64 ; =>canonical);
-    transitions::emit_call_forward_arguments(
+    emit_load_reg(ops, 1, method)?;
+    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+    emit_load_runtime_stub(
         ops,
         relocations,
-        table,
-        [dst, method, callee, receiver],
-        bail,
-        threw,
-        fatal,
+        16,
+        table.entry(abi::STUB_JIT_FORWARD_SOURCE_READY),
+        abi::STUB_JIT_FORWARD_SOURCE_READY,
     );
+    dynasm!(ops ; .arch aarch64 ; blr x16 ; cbz x0, =>bail);
+    let mut words = vec![method, callee, receiver];
+    words.extend(
+        view.code_block
+            .forwarded_argument_bindings()
+            .filter_map(|(_, storage)| match storage {
+                otter_bytecode::ArgumentBindingStorage::Register { reg } => Some(reg),
+                otter_bytecode::ArgumentBindingStorage::Upvalue { .. } => None,
+            }),
+    );
+    if words.len() > 510 {
+        // The canonical frame is reconstructed before the call has effects.
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
+    } else {
+        let words = words
+            .into_iter()
+            .map(super::value_packet::PacketWord::Register)
+            .collect::<Vec<_>>();
+        super::value_packet::emit_value_packet_transition(
+            ops,
+            relocations,
+            table,
+            abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
+            &words,
+            dst,
+            throw_value,
+            fatal,
+        )?;
+    }
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

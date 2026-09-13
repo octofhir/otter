@@ -466,6 +466,9 @@ pub enum DirectCallKind {
     /// candidate, and every guard miss or absent candidate completes through
     /// the generic explicit-receiver value call.
     CallWithThis,
+    /// Intrinsic apply forwarding with explicit method/callee/receiver and live
+    /// register bindings; runtime selection follows the permanent entry cell.
+    Forward,
     /// Method call whose receiver/prototype chain and current callable must be
     /// revalidated immediately before native entry.
     Method,
@@ -509,10 +512,12 @@ pub enum ColdCallKind {
     Method,
 }
 
-/// How a generated call obtains the callee's declared parameter prefix.
+/// How a call descriptor represents its explicit input operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectCallArgumentMode {
-    /// Each argument is an explicit machine operand.
+    /// Each input is an explicit machine operand. Forward calls carry method,
+    /// callee, receiver and register bindings here; the forwarded actual count
+    /// is dynamic and belongs to the source activation.
     Fixed,
     /// One machine operand names the compiler-created dense argument array.
     Spread,
@@ -2428,13 +2433,20 @@ impl InstructionSequence {
                                 })
                         }
                         CallTarget::Direct {
-                            kind, candidates, ..
+                            kind,
+                            candidates,
+                            argument_mode,
+                            ..
                         } => {
                             let method = *kind == DirectCallKind::Method;
                             let count = candidates.len();
                             let valid_count = if method {
                                 !descriptor.arguments.is_empty()
                                     && count <= MAX_MACHINE_DIRECT_METHOD_TARGETS
+                            } else if *kind == DirectCallKind::Forward {
+                                descriptor.arguments.len() >= 3
+                                    && count == 0
+                                    && *argument_mode == DirectCallArgumentMode::Fixed
                             } else if *kind == DirectCallKind::CallWithThis {
                                 descriptor.arguments.len() >= 2 && count <= 1
                             } else if *kind == DirectCallKind::Construct {

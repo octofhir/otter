@@ -6,6 +6,8 @@
 //! - Two forwards in one activation whose `apply` methods are overridden,
 //!   observing the mapped arguments object and its identity.
 //! - An arrow referencing the enclosing activation's `arguments`.
+//! - Live mapped parameters and mutated/materialized argument lists, including
+//!   allocating length coercion and index getters.
 //!
 //! # Invariants
 //! - Bodies that only forward `arguments` never materialize the object on
@@ -203,6 +205,29 @@ reads + "|" + calls + "|" + sum;
         assert_eq!(
             result.completion_string(),
             "6000|6000|17997000",
+            "{selection:?}"
+        );
+    }
+}
+
+#[test]
+fn forwarded_arguments_read_live_mappings_and_materialized_objects() {
+    let source = include_str!("../../otter-difftest/corpus/forward_arguments_live.js");
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .run_script(SourceInput::from_javascript(source), "forward-live.js")
+            .unwrap_or_else(|error| panic!("{selection:?}: {error:?}"));
+        assert_eq!(
+            result.completion_string(),
+            "[210000,[\"42\",\"1,9,3\",\"1\",\"1\",\"1\",\"43,99\"],64,128,64,64,0]",
             "{selection:?}"
         );
     }

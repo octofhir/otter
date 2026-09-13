@@ -3508,7 +3508,6 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let method = *read_register(&stack[top_idx], method_reg)?;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)?;
         if crate::method_ops::is_function_prototype_intrinsic_value(
             method,
             &self.gc_heap,
@@ -3517,10 +3516,25 @@ impl Interpreter {
             if !self.is_callable_runtime(&callee) {
                 return Err(VmError::NotCallable);
             }
-            let forwarded: SmallVec<[Value; 8]> = self
+            let existing = self
                 .frame_cold(&stack[top_idx])
-                .map(|cold| cold.incoming_args.iter().copied().collect())
-                .unwrap_or_default();
+                .and_then(|cold| cold.arguments_object);
+            let forwarded = if let Some(arguments) = existing {
+                self.create_list_from_array_like(stack, context, arguments)?
+            } else {
+                let mut forwarded: SmallVec<[Value; 8]> = self
+                    .frame_cold(&stack[top_idx])
+                    .map(|cold| cold.incoming_args.iter().copied().collect())
+                    .unwrap_or_default();
+                self.refresh_mapped_argument_values(
+                    function,
+                    &crate::ActiveFrameRef::materialized(&stack[top_idx]),
+                    &mut forwarded,
+                )?;
+                forwarded
+            };
+            let callee = *read_register(&stack[top_idx], callee_reg)?;
+            let this_value = *read_register(&stack[top_idx], this_reg)?;
             stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &callee, this_value, forwarded, dst);
         }

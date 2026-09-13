@@ -18,6 +18,8 @@
 //!   method lookup, matching interpreter dispatch and invalidating any stale
 //!   cold-exit snapshot even when lookup throws.
 //! - Spread validation order matches interpreter dispatch.
+//! - Elided mapped arguments read live parameter cells; after materialization,
+//!   forwarding reads the actual arguments object through CreateListFromArrayLike.
 //!
 //! # See also
 //! - [`crate::Interpreter::do_call_spread`]
@@ -469,7 +471,6 @@ impl Interpreter {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let method = frame.read(method_reg)?;
         let callee = frame.read(receiver_reg)?;
-        let this_value = frame.read(this_reg)?;
         let intrinsic_apply = crate::method_ops::is_function_prototype_intrinsic_value(
             method,
             &self.gc_heap,
@@ -479,17 +480,33 @@ impl Interpreter {
             if !self.is_callable_runtime(&callee) {
                 return Err(VmError::NotCallable);
             }
-            let forwarded = match (frame.incoming_argument_count(), materialized_frame_index) {
-                (Some(count), _) => (0..count)
-                    .map(|index| frame.incoming_argument(index))
-                    .collect::<Result<_, _>>()?,
-                (None, Some(frame_index)) => self
-                    .frame_cold(stack.get(frame_index).ok_or(VmError::InvalidOperand)?)
-                    .map(|cold| cold.incoming_args.iter().copied().collect())
-                    .unwrap_or_default(),
-                (None, None) => return Err(VmError::InvalidOperand),
+            let existing = materialized_frame_index
+                .and_then(|index| stack.get(index))
+                .and_then(|frame| self.frame_cold(frame))
+                .and_then(|cold| cold.arguments_object);
+            let forwarded = if let Some(arguments) = existing {
+                self.create_list_from_array_like(stack, context, arguments)?
+            } else {
+                let mut forwarded =
+                    match (frame.incoming_argument_count(), materialized_frame_index) {
+                        (Some(count), _) => (0..count)
+                            .map(|index| frame.incoming_argument(index))
+                            .collect::<Result<SmallVec<[Value; 8]>, _>>()?,
+                        (None, Some(frame_index)) => self
+                            .frame_cold(stack.get(frame_index).ok_or(VmError::InvalidOperand)?)
+                            .map(|cold| cold.incoming_args.iter().copied().collect())
+                            .unwrap_or_default(),
+                        (None, None) => return Err(VmError::InvalidOperand),
+                    };
+                let function = context
+                    .exec_function(frame.function_id())
+                    .ok_or(VmError::InvalidOperand)?;
+                self.refresh_mapped_argument_values(function, &frame.as_ref(), &mut forwarded)?;
+                forwarded
             };
-            (callee, this_value, forwarded)
+            // Array-like length/index getters can collect or reenter. Keep the
+            // committed callee lookup and receiver in their traced frame slots.
+            (frame.read(receiver_reg)?, frame.read(this_reg)?, forwarded)
         } else {
             let Some(frame_index) = materialized_frame_index else {
                 return Ok(false);
@@ -513,6 +530,33 @@ impl Interpreter {
         let result = self.run_rooted_call_values(stack, context, target, receiver, args)?;
         frame.write(dst, result)?;
         Ok(true)
+    }
+
+    /// Refresh the mapped prefix of an elided arguments list from the same
+    /// parameter storage an arguments exotic object would read. Extra actuals,
+    /// strict/unmapped parameters and absent actuals keep their incoming values.
+    /// No allocation or JavaScript reentry occurs while the frame is borrowed.
+    pub(crate) fn refresh_mapped_argument_values(
+        &self,
+        function: &crate::executable::CodeBlock,
+        frame: &crate::ActiveFrameRef<'_>,
+        arguments: &mut [Value],
+    ) -> Result<(), VmError> {
+        if function.arguments_object_kind != ArgumentsObjectKind::Mapped {
+            return Ok(());
+        }
+        for binding in &function.mapped_argument_bindings {
+            let Some(value) = arguments.get_mut(binding.argument_index as usize) else {
+                continue;
+            };
+            *value = match binding.storage {
+                ArgumentBindingStorage::Register { reg } => frame.read(reg)?,
+                ArgumentBindingStorage::Upvalue { idx } => {
+                    crate::upvalue::read_upvalue(&self.gc_heap, frame.upvalue(u32::from(idx))?)
+                }
+            };
+        }
+        Ok(())
     }
 
     /// Parameter bindings that alias the arguments object's indexed entries,

@@ -560,6 +560,39 @@ benchmark repeat is needed. The handoff records the complete writable-data
 prototype proof, descriptor invalidation requirements and scratch-register
 contract before enabling the new native path.
 
+Native writable-data transitions landed in signed `472563aa`. The single
+VM-owned way now carries an explicit prototype proof (24 bytes), and both tiers
+check live shape/descriptor/sidecar state before receiver mutation. Focused GC
+stress also exposed and repaired stale Proxy receiver/descriptor operands.
+Nine runtime tests pass at GC strides1..16; scoped clippy, the cell-fill unit
+and three release differential cases pass. RayTrace is1712 ± 6 versus1311 ± 1
+(+30.59%, five valid fresh processes, same source hash, RSS +0.12%). Runtime
+store capture fell from10,330,955 observations to2100; Vector/Color fields now
+enter the runtime twice each with native ways. Full evidence is in
+`benchmarks/results/s1-20260913-native-writable/README.md`.
+
+A single sustained profile of that accepted binary has2757 isolate stacks:
+forwarded-call ancestry960, runtime property load534, base constructor prepare487,
+runtime property store1. These inclusive rows overlap and include callee work;
+they are not pure overhead percentages. Source and events show the shared
+Class.create trampoline is polymorphic, so a monomorphic-only forwarded-call
+implementation would miss the measured hotspot. See
+`benchmarks/results/s1-20260913-native-profile/README.md`.
+
+Forwarded argument semantics required repair before generated copying: mapped
+parameters must read their live bindings; once an arguments object has been
+exposed, subsequent intrinsic apply observes its actual length/index properties.
+Both interpreter and generated runtime completion now follow that rule. Generic
+array-like collection roots its source and earlier arguments across allocating
+length coercion and indexed getters. Five focused forwarding tests, including
+these mutations and abrupt getters, pass normally and with GC+verification1..16.
+Scoped VM clippy and three affected release differential cases also pass, with
+one release build. Evidence: `benchmarks/results/s2-20260913-live-forward-arguments/`.
+No throughput measurement is attributed to this correctness build.
+This is the S2 semantic prerequisite; the generated direct-forward path remains
+open and must handle the measured polymorphic target and the full live argument
+span, preserving the already-committed apply lookup.
+
 The intended replacement path remains:
 
 ```text

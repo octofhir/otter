@@ -9,6 +9,7 @@
 //! - Class constructor wrapper construction for `MakeClass`.
 //! - `Function.prototype.bind` metadata and bound-function construction.
 //! - Own callable descriptors, including accessor invocation on property loads.
+//! - Array-like argument collection with roots across observable getters.
 //!
 //! # Invariants
 //! - Own callable accessors run with the callable as receiver; data-only
@@ -20,6 +21,8 @@
 //! - Function property-descriptor results remain in a handle-arena slot across
 //!   every field write; shape allocation never leaves the builder with a stale
 //!   raw object handle.
+//! - Array-like collection keeps the source and earlier arguments rooted while
+//!   length coercion or later indexed getters allocate and reenter.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -1159,21 +1162,30 @@ impl Interpreter {
                 ("Function.prototype.apply argument list must be object-like".to_string()).into(),
             ));
         }
-        let length = self.get_property_value_for_call(stack, context, value, "length")?;
-        // §7.3.18 step 3 — `len = ? ToLength(? Get(obj, "length"))`. The
-        // §7.1.4 ToNumber inside ToLength fires a `valueOf` /
-        // `@@toPrimitive` hook on an object-valued `length`, so coerce
-        // with the execution context here rather than through the
-        // infallible primitive-only `to_length` (which would read an
-        // object as NaN -> 0).
-        let length_num = self.coerce_to_number(stack, context, &length)?;
-        let len = to_length(&Value::number(length_num), &self.gc_heap)?;
-        let mut values = SmallVec::new();
-        for index in 0..len {
-            let key = index.to_string();
-            values.push(self.get_property_value_for_call(stack, context, value, &key)?);
-        }
-        Ok(values)
+        self.with_handle_scope(|interp, scope| {
+            let source = interp.scoped_value(scope, value);
+            let length = interp.get_property_value_for_call(stack, context, value, "length")?;
+            // ToLength and every indexed getter may allocate or reenter.
+            // Retain both the array-like source and all earlier result values
+            // in the arena until the complete argument list is ready.
+            let length_num = interp.coerce_to_number(stack, context, &length)?;
+            let len = to_length(&Value::number(length_num), &interp.gc_heap)?;
+            let mut values = SmallVec::<[_; 8]>::new();
+            for index in 0..len {
+                let key = index.to_string();
+                let value = interp.get_property_value_for_call(
+                    stack,
+                    context,
+                    interp.escape_scoped(source),
+                    &key,
+                )?;
+                values.push(interp.scoped_value(scope, value));
+            }
+            Ok(values
+                .into_iter()
+                .map(|value| interp.escape_scoped(value))
+                .collect())
+        })
     }
 
     /// Public `[[Get]]` for host code (e.g. `assert.throws` inspecting a thrown

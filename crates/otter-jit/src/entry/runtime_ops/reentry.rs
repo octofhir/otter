@@ -13,6 +13,7 @@
 //! - Pure-exception routing for Template propagation and local handlers.
 //! - Reentrant equality, typed numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
+//! - Inline deopt reconstructs exact this/closure bindings from allocator recipes.
 //!
 //! # Invariants
 //! Every entry receives a live JIT context whose canonical
@@ -203,9 +204,9 @@ pub(crate) extern "C" fn jit_acknowledge_caught_throw_stub(ctx: *mut JitCtx) -> 
 /// function was entered, which is what lets a unit with spliced frames be a
 /// generated direct-call target like any other.
 ///
-/// A rebuilt spliced frame draws no upvalue spine: eligibility declines a
-/// candidate whose body reads or writes a captured binding, so no instruction
-/// the rebuilt body can reach observes one.
+/// Each spliced frame restores the exact callable from its entry recipe; the
+/// VM derives its captured-cell spine from that live closure. Caller and callee
+/// bindings must never be substituted merely because their function ids match.
 pub(crate) extern "C" fn jit_deopt_writeback_stub(
     ctx: *mut JitCtx,
     exit_index: u64,
@@ -352,7 +353,10 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
             Some(entry) => (
                 entry.return_register,
                 entry.this.repr.reconstitute(slot_raw(entry.this.location)),
-                otter_vm::Value::undefined(),
+                entry
+                    .closure
+                    .repr
+                    .reconstitute(slot_raw(entry.closure.location)),
             ),
         };
         frames.push(otter_vm::jit::JitDeoptFrame {

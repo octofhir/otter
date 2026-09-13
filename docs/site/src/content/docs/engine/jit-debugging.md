@@ -746,8 +746,11 @@ All joins use the same `code.bin` offset basis:
   `runtimeAddressRange` as hexadecimal text, allowing a process-local native
   program counter to join the owning code object before applying offsets;
 - `relocations.json` describes the symbolic meaning of baked-address ranges;
-- `deopt.json` supplies frame reconstruction for a `deoptExitId` named by the
-  code map or assembly annotation;
+- `deopt.json` supplies outermost-first frame reconstruction for a `deoptExitId`
+  named by the code map or assembly annotation. Each frame includes its function,
+  byte PC and register recipes. The outermost `entry` is null; nested entries
+  contain `returnRegister`, `this` and `closure` recipes using the same location
+  and representation fields as ordinary slots;
 - `safepoints.json` supplies tagged frame/register/spill locations by
   safepoint id and frame state.
 

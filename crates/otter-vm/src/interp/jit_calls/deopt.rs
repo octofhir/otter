@@ -16,6 +16,8 @@
 //! - Register values are attached/copied exactly once after the side exit.
 //! - The direct-eval environment is moved exactly once from the published
 //!   native frame into the fully published outer materialized frame.
+//! - Inline chains return a complete result for materialized and stack-owned
+//!   native entries alike; their published outer frame retains its GC lifetime.
 //! - Every rebuilt frame receives the exact static catch-only handler stack for
 //!   its resume PC before interpreter dispatch can observe it.
 //! - Every temporary materialized frame and register window is removed before
@@ -201,12 +203,7 @@ impl Interpreter {
         // bounded reoptimization budget. An installed generation that keeps
         // exiting is discarded on the same rule as every other entry path.
         let outermost = frames.first().ok_or(VmError::InvalidOperand)?;
-        if native.header.function_id != outermost.callee_fid
-            || native
-                .header
-                .flags
-                .contains(NativeFrameFlags::STACK_REGISTERS)
-        {
+        if native.header.function_id != outermost.callee_fid {
             return Err(VmError::InvalidOperand);
         }
         self.note_jit_optimized_bail(outermost.callee_fid, outermost.callee_pc);
@@ -361,58 +358,66 @@ mod tests {
 
     #[test]
     fn every_spliced_frame_rebuilds_its_own_catch_stack() {
-        let context = context(vec![catch_function(0), catch_function(1)]);
-        let mut interpreter = Interpreter::new();
-        let mut stack = ActivationStack::new();
-        let thrown = Value::number_i32(73);
-        let eval_env = crate::eval_env::alloc_eval_env(&mut interpreter.gc_heap, None)
-            .expect("inline eval env");
-        let mut native = NativeFrame::new(
-            crate::native_abi::VmFrameHeader {
-                function_id: 0,
-                pc: 1,
-                register_count: 0,
-                kind: crate::native_abi::NativeFrameKind::Optimizing,
-                flags: NativeFrameFlags::empty(),
-            },
-            0,
-            Value::function(0),
-            Value::undefined(),
-        );
-        native.set_eval_env(Some(eval_env));
-        let frames = [
-            jit::JitDeoptFrame {
-                callee_fid: 0,
-                callee_pc: 1,
-                return_register: 0,
-                this: Value::undefined(),
-                closure: Value::function(0),
-                registers: vec![Value::undefined(), Value::undefined()],
-            },
-            jit::JitDeoptFrame {
-                callee_fid: 1,
-                callee_pc: 1,
-                return_register: 0,
-                this: Value::undefined(),
-                closure: Value::function(1),
-                registers: vec![thrown, Value::undefined()],
-            },
-        ];
+        for stack_owned in [false, true] {
+            let context = context(vec![catch_function(0), catch_function(1)]);
+            let mut interpreter = Interpreter::new();
+            let mut stack = ActivationStack::new();
+            let thrown = Value::number_i32(73);
+            let eval_env = crate::eval_env::alloc_eval_env(&mut interpreter.gc_heap, None)
+                .expect("inline eval env");
+            let mut native = NativeFrame::new(
+                crate::native_abi::VmFrameHeader {
+                    function_id: 0,
+                    pc: 1,
+                    register_count: 0,
+                    kind: crate::native_abi::NativeFrameKind::Optimizing,
+                    flags: NativeFrameFlags::empty(),
+                },
+                0,
+                Value::function(0),
+                Value::undefined(),
+            );
+            let mut native_registers = [Value::undefined(); 2];
+            if stack_owned {
+                native.register_base = native_registers.as_mut_ptr() as u64;
+                native.header.register_count = 2;
+                native.set_stack_registers();
+            }
+            native.set_eval_env(Some(eval_env));
+            let frames = [
+                jit::JitDeoptFrame {
+                    callee_fid: 0,
+                    callee_pc: 1,
+                    return_register: 0,
+                    this: Value::undefined(),
+                    closure: Value::function(0),
+                    registers: vec![Value::undefined(), Value::undefined()],
+                },
+                jit::JitDeoptFrame {
+                    callee_fid: 1,
+                    callee_pc: 1,
+                    return_register: 0,
+                    this: Value::undefined(),
+                    closure: Value::function(1),
+                    registers: vec![thrown, Value::undefined()],
+                },
+            ];
 
-        let result = interpreter
-            .with_runtime_turn(&mut stack, |turn| {
-                let (interpreter, stack) = turn.into_parts();
-                interpreter.jit_deopt_materialize_inline_frames(
-                    &context,
-                    stack,
-                    &mut native,
-                    &frames,
-                )
-            })
-            .expect("both nested catches resume");
-        assert_eq!(result, thrown);
-        assert!(native.eval_env().is_none());
-        assert!(stack.is_empty());
+            let result = interpreter
+                .with_runtime_turn(&mut stack, |turn| {
+                    let (interpreter, stack) = turn.into_parts();
+                    interpreter.jit_deopt_materialize_inline_frames(
+                        &context,
+                        stack,
+                        &mut native,
+                        &frames,
+                    )
+                })
+                .expect("both nested catches resume");
+            assert_eq!(result, thrown);
+            assert!(native.eval_env().is_none());
+            assert!(stack.is_empty());
+        }
     }
 
     #[test]

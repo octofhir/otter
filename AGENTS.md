@@ -479,8 +479,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     without deopt or replay. The probe has no safepoint; only the cold call owns
     moving roots. Its stable untraced IC address must originate in a property
     probe. Named stores protected by local catches remain on Template until
-    their cold call has the same explicit CFG contract. Inline callee property
-    bodies still require complete activation publication during reentry.
+    their cold call has the same explicit CFG contract. Plain named-load callee
+    bodies can be spliced into Machine SSA. Their cold instructions expose
+    `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure
+    values are boxed only in cold CFG and retained as explicit safepoint roots.
+    The IC cell owns immutable root-index recipes tied to the code generation
+    and safepoint. The fixed property boundary reads the current published roots,
+    publishes canonical callee NativeFrames, and normalizes throws before scope
+    cleanup. The existing caller is neither copied nor interpreted; its PC names
+    the original call while every callee keeps its own source position.
     Primitive-string and dense-array `.length` share the property-load region;
     unsigned lengths outside int32 exit to canonical Number boxing. A fixed
     TypedArray view over a resizable ArrayBuffer also guards its complete baked
@@ -524,10 +531,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     frame, publishes no VM PC, and never round-trips through the interpreter
     window. The canonical frame-building generic miss is the cold sibling
     outside that region.
-  - Optimizing plain/method splices use ordinary `instruction` regions keyed by
-    `inlineFrame`; the caller call opcode owns the identity guard and the
-    callee frame owns its body operations. `deopt.json` records the complete
-    outermost-first caller/callee chain. Loop-invariant global-object reads and
+  - Optimizing plain scalar/named-load splices use the same HIR and allocator.
+    The caller owns the identity/this guard; named accesses retain the callee's
+    source program and cold activation recipes in `optimized-ir.txt`.
+    `deopt.json` records the complete outermost-first caller/callee chain.
+    Method-body splicing remains unfinished; generated method calls and method
+    intrinsic hits retain their existing guards and boundaries. Loop-invariant global-object reads and
     method guards keep their full proofs on the first iteration and use
     independent native-stack caches on later iterations. A cached global slot
     makes its loaded builtin namespace receiver activation-invariant; other

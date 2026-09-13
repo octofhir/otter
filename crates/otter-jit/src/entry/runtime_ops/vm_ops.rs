@@ -13,13 +13,19 @@
 //! name and feedback site from the immutable source identity in their IC cell;
 //! the published activation supplies execution ownership, not property lookup.
 //! IC cells store the VM-owned `JitPropertyIcWay` directly; the generated stride
-//! derives from that same type. Allocating or throwing operations keep precise
+//! derives from that same type. Inline sites also own immutable frame recipes
+//! keyed to their exact generation/safepoint. They publish descendants only on
+//! cold reentry and normalize exceptions before those frames are removed.
+//! Allocating or throwing operations keep precise
 //! roots live. Committed
 //! JavaScript throws travel in the pair payload; only structural failures use
 //! the shared error slot.
 //!
 //! # See also
 //! - `otter_vm::jit_runtime_ops` — safe VM-side implementations.
+
+#[path = "property_inline_frames.rs"]
+mod property_inline_frames;
 
 use super::super::JitCtx;
 use super::{committed_vm_result, park_jit_error};
@@ -49,18 +55,37 @@ pub(crate) const WHISKER_IC_WAY_BYTES: u32 =
 /// (no GC pointers), so it needs no tracing. Shape offsets are stable tokens:
 /// shapes are immortal and pinned in old space.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WhiskerIcCell {
     ways: [otter_vm::JitPropertyIcWay; IC_WAYS],
     // Only the cold stub reads this immutable identity. Keep ways first so
     // generated probes retain the shared VM-owned program layout.
     source: Option<(u32, u32)>,
+    inline_owner: Option<(u64, u32)>,
+    inline_frames: Box<[otter_vm::deopt::DeoptFrame<Option<u16>>]>,
 }
 
 impl WhiskerIcCell {
     /// Set once during emission, before the code object is published.
     pub(crate) fn set_source(&mut self, function_id: u32, instruction_pc: u32) {
         self.source = Some((function_id, instruction_pc));
+    }
+
+    pub(crate) fn set_inline_frames(
+        &mut self,
+        code_object_id: u64,
+        safepoint_id: u32,
+        frames: Box<[otter_vm::deopt::DeoptFrame<Option<u16>>]>,
+    ) {
+        self.inline_owner = Some((code_object_id, safepoint_id));
+        self.inline_frames = frames;
+    }
+
+    pub(crate) fn inline_retained_bytes(&self) -> u64 {
+        self.inline_frames.iter().fold(
+            std::mem::size_of_val(self.inline_frames.as_ref()) as u64,
+            |total, frame| total.saturating_add(std::mem::size_of_val(frame.slots.as_ref()) as u64),
+        )
     }
 }
 
@@ -108,26 +133,32 @@ pub(crate) extern "C" fn jit_load_property_stub(
     // SAFETY: generated code supplies its live code-owned cell, or null for
     // an invalid boundary invocation. Copy the source before possible reentry.
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
-    let result = source
-        .ok_or(VmError::InvalidOperand)
-        .and_then(|(function_id, pc)| {
-            ctx.runtime_call()?.load_property_value(
-                function_id,
-                pc,
-                Value::from_bits(receiver_bits),
-            )
-        });
+    let result = (|| {
+        let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
+        // Decode immutable recipes before reentry can patch the same IC ways.
+        // No cell reference survives the semantic call.
+        let mut frames = unsafe { cell.as_ref() }
+            .ok_or(VmError::InvalidOperand)?
+            .decode_inline_frames(ctx)?;
+        let mut call = ctx.runtime_call()?;
+        call.with_inline_activations(&mut frames, |call| {
+            match call.load_property_value(function_id, pc, Value::from_bits(receiver_bits)) {
+                Ok((value, fill)) => Ok((NativeResultPair::success(value), fill)),
+                Err(error) => call
+                    .take_js_throw(error)
+                    .map(|value| (NativeResultPair::throw_value(value), None)),
+            }
+        })?
+    })();
     match result {
-        Ok((value, fill)) => {
-            if !cell.is_null()
-                && let Some(way) = fill
-            {
+        Ok((pair, fill)) => {
+            if let Some(way) = fill {
                 // SAFETY: stable per-site cell address baked into this code.
                 unsafe {
                     whisker_ic_fill(cell, way);
                 }
             }
-            NativeResultPair::success(value)
+            pair
         }
         Err(err) => committed_vm_result(ctx, Err(err)),
     }

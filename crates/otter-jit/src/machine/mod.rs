@@ -37,6 +37,8 @@
 //! - Named loads expose a no-call probe and a committed cold/status CFG.
 //!   Only the cold call roots tagged state; its raw IC pointer must come from
 //!   a property probe. Local catches consume the pure exception payload.
+//!   Inlined cold sites carry boxed frame operands as explicit tagged roots;
+//!   the source-owned recipes publish descendants without copying the caller.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
 //!   and constructor targets remain monomorphic; an explicit-receiver call
 //!   and a base construct own at most one candidate and otherwise the generic
@@ -75,6 +77,7 @@ mod committed_probe;
 mod deopt;
 mod derived_this;
 mod frame;
+mod inline_frames;
 mod native_leaf;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
@@ -994,6 +997,9 @@ pub struct MachineInstruction {
     pub safepoint: Option<SafepointId>,
     /// Deopt exit described by metadata operands, when present.
     pub deopt: Option<DeoptId>,
+    /// Boxed inline activation recipes at committed cold reentry. The first
+    /// frame names the suspended caller and has no copied register window.
+    pub inline_frames: Box<[otter_vm::deopt::DeoptFrame<Option<MachineValue>>]>,
     /// Control-flow role.
     pub control: ControlFlow,
 }
@@ -1008,6 +1014,7 @@ impl MachineInstruction {
             clobbers: Vec::new(),
             safepoint: None,
             deopt: None,
+            inline_frames: Box::default(),
             control: ControlFlow::None,
         }
     }
@@ -1227,7 +1234,7 @@ impl InstructionSequence {
         self.packed_double_view_cache_count
     }
 
-    /// Deterministic identity excluding source/module/function identities.
+    /// Deterministic machine instruction and source-recipe dump.
     #[must_use]
     pub fn normalized(&self) -> String {
         let mut output = format!(
@@ -1263,6 +1270,10 @@ impl InstructionSequence {
                     instruction.deopt
                 )
                 .expect("writing to String cannot fail");
+                if !instruction.inline_frames.is_empty() {
+                    writeln!(output, "    inline-frames={:?}", instruction.inline_frames)
+                        .expect("writing to String cannot fail");
+                }
             }
         }
         output
@@ -2691,6 +2702,7 @@ impl InstructionSequence {
 
     pub(super) fn verify(&self) -> Result<(), VerificationError> {
         self.verify_structure()?;
+        inline_frames::verify(self)?;
         self.verify_gc_root_liveness()
     }
 }

@@ -189,6 +189,14 @@ impl JitFunctionCode for OptimizedCode {
             ],
         )
         .saturating_add(self.deopt.retained_bytes())
+        .saturating_add(
+            self._load_ic_cells
+                .iter()
+                .chain(self._store_ic_cells.iter())
+                .fold(0u64, |bytes, cell| {
+                    bytes.saturating_add(cell.inline_retained_bytes())
+                }),
+        )
     }
 
     fn native_frame_kind(&self) -> otter_vm::native_abi::NativeFrameKind {

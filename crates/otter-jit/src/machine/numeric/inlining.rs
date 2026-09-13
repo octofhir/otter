@@ -1,12 +1,13 @@
 //! Bounded callee CFG splicing into the single numeric HIR.
 //!
 //! # Contents
-//! - Plain numeric-body admission from each candidate's own compile snapshot.
+//! - Plain scalar/property-body admission from each candidate's own compile snapshot.
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
-//! - Only self-contained scalar bodies are admitted. Property, binding,
-//!   allocation and JavaScript-call operations retain ordinary call linkage.
+//! - Scalar and named-load bodies are admitted. Binding, allocation and
+//!   JavaScript-call operations retain ordinary call linkage. Named-load cold
+//!   calls publish exact inline frames without replaying completed effects.
 //! - Identity and parameter guards precede callee effects; body exits rebuild
 //!   the caller after its call and the callee at its exact source instruction.
 //! - Caller CFG order and backedge identities survive insertion. Callee loops
@@ -79,9 +80,9 @@ pub(super) fn splice(
             }
             if let Some(node) = body.nodes.iter().copied().find(|&node| {
                 !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
-                    && map_scalar(node, &|v| v).is_none()
+                    && map_body_node(node, &|v| v).is_none()
             }) {
-                return Err(format!("non-scalar callee operation: {node:?}"));
+                return Err(format!("unsupported callee operation: {node:?}"));
             }
             if body.blocks.iter().enumerate().any(|(i, b)| {
                 b.successors.iter().any(|&s| s <= i)
@@ -89,7 +90,11 @@ pub(super) fn splice(
             }) {
                 return Err("callee requires loop or throw CFG".into());
             }
-            let this_mode = target.candidates[0].callee.plan.this_mode;
+            let plan = &target.candidates[0].callee.plan;
+            if plan.own_upvalue_count != 0 || plan.needs_incoming_arguments {
+                return Err("callee requires activation entry setup".into());
+            }
+            let this_mode = plan.this_mode;
             let mut proposed = function.clone();
             splice_one(&mut proposed, view, NumericValue(index), &body, this_mode)
                 .ok_or("scalar splice frame or argument contract")?;
@@ -264,8 +269,11 @@ fn splice_one(
     let map = |value: NumericValue| mapping[value.0];
     for (index, &node) in body.nodes.iter().enumerate() {
         if !matches!(node, NumericNode::Parameter { .. } | NumericNode::This) {
-            hir.nodes[mapping[index].0] = map_scalar(node, &map)?;
+            hir.nodes[mapping[index].0] = map_body_node(node, &map)?;
         }
+    }
+    for (node, site) in &body.property_sites {
+        hir.property_sites.insert(map(*node), site.clone());
     }
     for state in &body.frame_states {
         let NumericFramePoint::Node(node) = state.point else {
@@ -398,12 +406,23 @@ fn splice_one(
     Some(())
 }
 
-fn map_scalar(
+fn map_body_node(
     node: NumericNode,
     map: &impl Fn(NumericValue) -> NumericValue,
 ) -> Option<NumericNode> {
     use NumericNode::*;
     Some(match node {
+        PropertyLoad {
+            receiver,
+            byte_pc,
+            exotic_length,
+            exceptional_edge: None,
+        } => PropertyLoad {
+            receiver: map(receiver),
+            byte_pc,
+            exotic_length,
+            exceptional_edge: None,
+        },
         BlockParameter(_) | TaggedConstant(_) | IntegerConstant(_) | BooleanConstant(_)
         | Constant(_) => node,
         TaggedToNumber(value) => TaggedToNumber(map(value)),

@@ -11,6 +11,7 @@
 //! - Target growth after tier-up invalidates and replans forwarding feedback.
 //! - Native polymorphic hits, dynamic actual windows, bounded fallback, moving
 //!   roots and exact exceptions after warmup.
+//! - Saturated native dispatch with fresh/inherited captures and semantic misses.
 //!
 //! # Invariants
 //! - Bodies that only forward `arguments` never materialize the object on
@@ -451,6 +452,63 @@ fn saturated_forwarding_preserves_live_arguments_and_reports_distinct_feedback()
                 } if *caller_function_id == forward_id
             )),
             "{selection:?}: saturated ordinary feedback must not be reported as bounded polymorphism"
+        );
+    }
+}
+
+#[test]
+fn saturated_forwards_use_native_entry_with_live_actuals_and_captures() {
+    let setup = include_str!("../../otter-difftest/corpus/forward_arguments_saturated.js");
+    let probe = r#"
+var nativeSum = 0;
+for (var j = 0; j < 512; j++) {
+  selected = targets[j % targets.length];
+  nativeSum += forward(j, 2, { value: 7 });
+}
+nativeSum;
+"#;
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .jit_debug(JitDebugRequest::artifacts())
+            .build()
+            .expect("runtime");
+        let warm = runtime
+            .run_script(SourceInput::from_javascript(setup), "saturated-setup.js")
+            .expect("warm saturated targets");
+        assert_eq!(warm.completion_string(), "[314496,135420]");
+        assert!(
+            warm.jit_artifacts()
+                .expect("artifacts")
+                .bundles()
+                .iter()
+                .any(|bundle| {
+                    bundle.manifest().function_name() == "forward"
+                        && bundle
+                            .file(otter_runtime::JitArtifactFileName::CodeMap)
+                            .is_some_and(|file| {
+                                std::str::from_utf8(file.contents())
+                                    .expect("code map")
+                                    .contains("runtimeForwardCallNativeEntry")
+                            })
+                }),
+            "{selection:?}: runtime-selected entry must be emitted in the forwarder"
+        );
+        let before = runtime.execution_stats();
+        let result = runtime
+            .run_script(SourceInput::from_javascript(probe), "saturated-native.js")
+            .unwrap_or_else(|error| panic!("{selection:?}: {error:?}"));
+        assert_eq!(result.completion_string(), "136324", "{selection:?}");
+        let after = runtime.execution_stats();
+        let native_calls = after.jit_generated_calls - before.jit_generated_calls;
+        let rooted_calls = after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
+        assert!(
+            native_calls >= 512,
+            "{selection:?}: native calls={native_calls}"
+        );
+        assert!(
+            rooted_calls < 64,
+            "{selection:?}: rooted calls={rooted_calls}"
         );
     }
 }

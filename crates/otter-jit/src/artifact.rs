@@ -364,11 +364,11 @@ impl CodeRegion {
         caller_function_id: u32,
         logical_pc: u32,
         byte_pc: u32,
-        direct_call: DirectCallArtifact,
+        direct_call: impl Into<Option<DirectCallArtifact>>,
     ) -> Self {
         let mut region = Self::structural(kind, start, end);
         region.function_id = Some(caller_function_id);
-        region.direct_call = Some(direct_call);
+        region.direct_call = direct_call.into();
         region.logical_pc = Some(logical_pc);
         region.byte_pc = Some(byte_pc);
         region

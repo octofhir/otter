@@ -1,8 +1,8 @@
-//! Direct forwarding through bounded ordinary-call target populations.
+//! Native forwarding through bounded and runtime-selected ordinary targets.
 //!
 //! # Contents
-//! - One intrinsic-apply/live-argument probe per source operation.
-//! - Exact function identity selection and shared generated linkage.
+//! - Intrinsic-apply/live-argument probes before native target admission.
+//! - Bounded exact identity selection and general current-generation dispatch.
 //! - Committed runtime completion for every pre-entry miss.
 //!
 //! # Invariants
@@ -10,8 +10,8 @@
 //!   plain-call proof uses other scratch registers and saves the count before GC.
 //! - No source lookup or getter is replayed. Every direct rejection joins the
 //!   existing committed forwarding boundary with the original operands intact.
-//! - Target selection is bounded by the CodeBlock population; native bodies
-//!   share the existing entry cells, native frame, root and deopt contracts.
+//! - Saturation or a bounded miss still permits general native target admission;
+//!   both paths share entry cells, native frames, roots and completion contracts.
 //!
 //! # See also
 //! - [`crate::arm64::emit_direct_call_with_access`] — shared call lifecycle.
@@ -186,6 +186,27 @@ pub(super) fn emit_forward_call(
         dynasm!(ops ; .arch aarch64 ; =>next);
     }
     dynasm!(ops ; .arch aarch64 ; =>cold);
+    let canonical = ops.new_dynamic_label();
+    crate::arm64::emit_runtime_forward(
+        ops,
+        relocations,
+        view,
+        table,
+        [dst, method, callee, receiver],
+        logical_pc,
+        byte_pc,
+        code_map,
+        canonical,
+        threw,
+        throw_value,
+        fatal,
+        done,
+        20,
+        |ops, source, target, _| emit_load_reg(ops, target, source),
+        |ops, destination, source, _| emit_store_reg(ops, source, destination),
+        |_| Ok(()),
+    )?;
+    dynasm!(ops ; .arch aarch64 ; =>canonical);
     transitions::emit_call_forward_arguments(
         ops,
         relocations,

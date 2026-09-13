@@ -1748,13 +1748,7 @@ impl Interpreter {
                     );
                     continue;
                 };
-                let direct_ineligible = callee.is_generator
-                    || callee.is_async
-                    || callee.is_async_generator
-                    || callee.has_rest
-                    || callee.contains_direct_eval
-                    || (callee.is_derived_constructor && (!is_construct || callee.makes_function))
-                    || (is_construct && callee.is_method);
+                let direct_ineligible = !callee.admits_generated_call(unresolved_call_kind);
                 // An `arguments` body reads the actual-argument window its
                 // generated caller publishes, so it still takes direct linkage;
                 // spliced into the caller it would have no window to read.
@@ -2089,14 +2083,7 @@ impl Interpreter {
         let method = context
             .exec_function(target.method_fid)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
-        if method.is_generator
-            || method.is_async
-            || method.is_async_generator
-            || method.needs_arguments
-            || method.has_rest
-            || method.contains_direct_eval
-            || method.is_derived_constructor
-        {
+        if !method.admits_generated_call(jit::JitDirectCallKind::Method) {
             return Err(jit_debug::JitDirectCallRejectionReason::IneligibleFunction);
         }
         let guard = self

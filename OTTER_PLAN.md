@@ -633,28 +633,38 @@ polymorphic probe demonstrates native entries with <64 rooted runtime transition
 in both generated policies. Evidence:
 `benchmarks/results/s2-20260913-native-forwarding/README.md`.
 
-S2 remains active: a single debug RayTrace capture validates but function535/PC4
-has zero direct targets at both preparation tiers; the bounded Poly arm's lack of
-per-target plans indicates saturated feedback. Machine also rejects the forwarding
-opcode. Do not claim a RayTrace win or repeat release measurements yet. Next:
-generic native target selection through the existing entry-cell/frame contract,
->8-target coverage, explicit Machine call CFG, then one affected release cycle.
-No larger target cap, duplicate registry, full gate or new benchmark baseline.
-The authoritative handoff was shortened; superseded history is preserved in
-`scratchpad/JIT_LANE_HISTORY_2026_09_13.md`.
+S2 remains active. The earlier debug RayTrace capture established saturated
+feedback at function535/PC4 and a Machine HIR rejection of CallForwardArguments.
+Saturation is now reported as `megamorphic`, distinct from bounded `polymorphic`.
+Current-generation plan lookup follows the registry-owned publication directly;
+cell retention remains authoritative, with no extra registry or reverse index.
 
-Saturated ordinary feedback now has a distinct `megamorphic` inline-rejection
-tag. A nine-distinct-body forwarding corpus preserves mapped inputs and exact
-checksums across all tiers, and requires the explicit saturation event. The
-existing two-target replan regression keeps bounded polymorphism distinct.
-Current-generation plan selection also reads the registry-owned publication
-directly instead of scanning all historical generation cells. Cell retention and
-single-mutator publication remain the authority; no reverse index was added.
-Final forwarding9/9, the extended publication/lifetime unit and VM lib clippy
-pass; the new fixture also passed GC+verify1 before the lookup-only edit. Evidence:
-`benchmarks/results/s2-20260913-saturated-targets/README.md`.
-These changes establish diagnosis/lookup for general dispatch, not native
-execution of saturated calls. Shared dynamic linkage and Machine CFG are open.
+Template now also admits runtime-selected ordinary targets after a bounded miss
+or saturation. One leaf probe checks intrinsic apply, live actuals, the shared
+CodeBlock call policy and exact closure capture contract. It writes the existing
+JitDirectCallPlan into untraced native scratch. Generated linkage obtains the
+current entry cell, checks stack capacity, initializes all roots, allocates fresh
+captures through the existing helper, copies live arguments and publishes the
+same frame. Static and runtime-selected calls share one return/throw/deopt/cleanup
+emitter. Unsupported or missing targets retain canonical completion exactly once.
+
+The nine-body fixture now covers fresh/inherited captures, object actuals,
+throws, custom apply, rest, direct eval and rejected class calls. A settled
+512-call probe in both generated policies requires at least512 native entries
+and fewer than64 rooted call transitions. Both saturation tests pass, also under
+GC+verify1/4/16. Existing forwarding9/9 and shared-completion Machine calls23/23
+pass; scoped VM/JIT clippy passes. The exact RayTrace trampoline reaches the
+new native-entry region in a bounded sampled diagnostic. One release build then
+passes15/15 affected process comparisons, including saturation GC+verify1/4/16.
+Five valid RayTrace processes score2035 +/-4 (range2010–2043), +18.87% against
+accepted1712 +/-6; median peak RSS grows0.39%. Evidence:
+`benchmarks/results/s2-20260913-runtime-forwarding/README.md`.
+
+Next: Machine forwarding requires explicit call CFG, operand/clobber/root liveness and
+exception landing before register allocation. No larger target cap, duplicate
+frame/registry, full gate, bisect or new other-engine benchmark baseline.
+The authoritative handoff is `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`;
+superseded history stays in `scratchpad/JIT_LANE_HISTORY_2026_09_13.md`.
 
 The intended replacement path remains:
 
@@ -676,7 +686,8 @@ element/property/binding access, string constants, intrinsics, exceptions, and
 deopt reconstruction. Keep extending the final path; do not translate new IR
 back into deleted/legacy SSA or add an emitter-specific semantic path.
 
-Current state (measured 2026-09-12, Octane in fresh processes against node
+Historical state (measured 2026-09-12; superseded where the current S2
+checkpoint above says otherwise, Octane in fresh processes against node
 v24): NavierStokes 2x, Richards 19x, Splay 27x (2x noise), Box2D 61x,
 DeltaBlue 86x, EarleyBoyer 96x, RayTrace 94x, Crypto 248x behind. A body
 whose every use of `arguments` is `callee.apply(x, arguments)` now compiles
@@ -728,16 +739,11 @@ well as the root's. The rebuild still waits for the 100-exit budget (JSC's
 `osrExitCountForReoptimization`), so a site such as RayTrace's `rayTrace`
 `LooseNotEqual` pays one budget per generation.
 
-Next work, in order: `Op::CallForwardArguments` still enters the callee
-through the runtime call boundary — the direct-call linkage must accept the
-published incoming window as its argument source so the forward becomes a
-generated call and the Machine tier can admit the opcode; the spread
-call/construct transition
-still requires a materialized frame and side-exits stack-owned callees;
-admit `Throw`/`NewError`, closures with captured cells, and object/array
-literals into the Machine HIR with committed cold paths where no fast path
-is proven yet, measuring the decline histogram on Octane after each family;
-then the sequence below.
+Next work follows the current S2 checkpoint above. Template forwarding now
+has generated bounded and runtime-selected linkage; Machine still needs explicit
+call CFG and allocation/root integration. Generated spread and several literal,
+throw and catch families have also advanced since the historical measurements:
+audit current coverage before reviving any item from that older blocker list.
 
 Active sequence:
 

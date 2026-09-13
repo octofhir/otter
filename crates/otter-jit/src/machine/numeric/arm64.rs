@@ -70,6 +70,8 @@
 //!   or reentry, with every ABI clobber declared before allocation.
 //! - Pure scalar leaves exchange unboxed scalars in fixed ABI operands;
 //!   regalloc2 owns every argument/result move and no frame shuttle exists.
+//! - Truthiness probes read immediate tags and non-primitive cell headers with
+//!   reserved scratch registers; canonical leaf calls occupy separate blocks.
 //! - Derived-this binding has explicit fast/cold Machine blocks. The fast
 //!   probe writes only an unbound stack-owned derived frame; the committed
 //!   cold call owns materialized state, duplicate-bind errors and local catches.
@@ -88,6 +90,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod forward_call;
+mod truthiness;
 mod value_span;
 use value_span::emit_value_span_arguments;
 
@@ -1918,6 +1921,18 @@ pub(super) fn emit(
                     ; mov w16, #1
                     ; eor W(destination), W(source), w16
                 );
+            }
+            MachineOpcode::TruthinessProbe => {
+                let start = ops.offset().0;
+                truthiness::emit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    integer_register(locations[0])?,
+                    integer_register(locations[1])?,
+                    integer_register(locations[2])?,
+                );
+                structural_regions.push(("machineTruthinessProbe", None, start, ops.offset().0));
             }
             MachineOpcode::TaggedNullishEqual { byte_pc, equal } => {
                 let source = integer_register(locations[0])?;

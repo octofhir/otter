@@ -76,6 +76,7 @@ pub(crate) mod numeric;
 mod regalloc;
 mod safepoint;
 mod target;
+mod truthiness;
 
 pub use deopt::{
     MachineDeoptError, MachineFrameSlot, MachineFrameState, lower_deopt_table, undefined_slot,
@@ -800,6 +801,9 @@ pub enum MachineOpcode {
     IntegerToBoolean,
     /// Convert a Float64 value to canonical Boolean bits.
     FloatToBoolean,
+    /// No-call truthiness probe: tagged input, Boolean result, Boolean hit.
+    /// Uncertain cells miss to an explicit canonical leaf sibling.
+    TruthinessProbe,
     /// Invert canonical Boolean bits.
     BooleanNot,
     /// Compare one tagged value with a statically known `null` or `undefined`.
@@ -1732,6 +1736,35 @@ impl InstructionSequence {
                     }
                 }
                 match &instruction.opcode {
+                    MachineOpcode::TruthinessProbe => {
+                        let valid =
+                            instruction.operands.len() == 3
+                                && instruction.operands.iter().enumerate().all(
+                                    |(index, operand)| {
+                                        let (expected, representation) = if index == 0 {
+                                            (
+                                                MachineOperand::register_input(operand.value),
+                                                MachineRepresentation::Tagged,
+                                            )
+                                        } else {
+                                            (
+                                                MachineOperand::register_output(operand.value),
+                                                MachineRepresentation::Boolean,
+                                            )
+                                        };
+                                        *operand == expected
+                                            && self.representations[operand.value.0 as usize]
+                                                == representation
+                                    },
+                                );
+                        if !valid
+                            || !instruction.clobbers.is_empty()
+                            || instruction.deopt.is_some()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
                     MachineOpcode::BindingGuard {
                         semantics, target, ..
                     } => {

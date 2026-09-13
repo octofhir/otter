@@ -707,6 +707,21 @@ leaf calls; generated truthiness is the next concrete structural investigation.
 No tier-disable heuristic or repeat of unchanged gates. Artifacts54MB are archived
 to5.6MB and verified before raw removal. Evidence:
 `benchmarks/results/s4-20260913-machine-errors/README.md`.
+
+Tagged truthiness now expands before register allocation to an explicit probe,
+cold leaf call and Boolean SSA join. Immediate primitives and non-primitive,
+non-native-function cells execute without a call; primitive cells/native
+functions retain canonical string, BigInt and HTMLDDA semantics. Two JIT
+CFG/execution tests and the mixed runtime test pass, including GC1/4/16,
+revoked Proxy, live joins and no deopt on cold truthiness. Scoped JIT clippy
+passes. One release build,8 affected comparisons and5 valid RayTrace processes:
+1943 +/-3, range1929–1946, RSS152928256. This small +0.52% change from1933 does
+not close the4.52% debt against2035. Current installed release is this candidate.
+Real events show no compile declines. Next investigate the class-only receiver
+allocation boundary for ordinary constructors; guard live prototype semantics
+through the existing contract, without a parallel allocator. Evidence:
+`benchmarks/results/s2-20260913-machine-truthiness/README.md`.
+
 No full gate, bisect, second build tree or repeated
 other-engine baseline. Evidence:
 `benchmarks/results/s2-20260913-machine-forwarding/README.md`.

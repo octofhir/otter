@@ -67,6 +67,7 @@
 //! # See also
 //! - [`crate::optimizing`] — the production Machine compilation entry.
 
+mod committed_probe;
 mod deopt;
 mod derived_this;
 mod frame;
@@ -676,11 +677,11 @@ pub struct CallDescriptor {
     pub safepoint: SafepointKind,
 }
 
-fn is_explicit_binding_runtime_call(descriptor: &CallDescriptor) -> bool {
+fn is_explicit_committed_runtime_call(descriptor: &CallDescriptor) -> bool {
     matches!(
         &descriptor.target,
         CallTarget::CommittedRuntime { target, .. }
-            if *target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE
+            if target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
                 && target.result_abi
                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
                 && target.result_domain
@@ -804,6 +805,14 @@ pub enum MachineOpcode {
     /// No-call truthiness probe: tagged input, Boolean result, Boolean hit.
     /// Uncertain cells miss to an explicit canonical leaf sibling.
     TruthinessProbe,
+    /// No-call loose equality proof: tagged pair, tagged Boolean, Boolean hit.
+    /// Coercive operands use the explicit canonical committed cold sibling.
+    LooseEqualityProbe {
+        /// Source bytecode offset for structural attribution.
+        byte_pc: u32,
+        /// True for ==, false for !=.
+        equal: bool,
+    },
     /// Invert canonical Boolean bits.
     BooleanNot,
     /// Compare one tagged value with a statically known `null` or `undefined`.
@@ -1736,12 +1745,18 @@ impl InstructionSequence {
                     }
                 }
                 match &instruction.opcode {
-                    MachineOpcode::TruthinessProbe => {
+                    MachineOpcode::TruthinessProbe | MachineOpcode::LooseEqualityProbe { .. } => {
+                        let (input_count, result_type) =
+                            if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {
+                                (1, MachineRepresentation::Boolean)
+                            } else {
+                                (2, MachineRepresentation::Tagged)
+                            };
                         let valid =
-                            instruction.operands.len() == 3
+                            instruction.operands.len() == input_count + 2
                                 && instruction.operands.iter().enumerate().all(
                                     |(index, operand)| {
-                                        let (expected, representation) = if index == 0 {
+                                        let (expected, representation) = if index < input_count {
                                             (
                                                 MachineOperand::register_input(operand.value),
                                                 MachineRepresentation::Tagged,
@@ -1749,7 +1764,11 @@ impl InstructionSequence {
                                         } else {
                                             (
                                                 MachineOperand::register_output(operand.value),
-                                                MachineRepresentation::Boolean,
+                                                if index == input_count {
+                                                    result_type
+                                                } else {
+                                                    MachineRepresentation::Boolean
+                                                },
                                             )
                                         };
                                         *operand == expected
@@ -1961,7 +1980,7 @@ impl InstructionSequence {
                             };
                             self.call_descriptors
                                 .get(descriptor as usize)
-                                .is_some_and(is_explicit_binding_runtime_call)
+                                .is_some_and(is_explicit_committed_runtime_call)
                         } else {
                             false
                         };
@@ -2426,8 +2445,8 @@ impl InstructionSequence {
                                 == [MachineRepresentation::Tagged]
                                 && descriptor.exceptional != ExceptionalEdge::None
                                 && *target != otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
-                            let exposes_binding_status =
-                                is_explicit_binding_runtime_call(descriptor);
+                            let exposes_committed_status =
+                                is_explicit_committed_runtime_call(descriptor);
                             semantic_arity <= 2
                                 && target.signature
                                     == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
@@ -2444,7 +2463,7 @@ impl InstructionSequence {
                                 && descriptor.arguments.iter().all(|representation| {
                                     *representation == MachineRepresentation::Tagged
                                 })
-                                && (collapses_status || exposes_binding_status)
+                                && (collapses_status || exposes_committed_status)
                                 && descriptor.effects == complete_effects
                                 && descriptor.clobbers
                                     == TargetRegisterFile::aarch64_scalar_call_clobbers()

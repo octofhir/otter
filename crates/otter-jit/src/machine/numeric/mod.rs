@@ -112,7 +112,7 @@ use self::hir::{
 };
 use self::semantics::CommittedValueOperation;
 #[cfg(test)]
-use super::is_explicit_binding_runtime_call;
+use super::is_explicit_committed_runtime_call;
 use super::{
     CallDescriptor, CallEffects, CallTarget, ColdCallKind, ControlFlow, DeoptId,
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
@@ -467,6 +467,7 @@ fn select_with_packed_double_view_caches(
     let mut binding_inputs = BTreeMap::<usize, [Option<MachineValue>; 2]>::new();
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
     let mut call_descriptors = Vec::<CallDescriptor>::new();
+    let mut committed_probes = BTreeMap::new();
     let mut next_safepoint = 0_u32;
     let mut blocks = Vec::with_capacity(selection_cfg.order.len());
     let frame_state_indices = hir
@@ -1011,6 +1012,27 @@ fn select_with_packed_double_view_caches(
                             }),
                         ),
                     );
+                    let probe = match operation {
+                        CommittedValueOperation::Scalar(
+                            otter_vm::native_abi::ScalarValueOp::BindThisValue,
+                        ) => Some(super::committed_probe::ProbeKind::DerivedThis),
+                        CommittedValueOperation::ObjectProtocol(
+                            otter_vm::native_abi::ObjectProtocolValueOp::LooseEqual,
+                        ) => Some(super::committed_probe::ProbeKind::LooseEquality { equal: true }),
+                        CommittedValueOperation::ObjectProtocol(
+                            otter_vm::native_abi::ObjectProtocolValueOp::LooseNotEqual,
+                        ) => {
+                            Some(super::committed_probe::ProbeKind::LooseEquality { equal: false })
+                        }
+                        _ => None,
+                    };
+                    if let Some(probe) = probe
+                        && committed_probes
+                            .insert(descriptor_index as u32, probe)
+                            .is_some_and(|old| old != probe)
+                    {
+                        return Err(super::VerificationError::InvalidEntry);
+                    }
                     let mut operands = inputs
                         .iter()
                         .copied()
@@ -2171,25 +2193,10 @@ fn select_with_packed_double_view_caches(
         ));
     }
 
-    let derived_this_sites = hir
-        .nodes
-        .iter()
-        .filter_map(|node| match node {
-            NumericNode::CommittedValue {
-                operation:
-                    semantics::CommittedValueOperation::Scalar(
-                        otter_vm::native_abi::ScalarValueOp::BindThisValue,
-                    ),
-                byte_pc,
-                ..
-            } => Some(*byte_pc),
-            _ => None,
-        })
-        .collect();
-    super::derived_this::expand(
+    super::committed_probe::expand(
         &mut representations,
-        &call_descriptors,
-        &derived_this_sites,
+        &mut call_descriptors,
+        &committed_probes,
         &mut blocks,
         &mut instructions,
     )?;
@@ -6798,10 +6805,17 @@ mod tests {
                     .iter()
                     .any(|operand| operand.purpose == OperandPurpose::TaggedRoot)
             );
+            assert_eq!(sequence.blocks()[cold].successors.len(), 3);
             assert_eq!(
-                sequence.blocks()[cold].successors.len(),
-                if local_catch { 2 } else { 1 }
+                sequence.instructions()[sequence.blocks()[cold].end.0 as usize - 1].opcode,
+                MachineOpcode::BranchNativeStatus
             );
+            let MachineOpcode::Call(descriptor) = cold_instruction.opcode else {
+                unreachable!()
+            };
+            assert!(is_explicit_committed_runtime_call(
+                &sequence.call_descriptors()[descriptor as usize]
+            ));
             let allocation = sequence
                 .allocate(&TargetRegisterFile::aarch64_scalar_function())
                 .expect("all SSA critical edges are split");
@@ -7141,7 +7155,7 @@ mod tests {
                     return None;
                 };
                 let descriptor = &sequence.call_descriptors[descriptor as usize];
-                is_explicit_binding_runtime_call(descriptor).then_some((instruction, descriptor))
+                is_explicit_committed_runtime_call(descriptor).then_some((instruction, descriptor))
             })
             .collect::<Vec<_>>();
         assert_eq!(committed_calls.len(), 2);
@@ -7205,7 +7219,7 @@ mod tests {
                     let MachineOpcode::Call(descriptor) = instruction.opcode else {
                         return false;
                     };
-                    is_explicit_binding_runtime_call(
+                    is_explicit_committed_runtime_call(
                         &sequence.call_descriptors[descriptor as usize],
                     )
                 })
@@ -7297,7 +7311,7 @@ mod tests {
                     let MachineOpcode::Call(descriptor) = instruction.opcode else {
                         return false;
                     };
-                    is_explicit_binding_runtime_call(
+                    is_explicit_committed_runtime_call(
                         &sequence.call_descriptors[descriptor as usize],
                     )
                 })
@@ -7333,7 +7347,7 @@ mod tests {
                 let MachineOpcode::Call(descriptor) = instruction.opcode else {
                     return None;
                 };
-                if !is_explicit_binding_runtime_call(
+                if !is_explicit_committed_runtime_call(
                     &sequence.call_descriptors[descriptor as usize],
                 ) {
                     return None;
@@ -7492,7 +7506,7 @@ mod tests {
                 let MachineOpcode::Call(descriptor) = instruction.opcode else {
                     return false;
                 };
-                is_explicit_binding_runtime_call(
+                is_explicit_committed_runtime_call(
                     &safepoint_escape.call_descriptors[descriptor as usize],
                 )
             })

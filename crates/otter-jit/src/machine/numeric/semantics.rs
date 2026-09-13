@@ -149,13 +149,13 @@ fn classify_instruction(
     let instruction = view.instructions.get(logical_pc)?;
     let code = view.code_block.as_ref();
     let op = instruction.op(code);
-    // Loose equality stays a guarded numeric or nullish comparison while its
-    // feedback is numeric or empty; only a site that has seen coercive
-    // operands takes the committed canonical comparison.
+    // Only observed numeric operands justify numeric speculation. Unseen or
+    // coercive sites retain a generated comparison proof with one committed
+    // cold sibling, so their first real operands cannot start a deopt loop.
     let committed_value = committed_value_operation(op, view.derived_constructor).filter(|_| {
         !matches!(op, Op::LooseEqual | Op::LooseNotEqual) || {
             let feedback = instruction.arith_feedback();
-            !feedback.is_numeric_only() && !feedback.is_empty()
+            !feedback.is_numeric_only()
         }
     });
     let effects = if committed_value.is_some() || opcode_schema(op).binding.is_some() {

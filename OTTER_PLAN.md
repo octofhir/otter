@@ -735,13 +735,34 @@ lookup exactly once, inherited setters and descriptor changes. Profile4,
 closure-layout1 and fixed/spread/super1 pass; GC+verify1/4/16 and VM/JIT lib
 clippy pass. One release build3m01s,7 comparisons and5 RayTrace processes:
 2103 +/-25, range2044–2128, RSS151961600. This is8.23% above previous1943 and
-3.34% above best2035, closing the prior local performance debt. Current installed
-release is this receiver candidate. Events2918 have no declines or loss;
+3.34% above best2035, closing the prior local performance debt. The subsequent loose-probe checkpoint follows below. Events2918 have no declines or loss;
 98 generations total1707024 compiled bytes (including retired code), versus
 previous97/1655496. Generated-call deopts153 retain the100 exits at593:196.
-Next investigate unseen loose-equality speculation and per-site exit feedback;
-keep exact coercion/HTMLDDA behavior and shared committed Machine CFG. Evidence:
+Its subsequent loose-equality slice is recorded below. Evidence:
 `benchmarks/results/s2-20260913-ordinary-receiver/README.md`.
+
+Unseen loose comparisons now keep a generated proof plus canonical committed
+cold CFG instead of assuming numeric operands. Identity, homogeneous Numbers,
+nullish pairs and ordinary object pairs complete without calls; coercion,
+HTMLDDA and throws remain canonical. The shared derived-this/probe expansion
+exposes the existing Tagged/NativeStatus pair and Success/Throw/Fatal branches
+before allocation. This fixes a discovered hidden throw branch bypassing SSA
+edge moves and delivering Boolean instead of the original exception object.
+The binding pair emitter/validator is generalized without another ABI carrier.
+
+Focused source/runtime/GC1/4/16 checks pass, including first unseen optimizing
+entries without deopt,52 comparison assertions, allocating coercion exactly
+once, local/escaping thrown identity, multiple probes and live joins. Existing
+nullish3 and repeated-super1 pass; scoped JIT clippy passes. One release build
+2m20s,9 comparisons,5 RayTrace samples:2133 +/-9, range2108–2144, RSS152109056.
+The +1.43% shift from2103 has overlapping ranges and is not a strong isolated
+speedup claim. Current installed release is this loose-probe candidate.
+Events2902 have no declines/loss;98 generations sum1708056 compiled bytes,
+including retired code. Generated-call deopts137:593:21=100,536:1=33,587:36=4.
+The previous593:196 LooseNotEqual exits are gone, revealing the100-exit AddImm
+loss at logicalPC21/byte255. Investigate the numeric guard and existing exit
+feedback; do not lower the global threshold blindly. Evidence:
+`benchmarks/results/s2-20260913-loose-probe/README.md`.
 
 No full gate, bisect, second build tree or repeated
 other-engine baseline. Evidence:

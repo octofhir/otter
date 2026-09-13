@@ -90,6 +90,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod forward_call;
+mod loose_equality;
 mod truthiness;
 mod value_span;
 use value_span::emit_value_span_arguments;
@@ -119,7 +120,7 @@ use super::super::{
     InstructionSequence, MachineBindingTarget, MachineFrameLayout, MachineInstructionId,
     MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation, MachineSafepointSite,
     MachineSafepointTable, MachineValue, PackedDoubleViewCacheId, binding_target_matches_semantics,
-    is_explicit_binding_runtime_call,
+    is_explicit_committed_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -894,7 +895,7 @@ fn emit_committed_runtime_call(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_binding_runtime_call(
+fn emit_committed_pair_call(
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
@@ -913,13 +914,14 @@ fn emit_binding_runtime_call(
         semantic_arity,
     } = &descriptor.target
     else {
-        return Err(Unsupported::OperandShape("scalar binding runtime target"));
+        return Err(Unsupported::OperandShape(
+            "scalar committed pair runtime target",
+        ));
     };
     let logical_pc = *logical_pc;
     let byte_pc = *byte_pc;
     let semantic_arity = usize::from(*semantic_arity);
-    if !is_explicit_binding_runtime_call(descriptor)
-        || *target != STUB_JIT_BINDING_VALUE
+    if !is_explicit_committed_runtime_call(descriptor)
         || semantic_arity > 2
         || target.signature != RuntimeStubSignature::CommittedValue2
         || target.result_abi != RuntimeStubResultAbi::NativePair
@@ -927,7 +929,9 @@ fn emit_binding_runtime_call(
         || descriptor.arguments.len() != semantic_arity
         || instruction.deopt.is_some()
     {
-        return Err(Unsupported::OperandShape("scalar binding runtime contract"));
+        return Err(Unsupported::OperandShape(
+            "scalar committed pair runtime contract",
+        ));
     }
     let arguments = instruction
         .operands
@@ -943,25 +947,25 @@ fn emit_binding_runtime_call(
         .collect::<Vec<_>>();
     let [payload, status] = outputs.as_slice() else {
         return Err(Unsupported::OperandShape(
-            "scalar binding runtime result pair",
+            "scalar committed pair runtime result pair",
         ));
     };
     let payload_location = *locations.get(payload.0).ok_or(Unsupported::OperandShape(
-        "scalar binding payload allocation",
+        "scalar committed pair payload allocation",
     ))?;
     let status_location = *locations.get(status.0).ok_or(Unsupported::OperandShape(
-        "scalar binding status allocation",
+        "scalar committed pair status allocation",
     ))?;
     if arguments.len() != semantic_arity {
         return Err(Unsupported::OperandShape(
-            "scalar binding runtime semantic arity",
+            "scalar committed pair runtime semantic arity",
         ));
     }
     let site = safepoints
         .site(id)
         .filter(|site| instruction.safepoint == Some(site.id))
         .ok_or(Unsupported::OperandShape(
-            "scalar binding runtime safepoint",
+            "scalar committed pair runtime safepoint",
         ))?;
 
     emit_clear_packed_double_view_caches(ops, frame, sequence.packed_double_view_cache_count())?;
@@ -976,7 +980,7 @@ fn emit_binding_runtime_call(
             site,
             value,
             u8::try_from(index + 1)
-                .map_err(|_| Unsupported::OperandShape("scalar binding runtime argument"))?,
+                .map_err(|_| Unsupported::OperandShape("scalar committed pair runtime argument"))?,
             MACHINE_ROOT_RECORD_SIZE,
         )?;
     }
@@ -1933,6 +1937,29 @@ pub(super) fn emit(
                     integer_register(locations[2])?,
                 );
                 structural_regions.push(("machineTruthinessProbe", None, start, ops.offset().0));
+            }
+            MachineOpcode::LooseEqualityProbe { byte_pc, equal } => {
+                let start = ops.offset().0;
+                loose_equality::emit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    [
+                        integer_register(locations[0])?,
+                        integer_register(locations[1])?,
+                    ],
+                    [
+                        integer_register(locations[2])?,
+                        integer_register(locations[3])?,
+                    ],
+                    equal,
+                );
+                structural_regions.push((
+                    "machineLooseEqualityProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::TaggedNullishEqual { byte_pc, equal } => {
                 let source = integer_register(locations[0])?;
@@ -3363,9 +3390,9 @@ pub(super) fn emit(
                         ));
                         continue;
                     }
-                    if is_explicit_binding_runtime_call(descriptor) {
+                    if is_explicit_committed_runtime_call(descriptor) {
                         let start = ops.offset().0;
-                        let byte_pc = emit_binding_runtime_call(
+                        let byte_pc = emit_committed_pair_call(
                             &mut ops,
                             &mut relocations,
                             transitions,
@@ -3378,7 +3405,13 @@ pub(super) fn emit(
                             safepoints,
                         )?;
                         structural_regions.push((
-                            "machineBindingCold",
+                            if matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. } if target == STUB_JIT_BINDING_VALUE) {
+                                "machineBindingCold"
+                            } else if super::super::derived_this::cold_byte_pc(sequence, block_index) == Some(byte_pc) {
+                                "machineDerivedThisBindCold"
+                            } else {
+                                "machineCommittedValueEffect"
+                            },
                             Some(byte_pc),
                             start,
                             ops.offset().0,

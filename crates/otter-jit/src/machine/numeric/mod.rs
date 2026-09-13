@@ -60,6 +60,9 @@
 //!   immediates and ordinary cells directly and exits before its Boolean
 //!   definition only for a native-function cell, the sole HTMLDDA carrier,
 //!   without a generated call.
+//! - Tagged truthiness expands to a no-call probe and explicit cold leaf before
+//!   allocation. Primitive cells and HTMLDDA candidates retain canonical VM
+//!   decisions; both paths join through ordinary Boolean SSA parameters.
 //! - Allocating calls save every live tagged value from its exact late-use
 //!   location into the frame's collector-visible root area and reload it after
 //!   moving GC; no interpreter-window shuttle or emitter-local map exists.
@@ -2190,6 +2193,12 @@ fn select_with_packed_double_view_caches(
         &mut blocks,
         &mut instructions,
     )?;
+    super::truthiness::expand(
+        &mut representations,
+        &call_descriptors,
+        &mut blocks,
+        &mut instructions,
+    );
     InstructionSequence::new_selected_with_packed_double_view_caches(
         selection_cfg.originals[0],
         representations,
@@ -8875,7 +8884,7 @@ mod tests {
     }
 
     #[test]
-    fn tagged_truthiness_uses_the_verified_leaf_call_descriptor() {
+    fn tagged_truthiness_has_explicit_probe_and_cold_leaf_cfg() {
         let view = tagged_truthiness_branch_view();
         let hir = NumericFunction::build(&view).expect("tagged truthiness HIR");
         assert_eq!(hir.frame_states.len(), 1);
@@ -8887,6 +8896,28 @@ mod tests {
 
         let sequence = select(&hir).expect("tagged truthiness Machine IR");
         assert_eq!(sequence.call_descriptors().len(), 1);
+        let probe_block = sequence
+            .blocks()
+            .iter()
+            .find(|block| {
+                sequence.instructions()[block.first.0 as usize..block.end.0 as usize]
+                    .iter()
+                    .any(|i| i.opcode == MachineOpcode::TruthinessProbe)
+            })
+            .expect("explicit fast truthiness block");
+        assert_eq!(probe_block.successors.len(), 2);
+        let fast = &sequence.blocks()[probe_block.successors[0].0 as usize];
+        let cold = &sequence.blocks()[probe_block.successors[1].0 as usize];
+        assert_eq!(fast.successors, cold.successors, "both results join");
+        assert!(
+            sequence.instructions()[fast.first.0 as usize..fast.end.0 as usize]
+                .iter()
+                .all(|i| !matches!(i.opcode, MachineOpcode::Call(_)))
+        );
+        assert!(matches!(
+            sequence.instructions()[cold.first.0 as usize].opcode,
+            MachineOpcode::Call(0)
+        ));
         let descriptor = &sequence.call_descriptors()[0];
         assert_eq!(
             descriptor.target,
@@ -8991,7 +9022,7 @@ mod tests {
         }
 
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
-        let frame = vec![Value::boolean(true).to_bits(), selected, rejected];
+        let frame = vec![Value::hole().to_bits(), selected, rejected];
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
         let (result, after, pc, register_count) = execute_at_with_heap(

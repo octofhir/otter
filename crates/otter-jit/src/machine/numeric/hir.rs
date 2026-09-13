@@ -1,7 +1,8 @@
 //! Typed scalar HIR and control-flow construction.
 //!
 //! # Contents
-//! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks.
+//! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks and
+//!   per-node source-owned property programs.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, the schema-owned
@@ -696,6 +697,7 @@ pub(super) struct NumericBlock {
 pub(super) struct NumericFunction {
     pub(super) function_id: u32,
     pub(super) nodes: Vec<NumericNode>,
+    pub(super) property_sites: BTreeMap<NumericValue, super::super::MachinePropertySite>,
     pub(super) blocks: Vec<NumericBlock>,
     pub(super) frame_states: Vec<NumericFrameState>,
     pub(super) direct_call_targets: Vec<NumericDirectCallTarget>,
@@ -1295,6 +1297,25 @@ impl NumericFunction {
         Some((
             Self {
                 function_id: code.id,
+                property_sites: nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, node)| {
+                        let (byte_pc, op) = match *node {
+                            NumericNode::PropertyLoad { byte_pc, .. } => {
+                                (byte_pc, Op::LoadProperty)
+                            }
+                            NumericNode::PropertyStore { byte_pc, .. } => {
+                                (byte_pc, Op::StoreProperty)
+                            }
+                            _ => return None,
+                        };
+                        Some(
+                            super::super::MachinePropertySite::capture(view, byte_pc, op)
+                                .map(|site| (NumericValue(index), site)),
+                        )
+                    })
+                    .collect::<Option<BTreeMap<_, _>>>()?,
                 nodes,
                 blocks,
                 frame_states,
@@ -4522,6 +4543,7 @@ mod tests {
         }
         let backedge_receiver = if varying_receiver { value(2) } else { value(1) };
         let function = NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 150,
             nodes,
             blocks: vec![

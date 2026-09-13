@@ -308,6 +308,7 @@ mod tests {
             NumericNode::IntegerAddImmediate(NumericValue(1), 1),
         ];
         NumericFunction {
+            property_sites: Default::default(),
             function_id: 1,
             parameter_count: 1,
             register_count: 2,

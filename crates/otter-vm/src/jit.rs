@@ -1282,7 +1282,7 @@ impl JitElementAccess {
 /// walking its ways. A receiver that stops matching misses to the same window
 /// transition the cell walk would have, which re-patches the cell and lets the
 /// next compile re-bake.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitInlinePropertyLoad {
     /// Guarded receiver shape handle offset.
     pub receiver_shape: u32,

@@ -505,9 +505,15 @@ checks that source against the innermost frame recipe. The emitter no longer
 looks up property proofs in the root snapshot or source PC in the root deopt
 frame. Two distinct snapshots with equal function id/PC retain separate programs.
 143 numeric tests,16 runtime property/scalar-inline tests and scoped JIT clippy
-pass. No release build or timing. The remaining property prerequisite is explicit
-cold CFG with correct inline activation publication; property bodies remain
-unadmitted until that reentry/exception contract is represented before allocation. Next: operation ownership for source-dependent callee facts,
+pass. Named loads now have explicit Machine probe/hit/cold/status/join CFG.
+The probe has no call or safepoint; its stable IC-address SSA output reaches the
+same VM-declared committed pair boundary. The allocator sees the cold call and
+all moving roots. Local catches receive its pure Throw payload through a split
+SSA edge, without deopt or repeated getter effects.144 numeric tests,16 runtime
+tests,23 existing committed-contract tests and scoped JIT clippy pass (overlap;
+do not sum). Four generic-property tests also pass at GC stress+verify1/4/16
+using the same binary. No release build or timing. Named-store cold CFG and
+inline activation publication remain open; property callees are not yet spliced. Next: operation ownership for source-dependent callee facts,
 then dot-like property helpers and complete temporary-object arithmetic chains.
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not

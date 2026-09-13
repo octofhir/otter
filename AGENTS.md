@@ -473,11 +473,14 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     guarded shape, descriptor state, and no exotic sidecar. Dictionary-backed
     `%Object.prototype%` additions stay on the canonical store boundary. Runtime success or throw commits exactly
     once; a property miss never deoptimizes and replays the source operation.
-    Property operations protected by a local catch remain on the Template tier
-    until their fast probe and committed cold call become explicit Machine CFG
-    before register allocation. The fixed property boundary already returns a
-    pure exception value; no emitter-hidden call may bypass SSA landing and GC
-    liveness.
+    Named loads expose their probe, hit edge, `machinePropertyLoadCold` call,
+    Success/Throw/Fatal control and result join before register allocation.
+    Local catches receive the pure exception payload through SSA landing edges
+    without deopt or replay. The probe has no safepoint; only the cold call owns
+    moving roots. Its stable untraced IC address must originate in a property
+    probe. Named stores protected by local catches remain on Template until
+    their cold call has the same explicit CFG contract. Inline callee property
+    bodies still require complete activation publication during reentry.
     Primitive-string and dense-array `.length` share the property-load region;
     unsigned lengths outside int32 exit to canonical Number boxing. A fixed
     TypedArray view over a resizable ArrayBuffer also guards its complete baked

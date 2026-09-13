@@ -43,11 +43,12 @@
 //!   Template baseline.
 //!   Every conversion and access frame state describes the exact pre-access
 //!   register window.
-//! - Ordinary property nodes exist independently of settled shape/slot
-//!   metadata. Selection either emits a guarded hit or exact-deoptimizes at the
-//!   original bytecode. Named `.length` loads retain their exotic fast-path
-//!   marker; every property frame state describes the exact pre-access register
-//!   window.
+//! - Named loads end their HIR block and select a probe plus committed cold
+//!   call with explicit Success/Throw/Fatal edges. Supported local catches
+//!   receive the cold exception payload through SSA, without replay. Source
+//!   frames publish roots at that cold call. Stores retain their own guarded
+//!   committed boundary and source frame state. Named `.length` loads retain
+//!   the exotic fast-path marker.
 //! - Every schema-owned binding read, write, and delete remains one typed HIR
 //!   family. Structurally proven global-this, upvalue, global lexical, and
 //!   global-object targets retain a generated sibling; dynamic/shadowed sites
@@ -203,6 +204,7 @@ pub(super) enum NumericNode {
         receiver: NumericValue,
         byte_pc: u32,
         exotic_length: bool,
+        exceptional_edge: Option<u16>,
     },
     PropertyStore {
         receiver: NumericValue,
@@ -626,6 +628,7 @@ impl NumericNode {
     /// Authoritative selection use of an attached frame state.
     pub(super) const fn frame_state_purpose(self) -> Option<NumericFrameStatePurpose> {
         match self {
+            Self::PropertyLoad { .. } => Some(NumericFrameStatePurpose::TaggedRoots),
             Self::CommittedValue { .. } | Self::Binding { .. } | Self::LiteralAllocation { .. } => {
                 Some(NumericFrameStatePurpose::TaggedRoots)
             }
@@ -638,7 +641,6 @@ impl NumericNode {
             | Self::TaggedToInt32(..)
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
-            | Self::PropertyLoad { .. }
             | Self::PropertyStore { .. }
             | Self::ElementLoad { .. }
             | Self::ElementStore { .. }
@@ -1751,7 +1753,9 @@ fn build_raw_blocks(
                 .enclosing_exception_region(pc)
                 .and_then(|region| region.catch_pc)
                 .is_some();
-        if (binding || protected_throw) && usize::try_from(pc + 1).ok()? < view.instructions.len() {
+        if (binding || op == Op::LoadProperty || protected_throw)
+            && usize::try_from(pc + 1).ok()? < view.instructions.len()
+        {
             starts.insert(pc + 1);
         }
     }
@@ -2491,7 +2495,8 @@ fn lower_instruction(
         || semantics.committed_value.is_some()
         || matches!(
             op,
-            Op::Call
+            Op::LoadProperty
+                | Op::Call
                 | Op::CallWithThis
                 | Op::CallForwardArguments
                 | Op::CallSpread
@@ -2636,24 +2641,19 @@ fn lower_instruction(
         }
         Op::LoadProperty => {
             let _ = instruction.const_index(code, 2)?;
-            // A runtime-backed named-property miss can invoke getters, proxies,
-            // and user coercion before throwing. Machine landing pads do not
-            // yet reconstruct a committed exceptional state, so keep local
-            // handlers on the Template baseline instead of replaying the
-            // original operation after an observable effect.
-            if exceptional_edge.is_some() {
-                note_decline(decline, op, logical_pc, "inside a local catch");
-                return None;
-            }
             let value = push(
                 nodes,
                 NumericNode::PropertyLoad {
                     receiver: read_value(registers, register(instruction, code, 1)?)?,
                     byte_pc: instruction.byte_pc,
                     exotic_length: instruction.load_array_length,
+                    exceptional_edge: exceptional_edge.and_then(|edge| u16::try_from(edge).ok()),
                 },
             );
             block_nodes.push(value);
+            if exceptional_edge.is_some() {
+                *exceptional_value = Some(value);
+            }
             push_frame_state(
                 frame_states,
                 NumericFramePoint::Node(value),
@@ -6994,6 +6994,7 @@ mod tests {
                         receiver,
                         byte_pc: 8,
                         exotic_length: false,
+                        exceptional_edge: None,
                     }
             })
             .map(NumericValue)

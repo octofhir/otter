@@ -61,7 +61,8 @@
 //!   exact pre-construction frame state; all wider arities stay on the Template
 //!   baseline.
 //! - Register reads, writes, and potential implicit exception exits come only
-//!   from the bytecode opcode schema. A protected may-throw instruction ends
+//!   from the bytecode opcode schema; elided forwarding additionally reads the
+//!   CodeBlock-owned mapped register bindings. A protected may-throw instruction ends
 //!   its HIR block, and its pre-state retains values used only by the innermost
 //!   catch. Selection must explicitly return the `NativeResultPair` exception value;
 //!   it is never inferred from an operand position.
@@ -2006,6 +2007,18 @@ fn instruction_accesses(
             RegisterAccess::Read => reads.push(register),
             RegisterAccess::Write => writes.push(register),
             RegisterAccess::None => unreachable!(),
+        }
+    }
+    // Elided arguments are an implicit operand span. Preserve the current
+    // mapped register bindings even when the call's destination overwrites one
+    // of them; captured bindings stay in the traced upvalue spine instead.
+    if op == Op::CallForwardArguments {
+        for (_, storage) in code.forwarded_argument_bindings() {
+            if let otter_bytecode::ArgumentBindingStorage::Register { reg } = storage
+                && !reads.contains(&reg)
+            {
+                reads.push(reg);
+            }
         }
     }
     Some((reads, writes))
@@ -6978,6 +6991,60 @@ mod tests {
         );
         assert_eq!(int32_parameters, 0);
         assert_eq!(number_parameters, 0);
+    }
+
+    #[test]
+    fn forwarding_keeps_live_mapped_inputs_before_overwriting_its_destination() {
+        use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind};
+
+        let mut view = JitCompileSnapshot::without_feedback(
+            104,
+            6,
+            6,
+            vec![
+                JitTestInstruction::new(
+                    Op::CallForwardArguments,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(3),
+                        Operand::Register(4),
+                        Operand::Register(5),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 16, vec![Operand::Register(0)]),
+            ],
+        );
+        let bindings = [
+            (0, ArgumentBindingStorage::Register { reg: 1 }),
+            (1, ArgumentBindingStorage::Upvalue { idx: 0 }),
+            (2, ArgumentBindingStorage::Register { reg: 0 }),
+        ];
+        for (kind, expected) in [
+            (
+                ArgumentsObjectKind::Mapped,
+                vec![true, true, false, true, true, true],
+            ),
+            (
+                ArgumentsObjectKind::Unmapped,
+                vec![false, false, false, true, true, true],
+            ),
+        ] {
+            view.seed_argument_bindings_for_test(kind, &bindings);
+            let semantics = classify_snapshot(&view).expect("forwarding semantics");
+            let mut live = vec![true, false, false, false, false, false];
+            transfer_instruction_liveness(
+                &view.instructions[0],
+                &view.code_block,
+                None,
+                &[],
+                semantics[0],
+                &mut live,
+            )
+            .expect("forwarding liveness");
+            assert_eq!(live, expected, "{kind:?}");
+        }
     }
 
     #[test]

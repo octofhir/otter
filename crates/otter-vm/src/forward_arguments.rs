@@ -4,6 +4,7 @@
 //! - Elided-arguments eligibility/count observation without allocation or JS.
 //! - Copying a complete live argument list into an unpublished native callee.
 //! - Shared mapped-parameter refresh for canonical and generated completion.
+//! - Immutable binding reads for native SSA operand and liveness construction.
 //!
 //! # Invariants
 //! - A materialized arguments object is never treated as an incoming window:
@@ -21,6 +22,22 @@ use crate::{
     ActivationStack, ActiveFrameMut, ActiveFrameRef, CodeBlock, Interpreter, Value, VmError,
 };
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind};
+
+impl CodeBlock {
+    /// Immutable mapped bindings consumed by elided argument forwarding.
+    ///
+    /// The argument index is not a register index: duplicate formals and captured
+    /// parameters retain the compiler's exact storage mapping. Unmapped bodies
+    /// consume only their original actual window and expose no binding reads.
+    pub fn forwarded_argument_bindings(
+        &self,
+    ) -> impl Iterator<Item = (u16, ArgumentBindingStorage)> + '_ {
+        self.mapped_argument_bindings
+            .iter()
+            .filter(|_| self.arguments_object_kind == ArgumentsObjectKind::Mapped)
+            .map(|binding| (binding.argument_index, binding.storage))
+    }
+}
 
 impl Interpreter {
     pub(crate) fn elided_forward_argument_count(

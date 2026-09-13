@@ -693,7 +693,7 @@ fn is_explicit_committed_runtime_call(descriptor: &CallDescriptor) -> bool {
     matches!(
         &descriptor.target,
         CallTarget::CommittedRuntime { target, .. }
-            if (target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2 || *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY)
+            if (target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2 || *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY || *target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY)
                 && target.result_abi
                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
                 && target.result_domain
@@ -941,7 +941,8 @@ pub enum MachineOpcode {
         /// dense-array/primitive-string layout program.
         exotic_length: bool,
     },
-    /// Probe one source-owned named store, then commit its boxed cold boundary.
+    /// Probe and commit one source-owned named store without allocating or reentry.
+    /// Outputs are a hit Boolean and stable IC-cell address; a miss has no effect.
     PropertyStore {
         /// Owned source identity and settled program from this compilation site.
         site: Box<MachinePropertySite>,
@@ -1798,9 +1799,11 @@ impl InstructionSequence {
                                 self.representations[operand.value.0 as usize]
                                     != MachineRepresentation::Tagged
                             })
-                            || !instruction.clobbers.iter().copied().eq(
-                                scratch.iter().copied().map(PhysicalRegister::integer),
-                            )
+                            || !instruction
+                                .clobbers
+                                .iter()
+                                .copied()
+                                .eq(scratch.iter().copied().map(PhysicalRegister::integer))
                             || instruction.deopt.is_none()
                             || instruction.safepoint.is_some()
                         {
@@ -2233,55 +2236,25 @@ impl InstructionSequence {
                     }
                 }
                 if matches!(instruction.opcode, MachineOpcode::PropertyStore { .. }) {
-                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
-                    else {
+                    let [receiver, value, hit, cell] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let receiver = ordinary[0];
-                    let receiver_is_tagged_location = receiver
-                        == MachineOperand::location_input(receiver.value)
-                        && self.representations[receiver.value.0 as usize]
-                            == MachineRepresentation::Tagged;
-                    let ordinary_signature = match &instruction.opcode {
-                        MachineOpcode::PropertyLoad { .. } => {
-                            let output = ordinary[1];
-                            output == MachineOperand::register_output(output.value)
-                                && self.representations[output.value.0 as usize]
-                                    == MachineRepresentation::Tagged
-                        }
-                        MachineOpcode::PropertyStore { .. } => {
-                            let value = ordinary[1];
-                            value == MachineOperand::location_input(value.value)
-                                && self.representations[value.value.0 as usize]
-                                    == MachineRepresentation::Tagged
-                        }
-                        _ => false,
-                    };
-                    let metadata_shape = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::tagged_root(operand.value)
-                            || *operand == MachineOperand::deopt(operand.value)
-                    });
-                    let root_values = metadata
-                        .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-                        .map(|operand| operand.value)
-                        .collect::<std::collections::BTreeSet<_>>();
-                    let required_roots = match &instruction.opcode {
-                        MachineOpcode::PropertyLoad { .. } => root_values.contains(&receiver.value),
-                        MachineOpcode::PropertyStore { .. } => {
-                            root_values.contains(&receiver.value)
-                                && root_values.contains(&ordinary[1].value)
-                        }
-                        _ => false,
-                    };
-                    if !receiver_is_tagged_location
-                        || !ordinary_signature
-                        || !metadata_shape
-                        || !required_roots
-                        || instruction.clobbers
-                            != TargetRegisterFile::aarch64_scalar_call_clobbers()
-                        || instruction.deopt.is_none()
-                        || instruction.safepoint.is_none()
+                    if [receiver, value].iter().any(|operand| {
+                        **operand != MachineOperand::location_input(operand.value)
+                            || self.representations[operand.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                    }) || [
+                        (*hit, MachineRepresentation::Boolean),
+                        (*cell, MachineRepresentation::Int64),
+                    ]
+                    .iter()
+                    .any(|(operand, repr)| {
+                        *operand != MachineOperand::register_output(operand.value)
+                            || self.representations[operand.value.0 as usize] != *repr
+                    }) || instruction.clobbers
+                        != TargetRegisterFile::aarch64_scalar_call_clobbers()
+                        || instruction.deopt.is_some()
+                        || instruction.safepoint.is_some()
                         || instruction.control != ControlFlow::None
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2508,6 +2481,10 @@ impl InstructionSequence {
                             let semantic_arity = usize::from(*semantic_arity);
                             let named_load =
                                 *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY;
+                            let named_store =
+                                *target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY;
+                            let named_property = named_load || named_store;
+                            let cell_index = if named_store { 2 } else { 1 };
                             let complete_effects = CallEffects::READS_HEAP
                                 .union(CallEffects::WRITES_HEAP)
                                 .union(CallEffects::INVALIDATES_SHAPES)
@@ -2528,14 +2505,14 @@ impl InstructionSequence {
                                 .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
                                 .map(|operand| operand.value)
                                 .collect::<std::collections::BTreeSet<_>>();
-                            let collapses_status = !named_load
+                            let collapses_status = !named_property
                                 && descriptor.results == [MachineRepresentation::Tagged]
                                 && descriptor.exceptional != ExceptionalEdge::None
                                 && *target != otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
                             let exposes_committed_status =
                                 is_explicit_committed_runtime_call(descriptor);
-                            semantic_arity <= 2
-                                && (named_load || target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2)
+                            semantic_arity <= if named_store { 3 } else { 2 }
+                                && (named_property || target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2)
                                 && target.argument_count == if named_load { 1 } else { 2 }
                                 && target.result_abi
                                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
@@ -2546,7 +2523,7 @@ impl InstructionSequence {
                                 && target.exception
                                     == otter_vm::native_abi::RuntimeStubException::Status
                                 && descriptor.arguments.len() == semantic_arity
-                                && (if named_load { descriptor.arguments == [MachineRepresentation::Tagged, MachineRepresentation::Int64] } else { descriptor.arguments.iter().all(|representation| *representation == MachineRepresentation::Tagged) })
+                                && (if named_property { descriptor.arguments.len() == cell_index + 1 && descriptor.arguments[cell_index] == MachineRepresentation::Int64 && descriptor.arguments[..cell_index].iter().all(|r| *r == MachineRepresentation::Tagged) } else { descriptor.arguments.iter().all(|representation| *representation == MachineRepresentation::Tagged) })
                                 && (collapses_status || exposes_committed_status)
                                 && descriptor.effects == complete_effects
                                 && descriptor.clobbers
@@ -2554,12 +2531,12 @@ impl InstructionSequence {
                                 && descriptor.safepoint == SafepointKind::Gc
                                 && instruction.deopt.is_none()
                                 && inputs.len() == semantic_arity
-                                && (!named_load || self.instructions[..id.0 as usize].iter().any(|producer|
-                                    matches!(producer.opcode, MachineOpcode::PropertyLoad { .. })
-                                    && producer.operands.get(3).is_some_and(|cell| cell.value == inputs[1].value)))
+                                && (!named_property || self.instructions[..id.0 as usize].iter().any(|producer|
+                                    (if named_store { matches!(producer.opcode, MachineOpcode::PropertyStore { .. }) } else { matches!(producer.opcode, MachineOpcode::PropertyLoad { .. }) })
+                                    && producer.operands.get(3).is_some_and(|cell| cell.value == inputs[cell_index].value)))
                                 && inputs.iter().all(|operand| {
                                     **operand == MachineOperand::location_input(operand.value)
-                                        && (roots.contains(&operand.value) || (named_load && operand.value == inputs[1].value && self.representations[operand.value.0 as usize] == MachineRepresentation::Int64))
+                                        && (roots.contains(&operand.value) || (named_property && operand.value == inputs[cell_index].value && self.representations[operand.value.0 as usize] == MachineRepresentation::Int64))
                                 })
                                 && outputs.iter().all(|operand| {
                                     operand.role == OperandRole::Definition

@@ -473,18 +473,19 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     guarded shape, descriptor state, and no exotic sidecar. Dictionary-backed
     `%Object.prototype%` additions stay on the canonical store boundary. Runtime success or throw commits exactly
     once; a property miss never deoptimizes and replays the source operation.
-    Named loads expose their probe, hit edge, `machinePropertyLoadCold` call,
-    Success/Throw/Fatal control and result join before register allocation.
+    Named loads and stores expose their probe, hit edge,
+    `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
+    Success/Throw/Fatal control and join before register allocation.
     Local catches receive the pure exception payload through SSA landing edges
     without deopt or replay. The probe has no safepoint; only the cold call owns
     moving roots. Its stable untraced IC address must originate in a property
     probe. Named stores protected by local catches remain on Template until
-    their cold call has the same explicit CFG contract. Plain named-load callee
+    their HIR exception operands are admitted. Plain named-load/store callee
     bodies can be spliced into Machine SSA. Their cold instructions expose
     `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure
     values are boxed only in cold CFG and retained as explicit safepoint roots.
-    The IC cell owns immutable root-index recipes tied to the code generation
-    and safepoint. The fixed property boundary reads the current published roots,
+    The code-owned safepoint record owns root-index recipes tied to the code
+    generation and safepoint. The fixed property boundary reads the current published roots,
     publishes canonical callee NativeFrames, and normalizes throws before scope
     cleanup. The existing caller is neither copied nor interpreted; its PC names
     the original call while every callee keeps its own source position.

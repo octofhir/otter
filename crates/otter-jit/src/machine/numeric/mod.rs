@@ -6,7 +6,7 @@
 //!   reentrant calls, and catch landing pads.
 //! - `frame_state` — source-owned activation chains and complete SSA liveness.
 //! - `inlining` — guarded scalar callee CFG splicing before selection/allocation.
-//! - `property_cfg` — explicit named-load probe/cold/status/landing/join blocks.
+//! - `property_cfg` — explicit named-property probe/cold/status/landing/join blocks.
 //! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - Derived-this committed operations split into generated and cold CFG
@@ -50,9 +50,9 @@
 //!   and stable IC-address SSA values without a call or safepoint. Misses enter
 //!   an explicit rooted committed pair call; Success joins, Throw enters the
 //!   local catch or propagates, and Fatal exits. No property effect replays.
-//!   Stores retain a guarded committed boundary.
-//!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
-//!   post-commit conditional generational barrier and its call clobbers.
+//!   Named stores use the same explicit cold CFG and return hit/address values
+//!   from their non-reentrant generated commit. A proven non-cell value omits
+//!   the value barrier; the transition-shape barrier retains its leaf clobbers.
 //! - Every schema-owned binding read, write, and delete expands before
 //!   allocation into explicit guard/hit/cold/status/join control. Stable
 //!   captured cells and prepared global lexical/object slots read or write on
@@ -319,7 +319,6 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
         transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT),
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT),
-        transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
         transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
         transitions.entry(STUB_JIT_CALL_WITH_THIS_VALUE),
         transitions.entry(STUB_JIT_CONSTRUCT_VALUE),
@@ -737,13 +736,24 @@ fn select_with_packed_double_view_caches(
         for &node_value in &block.nodes {
             let result = values[node_value.0];
             let node = hir.nodes[node_value.0];
-            if let NumericNode::PropertyLoad {
-                receiver,
-                byte_pc,
-                exotic_length,
-                ..
-            } = node
-            {
+            if matches!(
+                node,
+                NumericNode::PropertyLoad { .. } | NumericNode::PropertyStore { .. }
+            ) {
+                let (receiver, byte_pc, exotic_length, stored) = match node {
+                    NumericNode::PropertyLoad {
+                        receiver,
+                        byte_pc,
+                        exotic_length,
+                        ..
+                    } => (receiver, byte_pc, exotic_length, None),
+                    NumericNode::PropertyStore {
+                        receiver,
+                        value,
+                        byte_pc,
+                    } => (receiver, byte_pc, false, Some(value)),
+                    _ => unreachable!(),
+                };
                 if block.nodes.last().copied() != Some(node_value) {
                     return Err(super::VerificationError::OpcodeSignatureMismatch(first));
                 }
@@ -754,25 +764,53 @@ fn select_with_packed_double_view_caches(
                     &mut instructions,
                     receiver,
                 );
-                property_inputs.insert(block_index, receiver);
+                let stored_type = stored.map(|value| hir.nodes[value.0].value_type());
+                let stored = stored.map(|value| {
+                    tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    )
+                });
+                property_inputs.insert(block_index, (receiver, stored));
                 let outputs = property_values[&block_index];
-                let mut probe = MachineInstruction::plain(
-                    MachineOpcode::PropertyLoad {
-                        site: Box::new(
-                            owned_property_site(hir, node_value, byte_pc)
-                                .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?
-                                .clone(),
-                        ),
-                        exotic_length,
-                    },
-                    vec![
-                        MachineOperand::location_input(receiver),
-                        MachineOperand::register_output(outputs.payload),
-                        MachineOperand::register_output(outputs.hit),
-                        MachineOperand::register_output(outputs.cell),
-                    ],
+                let property = Box::new(
+                    owned_property_site(hir, node_value, byte_pc)
+                        .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?
+                        .clone(),
                 );
-                probe.clobbers = property_load_clobbers();
+                let mut operands = vec![MachineOperand::location_input(receiver)];
+                if let Some(value) = stored {
+                    operands.push(MachineOperand::location_input(value));
+                } else {
+                    operands.push(MachineOperand::register_output(outputs.payload));
+                }
+                operands.extend([
+                    MachineOperand::register_output(outputs.hit),
+                    MachineOperand::register_output(outputs.cell),
+                ]);
+                let non_cell = stored_type.is_some_and(property_store_value_is_non_cell);
+                let mut probe = MachineInstruction::plain(
+                    if stored.is_some() {
+                        MachineOpcode::PropertyStore {
+                            site: property,
+                            value_is_non_cell: non_cell,
+                        }
+                    } else {
+                        MachineOpcode::PropertyLoad {
+                            site: property,
+                            exotic_length,
+                        }
+                    },
+                    operands,
+                );
+                probe.clobbers = if stored.is_some() {
+                    property_store_clobbers(non_cell)
+                } else {
+                    property_load_clobbers()
+                };
                 instructions.push(probe);
                 let mut branch = MachineInstruction::plain(
                     MachineOpcode::BranchIf(true),
@@ -974,10 +1012,15 @@ fn select_with_packed_double_view_caches(
                     )
                 }
                 NumericNode::InlineMethodGuard { source, target } => {
-                    let invalid = || super::VerificationError::OpcodeSignatureMismatch(
-                        MachineInstructionId(instructions.len() as u32),
-                    );
-                    let target = hir.direct_call_targets.get(target as usize).ok_or_else(invalid)?;
+                    let invalid = || {
+                        super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
+                            instructions.len() as u32,
+                        ))
+                    };
+                    let target = hir
+                        .direct_call_targets
+                        .get(target as usize)
+                        .ok_or_else(invalid)?;
                     let [candidate] = target.candidates.as_slice() else {
                         return Err(invalid());
                     };
@@ -988,7 +1031,9 @@ fn select_with_packed_double_view_caches(
                         return Err(invalid());
                     }
                     let mut guard = MachineInstruction::plain(
-                        MachineOpcode::InlineMethodGuard { guard: Box::new(program.clone()) },
+                        MachineOpcode::InlineMethodGuard {
+                            guard: Box::new(program.clone()),
+                        },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),
                             MachineOperand::register_output(result),
@@ -1594,54 +1639,8 @@ fn select_with_packed_double_view_caches(
                         .expect("bounded scalar function safepoint count");
                     call
                 }
-                NumericNode::PropertyLoad { .. } => {
+                NumericNode::PropertyLoad { .. } | NumericNode::PropertyStore { .. } => {
                     unreachable!("property probe is selected before ordinary nodes")
-                }
-                NumericNode::PropertyStore {
-                    receiver,
-                    value,
-                    byte_pc,
-                } => {
-                    let receiver = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        receiver,
-                    );
-                    let value_is_non_cell =
-                        property_store_value_is_non_cell(hir.nodes[value.0].value_type());
-                    let value = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        value,
-                    );
-                    let mut store = MachineInstruction::plain(
-                        MachineOpcode::PropertyStore {
-                            site: Box::new(
-                                owned_property_site(hir, node_value, byte_pc)
-                                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(
-                                        MachineInstructionId(instructions.len() as u32),
-                                    ))?
-                                    .clone(),
-                            ),
-                            value_is_non_cell,
-                        },
-                        vec![
-                            MachineOperand::location_input(receiver),
-                            MachineOperand::location_input(value),
-                            MachineOperand::tagged_root(receiver),
-                            MachineOperand::tagged_root(value),
-                        ],
-                    );
-                    store.clobbers = property_store_clobbers(value_is_non_cell);
-                    store.safepoint = Some(super::SafepointId(next_safepoint));
-                    next_safepoint = next_safepoint
-                        .checked_add(1)
-                        .expect("bounded scalar function safepoint count");
-                    store
                 }
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
                     MachineOpcode::IntegerConstant(i64::from(value)),
@@ -2516,7 +2515,12 @@ fn select_binding_cold_block(
         .expect("bounded scalar function safepoint count");
     let state_index = frame_state_indices[&NumericFramePoint::Node(node_value)];
     inline_reentry::select_frames(
-        hir, state_index, machine_values, representations, instructions, &mut call,
+        hir,
+        state_index,
+        machine_values,
+        representations,
+        instructions,
+        &mut call,
     );
     attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
     attach_safepoint_roots(representations, &mut call);
@@ -6587,11 +6591,22 @@ mod tests {
                     logical_pc: 1,
                     osr_entry_allowed: false,
                     predecessors: vec![0],
-                    successors: Vec::new(),
+                    successors: vec![2],
                     parameters: Vec::new(),
                     parameter_registers: Vec::new(),
-                    successor_arguments: Vec::new(),
+                    successor_arguments: vec![vec![]],
                     nodes: vec![value(3)],
+                    terminator: NumericTerminator::Jump,
+                },
+                hir::NumericBlock {
+                    logical_pc: 2,
+                    osr_entry_allowed: false,
+                    predecessors: vec![1],
+                    successors: vec![],
+                    parameters: vec![],
+                    parameter_registers: vec![],
+                    successor_arguments: vec![],
+                    nodes: vec![],
                     terminator: NumericTerminator::Return(value(2)),
                 },
             ],
@@ -8079,7 +8094,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_properties_with_explicit_load_completion_and_exact_store_state() {
+    fn selects_properties_with_explicit_completion_and_cold_roots() {
         let hir = property_selection_hir();
         let sequence = select(&hir).expect("property Machine IR");
 
@@ -8153,12 +8168,6 @@ mod tests {
                 MachineOperand::location_input(store_value),
             ]
         );
-        assert!(
-            store
-                .operands
-                .iter()
-                .all(|operand| operand.purpose != OperandPurpose::Output)
-        );
         assert_eq!(
             sequence.representations()[store_receiver.0 as usize],
             MachineRepresentation::Tagged
@@ -8168,24 +8177,25 @@ mod tests {
             MachineRepresentation::Tagged
         );
         assert_eq!(store.clobbers, property_store_clobbers(true));
-        assert_eq!(store.deopt, Some(DeoptId(0)));
-        assert!(store.safepoint.is_some());
-        assert_eq!(
-            store.operands[2],
-            MachineOperand::tagged_root(store_receiver)
+        assert!(store.deopt.is_none() && store.safepoint.is_none());
+        assert_eq!(store.operands.len(), 4);
+        let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
+            MachineOpcode::Call(index) => matches!(sequence.call_descriptors()[index as usize].target,
+                CallTarget::CommittedRuntime { target, .. } if target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
+            _ => false,
+        }).expect("explicit named-store cold call");
+        assert!(cold.safepoint.is_some() && cold.deopt.is_none());
+        assert!(
+            cold.operands
+                .contains(&MachineOperand::tagged_root(store_receiver))
         );
-        assert_eq!(store.operands[3], MachineOperand::tagged_root(store_value));
+        assert!(
+            cold.operands
+                .contains(&MachineOperand::tagged_root(store_value))
+        );
         assert_eq!(
-            store.operands[4..]
-                .iter()
-                .map(|operand| (operand.value, operand.purpose))
-                .collect::<Vec<_>>(),
-            [
-                (MachineValue(0), OperandPurpose::Deopt),
-                (MachineValue(1), OperandPurpose::Deopt),
-                (MachineValue(2), OperandPurpose::Deopt),
-                (MachineValue(2), OperandPurpose::TaggedRoot),
-            ]
+            cold.operands[2],
+            MachineOperand::location_input(store.operands[3].value)
         );
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::BoxInt32
@@ -8397,13 +8407,13 @@ mod tests {
     }
 
     #[test]
-    fn property_store_deopt_retains_unboxed_source_representations() {
+    fn property_store_cold_call_does_not_create_a_replay_exit() {
         let hir = property_selection_hir();
         let sequence = select(&hir).expect("property Machine IR");
         let allocation = sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
-            .expect("property deopt allocation");
-        let layout = arm64::frame_layout(&allocation, 0).expect("property deopt frame");
+            .unwrap();
+        let layout = arm64::frame_layout(&allocation, 0).unwrap();
         let table = lower_deopt_table(
             &sequence,
             &allocation,
@@ -8412,14 +8422,14 @@ mod tests {
             arm64::FP_BUDGET,
             &machine_frame_states(&hir),
         )
-        .expect("property deopt table");
-        let exit = table
-            .lookup(DeoptExitId(0))
-            .expect("property-store exit")
-            .outermost();
-        assert_eq!(exit.slots[0].repr, otter_vm::deopt::DeoptRepr::Int32);
-        assert_eq!(exit.slots[1].repr, otter_vm::deopt::DeoptRepr::Boolean);
-        assert_eq!(exit.slots[2].repr, otter_vm::deopt::DeoptRepr::Tagged);
+        .unwrap();
+        assert!(table.lookup(DeoptExitId(0)).is_none());
+        assert!(
+            sequence
+                .instructions()
+                .iter()
+                .all(|instruction| instruction.deopt.is_none())
+        );
     }
 
     #[test]

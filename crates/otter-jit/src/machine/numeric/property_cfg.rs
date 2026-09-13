@@ -1,7 +1,7 @@
-//! Explicit named-load probe, committed cold call and completion CFG.
+//! Explicit named-property probe, committed cold call and completion CFG.
 //!
 //! # Contents
-//! - Machine values and blocks for a source-owned property read.
+//! - Machine values and blocks for a source-owned property operation.
 //! - Collector-visible cold operands and explicit native status control.
 //!
 //! # Invariants
@@ -49,7 +49,11 @@ impl Values {
 
 pub(super) fn site(hir: &NumericFunction, block: usize) -> Option<hir::NumericValue> {
     let value = *hir.blocks.get(block)?.nodes.last()?;
-    matches!(hir.nodes[value.0], NumericNode::PropertyLoad { .. }).then_some(value)
+    matches!(
+        hir.nodes[value.0],
+        NumericNode::PropertyLoad { .. } | NumericNode::PropertyStore { .. }
+    )
+    .then_some(value)
 }
 
 pub(super) fn exceptional(hir: &NumericFunction, block: usize) -> Option<usize> {
@@ -68,13 +72,14 @@ pub(super) fn select_block(
     cfg: &SelectionCfg,
     block_index: usize,
     values: Values,
-    receiver: MachineValue,
+    inputs: (MachineValue, Option<MachineValue>),
     machine_values: &[MachineValue],
     representations: &mut Vec<MachineRepresentation>,
     call_descriptors: &mut Vec<CallDescriptor>,
     next_safepoint: &mut u32,
     instructions: &mut Vec<MachineInstruction>,
 ) -> Result<MachineBlockData, super::super::VerificationError> {
+    let (receiver, stored) = inputs;
     let first = MachineInstructionId(instructions.len() as u32);
     let node = site(hir, block_index).ok_or(super::super::VerificationError::InvalidBlock(
         cfg.originals[block_index],
@@ -91,23 +96,39 @@ pub(super) fn select_block(
     match selected {
         SelectedBlock::PropertyCold(_) => {
             let source = &hir.property_sites[&node];
-            let mut descriptor = binding_value_descriptor(source.logical_pc, source.byte_pc, 2);
-            if let CallTarget::CommittedRuntime { target, .. } = &mut descriptor.target {
-                *target = otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY;
-            }
-            descriptor.arguments =
-                vec![MachineRepresentation::Tagged, MachineRepresentation::Int64];
-            let descriptor_index = intern_call_descriptor(call_descriptors, descriptor);
-            let mut call = MachineInstruction::plain(
-                MachineOpcode::Call(descriptor_index as u32),
-                vec![
-                    MachineOperand::location_input(receiver),
-                    MachineOperand::location_input(values.cell),
-                    MachineOperand::register_output(values.cold_payload),
-                    MachineOperand::register_output(values.status),
-                    MachineOperand::tagged_root(receiver),
-                ],
+            let mut descriptor = binding_value_descriptor(
+                source.logical_pc,
+                source.byte_pc,
+                if stored.is_some() { 3 } else { 2 },
             );
+            if let CallTarget::CommittedRuntime { target, .. } = &mut descriptor.target {
+                *target = if stored.is_some() {
+                    otter_vm::native_abi::STUB_JIT_STORE_PROPERTY
+                } else {
+                    otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY
+                };
+            }
+            descriptor.arguments = vec![MachineRepresentation::Tagged];
+            if stored.is_some() {
+                descriptor.arguments.push(MachineRepresentation::Tagged);
+            }
+            descriptor.arguments.push(MachineRepresentation::Int64);
+            let descriptor_index = intern_call_descriptor(call_descriptors, descriptor);
+            let mut operands = vec![MachineOperand::location_input(receiver)];
+            if let Some(value) = stored {
+                operands.push(MachineOperand::location_input(value));
+            }
+            operands.extend([
+                MachineOperand::location_input(values.cell),
+                MachineOperand::register_output(values.cold_payload),
+                MachineOperand::register_output(values.status),
+                MachineOperand::tagged_root(receiver),
+            ]);
+            if let Some(value) = stored {
+                operands.push(MachineOperand::tagged_root(value));
+            }
+            let mut call =
+                MachineInstruction::plain(MachineOpcode::Call(descriptor_index as u32), operands);
             call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
             call.safepoint = Some(SafepointId(*next_safepoint));
             *next_safepoint += 1;
@@ -150,13 +171,21 @@ pub(super) fn select_block(
             jump(instructions);
             result.predecessors = vec![cfg.originals[block_index]];
             result.successors = vec![blocks.join];
-            result.successor_arguments = vec![vec![values.payload]];
+            result.successor_arguments = vec![if stored.is_some() {
+                vec![]
+            } else {
+                vec![values.payload]
+            }];
         }
         SelectedBlock::PropertySuccess(_) => {
             jump(instructions);
             result.predecessors = vec![blocks.cold];
             result.successors = vec![blocks.join];
-            result.successor_arguments = vec![vec![values.cold_payload]];
+            result.successor_arguments = vec![if stored.is_some() {
+                vec![]
+            } else {
+                vec![values.cold_payload]
+            }];
         }
         SelectedBlock::PropertyThrow(_) | SelectedBlock::PropertyFatal(_) => {
             let throwing = matches!(selected, SelectedBlock::PropertyThrow(_));
@@ -184,7 +213,9 @@ pub(super) fn select_block(
             }
             jump(instructions);
             result.predecessors = vec![blocks.hit, blocks.success];
-            result.parameters = vec![machine_value(machine_values, node)];
+            if stored.is_none() {
+                result.parameters = vec![machine_value(machine_values, node)];
+            }
             for (edge, &successor) in hir.blocks[block_index].successors.iter().enumerate() {
                 if exceptional(hir, block_index) == Some(edge) {
                     continue;

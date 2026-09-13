@@ -387,10 +387,13 @@ sidecar; deeper prototype links need no guard because the own writable property
 ends `[[Set]]` lookup. Dictionary-backed `%Object.prototype%` additions remain
 canonical.
 Success or throw commits once; named-property misses do not exact-deopt and
-replay the source operation. A property operation with a local catch stays on
-Template until its fast probe and committed cold call are explicit Machine CFG
-before register allocation. The boundary already returns a pure exception
-value.
+replay the source operation. Both named loads and stores split their generated
+probe/commit and rooted cold call before register allocation. Cold calls expose
+`machinePropertyLoadCold` or `machinePropertyStoreCold`, followed by explicit
+Success/Throw/Fatal control. Unprotected load/store helper bodies can inline;
+their safepoint-owned `inlineFrames` recipes publish exact callee source frames
+and moving roots before setters/getters run. Named loads route local exceptions
+through SSA; protected stores still require HIR exception-operand admission.
 Indexed element regions similarly guard a baked dense layout before direct
 access.
 Packed-double Array regions additionally prove the ordinary receiver's exotic

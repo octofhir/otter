@@ -928,10 +928,11 @@ fn emit_committed_pair_call(
     };
     let byte_pc = *byte_pc;
     let semantic_arity = usize::from(*semantic_arity);
-    let named_load = *target == STUB_JIT_LOAD_PROPERTY;
+    let named_store = *target == STUB_JIT_STORE_PROPERTY;
+    let named_property = *target == STUB_JIT_LOAD_PROPERTY || named_store;
     if !is_explicit_committed_runtime_call(descriptor)
-        || semantic_arity > 2
-        || (!named_load && target.signature != RuntimeStubSignature::CommittedValue2)
+        || semantic_arity > if named_store { 3 } else { 2 }
+        || (!named_property && target.signature != RuntimeStubSignature::CommittedValue2)
         || target.result_abi != RuntimeStubResultAbi::NativePair
         || target.result_domain != NativeResultDomain::Committed
         || descriptor.arguments.len() != semantic_arity
@@ -982,8 +983,14 @@ fn emit_committed_pair_call(
     emit_load_u64(ops, 1, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; mov x2, x1);
     for (index, value) in arguments.iter().copied().enumerate() {
-        if named_load && index == 1 {
-            emit_load_allocated_tagged(ops, frame, locations[index], 2, MACHINE_ROOT_RECORD_SIZE)?;
+        if named_property && index + 1 == semantic_arity {
+            emit_load_allocated_tagged(
+                ops,
+                frame,
+                locations[index],
+                (index + 1) as u8,
+                MACHINE_ROOT_RECORD_SIZE,
+            )?;
             continue;
         }
         emit_load_safepoint_root(
@@ -1352,7 +1359,6 @@ pub(super) fn emit(
     to_boolean_entry: u64,
     load_element_entry: u64,
     store_element_entry: u64,
-    store_property_entry: u64,
     call_method_value_entry: u64,
     call_with_this_value_entry: u64,
     construct_value_entry: u64,
@@ -1587,7 +1593,15 @@ pub(super) fn emit(
                 let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 emit_method_guard_from_tagged_register(
-                    &mut ops, &mut relocations, view, guard, 9, 9, None, false, miss,
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    guard,
+                    9,
+                    9,
+                    None,
+                    false,
+                    miss,
                 )?;
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                 structural_regions.push(("machineInlineMethodGuard", None, start, ops.offset().0));
@@ -2199,10 +2213,7 @@ pub(super) fn emit(
             } => {
                 let byte_pc = property.byte_pc;
                 let logical_pc = property.logical_pc;
-                let site = safepoints
-                    .site(id)
-                    .filter(|site| instruction.safepoint == Some(site.id))
-                    .ok_or(Unsupported::OperandShape("scalar property store safepoint"))?;
+
                 let cell_ordinal = u32::try_from(next_store_ic)
                     .map_err(|_| Unsupported::OperandShape("scalar property store IC ordinal"))?;
                 let cell = store_ic_cells
@@ -2212,6 +2223,17 @@ pub(super) fn emit(
                 let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
                 next_store_ic += 1;
                 let start = ops.offset().0;
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    9,
+                    cell_addr as u64,
+                    RelocationTarget::PropertyIcCell {
+                        access: PropertyIcAccess::Store,
+                        ordinal: cell_ordinal,
+                    },
+                );
+                emit_store_allocated_tagged(&mut ops, frame, locations[3], 9, 0)?;
                 let probe_cell = ops.new_dynamic_label();
                 let commit = ops.new_dynamic_label();
                 let runtime = ops.new_dynamic_label();
@@ -2278,72 +2300,12 @@ pub(super) fn emit(
                     emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
                     dynasm!(ops ; .arch aarch64 ; =>committed);
                 }
+                emit_load_u64(&mut ops, 9, 1);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime);
-
-                emit_clear_packed_double_view_caches(
-                    &mut ops,
-                    frame,
-                    sequence.packed_double_view_cache_count(),
-                )?;
-                emit_save_safepoint_roots(&mut ops, frame, site)?;
-                emit_publish_machine_roots(&mut ops, frame, site)?;
-                emit_load_safepoint_root(
-                    &mut ops,
-                    frame,
-                    site,
-                    instruction.operands[0].value,
-                    1,
-                    MACHINE_ROOT_RECORD_SIZE,
-                )?;
-                emit_load_safepoint_root(
-                    &mut ops,
-                    frame,
-                    site,
-                    instruction.operands[1].value,
-                    2,
-                    MACHINE_ROOT_RECORD_SIZE,
-                )?;
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    3,
-                    cell_addr as u64,
-                    RelocationTarget::PropertyIcCell {
-                        access: PropertyIcAccess::Store,
-                        ordinal: cell_ordinal,
-                    },
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
-                    ; movz w15, logical_pc
-                    ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
-                    ; mov x0, x19
-                );
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    16,
-                    store_property_entry,
-                    RelocationTarget::runtime_stub(STUB_JIT_STORE_PROPERTY),
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; blr x16
-                    ; mov x17, x0
-                    ; mov x15, x1
-                );
-                emit_clear_machine_roots(&mut ops);
-                emit_reload_safepoint_roots(&mut ops, frame, site)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cbz x15, =>done
-                    ; cmp x15, NativeResultStatus::Throw as u32
-                    ; b.ne =>fatal
-                    ; mov x0, x17
-                    ; b =>throw_value
-                    ; =>done
-                );
+                emit_load_u64(&mut ops, 9, 0);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; =>done);
                 structural_regions.push((
                     "machinePropertyStore",
                     Some(byte_pc),
@@ -3382,6 +3344,8 @@ pub(super) fn emit(
                                 "machineBindingCold"
                             } else if matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. } if target == STUB_JIT_LOAD_PROPERTY) {
                                 "machinePropertyLoadCold"
+                            } else if matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. } if target == STUB_JIT_STORE_PROPERTY) {
+                                "machinePropertyStoreCold"
                             } else if super::super::derived_this::cold_byte_pc(sequence, block_index) == Some(byte_pc) {
                                 "machineDerivedThisBindCold"
                             } else {
@@ -5244,7 +5208,6 @@ mod tests {
                 1,
                 1,
                 1,
-                1,
                 &mut load_ic_cells,
                 &mut store_ic_cells,
                 3,
@@ -5320,7 +5283,6 @@ mod tests {
             &DeoptRuntime::default(),
             &safepoints,
             &transitions,
-            1,
             1,
             1,
             1,

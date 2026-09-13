@@ -530,7 +530,7 @@ Cold reentry preserves four source frames; arithmetic exits reconstruct all four
 An inner method identity miss reconstructs three suspended frames without
 repeating an earlier getter in forward. Eleven inline runtime tests pass.
 
-Still open: protected inline sites, explicit named-store cold CFG,
+Still open: protected inline sites and store exception operands,
 other binding/allocation bodies, residual-call inlining and richer entry recipes for
 fresh captures/arguments. Next is caller-specific construction and eliminating
 non-escaping temporary objects across the expanded helper graph. No obsolete Function.caller/arguments expansion
@@ -558,6 +558,14 @@ factory and fresh construct site both exercise real two-frame numeric exits and
 preserve forwarded arguments, receiver substitution and single coercion effects.
 This fixes current-engine reconstruction; constructor splicing and virtual
 allocation elimination remain the next structural work, with no speed claim.
+Named stores now use explicit probe/hit/cold/status/join CFG, with roots only at
+the committed cold call; the emitter-hidden runtime path is removed. Unprotected
+field-initializer helpers splice into caller SSA. Setter return/throw and strict
+read-only TypeError preserve source stacks; a later arithmetic deopt reconstructs
+the callee without repeating the store. Existing transition/value barriers remain.
+Protected stores still require HIR exception-operand admission. Actual constructor
+entry/allocation and argument forwarding are still separate A2 barriers.
+Evidence: benchmarks/results/a2-20260913-inline-stores/README.md.
 Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.
 
 The handoff's structural A1–A3 order supersedes the chronological next steps below.

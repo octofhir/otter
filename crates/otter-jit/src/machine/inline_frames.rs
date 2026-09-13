@@ -4,7 +4,7 @@
 //! - Verification of the shared frame schema against explicit safepoint roots.
 //!
 //! # Invariants
-//! - Only committed named-load and binding cold calls carry these recipes.
+//! - Only committed named-property and binding cold calls carry these recipes.
 //! - The published caller is represented by source identity, never copied slots.
 //! - Every descendant value is tagged and an explicit allocator-visible root.
 
@@ -24,7 +24,8 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
         let descriptor = &sequence.call_descriptors[descriptor as usize];
         if !matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
             if target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY
-                || target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE)
+                || target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE
+                || target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY)
             || instruction.safepoint.is_none()
             || instruction.deopt.is_some()
             || frames.len() < 2
@@ -43,12 +44,14 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
                 }
             }
             _ => {
-                let cell = instruction.operands[1].value;
+                let store = matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. } if target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY);
+                let cell = instruction.operands[if store { 2 } else { 1 }].value;
                 let property = sequence
                     .instructions
                     .iter()
                     .find_map(|probe| match &probe.opcode {
                         MachineOpcode::PropertyLoad { site, .. }
+                        | MachineOpcode::PropertyStore { site, .. }
                             if probe.operands[3].value == cell =>
                         {
                             Some(site)

@@ -5,9 +5,9 @@
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
-//! - Scalar, global-read and named-load bodies, including bounded fully spliced helper
+//! - Scalar, global-read and named-property bodies, including bounded fully spliced helper
 //!   chains, are admitted. Other bindings, allocation and residual JavaScript calls
-//!   retain ordinary call linkage. Named-load cold
+//!   retain ordinary call linkage. Named-property cold
 //!   calls publish exact inline frames without replaying completed effects.
 //! - Identity and parameter guards precede callee effects; body exits rebuild
 //!   the caller after its call and the callee at its exact source instruction.
@@ -537,6 +537,15 @@ fn map_body_node(
         TaggedToInt32(value) => TaggedToInt32(map(value)),
         WidenInt32(value) => WidenInt32(map(value)),
         WidenUint32(value) => WidenUint32(map(value)),
+        PropertyStore {
+            receiver,
+            value,
+            byte_pc,
+        } => PropertyStore {
+            receiver: map(receiver),
+            value: map(value),
+            byte_pc,
+        },
         FloatToInt32(value) => FloatToInt32(map(value)),
         BooleanToInt32(value) => BooleanToInt32(map(value)),
         IntegerNeg(value) => IntegerNeg(map(value)),

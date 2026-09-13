@@ -156,27 +156,33 @@ pub(crate) extern "C" fn jit_store_property_stub(
     let ctx = unsafe { &mut *ctx };
     // SAFETY: the same stable code-owned cell contract as the load boundary.
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
-    let result = source
-        .ok_or(VmError::InvalidOperand)
-        .and_then(|(function_id, pc)| {
-            ctx.runtime_call()?.store_property_value(
+    let result = (|| {
+        let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
+        let mut frames = super::inline_frames::decode(ctx)?;
+        let mut call = ctx.runtime_call()?;
+        call.with_inline_activations(&mut frames, |call| {
+            match call.store_property_value(
                 function_id,
                 pc,
                 Value::from_bits(receiver_bits),
                 Value::from_bits(value_bits),
-            )
-        });
+            ) {
+                Ok(fill) => Ok((NativeResultPair::success(Value::undefined()), fill)),
+                Err(error) => call
+                    .take_js_throw(error)
+                    .map(|value| (NativeResultPair::throw_value(value), None)),
+            }
+        })?
+    })();
     match result {
-        Ok(fill) => {
-            if !cell.is_null()
-                && let Some(way) = fill
-            {
+        Ok((pair, fill)) => {
+            if let Some(way) = fill {
                 // SAFETY: stable per-site cell address baked into this code.
                 unsafe {
                     whisker_ic_fill(cell, way);
                 }
             }
-            NativeResultPair::success(Value::undefined())
+            pair
         }
         Err(err) => committed_vm_result(ctx, Err(err)),
     }

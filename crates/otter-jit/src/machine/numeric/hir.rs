@@ -43,11 +43,11 @@
 //!   Template baseline.
 //!   Every conversion and access frame state describes the exact pre-access
 //!   register window.
-//! - Named loads end their HIR block and select a probe plus committed cold
+//! - Named accesses end their HIR block and select a probe plus committed cold
 //!   call with explicit Success/Throw/Fatal edges. Supported local catches
 //!   receive the cold exception payload through SSA, without replay. Source
-//!   frames publish roots at that cold call. Stores retain their own guarded
-//!   committed boundary and source frame state. Named `.length` loads retain
+//!   frames publish roots at that cold call. Protected stores remain declined
+//!   until their exception operands are admitted. Named `.length` loads retain
 //!   the exotic fast-path marker.
 //! - Every schema-owned binding read, write, and delete remains one typed HIR
 //!   family. Structurally proven global-this, upvalue, global lexical, and
@@ -633,7 +633,9 @@ impl NumericNode {
     /// Authoritative selection use of an attached frame state.
     pub(super) const fn frame_state_purpose(self) -> Option<NumericFrameStatePurpose> {
         match self {
-            Self::PropertyLoad { .. } => Some(NumericFrameStatePurpose::TaggedRoots),
+            Self::PropertyLoad { .. } | Self::PropertyStore { .. } => {
+                Some(NumericFrameStatePurpose::TaggedRoots)
+            }
             Self::CommittedValue { .. } | Self::Binding { .. } | Self::LiteralAllocation { .. } => {
                 Some(NumericFrameStatePurpose::TaggedRoots)
             }
@@ -647,7 +649,6 @@ impl NumericNode {
             | Self::TaggedToInt32(..)
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
-            | Self::PropertyStore { .. }
             | Self::ElementLoad { .. }
             | Self::ElementStore { .. }
             | Self::CheckedFloat64ToElementIndex { .. }
@@ -1759,7 +1760,7 @@ fn build_raw_blocks(
                 .enclosing_exception_region(pc)
                 .and_then(|region| region.catch_pc)
                 .is_some();
-        if (binding || op == Op::LoadProperty || protected_throw)
+        if (binding || matches!(op, Op::LoadProperty | Op::StoreProperty) || protected_throw)
             && usize::try_from(pc + 1).ok()? < view.instructions.len()
         {
             starts.insert(pc + 1);

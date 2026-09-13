@@ -30,7 +30,7 @@ const PLAN_INHERITED: u32 = std::mem::offset_of!(JitDirectCallPlan, inherited_up
 const PLAN_ACTUALS: u32 = std::mem::offset_of!(JitDirectCallPlan, needs_incoming_arguments) as u32;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_runtime_forward<Load, Store, Restore>(
+pub(crate) fn emit_runtime_forward<Load, Store, Restore, LoadBinding>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -48,11 +48,13 @@ pub(crate) fn emit_runtime_forward<Load, Store, Restore>(
     mut load: Load,
     store: Store,
     restore_roots: Restore,
+    load_binding: LoadBinding,
 ) -> Result<(), Unsupported>
 where
     Load: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
     Store: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
     Restore: FnMut(&mut Assembler) -> Result<(), Unsupported>,
+    LoadBinding: FnMut(&mut Assembler, u16, u8) -> Result<(), Unsupported>,
 {
     let layout = StackLayout::dynamic_prefix();
     let size_slot = layout.allocation_size.expect("dynamic prefix");
@@ -273,7 +275,14 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cbnz x0, =>uncommitted_rejected
+        ; tbnz x0, #63, =>uncommitted_rejected
+        ; ldr x17, [sp, layout.caller_code_object_id]
+        ; ldrh w2, [x17, PLAN_PARAMS]
+        ; ldrh w3, [x17, PLAN_REGISTERS]
+    );
+    forward_bindings::emit(ops, view, layout, load_binding)?;
+    dynasm!(ops
+        ; .arch aarch64
         ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
         ; ldr x14, [X(context_register), THREAD_OFFSET]
         ; ldr x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]

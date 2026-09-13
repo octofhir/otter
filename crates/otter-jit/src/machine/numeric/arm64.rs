@@ -3074,6 +3074,11 @@ pub(super) fn emit(
                                     )?,
                                 )
                             },
+                            |_, _, _| {
+                                Err(Unsupported::OperandShape(
+                                    "Machine forwarding operands not lowered",
+                                ))
+                            },
                         )?;
                         if *kind == DirectCallKind::Method {
                             structural_regions.push((

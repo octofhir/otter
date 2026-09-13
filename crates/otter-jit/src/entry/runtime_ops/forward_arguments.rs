@@ -2,12 +2,12 @@
 //!
 //! # Contents
 //! - Intrinsic-apply/live-window count and runtime target-plan probes.
-//! - Complete live argument copy before generated callee publication.
+//! - Incoming/captured argument copy before generated register-alias stores.
 //!
 //! # Invariants
 //! - All probes and copies are leaf/no-allocation with no observable JS effects.
-//! - Count/plan misses return `u64::MAX`; copy misses return one, matching the
-//!   engine-owned descriptors. Neither failure parks an exception.
+//! - Count/plan/copy misses return `u64::MAX`; success returns actual count in the
+//!   engine-owned descriptors. No failure parks an exception.
 //!
 //! # See also
 //! - `otter_vm::runtime_activation` — checked compiled activation operations.
@@ -29,16 +29,17 @@ pub(crate) extern "C" fn jit_copy_forwarded_arguments_stub(
     parameter_count: u64,
 ) -> u64 {
     let Ok(parameter_count) = u16::try_from(parameter_count) else {
-        return 1;
+        return u64::MAX;
     };
     // SAFETY: generated code supplies its live entry-lifetime context.
     let ctx = unsafe { &mut *ctx };
     let Ok(runtime) = ctx.runtime_call() else {
-        return 1;
+        return u64::MAX;
     };
     // SAFETY: shared generated linkage owns a complete initialized private
     // destination frame and keeps it disjoint from the published caller.
-    u64::from(!unsafe { runtime.copy_forwarded_arguments(destination, parameter_count) })
+    unsafe { runtime.copy_forwarded_argument_window(destination, parameter_count) }
+        .map_or(u64::MAX, u64::from)
 }
 
 /// Write the existing engine plan into caller-owned native scratch. The metadata

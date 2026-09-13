@@ -2,15 +2,16 @@
 //!
 //! # Contents
 //! - Elided-arguments eligibility/count observation without allocation or JS.
-//! - Copying a complete live argument list into an unpublished native callee.
+//! - Copying incoming actuals and captured aliases into a private native callee.
 //! - Shared mapped-parameter refresh for canonical and generated completion.
 //! - Immutable binding reads for native SSA operand and liveness construction.
 //!
 //! # Invariants
 //! - A materialized arguments object is never treated as an incoming window:
 //!   its getters, length and mutations require canonical observable collection.
-//! - Leaf copies read current mapped bindings, preserve extra actuals, and do
-//!   not invent missing arguments. No GC or JS reentry occurs during a copy.
+//! - Leaf copies read current captured bindings; generated linkage patches
+//!   register aliases from current homes. Together they preserve extra actuals and
+//!   never invent missing arguments. No GC or JS reentry occurs during a copy.
 //! - The destination is unpublished and fully initialized. A rejected copy
 //!   has no JavaScript effect; generated linkage discards that private frame.
 //!
@@ -58,7 +59,7 @@ impl Interpreter {
         u32::try_from(count).ok()
     }
 
-    pub(crate) fn copy_live_forwarded_arguments(
+    pub(crate) fn copy_forwarded_argument_window(
         &self,
         function: &CodeBlock,
         stack: &ActivationStack,
@@ -66,16 +67,16 @@ impl Interpreter {
         materialized: Option<usize>,
         destination: &mut ActiveFrameMut<'_>,
         parameter_count: u16,
-    ) -> Result<bool, VmError> {
+    ) -> Result<Option<u32>, VmError> {
         let Some(count) = self.elided_forward_argument_count(stack, source, materialized) else {
-            return Ok(false);
+            return Ok(None);
         };
         let count = count as usize;
         let incoming = destination.incoming_argument_count();
         if usize::from(parameter_count) > destination.register_count()
             || incoming.is_some_and(|length| length != count)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let cold = materialized
             .and_then(|index| stack.get(index))
@@ -105,15 +106,18 @@ impl Interpreter {
             };
             write(index, value)?;
         }
-        if function.arguments_object_kind == ArgumentsObjectKind::Mapped {
-            for binding in &function.mapped_argument_bindings {
-                let index = binding.argument_index as usize;
-                if index < count {
-                    write(index, self.live_argument_binding(source, binding.storage)?)?;
-                }
+        for (argument_index, storage) in function.forwarded_argument_bindings() {
+            let index = usize::from(argument_index);
+            if index < count
+                && let ArgumentBindingStorage::Upvalue { .. } = storage
+            {
+                write(index, self.live_argument_binding(source, storage)?)?;
             }
         }
-        Ok(true)
+        // Register mappings belong to the generated caller's current value
+        // homes, which may be SSA roots rather than the entry register window.
+        // Generated linkage patches those values before publishing the callee.
+        Ok(Some(count as u32))
     }
 
     fn live_argument_binding(

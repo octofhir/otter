@@ -56,6 +56,7 @@
 //! - `otter-vm/src/native_abi/frame.rs` — stack-register root ownership.
 
 mod completion;
+mod forward_bindings;
 mod layout;
 mod runtime_forward;
 pub(crate) use runtime_forward::emit_runtime_forward;
@@ -885,6 +886,11 @@ pub(crate) fn emit_direct_call(
             ))
         },
         |_, _| Ok(()),
+        |_, _, _| {
+            Err(Unsupported::OperandShape(
+                "forward bindings outside forwarding site",
+            ))
+        },
     )
 }
 
@@ -896,9 +902,18 @@ pub(crate) fn emit_direct_call(
 /// pointer restored and before the result is committed. `refresh_roots` may
 /// rewrite every allocator-owned register after a moving collection; the
 /// linkage therefore reloads its private `x25` generation handle from the
-/// linkage frame after each refresh.
+/// linkage frame after each refresh. `load_binding` receives a mapped VM register
+/// and the stable caller-SP base register, writes x14 from a current rooted home,
+/// and obeys the scratch contract in `forward_bindings`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, Refresh>(
+pub(crate) fn emit_direct_call_with_access<
+    Load,
+    Store,
+    Restore,
+    RootReceiver,
+    Refresh,
+    LoadBinding,
+>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -923,6 +938,7 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     restore_roots: Restore,
     mut root_receiver: RootReceiver,
     mut refresh_roots: Refresh,
+    load_binding: LoadBinding,
 ) -> Result<(), Unsupported>
 where
     Load: FnMut(&mut Assembler, u16, u8, u32) -> Result<(), Unsupported>,
@@ -930,6 +946,7 @@ where
     Restore: FnMut(&mut Assembler) -> Result<(), Unsupported>,
     RootReceiver: FnMut(&mut Assembler, u8, u32) -> Result<(), Unsupported>,
     Refresh: FnMut(&mut Assembler, u32) -> Result<(), Unsupported>,
+    LoadBinding: FnMut(&mut Assembler, u16, u8) -> Result<(), Unsupported>,
 {
     let (layout, direct_call) = layout_and_artifact(view, site)?;
 
@@ -1733,7 +1750,10 @@ where
             copy_forwarded_arguments_entry,
             abi::STUB_JIT_COPY_FORWARDED_ARGUMENTS,
         );
-        dynasm!(ops ; .arch aarch64 ; blr x16 ; cbnz x0, =>uncommitted_rejected);
+        dynasm!(ops ; .arch aarch64 ; blr x16 ; tbnz x0, #63, =>uncommitted_rejected);
+        emit_load_u64(ops, 2, u64::from(site.target.plan.param_count));
+        emit_load_u64(ops, 3, u64::from(site.target.plan.register_count));
+        forward_bindings::emit(ops, view, layout, load_binding)?;
     }
     dynasm!(ops
         ; .arch aarch64

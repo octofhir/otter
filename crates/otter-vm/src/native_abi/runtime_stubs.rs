@@ -1623,8 +1623,9 @@ pub const STUB_JIT_FORWARD_ARGUMENT_COUNT: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
-/// Copy live forwarded actuals into a fully initialized unpublished callee.
-/// Returns zero for success or one for a pre-entry miss; never invokes getters.
+/// Copy incoming actuals and captured aliases into an initialized private callee.
+/// Returns the actual count, or `u64::MAX` on a pre-entry miss. Generated code
+/// patches register aliases from current rooted homes before publication.
 pub const STUB_JIT_COPY_FORWARDED_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     96,
     RuntimeStubClass::LeafNoAlloc,

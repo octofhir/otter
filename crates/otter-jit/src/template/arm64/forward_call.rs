@@ -164,6 +164,7 @@ pub(super) fn emit_forward_call(
                     "forward call post-reservation SSA access",
                 ))
             },
+            |ops, reg, _| emit_load_reg(ops, 14, reg),
         )?;
         if let Some(events) = events.as_deref_mut() {
             events.insert(
@@ -205,6 +206,7 @@ pub(super) fn emit_forward_call(
         |ops, source, target, _| emit_load_reg(ops, target, source),
         |ops, destination, source, _| emit_store_reg(ops, source, destination),
         |_| Ok(()),
+        |ops, reg, _| emit_load_reg(ops, 14, reg),
     )?;
     dynasm!(ops ; .arch aarch64 ; =>canonical);
     transitions::emit_call_forward_arguments(

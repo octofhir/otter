@@ -491,9 +491,11 @@ complete caller/callee frame recipes stay in the single HIR.
 
 Named reads expose probe/hit/cold/status/join CFG before allocation. Inline cold
 calls box descendant register/this/closure operands and retain them as explicit
-TaggedRoot uses. The code-owned IC cell stores only immutable source identity
-and generation/safepoint-bound root-index recipes. The fixed property boundary
-reads current roots, temporarily publishes canonical callee NativeFrames and
+TaggedRoot uses. IC cells retain property programs/source identity only.
+Inline root-index recipes belong to code-owned safepoint records, shared by
+property and global-read cold calls. The active registry generation resolves
+one recipe; a suspended outer root record cannot stand in for the callee.
+The fixed boxed-value boundaries read current roots, temporarily publishes canonical callee NativeFrames and
 normalizes a pure exception before removing them. It returns to the same
 Machine body on success; neither caller nor callee bytecode is replayed. The
 caller PC points to the original call, and callee positions remain source-owned.
@@ -529,7 +531,7 @@ An inner method identity miss reconstructs three suspended frames without
 repeating an earlier getter in forward. Eleven inline runtime tests pass.
 
 Still open: protected inline sites, explicit named-store cold CFG,
-binding/allocation bodies, residual-call inlining and richer entry recipes for
+other binding/allocation bodies, residual-call inlining and richer entry recipes for
 fresh captures/arguments. Next is caller-specific construction and eliminating
 non-escaping temporary objects across the expanded helper graph. No obsolete Function.caller/arguments expansion
 or compatibility layer belongs in this work.
@@ -539,10 +541,13 @@ A2 admission audit on42d706ff uses the real Class.create-style
 initialize.apply(this, arguments) constructor shape. A20000-call producer/dot
 probe returns1320000; consume has one remaining Direct call and dot is actually
 inlined. multiplyScalar is rejected earlier than allocation at its global
-Vector Binding read (bytePC0, target=None). First implement source-owned binding
-cold reentry: consolidate inline frame recipes into existing code/safepoint
-ownership, then use the current fixed boxed binding ABI and exact callee frame.
-Do not whitelist bindings against the outer frame or add a parallel decoder.
+Vector Binding read (bytePC0, target=None). Source-owned global reads are now
+admitted: property and binding calls share one safepoint-owned frame decoder,
+keep their fixed boxed ABI, and normalize JavaScript errors while exact callee
+frames remain published. The global getter fixture also calls a hot Template
+helper while the outer Machine roots remain suspended. Missing globals keep
+leaf/caller error stacks; a later numeric exit does not repeat the getter.
+The source frame schema itself supplies typed inlineFrames artifact output.
 Next expose contextual construct/initializer fields; virtual-object deopt
 materialization remains absent and must precede an elimination claim.
 Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.

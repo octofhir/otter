@@ -9,9 +9,9 @@
 //!
 //! # Invariants
 //! - No entry accepts a byte PC. Most operands are decoded during compilation;
-//!   fixed-value named-property entries use the published function/logical-PC
-//!   identity to validate the exact `CodeBlockInstruction` and derive its
-//!   immutable property name and feedback site.
+//!   fixed-value named-property entries retain source identity in their IC
+//!   cells. Bindings use the published function/logical-PC identity. Shared
+//!   code/safepoint recipes publish inline descendants before cold operations.
 //! - Raw metadata pointers target immutable boxed slices retained by the
 //!   active code object for the executable mapping's full lifetime.
 //! - JS values remain in the published frame window or its precise safepoint
@@ -30,6 +30,7 @@ use otter_vm::{VmError, native_abi::NativeResultStatus};
 use super::JitCtx;
 
 mod calls;
+mod inline_frames;
 mod forward_arguments;
 mod literals;
 mod reentry;

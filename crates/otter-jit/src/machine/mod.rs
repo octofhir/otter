@@ -37,7 +37,7 @@
 //! - Named loads expose a no-call probe and a committed cold/status CFG.
 //!   Only the cold call roots tagged state; its raw IC pointer must come from
 //!   a property probe. Local catches consume the pure exception payload.
-//!   Inlined cold sites carry boxed frame operands as explicit tagged roots;
+//!   Inlined property/global-read cold sites carry boxed frame operands as explicit tagged roots;
 //!   the source-owned recipes publish descendants without copying the caller.
 //! - Inline method guards own their source's receiver/prototype/slot program,
 //!   produce the current callable, and exact-deopt before any lookup effects.

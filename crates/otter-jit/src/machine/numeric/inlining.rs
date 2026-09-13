@@ -5,8 +5,8 @@
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
-//! - Scalar and named-load bodies, including bounded fully spliced helper
-//!   chains, are admitted. Binding, allocation and residual JavaScript calls
+//! - Scalar, global-read and named-load bodies, including bounded fully spliced helper
+//!   chains, are admitted. Other bindings, allocation and residual JavaScript calls
 //!   retain ordinary call linkage. Named-load cold
 //!   calls publish exact inline frames without replaying completed effects.
 //! - Identity and parameter guards precede callee effects; body exits rebuild
@@ -489,6 +489,24 @@ fn map_body_node(
 ) -> Option<NumericNode> {
     use NumericNode::*;
     Some(match node {
+        Binding {
+            semantics:
+                semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
+                    otter_bytecode::opcode_schema::BindingRead::Global { .. },
+                ),
+            inputs,
+            target,
+            logical_pc,
+            byte_pc,
+            exceptional_edge: None,
+        } => Binding {
+            semantics,
+            inputs: inputs.map(|input| input.map(map)),
+            target,
+            logical_pc,
+            byte_pc,
+            exceptional_edge: None,
+        },
         InlineCallGuard {
             source,
             function_id,

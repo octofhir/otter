@@ -7,7 +7,8 @@
 //!
 //! # Invariants
 //! - Every moving tagged root is copied from its exact allocator location into
-//!   one rewriteable native save slot before an allocating call.
+//!   one rewriteable native save slot before an allocating call. Inline
+//!   descendants reference those exact save slots in the VM-owned record.
 //! - VM [`otter_vm::native_abi::SafepointRecord`] entries name those same save
 //!   slots; emitters own no parallel root recipe.
 //! - Machine-register roots never reach the collector directly. Generated code
@@ -70,6 +71,10 @@ impl MachineSafepointTable {
     #[must_use]
     pub fn records(&self) -> &[SafepointRecord] {
         &self.records
+    }
+
+    pub(crate) fn records_mut(&mut self) -> &mut [SafepointRecord] {
+        &mut self.records
     }
 
     /// Maximum simultaneous native root-save slots required by this function.
@@ -191,6 +196,7 @@ pub fn lower_safepoints(
         root_slot_count = root_slot_count.max(site_root_count);
         let frame_state = instruction.deopt.map_or(NO_FRAME_STATE, |deopt| deopt.0);
         records.push(SafepointRecord {
+            inline_frames: Box::default(),
             id: id.0,
             frame_state,
             tagged_locations: (0..site_root_count)

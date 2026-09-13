@@ -190,12 +190,9 @@ impl JitFunctionCode for OptimizedCode {
         )
         .saturating_add(self.deopt.retained_bytes())
         .saturating_add(
-            self._load_ic_cells
-                .iter()
-                .chain(self._store_ic_cells.iter())
-                .fold(0u64, |bytes, cell| {
-                    bytes.saturating_add(cell.inline_retained_bytes())
-                }),
+            self.safepoint_records.iter().fold(0u64, |bytes, record| {
+                bytes.saturating_add(record.inline_retained_bytes())
+            }),
         )
     }
 

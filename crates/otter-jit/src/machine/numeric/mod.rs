@@ -234,15 +234,9 @@ pub(crate) fn try_compile(
     let allocation = sequence
         .allocate(&TargetRegisterFile::aarch64_scalar_function())
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
-    let machine_safepoints = lower_safepoints(&sequence, &allocation)
+    let mut machine_safepoints = lower_safepoints(&sequence, &allocation)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR safepoint lowering"))?;
-    inline_reentry::prepare_property_cells(
-        view,
-        &sequence,
-        &machine_safepoints,
-        code_object_id,
-        &mut load_ic_cells,
-    )?;
+    inline_reentry::prepare_safepoints(view, &sequence, &mut machine_safepoints)?;
     let parameter_prefix_entry = machine_safepoints.is_empty()
         && !hir
             .frame_states
@@ -557,7 +551,7 @@ fn select_with_packed_double_view_caches(
                     binding_values[&block_index],
                     binding_inputs[&block_index],
                     &values,
-                    &representations,
+                    &mut representations,
                     &frame_state_indices,
                     &mut call_descriptors,
                     &mut next_safepoint,
@@ -2482,7 +2476,7 @@ fn select_binding_cold_block(
     values: BindingSelectedValues,
     inputs: [Option<MachineValue>; 2],
     machine_values: &[MachineValue],
-    representations: &[MachineRepresentation],
+    representations: &mut Vec<MachineRepresentation>,
     frame_state_indices: &BTreeMap<NumericFramePoint, usize>,
     call_descriptors: &mut Vec<CallDescriptor>,
     next_safepoint: &mut u32,
@@ -2521,6 +2515,9 @@ fn select_binding_cold_block(
         .checked_add(1)
         .expect("bounded scalar function safepoint count");
     let state_index = frame_state_indices[&NumericFramePoint::Node(node_value)];
+    inline_reentry::select_frames(
+        hir, state_index, machine_values, representations, instructions, &mut call,
+    );
     attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
     attach_safepoint_roots(representations, &mut call);
     instructions.push(call);

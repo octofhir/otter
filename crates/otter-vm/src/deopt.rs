@@ -205,7 +205,8 @@ pub struct DeoptSlot {
 /// interpreter a complete set of frames rather than re-running the caller's
 /// call instruction, so the binding a call would have established has to be
 /// described here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeoptFrameEntry<Slot = DeoptSlot> {
     /// Caller register the frame's return value is written to.
     pub return_register: u16,
@@ -220,7 +221,8 @@ pub struct DeoptFrameEntry<Slot = DeoptSlot> {
 /// Rebuilding it means materializing each [`DeoptSlot`] (read the raw bits at
 /// its location, [`DeoptRepr::reconstitute`]) into the interpreter register of
 /// the same index, and resuming that frame at `byte_pc`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeoptFrame<Slot = DeoptSlot> {
     /// VM function id whose body this frame runs.
     pub function_id: u32,

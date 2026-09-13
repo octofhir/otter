@@ -604,6 +604,19 @@ generated tiers. Six forwarding tests, GC+verify1/4/16, five feedback units and
 is deferred to the coherent generated-forwarding implementation; no new release
 build or performance claim accompanies this prerequisite.
 
+Shared generated linkage now places fixed control slots and upvalues before
+registers/actuals. One focused `arm64/direct_call/layout.rs` owns checked offsets;
+control storage is independent of actual arity, while the native register-base
+pointer and contiguous argument window preserve the current GC contract. Two
+layout tests and 29 affected runtime tests pass; scoped JIT clippy passes.
+Forwarding also passes GC+verify stride1. An overbroad whole-target stress run
+was stopped; its fast-allocation assertion was corrected to check the rooted GC
+sibling under stress while retaining the normal fast-hit requirement. Focused
+normal, stress1 and disabled-stress0 checks pass; the interrupted run is not a gate.
+Dynamic reservation/copy remains open. Source audit confirms forwarding can
+finish SSA loads before reservation, avoiding a general spill-addressing rewrite.
+Evidence: `benchmarks/results/s2-20260913-call-layout/README.md`.
+
 The intended replacement path remains:
 
 ```text

@@ -6,7 +6,8 @@
 //! - Own/prototype guarded methods, exact receiver binding, and guard misses.
 //! - Base constructors with `new.target`, receiver substitution, and accessors.
 //! - Non-reentrant own-data prototype preparation and observable fallback.
-//! - Generated receiver allocation, exact cold attribution, and page refill.
+//! - Generated receiver allocation, exact cold attribution, and page refill;
+//!   stress mode proves the rooted GC sibling while the fast window is disabled.
 //! - Plain, base, derived, and superclass spread calls sharing that linkage.
 //! - Nested generated calls retaining a tagged value across moving GC.
 //!
@@ -28,6 +29,22 @@
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
+
+fn gc_stress_stride() -> u32 {
+    let Ok(value) = std::env::var("OTTER_GC_STRESS") else {
+        return 0;
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value == "full" || value.is_empty() {
+        return 1;
+    }
+    value
+        .trim_end_matches("full")
+        .trim_end_matches(['=', ',', ':'])
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(1)
+}
 
 const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
 
@@ -1098,7 +1115,7 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
     assert!(production.stats.property_store_misses < 500);
     assert!(production.used_generated_receiver_allocation);
     assert!(production.used_cold_receiver_allocation);
-    if std::env::var_os("OTTER_GC_STRESS").is_some() {
+    if gc_stress_stride() != 0 {
         assert_eq!(production.stats.jit_receiver_alloc_generated, 0);
         assert!(production.stats.jit_receiver_alloc_space_misses > 0);
         assert!(production.stats.jit_receiver_alloc_gc_transitions > 0);
@@ -1134,11 +1151,7 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
 
     assert_eq!(production.completion, "800060000");
     assert!(production.stats.jit_generated_calls > 0);
-    assert!(
-        production.stats.jit_receiver_alloc_generated > 20_000,
-        "stats={:?}",
-        production.stats
-    );
+    assert!(production.stats.jit_receiver_alloc_attempts > 20_000);
     assert!(production.stats.jit_receiver_alloc_space_misses > 0);
     assert_eq!(production.stats.jit_receiver_alloc_guard_misses, 0);
     assert_eq!(
@@ -1154,16 +1167,36 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
         production.stats.jit_receiver_alloc_rust_transitions,
         production.stats.jit_receiver_alloc_cold_transitions
     );
-    assert_eq!(
-        production.stats.jit_receiver_alloc_refills,
-        production.stats.jit_receiver_alloc_space_misses
-    );
     assert_eq!(production.stats.jit_receiver_alloc_deopts, 0);
     assert_eq!(production.stats.jit_receiver_alloc_oom, 0);
-    assert!(
-        production.stats.jit_alloc_stub_transitions
-            < production.stats.jit_receiver_alloc_attempts / 100
-    );
+    if gc_stress_stride() != 0 {
+        // Stress keeps the nursery fast window unavailable: every otherwise
+        // eligible generated attempt must reach the rooted GC allocator.
+        assert_eq!(production.stats.jit_receiver_alloc_generated, 0);
+        assert_eq!(production.stats.jit_receiver_alloc_refills, 0);
+        assert_eq!(
+            production.stats.jit_receiver_alloc_gc_transitions,
+            production.stats.jit_receiver_alloc_attempts
+        );
+        assert!(
+            production.stats.jit_alloc_stub_transitions
+                >= production.stats.jit_receiver_alloc_cold_transitions
+        );
+    } else {
+        assert!(
+            production.stats.jit_receiver_alloc_generated > 20_000,
+            "stats={:?}",
+            production.stats
+        );
+        assert_eq!(
+            production.stats.jit_receiver_alloc_refills,
+            production.stats.jit_receiver_alloc_space_misses
+        );
+        assert!(
+            production.stats.jit_alloc_stub_transitions
+                < production.stats.jit_receiver_alloc_attempts / 100
+        );
+    }
 }
 
 #[test]

@@ -21,7 +21,9 @@
 //! - Every rebuilt frame receives the exact static catch-only handler stack for
 //!   its resume PC before interpreter dispatch can observe it.
 //! - The outer inline continuation retains the live activation's actuals,
-//!   captured cells, arguments object and constructor bindings.
+//!   captured cells, arguments object and constructor bindings. Descendants
+//!   use the same decoded frame schema, including their own or lexical new.target.
+//!   A lexical arrow binding never enables constructor result substitution.
 //! - Every temporary materialized frame and register window is removed before
 //!   returning to compiled code.
 //! - Nested dispatch stops at the caller's activation floor and reuses the
@@ -38,7 +40,7 @@
 //!
 //! # See also
 //! - [`crate::active_frame`] — canonical tier-neutral activation access.
-//! - [`crate::jit::JitDeoptFrame`] — owned inline-deopt reconstruction input.
+//! - [`crate::deopt::DeoptFrame`] — owned inline-deopt reconstruction input.
 //! - [`crate::native_abi::NativeFrame`] — canonical activation reconstructed only after a
 //!   cold side exit.
 
@@ -201,16 +203,45 @@ impl Interpreter {
         stack: &mut ActivationStack,
         native: &mut NativeFrame,
         materialized_index: Option<usize>,
-        frames: &[jit::JitDeoptFrame],
+        frames: &[crate::deopt::DeoptFrame<Value>],
     ) -> Result<Value, VmError> {
         // The chain runs to completion here rather than reporting a bail, so
         // this is the only place the exit can charge the optimizing tier's
         // bounded reoptimization budget. An installed generation that keeps
         // exiting is discarded on the same rule as every other entry path.
         let outermost = frames.first().ok_or(VmError::InvalidOperand)?;
-        if native.header.function_id != outermost.callee_fid {
+        if native.header.function_id != outermost.function_id {
             return Err(VmError::InvalidOperand);
         }
+        let resume_pcs = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let function = context
+                    .exec_function(frame.function_id)
+                    .ok_or(VmError::InvalidOperand)?;
+                if frame.entry.is_some() != (index != 0)
+                    || frame.slots.len() != usize::from(function.register_count)
+                    || frame.entry.is_some_and(|entry| {
+                        usize::from(entry.return_register) >= frames[index - 1].slots.len()
+                    })
+                {
+                    return Err(VmError::InvalidOperand);
+                }
+                if frame.entry.is_some_and(|entry| {
+                    !entry.new_target.is_undefined()
+                        && !function.is_arrow
+                        && !function.is_derived_constructor
+                        && entry.this.as_object().is_none()
+                }) {
+                    return Err(VmError::InvalidOperand);
+                }
+                (0..function.code.len())
+                    .find(|&pc| function.instruction_byte_pc(pc) == Some(frame.byte_pc))
+                    .and_then(|pc| u32::try_from(pc).ok())
+                    .ok_or(VmError::InvalidOperand)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         // SAFETY: the entry remains published until this continuation returns;
         // copying its windows below performs only host allocation, never GC.
         let active = unsafe { ActiveFrameRef::from_native_ptr(native) }
@@ -242,7 +273,7 @@ impl Interpreter {
                     .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
             })
             .transpose()?;
-        self.note_jit_optimized_bail(outermost.callee_fid, outermost.callee_pc);
+        self.note_jit_optimized_bail(outermost.function_id, resume_pcs[0]);
         // The speculation that exited lives in the innermost spliced body; its
         // own exit profile must learn the PC so the next bake of that body,
         // inline or standalone, widens the site.
@@ -250,14 +281,19 @@ impl Interpreter {
             && frames.len() > 1
         {
             self.jit_optimized_bail_pcs
-                .entry(innermost.callee_fid)
+                .entry(innermost.function_id)
                 .or_default()
-                .insert(innermost.callee_pc);
+                .insert(*resume_pcs.last().ok_or(VmError::InvalidOperand)?);
         }
         let handler_plans = frames
             .iter()
-            .map(|frame| {
-                Self::jit_prepare_static_catch_handlers(context, frame.callee_fid, frame.callee_pc)
+            .enumerate()
+            .map(|(index, frame)| {
+                Self::jit_prepare_static_catch_handlers(
+                    context,
+                    frame.function_id,
+                    resume_pcs[index],
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let _window_rollback = self.register_window_rollback();
@@ -265,8 +301,14 @@ impl Interpreter {
         let mut materialized: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
 
         for (index, deopt) in frames.iter().enumerate() {
+            let entry = deopt.entry.unwrap_or(crate::deopt::DeoptFrameEntry {
+                return_register: 0,
+                this: native.this_value(),
+                closure: native.self_value(),
+                new_target: native.new_target(),
+            });
             let function = context
-                .exec_function(deopt.callee_fid)
+                .exec_function(deopt.function_id)
                 .ok_or(VmError::InvalidOperand)?;
             let upvalues: crate::frame_state::UpvalueSpine = if index == 0 {
                 (0..active.upvalue_count())
@@ -274,29 +316,29 @@ impl Interpreter {
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice()
             } else {
-                match deopt.closure.as_closure(&self.gc_heap) {
+                match entry.closure.as_closure(&self.gc_heap) {
                     Some(closure) => closure.upvalues_snapshot(&self.gc_heap).into_boxed_slice(),
                     None => Vec::new().into_boxed_slice(),
                 }
             };
-            let mut window = self.alloc_reg_window(deopt.registers.len())?;
-            window.copy_from_slice(&deopt.registers);
-            let return_register = (index != 0).then_some(deopt.return_register);
+            let mut window = self.alloc_reg_window(deopt.slots.len())?;
+            window.copy_from_slice(&deopt.slots);
+            let return_register = (index != 0).then_some(entry.return_register);
             let mut frame = Frame::with_exec_return_upvalues_and_this(
                 function,
                 return_register,
                 upvalues,
-                deopt.this,
+                entry.this,
                 window,
             );
-            frame.self_value = deopt.closure;
-            frame.pc = deopt.callee_pc;
+            frame.self_value = entry.closure;
+            frame.pc = resume_pcs[index];
             materialized.push(frame);
             self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 total: u32::try_from(frames.len()).unwrap_or(u32::MAX),
-                function_id: deopt.callee_fid,
-                resume_pc: deopt.callee_pc,
+                function_id: deopt.function_id,
+                resume_pc: resume_pcs[index],
             });
         }
 
@@ -317,8 +359,30 @@ impl Interpreter {
             }
             cold.new_target = (!new_target.is_undefined()).then_some(new_target);
             cold.is_derived_constructor = native.is_derived_constructor();
-            if !new_target.is_undefined() && !cold.is_derived_constructor {
+            if !new_target.is_undefined()
+                && !cold.is_derived_constructor
+                && !context
+                    .exec_function(outermost.function_id)
+                    .expect("validated function")
+                    .is_arrow
+            {
                 cold.construct_target = native.this_value().as_object();
+            }
+        }
+
+        for (deopt, frame) in frames.iter().zip(materialized.iter_mut()).skip(1) {
+            let entry = deopt.entry.expect("validated descendant entry");
+            if !entry.new_target.is_undefined() {
+                let function = context
+                    .exec_function(deopt.function_id)
+                    .expect("validated function");
+                let derived = function.is_derived_constructor;
+                let cold = self.frame_ensure_cold(frame);
+                cold.new_target = Some(entry.new_target);
+                cold.is_derived_constructor = derived;
+                if !derived && !function.is_arrow {
+                    cold.construct_target = entry.this.as_object();
+                }
             }
         }
 
@@ -449,21 +513,30 @@ mod tests {
             }
             native.set_eval_env(Some(eval_env));
             let frames = [
-                jit::JitDeoptFrame {
-                    callee_fid: 0,
-                    callee_pc: 1,
-                    return_register: 0,
-                    this: Value::undefined(),
-                    closure: Value::function(0),
-                    registers: vec![Value::undefined(), Value::undefined()],
+                crate::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: context
+                        .exec_function(0)
+                        .unwrap()
+                        .instruction_byte_pc(1)
+                        .unwrap(),
+                    entry: None,
+                    slots: Box::new([Value::undefined(), Value::undefined()]),
                 },
-                jit::JitDeoptFrame {
-                    callee_fid: 1,
-                    callee_pc: 1,
-                    return_register: 0,
-                    this: Value::undefined(),
-                    closure: Value::function(1),
-                    registers: vec![thrown, Value::undefined()],
+                crate::deopt::DeoptFrame {
+                    function_id: 1,
+                    byte_pc: context
+                        .exec_function(1)
+                        .unwrap()
+                        .instruction_byte_pc(1)
+                        .unwrap(),
+                    entry: Some(crate::deopt::DeoptFrameEntry {
+                        return_register: 0,
+                        this: Value::undefined(),
+                        closure: Value::function(1),
+                        new_target: Value::undefined(),
+                    }),
+                    slots: Box::new([thrown, Value::undefined()]),
                 },
             ];
 
@@ -481,6 +554,103 @@ mod tests {
                 .expect("both nested catches resume");
             assert_eq!(result, thrown);
             assert!(native.eval_env().is_none());
+            assert!(stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn inline_constructor_restores_new_target_and_receiver_result() {
+        for returns_target in [false, true] {
+            let context = context(
+                (0..3)
+                    .map(|id| Function {
+                        id,
+                        scratch: 1,
+                        code: if id == 1 {
+                            vec![
+                                Instruction {
+                                    pc: 0,
+                                    op: Op::LoadNewTarget,
+                                    operands: vec![Operand::Register(0)],
+                                },
+                                Instruction {
+                                    pc: 1,
+                                    op: if returns_target {
+                                        Op::ReturnValue
+                                    } else {
+                                        Op::ReturnUndefined
+                                    },
+                                    operands: if returns_target {
+                                        vec![Operand::Register(0)]
+                                    } else {
+                                        vec![]
+                                    },
+                                },
+                            ]
+                            .into()
+                        } else {
+                            vec![Instruction {
+                                pc: 0,
+                                op: Op::ReturnValue,
+                                operands: vec![Operand::Register(0)],
+                            }]
+                            .into()
+                        },
+                        ..Function::default()
+                    })
+                    .collect(),
+            );
+            let mut vm = Interpreter::new();
+            let mut stack = ActivationStack::new();
+            let mut registers = [Value::undefined()];
+            let mut native = NativeFrame::new(
+                crate::native_abi::VmFrameHeader::interpreter(0, 1),
+                registers.as_mut_ptr() as u64,
+                Value::function(0),
+                Value::undefined(),
+            );
+            native.set_stack_registers();
+            vm.with_runtime_turn(&mut stack, |turn| {
+                let (vm, stack) = turn.into_parts();
+                let receiver =
+                    Value::object(vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap());
+                let frames = [
+                    crate::deopt::DeoptFrame {
+                        function_id: 0,
+                        byte_pc: 0,
+                        entry: None,
+                        slots: Box::new([Value::undefined()]),
+                    },
+                    crate::deopt::DeoptFrame {
+                        function_id: 1,
+                        byte_pc: 0,
+                        entry: Some(crate::deopt::DeoptFrameEntry {
+                            return_register: 0,
+                            this: receiver,
+                            closure: Value::function(1),
+                            new_target: Value::function(2),
+                        }),
+                        slots: Box::new([Value::undefined()]),
+                    },
+                ];
+                let result = vm
+                    .jit_deopt_materialize_inline_frames(
+                        &context,
+                        stack,
+                        &mut native,
+                        None,
+                        &frames,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    result,
+                    if returns_target {
+                        Value::function(2)
+                    } else {
+                        receiver
+                    }
+                );
+            });
             assert!(stack.is_empty());
         }
     }

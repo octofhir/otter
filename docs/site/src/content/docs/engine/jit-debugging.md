@@ -392,7 +392,9 @@ probe/commit and rooted cold call before register allocation. Cold calls expose
 `machinePropertyLoadCold` or `machinePropertyStoreCold`, followed by explicit
 Success/Throw/Fatal control. Unprotected load/store helper bodies can inline;
 their safepoint-owned `inlineFrames` recipes publish exact callee source frames
-and moving roots before setters/getters run. Named loads route local exceptions
+and moving roots before setters/getters run. Entry recipes include `newTarget`;
+deopt artifacts use the same frame schema. Lexical arrow bindings preserve
+ordinary return semantics rather than constructor receiver substitution. Named loads route local exceptions
 through SSA; protected stores still require HIR exception-operand admission.
 Indexed element regions similarly guard a baked dense layout before direct
 access.

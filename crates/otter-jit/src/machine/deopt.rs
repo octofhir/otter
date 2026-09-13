@@ -8,7 +8,7 @@
 //! # Invariants
 //! - Value slots resolve only through late deopt operands retained by regalloc2.
 //! - Integer, floating-point, and spill namespaces are unified deterministically.
-//! - Caller/callee registers, this and closure use the same allocator locations.
+//! - Caller/callee registers, this, closure and new.target use allocator locations.
 //! - Every output frame is register-count wide and every deopt id is dense.
 //! - Target emitters consume the same locations; no pre-allocation fallback exists.
 
@@ -106,6 +106,7 @@ pub fn lower_deopt_table(
                         .entry
                         .map(|entry| -> Result<_, MachineDeoptError> {
                             Ok(DeoptFrameEntry {
+                                new_target: lower(entry.new_target)?,
                                 return_register: entry.return_register,
                                 this: lower(entry.this)?,
                                 closure: lower(entry.closure)?,
@@ -299,6 +300,7 @@ mod tests {
                 function_id: 72,
                 byte_pc: 8,
                 entry: Some(DeoptFrameEntry {
+                    new_target: float,
                     return_register: 1,
                     this: float,
                     closure: integer,
@@ -330,6 +332,7 @@ mod tests {
         assert_eq!(entry.return_register, 1);
         assert_eq!(entry.this, caller.slots[1]);
         assert_eq!(entry.closure, caller.slots[0]);
+        assert_eq!(entry.new_target, caller.slots[1]);
     }
 
     #[test]

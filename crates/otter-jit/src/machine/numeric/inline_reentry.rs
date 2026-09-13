@@ -39,6 +39,7 @@ pub(super) fn select_frames(
             function_id: frame.function_id,
             byte_pc: frame.byte_pc,
             entry: frame.entry.as_ref().map(|entry| DeoptFrameEntry {
+                new_target: slot(&entry.new_target),
                 return_register: entry.return_register,
                 this: slot(&entry.this),
                 closure: slot(&entry.closure),
@@ -101,6 +102,7 @@ pub(super) fn prepare_safepoints(
                         frame.byte_pc
                     },
                     entry: Some(DeoptFrameEntry {
+                        new_target: slot(&entry.new_target)?,
                         return_register: entry.return_register,
                         this: slot(&entry.this)?,
                         closure: slot(&entry.closure)?,
@@ -133,9 +135,15 @@ mod tests {
         ));
         let before_load = hir.blocks[0].nodes.len() - 1;
         hir.blocks[0].nodes.insert(before_load, callable);
+        let new_target = hir::NumericValue(hir.nodes.len());
+        hir.nodes.push(NumericNode::TaggedConstant(
+            otter_vm::Value::function(95).to_bits(),
+        ));
+        hir.blocks[0].nodes.insert(before_load, new_target);
         let state = &mut hir.frame_states[0];
         let mut child = state.frames[0].clone();
         child.entry = Some(DeoptFrameEntry {
+            new_target: hir::NumericFrameSlot::Value(new_target),
             return_register: 0,
             this: hir::NumericFrameSlot::Value(hir::NumericValue(0)),
             closure: hir::NumericFrameSlot::Value(callable),
@@ -162,7 +170,7 @@ mod tests {
         let required: Vec<_> = child
             .slots
             .iter()
-            .chain([&entry.this, &entry.closure])
+            .chain([&entry.this, &entry.closure, &entry.new_target])
             .flatten()
             .copied()
             .collect();

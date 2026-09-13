@@ -332,44 +332,24 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
         return NativeResultPair::side_exit(u64::from(resume_pc));
     }
 
-    // The outermost frame keeps the entry's own bindings; every spliced frame
-    // carries the ones its call would have established.
-    let entry_this;
-    let entry_self;
-    match unsafe { ctx.native_frame.as_ref() } {
-        Some(frame) => {
-            entry_this = frame.this_value();
-            entry_self = frame.self_value();
-        }
-        None => return compiled_fatal(ctx, VmError::InvalidOperand),
-    }
-    let mut frames = Vec::with_capacity(state.frames.len());
-    for (depth, frame) in state.frames.iter().enumerate() {
-        let registers = frame
-            .slots
-            .iter()
-            .map(|slot| slot.repr.reconstitute(slot_raw(slot.location)))
-            .collect::<Vec<_>>();
-        let (return_register, this, closure) = match frame.entry {
-            None => (0, entry_this, entry_self),
-            Some(entry) => (
-                entry.return_register,
-                entry.this.repr.reconstitute(slot_raw(entry.this.location)),
-                entry
-                    .closure
-                    .repr
-                    .reconstitute(slot_raw(entry.closure.location)),
-            ),
-        };
-        frames.push(otter_vm::jit::JitDeoptFrame {
-            callee_fid: frame.function_id,
-            callee_pc: exit.resume_pcs[depth],
-            return_register,
-            this,
-            closure,
-            registers,
-        });
-    }
+    // Decode the one shared frame schema. Root entry bindings remain owned by
+    // the published native activation; descendants carry explicit operands.
+    let decode = |slot: otter_vm::deopt::DeoptSlot| slot.repr.reconstitute(slot_raw(slot.location));
+    let frames = state
+        .frames
+        .iter()
+        .map(|frame| otter_vm::deopt::DeoptFrame {
+            function_id: frame.function_id,
+            byte_pc: frame.byte_pc,
+            entry: frame.entry.map(|entry| otter_vm::deopt::DeoptFrameEntry {
+                return_register: entry.return_register,
+                this: decode(entry.this),
+                closure: decode(entry.closure),
+                new_target: decode(entry.new_target),
+            }),
+            slots: frame.slots.iter().copied().map(decode).collect(),
+        })
+        .collect::<Vec<_>>();
 
     // SAFETY: the live `JitCtx` reentry contract.
     let materialized_index = match unsafe { ctx.native_frame.as_ref() } {

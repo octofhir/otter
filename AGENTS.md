@@ -482,7 +482,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     probe. Named stores protected by local catches remain on Template until
     their HIR exception operands are admitted. Plain named-load/store callee
     bodies can be spliced into Machine SSA. Their cold instructions expose
-    `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure
+    `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure/new.target
     values are boxed only in cold CFG and retained as explicit safepoint roots.
     The code-owned safepoint record owns root-index recipes tied to the code
     generation and safepoint. The fixed property boundary reads the current published roots,

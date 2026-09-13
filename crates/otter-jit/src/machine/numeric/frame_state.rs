@@ -40,7 +40,7 @@ impl NumericFrameState {
                 frame
                     .entry
                     .iter()
-                    .flat_map(|entry| [&entry.this, &entry.closure]),
+                    .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target]),
             )
         })
     }

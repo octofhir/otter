@@ -1676,29 +1676,6 @@ pub enum JitMethodHint {
     NumberToString,
 }
 
-/// Cold reconstruction input for one frame in a nested inline deopt.
-///
-/// Decoded from the emitted side-exit buffer and consumed only by
-/// [`crate::Interpreter::jit_deopt_materialize_inline_frames`]. Normal tier
-/// transitions retain the canonical native activation and never build this
-/// owned record.
-pub struct JitDeoptFrame {
-    /// Function id this frame executes.
-    pub callee_fid: u32,
-    /// Logical PC to resume this frame at.
-    pub callee_pc: u32,
-    /// Register in the parent frame that receives this frame's return value.
-    /// Ignored for the outermost frame (its result bubbles out to emitted code).
-    pub return_register: u16,
-    /// Value bound as this frame's `this`.
-    pub this: crate::Value,
-    /// The method's closure, or `undefined` when the body reads no upvalue. The
-    /// resumed frame draws its upvalue spine from this closure's captured cells.
-    pub closure: crate::Value,
-    /// Full register window (unwritten slots `undefined`, live slots boxed).
-    pub registers: Vec<crate::Value>,
-}
-
 /// VM-owned runtime state retained behind [`crate::native_abi::VmThread`]
 /// while compiled code can re-enter the VM for typed runtime operations such
 /// as closure allocation.

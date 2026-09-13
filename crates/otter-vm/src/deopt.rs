@@ -43,8 +43,8 @@
 //!   register numbering the frame ABI fixes. Its frames are ordered outermost
 //!   first and retain their own function identity and exact resume PC.
 //! - The same frame and entry schema carries SSA inputs before allocation and
-//!   concrete recipes afterwards. Every nested entry preserves this and closure;
-//!   both obey the same bounds as register-window slots.
+//!   concrete recipes afterwards and decoded values at runtime. Every nested entry
+//!   preserves this, closure and new.target with register-slot location bounds.
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
@@ -214,6 +214,8 @@ pub struct DeoptFrameEntry<Slot = DeoptSlot> {
     pub this: Slot,
     /// Exact callable whose captured cells and self binding the activation owns.
     pub closure: Slot,
+    /// The own or lexical new.target binding; undefined when not bound.
+    pub new_target: Slot,
 }
 
 /// One interpreter frame to rebuild at a deopt point.
@@ -334,7 +336,7 @@ impl DeoptFrame {
         let entry_slots = self
             .entry
             .iter()
-            .flat_map(|entry| [&entry.this, &entry.closure]);
+            .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target]);
         for (slot_index, slot) in self.slots.iter().chain(entry_slots).enumerate() {
             match slot.location {
                 DeoptLocation::Register(register) if register >= limits.machine_register_count => {
@@ -701,6 +703,10 @@ mod tests {
             function_id: 1,
             byte_pc: 0,
             entry: Some(DeoptFrameEntry {
+                new_target: DeoptSlot {
+                    location: DeoptLocation::Literal(Value::undefined().to_bits()),
+                    repr: DeoptRepr::Tagged,
+                },
                 return_register: 0,
                 this: slot,
                 closure: slot,
@@ -711,13 +717,13 @@ mod tests {
             frames: Box::new([outer, inner]),
         };
         assert_eq!(valid.verify(verify_limits()), Ok(()));
-        for closure in [false, true] {
+        for binding in 0..3 {
             let mut invalid = valid.clone();
             let entry = invalid.frames[1].entry.as_mut().unwrap();
-            let operand = if closure {
-                &mut entry.closure
-            } else {
-                &mut entry.this
+            let operand = match binding {
+                0 => &mut entry.this,
+                1 => &mut entry.closure,
+                _ => &mut entry.new_target,
             };
             operand.location = DeoptLocation::Register(u16::MAX);
             assert!(matches!(
@@ -768,6 +774,10 @@ mod tests {
                     function_id: 9,
                     byte_pc: 0,
                     entry: Some(DeoptFrameEntry {
+                        new_target: DeoptSlot {
+                            location: DeoptLocation::Literal(Value::undefined().to_bits()),
+                            repr: DeoptRepr::Tagged,
+                        },
                         return_register: 0,
                         this: shared,
                         closure: shared,

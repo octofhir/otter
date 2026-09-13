@@ -11,7 +11,9 @@
 //! return a committed value/exception pair. Method calls copy their complete receiver/argument
 //! packet before reentry. Named operations derive their immutable property
 //! name and feedback site from the published function/logical-PC identity.
-//! Allocating or throwing operations keep precise roots live. Committed
+//! IC cells store the VM-owned `JitPropertyIcWay` directly; the generated stride
+//! derives from that same type. Allocating or throwing operations keep precise
+//! roots live. Committed
 //! JavaScript throws travel in the pair payload; only structural failures use
 //! the shared error slot.
 //!
@@ -32,37 +34,9 @@ use otter_vm::{
 /// thrashing a single cell.
 pub(crate) const IC_WAYS: usize = 4;
 
-/// One lowered cache program in a [`WhiskerIcCell`].
-///
-/// This is [`otter_vm::JitPropertyIcWay`] as generated code sees it. The four
-/// words keep ways 16-byte strided so the inline probe indexes them with a
-/// shift.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct WhiskerIcWay {
-    /// Guarded receiver shape-handle compressed offset; `0` == empty.
-    shape: u32,
-    /// Guarded holder shape when the program hops to the receiver's
-    /// prototype; `0` when the receiver owns the slot.
-    holder_shape: u32,
-    /// Byte offset from the holder's value slab pointer to the value slot.
-    value_byte: u32,
-    /// Child hidden class for an add-property transition; `0` keeps the
-    /// existing-slot program above.
-    transition_shape: u32,
-    /// Guarded shape of the direct prototype's own prototype for a
-    /// two-link missing-key add transition; `0` when the chain ends at the
-    /// direct prototype.
-    chain_shape: u32,
-}
-
-/// Byte stride between ways, shared by the cell and the emitted probes.
-pub(crate) const WHISKER_IC_WAY_BYTES: u32 = 20;
-
-const _: () = assert!(
-    std::mem::size_of::<WhiskerIcWay>() == WHISKER_IC_WAY_BYTES as usize,
-    "emitted probes index ways by a baked stride"
-);
+/// Byte stride of the VM-owned program, shared by the cell and emitted probes.
+pub(crate) const WHISKER_IC_WAY_BYTES: u32 =
+    std::mem::size_of::<otter_vm::JitPropertyIcWay>() as u32;
 
 /// WhiskerIC self-patching cell for one named-property site (one per
 /// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
@@ -76,14 +50,15 @@ const _: () = assert!(
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WhiskerIcCell {
-    ways: [WhiskerIcWay; IC_WAYS],
+    ways: [otter_vm::JitPropertyIcWay; IC_WAYS],
 }
 
 /// Self-patch one IC cell with a lowered cache program: fill the first empty
 /// way, or evict way 0 when all are full (the site is more polymorphic than the
 /// cache is wide). The guard token is invalidated before rewriting an occupied
-/// way and published last, so a concurrent inline probe never reads a live
-/// parent shape against stale program words.
+/// way and published last, so the complete program is installed before its
+/// receiver guard becomes live. Patching and probing belong to the same
+/// isolate thread; this cell is not a cross-thread synchronization primitive.
 ///
 /// # Safety
 /// `cell` must be a valid, stable [`WhiskerIcCell`] pointer (a site's cell from
@@ -93,14 +68,14 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIc
         let ways = &mut (*cell).ways;
         let slot = ways
             .iter()
-            .position(|w| w.shape == 0 || w.shape == way.receiver_shape)
+            .position(|w| w.receiver_shape == 0 || w.receiver_shape == way.receiver_shape)
             .unwrap_or(0);
-        ways[slot].shape = 0;
+        ways[slot].receiver_shape = 0;
         ways[slot].value_byte = way.value_byte;
         ways[slot].holder_shape = way.holder_shape;
         ways[slot].transition_shape = way.transition_shape;
         ways[slot].chain_shape = way.chain_shape;
-        ways[slot].shape = way.receiver_shape;
+        ways[slot].receiver_shape = way.receiver_shape;
     }
 }
 
@@ -539,6 +514,6 @@ mod tests {
         assert_eq!(cell.ways[0].holder_shape, 23);
         assert_eq!(cell.ways[0].transition_shape, 29);
         assert_eq!(cell.ways[0].chain_shape, 31);
-        assert_eq!(cell.ways[0].shape, 17);
+        assert_eq!(cell.ways[0].receiver_shape, 17);
     }
 }

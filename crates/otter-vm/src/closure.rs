@@ -27,7 +27,7 @@
 //! # Invariants
 //!
 //! - The machine-facing prefix is `#[repr(C)]`: native linkage may read
-//!   [`ClosureCallHeader`], `bound_this`, and `bound_new_target` only. The
+//!   [`ClosureCallHeader`], bound values and the constructor header only. The
 //!   nullable direct-eval handle has one representation and one traced owner:
 //!   [`ClosureCallHeader::eval_env`]. Native linkage must never interpret the
 //!   following Rust `Option` layout.
@@ -169,7 +169,7 @@ impl ClosureCallHeader {
 
 /// GC body backing every closure value.
 ///
-/// Only the prefix through `bound_new_target` is part of the stable call ABI.
+/// The prefix through `construct` is part of the stable call/allocation ABI.
 /// Everything after it is a traced implementation detail.
 #[repr(C, align(8))]
 #[derive(Debug)]
@@ -180,6 +180,8 @@ pub struct JsClosureBody {
     pub bound_this: Value,
     /// Canonical traced lexical `new.target`; consult the header flag for presence.
     pub bound_new_target: Value,
+    /// Canonical property and weak constructor state in the fixed prefix.
+    pub(crate) construct: crate::closure_construct::ClosureConstructHeader,
     /// Captured upvalue spine in declaration order, or a null handle
     /// when the closure captures nothing. The cells live in the spine
     /// body's own cell, so the closure owns no storage outside the heap
@@ -191,14 +193,6 @@ pub struct JsClosureBody {
     /// constructor's shared `this` cell so `super()` can bind it even
     /// when the arrow is invoked through a nested sync dispatch.
     pub bound_derived_this: Option<UpvalueCell>,
-    /// §10.2 — this closure instance's own-property bag. Each function
-    /// object created by evaluating a function expression/declaration
-    /// owns a DISTINCT property store (`f.foo = 1`, the materialized
-    /// `f.prototype`, etc.), so it lives per-instance here rather than
-    /// in a side table keyed by the bytecode template id (which every
-    /// sibling closure of the same source would share). `None` until
-    /// the first own property or `prototype` materialization.
-    pub own_props: Option<JsObject>,
     /// Per-instance deletion of the intrinsic `name` metadata property
     /// (`delete f.name`). Sibling closures of the same template keep
     /// their own copies, so the marker cannot live in a table keyed by
@@ -215,16 +209,6 @@ pub struct JsClosureBody {
     /// closure still walks the realm's `%Function.prototype%`; a
     /// stored `Value::null()` is an explicit null prototype.
     pub proto_override: Option<Value>,
-    /// Largest property count reached by a receiver this closure constructed,
-    /// learned at the next construct or before collection.
-    /// Sibling closures of one template construct unrelated classes, so the
-    /// profile lives per function object like JSC's allocation profile.
-    pub learned_instance_fields: std::cell::Cell<u16>,
-    /// The receiver most recently prepared for this constructor, sampled at
-    /// the next preparation for the size it grew to. This is not a strong
-    /// edge: the observation ledger clears it before collection. Tracing also
-    /// clears it defensively so heap-image relocation never preserves a sample.
-    pub last_instance: std::cell::Cell<Option<JsObject>>,
 }
 
 impl otter_gc::SafeTraceable for JsClosureBody {
@@ -246,13 +230,13 @@ impl otter_gc::SafeTraceable for JsClosureBody {
             visitor(p);
         }
         self.refresh_upvalue_base();
-        self.last_instance.set(None);
+        self.construct.last_instance.set(JsObject::null());
 
         self.bound_this.pelt_trace(visitor);
         self.bound_new_target.pelt_trace(visitor);
         self.bound_derived_this.pelt_trace(visitor);
         self.call_header.eval_env.pelt_trace(visitor);
-        self.own_props.pelt_trace(visitor);
+        self.construct.own_props.pelt_trace(visitor);
         self.proto_override.pelt_trace(visitor);
     }
 }
@@ -295,6 +279,37 @@ pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::offset_of!(JsClosure
 /// Byte offset of canonical `bound_new_target` in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET: usize =
     std::mem::offset_of!(JsClosureBody, bound_new_target);
+
+/// Byte offset of canonical constructor own_props state.
+pub const CLOSURE_BODY_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, construct)
+    + std::mem::offset_of!(crate::closure_construct::ClosureConstructHeader, own_props);
+/// Byte offset of canonical constructor prototype_shape state.
+pub const CLOSURE_BODY_PROTOTYPE_SHAPE_OFFSET: usize =
+    std::mem::offset_of!(JsClosureBody, construct)
+        + std::mem::offset_of!(
+            crate::closure_construct::ClosureConstructHeader,
+            prototype_shape
+        );
+/// Byte offset of canonical constructor prototype_slot state.
+pub const CLOSURE_BODY_PROTOTYPE_SLOT_OFFSET: usize =
+    std::mem::offset_of!(JsClosureBody, construct)
+        + std::mem::offset_of!(
+            crate::closure_construct::ClosureConstructHeader,
+            prototype_slot
+        );
+/// Byte offset of canonical constructor learned_instance_fields state.
+pub const CLOSURE_BODY_LEARNED_INSTANCE_FIELDS_OFFSET: usize =
+    std::mem::offset_of!(JsClosureBody, construct)
+        + std::mem::offset_of!(
+            crate::closure_construct::ClosureConstructHeader,
+            learned_instance_fields
+        );
+/// Byte offset of canonical constructor last_instance state.
+pub const CLOSURE_BODY_LAST_INSTANCE_OFFSET: usize = std::mem::offset_of!(JsClosureBody, construct)
+    + std::mem::offset_of!(
+        crate::closure_construct::ClosureConstructHeader,
+        last_instance
+    );
 
 const _: [(); 24] = [(); std::mem::size_of::<ClosureCallHeader>()];
 const _: [(); 8] = [(); std::mem::align_of::<ClosureCallHeader>()];
@@ -342,13 +357,11 @@ impl JsClosureBody {
             bound_new_target: bound_new_target.unwrap_or_else(Value::undefined),
             spine,
             bound_derived_this,
-            own_props: None,
+            construct: crate::closure_construct::ClosureConstructHeader::default(),
             name_deleted: false,
             length_deleted: false,
             non_extensible: false,
             proto_override: None,
-            learned_instance_fields: std::cell::Cell::new(0),
-            last_instance: std::cell::Cell::new(None),
         }
     }
 
@@ -538,17 +551,20 @@ impl JsClosure {
     }
 
     /// This closure instance's own-property bag, if it has been
-    /// materialized. See [`JsClosureBody::own_props`].
+    /// materialized. The zero compressed handle denotes an absent bag.
     #[must_use]
     pub fn own_props(self, heap: &GcHeap) -> Option<JsObject> {
-        heap.read_payload(self.handle, |body| body.own_props)
+        heap.read_payload(self.handle, |body| {
+            let bag = body.construct.own_props;
+            (!bag.is_null()).then_some(bag)
+        })
     }
 
     /// Install the per-instance own-property bag. Records the
     /// closure→bag edge with the GC write barrier (the body lives in
     /// old space; the bag may be younger).
     pub fn set_own_props(self, heap: &mut GcHeap, bag: JsObject) {
-        heap.with_payload(self.handle, |body| body.own_props = Some(bag));
+        heap.with_payload(self.handle, |body| body.construct.own_props = bag);
         heap.write_barrier(self.handle, bag);
     }
 

@@ -191,6 +191,10 @@ impl SyncJsCallRoots {
         self.current.get()
     }
 
+    pub(crate) fn construct_target(&self) -> Value {
+        self.new_target.get()
+    }
+
     pub(crate) fn receiver_value(&self) -> Value {
         self.receiver.get()
     }
@@ -562,6 +566,7 @@ impl Interpreter {
         } else {
             self.constructor_prototype_value("Object")?
         });
+        self.prepare_closure_prototype_slot(&roots);
         Ok(Some(self.allocate_bytecode_constructor_receiver(
             context,
             function_id,

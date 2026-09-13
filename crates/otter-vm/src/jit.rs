@@ -163,6 +163,16 @@ pub struct JitClosureCallLayout {
     pub bound_new_target_flag: u32,
     /// Flags requiring the call-setup runtime stub before compiled entry.
     pub runtime_setup_flags: u32,
+    /// Byte offset of canonical closure constructor own_props state.
+    pub own_props_byte: u32,
+    /// Byte offset of canonical closure constructor prototype_shape state.
+    pub prototype_shape_byte: u32,
+    /// Byte offset of canonical closure constructor prototype_slot state.
+    pub prototype_slot_byte: u32,
+    /// Byte offset of canonical closure constructor learned_instance_fields state.
+    pub learned_instance_fields_byte: u32,
+    /// Byte offset of canonical closure constructor last_instance state.
+    pub last_instance_byte: u32,
 }
 
 /// Machine-readable class-constructor wrapper layout.
@@ -182,15 +192,17 @@ pub struct JitClassConstructorLayout {
 /// Maximum ordinary prototype depth admitted by generated receiver allocation.
 pub const JIT_RECEIVER_PROTOTYPE_GUARD_CAP: usize = 8;
 
-/// One GC-movement-stable class receiver allocation program.
+/// One GC-movement-stable receiver allocation program.
 ///
-/// The program uses the live class wrapper's prototype value, guards its full
-/// ordinary shape chain, and initializes an in-body shaped object. Any mismatch
+/// The program reads the live class or guarded closure prototype, proves its
+/// required ordinary shape chain, and initializes an in-body shaped object. Any mismatch
 /// is pre-effect and returns to rooted receiver preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitReceiverAllocationPlan {
-    /// Expected underlying constructor function of the live `new.target` class.
+    /// Expected underlying function of the live `new.target` class or closure.
     pub new_target_function_id: u32,
+    /// Class wrappers retain the template-wide capacity admission proof.
+    pub class_allocation: bool,
     /// Initial receiver hidden class.
     pub receiver_shape: u32,
     /// Number of already-visible undefined slots described by that shape.
@@ -230,7 +242,7 @@ pub(crate) struct JitConstructorFieldTransitionPlan {
     pub(crate) slot: u16,
 }
 
-const _: [(); 40] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 60] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -955,7 +967,7 @@ pub struct JitDirectCallPlan {
 pub struct JitDirectCallee {
     /// Function identity, stable entry cell, and callee register-window shape.
     pub plan: JitDirectCallPlan,
-    /// Optional class-only safepoint-free receiver allocation program.
+    /// Optional guarded safepoint-free receiver allocation program.
     pub receiver_allocation: Option<JitReceiverAllocationPlan>,
 }
 

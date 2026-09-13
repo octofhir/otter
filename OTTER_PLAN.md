@@ -716,11 +716,32 @@ CFG/execution tests and the mixed runtime test pass, including GC1/4/16,
 revoked Proxy, live joins and no deopt on cold truthiness. Scoped JIT clippy
 passes. One release build,8 affected comparisons and5 valid RayTrace processes:
 1943 +/-3, range1929–1946, RSS152928256. This small +0.52% change from1933 does
-not close the4.52% debt against2035. Current installed release is this candidate.
-Real events show no compile declines. Next investigate the class-only receiver
-allocation boundary for ordinary constructors; guard live prototype semantics
-through the existing contract, without a parallel allocator. Evidence:
+not close the4.52% debt against2035. That checkpoint has no compile declines. Its next receiver slice is recorded
+below. Evidence:
 `benchmarks/results/s2-20260913-machine-truthiness/README.md`.
+
+Ordinary closure receiver allocation now uses the shared nursery program.
+The canonical closure prefix owns the live property bag, immutable shape/slot
+proof and existing weak observation. Per-closure capacity guards admit small
+siblings despite a large template-wide maximum. Rooted dictionary migration
+prepares the shape; a retained empty metadata sidecar is legal for this internal
+ordinary table. Live prototype/descriptor guards precede effects; GC clears the
+observation permission before movement and canonical preparation re-registers
+it. Bare interned function values retain their canonical preparation.
+
+Focused source checks pass, including >=256 native allocations both before and
+after explicit GC, a surviving receiver/child/prototype, sibling growth, Proxy
+lookup exactly once, inherited setters and descriptor changes. Profile4,
+closure-layout1 and fixed/spread/super1 pass; GC+verify1/4/16 and VM/JIT lib
+clippy pass. One release build3m01s,7 comparisons and5 RayTrace processes:
+2103 +/-25, range2044–2128, RSS151961600. This is8.23% above previous1943 and
+3.34% above best2035, closing the prior local performance debt. Current installed
+release is this receiver candidate. Events2918 have no declines or loss;
+98 generations total1707024 compiled bytes (including retired code), versus
+previous97/1655496. Generated-call deopts153 retain the100 exits at593:196.
+Next investigate unseen loose-equality speculation and per-site exit feedback;
+keep exact coercion/HTMLDDA behavior and shared committed Machine CFG. Evidence:
+`benchmarks/results/s2-20260913-ordinary-receiver/README.md`.
 
 No full gate, bisect, second build tree or repeated
 other-engine baseline. Evidence:

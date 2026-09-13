@@ -482,9 +482,9 @@ where licensing and determinism permit, established ECMAScript engines.
 
 Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
 
-Current priority: method and nested-body SSA inlining, then contextual
+Current priority: nested-body SSA inlining, then contextual
 construction and allocation elimination. The backend now splices bounded
-monomorphic plain scalar and named-load callees into the caller CFG before
+monomorphic plain/method scalar and named-load callees into the caller CFG before
 selection and allocation. Each body uses its own snapshot and source-owned
 property programs. Identity/this guards, argument substitution, return joins and
 complete caller/callee frame recipes stay in the single HIR.
@@ -506,11 +506,20 @@ runtime cases prove six dot-product field loads in the caller, no native callee
 call descriptor, actual optimizing entries, getter success/throw once, exact
 stack source lines, a late numeric deopt without repeated earlier reads, and
 arrow lexical this/closure across GC. The two new runtime cases pass with GC
-stress+verify1/4/16 using one binary. No release build or throughput claim.
+stress1/4/16 using one binary. No release build or throughput claim.
 
-Still open: method-body guards/splicing, nested helpers, protected inline sites,
+Method-body splicing now uses the shared live receiver/prototype/slot guard as
+an explicit SSA instruction. It returns the actual callable; the proven object
+receiver is the callee this operand. Source snapshot and guard must agree.
+The new method tests prove six spliced loads and no native call, cold getter
+success/throw, exact stack lines, late arithmetic deopt, own/prototype method
+replacement, getter lookup once, prototype replacement and bound-arrow fallback.
+Both tests pass at GC stress1/4/16;9 inline runtime cases and145 numeric cases
+pass. This is structural coverage, not a measured RayTrace speedup.
+
+Still open: nested helpers, protected inline sites,
 explicit named-store cold CFG, binding/allocation bodies, and richer entry
-recipes for fresh captures/arguments. The next step is the method/nested object
+recipes for fresh captures/arguments. The next step is the nested object
 arithmetic chain, followed by caller-specific construction and eliminating
 non-escaping temporary objects. No obsolete Function.caller/arguments expansion
 or compatibility layer belongs in this work.

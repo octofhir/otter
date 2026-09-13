@@ -1582,6 +1582,16 @@ pub(super) fn emit(
             MachineOpcode::TaggedConstant(bits) => {
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
             }
+            MachineOpcode::InlineMethodGuard { ref guard } => {
+                let start = ops.offset().0;
+                let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                emit_method_guard_from_tagged_register(
+                    &mut ops, &mut relocations, view, guard, 9, 9, None, false, miss,
+                )?;
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                structural_regions.push(("machineInlineMethodGuard", None, start, ops.offset().0));
+            }
             MachineOpcode::InlineCallGuard {
                 function_id,
                 this_mode,

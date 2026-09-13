@@ -1,7 +1,7 @@
 //! Bounded callee CFG splicing into the single numeric HIR.
 //!
 //! # Contents
-//! - Plain scalar/property-body admission from each candidate's own compile snapshot.
+//! - Plain/method scalar/property-body admission from each candidate's own compile snapshot.
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
@@ -48,7 +48,15 @@ pub(super) fn splice(
         else {
             continue;
         };
-        let Some(candidate) = view.inline_callees.get(&byte_pc) else {
+        let Some(call_target) = function.direct_call_targets.get(target as usize) else {
+            continue;
+        };
+        let candidate = match call_target.kind {
+            NumericDirectCallKind::Plain => view.inline_callees.get(&byte_pc).map(|c| &*c.body),
+            NumericDirectCallKind::Method => view.inline_methods.get(&byte_pc).map(|c| &*c.body),
+            _ => None,
+        };
+        let Some(candidate) = candidate else {
             continue;
         };
         let mut cost = 0;
@@ -60,16 +68,16 @@ pub(super) fn splice(
             if exceptional_edge.is_some() {
                 return Err("protected call site".into());
             }
-            if target.kind != NumericDirectCallKind::Plain || target.candidates.len() != 1 {
-                return Err("requires one plain-call target".into());
+            if target.candidates.len() != 1 {
+                return Err("requires one call target".into());
             }
-            if candidate.function_id() == view.code_block.id {
+            if candidate.code_block.id == view.code_block.id {
                 return Err("recursive callee".into());
             }
-            if candidate.function_id() != target.candidates[0].callee.plan.function_id {
+            if candidate.code_block.id != target.candidates[0].callee.plan.function_id {
                 return Err("callee snapshot disagrees with target".into());
             }
-            let body = NumericFunction::build(&candidate.body)
+            let body = NumericFunction::build(candidate)
                 .map_err(|reason| format!("callee HIR: {reason:?}"))?;
             cost = body.nodes.len() + 2 * usize::from(body.parameter_count) + 1;
             if body.nodes.len() > MAX_INLINE_NODES || body.blocks.len() > 8 {
@@ -94,10 +102,23 @@ pub(super) fn splice(
             if plan.own_upvalue_count != 0 || plan.needs_incoming_arguments {
                 return Err("callee requires activation entry setup".into());
             }
+            if target.kind == NumericDirectCallKind::Method
+                && target.candidates[0].guard.as_ref()
+                    != view.inline_methods.get(&byte_pc).map(|m| &m.guard)
+            {
+                return Err("method snapshot disagrees with guard".into());
+            }
             let this_mode = plan.this_mode;
             let mut proposed = function.clone();
-            splice_one(&mut proposed, view, NumericValue(index), &body, this_mode)
-                .ok_or("scalar splice frame or argument contract")?;
+            splice_one(
+                &mut proposed,
+                view,
+                candidate,
+                NumericValue(index),
+                &body,
+                this_mode,
+            )
+            .ok_or("scalar splice frame or argument contract")?;
             *function = proposed;
             Ok(())
         })();
@@ -106,7 +127,7 @@ pub(super) fn splice(
                 parent_function_id: view.code_block.id,
                 instruction_pc: logical_pc,
                 byte_pc,
-                callee_function_id: candidate.function_id(),
+                callee_function_id: candidate.code_block.id,
                 depth: 1,
                 cost: cost as u32,
                 outcome: match outcome {
@@ -141,12 +162,14 @@ fn boxed(
 fn splice_one(
     hir: &mut NumericFunction,
     view: &JitCompileSnapshot,
+    callee_view: &JitCompileSnapshot,
     call: NumericValue,
     body: &NumericFunction,
     this_mode: otter_vm::JitDirectCallThisMode,
 ) -> Option<()> {
     let NumericNode::DirectCall {
         source,
+        target,
         arguments: NumericDirectCallArguments::Fixed { start, count },
         logical_pc,
         byte_pc,
@@ -185,15 +208,26 @@ fn splice_one(
         .position(|&node| node == call)?;
     let old_block = hir.blocks[block_index].clone();
     let mut prefix = old_block.nodes[..position].to_vec();
-    let callable = boxed(hir, source, &mut prefix);
+    let source = boxed(hir, source, &mut prefix);
+    let method =
+        hir.direct_call_targets.get(target as usize)?.kind == NumericDirectCallKind::Method;
     let guard = push(
         hir,
-        NumericNode::InlineCallGuard {
-            source: callable,
-            function_id: body.function_id,
-            this_mode,
+        if method {
+            NumericNode::InlineMethodGuard { source, target }
+        } else {
+            NumericNode::InlineCallGuard {
+                source,
+                function_id: body.function_id,
+                this_mode,
+            }
         },
     );
+    let (callable, this) = if method {
+        (guard, source)
+    } else {
+        (source, guard)
+    };
     prefix.push(guard);
     let mut guard_state = call_state.clone();
     guard_state.point = NumericFramePoint::Node(guard);
@@ -203,7 +237,7 @@ fn splice_one(
     *parent.slots.get_mut(usize::from(destination))? = NumericFrameSlot::Undefined;
     let entry = DeoptFrameEntry {
         return_register: destination,
-        this: NumericFrameSlot::Value(guard),
+        this: NumericFrameSlot::Value(this),
         closure: NumericFrameSlot::Value(callable),
     };
     let mut raw_arguments = Vec::new();
@@ -217,13 +251,7 @@ fn splice_one(
     let mut entry_frames = parents.clone();
     entry_frames.push(DeoptFrame {
         function_id: body.function_id,
-        byte_pc: view
-            .inline_callees
-            .get(&byte_pc)?
-            .body
-            .instructions
-            .first()?
-            .byte_pc,
+        byte_pc: callee_view.instructions.first()?.byte_pc,
         entry: Some(entry),
         slots: entry_slots.into(),
     });
@@ -257,7 +285,7 @@ fn splice_one(
                     _ => return None,
                 };
             }
-            NumericNode::This => mapping[index] = guard,
+            NumericNode::This => mapping[index] = this,
             _ => {
                 mapping[index] = push(
                     hir,

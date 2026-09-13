@@ -165,7 +165,9 @@ fn visit_inputs(
             visit(value, true);
         }
         PropertyLoad { receiver, .. } => visit(receiver, true),
-        InlineCallGuard { source, .. } | BoxTagged(source) => visit(source, true),
+        InlineCallGuard { source, .. } | InlineMethodGuard { source, .. } | BoxTagged(source) => {
+            visit(source, true)
+        }
         ElementLoad {
             receiver, index, ..
         } => {

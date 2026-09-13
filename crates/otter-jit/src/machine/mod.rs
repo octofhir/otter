@@ -39,6 +39,8 @@
 //!   a property probe. Local catches consume the pure exception payload.
 //!   Inlined cold sites carry boxed frame operands as explicit tagged roots;
 //!   the source-owned recipes publish descendants without copying the caller.
+//! - Inline method guards own their source's receiver/prototype/slot program,
+//!   produce the current callable, and exact-deopt before any lookup effects.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
 //!   and constructor targets remain monomorphic; an explicit-receiver call
 //!   and a base construct own at most one candidate and otherwise the generic
@@ -720,6 +722,11 @@ pub enum MachineOpcode {
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
     EntryThis,
+    /// Re-read a method's receiver/prototype/slot proof and return its callable.
+    InlineMethodGuard {
+        /// One source-owned immutable method identity program.
+        guard: Box<otter_vm::jit::JitMethodGuard>,
+    },
     /// Prove a plain inline callable and produce its exact this binding.
     InlineCallGuard {
         /// Canonical bytecode target identity.
@@ -1769,9 +1776,18 @@ impl InstructionSequence {
                     }
                 }
                 match &instruction.opcode {
-                    MachineOpcode::InlineCallGuard { .. } => {
+                    MachineOpcode::InlineCallGuard { .. }
+                    | MachineOpcode::InlineMethodGuard { .. } => {
                         let [input, output, late @ ..] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let scratch: &[u8] = if matches!(
+                            instruction.opcode,
+                            MachineOpcode::InlineMethodGuard { .. }
+                        ) {
+                            &[9, 10, 11, 12, 13, 14, 15]
+                        } else {
+                            &[9, 10, 11, 12, 14]
                         };
                         if late
                             .iter()
@@ -1782,8 +1798,9 @@ impl InstructionSequence {
                                 self.representations[operand.value.0 as usize]
                                     != MachineRepresentation::Tagged
                             })
-                            || instruction.clobbers
-                                != [9, 10, 11, 12, 14].map(PhysicalRegister::integer)
+                            || !instruction.clobbers.iter().copied().eq(
+                                scratch.iter().copied().map(PhysicalRegister::integer),
+                            )
                             || instruction.deopt.is_none()
                             || instruction.safepoint.is_some()
                         {

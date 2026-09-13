@@ -372,13 +372,34 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
     }
 
     // SAFETY: the live `JitCtx` reentry contract.
+    let materialized_index = match unsafe { ctx.native_frame.as_ref() } {
+        Some(frame)
+            if frame
+                .header
+                .flags
+                .contains(otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS) =>
+        {
+            None
+        }
+        Some(_) => match ctx.materialized_frame_index() {
+            Ok(index) => Some(index),
+            Err(error) => return compiled_fatal(ctx, error),
+        },
+        None => return compiled_fatal(ctx, VmError::InvalidOperand),
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
     let Some(native) = (unsafe { ctx.native_frame.as_mut() }) else {
         return compiled_fatal(ctx, VmError::InvalidOperand);
     };
-    match vm.jit_deopt_materialize_inline_frames(context, stack, native, &frames) {
+    match vm.jit_deopt_materialize_inline_frames(
+        context,
+        stack,
+        native,
+        materialized_index,
+        &frames,
+    ) {
         Ok(value) => NativeResultPair::success(value),
         Err(error) => compiled_error(ctx, error),
     }
@@ -972,10 +993,9 @@ pub(crate) extern "C" fn jit_binding_value_stub(
         let mut frames = super::inline_frames::decode(ctx)?;
         let mut runtime = ctx.runtime_call()?;
         runtime.with_inline_activations(&mut frames, |runtime| {
-            match runtime.binding_values(
-                Value::from_bits(value0_bits),
-                Value::from_bits(value1_bits),
-            ) {
+            match runtime
+                .binding_values(Value::from_bits(value0_bits), Value::from_bits(value1_bits))
+            {
                 Ok(value) => Ok(NativeResultPair::success(value)),
                 Err(CommittedValueError::JavaScript(error)) => runtime
                     .take_js_throw(error)

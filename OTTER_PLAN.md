@@ -550,6 +550,14 @@ leaf/caller error stacks; a later numeric exit does not repeat the getter.
 The source frame schema itself supplies typed inlineFrames artifact output.
 Next expose contextual construct/initializer fields; virtual-object deopt
 materialization remains absent and must precede an elimination claim.
+Constructor-boundary probing exposed an existing inline-exit correctness hole:
+the outer continuation lost incoming actuals and constructor state. It now reads
+the exact native entry and its validated materialized owner, retaining actuals,
+rest/arguments-object state, live upvalues and new.target before dispatch. A hot
+factory and fresh construct site both exercise real two-frame numeric exits and
+preserve forwarded arguments, receiver substitution and single coercion effects.
+This fixes current-engine reconstruction; constructor splicing and virtual
+allocation elimination remain the next structural work, with no speed claim.
 Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.
 
 The handoff's structural A1–A3 order supersedes the chronological next steps below.

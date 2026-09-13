@@ -27,7 +27,8 @@
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
 //! - The vector's feedback epoch advances once per material state transition,
-//!   never for an already-recorded observation.
+//!   never for an already-recorded observation. Every ordinary-call target
+//!   population transition invalidates stale compiled caller plans.
 //! - The isolate's VM thread is the sole writer. Arithmetic/element bits are
 //!   advisory monotonic atomics. Multiword property and bounded-call records
 //!   publish coherent reader snapshots with a per-slot sequence counter.
@@ -102,10 +103,11 @@ impl CallTargetTransition {
         !matches!(self, Self::Unchanged)
     }
 
-    /// Preserve the baseline's existing first-target invalidation decision.
+    /// Every new target changes the immutable caller plan. Repeated hits and
+    /// observations after saturation do not invalidate an installed generation.
     #[must_use]
     pub(crate) const fn evict_for_reopt(self) -> bool {
-        matches!(self, Self::BecameMonomorphic)
+        self.state_changed()
     }
 }
 

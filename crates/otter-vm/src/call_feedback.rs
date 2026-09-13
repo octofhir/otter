@@ -5,6 +5,8 @@
 //!   execution feedback shared by plain and method calls.
 //! - [`Interpreter::record_ordinary_call_feedback`] — typed recording keyed by
 //!   the canonical instruction index in the supplied CodeBlock.
+//! - [`Interpreter::record_resolved_bytecode_call_feedback`] — generated-call
+//!   target publication and caller invalidation before committed callee entry.
 //! - [`Interpreter::commit_method_call_feedback_transition`] — publication and
 //!   invalidation for isolate-owned method-target growth.
 //!
@@ -67,6 +69,33 @@ impl Interpreter {
         changed
     }
 
+    /// Publish an already-resolved bytecode callable at a generated call site.
+    /// This leaf observation never allocates in the GC heap or invokes user
+    /// code. Non-bytecode callables retain their canonical dispatch behavior.
+    pub(crate) fn record_resolved_bytecode_call_feedback(
+        &mut self,
+        code_block: &CodeBlock,
+        instruction_pc: u32,
+        caller_function_id: u32,
+        callee: crate::Value,
+    ) {
+        let Some(target_function_id) = callee.as_function().or_else(|| {
+            callee
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        }) else {
+            return;
+        };
+        let transition = self.record_ordinary_call_feedback(
+            code_block,
+            instruction_pc,
+            OrdinaryCallTarget::Bytecode(target_function_id),
+        );
+        if transition.evict_for_reopt() {
+            self.evict_compiled_for_reopt(caller_function_id);
+        }
+    }
+
     /// Record both compact and bounded ordinary-call feedback for one site.
     ///
     /// Dense and side-table transitions that describe the same first or second
@@ -105,6 +134,20 @@ mod tests {
                 ],
             )],
         )
+    }
+
+    #[test]
+    fn caller_invalidation_follows_bounded_target_growth() {
+        let code_block = call_code_block();
+        for target in 0..=MAX_CALL_TARGETS as u32 {
+            assert!(code_block.record_call_feedback(0, target).evict_for_reopt());
+            assert!(!code_block.record_call_feedback(0, target).evict_for_reopt());
+        }
+        assert!(
+            !code_block
+                .record_call_feedback(0, u32::MAX)
+                .evict_for_reopt()
+        );
     }
 
     #[test]

@@ -499,8 +499,15 @@ function/PC from the code-owned IC cell; both Template and Machine initialize it
 The VM service validates that explicit source independently of the published
 native frame. Seven scoped VM tests and11 property runtime tests pass, including
 a foreign-function published frame and local-catch Template completion; VM/JIT
-clippy passes. This removes root-PC lookup coupling, but does not publish inline
-JS activations for accessor reentry or yet admit property bodies. Next: operation ownership for source-dependent callee facts,
+clippy passes. Machine property operations now also own the prepared shape/slot
+program and source function/logical/byte PC captured by their HIR node. Selection
+checks that source against the innermost frame recipe. The emitter no longer
+looks up property proofs in the root snapshot or source PC in the root deopt
+frame. Two distinct snapshots with equal function id/PC retain separate programs.
+143 numeric tests,16 runtime property/scalar-inline tests and scoped JIT clippy
+pass. No release build or timing. The remaining property prerequisite is explicit
+cold CFG with correct inline activation publication; property bodies remain
+unadmitted until that reentry/exception contract is represented before allocation. Next: operation ownership for source-dependent callee facts,
 then dot-like property helpers and complete temporary-object arithmetic chains.
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not

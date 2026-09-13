@@ -11,6 +11,7 @@
 //! # Contents
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
+//! - [`MachinePropertySite`] — source-owned immutable named-access proofs.
 //! - [`MachineOpcode`] — scalar operations, guarded element accesses, control
 //!   flow, and descriptor-backed calls.
 //! - [`CallDescriptor`], [`CallTarget`], [`DirectCallCandidate`], and
@@ -74,6 +75,7 @@ mod frame;
 mod native_leaf;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
+mod property;
 mod regalloc;
 mod safepoint;
 mod target;
@@ -83,6 +85,7 @@ pub use deopt::{
     MachineDeoptError, MachineFrameSlot, MachineFrameState, lower_deopt_table, undefined_slot,
 };
 pub use frame::{FrameLayoutError, MachineFrameLayout};
+pub use property::MachinePropertySite;
 pub use regalloc::{
     AllocatedLocation, AllocatedMetadata, AllocatedSequence, AllocationEdit, AllocationError,
     AllocationPoint,
@@ -915,20 +918,18 @@ pub enum MachineOpcode {
     },
     /// Clear every persistent packed-double view word at one semantic boundary.
     ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason),
-    /// Guard and load one settled own-data property or exotic array/string
-    /// length, deoptimizing at the source operation before effects on a miss.
+    /// Probe one source-owned named load, then commit its boxed cold boundary.
     PropertyLoad {
-        /// Source bytecode offset used for settled metadata and artifacts.
-        byte_pc: u32,
+        /// Owned source identity and settled program from this compilation site.
+        site: Box<MachinePropertySite>,
         /// Whether the property name is `length` and should first try the
         /// dense-array/primitive-string layout program.
         exotic_length: bool,
     },
-    /// Guard and store one settled existing own-data property, deoptimizing
-    /// before the first effect on any metadata, receiver, shape, or slot miss.
+    /// Probe one source-owned named store, then commit its boxed cold boundary.
     PropertyStore {
-        /// Source bytecode offset used for settled metadata and artifacts.
-        byte_pc: u32,
+        /// Owned source identity and settled program from this compilation site.
+        site: Box<MachinePropertySite>,
         /// Whether scalar typing proves the boxed value cannot be a GC cell,
         /// allowing emission to omit the conditional generational barrier.
         value_is_non_cell: bool,

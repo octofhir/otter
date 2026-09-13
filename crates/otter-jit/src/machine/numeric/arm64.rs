@@ -2063,20 +2063,11 @@ pub(super) fn emit(
                 integer_register(locations[1])?,
             ),
             MachineOpcode::PropertyLoad {
-                byte_pc,
+                site: ref property,
                 exotic_length,
             } => {
-                let deopt = instruction.deopt.ok_or(Unsupported::OperandShape(
-                    "scalar property load frame state",
-                ))?;
-                let exit = deopt_runtime
-                    .exits
-                    .get(deopt.0 as usize)
-                    .ok_or(Unsupported::OperandShape("scalar property load deopt exit"))?;
-                let logical_pc = *exit
-                    .resume_pcs
-                    .first()
-                    .ok_or(Unsupported::OperandShape("scalar property load logical PC"))?;
+                let byte_pc = property.byte_pc;
+                let logical_pc = property.logical_pc;
                 let site = safepoints
                     .site(id)
                     .filter(|site| instruction.safepoint == Some(site.id))
@@ -2086,7 +2077,7 @@ pub(super) fn emit(
                 let cell = load_ic_cells
                     .get_mut(next_load_ic)
                     .ok_or(Unsupported::OperandShape("scalar property load IC cell"))?;
-                cell.set_source(view.code_block.id, logical_pc);
+                cell.set_source(property.function_id, logical_pc);
                 let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
                 next_load_ic += 1;
                 let start = ops.offset().0;
@@ -2119,11 +2110,8 @@ pub(super) fn emit(
                     );
                 }
 
-                if let Some(chain) = (view.cage_base != 0)
-                    .then(|| view.property_loads.get(&byte_pc))
-                    .flatten()
-                    .filter(|chain| !chain.is_empty())
-                {
+                if view.cage_base != 0 && !property.program.is_empty() {
+                    let chain = &property.program;
                     emit_settled_property_load(
                         &mut ops,
                         &mut relocations,
@@ -2229,22 +2217,11 @@ pub(super) fn emit(
                 ));
             }
             MachineOpcode::PropertyStore {
-                byte_pc,
+                site: ref property,
                 value_is_non_cell,
             } => {
-                let deopt = instruction.deopt.ok_or(Unsupported::OperandShape(
-                    "scalar property store frame state",
-                ))?;
-                let exit =
-                    deopt_runtime
-                        .exits
-                        .get(deopt.0 as usize)
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar property store deopt exit",
-                        ))?;
-                let logical_pc = *exit.resume_pcs.first().ok_or(Unsupported::OperandShape(
-                    "scalar property store logical PC",
-                ))?;
+                let byte_pc = property.byte_pc;
+                let logical_pc = property.logical_pc;
                 let site = safepoints
                     .site(id)
                     .filter(|site| instruction.safepoint == Some(site.id))
@@ -2254,7 +2231,7 @@ pub(super) fn emit(
                 let cell = store_ic_cells
                     .get_mut(next_store_ic)
                     .ok_or(Unsupported::OperandShape("scalar property store IC cell"))?;
-                cell.set_source(view.code_block.id, logical_pc);
+                cell.set_source(property.function_id, logical_pc);
                 let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
                 next_store_ic += 1;
                 let start = ops.offset().0;
@@ -2262,11 +2239,8 @@ pub(super) fn emit(
                 let commit = ops.new_dynamic_label();
                 let runtime = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                if let Some(chain) = (view.cage_base != 0)
-                    .then(|| view.property_stores.get(&byte_pc))
-                    .flatten()
-                    .filter(|chain| !chain.is_empty())
-                {
+                if view.cage_base != 0 && !property.program.is_empty() {
+                    let chain = &property.program;
                     emit_settled_property_store_guard(
                         &mut ops,
                         &mut relocations,

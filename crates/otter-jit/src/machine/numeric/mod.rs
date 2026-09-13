@@ -1472,7 +1472,13 @@ fn select_with_packed_double_view_caches(
                     );
                     let mut load = MachineInstruction::plain(
                         MachineOpcode::PropertyLoad {
-                            byte_pc,
+                            site: Box::new(
+                                owned_property_site(hir, node_value, byte_pc)
+                                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(
+                                        MachineInstructionId(instructions.len() as u32),
+                                    ))?
+                                    .clone(),
+                            ),
                             exotic_length,
                         },
                         vec![
@@ -1511,7 +1517,13 @@ fn select_with_packed_double_view_caches(
                     );
                     let mut store = MachineInstruction::plain(
                         MachineOpcode::PropertyStore {
-                            byte_pc,
+                            site: Box::new(
+                                owned_property_site(hir, node_value, byte_pc)
+                                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(
+                                        MachineInstructionId(instructions.len() as u32),
+                                    ))?
+                                    .clone(),
+                            ),
                             value_is_non_cell,
                         },
                         vec![
@@ -2609,6 +2621,24 @@ fn element_clobbers() -> Vec<PhysicalRegister> {
         .collect()
 }
 
+/// Select a site's own immutable program only when its frame recipe names
+/// the same source operation. This also holds after future callee remapping.
+fn owned_property_site(
+    hir: &NumericFunction,
+    node: hir::NumericValue,
+    byte_pc: u32,
+) -> Option<&super::MachinePropertySite> {
+    let site = hir.property_sites.get(&node)?;
+    let frame = hir
+        .frame_states
+        .iter()
+        .find(|state| state.point == NumericFramePoint::Node(node))?
+        .frames
+        .last()?;
+    (site.byte_pc == byte_pc && frame.byte_pc == byte_pc && frame.function_id == site.function_id)
+        .then_some(site)
+}
+
 fn property_load_clobbers() -> Vec<PhysicalRegister> {
     TargetRegisterFile::aarch64_scalar_call_clobbers()
 }
@@ -3370,6 +3400,7 @@ mod tests {
         use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry};
         let value = NumericValue;
         let hir = NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 1,
             parameter_count: 2,
             register_count: 2,
@@ -3528,6 +3559,7 @@ mod tests {
         nodes.push(NumericNode::BlockParameter(target_type));
         (
             NumericFunction {
+                property_sites: BTreeMap::new(),
                 function_id: 175,
                 nodes,
                 blocks: vec![
@@ -3569,6 +3601,7 @@ mod tests {
     fn tagged_backedge_conversion_hir() -> NumericFunction {
         let value = hir::NumericValue;
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 176,
             nodes: vec![
                 NumericNode::TaggedConstant(Value::undefined().to_bits()),
@@ -3653,6 +3686,7 @@ mod tests {
     fn method_call_selection_hir() -> NumericFunction {
         let value = hir::NumericValue;
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 150,
             nodes: vec![
                 NumericNode::Parameter {
@@ -3723,6 +3757,7 @@ mod tests {
     fn generic_wide_method_call_selection_hir(argument_count: u32) -> NumericFunction {
         let value = hir::NumericValue;
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 152,
             nodes: vec![
                 NumericNode::Parameter {
@@ -3782,6 +3817,7 @@ mod tests {
     fn cold_call_selection_hir() -> NumericFunction {
         let value = hir::NumericValue;
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 151,
             nodes: vec![
                 NumericNode::Parameter {
@@ -3911,6 +3947,7 @@ mod tests {
     fn array_construct_selection_hir() -> NumericFunction {
         let value = hir::NumericValue;
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 152,
             nodes: vec![
                 NumericNode::IntegerConstant(7),
@@ -4028,6 +4065,7 @@ mod tests {
             }]
         };
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 153,
             nodes,
             blocks,
@@ -6061,6 +6099,7 @@ mod tests {
     fn element_selection_hir(store_value: bool) -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 93,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6131,6 +6170,7 @@ mod tests {
     fn generic_element_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6197,6 +6237,7 @@ mod tests {
     fn packed_double_element_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 94,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6272,6 +6313,7 @@ mod tests {
     fn packed_double_tagged_index_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 95,
             nodes: vec![
                 NumericNode::Parameter {
@@ -6337,6 +6379,28 @@ mod tests {
     fn property_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: [
+                (
+                    value(2),
+                    super::super::MachinePropertySite {
+                        function_id: 94,
+                        logical_pc: 0,
+                        byte_pc: 24,
+                        program: Box::default(),
+                    },
+                ),
+                (
+                    value(3),
+                    super::super::MachinePropertySite {
+                        function_id: 94,
+                        logical_pc: 1,
+                        byte_pc: 40,
+                        program: Box::default(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
             function_id: 94,
             nodes: vec![
                 NumericNode::IntegerConstant(7),
@@ -6649,6 +6713,7 @@ mod tests {
     fn string_constant_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![NumericNode::StringConstantCell {
                 byte_pc: 24,
@@ -6677,6 +6742,7 @@ mod tests {
     fn tagged_nullish_selection_hir(equal: bool) -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![
                 NumericNode::Parameter {
@@ -7855,7 +7921,7 @@ mod tests {
             .find(|instruction| {
                 instruction.opcode
                     == MachineOpcode::PropertyLoad {
-                        byte_pc: 24,
+                        site: Box::new(hir.property_sites[&hir::NumericValue(2)].clone()),
                         exotic_length: false,
                     }
             })
@@ -7897,7 +7963,7 @@ mod tests {
             .find(|instruction| {
                 instruction.opcode
                     == MachineOpcode::PropertyStore {
-                        byte_pc: 40,
+                        site: Box::new(hir.property_sites[&hir::NumericValue(3)].clone()),
                         value_is_non_cell: true,
                     }
             })
@@ -7955,8 +8021,8 @@ mod tests {
         }));
 
         let normalized = sequence.normalized();
-        assert!(normalized.contains("PropertyLoad { byte_pc: 24, exotic_length: false }"));
-        assert!(normalized.contains("PropertyStore { byte_pc: 40, value_is_non_cell: true }"));
+        assert!(normalized.contains("PropertyLoad { site: MachinePropertySite { function_id: 94, logical_pc: 0, byte_pc: 24, program: [] }, exotic_length: false }"));
+        assert!(normalized.contains("PropertyStore { site: MachinePropertySite { function_id: 94, logical_pc: 1, byte_pc: 40, program: [] }, value_is_non_cell: true }"));
         sequence
             .allocate(&TargetRegisterFile::aarch64_scalar_function())
             .expect("property late-location allocation");
@@ -7983,7 +8049,7 @@ mod tests {
             .find(|instruction| {
                 instruction.opcode
                     == MachineOpcode::PropertyStore {
-                        byte_pc: 40,
+                        site: Box::new(hir.property_sites[&hir::NumericValue(3)].clone()),
                         value_is_non_cell: false,
                     }
             })
@@ -8048,6 +8114,64 @@ mod tests {
     }
 
     #[test]
+    fn property_selection_rejects_a_program_from_a_different_activation() {
+        let mut hir = property_selection_hir();
+        hir.property_sites
+            .get_mut(&hir::NumericValue(2))
+            .unwrap()
+            .function_id += 1;
+        assert!(
+            select(&hir).is_err(),
+            "foreign property facts must not enter Machine IR"
+        );
+    }
+
+    #[test]
+    fn property_programs_survive_equal_source_ids_in_distinct_snapshots() {
+        let mut first = property_store_emission_view(true);
+        let mut second = first.clone();
+        first.property_stores.insert(
+            8,
+            vec![otter_vm::JitInlinePropertyLoad {
+                receiver_shape: 101,
+                value_byte: 8,
+            }],
+        );
+        second.property_stores.insert(
+            8,
+            vec![otter_vm::JitInlinePropertyLoad {
+                receiver_shape: 202,
+                value_byte: 16,
+            }],
+        );
+        let first_hir = NumericFunction::build(&first).unwrap();
+        let second_hir = NumericFunction::build(&second).unwrap();
+        first.property_stores.clear();
+        second.property_stores.clear();
+        for (hir, expected_shape, expected_slot) in [(&first_hir, 101, 8), (&second_hir, 202, 16)] {
+            let sequence = select(hir).unwrap();
+            let site = sequence
+                .instructions()
+                .iter()
+                .find_map(|instruction| match &instruction.opcode {
+                    MachineOpcode::PropertyStore { site, .. } => Some(site),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(site.function_id, first.code_block.id);
+            assert_eq!(site.byte_pc, 8);
+            assert_eq!(site.logical_pc, 1);
+            assert_eq!(
+                site.program.as_ref(),
+                &[otter_vm::JitInlinePropertyLoad {
+                    receiver_shape: expected_shape,
+                    value_byte: expected_slot
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn property_selection_preserves_exotic_length_program() {
         let mut hir = property_selection_hir();
         let NumericNode::PropertyLoad { exotic_length, .. } = &mut hir.nodes[2] else {
@@ -8059,7 +8183,7 @@ mod tests {
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode
                 == MachineOpcode::PropertyLoad {
-                    byte_pc: 24,
+                    site: Box::new(hir.property_sites[&hir::NumericValue(2)].clone()),
                     exotic_length: true,
                 }
         }));
@@ -11139,6 +11263,7 @@ mod tests {
             }
         };
         let hir = NumericFunction {
+            property_sites: BTreeMap::new(),
             function_id: 190,
             nodes: vec![
                 NumericNode::TaggedConstant(Value::undefined().to_bits()),

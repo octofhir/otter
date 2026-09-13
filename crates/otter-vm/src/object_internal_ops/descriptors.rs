@@ -7,8 +7,9 @@
 //! - The array-index accessor protector and the prototype shape epoch.
 //!
 //! # Invariants
-//! - A proxy receiver never reaches these; the proxy-aware entries in [`super`]
-//!   resolve the trap first.
+//! - Proxy descriptor operations dispatch through their canonical traps.
+//! - The receiver phase of `[[Set]]` roots receiver and value across the
+//!   potentially reentrant `[[GetOwnProperty]]` before defining the property.
 
 use crate::activation_stack::ActivationStack;
 use crate::{
@@ -703,8 +704,17 @@ impl Interpreter {
         if !crate::reflect::is_type_object_value(receiver) {
             return Ok(false);
         }
+        let scope_frame = crate::handles::HandleScopeFrame::enter(self);
+        let scope = scope_frame.token();
+        let receiver_root = self.scoped_value(&scope, *receiver);
+        let value_root = self.scoped_value(&scope, value);
         let existing =
             self.ordinary_get_own_property_descriptor_value(stack, context, *receiver, key, 0)?;
+        // A Proxy's descriptor trap (including its absent-trap path) may
+        // allocate or reenter. The caller's rooted argument slots do not
+        // update these copied operands; reload before the defining effect.
+        let receiver = self.escape_scoped(receiver_root);
+        let value = self.escape_scoped(value_root);
         match existing {
             Some(desc) => match desc.kind {
                 object::DescriptorKind::Accessor { .. } => Ok(false),
@@ -716,7 +726,7 @@ impl Interpreter {
                         value: Some(value),
                         ..Default::default()
                     };
-                    self.define_own_property_value(stack, context, receiver, key, partial)
+                    self.define_own_property_value(stack, context, &receiver, key, partial)
                 }
             },
             None => {
@@ -727,7 +737,7 @@ impl Interpreter {
                     configurable: Some(true),
                     ..Default::default()
                 };
-                self.define_own_property_value(stack, context, receiver, key, descriptor)
+                self.define_own_property_value(stack, context, &receiver, key, descriptor)
             }
         }
     }

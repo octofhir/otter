@@ -366,8 +366,12 @@ property boundary. The cell can learn own/prototype loads, existing-slot
 stores, and guarded no-allocation add-property transitions. Transition hits
 prove the parent shape, supported prototype topology, receiver extensibility,
 and inline slot capacity before publishing the child shape and value. The
-current transition program supports null prototypes and a fast direct terminal
-prototype; dictionary-backed `%Object.prototype%` additions remain canonical.
+current transition program supports null prototypes, missing-key chains of at
+most two fast prototypes, and direct inherited writable data. The latter proves
+the live prototype shape, unmodified descriptor state, and absence of an exotic
+sidecar; deeper prototype links need no guard because the own writable property
+ends `[[Set]]` lookup. Dictionary-backed `%Object.prototype%` additions remain
+canonical.
 Success or throw commits once; named-property misses do not exact-deopt and
 replay the source operation. A property operation with a local catch stays on
 Template until its fast probe and committed cold call are explicit Machine CFG

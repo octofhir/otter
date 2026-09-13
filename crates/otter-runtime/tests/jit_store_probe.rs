@@ -1,7 +1,7 @@
 //! Guarded runtime store probes across prototype and descriptor changes.
 //!
 //! # Contents
-//! - A hot direct-prototype-data transition that requires the runtime IC.
+//! - Native direct-prototype-data transition fill and subsequent reuse.
 //! - Read-only, setter, own-slot, non-extensible and Proxy invalidations.
 //! - Nested allocating getter/setter scopes, object throws and later reuse.
 //! - Bounded runtime path counters and isolation of later capture batches.
@@ -39,13 +39,6 @@ fn runtime_store_probe_preserves_invalidations_and_exact_effects() {
             "[17997000,true,1,7,8,9,true,1,17]",
             "{selection:?}"
         );
-        if selection != JitSelection::InterpreterOnly {
-            let stats = runtime.execution_stats();
-            assert!(
-                stats.jit_runtime_property_stubs > 1000,
-                "inherited-data transitions must exercise the runtime IC: {stats:?}"
-            );
-        }
     }
 }
 
@@ -146,4 +139,138 @@ fn store_diagnostics_count_paths_without_replaying_effects() {
         })
         .sum();
     assert_eq!(count, 1, "later capture must not inherit old counters");
+}
+
+#[test]
+fn inherited_writable_data_fills_and_reuses_native_store_way() {
+    use otter_runtime::{JitDebugEvent, JitDebugRequest};
+
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .jit_debug(JitDebugRequest::events())
+            .build()
+            .expect("runtime");
+        let warm = runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+            const writableProto = { nativeWritable: 0 };
+            function nativeWritableStore(receiver, value) {
+                'use strict';
+                receiver.nativeWritable = value;
+                return value;
+            }
+            for (let i = 0; i < 6000; i++) {
+                nativeWritableStore(Object.create(writableProto), i);
+            }
+        "#,
+                ),
+                "native-writable-warm.js",
+            )
+            .expect("warm store");
+        assert!(
+            warm.jit_debug_report()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|event| {
+                    matches!(event, JitDebugEvent::PropertyStoreRuntime {
+                property_name, native_way: true, failed: false, ..
+            } if property_name == "nativeWritable")
+                }),
+            "{selection:?}: native way must be offered"
+        );
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+            const fresh = Object.create(writableProto);
+            const payload = { marker: 91 };
+            nativeWritableStore(fresh, payload);
+            fresh.nativeWritable === payload && Object.hasOwn(fresh, 'nativeWritable')
+                && writableProto.nativeWritable === 0
+        "#,
+                ),
+                "native-writable-reuse.js",
+            )
+            .expect("native reuse");
+        assert_eq!(result.completion_string(), "true", "{selection:?}");
+        let stores: u64 = result
+            .jit_debug_report()
+            .unwrap()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                JitDebugEvent::PropertyStoreRuntime {
+                    property_name,
+                    count,
+                    ..
+                } if property_name == "nativeWritable" => Some(*count),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            stores, 0,
+            "{selection:?}: cached transition must stay generated"
+        );
+        let mutated = runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+            let deepTraps = 0;
+            Object.setPrototypeOf(writableProto, new Proxy({}, {
+                set() { deepTraps++; throw new Error('lookup went past writable own data'); }
+            }));
+            const deep = Object.create(writableProto);
+            nativeWritableStore(deep, 17);
+            const peerProto = { nativeWritable: 2 };
+            const peer = Object.create(peerProto);
+            nativeWritableStore(peer, 19);
+            const blocked = Object.preventExtensions(Object.create(writableProto));
+            let rejected = false;
+            try { nativeWritableStore(blocked, 23); }
+            catch (error) { rejected = error instanceof TypeError; }
+            Object.freeze(peerProto);
+            let frozen = false;
+            const frozenTarget = Object.create(peerProto);
+            try { nativeWritableStore(frozenTarget, 29); }
+            catch (error) { frozen = error instanceof TypeError; }
+            JSON.stringify([deep.nativeWritable, deepTraps, peer.nativeWritable,
+                peerProto.nativeWritable, rejected, Object.hasOwn(blocked, 'nativeWritable'),
+                frozen, Object.hasOwn(frozenTarget, 'nativeWritable')]);
+        "#,
+                ),
+                "native-writable-mutations.js",
+            )
+            .expect("live prototype and receiver guards");
+        assert_eq!(
+            mutated.completion_string(),
+            "[17,0,19,2,true,false,true,false]",
+            "{selection:?}"
+        );
+    }
+}
+
+#[test]
+fn proxy_receiver_define_preserves_relocated_descriptors() {
+    let source = include_str!("../../otter-difftest/corpus/property_proxy_receiver_gc.js");
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .run_script(SourceInput::from_javascript(source), "proxy-receiver-gc.js")
+            .expect("proxy receiver descriptor operations");
+        assert_eq!(
+            result.completion_string(),
+            "[64,32,32,2016]",
+            "{selection:?}"
+        );
+    }
 }

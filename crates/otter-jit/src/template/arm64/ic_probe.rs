@@ -51,16 +51,17 @@
 //! - Register contract on entry: `x15` holds the cell address, `w14` the
 //!   receiver shape handle, `x13` the receiver's `GcHeader`. On a matched way
 //!   `w17` holds the slot byte offset, `w7` the guarded holder shape, and `w6`
-//!   the transition child shape while the probe runs. A store probe returns
-//!   that child in non-allocatable `w16` (`0` for an existing-slot program);
+//!   the transition child shape while the probe runs; `w10` carries the
+//!   prototype proof kind until the transition guard consumes it. A store
+//!   probe returns that child in non-allocatable `w16` (`0` for an existing-slot program);
 //!   after [`emit_resolve_holder`], `x13` is the holder's header and `w14` its
 //!   shape.
 //! - The hop reads the receiver's `[[Prototype]]` at run time. The receiver
 //!   shape cannot stand in for it: the prototype lives in the object body, so
 //!   `setPrototypeOf` changes it while the shape stays put.
-//! - A matching shape is insufficient by itself. Every ordinary receiver and
-//!   prototype also proves live fast cache mode, no overridden slot metadata,
-//!   and no exotic sidecar before generated code trusts that shape.
+//! - A matching shape is insufficient by itself. Receiver and data-holder
+//!   guards also prove live fast mode, no overridden slot metadata, and no
+//!   exotic sidecar. Missing-key chain links use their narrower absence proof.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
@@ -90,7 +91,8 @@ use crate::entry::{
 /// On a match `w7` carries the way's holder shape, `w17` its slot byte offset,
 /// `w6` its add-transition child shape (`0` for an existing-slot program), and
 /// `w11` the second prototype-chain shape of a two-link add transition (`0`
-/// otherwise), then control falls through to `matched`.
+/// otherwise), and `w10` the prototype proof kind. Control falls through to
+/// `matched`.
 pub(crate) fn emit_way_walk(ops: &mut Assembler, matched: DynamicLabel, miss: DynamicLabel) {
     for way in 0..IC_WAYS as u32 {
         let shape_off = way * WHISKER_IC_WAY_BYTES;
@@ -98,6 +100,8 @@ pub(crate) fn emit_way_walk(ops: &mut Assembler, matched: DynamicLabel, miss: Dy
         let value_byte_off = shape_off + 8;
         let transition_shape_off = shape_off + 12;
         let chain_shape_off = shape_off + 16;
+        let prototype_guard_off =
+            shape_off + std::mem::offset_of!(otter_vm::JitPropertyIcWay, prototype_guard) as u32;
         let next = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
@@ -108,6 +112,7 @@ pub(crate) fn emit_way_walk(ops: &mut Assembler, matched: DynamicLabel, miss: Dy
             ; ldr w17, [x15, value_byte_off]
             ; ldr w6, [x15, transition_shape_off]
             ; ldr w11, [x15, chain_shape_off]
+            ; ldr w10, [x15, prototype_guard_off]
             ; b =>matched
             ; =>next
         );
@@ -501,7 +506,7 @@ where
     // Add-transition programs are store-only. A store and load site own
     // disjoint cells, but rejecting this discriminator keeps malformed cell
     // data pre-effect rather than interpreting it as an existing load.
-    dynasm!(ops ; .arch aarch64 ; cbnz w6, =>miss);
+    dynasm!(ops ; .arch aarch64 ; cbnz w6, =>miss ; cbnz w10, =>miss);
     emit_resolve_holder(ops, relocations, view, miss);
     super::values::emit_slab_base(ops, view, 13, 14);
     dynasm!(ops
@@ -520,7 +525,7 @@ where
 /// One program serves both tiers: the receiver is an ordinary object cell with
 /// a non-empty hidden class, the site's cache names a slot that the receiver
 /// itself owns. Existing-slot programs reject a prototype hop. Add-transition
-/// programs instead prove their null/direct-terminal prototype contract,
+/// programs instead prove their missing-key or direct writable-data contract,
 /// extensibility, exact append length, and inline capacity before publishing
 /// the child shape, new length, and (for slot zero) inline values pointer. A
 /// settled site compares its shape against an immediate and materializes a
@@ -605,13 +610,13 @@ where
         ; lsr w15, w17, #3
         ; cmp w16, w15
         ; b.ne =>miss
-        // holder_shape==0 describes a null receiver prototype. Otherwise it
-        // describes a fast direct prototype missing the key, whose own
-        // prototype is null (chain shape 0) or is the one further fast object
-        // the chain shape guards, itself with a null prototype. Every object
-        // ordinary `[[Set]]` would consult is therefore shape-checked.
+        // holder_shape==0 describes a null receiver prototype. Otherwise the
+        // selected program proves either direct own writable data or a missing
+        // key on the complete one/two-link chain ending in null. Every object
+        // ordinary [[Set]] would consult is checked before the append.
         ; ldr w16, [x13, view.jit_proto_byte]
         ; cbnz w7, =>transition_proto_done
+        ; cbnz w10, =>miss
         ; cbnz w16, =>miss
     );
     let transition_guards_done = ops.new_dynamic_label();
@@ -631,6 +636,26 @@ where
         ; ldrb w14, [x15]
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>miss
+    );
+    let missing_property = ops.new_dynamic_label();
+    let writable_data = otter_vm::jit::JitPropertyIcPrototypeGuard::WritableData as u32;
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz w10, =>missing_property
+        ; cmp w10, writable_data
+        ; b.ne =>miss
+        ; cbnz w11, =>miss
+    );
+    // A writable own slot ends [[Set]] lookup. Shape alone cannot prove
+    // writability after an in-place descriptor override or exotic mutation.
+    emit_fast_object_state_guard(ops, view, 15, miss);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [x15, view.object_shape_byte]
+        ; cmp w14, w7
+        ; b.ne =>miss
+        ; b =>transition_guards_done
+        ; =>missing_property
     );
     emit_chain_link_state_guard(ops, view, 15, miss);
     dynasm!(ops
@@ -684,7 +709,7 @@ where
     // Existing-slot ways may only name an own slot. For a transition the same
     // holder word described (and was consumed by) the prototype guard above.
     let parent_ready = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; cbnz w6, =>parent_ready ; cbnz w7, =>miss ; =>parent_ready);
+    dynasm!(ops ; .arch aarch64 ; cbnz w6, =>parent_ready ; cbnz w7, =>miss ; cbnz w10, =>miss ; =>parent_ready);
     // `x12` retains the guarded receiver's header: the slab base overwrites
     // `x13`, and a pointer store's write barrier names the parent object, not
     // its value slab.

@@ -8,6 +8,8 @@
 //! # Invariants
 //! - An array define keeps `length` and the dense range consistent before it
 //!   reports success, so no partially applied descriptor is observable.
+//! - Proxy defines keep the proxy, target, key value, and both descriptors
+//!   rooted across trap argument construction, reentry, and invariant checks.
 
 use super::*;
 use crate::activation_stack::ActivationStack;
@@ -169,12 +171,35 @@ impl Interpreter {
                     .into(),
                 ));
             }
+            let scope_frame = crate::handles::HandleScopeFrame::enter(self);
+            let scope = scope_frame.token();
+            let proxy_root = self.scoped_value(&scope, *target);
+            let target_root = self.scoped_value(&scope, proxy.target(&self.gc_heap));
+            let value_root = descriptor
+                .value
+                .map(|value| self.scoped_value(&scope, value));
+            let get_root = descriptor.get.map(|value| self.scoped_value(&scope, value));
+            let set_root = descriptor.set.map(|value| self.scoped_value(&scope, value));
+            let current_descriptor = |interp: &Self| {
+                let mut current = descriptor.clone();
+                current.value = value_root.map(|value| interp.escape_scoped(value));
+                current.get = get_root.map(|value| interp.escape_scoped(value));
+                current.set = set_root.map(|value| interp.escape_scoped(value));
+                current
+            };
             let key_value = self.vm_property_key_to_value(key)?;
-            let target_value = proxy.target(&self.gc_heap);
+            let key_root = self.scoped_value(&scope, key_value);
             let descriptor_object =
-                self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![target_value, key_value, Value::object(descriptor_object),];
+                self.partial_descriptor_to_object(&current_descriptor(self), &[])?;
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                self.escape_scoped(target_root),
+                self.escape_scoped(key_root),
+                Value::object(descriptor_object),
+            ];
+            let proxy = self
+                .escape_scoped(proxy_root)
+                .as_proxy()
+                .ok_or(VmError::InvalidOperand)?;
             return match self.invoke_proxy_trap(
                 stack,
                 context,
@@ -187,14 +212,39 @@ impl Interpreter {
                     if !ok {
                         return Ok(false);
                     }
-                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                    let mut target_desc = self.ordinary_get_own_property_descriptor_value(
                         stack,
                         context,
-                        target_value,
+                        self.escape_scoped(target_root),
                         key,
                         0,
                     )?;
-                    let extensible = self.is_extensible_value(stack, context, &target_value)?;
+                    let target_payloads = target_desc.as_ref().map(|desc| match desc.kind {
+                        object::DescriptorKind::Data { value } => {
+                            [Some(self.scoped_value(&scope, value)), None]
+                        }
+                        object::DescriptorKind::Accessor { getter, setter } => [
+                            getter.map(|v| self.scoped_value(&scope, v)),
+                            setter.map(|v| self.scoped_value(&scope, v)),
+                        ],
+                    });
+                    let extensible =
+                        self.is_extensible_value(stack, context, &self.escape_scoped(target_root))?;
+                    if let (Some(desc), Some([first, second])) = (&mut target_desc, target_payloads)
+                    {
+                        desc.kind = match desc.kind {
+                            object::DescriptorKind::Accessor { .. } => {
+                                object::DescriptorKind::Accessor {
+                                    getter: first.map(|v| self.escape_scoped(v)),
+                                    setter: second.map(|v| self.escape_scoped(v)),
+                                }
+                            }
+                            object::DescriptorKind::Data { .. } => object::DescriptorKind::Data {
+                                value: self.escape_scoped(first.expect("data descriptor value")),
+                            },
+                        };
+                    }
+                    let descriptor = current_descriptor(self);
                     // §10.5.6 step 16 — settingConfigFalse is true only
                     // when the descriptor EXPLICITLY carries
                     // [[Configurable]]: false; an absent field never
@@ -261,7 +311,7 @@ impl Interpreter {
                         context,
                         &fallthrough_target,
                         key,
-                        descriptor,
+                        current_descriptor(self),
                     )
                 }
             };

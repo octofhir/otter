@@ -1675,14 +1675,17 @@ impl Interpreter {
                     );
                     targets.iter().copied().collect()
                 }
-                _ => {
-                    self.record_jit_inline_candidate(
-                        fid,
-                        instruction_pc,
-                        tier,
-                        None,
-                        Some(jit_debug::JitInlineRejectionReason::Polymorphic),
-                    );
+                state => {
+                    let reason = match state {
+                        feedback::CallSiteDistribution::Poly(_) => {
+                            jit_debug::JitInlineRejectionReason::Polymorphic
+                        }
+                        feedback::CallSiteDistribution::Megamorphic => {
+                            jit_debug::JitInlineRejectionReason::Megamorphic
+                        }
+                        feedback::CallSiteDistribution::Mono(_) => unreachable!(),
+                    };
+                    self.record_jit_inline_candidate(fid, instruction_pc, tier, None, Some(reason));
                     continue;
                 }
             };

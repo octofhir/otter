@@ -404,3 +404,53 @@ checksum;
         );
     }
 }
+
+#[test]
+fn saturated_forwarding_preserves_live_arguments_and_reports_distinct_feedback() {
+    let source = include_str!("../../otter-difftest/corpus/forward_arguments_saturated.js");
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .jit_debug(JitDebugRequest::events())
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .run_script(SourceInput::from_javascript(source), "forward-saturated.js")
+            .unwrap_or_else(|error| panic!("{selection:?}: {error:?}"));
+        assert_eq!(
+            result.completion_string(),
+            "[314496,135420]",
+            "{selection:?}"
+        );
+        if selection == JitSelection::InterpreterOnly {
+            continue;
+        }
+        let report = result.jit_debug_report().expect("events");
+        let forward_id = report
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                JitDebugEvent::CompilePrepared {
+                    function_id,
+                    function_name,
+                    ..
+                } if function_name == "forward" => Some(*function_id),
+                _ => None,
+            })
+            .expect("compiled forwarding body");
+        assert!(
+            report.events().iter().any(|event| matches!(event,
+                JitDebugEvent::InlineCandidate {
+                    caller_function_id,
+                    bake_rejection: Some(otter_runtime::JitInlineRejectionReason::Megamorphic),
+                    ..
+                } if *caller_function_id == forward_id
+            )),
+            "{selection:?}: saturated ordinary feedback must not be reported as bounded polymorphism"
+        );
+    }
+}

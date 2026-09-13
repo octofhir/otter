@@ -32,6 +32,9 @@
 //!   external anchor drops and the interpreter reaches a native-activation
 //!   retirement epoch before [`JitCodeRegistry::retire_unreferenced`] removes
 //!   it. Safepoint resolution therefore does not apply the entry check.
+//! - Function publication points only into registry-owned generation cells,
+//!   including retained tombstones. Reading the current target never scans
+//!   generation history or consults a second address-to-generation index.
 //! - Generated callers retain only stable function-cell addresses. Publishing a
 //!   new generation never invalidates or recompiles dependent callers.
 //! - Invalidating a generation unlinks its entry cell before executable
@@ -348,15 +351,7 @@ impl JitCodeRegistry {
         &self,
         function: &crate::executable::CodeBlock,
     ) -> Option<JitDirectCallPlan> {
-        let function_entry = self.function_entry_cells.get(&function.id)?;
-        let generation_addr = function_entry.current_generation();
-        if generation_addr == 0 {
-            return None;
-        }
-        let generation = self
-            .entry_cells
-            .values()
-            .find(|cell| std::ptr::from_ref(cell.as_ref()) as u64 == generation_addr)?;
+        let (function_entry, generation) = self.published_function_entry(function.id)?;
         let registered = self.codes.get(&generation.code_object_id)?;
         if registered.state != CodeLifetimeState::Installed
             || !self.dependencies_are_current(&registered.dependencies)
@@ -371,7 +366,7 @@ impl JitCodeRegistry {
         Some(JitDirectCallPlan {
             function_id: function.id,
             code_object_id: generation.code_object_id,
-            entry_cell: std::ptr::from_ref(function_entry.as_ref()) as u64,
+            entry_cell: std::ptr::from_ref(function_entry) as u64,
             tier: registered.code.native_frame_kind(),
             this_mode: if function.is_strict || function.is_arrow {
                 JitDirectCallThisMode::StrictOrLexical
@@ -386,6 +381,27 @@ impl JitCodeRegistry {
             inherited_upvalue_count: function.inherited_upvalue_count,
             needs_incoming_arguments: function.needs_arguments,
         })
+    }
+
+    /// Read the registry-owned publication without scanning generation history.
+    /// The publication itself is the sole authority; no reverse-address index or
+    /// separately cached generation id participates in target selection.
+    fn published_function_entry(
+        &self,
+        function_id: u32,
+    ) -> Option<(&FunctionEntryCell, &CodeEntryCell)> {
+        let function = self.function_entry_cells.get(&function_id)?;
+        let address = function.current_generation();
+        if address == 0 {
+            return None;
+        }
+        // SAFETY: only this registry publishes its boxed CodeEntryCell addresses
+        // into its private function cells. Generation cells, including unlinked
+        // tombstones, are retained for the entire registry lifetime. The single
+        // mutator cannot change publication while this shared borrow is live.
+        let generation = unsafe { &*(address as *const CodeEntryCell) };
+        debug_assert_eq!(generation.native_frame_header.function_id, function_id);
+        Some((function, generation))
     }
 
     /// Re-read one permanent function cell through the registry's cold
@@ -986,7 +1002,16 @@ mod tests {
             parameter_prefix_entry: false,
         });
 
+        assert!(registry.published_function_entry(7).is_none());
         assert!(registry.register_generation(101, baseline, 2, 9));
+        assert_eq!(
+            registry
+                .published_function_entry(7)
+                .unwrap()
+                .1
+                .code_object_id,
+            101
+        );
         assert!(registry.register_generation(201, caller, 2, 12));
         let stable_addr = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
         assert_eq!(
@@ -995,6 +1020,14 @@ mod tests {
         );
 
         assert!(registry.register_generation(102, optimizing, 2, 9));
+        assert_eq!(
+            registry
+                .published_function_entry(7)
+                .unwrap()
+                .1
+                .code_object_id,
+            102
+        );
         assert_eq!(
             std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64,
             stable_addr,
@@ -1012,6 +1045,14 @@ mod tests {
         assert_eq!(optimizing_cell.native_frame_header.register_count, 2);
 
         assert_eq!(registry.invalidate_code_object(102), vec![7]);
+        assert_eq!(
+            registry
+                .published_function_entry(7)
+                .unwrap()
+                .1
+                .code_object_id,
+            101
+        );
         assert_eq!(
             registry.function_entry_cells[&7].current_generation(),
             registry.entry_cell_addr(101).unwrap(),
@@ -1036,6 +1077,21 @@ mod tests {
             registry.function_entry_cells[&7].current_generation(),
             registry.entry_cell_addr(103).unwrap(),
             "refreshing baseline must preserve the independent optimizing generation"
+        );
+        assert_eq!(
+            registry
+                .published_function_entry(7)
+                .unwrap()
+                .1
+                .code_object_id,
+            103
+        );
+        assert_eq!(registry.invalidate_function(7), vec![7]);
+        registry.retire_unreferenced();
+        assert!(registry.published_function_entry(7).is_none());
+        assert!(
+            registry.entry_cell_addr(103).is_some(),
+            "retired cells remain owned tombstones"
         );
     }
 

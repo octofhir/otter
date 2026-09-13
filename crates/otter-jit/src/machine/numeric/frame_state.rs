@@ -64,6 +64,30 @@ pub(super) enum NumericFrameStatePurpose {
 }
 
 pub(super) fn resume_pc(root: &JitCompileSnapshot, function_id: u32, byte_pc: u32) -> Option<u32> {
+    source_snapshot(root, function_id)?
+        .instructions
+        .iter()
+        .position(|instruction| instruction.byte_pc == byte_pc)
+        .and_then(|pc| u32::try_from(pc).ok())
+}
+
+/// Suspended parents store an after-call deopt PC; reentry publishes the call
+/// instruction itself, in both logical-PC and encoded-byte-PC coordinates.
+pub(super) fn suspended_call_pc(
+    root: &JitCompileSnapshot,
+    function_id: u32,
+    after_byte_pc: u32,
+) -> Option<(u32, u32)> {
+    let view = source_snapshot(root, function_id)?;
+    let after = view
+        .instructions
+        .iter()
+        .position(|instruction| instruction.byte_pc == after_byte_pc)?;
+    let call = after.checked_sub(1)?;
+    Some((u32::try_from(call).ok()?, view.instructions[call].byte_pc))
+}
+
+fn source_snapshot(root: &JitCompileSnapshot, function_id: u32) -> Option<&JitCompileSnapshot> {
     let mut pending = vec![root];
     let mut seen = BTreeSet::new();
     while let Some(view) = pending.pop() {
@@ -71,11 +95,7 @@ pub(super) fn resume_pc(root: &JitCompileSnapshot, function_id: u32, byte_pc: u3
             continue;
         }
         if view.code_block.id == function_id {
-            return view
-                .instructions
-                .iter()
-                .position(|instruction| instruction.byte_pc == byte_pc)
-                .and_then(|pc| u32::try_from(pc).ok());
+            return Some(view);
         }
         pending.extend(
             view.inline_callees

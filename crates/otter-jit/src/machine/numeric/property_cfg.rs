@@ -70,7 +70,7 @@ pub(super) fn select_block(
     values: Values,
     receiver: MachineValue,
     machine_values: &[MachineValue],
-    representations: &[MachineRepresentation],
+    representations: &mut Vec<MachineRepresentation>,
     call_descriptors: &mut Vec<CallDescriptor>,
     next_safepoint: &mut u32,
     instructions: &mut Vec<MachineInstruction>,
@@ -118,6 +118,14 @@ pub(super) fn select_block(
                 .ok_or(super::super::VerificationError::OpcodeSignatureMismatch(
                     first,
                 ))?;
+            inline_reentry::select_frames(
+                hir,
+                state_index,
+                machine_values,
+                representations,
+                instructions,
+                &mut call,
+            );
             attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
             attach_safepoint_roots(representations, &mut call);
             instructions.push(call);

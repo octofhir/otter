@@ -98,6 +98,7 @@ mod arm64;
 mod boxed_arithmetic;
 mod frame_state;
 mod hir;
+mod inline_reentry;
 mod inlining;
 mod property_cfg;
 mod semantics;
@@ -235,6 +236,13 @@ pub(crate) fn try_compile(
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
     let machine_safepoints = lower_safepoints(&sequence, &allocation)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR safepoint lowering"))?;
+    inline_reentry::prepare_property_cells(
+        view,
+        &sequence,
+        &machine_safepoints,
+        code_object_id,
+        &mut load_ic_cells,
+    )?;
     let parameter_prefix_entry = machine_safepoints.is_empty()
         && !hir
             .frame_states
@@ -523,7 +531,7 @@ fn select_with_packed_double_view_caches(
                     property_values[&block_index],
                     property_inputs[&block_index],
                     &values,
-                    &representations,
+                    &mut representations,
                     &mut call_descriptors,
                     &mut next_safepoint,
                     &mut instructions,
@@ -6274,7 +6282,7 @@ mod tests {
                 point: NumericFramePoint::Node(point),
                 frames: Box::new([otter_vm::deopt::DeoptFrame {
                     function_id: 93,
-                    byte_pc: byte_pc,
+                    byte_pc,
                     entry: None,
                     slots: (slots
                         .into_iter()
@@ -6341,7 +6349,7 @@ mod tests {
                 point: NumericFramePoint::Node(point),
                 frames: Box::new([otter_vm::deopt::DeoptFrame {
                     function_id: 96,
-                    byte_pc: byte_pc,
+                    byte_pc,
                     entry: None,
                     slots: (slots
                         .into_iter()
@@ -6417,7 +6425,7 @@ mod tests {
                 point: NumericFramePoint::Node(point),
                 frames: Box::new([otter_vm::deopt::DeoptFrame {
                     function_id: 94,
-                    byte_pc: byte_pc,
+                    byte_pc,
                     entry: None,
                     slots: (slots
                         .into_iter()
@@ -6483,7 +6491,7 @@ mod tests {
                 point: NumericFramePoint::Node(point),
                 frames: Box::new([otter_vm::deopt::DeoptFrame {
                     function_id: 95,
-                    byte_pc: byte_pc,
+                    byte_pc,
                     entry: None,
                     slots: (slots
                         .into_iter()
@@ -6501,7 +6509,7 @@ mod tests {
         }
     }
 
-    fn property_selection_hir() -> NumericFunction {
+    pub(super) fn property_selection_hir() -> NumericFunction {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: [

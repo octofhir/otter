@@ -482,54 +482,39 @@ where licensing and determinism permit, established ECMAScript engines.
 
 Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
 
-Current priority: extend real Machine SSA inlining to property/method bodies,
-then contextual construction and allocation elimination. The scalar backend now
-splices bounded plain scalar callees into the caller CFG before selection and
-allocation. Identity/this guards, argument substitution and return joins use the
-same HIR. Inner exits reconstruct the caller after its call and the exact callee
-closure/this at its own byte PC. Final successful compiles report InlineLowered;
-non-scalar, recursive, protected and over-budget candidates remain ordinary calls.
-Five runtime tests prove actual Machine entries, two branching splices, identity
-misses, caller-loop continuation, lexical this and nested deopt without repeated
-effects. They pass with GC stress+verification at1/4/16;141 numeric tests and scoped
-JIT clippy pass. No release build or throughput claim for this bounded slice.
-Property/binding/allocation bodies, methods, nested inlining and protected sites
-are not admitted yet. Named-property cold completion now takes immutable source
-function/PC from the code-owned IC cell; both Template and Machine initialize it.
-The VM service validates that explicit source independently of the published
-native frame. Seven scoped VM tests and11 property runtime tests pass, including
-a foreign-function published frame and local-catch Template completion; VM/JIT
-clippy passes. Machine property operations now also own the prepared shape/slot
-program and source function/logical/byte PC captured by their HIR node. Selection
-checks that source against the innermost frame recipe. The emitter no longer
-looks up property proofs in the root snapshot or source PC in the root deopt
-frame. Two distinct snapshots with equal function id/PC retain separate programs.
-143 numeric tests,16 runtime property/scalar-inline tests and scoped JIT clippy
-pass. Named loads now have explicit Machine probe/hit/cold/status/join CFG.
-The probe has no call or safepoint; its stable IC-address SSA output reaches the
-same VM-declared committed pair boundary. The allocator sees the cold call and
-all moving roots. Local catches receive its pure Throw payload through a split
-SSA edge, without deopt or repeated getter effects.144 numeric tests,16 runtime
-tests,23 existing committed-contract tests and scoped JIT clippy pass (overlap;
-do not sum). Four generic-property tests also pass at GC stress+verify1/4/16
-using the same binary. No release build or timing.
+Current priority: method and nested-body SSA inlining, then contextual
+construction and allocation elimination. The backend now splices bounded
+monomorphic plain scalar and named-load callees into the caller CFG before
+selection and allocation. Each body uses its own snapshot and source-owned
+property programs. Identity/this guards, argument substitution, return joins and
+complete caller/callee frame recipes stay in the single HIR.
 
-The VM cold boundary now has scoped inline activation publication. Boxed
-DeoptFrame<Value> recipes publish descendants through the existing NativeFrame
-inventory, preserving the caller and returning without interpreter execution.
-The scope validates source PCs, exact closure identity, capture layout and entry
-bounds before effects; moving roots, this/SELF, nested publication, error stacks
-and unwind cleanup use the existing owners. Three focused VM tests pass, also
-at GC stress+verify1/4/16 on one binary; scoped VM clippy passes. This boundary
-is not yet called by generated property cold sites. No additional support for
-obsolete Function.caller/arguments properties or compatibility layer is added.
+Named reads expose probe/hit/cold/status/join CFG before allocation. Inline cold
+calls box descendant register/this/closure operands and retain them as explicit
+TaggedRoot uses. The code-owned IC cell stores only immutable source identity
+and generation/safepoint-bound root-index recipes. The fixed property boundary
+reads current roots, temporarily publishes canonical callee NativeFrames and
+normalizes a pure exception before removing them. It returns to the same
+Machine body on success; neither caller nor callee bytecode is replayed. The
+caller PC points to the original call, and callee positions remain source-owned.
+Recipe memory participates in retained-code accounting. Body arithmetic exits
+still reconstruct the caller after its call and the callee after prior effects.
 
-Next: attach boxed inline frame operands to Machine property cold safepoints,
-resolve their allocator root homes into code-owned recipes, and call the scoped
-boundary while normalizing the committed exception. Publish the outer caller's
-call PC, not the callee's source PC. Then admit source-owned dot-like property
-callees and prove their emitted body and effect-once getter/throw behavior.
-Named-store cold CFG, method splices and temporary-object elimination remain open.
+Evidence:145 numeric tests;18 runtime tests across property and scalar-inline
+paths;18 focused inline/metadata tests overlap and must not be summed. New
+runtime cases prove six dot-product field loads in the caller, no native callee
+call descriptor, actual optimizing entries, getter success/throw once, exact
+stack source lines, a late numeric deopt without repeated earlier reads, and
+arrow lexical this/closure across GC. The two new runtime cases pass with GC
+stress+verify1/4/16 using one binary. No release build or throughput claim.
+
+Still open: method-body guards/splicing, nested helpers, protected inline sites,
+explicit named-store cold CFG, binding/allocation bodies, and richer entry
+recipes for fresh captures/arguments. The next step is the method/nested object
+arithmetic chain, followed by caller-specific construction and eliminating
+non-escaping temporary objects. No obsolete Function.caller/arguments expansion
+or compatibility layer belongs in this work.
+
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not
 addressed by repeatedly chasing1–2% local changes. The current boxed-arithmetic

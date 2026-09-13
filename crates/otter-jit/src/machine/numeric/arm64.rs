@@ -896,6 +896,7 @@ fn emit_committed_runtime_call(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_committed_pair_call(
+    view: &JitCompileSnapshot,
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
@@ -918,7 +919,13 @@ fn emit_committed_pair_call(
             "scalar committed pair runtime target",
         ));
     };
-    let logical_pc = *logical_pc;
+    let logical_pc = if let Some(parent) = instruction.inline_frames.first() {
+        super::frame_state::suspended_call_pc(view, parent.function_id, parent.byte_pc)
+            .ok_or(Unsupported::OperandShape("inline caller publication PC"))?
+            .0
+    } else {
+        *logical_pc
+    };
     let byte_pc = *byte_pc;
     let semantic_arity = usize::from(*semantic_arity);
     let named_load = *target == STUB_JIT_LOAD_PROPERTY;
@@ -3348,6 +3355,7 @@ pub(super) fn emit(
                     if is_explicit_committed_runtime_call(descriptor) {
                         let start = ops.offset().0;
                         let byte_pc = emit_committed_pair_call(
+                            view,
                             &mut ops,
                             &mut relocations,
                             transitions,

@@ -1502,6 +1502,26 @@ impl JitCompileSnapshot {
             .arith_feedback = feedback;
     }
 
+    /// Set compiler-owned argument mapping in a backend-test snapshot.
+    #[doc(hidden)]
+    pub fn seed_argument_bindings_for_test(
+        &mut self,
+        kind: otter_bytecode::ArgumentsObjectKind,
+        bindings: &[(u16, otter_bytecode::ArgumentBindingStorage)],
+    ) {
+        let code = std::sync::Arc::make_mut(&mut self.code_block);
+        code.arguments_object_kind = kind;
+        code.mapped_argument_bindings = bindings
+            .iter()
+            .map(
+                |&(argument_index, storage)| crate::executable::ExecMappedArgumentBinding {
+                    argument_index,
+                    storage,
+                },
+            )
+            .collect();
+    }
+
     /// Mark one backend-test call site as previously attempted.
     ///
     /// Production snapshots obtain this fact from their owning CodeBlock's

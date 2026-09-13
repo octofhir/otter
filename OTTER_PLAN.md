@@ -666,6 +666,15 @@ frame/registry, full gate, bisect or new other-engine benchmark baseline.
 The authoritative handoff is `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`;
 superseded history stays in `scratchpad/JIT_LANE_HISTORY_2026_09_13.md`.
 
+Machine forwarding preparation now preserves implicit mapped-register inputs in
+instruction liveness, including destination aliasing, using the CodeBlock's exact
+argument/storage map. A focused mapped/unmapped/captured unit and scoped VM/JIT
+clippy pass. HIR admission remains closed until those values are explicit call
+operands and roots, the dynamic frame uses stable caller-home addressing after
+capture GC, and the committed cold sibling returns a pure exception value.
+Evidence: `benchmarks/results/s2-20260913-machine-forward-liveness/README.md`.
+No release or benchmark was repeated for this prerequisite.
+
 The intended replacement path remains:
 
 ```text

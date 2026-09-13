@@ -534,6 +534,19 @@ fresh captures/arguments. Next is caller-specific construction and eliminating
 non-escaping temporary objects across the expanded helper graph. No obsolete Function.caller/arguments expansion
 or compatibility layer belongs in this work.
 
+
+A2 admission audit on42d706ff uses the real Class.create-style
+initialize.apply(this, arguments) constructor shape. A20000-call producer/dot
+probe returns1320000; consume has one remaining Direct call and dot is actually
+inlined. multiplyScalar is rejected earlier than allocation at its global
+Vector Binding read (bytePC0, target=None). First implement source-owned binding
+cold reentry: consolidate inline frame recipes into existing code/safepoint
+ownership, then use the current fixed boxed binding ABI and exact callee frame.
+Do not whitelist bindings against the outer frame or add a parallel decoder.
+Next expose contextual construct/initializer fields; virtual-object deopt
+materialization remains absent and must precede an elimination claim.
+Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.
+
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not
 addressed by repeatedly chasing1–2% local changes. The current boxed-arithmetic

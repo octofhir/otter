@@ -470,7 +470,7 @@ fn emit_runtime_stub(
 /// No allocation or safepoint occurs between reading the compressed root slot
 /// and publishing it in the callee frame. A later moving collection rewrites
 /// the published `NativeFrame::this_value` slot in place.
-fn emit_load_sloppy_global_this(
+pub(super) fn emit_load_sloppy_global_this(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,

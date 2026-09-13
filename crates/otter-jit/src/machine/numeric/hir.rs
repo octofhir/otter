@@ -7,7 +7,7 @@
 //! - [`NumericNode`] — tagged/scalar parameters, constants, the schema-owned
 //!   binding family, guarded coercions, ordinary properties,
 //!   indexed elements, arithmetic, comparison, typed array construction, and
-//!   typed plain/method/forwarded calls.
+//!   typed plain/method/forwarded calls and frameless scalar-inline guards.
 //! - Forwarding carries method, callee, receiver and mapped register values as
 //!   explicit SSA operands; captured aliases remain live activation cells.
 //! - [`NumericPackedDoubleViewCachePlan`] — bounded natural-loop sharing of
@@ -168,6 +168,12 @@ pub(super) enum NumericNode {
     TaggedToInt32(NumericValue),
     This,
     ClassSuperConstructor(NumericValue),
+    InlineCallGuard {
+        source: NumericValue,
+        function_id: u32,
+        this_mode: otter_vm::JitDirectCallThisMode,
+    },
+    BoxTagged(NumericValue),
     Binding {
         semantics: BindingSemantics,
         inputs: [Option<NumericValue>; 2],
@@ -529,6 +535,8 @@ impl NumericNode {
     pub(super) const fn value_type(self) -> NumericType {
         match self {
             Self::TaggedConstant(..)
+            | Self::InlineCallGuard { .. }
+            | Self::BoxTagged(..)
             | Self::This
             | Self::ClassSuperConstructor(..)
             | Self::Binding { .. }
@@ -624,6 +632,7 @@ impl NumericNode {
                 Some(NumericFrameStatePurpose::RuntimeMetadata)
             }
             Self::ColdCallExit { .. }
+            | Self::InlineCallGuard { .. }
             | Self::TaggedToNumber(..)
             | Self::TaggedToInt32(..)
             | Self::ClassSuperConstructor(..)

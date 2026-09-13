@@ -22,6 +22,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod direct_call;
+pub(crate) mod inline_guard;
 mod method_guard;
 
 /// Backedges between shared interrupt/fuel-cell probes in generated code.

@@ -482,17 +482,20 @@ where licensing and determinism permit, established ECMAScript engines.
 
 Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
 
-Current priority: actual Machine SSA inlining, then contextual construction and
-allocation elimination. The active scalar backend currently compiles one function
-at a time and does not splice the VM's prepared inline candidates. Machine
-deopt lowering now accepts the VM-owned frame chain, including exact this and
-closure recipes; verification covers nested entries and caller destinations.
-Runtime materialization supports both native entry modes, and artifacts expose
-entry recipes. HIR frame-state liveness and Machine selection now propagate
-complete chains, including activation-only closure values; each resume PC uses
-its owning function's bytecode. Production HIR still builds one function:
-candidate preparation and compilation admission are not optimizing inlining.
-Connect per-site callee ownership and CFG through the one HIR/allocator/emitter next.
+Current priority: extend real Machine SSA inlining to property/method bodies,
+then contextual construction and allocation elimination. The scalar backend now
+splices bounded plain scalar callees into the caller CFG before selection and
+allocation. Identity/this guards, argument substitution and return joins use the
+same HIR. Inner exits reconstruct the caller after its call and the exact callee
+closure/this at its own byte PC. Final successful compiles report InlineLowered;
+non-scalar, recursive, protected and over-budget candidates remain ordinary calls.
+Five runtime tests prove actual Machine entries, two branching splices, identity
+misses, caller-loop continuation, lexical this and nested deopt without repeated
+effects. They pass with GC stress+verification at1/4/16;141 numeric tests and scoped
+JIT clippy pass. No release build or throughput claim for this bounded slice.
+Property/binding/allocation bodies, methods, nested inlining and protected sites
+are not admitted yet. Next: operation ownership for source-dependent callee facts,
+then dot-like property helpers and complete temporary-object arithmetic chains.
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not
 addressed by repeatedly chasing1–2% local changes. The current boxed-arithmetic

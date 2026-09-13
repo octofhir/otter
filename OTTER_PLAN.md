@@ -482,8 +482,8 @@ where licensing and determinism permit, established ECMAScript engines.
 
 Autonomous execution follows `scratchpad/PLAN_JIT_HANDOFF_2026_09_12.md`.
 
-Current priority: nested-body SSA inlining, then contextual
-construction and allocation elimination. The backend now splices bounded
+Current priority: contextual construction and allocation elimination across
+inlined object arithmetic. The backend now splices bounded
 monomorphic plain/method scalar and named-load callees into the caller CFG before
 selection and allocation. Each body uses its own snapshot and source-owned
 property programs. Identity/this guards, argument substitution, return joins and
@@ -517,11 +517,21 @@ replacement, getter lookup once, prototype replacement and bound-arrow fallback.
 Both tests pass at GC stress1/4/16;9 inline runtime cases and145 numeric cases
 pass. This is structural coverage, not a measured RayTrace speedup.
 
-Still open: nested helpers, protected inline sites,
-explicit named-store cold CFG, binding/allocation bodies, and richer entry
-recipes for fresh captures/arguments. The next step is the nested object
-arithmetic chain, followed by caller-specific construction and eliminating
-non-escaping temporary objects. No obsolete Function.caller/arguments expansion
+Bounded mixed helper chains now splice recursively. Every body owns its nested
+plain/method snapshots; the duplicate nested-method table is removed. One VM
+preparation budget admits at most64 bodies and3 callee levels, rejecting
+recursive ancestry. Machine keeps its source-body and total-growth limits,
+remaps nested method-target indices and each descendant this/closure independently,
+and publishes descendant diagnostics only when the enclosing splice succeeds.
+The caller → wrapper → forward → dot test has no internal native-call descriptor.
+Cold reentry preserves four source frames; arithmetic exits reconstruct all four.
+An inner method identity miss reconstructs three suspended frames without
+repeating an earlier getter in forward. Eleven inline runtime tests pass.
+
+Still open: protected inline sites, explicit named-store cold CFG,
+binding/allocation bodies, residual-call inlining and richer entry recipes for
+fresh captures/arguments. Next is caller-specific construction and eliminating
+non-escaping temporary objects across the expanded helper graph. No obsolete Function.caller/arguments expansion
 or compatibility layer belongs in this work.
 
 The handoff's structural A1–A3 order supersedes the chronological next steps below.

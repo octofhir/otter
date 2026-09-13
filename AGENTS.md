@@ -538,7 +538,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `machineInlineMethodGuard` reuses the shared receiver/prototype/slot proof,
     returns the current callable and rejects bound-this/runtime-setup/eval-env
     closures before effects. Its receiver supplies the inlined this value.
-    Nested body splicing remains unfinished. Loop-invariant global-object reads and
+    Bounded nested plain/method bodies share the snapshot tree and remap every
+    descendant this/closure, property source and method guard into the caller.
+    Source bodies remain bounded; recursive ancestry and residual unsupported
+    calls decline the enclosing splice. Loop-invariant global-object reads and
     method guards keep their full proofs on the first iteration and use
     independent native-stack caches on later iterations. A cached global slot
     makes its loaded builtin namespace receiver activation-invariant; other

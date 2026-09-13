@@ -8,6 +8,7 @@
 //! - Bounded call-graph tiering for hot observed callees that need an entry
 //!   generation before the caller's stable direct-link snapshot is sealed.
 //! - Call/method target profiling and reoptimization eviction.
+//! - Plain and method candidate snapshots share one bounded ancestry tree.
 //! - Cross-script recompilation resolves the defining code owner before baking.
 //!
 //! # Invariants
@@ -23,6 +24,10 @@
 //! compiling an unbounded observed call graph.
 #![allow(unused_imports)]
 use crate::*;
+
+#[path = "inline_snapshot_budget.rs"]
+mod inline_snapshot_budget;
+use inline_snapshot_budget::InlineSnapshotBudget;
 
 const EAGER_DIRECT_TARGET_DEPTH: u8 = 2;
 
@@ -1557,27 +1562,35 @@ impl Interpreter {
     /// cells, hidden classes and call plans against *itself*, exactly as it
     /// would as an outermost function: a spliced instruction that read the
     /// caller's tables would find nothing to fold against and could only lower
-    /// as an exit. Only the inline-candidate tables stop here — which of this
-    /// body's own calls get spliced is decided by the frame that splices it.
-    pub(crate) fn bake_inline_body(
+    /// as an exit. Nested candidates share the root preparation budget and use
+    /// this body's own feedback; the compiler decides which bodies to splice.
+    fn bake_inline_body(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         tier: jit_debug::JitDebugTier,
+        budget: &mut InlineSnapshotBudget,
     ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
-        self.prewarm_string_constant_cells(context, fid)?;
-        let mut body = context.jit_compile_snapshot(fid)?;
-        self.publish_property_feedback_for_view(&body);
-        Self::bake_typed_array_layout(&mut body);
-        Self::bake_string_layout(&mut body);
-        self.bake_string_constant_cells(&mut body, context, fid)?;
-        self.bake_global_lexical_loads(&mut body, context, fid);
-        self.bake_call_site_plans(&mut body, context, fid, tier, 0, false);
-        self.bake_guarded_method_calls(&mut body);
-        self.bake_element_accesses(&mut body);
-        self.bake_property_loads(&mut body);
-        self.bake_optimized_exit_profile(&mut body, fid);
-        Some(std::sync::Arc::new(body))
+        if !budget.enter(fid) {
+            return None;
+        }
+        let result = (|| {
+            self.prewarm_string_constant_cells(context, fid)?;
+            let mut body = context.jit_compile_snapshot(fid)?;
+            self.publish_property_feedback_for_view(&body);
+            Self::bake_typed_array_layout(&mut body);
+            Self::bake_string_layout(&mut body);
+            self.bake_string_constant_cells(&mut body, context, fid)?;
+            self.bake_global_lexical_loads(&mut body, context, fid);
+            self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
+            self.bake_guarded_method_calls(&mut body);
+            self.bake_element_accesses(&mut body);
+            self.bake_property_loads(&mut body);
+            self.bake_optimized_exit_profile(&mut body, fid);
+            Some(std::sync::Arc::new(body))
+        })();
+        budget.leave();
+        result
     }
 
     /// Bake the logical PCs at which earlier optimized generations of `fid`
@@ -1620,15 +1633,16 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         eager_direct_target_depth: u8,
     ) {
-        self.bake_call_site_plans(view, context, fid, tier, eager_direct_target_depth, true);
+        self.bake_call_site_plans(
+            view, context, fid, tier, eager_direct_target_depth,
+            &mut InlineSnapshotBudget::new(fid),
+        );
     }
 
     /// Call-site plan baking shared by an outermost body and a spliced one.
     ///
-    /// `splice_candidates` decides whether the inline-candidate tables are
-    /// filled. A body being baked *as* a candidate leaves them empty: its own
-    /// call sites are described by direct-call and static-native plans, and the
-    /// splicing frame owns every further splice decision.
+    /// Every body owns its nested candidate tables. One ancestry/depth/work
+    /// budget bounds the whole tree independently of generated-entry tiering.
     fn bake_call_site_plans(
         &mut self,
         view: &mut jit::JitCompileSnapshot,
@@ -1636,7 +1650,7 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
         eager_direct_target_depth: u8,
-        splice_candidates: bool,
+        budget: &mut InlineSnapshotBudget,
     ) {
         let mut pending_direct_targets = rustc_hash::FxHashSet::default();
         let call_sites: Vec<_> = view
@@ -1863,10 +1877,10 @@ impl Interpreter {
                 if is_construct || op == Op::CallSpread {
                     continue;
                 }
-                if !splice_candidates || inline_ineligible || target_count != 1 {
+                if inline_ineligible || target_count != 1 {
                     continue;
                 }
-                let Some(body) = self.bake_inline_body(context, callee_fid, tier) else {
+                let Some(body) = self.bake_inline_body(context, callee_fid, tier, budget) else {
                     self.record_jit_inline_candidate(
                         fid,
                         instruction_pc,
@@ -2003,12 +2017,9 @@ impl Interpreter {
                 view.direct_methods
                     .insert(snap.call_byte_pc, direct_methods);
             }
-            if !splice_candidates {
-                continue;
-            }
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
-                if let Some(method) = self.bake_one_inline_method(context, target, tier) {
+                if let Some(method) = self.bake_one_inline_method(context, target, tier, budget) {
                     baked.push(method);
                 }
             }
@@ -2178,27 +2189,12 @@ impl Interpreter {
     /// is ineligible (generator/async/derived-constructor/etc.), its view is
     /// missing, or any body property fails to resolve to a sealed receiver slot.
     /// Shared by the monomorphic and polymorphic method-inline bake paths.
-    pub(crate) fn bake_one_inline_method(
+    fn bake_one_inline_method(
         &mut self,
         context: &ExecutionContext,
         target: &PolyMethodTarget,
         tier: jit_debug::JitDebugTier,
-    ) -> Option<jit::JitInlineMethod> {
-        self.bake_inline_method_rec(context, target, tier, 0)
-    }
-
-    /// Recursion bound for nested method-body inlining. A method whose tail is a
-    /// call splices that callee's body; the callee may in turn call, so the bake
-    /// recurses down the monomorphic call chain to this depth (richards is
-    /// `run → task.run → scheduler.X`). Deeper calls side-exit if reached.
-    const MAX_INLINE_METHOD_DEPTH: u32 = 3;
-
-    pub(crate) fn bake_inline_method_rec(
-        &mut self,
-        context: &ExecutionContext,
-        target: &PolyMethodTarget,
-        tier: jit_debug::JitDebugTier,
-        depth: u32,
+        budget: &mut InlineSnapshotBudget,
     ) -> Option<jit::JitInlineMethod> {
         let method = context.exec_function(target.method_fid)?;
         if method.is_generator
@@ -2212,7 +2208,7 @@ impl Interpreter {
         {
             return None;
         }
-        let method_view = self.bake_inline_body(context, target.method_fid, tier)?;
+        let method_view = self.bake_inline_body(context, target.method_fid, tier, budget)?;
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
         // byte offset; bail out if any property is absent, an accessor, or spills
         // past the inline value capacity. A receiver property resolves against
@@ -2253,56 +2249,12 @@ impl Interpreter {
             prop_offsets.insert(instr.byte_pc, value_byte);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }
-        // Recursively bake the body's monomorphic nested method calls so the
-        // inliner can splice their bodies. Only `Mono` sites recurse;
-        // polymorphic/megamorphic internal calls stay uninlined.
-        // Collect targets first — the recursion needs `&mut self`, which cannot
-        // overlap the feedback-map borrow.
-        let mut nested_targets: Vec<(u32, PolyMethodTarget)> = Vec::new();
-        if depth < Self::MAX_INLINE_METHOD_DEPTH {
-            for instr in &method_view.instructions {
-                if instr.op(&method_view.code_block) != Op::CallMethodValue {
-                    continue;
-                }
-                let Some(site) = instr.property_ic_site(&method_view.code_block) else {
-                    continue;
-                };
-                if let Some(MethodCallFeedback::Mono {
-                    method_fid,
-                    recv_shape,
-                    proto_chain,
-                    method_value_byte,
-                }) = self.method_target_feedback(site)
-                {
-                    nested_targets.push((
-                        instr.byte_pc,
-                        PolyMethodTarget {
-                            method_fid,
-                            recv_shape,
-                            proto_chain,
-                            method_value_byte,
-                            hits: 1,
-                        },
-                    ));
-                }
-            }
-        }
-        let mut nested_methods: rustc_hash::FxHashMap<u32, jit::JitInlineMethod> =
-            rustc_hash::FxHashMap::default();
-        for (pc, nested_target) in nested_targets {
-            if let Some(nested) =
-                self.bake_inline_method_rec(context, &nested_target, tier, depth + 1)
-            {
-                nested_methods.insert(pc, nested);
-            }
-        }
         let guard = self.bake_method_guard(target)?;
         Some(jit::JitInlineMethod {
             body: method_view,
             guard,
             prop_offsets,
             prop_shapes,
-            nested_methods,
         })
     }
 }

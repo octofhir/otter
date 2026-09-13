@@ -5,14 +5,17 @@
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
-//! - Scalar and named-load bodies are admitted. Binding, allocation and
-//!   JavaScript-call operations retain ordinary call linkage. Named-load cold
+//! - Scalar and named-load bodies, including bounded fully spliced helper
+//!   chains, are admitted. Binding, allocation and residual JavaScript calls
+//!   retain ordinary call linkage. Named-load cold
 //!   calls publish exact inline frames without replaying completed effects.
 //! - Identity and parameter guards precede callee effects; body exits rebuild
 //!   the caller after its call and the callee at its exact source instruction.
 //! - Caller CFG order and backedge identities survive insertion. Callee loops
 //!   and protected caller sites require further CFG admission and stay calls.
-//! - A rejected candidate cannot partially mutate the caller graph.
+//! - A rejected candidate cannot partially mutate the caller graph or publish
+//!   successful descendant diagnostics. Descendant entry operands and method
+//!   target indices are remapped into the caller alongside ordinary SSA values.
 //!
 //! # See also
 //! - `frame_state` — shared frame recipes and complete late-use liveness.
@@ -34,6 +37,20 @@ pub(super) fn splice(
     function: &mut NumericFunction,
     view: &JitCompileSnapshot,
     capture_events: bool,
+) -> Vec<otter_vm::JitCompilerDiagnostic> {
+    splice_tree(
+        function,
+        view,
+        capture_events,
+        &mut vec![view.code_block.id],
+    )
+}
+
+fn splice_tree(
+    function: &mut NumericFunction,
+    view: &JitCompileSnapshot,
+    capture_events: bool,
+    ancestry: &mut Vec<u32>,
 ) -> Vec<otter_vm::JitCompilerDiagnostic> {
     let original_nodes = function.nodes.len();
     let mut diagnostics = Vec::new();
@@ -60,6 +77,7 @@ pub(super) fn splice(
             continue;
         };
         let mut cost = 0;
+        let mut nested_diagnostics = Vec::new();
         let outcome = (|| -> Result<(), String> {
             let target = function
                 .direct_call_targets
@@ -71,18 +89,21 @@ pub(super) fn splice(
             if target.candidates.len() != 1 {
                 return Err("requires one call target".into());
             }
-            if candidate.code_block.id == view.code_block.id {
-                return Err("recursive callee".into());
+            if ancestry.contains(&candidate.code_block.id) || ancestry.len() > 3 {
+                return Err("inline ancestry/depth budget".into());
             }
             if candidate.code_block.id != target.candidates[0].callee.plan.function_id {
                 return Err("callee snapshot disagrees with target".into());
             }
-            let body = NumericFunction::build(candidate)
+            let mut body = NumericFunction::build(candidate)
                 .map_err(|reason| format!("callee HIR: {reason:?}"))?;
-            cost = body.nodes.len() + 2 * usize::from(body.parameter_count) + 1;
             if body.nodes.len() > MAX_INLINE_NODES || body.blocks.len() > 8 {
-                return Err("scalar body budget".into());
+                return Err("source body budget".into());
             }
+            ancestry.push(candidate.code_block.id);
+            nested_diagnostics = splice_tree(&mut body, candidate, capture_events, ancestry);
+            ancestry.pop();
+            cost = body.nodes.len() + 2 * usize::from(body.parameter_count) + 1;
             if function.nodes.len() - original_nodes + cost > MAX_ADDED_NODES {
                 return Err("caller growth budget".into());
             }
@@ -123,12 +144,15 @@ pub(super) fn splice(
             Ok(())
         })();
         if capture_events {
+            if outcome.is_ok() {
+                diagnostics.extend(nested_diagnostics);
+            }
             diagnostics.push(otter_vm::JitCompilerDiagnostic::InlineLowered {
                 parent_function_id: view.code_block.id,
                 instruction_pc: logical_pc,
                 byte_pc,
                 callee_function_id: candidate.code_block.id,
-                depth: 1,
+                depth: ancestry.len() as u32,
                 cost: cost as u32,
                 outcome: match outcome {
                     Ok(()) => otter_vm::JitInlineLoweringOutcome::Inlined,
@@ -294,10 +318,23 @@ fn splice_one(
             }
         }
     }
+    let target_base = u16::try_from(hir.direct_call_targets.len()).ok()?;
+    u16::try_from(
+        hir.direct_call_targets
+            .len()
+            .checked_add(body.direct_call_targets.len())?,
+    )
+    .ok()?;
+    hir.direct_call_targets
+        .extend(body.direct_call_targets.iter().cloned());
     let map = |value: NumericValue| mapping[value.0];
     for (index, &node) in body.nodes.iter().enumerate() {
         if !matches!(node, NumericNode::Parameter { .. } | NumericNode::This) {
-            hir.nodes[mapping[index].0] = map_body_node(node, &map)?;
+            let mut mapped = map_body_node(node, &map)?;
+            if let NumericNode::InlineMethodGuard { target, .. } = &mut mapped {
+                *target = target.checked_add(target_base)?;
+            }
+            hir.nodes[mapping[index].0] = mapped;
         }
     }
     for (node, site) in &body.property_sites {
@@ -314,9 +351,21 @@ fn splice_one(
             continue;
         }
         let mut frames = parents.clone();
-        for original in state.frames.iter() {
+        for (index, original) in state.frames.iter().enumerate() {
             let mut frame = original.clone();
-            frame.entry = Some(entry);
+            if index == 0 {
+                if frame.entry.is_some() {
+                    return None;
+                }
+                frame.entry = Some(entry);
+            } else {
+                let nested = frame.entry.as_mut()?;
+                for slot in [&mut nested.this, &mut nested.closure] {
+                    if let NumericFrameSlot::Value(value) = slot {
+                        *value = map(*value);
+                    }
+                }
+            }
             for slot in frame.slots.iter_mut() {
                 if let NumericFrameSlot::Value(value) = slot {
                     *value = map(*value);
@@ -440,6 +489,19 @@ fn map_body_node(
 ) -> Option<NumericNode> {
     use NumericNode::*;
     Some(match node {
+        InlineCallGuard {
+            source,
+            function_id,
+            this_mode,
+        } => InlineCallGuard {
+            source: map(source),
+            function_id,
+            this_mode,
+        },
+        InlineMethodGuard { source, target } => InlineMethodGuard {
+            source: map(source),
+            target,
+        },
         PropertyLoad {
             receiver,
             byte_pc,

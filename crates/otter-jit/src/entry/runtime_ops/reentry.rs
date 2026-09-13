@@ -771,8 +771,7 @@ pub(crate) extern "C" fn jit_structural_op_stub(
     }
 }
 
-/// Complete one allocating-construction opcode (`CollectRest`, `NewError`,
-/// `NewBuiltinError`, `ArrayPush`). Returns committed `Success`, pre-effect
+/// Complete one allocating-construction opcode (`CollectRest`, `ArrayPush`). Returns committed `Success`, pre-effect
 /// `SideExit`, or parked `Throw`.
 pub(crate) extern "C" fn jit_construct_op_stub(
     ctx: *mut JitCtx,

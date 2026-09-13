@@ -474,9 +474,8 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
-    /// Complete one allocating-construction opcode (`CollectRest`, `NewError`,
-    /// `NewBuiltinError`, `ArrayPush`) through the shared reentrant construction
-    /// transition. `arg0`/`arg1`/`arg2` name the destination plus source/value
+    /// Complete an allocating-construction opcode such as `CollectRest` or
+    /// `ArrayPush` through the shared reentrant construction transition. `arg0`/`arg1`/`arg2` name the destination plus source/value
     /// registers or a constant kind index.
     ConstructOp {
         opcode: u8,
@@ -1331,8 +1330,7 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::NewError
-                | Op::ArrayPush
+                Op::ArrayPush
                 | Op::NewWeakRef
                 | Op::NewFinalizationRegistry
                 | Op::PromiseFulfilledOf => {
@@ -1344,7 +1342,7 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::NewBuiltinError | Op::NewCollection => {
+                Op::NewCollection => {
                     let operands = lowered.global_store_operands()?;
                     TemplateOp::ConstructOp {
                         opcode: lowered.op as u8,
@@ -1444,6 +1442,26 @@ impl TemplatePlan {
                         packed_head: u64::from(operands.dst) | ((arguments.len() as u64) << 16),
                         method: u64::from(operands.method),
                         packed_args: pack_register_lanes(arguments),
+                    }
+                }
+                Op::NewError => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ScalarValue {
+                        operation: ScalarValueOp::NewError,
+                        result: operands.dst,
+                        value0: Some(operands.src),
+                        value1: None,
+                    }
+                }
+                Op::NewBuiltinError => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::ScalarValue {
+                        operation: ScalarValueOp::NewBuiltinError,
+                        result: operands.value,
+                        value0: Some(u16::try_from(operands.extra).map_err(|_| {
+                            Unsupported::OperandShape("native error message register")
+                        })?),
+                        value1: None,
                     }
                 }
                 Op::BindThisValue => {

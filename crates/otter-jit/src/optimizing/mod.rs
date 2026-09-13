@@ -335,7 +335,12 @@ mod tests {
     #[test]
     fn machine_only_optimizer_refuses_out_of_subset_on_every_host() {
         let instructions = vec![
-            JitTestInstruction::new(Op::Throw, 0, 11, vec![Operand::Register(0)]),
+            JitTestInstruction::new(
+                Op::NewWeakRef,
+                0,
+                11,
+                vec![Operand::Register(1), Operand::Register(0)],
+            ),
             JitTestInstruction::new(Op::ReturnValue, 1, 29, vec![Operand::Register(1)]),
         ];
         let view = JitCompileSnapshot::without_feedback(17, 1, 2, instructions);
@@ -346,7 +351,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(super::Unsupported::Constraint {
-                op: Op::Throw,
+                op: Op::NewWeakRef,
                 constraint: "opcode outside the Machine HIR",
             })
         ));

@@ -83,6 +83,7 @@ mod cpu_profile;
 pub mod date;
 mod element_feedback;
 mod eval_env;
+mod native_stack_snapshot;
 mod stack_snapshot;
 // `date` is a directory module — see `date/mod.rs`.
 mod activation_stack;
@@ -1042,9 +1043,9 @@ pub struct Interpreter {
     sync_reentry_depth: u32,
     /// Published compiler-generated frames temporarily mirrored by cold
     /// interpreter materialization. Logical-depth reads subtract this transfer
-    /// count from the canonical native-activation scan so a deoptimized frame
-    /// is never counted twice.
-    jit_materialized_generated_call_depth: u32,
+    /// count from the canonical native-activation scan. Each (native address,
+    /// materialized index) also identifies the same frame during stack capture.
+    jit_materialized_generated_calls: Vec<(usize, usize)>,
     /// Whether synchronous `Atomics.wait` may block this isolate's host thread.
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed

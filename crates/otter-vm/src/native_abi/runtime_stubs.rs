@@ -1045,8 +1045,7 @@ pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
-/// Completes allocating construction opcodes (`CollectRest`, `NewError`,
-/// `NewBuiltinError`, `ArrayPush`) through the VM's construction helpers.
+/// Completes allocating construction opcodes (`CollectRest`, `ArrayPush`) through the VM's construction helpers.
 pub const STUB_JIT_CONSTRUCT_OP: RuntimeStubDescriptor = descriptor(
     47,
     RuntimeStubClass::Reentrant,

@@ -327,18 +327,21 @@ impl Interpreter {
     /// Temporarily transfer the current generated frame into interpreter
     /// ownership while `operation` runs.
     ///
-    /// Native publication remains intact for GC; only logical-depth ownership
-    /// is transferred and restored around the cold operation.
-    pub(crate) fn with_materialized_generated_call_depth<T>(
+    /// Native publication remains intact for GC. Exact frame identity transfers
+    /// logical-depth and diagnostic ownership around the cold operation.
+    pub(crate) fn with_materialized_native_frame<T>(
         &mut self,
+        native_address: usize,
+        materialized_index: usize,
         operation: impl FnOnce(&mut Self) -> T,
     ) -> Result<T, VmError> {
         if self.jit_generated_call_depth() == 0 {
             return Err(VmError::InvalidOperand);
         }
-        self.jit_materialized_generated_call_depth += 1;
+        self.jit_materialized_generated_calls
+            .push((native_address, materialized_index));
         let result = operation(self);
-        self.jit_materialized_generated_call_depth -= 1;
+        self.jit_materialized_generated_calls.pop();
         Ok(result)
     }
 

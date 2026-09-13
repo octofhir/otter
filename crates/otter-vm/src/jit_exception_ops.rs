@@ -30,7 +30,7 @@ use crate::{
     ExecutionContext, Frame, Interpreter, TryHandler, Value, VmError,
     activation_stack::ActivationStack,
     cold_frame::{AbruptFrameOutcome, AbruptKind, ParkedFinally},
-    read_register, snapshot_frames,
+    snapshot_frames,
 };
 
 /// Result of a committed exception-region operation in compiled code.
@@ -145,10 +145,6 @@ impl Interpreter {
                 AbruptKind::Jump(arg0 as u32),
                 arg1 as u32,
             ),
-            value if value == Op::Throw as u8 => {
-                let value = *read_register(&stack[frame_index], arg0 as u16)?;
-                self.jit_throw_from_compiled(context, stack, frame_index, value)
-            }
             value if value == Op::TdzError as u8 => {
                 let err = VmError::TemporalDeadZone {
                     local_index: arg0 as u32,

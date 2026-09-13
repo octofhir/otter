@@ -104,6 +104,9 @@ fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<Commit
         Op::LooseNotEqual => {
             CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::LooseNotEqual)
         }
+        Op::Throw => CommittedValueOperation::Scalar(ScalarValueOp::PrepareThrow),
+        Op::NewError => CommittedValueOperation::Scalar(ScalarValueOp::NewError),
+        Op::NewBuiltinError => CommittedValueOperation::Scalar(ScalarValueOp::NewBuiltinError),
         Op::ToObject => CommittedValueOperation::Scalar(ScalarValueOp::ToObject),
         Op::ToPropertyKey => CommittedValueOperation::Scalar(ScalarValueOp::ToPropertyKey),
         Op::TypeOf => CommittedValueOperation::Scalar(ScalarValueOp::TypeOf),

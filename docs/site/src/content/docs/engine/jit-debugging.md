@@ -113,12 +113,17 @@ graph.
 
 Base-construct artifacts add `directConstructPrepare` between the shared guard
 and frame publication. Its nested `directConstructPrepareFast` region probes an
-already materialized own data `new.target.prototype`. Exact class wrappers then
-enter `directConstructReceiverAllocFast`, which guards the live wrapper,
+already materialized own data `new.target.prototype`. Exact class wrappers and
+ordinary closure constructors enter `directConstructReceiverAllocFast`, which guards the live callable,
 prototype chain, collector marking state, young from-space page, bump capacity,
 and heap cap before initializing the complete object and accounting it in
 generated code. `directConstructReceiverAllocCold` is the rooted allocator
 sibling for a structural guard miss, nursery refill/GC, stress mode, or OOM.
+Ordinary closures read their live own-property slot through a matching shape
+and descriptor proof. Their learned capacity and weak last-instance observation
+are per closure; a large sibling sharing bytecode does not exclude a small one.
+GC clears weak permission before movement, and the next canonical preparation
+registers it again. No moving prototype value is cached.
 For a conservatively matched straight-line base initializer, the immutable plan
 reuses the VM's final hidden-class cache and creates undefined own slots up
 front. Fixed, spread, and generated `superConstruct` bodies then overwrite
@@ -150,7 +155,8 @@ successful `super()` result only in an unbound stack-owned derived frame.
 `machineDerivedThisBindCold` uses the canonical binding operation for materialized
 frames, shared lexical `this` cells, and repeated-bind errors. Both siblings and
 their SSA join are explicit before register allocation; only the cold call owns
-the safepoint and exceptional edge. A repeated `super()` preserves the first
+the safepoint. Its value/status pair feeds an explicit Success/Throw/Fatal branch,
+so allocated exception moves run before the catch edge. A repeated `super()` preserves the first
 `this`, performs the second base constructor's effects once, and delivers the
 ReferenceError to the original catch landing without replaying construction.
 `directConstructResultFast` performs base substitution and valid
@@ -207,8 +213,16 @@ with a precise safepoint and explicit Success/Throw/Fatal control; they never
 exact-deoptimize and replay the source operation.
 Tagged loose comparisons with a static `null` or `undefined` operand expose a
 `machineTaggedNullishEqual` region. Immediate nullish and non-cell primitive
-cases complete without reentry; a Cell exact-deoptimizes before writing the
-Boolean result so HTMLDDA semantics remain canonical.
+cases and ordinary cells complete without reentry; a native-function cell
+exact-deoptimizes before writing the Boolean result so HTMLDDA semantics remain
+canonical.
+Other non-numeric or unseen loose comparisons expose `machineLooseEqualityProbe`.
+Identity, homogeneous Number, nullish-pair and ordinary object-pair proofs finish
+without calls. Uncertain or coercive operands enter `machineCommittedValueEffect`
+once, with precise moving roots and explicit Success/Throw/Fatal CFG. Both
+operators preserve the original thrown value and local catch landing; a miss
+never deoptimizes and replays coercion. Observed numeric feedback retains the
+ordinary specialized numeric comparison.
 For a completely generated, non-reentrant outermost loop, a
 `loopInvariantGlobalObjectLoadCache` code-map region identifies the first
 proof plus its activation-local fast reuse. The native-stack slot retains the

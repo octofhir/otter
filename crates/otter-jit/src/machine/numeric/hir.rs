@@ -3687,13 +3687,7 @@ fn lower_instruction(
         }
         Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual => {
             let feedback = instruction.arith_feedback();
-            let speculate_unseen_loose_numeric =
-                feedback.is_empty() && matches!(op, Op::LooseEqual | Op::LooseNotEqual) && {
-                    let left = read_value(registers, register(instruction, code, 1)?)?;
-                    let right = read_value(registers, register(instruction, code, 2)?)?;
-                    !value_is_static_nullish(nodes, left) && !value_is_static_nullish(nodes, right)
-                };
-            if !feedback.is_numeric_only() && !speculate_unseen_loose_numeric {
+            if !feedback.is_numeric_only() {
                 let left = read_value(registers, register(instruction, code, 1)?)?;
                 let right = read_value(registers, register(instruction, code, 2)?)?;
                 let value = if matches!(op, Op::Equal | Op::NotEqual) {
@@ -5833,7 +5827,7 @@ mod tests {
     }
 
     #[test]
-    fn unseen_loose_equality_guards_numeric_inputs_and_declines_malformed_shapes() {
+    fn unseen_loose_equality_uses_committed_cfg_and_declines_malformed_shapes() {
         let generic = JitCompileSnapshot::without_feedback(
             116,
             2,
@@ -5852,30 +5846,34 @@ mod tests {
                 JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
             ],
         );
-        let hir = NumericFunction::build(&generic).expect("guarded unseen loose-equality HIR");
-        let decodes = hir
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                matches!(node, NumericNode::TaggedToNumber(_)).then_some(NumericValue(index))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(decodes.len(), 2);
+        let hir = NumericFunction::build(&generic).expect("committed unseen loose-equality HIR");
         assert!(
             hir.nodes
                 .iter()
-                .any(|node| matches!(node, NumericNode::Equal(_, _)))
+                .any(|node| matches!(node, NumericNode::CommittedValue { .. }))
         );
-        for decode in decodes {
-            let state = hir
-                .frame_states
+        assert!(
+            !hir.nodes
                 .iter()
-                .find(|state| state.point == NumericFramePoint::Node(decode))
-                .expect("exact pre-coercion state");
-            assert_eq!(state.byte_pc, 0);
-            assert_eq!(state.slots[2], NumericFrameSlot::Undefined);
-        }
+                .any(|node| matches!(node, NumericNode::TaggedToNumber(_)))
+        );
+        let sequence = super::super::select(&hir).expect("explicit loose-equality CFG");
+        let probe = sequence
+            .instructions()
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    crate::machine::MachineOpcode::LooseEqualityProbe { equal: true, .. }
+                )
+            })
+            .expect("generated proof");
+        assert!(probe.safepoint.is_none() && probe.deopt.is_none());
+        assert!(sequence.instructions().iter().any(|instruction| matches!(
+            instruction.opcode,
+            crate::machine::MachineOpcode::Call(_)
+        )
+            && instruction.safepoint.is_some()));
 
         for operands in [
             vec![
@@ -5908,7 +5906,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_equality_snapshot_path_has_no_semantic_exception_edge() {
+    fn loose_equality_snapshot_preserves_possible_coercion_exception_liveness() {
         let view = loose_nullish_view(Op::LooseEqual, Op::LoadNull, false);
         let code = view.code_block.as_ref();
         let comparison = &view.instructions[1];
@@ -5947,13 +5945,13 @@ mod tests {
             &mut live,
         )
         .expect("snapshot-aware loose-equality liveness");
-        assert!(!semantics[1].has_implicit_exception_side_exit(Op::LooseEqual));
+        assert!(semantics[1].has_implicit_exception_side_exit(Op::LooseEqual));
         assert!(live[0] && live[1], "both operands are ordinary reads");
         assert!(!live[2], "destination is killed before the operation");
         assert!(!live[3], "the catch supplies its exception register");
         assert!(
-            !live[4],
-            "a proved pre-effect path does not fabricate a semantic throw edge"
+            live[4],
+            "snapshot liveness retains catch roots until HIR proves a static nullish operand"
         );
     }
 

@@ -20,6 +20,8 @@
 //!   native entries alike; their published outer frame retains its GC lifetime.
 //! - Every rebuilt frame receives the exact static catch-only handler stack for
 //!   its resume PC before interpreter dispatch can observe it.
+//! - The outer inline continuation retains the live activation's actuals,
+//!   captured cells, arguments object and constructor bindings.
 //! - Every temporary materialized frame and register window is removed before
 //!   returning to compiled code.
 //! - Nested dispatch stops at the caller's activation floor and reuses the
@@ -191,11 +193,14 @@ impl Interpreter {
     /// compiled code; every younger frame returns through its recorded parent
     /// destination. This owned reconstruction is reserved for inlined
     /// optimized exits that cannot resume one canonical native activation.
+    /// `materialized_index` identifies the existing owner for an arena-backed
+    /// entry; generated stack entries carry their actuals in the native window.
     pub fn jit_deopt_materialize_inline_frames(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         native: &mut NativeFrame,
+        materialized_index: Option<usize>,
         frames: &[jit::JitDeoptFrame],
     ) -> Result<Value, VmError> {
         // The chain runs to completion here rather than reporting a bail, so
@@ -206,6 +211,37 @@ impl Interpreter {
         if native.header.function_id != outermost.callee_fid {
             return Err(VmError::InvalidOperand);
         }
+        // SAFETY: the entry remains published until this continuation returns;
+        // copying its windows below performs only host allocation, never GC.
+        let active = unsafe { ActiveFrameRef::from_native_ptr(native) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        let source = materialized_index
+            .map(|index| {
+                let frame = stack.get(index).ok_or(VmError::InvalidOperand)?;
+                if frame.header.function_id != native.header.function_id
+                    || frame.registers.as_ptr() as u64 != native.register_base
+                {
+                    return Err(VmError::InvalidOperand);
+                }
+                Ok(frame)
+            })
+            .transpose()?;
+        let source_cold = source.and_then(|frame| self.frame_cold(frame)).map(|cold| {
+            (
+                cold.incoming_args.clone(),
+                cold.rest_args.clone(),
+                cold.arguments_object,
+                cold.construct_target,
+            )
+        });
+        let incoming = active
+            .incoming_argument_count()
+            .map(|count| {
+                (0..count)
+                    .map(|index| active.incoming_argument(index))
+                    .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
+            })
+            .transpose()?;
         self.note_jit_optimized_bail(outermost.callee_fid, outermost.callee_pc);
         // The speculation that exited lives in the innermost spliced body; its
         // own exit profile must learn the PC so the next bake of that body,
@@ -232,11 +268,17 @@ impl Interpreter {
             let function = context
                 .exec_function(deopt.callee_fid)
                 .ok_or(VmError::InvalidOperand)?;
-            let upvalues: crate::frame_state::UpvalueSpine =
+            let upvalues: crate::frame_state::UpvalueSpine = if index == 0 {
+                (0..active.upvalue_count())
+                    .map(|index| active.upvalue(index as u32))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice()
+            } else {
                 match deopt.closure.as_closure(&self.gc_heap) {
                     Some(closure) => closure.upvalues_snapshot(&self.gc_heap).into_boxed_slice(),
                     None => Vec::new().into_boxed_slice(),
-                };
+                }
+            };
             let mut window = self.alloc_reg_window(deopt.registers.len())?;
             window.copy_from_slice(&deopt.registers);
             let return_register = (index != 0).then_some(deopt.return_register);
@@ -256,6 +298,28 @@ impl Interpreter {
                 function_id: deopt.callee_fid,
                 resume_pc: deopt.callee_pc,
             });
+        }
+
+        // All fallible frame/window construction is complete. Attach call
+        // state before any handler installation or dispatch can collect.
+        let outer = &mut materialized[0];
+        let new_target = active.new_target_value();
+        if source_cold.is_some() || incoming.is_some() || !new_target.is_undefined() {
+            let cold = self.frame_ensure_cold(outer);
+            if let Some((args, rest, object, receiver)) = source_cold {
+                cold.incoming_args = args;
+                cold.rest_args = rest;
+                cold.arguments_object = object;
+                cold.construct_target = receiver;
+            }
+            if let Some(args) = incoming {
+                cold.incoming_args = args;
+            }
+            cold.new_target = (!new_target.is_undefined()).then_some(new_target);
+            cold.is_derived_constructor = native.is_derived_constructor();
+            if !new_target.is_undefined() && !cold.is_derived_constructor {
+                cold.construct_target = native.this_value().as_object();
+            }
         }
 
         for (index, plan) in handler_plans.into_iter().enumerate() {
@@ -410,6 +474,7 @@ mod tests {
                         &context,
                         stack,
                         &mut native,
+                        None,
                         &frames,
                     )
                 })

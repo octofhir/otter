@@ -712,6 +712,7 @@ pub(super) fn compile(
                     u32::try_from(next_load_ic).expect("template load IC ordinal fits u32");
                 let cell = &mut load_ic_cells[next_load_ic];
                 next_load_ic += 1;
+                cell.set_source(view.code_block.id, instr.pc);
                 let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_load_property(
                     &mut ops,
@@ -740,6 +741,7 @@ pub(super) fn compile(
                     u32::try_from(next_store_ic).expect("template store IC ordinal fits u32");
                 let cell = &mut store_ic_cells[next_store_ic];
                 next_store_ic += 1;
+                cell.set_source(view.code_block.id, instr.pc);
                 let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_store_property(
                     &mut ops,

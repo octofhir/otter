@@ -24,8 +24,8 @@ use crate::{
 };
 use otter_bytecode::Op;
 
-/// Decode one fixed named-property operation from the exact published native
-/// frame identity. Generated code supplies values only; the immutable
+/// Decode one fixed named-property operation from its explicit source
+/// identity, independently of the published native activation. The immutable
 /// CodeBlock remains the authority for property spelling and feedback site.
 fn named_property_site(
     context: &ExecutionContext,
@@ -60,7 +60,7 @@ fn named_property_site(
 }
 
 impl Interpreter {
-    /// Resolve and complete the exact published `LoadProperty` over one boxed
+    /// Resolve and complete the source-owned `LoadProperty` over one boxed
     /// receiver.
     ///
     /// The function id and logical PC select and validate the immutable

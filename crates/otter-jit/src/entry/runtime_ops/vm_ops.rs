@@ -10,7 +10,8 @@
 //! and named-property entries instead receive fixed boxed-value operands and
 //! return a committed value/exception pair. Method calls copy their complete receiver/argument
 //! packet before reentry. Named operations derive their immutable property
-//! name and feedback site from the published function/logical-PC identity.
+//! name and feedback site from the immutable source identity in their IC cell;
+//! the published activation supplies execution ownership, not property lookup.
 //! IC cells store the VM-owned `JitPropertyIcWay` directly; the generated stride
 //! derives from that same type. Allocating or throwing operations keep precise
 //! roots live. Committed
@@ -44,13 +45,23 @@ pub(crate) const WHISKER_IC_WAY_BYTES: u32 =
 /// a live receiver, so empty ways are skipped for free); on a hit it reads the
 /// matched way's `value_byte`. On a monomorphic own-data inline-slot miss the
 /// stub fills the next empty way, so a poly site caches every shape it sees up
-/// to the width. The cell holds only compressed offsets (no GC pointers), so it
-/// needs no tracing, and a shape offset is a stable token (shapes are immortal
-/// and pinned in old space).
+/// to the width. The cell holds stable shape offsets and immutable source ids
+/// (no GC pointers), so it needs no tracing. Shape offsets are stable tokens:
+/// shapes are immortal and pinned in old space.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WhiskerIcCell {
     ways: [otter_vm::JitPropertyIcWay; IC_WAYS],
+    // Only the cold stub reads this immutable identity. Keep ways first so
+    // generated probes retain the shared VM-owned program layout.
+    source: Option<(u32, u32)>,
+}
+
+impl WhiskerIcCell {
+    /// Set once during emission, before the code object is published.
+    pub(crate) fn set_source(&mut self, function_id: u32, instruction_pc: u32) {
+        self.source = Some((function_id, instruction_pc));
+    }
 }
 
 /// Self-patch one IC cell with a lowered cache program: fill the first empty
@@ -80,9 +91,9 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIc
     }
 }
 
-/// Complete the exact published `LoadProperty` from one boxed receiver.
+/// Complete the source-owned `LoadProperty` from one boxed receiver.
 ///
-/// The native frame supplies function/logical-PC identity; the VM validates
+/// The code-owned cell supplies function/logical-PC identity; the VM validates
 /// the opcode and derives its property name and feedback site. Success returns
 /// the loaded value and may patch `cell`. Failure returns either a pure
 /// JavaScript exception or a structural Fatal; this boundary never requests
@@ -94,9 +105,18 @@ pub(crate) extern "C" fn jit_load_property_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx
-        .runtime_call()
-        .and_then(|mut runtime| runtime.load_property_value(Value::from_bits(receiver_bits)));
+    // SAFETY: generated code supplies its live code-owned cell, or null for
+    // an invalid boundary invocation. Copy the source before possible reentry.
+    let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
+    let result = source
+        .ok_or(VmError::InvalidOperand)
+        .and_then(|(function_id, pc)| {
+            ctx.runtime_call()?.load_property_value(
+                function_id,
+                pc,
+                Value::from_bits(receiver_bits),
+            )
+        });
     match result {
         Ok((value, fill)) => {
             if !cell.is_null()
@@ -127,12 +147,18 @@ pub(crate) extern "C" fn jit_store_property_stub(
 ) -> NativeResultPair {
     // SAFETY: as `jit_load_property_stub`.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx.runtime_call().and_then(|mut runtime| {
-        runtime.store_property_value(
-            Value::from_bits(receiver_bits),
-            Value::from_bits(value_bits),
-        )
-    });
+    // SAFETY: the same stable code-owned cell contract as the load boundary.
+    let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
+    let result = source
+        .ok_or(VmError::InvalidOperand)
+        .and_then(|(function_id, pc)| {
+            ctx.runtime_call()?.store_property_value(
+                function_id,
+                pc,
+                Value::from_bits(receiver_bits),
+                Value::from_bits(value_bits),
+            )
+        });
     match result {
         Ok(fill) => {
             if !cell.is_null()

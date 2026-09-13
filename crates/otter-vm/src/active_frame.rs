@@ -665,6 +665,19 @@ impl<'a> ActiveFrameMut<'a> {
         self.as_ref().incoming_argument(index)
     }
 
+    /// Write one actual-argument slot in an initialized native window.
+    /// Generated linkage uses this while the callee frame is still private.
+    pub(crate) fn write_incoming_argument(
+        &mut self,
+        index: usize,
+        value: Value,
+    ) -> Result<(), VmError> {
+        match &mut self.inner {
+            ActiveFrameMutInner::Native(native) if native.incoming.write(index, value) => Ok(()),
+            _ => Err(VmError::InvalidOperand),
+        }
+    }
+
     /// Raw base of the initialized tagged register window.
     ///
     /// This is a native integration descriptor, not an exclusive Rust borrow.

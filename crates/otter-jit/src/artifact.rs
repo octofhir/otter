@@ -144,6 +144,7 @@ impl DirectCallKindArtifact {
 pub(crate) enum DirectCallArgumentModeArtifact {
     Fixed,
     Spread,
+    Forward,
 }
 
 impl DirectCallArgumentModeArtifact {
@@ -151,6 +152,7 @@ impl DirectCallArgumentModeArtifact {
         match self {
             Self::Fixed => "fixed",
             Self::Spread => "spread",
+            Self::Forward => "forward",
         }
     }
 }
@@ -195,8 +197,10 @@ pub(crate) struct DirectCallArtifact {
     pub(crate) target_tier: DirectCallTierArtifact,
     pub(crate) this_mode: DirectCallThisModeArtifact,
     pub(crate) callee_native_frame_bytes: u32,
-    pub(crate) linkage_bytes: u32,
-    pub(crate) reserved_stack_bytes: u32,
+    /// Exact linkage bytes, or null when actual arity determines them at runtime.
+    pub(crate) linkage_bytes: Option<u32>,
+    /// Exact total reservation, or null for a dynamic argument window.
+    pub(crate) reserved_stack_bytes: Option<u32>,
     pub(crate) callee_register_count: u16,
     pub(crate) own_upvalue_count: u16,
     pub(crate) inherited_upvalue_count: u16,
@@ -828,8 +832,8 @@ mod tests {
                 target_tier: DirectCallTierArtifact::Optimizing,
                 this_mode: DirectCallThisModeArtifact::SloppyGlobal,
                 callee_native_frame_bytes: 160,
-                linkage_bytes: 112,
-                reserved_stack_bytes: 272,
+                linkage_bytes: Some(112),
+                reserved_stack_bytes: Some(272),
                 callee_register_count: 6,
                 own_upvalue_count: 2,
                 inherited_upvalue_count: 1,

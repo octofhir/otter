@@ -1047,7 +1047,10 @@ pub(super) fn emit_call_with_receiver(
             fatal,
         );
     }
-    let direct_target = view.direct_callees.get(&byte_pc);
+    let direct_target = view
+        .direct_callees
+        .get(&byte_pc)
+        .and_then(|targets| targets.first());
     if let Some(candidate) = view
         .inline_callees
         .get(&byte_pc)
@@ -1324,6 +1327,7 @@ pub(super) fn emit_construct(
             table.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
             0,
             table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
+            0,
             code_map,
             bail,
             threw,

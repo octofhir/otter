@@ -2974,6 +2974,7 @@ pub(super) fn emit(
                             derived_construct_result_entry,
                             copy_spread_arguments_entry,
                             initialize_upvalues_entry,
+                            0,
                             None,
                             if *kind == DirectCallKind::CallWithThis {
                                 call_with_this_guard_miss

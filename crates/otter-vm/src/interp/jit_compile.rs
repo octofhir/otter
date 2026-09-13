@@ -1604,7 +1604,8 @@ impl Interpreter {
     /// Bake compiler-native direct-call plans and inline-candidate bodies for
     /// `fid`'s call sites.
     ///
-    /// Plain-call candidates remain monomorphic. Method-call candidates may
+    /// Fixed/spread ordinary-call candidates remain monomorphic. Forwarded
+    /// arguments admit the bounded ordinary target population; method calls may
     /// contain a bounded, most-frequent-first polymorphic chain. Every generated
     /// target is a synchronous bytecode function with an exact bounded upvalue
     /// spine and one current non-OSR installed entry. Generated linkage binds
@@ -1662,202 +1663,226 @@ impl Interpreter {
                 }
                 _ => jit::JitDirectCallKind::Plain,
             };
-            let feedback::CallSiteDistribution::Mono(target) = state else {
-                self.record_jit_inline_candidate(
-                    fid,
-                    instruction_pc,
-                    tier,
-                    None,
-                    Some(jit_debug::JitInlineRejectionReason::Polymorphic),
-                );
-                continue;
-            };
-            let callee_fid = match target.target {
-                feedback::OrdinaryCallTarget::Bytecode(callee_fid) => callee_fid,
-                feedback::OrdinaryCallTarget::StaticNative(stub_id) => {
-                    let name = crate::native_abi::runtime_stub_name(stub_id);
-                    let declaration = crate::jit_static_native::jit_leaf_builtin(stub_id)
-                        .expect("native leaf call feedback names a declared entry");
-                    // Feedback recorded a call to this builtin, so the isolate
-                    // installed it and its external-ref index exists.
-                    let builtin_native_ref =
-                        crate::jit_static_native::jit_static_call_ref(stub_id, &self.gc_heap)
-                            .expect(
-                                "a builtin the site already called is interned in this isolate",
-                            );
-                    view.static_native_calls.insert(
-                        call_byte_pc,
-                        jit::JitStaticNativeCall {
-                            builtin_native_ref,
-                            leaf_stub_id: stub_id,
-                            argument_count: declaration.argument_count,
-                        },
-                    );
+            let targets: Vec<_> = match state {
+                feedback::CallSiteDistribution::Mono(target) => vec![target],
+                feedback::CallSiteDistribution::Poly(targets) if op == Op::CallForwardArguments => {
                     self.record_jit_inline_candidate(
                         fid,
                         instruction_pc,
                         tier,
                         None,
-                        Some(jit_debug::JitInlineRejectionReason::StaticNative { target: name }),
+                        Some(jit_debug::JitInlineRejectionReason::Polymorphic),
                     );
-                    self.record_jit_static_native_call_plan(fid, instruction_pc, tier, name);
+                    targets.iter().copied().collect()
+                }
+                _ => {
+                    self.record_jit_inline_candidate(
+                        fid,
+                        instruction_pc,
+                        tier,
+                        None,
+                        Some(jit_debug::JitInlineRejectionReason::Polymorphic),
+                    );
                     continue;
                 }
             };
-            let Some(callee) = context.exec_function(callee_fid) else {
-                self.record_jit_inline_candidate(
-                    fid,
-                    instruction_pc,
-                    tier,
-                    Some(callee_fid),
-                    Some(jit_debug::JitInlineRejectionReason::MissingCallee),
-                );
-                self.record_jit_direct_call_plan(
-                    unresolved_call_kind,
-                    fid,
-                    instruction_pc,
-                    tier,
-                    callee_fid,
-                    0,
-                    1,
-                    jit_debug::JitDirectCallPlanOutcome::Rejected {
-                        reason: jit_debug::JitDirectCallRejectionReason::MissingCallee,
-                    },
-                );
-                continue;
-            };
-            let direct_ineligible = callee.is_generator
-                || callee.is_async
-                || callee.is_async_generator
-                || callee.has_rest
-                || callee.contains_direct_eval
-                || (callee.is_derived_constructor && (!is_construct || callee.makes_function))
-                || (is_construct && callee.is_method);
-            // An `arguments` body reads the actual-argument window its
-            // generated caller publishes, so it still takes direct linkage;
-            // spliced into the caller it would have no window to read.
-            let inline_ineligible = direct_ineligible || callee.needs_arguments;
-            if inline_ineligible {
-                self.record_jit_inline_candidate(
-                    fid,
-                    instruction_pc,
-                    tier,
-                    Some(callee_fid),
-                    Some(jit_debug::JitInlineRejectionReason::Ineligible {
-                        generator: callee.is_generator,
-                        async_function: callee.is_async,
-                        async_generator: callee.is_async_generator,
-                        needs_arguments: callee.needs_arguments,
-                        has_rest: callee.has_rest,
-                        contains_direct_eval: callee.contains_direct_eval,
-                        derived_constructor: callee.is_derived_constructor,
-                        makes_function: callee.makes_function,
-                    }),
-                );
-            }
-            if direct_ineligible {
-                self.record_jit_direct_call_plan(
-                    unresolved_call_kind,
-                    fid,
-                    instruction_pc,
-                    tier,
-                    callee_fid,
-                    0,
-                    1,
-                    jit_debug::JitDirectCallPlanOutcome::Rejected {
-                        reason: jit_debug::JitDirectCallRejectionReason::IneligibleFunction,
-                    },
-                );
-                continue;
-            }
-            let direct_call_outcome = if let Some(plan) =
-                self.ensure_direct_callee_plan(context, callee, eager_direct_target_depth)
-            {
-                debug_assert_eq!(plan.function_id, callee_fid);
-                let receiver_allocation = if is_construct && !callee.is_derived_constructor {
-                    let new_target_function_id = match op {
-                        Op::New | Op::NewSpread => callee_fid,
-                        Op::SuperConstruct | Op::SuperConstructSpread => fid,
-                        _ => callee_fid,
-                    };
-                    self.bake_receiver_allocation_plan(callee_fid, new_target_function_id)
-                } else {
-                    None
+            let target_count = targets.len() as u32;
+            for (target_index, target) in targets.into_iter().enumerate() {
+                let target_index = target_index as u32;
+                let callee_fid = match target.target {
+                    feedback::OrdinaryCallTarget::Bytecode(callee_fid) => callee_fid,
+                    feedback::OrdinaryCallTarget::StaticNative(stub_id) => {
+                        let name = crate::native_abi::runtime_stub_name(stub_id);
+                        let declaration = crate::jit_static_native::jit_leaf_builtin(stub_id)
+                            .expect("native leaf call feedback names a declared entry");
+                        // Feedback recorded a call to this builtin, so the isolate
+                        // installed it and its external-ref index exists.
+                        let builtin_native_ref =
+                            crate::jit_static_native::jit_static_call_ref(stub_id, &self.gc_heap)
+                                .expect(
+                                    "a builtin the site already called is interned in this isolate",
+                                );
+                        view.static_native_calls.insert(
+                            call_byte_pc,
+                            jit::JitStaticNativeCall {
+                                builtin_native_ref,
+                                leaf_stub_id: stub_id,
+                                argument_count: declaration.argument_count,
+                            },
+                        );
+                        self.record_jit_inline_candidate(
+                            fid,
+                            instruction_pc,
+                            tier,
+                            None,
+                            Some(jit_debug::JitInlineRejectionReason::StaticNative {
+                                target: name,
+                            }),
+                        );
+                        self.record_jit_static_native_call_plan(fid, instruction_pc, tier, name);
+                        continue;
+                    }
                 };
-                let callee = jit::JitDirectCallee {
-                    plan,
-                    receiver_allocation,
+                let Some(callee) = context.exec_function(callee_fid) else {
+                    self.record_jit_inline_candidate(
+                        fid,
+                        instruction_pc,
+                        tier,
+                        Some(callee_fid),
+                        Some(jit_debug::JitInlineRejectionReason::MissingCallee),
+                    );
+                    self.record_jit_direct_call_plan(
+                        unresolved_call_kind,
+                        fid,
+                        instruction_pc,
+                        tier,
+                        callee_fid,
+                        target_index,
+                        target_count,
+                        jit_debug::JitDirectCallPlanOutcome::Rejected {
+                            reason: jit_debug::JitDirectCallRejectionReason::MissingCallee,
+                        },
+                    );
+                    continue;
                 };
-                if is_construct {
-                    view.direct_constructs.insert(call_byte_pc, callee);
-                } else {
-                    view.direct_callees.insert(call_byte_pc, callee);
+                let direct_ineligible = callee.is_generator
+                    || callee.is_async
+                    || callee.is_async_generator
+                    || callee.has_rest
+                    || callee.contains_direct_eval
+                    || (callee.is_derived_constructor && (!is_construct || callee.makes_function))
+                    || (is_construct && callee.is_method);
+                // An `arguments` body reads the actual-argument window its
+                // generated caller publishes, so it still takes direct linkage;
+                // spliced into the caller it would have no window to read.
+                let inline_ineligible = direct_ineligible || callee.needs_arguments;
+                if inline_ineligible {
+                    self.record_jit_inline_candidate(
+                        fid,
+                        instruction_pc,
+                        tier,
+                        Some(callee_fid),
+                        Some(jit_debug::JitInlineRejectionReason::Ineligible {
+                            generator: callee.is_generator,
+                            async_function: callee.is_async,
+                            async_generator: callee.is_async_generator,
+                            needs_arguments: callee.needs_arguments,
+                            has_rest: callee.has_rest,
+                            contains_direct_eval: callee.contains_direct_eval,
+                            derived_constructor: callee.is_derived_constructor,
+                            makes_function: callee.makes_function,
+                        }),
+                    );
                 }
-                jit_debug::JitDirectCallPlanOutcome::Available {
-                    code_object_id: plan.code_object_id,
-                    target_tier: match plan.tier {
-                        native_abi::NativeFrameKind::Baseline => jit_debug::JitDebugTier::Template,
-                        native_abi::NativeFrameKind::Optimizing => {
-                            jit_debug::JitDebugTier::Optimizing
-                        }
-                        native_abi::NativeFrameKind::Interpreter => {
-                            unreachable!("interpreter has no entry-capable code generation")
-                        }
-                    },
-                    this_mode: if is_construct && callee.plan.is_derived_constructor {
-                        jit::JitDirectCallThisMode::DerivedConstructor
-                    } else if is_construct {
-                        jit::JitDirectCallThisMode::ConstructReceiver
+                if direct_ineligible {
+                    self.record_jit_direct_call_plan(
+                        unresolved_call_kind,
+                        fid,
+                        instruction_pc,
+                        tier,
+                        callee_fid,
+                        target_index,
+                        target_count,
+                        jit_debug::JitDirectCallPlanOutcome::Rejected {
+                            reason: jit_debug::JitDirectCallRejectionReason::IneligibleFunction,
+                        },
+                    );
+                    continue;
+                }
+                let direct_call_outcome = if let Some(plan) =
+                    self.ensure_direct_callee_plan(context, callee, eager_direct_target_depth)
+                {
+                    debug_assert_eq!(plan.function_id, callee_fid);
+                    let receiver_allocation = if is_construct && !callee.is_derived_constructor {
+                        let new_target_function_id = match op {
+                            Op::New | Op::NewSpread => callee_fid,
+                            Op::SuperConstruct | Op::SuperConstructSpread => fid,
+                            _ => callee_fid,
+                        };
+                        self.bake_receiver_allocation_plan(callee_fid, new_target_function_id)
                     } else {
-                        plan.this_mode
-                    },
-                }
-            } else {
-                pending_direct_targets.insert(callee_fid);
-                jit_debug::JitDirectCallPlanOutcome::Rejected {
-                    reason: jit_debug::JitDirectCallRejectionReason::NoEntryGeneration,
-                }
-            };
-            let call_kind = match (op, callee.is_derived_constructor) {
-                (Op::New | Op::NewSpread, false) => jit::JitDirectCallKind::Construct,
-                (Op::New | Op::NewSpread, true) => jit::JitDirectCallKind::DerivedConstruct,
-                (Op::SuperConstruct | Op::SuperConstructSpread, false) => {
-                    jit::JitDirectCallKind::SuperConstruct
-                }
-                (Op::SuperConstruct | Op::SuperConstructSpread, true) => {
-                    jit::JitDirectCallKind::DerivedSuperConstruct
-                }
-                _ => jit::JitDirectCallKind::Plain,
-            };
-            self.record_jit_direct_call_plan(
-                call_kind,
-                fid,
-                instruction_pc,
-                tier,
-                callee_fid,
-                0,
-                1,
-                direct_call_outcome,
-            );
-            if is_construct || op == Op::CallSpread {
-                continue;
-            }
-            if !splice_candidates || inline_ineligible {
-                continue;
-            }
-            let Some(body) = self.bake_inline_body(context, callee_fid, tier) else {
-                self.record_jit_inline_candidate(
+                        None
+                    };
+                    let callee = jit::JitDirectCallee {
+                        plan,
+                        receiver_allocation,
+                    };
+                    if is_construct {
+                        view.direct_constructs.insert(call_byte_pc, callee);
+                    } else {
+                        view.direct_callees
+                            .entry(call_byte_pc)
+                            .or_default()
+                            .push(callee);
+                    }
+                    jit_debug::JitDirectCallPlanOutcome::Available {
+                        code_object_id: plan.code_object_id,
+                        target_tier: match plan.tier {
+                            native_abi::NativeFrameKind::Baseline => {
+                                jit_debug::JitDebugTier::Template
+                            }
+                            native_abi::NativeFrameKind::Optimizing => {
+                                jit_debug::JitDebugTier::Optimizing
+                            }
+                            native_abi::NativeFrameKind::Interpreter => {
+                                unreachable!("interpreter has no entry-capable code generation")
+                            }
+                        },
+                        this_mode: if is_construct && callee.plan.is_derived_constructor {
+                            jit::JitDirectCallThisMode::DerivedConstructor
+                        } else if is_construct {
+                            jit::JitDirectCallThisMode::ConstructReceiver
+                        } else {
+                            plan.this_mode
+                        },
+                    }
+                } else {
+                    pending_direct_targets.insert(callee_fid);
+                    jit_debug::JitDirectCallPlanOutcome::Rejected {
+                        reason: jit_debug::JitDirectCallRejectionReason::NoEntryGeneration,
+                    }
+                };
+                let call_kind = match (op, callee.is_derived_constructor) {
+                    (Op::New | Op::NewSpread, false) => jit::JitDirectCallKind::Construct,
+                    (Op::New | Op::NewSpread, true) => jit::JitDirectCallKind::DerivedConstruct,
+                    (Op::SuperConstruct | Op::SuperConstructSpread, false) => {
+                        jit::JitDirectCallKind::SuperConstruct
+                    }
+                    (Op::SuperConstruct | Op::SuperConstructSpread, true) => {
+                        jit::JitDirectCallKind::DerivedSuperConstruct
+                    }
+                    _ => jit::JitDirectCallKind::Plain,
+                };
+                self.record_jit_direct_call_plan(
+                    call_kind,
                     fid,
                     instruction_pc,
                     tier,
-                    Some(callee_fid),
-                    Some(jit_debug::JitInlineRejectionReason::MissingSnapshot),
+                    callee_fid,
+                    target_index,
+                    target_count,
+                    direct_call_outcome,
                 );
-                continue;
-            };
-            self.record_jit_inline_candidate(fid, instruction_pc, tier, Some(callee_fid), None);
-            view.inline_callees
-                .insert(call_byte_pc, jit::JitInlineCallee { body });
+                if is_construct || op == Op::CallSpread {
+                    continue;
+                }
+                if !splice_candidates || inline_ineligible || target_count != 1 {
+                    continue;
+                }
+                let Some(body) = self.bake_inline_body(context, callee_fid, tier) else {
+                    self.record_jit_inline_candidate(
+                        fid,
+                        instruction_pc,
+                        tier,
+                        Some(callee_fid),
+                        Some(jit_debug::JitInlineRejectionReason::MissingSnapshot),
+                    );
+                    continue;
+                };
+                self.record_jit_inline_candidate(fid, instruction_pc, tier, Some(callee_fid), None);
+                view.inline_callees
+                    .insert(call_byte_pc, jit::JitInlineCallee { body });
+            }
         }
 
         // Method-call sites: snapshot monomorphic and polymorphic feedback for

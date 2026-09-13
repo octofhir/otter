@@ -527,33 +527,6 @@ impl Interpreter {
         Ok(true)
     }
 
-    /// Refresh the mapped prefix of an elided arguments list from the same
-    /// parameter storage an arguments exotic object would read. Extra actuals,
-    /// strict/unmapped parameters and absent actuals keep their incoming values.
-    /// No allocation or JavaScript reentry occurs while the frame is borrowed.
-    pub(crate) fn refresh_mapped_argument_values(
-        &self,
-        function: &crate::executable::CodeBlock,
-        frame: &crate::ActiveFrameRef<'_>,
-        arguments: &mut [Value],
-    ) -> Result<(), VmError> {
-        if function.arguments_object_kind != ArgumentsObjectKind::Mapped {
-            return Ok(());
-        }
-        for binding in &function.mapped_argument_bindings {
-            let Some(value) = arguments.get_mut(binding.argument_index as usize) else {
-                continue;
-            };
-            *value = match binding.storage {
-                ArgumentBindingStorage::Register { reg } => frame.read(reg)?,
-                ArgumentBindingStorage::Upvalue { idx } => {
-                    crate::upvalue::read_upvalue(&self.gc_heap, frame.upvalue(u32::from(idx))?)
-                }
-            };
-        }
-        Ok(())
-    }
-
     /// Parameter bindings that alias the arguments object's indexed entries,
     /// resolved against the activation's capture cells.
     fn mapped_argument_entries(

@@ -54,18 +54,21 @@ pub(super) fn emit_spread_call_op(
 ) -> Result<(), Unsupported> {
     let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
     let direct = if opcode == otter_bytecode::Op::CallSpread as u8 {
-        view.direct_callees.get(&byte_pc).map(|target| {
-            (
-                target,
-                DirectCallForm::CallWithThis {
-                    callable: lane(arg0, 1),
-                    receiver: lane(arg0, 2),
-                },
-                lane(arg0, 0),
-                lane(arg0, 3),
-                otter_vm::JitDirectCallKind::Plain,
-            )
-        })
+        view.direct_callees
+            .get(&byte_pc)
+            .and_then(|targets| targets.first())
+            .map(|target| {
+                (
+                    target,
+                    DirectCallForm::CallWithThis {
+                        callable: lane(arg0, 1),
+                        receiver: lane(arg0, 2),
+                    },
+                    lane(arg0, 0),
+                    lane(arg0, 3),
+                    otter_vm::JitDirectCallKind::Plain,
+                )
+            })
     } else if opcode == otter_bytecode::Op::NewSpread as u8
         || opcode == otter_bytecode::Op::SuperConstructSpread as u8
     {
@@ -127,6 +130,7 @@ pub(super) fn emit_spread_call_op(
             transitions.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
             transitions.entry(abi::STUB_JIT_COPY_SPREAD_ARGUMENTS),
             transitions.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
+            0,
             code_map,
             bail,
             threw,

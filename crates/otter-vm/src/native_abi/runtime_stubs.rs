@@ -1610,6 +1610,32 @@ pub const STUB_JIT_CALL_FORWARD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
+/// Probe the already-resolved apply and count an elided live argument window.
+/// Returns the full Uint32 count, or `u64::MAX` for a pre-effect miss.
+pub const STUB_JIT_FORWARD_ARGUMENT_COUNT: RuntimeStubDescriptor = descriptor(
+    95,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    1,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+    NativeResultDomain::None,
+);
+
+/// Copy live forwarded actuals into a fully initialized unpublished callee.
+/// Returns zero for success or one for a pre-entry miss; never invokes getters.
+pub const STUB_JIT_COPY_FORWARDED_ARGUMENTS: RuntimeStubDescriptor = descriptor(
+    96,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+    NativeResultDomain::None,
+);
+
 /// Complete the exact published schema-owned binding operation from two boxed
 /// values. Function/PC identity selects the semantic family and operand roles
 /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
@@ -1770,6 +1796,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         92 => "jit_construct_value",
         93 => "jit_collect_arguments",
         94 => "jit_call_forward_arguments",
+        95 => "jit_forward_argument_count",
+        96 => "jit_copy_forwarded_arguments",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1870,6 +1898,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CONSTRUCT_VALUE,
     STUB_JIT_COLLECT_ARGUMENTS,
     STUB_JIT_CALL_FORWARD_ARGUMENTS,
+    STUB_JIT_FORWARD_ARGUMENT_COUNT,
+    STUB_JIT_COPY_FORWARDED_ARGUMENTS,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

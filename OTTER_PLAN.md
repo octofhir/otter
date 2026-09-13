@@ -574,9 +574,10 @@ enter the runtime twice each with native ways. Full evidence is in
 A single sustained profile of that accepted binary has2757 isolate stacks:
 forwarded-call ancestry960, runtime property load534, base constructor prepare487,
 runtime property store1. These inclusive rows overlap and include callee work;
-they are not pure overhead percentages. Source and events show the shared
-Class.create trampoline is polymorphic, so a monomorphic-only forwarded-call
-implementation would miss the measured hotspot. See
+they are not pure overhead percentages. Source and events initially classified the shared
+Class.create trampoline as polymorphic. The bounded-forwarding capture below
+refines that diagnosis to saturated feedback; a bounded candidate chain alone
+misses this hotspot. See
 `benchmarks/results/s1-20260913-native-profile/README.md`.
 
 Forwarded argument semantics required repair before generated copying: mapped
@@ -613,9 +614,34 @@ Forwarding also passes GC+verify stride1. An overbroad whole-target stress run
 was stopped; its fast-allocation assertion was corrected to check the rooted GC
 sibling under stress while retaining the normal fast-hit requirement. Focused
 normal, stress1 and disabled-stress0 checks pass; the interrupted run is not a gate.
-Dynamic reservation/copy remains open. Source audit confirms forwarding can
-finish SSA loads before reservation, avoiding a general spill-addressing rewrite.
+This fixed-layout prerequisite left dynamic reservation/copy to the native
+forwarding slice below. Source audit confirms forwarding can finish SSA loads
+before reservation, avoiding a general spill-addressing rewrite.
 Evidence: `benchmarks/results/s2-20260913-call-layout/README.md`.
+
+Native bounded forwarding is now debug-verified. Template selects the ordinary
+bounded callee population and uses shared generated linkage with the complete
+live mapped/actual window. A fixed control slot owns dynamic reservation size;
+all roots are initialized before capture allocation, and normal/throw/deopt/reject
+paths release that size. Exposed arguments and custom apply retain committed
+canonical completion. Artifact argumentMode includes forward; dynamic sizes are
+null. Pending-error and pure-value throw routes remain distinct.
+
+Forwarding8/8, Machine direct calls23/23, layout2/2 and scoped VM/JIT clippy pass;
+the final full-window/throw regression passes GC+verify1/4/16. A settled256-call
+polymorphic probe demonstrates native entries with <64 rooted runtime transitions
+in both generated policies. Evidence:
+`benchmarks/results/s2-20260913-native-forwarding/README.md`.
+
+S2 remains active: a single debug RayTrace capture validates but function535/PC4
+has zero direct targets at both preparation tiers; the bounded Poly arm's lack of
+per-target plans indicates saturated feedback. Machine also rejects the forwarding
+opcode. Do not claim a RayTrace win or repeat release measurements yet. Next:
+generic native target selection through the existing entry-cell/frame contract,
+>8-target coverage, explicit Machine call CFG, then one affected release cycle.
+No larger target cap, duplicate registry, full gate or new benchmark baseline.
+The authoritative handoff was shortened; superseded history is preserved in
+`scratchpad/JIT_LANE_HISTORY_2026_09_13.md`.
 
 The intended replacement path remains:
 

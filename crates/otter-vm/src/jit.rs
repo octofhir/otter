@@ -425,14 +425,14 @@ pub struct JitCompileSnapshot {
     /// byte-PC. Each plan names one exact bootstrap function identity and one
     /// machine-code operation; misses side-exit before effects.
     pub static_native_calls: rustc_hash::FxHashMap<u32, JitStaticNativeCall>,
-    /// Compiler-native direct callees keyed by the caller's `Op::Call` or
-    /// `Op::CallSpread` byte-PC. Each entry names one monomorphic synchronous callee
-    /// with an exact fresh/inherited upvalue spine and a current non-OSR native entry.
-    /// The emitter guards the dynamic callable against
-    /// [`JitDirectCallPlan::function_id`] and side-exits if the identity or
-    /// entry-cell lease no longer matches; no runtime resolver is part of the
-    /// compiled hit path.
-    pub direct_callees: rustc_hash::FxHashMap<u32, JitDirectCallee>,
+    /// Compiler-native ordinary-call candidates keyed by byte PC. Fixed and
+    /// spread calls have one target; forwarded arguments admit the bounded
+    /// feedback population. Each synchronous target has an exact fresh/inherited
+    /// upvalue spine and a stable non-OSR entry cell. Generated code guards
+    /// callable identity and binds the current generation. A miss precedes call
+    /// effects; forwarding retains its committed apply value for canonical
+    /// completion. Body-inline candidates remain separate and monomorphic.
+    pub direct_callees: rustc_hash::FxHashMap<u32, Vec<JitDirectCallee>>,
     /// Compiler-native constructors keyed by fixed or spread `Op::New` /
     /// `Op::SuperConstruct` byte-PCs. The dynamic callee must be the exact
     /// function or closure identity; receiver creation, derived-`this`, and
@@ -938,7 +938,7 @@ pub struct JitDirectCallPlan {
     pub needs_incoming_arguments: bool,
 }
 
-/// One baked compiler-native target for a monomorphic plain-call site.
+/// One baked compiler-native target in an ordinary-call candidate population.
 ///
 /// Presence in [`JitCompileSnapshot::direct_callees`] proves the callee is an
 /// ordinary synchronous body and has a stable entry cell with one current

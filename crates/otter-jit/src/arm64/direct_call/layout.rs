@@ -12,6 +12,8 @@
 //!   authoritative; no consumer infers it from the native header size.
 //! - Control slots and tagged windows are eight-byte aligned, capture offsets
 //!   are four-byte aligned, and the complete reservation is sixteen-byte aligned.
+//! - Forwarded actual windows keep their runtime reservation in a fixed control
+//!   slot. Their complete size is bounded before SP changes and root publication.
 //! - Every size operation is checked before applying the generated-call bound.
 //!
 //! # See also
@@ -25,6 +27,7 @@ use crate::entry::NATIVE_FRAME_STACK_SIZE;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StackLayout {
+    pub(super) allocation_size: Option<u32>,
     pub(super) register_base: u32,
     pub(super) incoming_base: u32,
     pub(super) incoming_count: u32,
@@ -55,12 +58,35 @@ impl StackLayout {
             u32::from(target.plan.register_count),
             upvalue_count,
             incoming_count,
+            false,
         )
     }
 
-    fn for_windows(register_count: u32, upvalue_count: u32, incoming_count: u32) -> Option<Self> {
+    pub(super) fn for_forward(target: &JitDirectCallee) -> Option<Self> {
+        target
+            .plan
+            .generated_stack_frame_bytes
+            .filter(|bytes| *bytes != 0)?;
+        let upvalues = u32::from(target.plan.own_upvalue_count)
+            .checked_add(u32::from(target.plan.inherited_upvalue_count))?;
+        Self::for_windows(
+            u32::from(target.plan.register_count),
+            upvalues,
+            0,
+            target.plan.needs_incoming_arguments,
+        )
+    }
+
+    fn for_windows(
+        register_count: u32,
+        upvalue_count: u32,
+        incoming_count: u32,
+        dynamic: bool,
+    ) -> Option<Self> {
         let saved_x25 = NATIVE_FRAME_STACK_SIZE;
-        let upvalue_base = saved_x25.checked_add(40)?;
+        let control_end = saved_x25.checked_add(40)?;
+        let allocation_size = dynamic.then_some(control_end);
+        let upvalue_base = control_end.checked_add(if dynamic { 8 } else { 0 })?;
         let upvalue_bytes = upvalue_count.checked_mul(4)?;
         let register_base = upvalue_base.checked_add(upvalue_bytes)?.checked_add(7)? & !7;
         let register_bytes = register_count.checked_mul(8)?;
@@ -70,6 +96,7 @@ impl StackLayout {
             .checked_add(15)?
             & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
+            allocation_size,
             register_base,
             incoming_base,
             incoming_count,
@@ -90,31 +117,35 @@ mod tests {
 
     #[test]
     fn actual_arity_cannot_move_control_or_capture_storage() {
-        for captures in [0, 1, 2, 7] {
-            let empty = StackLayout::for_windows(19, captures, 0).unwrap();
-            for actuals in [1, 2, 3, 16, 255] {
-                let layout = StackLayout::for_windows(19, captures, actuals).unwrap();
-                assert_eq!(layout.saved_x25, empty.saved_x25);
-                assert_eq!(layout.entry_addr, empty.entry_addr);
-                assert_eq!(layout.caller_frame, empty.caller_frame);
-                assert_eq!(layout.caller_code_object_id, empty.caller_code_object_id);
-                assert_eq!(layout.target_cell, empty.target_cell);
-                assert_eq!(layout.upvalue_base, empty.upvalue_base);
-                assert_eq!(layout.register_base, empty.register_base);
-                assert_eq!(layout.incoming_base, layout.register_base + 19 * 8);
-                assert!(layout.register_base >= layout.upvalue_base + captures * 4);
-                assert!(layout.frame_bytes >= layout.incoming_base + actuals * 8);
-                assert_eq!(layout.register_base % 8, 0);
-                assert_eq!(layout.frame_bytes % 16, 0);
+        for dynamic in [false, true] {
+            for captures in [0, 1, 2, 7] {
+                let empty = StackLayout::for_windows(19, captures, 0, dynamic).unwrap();
+                for actuals in [1, 2, 3, 16, 255] {
+                    let layout = StackLayout::for_windows(19, captures, actuals, dynamic).unwrap();
+                    assert_eq!(layout.allocation_size, empty.allocation_size);
+                    assert_eq!(layout.allocation_size.is_some(), dynamic);
+                    assert_eq!(layout.saved_x25, empty.saved_x25);
+                    assert_eq!(layout.entry_addr, empty.entry_addr);
+                    assert_eq!(layout.caller_frame, empty.caller_frame);
+                    assert_eq!(layout.caller_code_object_id, empty.caller_code_object_id);
+                    assert_eq!(layout.target_cell, empty.target_cell);
+                    assert_eq!(layout.upvalue_base, empty.upvalue_base);
+                    assert_eq!(layout.register_base, empty.register_base);
+                    assert_eq!(layout.incoming_base, layout.register_base + 19 * 8);
+                    assert!(layout.register_base >= layout.upvalue_base + captures * 4);
+                    assert!(layout.frame_bytes >= layout.incoming_base + actuals * 8);
+                    assert_eq!(layout.register_base % 8, 0);
+                    assert_eq!(layout.frame_bytes % 16, 0);
+                }
             }
         }
     }
 
     #[test]
     fn oversized_or_overflowing_windows_are_rejected() {
-        assert!(StackLayout::for_windows(u32::MAX, 0, 0).is_none());
-        assert!(StackLayout::for_windows(0, u32::MAX, 0).is_none());
-        assert!(StackLayout::for_windows(0, 0, u32::MAX).is_none());
-        assert!(StackLayout::for_windows(0, 0, MAX_DIRECT_CALL_FRAME_BYTES / 8).is_none());
+        assert!(StackLayout::for_windows(u32::MAX, 0, 0, false).is_none());
+        assert!(StackLayout::for_windows(0, u32::MAX, 0, false).is_none());
+        assert!(StackLayout::for_windows(0, 0, u32::MAX, false).is_none());
+        assert!(StackLayout::for_windows(0, 0, MAX_DIRECT_CALL_FRAME_BYTES / 8, false).is_none());
     }
 }

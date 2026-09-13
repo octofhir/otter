@@ -1072,6 +1072,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(match direct_call.argument_mode {
                 DirectCallArgumentModeArtifact::Fixed => 0,
                 DirectCallArgumentModeArtifact::Spread => 1,
+                DirectCallArgumentModeArtifact::Forward => 2,
             });
             output.push(match direct_call.target_tier {
                 DirectCallTierArtifact::Template => 0,
@@ -1085,8 +1086,8 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
                 DirectCallThisModeArtifact::DerivedConstructor => 4,
             });
             put_u32(output, direct_call.callee_native_frame_bytes);
-            put_u32(output, direct_call.linkage_bytes);
-            put_u32(output, direct_call.reserved_stack_bytes);
+            put_u32(output, direct_call.linkage_bytes.unwrap_or(u32::MAX));
+            put_u32(output, direct_call.reserved_stack_bytes.unwrap_or(u32::MAX));
             put_u16(output, direct_call.callee_register_count);
             put_u16(output, direct_call.own_upvalue_count);
             put_u16(output, direct_call.inherited_upvalue_count);
@@ -1158,8 +1159,8 @@ mod tests {
                 target_tier,
                 this_mode,
                 callee_native_frame_bytes: 160,
-                linkage_bytes: 112,
-                reserved_stack_bytes: 272,
+                linkage_bytes: Some(112),
+                reserved_stack_bytes: Some(272),
                 callee_register_count: 6,
                 own_upvalue_count: 2,
                 inherited_upvalue_count: 1,

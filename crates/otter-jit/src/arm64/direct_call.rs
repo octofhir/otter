@@ -1,7 +1,7 @@
 //! Compiler-generated AArch64 call linkage.
 //!
 //! # Contents
-//! - [`DirectCallSite`] — one baked monomorphic call-site description.
+//! - [`DirectCallSite`] — one baked target in a generated call-site chain.
 //! - [`emit_direct_call`] — exact callable guard, stack-owned callee frame,
 //!   native entry, return, and cold deoptimization.
 //! - [`emit_direct_call_with_access`] — the same linkage over allocator-owned
@@ -14,7 +14,7 @@
 //!   heap-cap miss; observable prototype lookup remains a pre-effect sibling.
 //!   Body entry, frame linkage, return substitution, and cleanup stay generated.
 //! - Every failure before native entry is effect-free and branches to the
-//!   caller's canonical deopt exit while its original call PC is published.
+//!   caller's canonical completion while its original call PC is published.
 //!   Base constructs finish generation/stack validation before receiver
 //!   preparation. An own data prototype and exact class wrapper allocate
 //!   without reentry; uncertain shapes reach the observable lookup, and no
@@ -31,6 +31,10 @@
 //!   `arguments`, so ignored trailing values are unobservable to the callee.
 //!   The prepared receiver is parked in the unpublished frame while caller
 //!   roots refresh, so a recycled destination may alias the callee register.
+//! - Forwarded calls copy the caller's live argument bindings without GC or JS
+//!   reentry. Targets consuming actuals use a bounded dynamic window with a
+//!   fixed control prefix; every exit releases its recorded reservation. Operand
+//!   callbacks preserve x8 until reservation and require no dynamic SP bias.
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
@@ -384,6 +388,17 @@ pub(crate) enum DirectCallArguments<'a> {
     Fixed(&'a [u16]),
     /// One compiler-created dense array containing already-evaluated values.
     Spread(u16),
+    /// Live actual count in an X register, after the committed intrinsic-apply
+    /// probe. Operand loaders must preserve x8 until the frame is reserved.
+    Forward { count: u8 },
+}
+
+fn emit_release_linkage(ops: &mut Assembler, layout: &StackLayout) {
+    if let Some(offset) = layout.allocation_size {
+        dynasm!(ops ; .arch aarch64 ; ldr w16, [sp, offset] ; add sp, sp, x16);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; add sp, sp, layout.frame_bytes);
+    }
 }
 
 /// Whether a baked target fits the bounded generated stack-call layout.
@@ -687,10 +702,19 @@ fn layout_and_artifact(
                 "spread direct call publishing incoming arguments",
             ));
         }
-        DirectCallArguments::Spread(_) => 0,
+        DirectCallArguments::Spread(_) | DirectCallArguments::Forward { .. } => 0,
     };
-    let layout = StackLayout::for_site(site.target, argument_count)
-        .ok_or(Unsupported::OperandShape("direct call stack frame"))?;
+    if matches!(site.arguments, DirectCallArguments::Forward { .. })
+        && !matches!(site.form, DirectCallForm::CallWithThis { .. })
+    {
+        return Err(Unsupported::OperandShape("forwarded call receiver form"));
+    }
+    let layout = if matches!(site.arguments, DirectCallArguments::Forward { .. }) {
+        StackLayout::for_forward(site.target)
+    } else {
+        StackLayout::for_site(site.target, argument_count)
+    }
+    .ok_or(Unsupported::OperandShape("direct call stack frame"))?;
     if matches!(
         site.form,
         DirectCallForm::Plain { .. } | DirectCallForm::CallWithThis { .. }
@@ -731,6 +755,7 @@ fn layout_and_artifact(
         argument_mode: match site.arguments {
             DirectCallArguments::Fixed(_) => DirectCallArgumentModeArtifact::Fixed,
             DirectCallArguments::Spread(_) => DirectCallArgumentModeArtifact::Spread,
+            DirectCallArguments::Forward { .. } => DirectCallArgumentModeArtifact::Forward,
         },
         target_function_id: site.target.plan.function_id,
         target_index: site.target_index,
@@ -774,8 +799,14 @@ fn layout_and_artifact(
             }
         },
         callee_native_frame_bytes,
-        linkage_bytes: layout.frame_bytes,
-        reserved_stack_bytes,
+        linkage_bytes: layout
+            .allocation_size
+            .is_none()
+            .then_some(layout.frame_bytes),
+        reserved_stack_bytes: layout
+            .allocation_size
+            .is_none()
+            .then_some(reserved_stack_bytes),
         callee_register_count: site.target.plan.register_count,
         own_upvalue_count: site.target.plan.own_upvalue_count,
         inherited_upvalue_count: site.target.plan.inherited_upvalue_count,
@@ -824,6 +855,7 @@ pub(crate) fn emit_direct_call(
         0,
         0,
         initialize_upvalues_entry,
+        0,
         code_map,
         bail,
         finish_error,
@@ -873,6 +905,7 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
     initialize_upvalues_entry: u64,
+    copy_forwarded_arguments_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     finish_error: DynamicLabel,
@@ -924,6 +957,21 @@ where
         ; cmp x10, x11
         ; b.hs =>caller_bail
     );
+
+    if let DirectCallArguments::Forward { count } = site.arguments {
+        if copy_forwarded_arguments_entry == 0 {
+            return Err(Unsupported::OperandShape(
+                "forwarded call argument copy entry",
+            ));
+        }
+        // x8 is outside the callable/receiver proof's scratch set. The caller
+        // probes intrinsic apply and the complete actual count once per site.
+        dynasm!(ops ; .arch aarch64 ; mov x8, X(count));
+        if layout.allocation_size.is_some() {
+            let capacity = (MAX_DIRECT_CALL_FRAME_BYTES - layout.incoming_base) / 8;
+            dynasm!(ops ; .arch aarch64 ; cmp w8, capacity ; b.hi =>caller_bail);
+        }
+    }
 
     match site.form {
         DirectCallForm::Method { callable, receiver } => {
@@ -1149,13 +1197,29 @@ where
     );
 
     let setup_start = ops.offset().0;
-    // Reserve the fixed caller-owned linkage frame and root the callable
+    // Reserve the caller-owned linkage frame and root the callable
     // state before the cold resolver can clobber caller-saved registers. The
     // frame is not published and no shared resource accounting is committed
     // until the selected generation's dynamic stack contract is validated.
+    if let Some(allocation_size) = layout.allocation_size {
+        dynasm!(ops
+            ; .arch aarch64
+            ; lsl x16, x8, #3
+            ; add x16, x16, layout.incoming_base + 15
+            ; and x16, x16, 0xffff_ffff_ffff_fff0u64
+            ; sub sp, sp, x16
+            ; str w16, [sp, allocation_size]
+        );
+    } else {
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, layout.frame_bytes);
+    }
+    if matches!(site.arguments, DirectCallArguments::Forward { .. })
+        && site.target.plan.needs_incoming_arguments
+    {
+        dynasm!(ops ; .arch aarch64 ; str w8, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]);
+    }
     dynasm!(ops
         ; .arch aarch64
-        ; sub sp, sp, layout.frame_bytes
         ; str x25, [sp, layout.saved_x25]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
         ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
@@ -1202,7 +1266,7 @@ where
         DirectCallArguments::Fixed(arguments) => arguments
             .len()
             .min(usize::from(site.target.plan.param_count)),
-        DirectCallArguments::Spread(_) => 0,
+        DirectCallArguments::Spread(_) | DirectCallArguments::Forward { .. } => 0,
     };
     emit_copy_fixed_arguments(ops, &layout, site, "direct call argument index", &mut load)?;
 
@@ -1276,11 +1340,33 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; str w14, [sp, 8]
-        ; movz w13, layout.incoming_count
-        ; str w13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         ; add x14, sp, layout.register_base
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
+
+    if layout.allocation_size.is_none() {
+        dynasm!(ops
+            ; .arch aarch64
+            ; movz w13, layout.incoming_count
+            ; str w13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+        );
+    } else {
+        // Every actual slot is a valid root before upvalue allocation can GC.
+        let initialized = ops.new_dynamic_label();
+        let initialize = ops.new_dynamic_label();
+        emit_load_u64(ops, 15, VALUE_UNDEFINED);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr w13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+            ; cbz w13, =>initialized
+            ; add x14, sp, layout.incoming_base
+            ; =>initialize
+            ; str x15, [x14], #8
+            ; subs w13, w13, #1
+            ; b.ne =>initialize
+            ; =>initialized
+        );
+    }
 
     let param_count = usize::from(site.target.plan.param_count);
     emit_initialize_register_range(
@@ -1639,6 +1725,18 @@ where
             ; cbnz x0, =>uncommitted_rejected
         );
     }
+    if matches!(site.arguments, DirectCallArguments::Forward { .. }) {
+        dynasm!(ops ; .arch aarch64 ; mov x0, X(context_register) ; mov x1, sp);
+        emit_load_u64(ops, 2, u64::from(site.target.plan.param_count));
+        emit_runtime_stub(
+            ops,
+            relocations,
+            16,
+            copy_forwarded_arguments_entry,
+            abi::STUB_JIT_COPY_FORWARDED_ARGUMENTS,
+        );
+        dynasm!(ops ; .arch aarch64 ; blr x16 ; cbnz x0, =>uncommitted_rejected);
+    }
     dynasm!(ops
         ; .arch aarch64
         ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
@@ -1909,7 +2007,10 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; ldr x25, [sp, layout.saved_x25]
-        ; add sp, sp, layout.frame_bytes
+    );
+    emit_release_linkage(ops, &layout);
+    dynasm!(ops
+        ; .arch aarch64
         ; cmp x1, abi::NativeResultStatus::Success as u32
         ; b.eq =>returned
         ; b =>cleanup_abrupt
@@ -1948,11 +2049,17 @@ where
         ; .arch aarch64
         ; =>entry_rejected
         ; ldr x25, [sp, layout.saved_x25]
-        ; add sp, sp, layout.frame_bytes
+    );
+    emit_release_linkage(ops, &layout);
+    dynasm!(ops
+        ; .arch aarch64
         ; b =>caller_bail
         ; =>uncommitted_rejected
         ; ldr x25, [sp, layout.saved_x25]
-        ; add sp, sp, layout.frame_bytes
+    );
+    emit_release_linkage(ops, &layout);
+    dynasm!(ops
+        ; .arch aarch64
         ; b =>caller_bail
     );
     record_region(
@@ -1972,8 +2079,8 @@ where
         ; .arch aarch64
         ; =>construct_prepare_error
         ; ldr x25, [sp, layout.saved_x25]
-        ; add sp, sp, layout.frame_bytes
     );
+    emit_release_linkage(ops, &layout);
     restore_roots(ops)?;
     dynasm!(ops ; .arch aarch64 ; b =>finish_error);
 
@@ -1982,8 +2089,8 @@ where
         ; =>construct_prepare_throw
         ; mov x17, x0
         ; ldr x25, [sp, layout.saved_x25]
-        ; add sp, sp, layout.frame_bytes
     );
+    emit_release_linkage(ops, &layout);
     restore_roots(ops)?;
     dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
 
@@ -1991,8 +2098,8 @@ where
         ; .arch aarch64
         ; =>construct_prepare_fatal
         ; ldr x25, [sp, layout.saved_x25]
-        ; add sp, sp, layout.frame_bytes
     );
+    emit_release_linkage(ops, &layout);
     restore_roots(ops)?;
     dynasm!(ops ; .arch aarch64 ; b =>fatal);
 

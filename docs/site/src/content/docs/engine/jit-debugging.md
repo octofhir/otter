@@ -595,7 +595,7 @@ and carries one typed `directCall` object:
 `targetTier`, and `calleeNativeFrameBytes` describe the generation current
 when this caller compiled; they are planning diagnostics, not a permanently
 baked dispatch target. `thisMode` records the call binding emitted before
-frame publication. `argumentMode` is `fixed` or `spread`. A spread operation
+frame publication. `argumentMode` is `fixed`, `spread`, or `forward`. A spread operation
 keeps its source array rooted across cold resolution and receiver preparation,
 then copies the declared-parameter prefix directly into the same unpublished
 callee frame with a leaf/no-allocation runtime stub. It does not introduce a
@@ -610,9 +610,23 @@ deopt. An own iterator, prototype replacement, accessor, or non-Array source
 misses before observable work and resumes the materialized opcode path. A
 generated-call deopt at that guard is therefore a semantic fallback, while
 repeated deopts at the default Array collection PCs indicate a regression.
+Forwarded intrinsic `apply` calls use `argumentMode: "forward"` and the same
+linkage regions. `targetIndex` / `targetCount` identify the bounded candidate
+population at each planning/lowering stage. A target that fails layout admission
+has an explicit `layoutUnsupported` lowering outcome; other candidates keep
+their original indices. The source's live mapped parameters and extra actuals
+are copied before callee publication. An exposed arguments object, custom apply,
+or unsupported target uses the committed canonical call exactly once. This
+forwarding path currently lowers in Template; the callee may enter either native
+tier.
+
 `linkageBytes` is the exact caller-owned `NativeFrame`, tagged register window,
 bookkeeping, and alignment. `reservedStackBytes` is the planning-time sum with
-the captured target prologue. At runtime the permanent function cell selects
+the captured target prologue. When forwarded actual arity determines the window
+size, both fields are `null` and assembly annotations show `dynamic`. A target
+that does not consume an actual window retains exact constant sizes. Generated
+code bounds the dynamic reservation before publication, initializes every root,
+and restores the recorded size on success, throw, deopt and pre-entry rejection. At runtime the permanent function cell selects
 the current generation, and generated linkage reads that generation's actual
 code-object id, tier, and native-frame reservation before entry. The same
 planning object appears on the stable function-cell relocation in

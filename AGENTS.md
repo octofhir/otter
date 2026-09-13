@@ -588,7 +588,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     reservation, register count, `ownUpvalueCount`, and
     `inheritedUpvalueCount`. Fresh capture cells occupy a caller-reserved
     stack spine; inherited closure cells follow in the same spine before the
-    callee frame is published. `argumentMode` is `fixed` or `spread`;
+    callee frame is published. `argumentMode` is `fixed`, `spread`, or `forward`;
+    forwarded intrinsic apply uses shared Template linkage with live mapped
+    bindings and complete actuals. Dynamic actual windows report null
+    `linkageBytes` / `reservedStackBytes` and assembly annotations show `dynamic`.
+    Materialized arguments, custom apply and pre-entry misses retain committed
+    canonical completion. Saturated target dispatch and Machine forwarding
+    coverage remain outside this bounded Template path;
     spread arguments are copied from the rooted dense array into the same
     unpublished callee frame through the leaf/no-allocation runtime stub.
     Compiler-generated default-Array iterator collection inside a generated

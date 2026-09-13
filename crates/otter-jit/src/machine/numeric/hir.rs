@@ -2404,7 +2404,7 @@ fn lower_instruction(
     frame_states: &mut Vec<NumericFrameState>,
     function_id: u32,
     logical_pc: u32,
-    direct_callees: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
+    direct_callees: &rustc_hash::FxHashMap<u32, Vec<otter_vm::JitDirectCallee>>,
     direct_constructs: &rustc_hash::FxHashMap<u32, otter_vm::JitDirectCallee>,
     direct_methods: &rustc_hash::FxHashMap<u32, Vec<otter_vm::jit::JitDirectMethod>>,
     constructor_field_transitions: &rustc_hash::FxHashMap<
@@ -3025,7 +3025,10 @@ fn lower_instruction(
                     RegisterState::Value(value),
                 );
             }
-            let direct = direct_callees.get(&instruction.byte_pc).copied();
+            let direct = direct_callees
+                .get(&instruction.byte_pc)
+                .and_then(|targets| targets.first())
+                .copied();
             if direct.is_none() && !instruction.call_attempted {
                 return lower_cold_call_exit(
                     NumericColdCallKind::Plain,
@@ -3190,7 +3193,7 @@ fn lower_instruction(
         }
         Op::CallSpread | Op::NewSpread | Op::SuperConstructSpread => {
             let callee = match op {
-                Op::CallSpread => *direct_callees.get(&instruction.byte_pc)?,
+                Op::CallSpread => *direct_callees.get(&instruction.byte_pc)?.first()?,
                 Op::NewSpread | Op::SuperConstructSpread => {
                     *direct_constructs.get(&instruction.byte_pc)?
                 }
@@ -4747,7 +4750,7 @@ mod tests {
         let call_byte_pc = view.instructions[2].byte_pc;
         view.direct_callees.insert(
             call_byte_pc,
-            JitDirectCallee {
+            vec![JitDirectCallee {
                 plan: JitDirectCallPlan {
                     function_id: 92,
                     code_object_id: 1,
@@ -4763,7 +4766,7 @@ mod tests {
                     needs_incoming_arguments: false,
                 },
                 receiver_allocation: None,
-            },
+            }],
         );
         view.cage_base = 0x1000;
         view.element_accesses.insert(
@@ -4812,7 +4815,7 @@ mod tests {
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(2)]),
             ],
         );
-        view.direct_callees.insert(8, direct_callee(129));
+        view.direct_callees.insert(8, vec![direct_callee(129)]);
         view
     }
 
@@ -4909,7 +4912,7 @@ mod tests {
         let call_byte_pc = view.instructions[2].byte_pc;
         view.direct_callees.insert(
             call_byte_pc,
-            JitDirectCallee {
+            vec![JitDirectCallee {
                 plan: JitDirectCallPlan {
                     function_id: 103,
                     code_object_id: 1,
@@ -4925,7 +4928,7 @@ mod tests {
                     needs_incoming_arguments: false,
                 },
                 receiver_allocation: None,
-            },
+            }],
         );
         view
     }
@@ -5072,7 +5075,7 @@ mod tests {
     fn direct_plan_wins_and_complete_method_chains_are_preserved() {
         let mut plain = call_view(false);
         plain.seed_call_attempted_for_test(0);
-        plain.direct_callees.insert(0, direct_callee(120));
+        plain.direct_callees.insert(0, vec![direct_callee(120)]);
         let hir = NumericFunction::build(&plain).expect("planned plain call HIR");
         assert!(
             hir.nodes

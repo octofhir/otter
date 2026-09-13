@@ -37,6 +37,7 @@ mod class_ops;
 mod committed_values;
 mod control;
 mod exceptions;
+mod forward_arguments;
 mod iterators;
 mod value_loads;
 mod value_ops;

@@ -55,6 +55,7 @@ mod class_value;
 mod construct;
 mod delete;
 mod exceptions;
+mod forward_call;
 mod functions;
 pub(crate) mod ic_probe;
 mod iterators;
@@ -120,31 +121,33 @@ pub(super) fn compile(
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut direct_call_events = capture_events.then(|| {
-        let mut events = view
-            .direct_callees
-            .iter()
-            .filter_map(|(&byte_pc, target)| {
-                let instruction = view
-                    .instructions
-                    .iter()
-                    .find(|instruction| instruction.byte_pc == byte_pc)?;
-                let instruction_pc = instruction.instruction_pc(&view.code_block);
-                Some((
-                    (byte_pc, 0),
+        let mut events = BTreeMap::new();
+        for (&byte_pc, targets) in &view.direct_callees {
+            let Some(instruction) = view
+                .instructions
+                .iter()
+                .find(|instruction| instruction.byte_pc == byte_pc)
+            else {
+                continue;
+            };
+            let instruction_pc = instruction.instruction_pc(&view.code_block);
+            for (target_index, target) in targets.iter().enumerate() {
+                events.insert(
+                    (byte_pc, target_index as u32),
                     otter_vm::JitCompilerDiagnostic::DirectCallLowered {
                         call_kind: otter_vm::JitDirectCallKind::Plain,
                         instruction_pc,
                         byte_pc,
                         callee_function_id: target.plan.function_id,
-                        target_index: 0,
-                        target_count: 1,
+                        target_index: target_index as u32,
+                        target_count: targets.len() as u32,
                         outcome: otter_vm::JitDirectCallLoweringOutcome::Rejected {
                             reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
                         },
                     },
-                ))
-            })
-            .collect::<BTreeMap<_, _>>();
+                );
+            }
+        }
         for (&byte_pc, methods) in &view.direct_methods {
             let Some(instruction) = view
                 .instructions
@@ -598,15 +601,20 @@ pub(super) fn compile(
                 receiver,
                 this_value,
             } => {
-                transitions::emit_call_forward_arguments(
+                forward_call::emit_forward_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    view,
+                    direct_call_events.as_mut(),
+                    code_map.as_mut(),
+                    instr.pc,
                     [dst, method, receiver, this_value],
                     bail,
+                    threw,
                     committed_throw,
                     fatal,
-                );
+                )?;
             }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
@@ -791,6 +799,7 @@ pub(super) fn compile(
                 if view
                     .direct_callees
                     .get(&byte_pc)
+                    .and_then(|targets| targets.first())
                     .is_some_and(crate::arm64::direct_call_target_is_supported)
                 {
                     calls::emit_call_with_receiver(

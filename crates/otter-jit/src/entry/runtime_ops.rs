@@ -30,10 +30,12 @@ use otter_vm::{VmError, native_abi::NativeResultStatus};
 use super::JitCtx;
 
 mod calls;
+mod forward_arguments;
 mod literals;
 mod reentry;
 mod vm_ops;
 pub(crate) use calls::*;
+pub(crate) use forward_arguments::*;
 pub(crate) use literals::*;
 pub(crate) use reentry::*;
 pub(crate) use vm_ops::*;

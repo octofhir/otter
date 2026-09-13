@@ -2086,6 +2086,7 @@ pub(super) fn emit(
                 let cell = load_ic_cells
                     .get_mut(next_load_ic)
                     .ok_or(Unsupported::OperandShape("scalar property load IC cell"))?;
+                cell.set_source(view.code_block.id, logical_pc);
                 let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
                 next_load_ic += 1;
                 let start = ops.offset().0;
@@ -2253,6 +2254,7 @@ pub(super) fn emit(
                 let cell = store_ic_cells
                     .get_mut(next_store_ic)
                     .ok_or(Unsupported::OperandShape("scalar property store IC cell"))?;
+                cell.set_source(view.code_block.id, logical_pc);
                 let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
                 next_store_ic += 1;
                 let start = ops.offset().0;

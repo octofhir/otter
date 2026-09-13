@@ -7,7 +7,8 @@
 //! # Invariants
 //! Register-index methods own a short [`crate::ActiveFrameMut`] scope
 //! internally. Fixed-value methods instead use the published frame only for
-//! function/PC identity and operate on explicitly rooted boxed operands. The
+//! execution ownership and operate on explicitly rooted boxed operands. Named
+//! property operations receive their source function/PC explicitly. The
 //! JIT supplies decoded inputs and receives semantic results; no borrowed
 //! frame/window representation crosses the VM service boundary.
 
@@ -512,34 +513,35 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_write_barrier(&frame, object, source)
     }
 
-    /// Complete the named-property read identified by the published frame.
+    /// Complete the named-property read identified by its explicit source site.
     ///
     /// The caller supplies one boxed receiver rather than register indices.
-    /// Function id, logical PC, property name, and feedback site are decoded
-    /// and validated against the immutable CodeBlock by the VM.
+    /// Source identity is independent of the published activation. The VM
+    /// validates the opcode and decodes the property name and feedback site
+    /// from that source function, never from the enclosing native caller.
     pub fn load_property_value(
         &mut self,
+        function_id: u32,
+        instruction_pc: u32,
         receiver: Value,
     ) -> Result<(Value, Option<crate::jit::JitPropertyIcWay>), VmError> {
-        let function_id = self.function_id();
-        let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
         vm.jit_runtime_load_property_value(stack, context, function_id, instruction_pc, receiver)
     }
 
-    /// Complete the named-property write identified by the published frame.
+    /// Complete the named-property write identified by its explicit source site.
     ///
     /// Success means the complete store committed exactly once and returns an
     /// optional inline-cache program for the compiler-owned cell.
     pub fn store_property_value(
         &mut self,
+        function_id: u32,
+        instruction_pc: u32,
         receiver: Value,
         value: Value,
     ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
-        let function_id = self.function_id();
-        let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
@@ -834,11 +836,22 @@ mod tests {
     }
 
     #[test]
-    fn stack_owned_named_properties_decode_and_validate_published_pc() {
+    fn stack_owned_named_properties_use_explicit_source_without_mutating_caller() {
         let mut vm = Interpreter::new();
-        let context = vm
-            .link_module(named_property_module())
-            .expect("valid bytecode fixture");
+        let mut module = named_property_module();
+        let mut outer = module.functions[0].clone();
+        outer.id = 1;
+        outer.name = "enclosingNativeCaller".to_owned();
+        outer.code = (0..4)
+            .map(|pc| Instruction {
+                pc,
+                op: Op::ReturnUndefined,
+                operands: Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        module.functions.push(outer);
+        let context = vm.link_module(module).expect("valid bytecode fixture");
         vm.ensure_property_ic_capacity(&context);
         let mut receiver = vm
             .allocate_object_literal_value()
@@ -866,14 +879,14 @@ mod tests {
         ];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
-                function_id: 0,
+                function_id: 1,
                 pc: 1,
                 register_count: 4,
                 kind: NativeFrameKind::Optimizing,
                 flags: Default::default(),
             },
             registers.as_mut_ptr() as u64,
-            Value::function(0),
+            Value::function(1),
             Value::undefined(),
         );
         frame.set_stack_registers();
@@ -883,27 +896,33 @@ mod tests {
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .expect("stack-owned runtime call");
-        let (y, _) = call.load_property_value(receiver).expect("pc 1 selects y");
+        let (y, _) = call
+            .load_property_value(0, call.pc(), receiver)
+            .expect("pc 1 selects y");
         assert_eq!(y.as_i32(), Some(22));
 
-        call.set_pc(0);
-        let (x, _) = call.load_property_value(receiver).expect("pc 0 selects x");
+        let (x, _) = call
+            .load_property_value(0, 0, receiver)
+            .expect("pc 0 selects x");
         assert_eq!(x.as_i32(), Some(11));
-        let (_, fill) = call.load_property_value(receiver).expect("warmed x load");
+        assert_eq!(call.pc(), 1, "source lookup must not mutate the caller PC");
+        let (_, fill) = call
+            .load_property_value(0, 0, receiver)
+            .expect("warmed x load");
         assert!(fill.is_some(), "warmed own-data load should seed the cell");
 
         call.set_pc(2);
-        call.store_property_value(receiver, Value::number_i32(33))
+        call.store_property_value(0, call.pc(), receiver, Value::number_i32(33))
             .expect("pc 2 selects x store");
         assert!(
-            call.store_property_value(receiver, Value::number_i32(33))
+            call.store_property_value(0, call.pc(), receiver, Value::number_i32(33))
                 .expect("warmed x store")
                 .is_some(),
             "ordinary existing-slot store should seed the cell"
         );
         call.set_pc(0);
         assert_eq!(
-            call.load_property_value(receiver)
+            call.load_property_value(0, call.pc(), receiver)
                 .expect("updated x")
                 .0
                 .as_i32(),
@@ -912,7 +931,7 @@ mod tests {
 
         call.set_pc(3);
         assert!(matches!(
-            call.load_property_value(receiver),
+            call.load_property_value(0, call.pc(), receiver),
             Err(VmError::InvalidOperand)
         ));
     }
@@ -1097,7 +1116,7 @@ mod tests {
             }
             .expect("stack-owned runtime call");
             let first_way = call
-                .store_property_value(registers[0], Value::number_i32(11))
+                .store_property_value(0, call.pc(), registers[0], Value::number_i32(11))
                 .expect("first canonical transition")
                 .expect("inline transition way");
             assert!(first_way.is_add_transition());
@@ -1110,7 +1129,7 @@ mod tests {
             );
 
             let second_way = call
-                .store_property_value(registers[1], Value::number_i32(22))
+                .store_property_value(0, call.pc(), registers[1], Value::number_i32(22))
                 .expect("installed VM transition replay")
                 .expect("replayed transition way");
             assert_eq!(second_way, first_way);
@@ -1240,7 +1259,7 @@ mod tests {
             }
             .expect("stack-owned transition call");
             let first_way = call
-                .store_property_value(registers[0], registers[2])
+                .store_property_value(0, call.pc(), registers[0], registers[2])
                 .expect("first canonical Cell store");
             assert_eq!(
                 first_way, None,
@@ -1248,7 +1267,7 @@ mod tests {
             );
 
             let second_way = call
-                .store_property_value(registers[1], registers[3])
+                .store_property_value(0, call.pc(), registers[1], registers[3])
                 .expect("second canonical Cell store");
             assert_eq!(
                 second_way, None,
@@ -1349,13 +1368,13 @@ mod tests {
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .expect("stack-owned runtime call");
         let first_way = call
-            .store_property_value(registers[1], Value::number_i32(7))
+            .store_property_value(0, call.pc(), registers[1], Value::number_i32(7))
             .expect("first direct-prototype transition")
             .expect("direct-prototype transition way");
         assert!(first_way.is_add_transition());
         assert_eq!(first_way.holder_shape, prototype_shape);
         let second_way = call
-            .store_property_value(registers[2], Value::number_i32(9))
+            .store_property_value(0, call.pc(), registers[2], Value::number_i32(9))
             .expect("transition replay")
             .expect("replayed direct-prototype way");
         assert_eq!(second_way, first_way);
@@ -1404,7 +1423,7 @@ mod tests {
             }
             .expect("stack-owned runtime call");
             assert!(
-                call.store_property_value(registers[0], Value::number_i32(1))
+                call.store_property_value(0, call.pc(), registers[0], Value::number_i32(1))
                     .is_err(),
                 "strict StoreProperty must throw instead of using construction-time set"
             );

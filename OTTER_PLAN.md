@@ -494,7 +494,13 @@ misses, caller-loop continuation, lexical this and nested deopt without repeated
 effects. They pass with GC stress+verification at1/4/16;141 numeric tests and scoped
 JIT clippy pass. No release build or throughput claim for this bounded slice.
 Property/binding/allocation bodies, methods, nested inlining and protected sites
-are not admitted yet. Next: operation ownership for source-dependent callee facts,
+are not admitted yet. Named-property cold completion now takes immutable source
+function/PC from the code-owned IC cell; both Template and Machine initialize it.
+The VM service validates that explicit source independently of the published
+native frame. Seven scoped VM tests and11 property runtime tests pass, including
+a foreign-function published frame and local-catch Template completion; VM/JIT
+clippy passes. This removes root-PC lookup coupling, but does not publish inline
+JS activations for accessor reentry or yet admit property bodies. Next: operation ownership for source-dependent callee facts,
 then dot-like property helpers and complete temporary-object arithmetic chains.
 The handoff's structural A1–A3 order supersedes the chronological next steps below.
 Last measured RayTrace is2133 +/-9 against recorded Node117880; the~55x gap is not

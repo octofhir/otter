@@ -577,7 +577,7 @@ pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
 /// Named-property read over one boxed receiver and stable IC cell.
 ///
 /// Accessors, proxies, and exotic receivers may re-enter JavaScript. The
-/// published native frame identifies the exact `LoadProperty`; success returns
+/// immutable source identity in the cell selects `LoadProperty`; success returns
 /// its value and may patch the supplied cell, while failure returns one pure
 /// exception value without replay.
 pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(

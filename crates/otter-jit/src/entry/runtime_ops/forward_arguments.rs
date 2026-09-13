@@ -1,12 +1,12 @@
 //! Leaf ABI entries for native argument forwarding.
 //!
 //! # Contents
-//! - Intrinsic-apply/live-window count probe.
+//! - Intrinsic-apply/live-window count and runtime target-plan probes.
 //! - Complete live argument copy before generated callee publication.
 //!
 //! # Invariants
-//! - Both operations are leaf/no-allocation and have no observable JS effects.
-//! - Count misses return `u64::MAX`; copy misses return one, matching the
+//! - All probes and copies are leaf/no-allocation with no observable JS effects.
+//! - Count/plan misses return `u64::MAX`; copy misses return one, matching the
 //!   engine-owned descriptors. Neither failure parks an exception.
 //!
 //! # See also
@@ -39,4 +39,29 @@ pub(crate) extern "C" fn jit_copy_forwarded_arguments_stub(
     // SAFETY: shared generated linkage owns a complete initialized private
     // destination frame and keeps it disjoint from the published caller.
     u64::from(!unsafe { runtime.copy_forwarded_arguments(destination, parameter_count) })
+}
+
+/// Write the existing engine plan into caller-owned native scratch. The metadata
+/// contains no moving value; a miss leaves scratch unread and has no JS effect.
+pub(crate) extern "C" fn jit_forward_call_plan_stub(
+    ctx: *mut JitCtx,
+    method: u64,
+    callee: u64,
+    output: *mut otter_vm::jit::JitDirectCallPlan,
+) -> u64 {
+    // SAFETY: generated linkage owns the live context and an aligned, disjoint
+    // plan-sized scratch reservation. This leaf never allocates or reenters.
+    let ctx = unsafe { &mut *ctx };
+    let Ok(runtime) = ctx.runtime_call() else {
+        return u64::MAX;
+    };
+    let Some(count) = runtime.forward_argument_count(otter_vm::Value::from_bits(method)) else {
+        return u64::MAX;
+    };
+    let Some(plan) = runtime.forwarded_call_plan(otter_vm::Value::from_bits(callee)) else {
+        return u64::MAX;
+    };
+    // SAFETY: the private scratch is initialized exactly once before any read.
+    unsafe { output.write(plan) };
+    u64::from(count)
 }

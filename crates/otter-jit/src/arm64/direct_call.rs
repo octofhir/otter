@@ -6,6 +6,8 @@
 //!   native entry, return, and cold deoptimization.
 //! - [`emit_direct_call_with_access`] — the same linkage over allocator-owned
 //!   value locations and caller-provided root restoration.
+//! - [`runtime_forward`] — actual-target frame setup after a leaf admission.
+//! - [`completion`] — one return/throw/deopt/cleanup implementation for both.
 //!
 //! # Invariants
 //! - Plain, method, and spread call entry/return execute entirely in generated code.
@@ -53,7 +55,10 @@
 //! - `otter-vm/src/native_abi/code_entry.rs` — stable generation leases.
 //! - `otter-vm/src/native_abi/frame.rs` — stack-register root ownership.
 
+mod completion;
 mod layout;
+mod runtime_forward;
+pub(crate) use runtime_forward::emit_runtime_forward;
 
 use layout::StackLayout;
 
@@ -914,8 +919,8 @@ pub(crate) fn emit_direct_call_with_access<Load, Store, Restore, RootReceiver, R
     done: DynamicLabel,
     context_register: u8,
     mut load: Load,
-    mut store: Store,
-    mut restore_roots: Restore,
+    store: Store,
+    restore_roots: Restore,
     mut root_receiver: RootReceiver,
     mut refresh_roots: Refresh,
 ) -> Result<(), Unsupported>
@@ -933,13 +938,6 @@ where
     let generation_ready = ops.new_dynamic_label();
     let uncommitted_rejected = ops.new_dynamic_label();
     let entry_rejected = ops.new_dynamic_label();
-    let callee_returned = ops.new_dynamic_label();
-    let callee_bailed = ops.new_dynamic_label();
-    let callee_threw = ops.new_dynamic_label();
-    let result_ready = ops.new_dynamic_label();
-    let cleanup = ops.new_dynamic_label();
-    let returned = ops.new_dynamic_label();
-    let cleanup_abrupt = ops.new_dynamic_label();
     let caller_bail = ops.new_dynamic_label();
     let construct_prepare_error = ops.new_dynamic_label();
     let construct_prepare_throw = ops.new_dynamic_label();
@@ -1798,310 +1796,31 @@ where
         direct_call,
     );
 
-    let return_start = ops.offset().0;
-    let invalid_callee_result = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x1, abi::NativeResultStatus::SideExit as u32
-        ; b.eq =>callee_bailed
-        ; cmp x1, abi::NativeResultStatus::Success as u32
-        ; b.eq =>callee_returned
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>callee_threw
-        ; cmp x1, abi::NativeResultStatus::Fatal as u32
-        ; b.eq =>result_ready
-        ; b =>invalid_callee_result
-        ; =>callee_threw
-    );
-    emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
-    emit_reset_generated_bail_streak(ops);
-    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>invalid_callee_result);
-    emit_fatal_pair(ops);
-    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
-    if site.form.prepared_receiver().is_some() {
-        let result_start = ops.offset().0;
-        let object = ops.new_dynamic_label();
-        let primitive = ops.new_dynamic_label();
-        let ready = ops.new_dynamic_label();
-        emit_object_type_branch(ops, relocations, view, 0, [9, 10, 11], object, primitive);
-        dynasm!(ops
-            ; .arch aarch64
-            ; =>primitive
-            ; ldr x0, [sp, NATIVE_FRAME_THIS_OFFSET]
-            ; b =>ready
-            ; =>object
-            ; =>ready
-            ; mov x1, xzr
-        );
-        record_region(
-            &mut code_map,
-            "directConstructResultFast",
-            result_start,
-            ops.offset().0,
-            site,
-            direct_call,
-        );
-    }
-    if site.form.is_derived() {
-        let result_start = ops.offset().0;
-        let object = ops.new_dynamic_label();
-        let primitive = ops.new_dynamic_label();
-        let cold = ops.new_dynamic_label();
-        let ready = ops.new_dynamic_label();
-        let invalid_construct_result = ops.new_dynamic_label();
-        emit_object_type_branch(ops, relocations, view, 0, [9, 10, 11], object, primitive);
-        dynasm!(ops ; .arch aarch64 ; =>primitive);
-        emit_load_u64(ops, 9, VALUE_UNDEFINED);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp x0, x9
-            ; b.ne =>cold
-            ; ldr x2, [sp, NATIVE_FRAME_THIS_OFFSET]
-        );
-        emit_load_u64(ops, 9, VALUE_HOLE);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp x2, x9
-            ; b.eq =>cold
-            ; mov x0, x2
-            ; b =>ready
-            ; =>object
-            ; b =>ready
-        );
-        record_region(
-            &mut code_map,
-            "directConstructResultFast",
-            result_start,
-            ops.offset().0,
-            site,
-            direct_call,
-        );
-        dynasm!(ops ; .arch aarch64 ; =>cold);
-        let cold_start = ops.offset().0;
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x1, x0
-            ; ldr x2, [sp, NATIVE_FRAME_THIS_OFFSET]
-            ; mov x0, X(context_register)
-        );
-        emit_runtime_stub(
-            ops,
-            relocations,
-            16,
-            derived_construct_result_entry,
-            abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x1, abi::NativeResultStatus::Success as u32
-            ; b.eq =>ready
-            ; cmp x1, abi::NativeResultStatus::Throw as u32
-            ; b.eq =>callee_threw
-            ; cmp x1, abi::NativeResultStatus::Fatal as u32
-            ; b.eq =>result_ready
-            ; b =>invalid_construct_result
-        );
-        dynasm!(ops ; .arch aarch64 ; =>invalid_construct_result);
-        emit_fatal_pair(ops);
-        dynasm!(ops ; .arch aarch64 ; b =>result_ready);
-        record_region(
-            &mut code_map,
-            "directConstructResultThrow",
-            cold_start,
-            ops.offset().0,
-            site,
-            direct_call,
-        );
-        dynasm!(ops ; .arch aarch64 ; =>ready);
-    }
-    emit_reset_generated_bail_streak(ops);
-    dynasm!(ops
-        ; .arch aarch64
-        ; b =>result_ready
-        ; =>callee_bailed
-        ; mov x7, x0
-        ; ldr w14, [sp, NATIVE_FRAME_PC_OFFSET]
-        ; cmp x0, x14
-        ; b.eq >callee_bail_pc_valid
-    );
-    emit_fatal_pair(ops);
-    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; callee_bail_pc_valid:);
-    emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_DEOPTS_OFFSET);
-    emit_increment_feedback_u32(ops, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET);
-    let invalid_deopt_result = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x0, X(context_register)
-        ; mov x1, sp
-    );
-    emit_load_u64(ops, 2, u64::from(site.caller_function_id));
-    emit_load_u64(ops, 3, u64::from(site.logical_pc));
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x4, [x25, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
-        ; ldr x5, [sp, layout.caller_code_object_id]
-    );
-    emit_load_u64(
-        ops,
-        6,
-        match site.form {
-            DirectCallForm::Plain { .. } => 0,
-            DirectCallForm::CallWithThis { .. } => 0,
-            DirectCallForm::Method { .. } => 1,
-            DirectCallForm::Construct { .. } => 2,
-            DirectCallForm::DerivedConstruct { .. } => 3,
-            DirectCallForm::SuperConstruct { .. } => 4,
-            DirectCallForm::DerivedSuperConstruct { .. } => 5,
-        },
-    );
-    emit_runtime_stub(
+    completion::emit(
         ops,
         relocations,
-        16,
+        view,
+        site.form,
+        site.dst,
+        site.caller_function_id,
+        site.logical_pc,
+        layout,
         deopt_entry,
-        abi::STUB_JIT_DEOPT_STACK_CALL,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x1, abi::NativeResultStatus::Success as u32
-        ; b.eq =>result_ready
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>callee_threw
-        ; cmp x1, abi::NativeResultStatus::Fatal as u32
-        ; b.eq =>result_ready
-        ; b =>invalid_deopt_result
-    );
-    dynasm!(ops ; .arch aarch64 ; =>invalid_deopt_result);
-    emit_fatal_pair(ops);
-    dynasm!(ops ; .arch aarch64 ; b =>result_ready);
-    dynasm!(ops ; .arch aarch64 ; =>result_ready ; b =>cleanup);
-    record_region(
-        &mut code_map,
-        "directCallReturn",
-        return_start,
-        ops.offset().0,
-        site,
-        direct_call,
-    );
-
-    let cleanup_start = ops.offset().0;
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>cleanup
-        // Restore caller publication before retiring the callee generation.
-        ; ldr x13, [sp, layout.caller_frame]
-        ; ldr x15, [sp, layout.caller_code_object_id]
-        ; str x13, [X(context_register), NATIVE_FRAME_OFFSET]
-        ; ldr x14, [X(context_register), THREAD_OFFSET]
-        ; stp x13, x15, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
-        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, #1
-        ; str x10, [x9]
-        ; ldr x11, [X(context_register), ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #3
-        ; str xzr, [x12]
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x25, [sp, layout.saved_x25]
-    );
-    emit_release_linkage(ops, &layout);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x1, abi::NativeResultStatus::Success as u32
-        ; b.eq =>returned
-        ; b =>cleanup_abrupt
-    );
-    dynasm!(ops ; .arch aarch64 ; =>returned);
-    restore_roots(ops)?;
-    store(ops, site.dst, 0, 0)?;
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>cleanup_abrupt);
-    let cleanup_throw = ops.new_dynamic_label();
-    let cleanup_fatal = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>cleanup_throw
-        ; cmp x1, abi::NativeResultStatus::Fatal as u32
-        ; b.eq =>cleanup_fatal
-    );
-    emit_fatal_pair(ops);
-    dynasm!(ops ; .arch aarch64 ; =>cleanup_fatal);
-    restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>fatal ; =>cleanup_throw ; mov x17, x0);
-    restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
-    record_region(
-        &mut code_map,
-        "directCallCleanup",
-        cleanup_start,
-        ops.offset().0,
-        site,
-        direct_call,
-    );
-
-    // Entry rejection owns no JS effects or published callee frame.
-    let entry_reject_start = ops.offset().0;
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>entry_rejected
-        ; ldr x25, [sp, layout.saved_x25]
-    );
-    emit_release_linkage(ops, &layout);
-    dynasm!(ops
-        ; .arch aarch64
-        ; b =>caller_bail
-        ; =>uncommitted_rejected
-        ; ldr x25, [sp, layout.saved_x25]
-    );
-    emit_release_linkage(ops, &layout);
-    dynasm!(ops
-        ; .arch aarch64
-        ; b =>caller_bail
-    );
-    record_region(
-        &mut code_map,
-        "directCallEntryReject",
-        entry_reject_start,
-        ops.offset().0,
-        site,
-        direct_call,
-    );
-
-    dynasm!(ops ; .arch aarch64 ; =>caller_bail);
-    restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>bail);
-
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>construct_prepare_error
-        ; ldr x25, [sp, layout.saved_x25]
-    );
-    emit_release_linkage(ops, &layout);
-    restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>finish_error);
-
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>construct_prepare_throw
-        ; mov x17, x0
-        ; ldr x25, [sp, layout.saved_x25]
-    );
-    emit_release_linkage(ops, &layout);
-    restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
-
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>construct_prepare_fatal
-        ; ldr x25, [sp, layout.saved_x25]
-    );
-    emit_release_linkage(ops, &layout);
-    restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>fatal);
-
-    Ok(())
+        derived_construct_result_entry,
+        |kind, start, end| record_region(&mut code_map, kind, start, end, site, direct_call),
+        bail,
+        finish_error,
+        throw_value,
+        fatal,
+        done,
+        uncommitted_rejected,
+        entry_rejected,
+        caller_bail,
+        construct_prepare_error,
+        construct_prepare_throw,
+        construct_prepare_fatal,
+        context_register,
+        store,
+        restore_roots,
+    )
 }

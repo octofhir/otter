@@ -759,6 +759,7 @@ pub enum JitDirectCallKind {
 }
 
 /// `this` binding performed by compiler-generated call linkage.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JitDirectCallThisMode {
@@ -897,19 +898,24 @@ pub struct JitStaticNativeCall {
 ///
 /// This is metadata only: frame reservation/rooting stays VM-owned, while the
 /// backend consumes `entry_cell` once it can emit the matching frame build and
-/// call/return sequence.
+/// call/return sequence. Runtime-selected linkage uses this same carrier in
+/// aligned native scratch: `repr(C)` and explicit field offsets expose only the
+/// initialized primitive fields needed by generated code. Padding and Rust
+/// option/enum payload layouts are never decoded. It contains no moving roots
+/// and is private VM/JIT plumbing, not an embedding or external ABI.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitDirectCallPlan {
     /// Callee function id in the executable module.
     pub function_id: u32,
-    /// Generation current when this cold compile plan was captured. Generated
+    /// Generation current when this plan was captured. Generated
     /// code uses it only for diagnostics; dispatch follows [`Self::entry_cell`].
     pub code_object_id: u64,
     /// Stable address of the function's
     /// [`crate::native_abi::FunctionEntryCell`]. The cell is registry-owned,
     /// never reused, and atomically selects the current generation.
     pub entry_cell: u64,
-    /// Native tier current when this cold compile plan was captured.
+    /// Native tier current when this plan was captured.
     pub tier: NativeFrameKind,
     /// Exact plain-call `this` binding the generated linkage must perform.
     pub this_mode: JitDirectCallThisMode,

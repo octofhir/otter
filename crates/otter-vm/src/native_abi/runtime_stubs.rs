@@ -1636,6 +1636,19 @@ pub const STUB_JIT_COPY_FORWARDED_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
+/// Resolve current ordinary-call metadata into native scratch and count live
+/// forwarded actuals. Returns the count or u64::MAX before any call effects.
+pub const STUB_JIT_FORWARD_CALL_PLAN: RuntimeStubDescriptor = descriptor(
+    97,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Variadic,
+    3,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::ValueWord,
+    NativeResultDomain::None,
+);
+
 /// Complete the exact published schema-owned binding operation from two boxed
 /// values. Function/PC identity selects the semantic family and operand roles
 /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
@@ -1798,6 +1811,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         94 => "jit_call_forward_arguments",
         95 => "jit_forward_argument_count",
         96 => "jit_copy_forwarded_arguments",
+        97 => "jit_forward_call_plan",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1900,6 +1914,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CALL_FORWARD_ARGUMENTS,
     STUB_JIT_FORWARD_ARGUMENT_COUNT,
     STUB_JIT_COPY_FORWARDED_ARGUMENTS,
+    STUB_JIT_FORWARD_CALL_PLAN,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

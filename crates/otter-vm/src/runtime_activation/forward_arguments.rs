@@ -2,10 +2,11 @@
 //!
 //! # Contents
 //! - Eligibility/count probe for an already-resolved intrinsic apply.
+//! - Runtime-selected ordinary target admission and current generation lookup.
 //! - Complete live-argument copy into an unpublished generated callee.
 //!
 //! # Invariants
-//! - Neither operation allocates in the GC heap or invokes JavaScript.
+//! - These operations neither allocate in the GC heap nor invoke JavaScript.
 //! - Frame and window pointers remain engine-private and are validated before use.
 //! - A rejected probe or copy leaves all JavaScript effects to canonical completion.
 //!
@@ -36,6 +37,44 @@ impl RuntimeCall<'_> {
             RuntimeFrameIdentity::StackOwned => None,
         };
         vm.elided_forward_argument_count(stack, &frame, materialized)
+    }
+
+    /// Resolve a runtime-selected ordinary bytecode target without allocation.
+    /// Function admission is shared with compile-time call baking. The result
+    /// contains stable engine metadata only; receiver binding and native-stack
+    /// reservation must still be proved before the callee is published.
+    pub fn forwarded_call_plan(
+        &self,
+        callee: crate::Value,
+    ) -> Option<crate::jit::JitDirectCallPlan> {
+        // SAFETY: these services belong to the live bound activation. No
+        // allocation, compilation or JavaScript reentry occurs during lookup.
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let source = unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }.ok()?;
+        let caller = context.exec_function(source.function_id())?;
+        let call_pc = unsafe { self.frame.as_ref() }.header.pc;
+        vm.record_call_attempt_feedback(caller, call_pc, source.function_id());
+        let (function_id, captures, flags) = if let Some(function_id) = callee.as_function() {
+            (function_id, 0, 0)
+        } else {
+            let closure = callee.as_closure(&vm.gc_heap)?;
+            let header = closure.call_header(&vm.gc_heap);
+            if header.requires_runtime_setup() {
+                return None;
+            }
+            (header.function_id, header.upvalue_count, header.flags)
+        };
+        let function = context.exec_function(function_id)?;
+        if !function.admits_generated_call(crate::jit::JitDirectCallKind::Plain)
+            || captures != u32::from(function.inherited_upvalue_count)
+            || (!(function.is_strict || function.is_arrow)
+                && flags & crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS != 0)
+        {
+            return None;
+        }
+        vm.record_resolved_bytecode_call_feedback(caller, call_pc, source.function_id(), callee);
+        vm.current_direct_callee_plan(function)
     }
 
     /// Copy the caller's live argument values into a private generated callee.

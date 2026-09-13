@@ -625,6 +625,15 @@ or unsupported target uses the committed canonical call exactly once. This
 forwarding path currently lowers in Template; the callee may enter either native
 tier.
 
+A saturated population or bounded candidate miss also has runtime-selected native
+dispatch. `runtimeForwardCallFrameSetup` and `runtimeForwardCallNativeEntry` mark
+its source site. The leaf probe admits the actual ordinary callable and obtains
+its permanent entry cell; generated code builds the same bounded frame and uses
+the common return/throw/deopt cleanup. These regions have caller/PC attribution
+and no `directCall` target payload: the target is selected at execution time.
+Region presence proves emitted coverage, not a hit count. Missing code, unsupported
+semantics, exposed arguments and stack-capacity misses keep canonical completion.
+
 `linkageBytes` is the exact caller-owned `NativeFrame`, tagged register window,
 bookkeeping, and alignment. `reservedStackBytes` is the planning-time sum with
 the captured target prologue. When forwarded actual arity determines the window

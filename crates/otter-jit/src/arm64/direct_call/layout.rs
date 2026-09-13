@@ -62,6 +62,12 @@ impl StackLayout {
         )
     }
 
+    /// Minimum shared prefix for a runtime-selected target. Window offsets are
+    /// computed from its admitted metadata; completion consumes only controls.
+    pub(super) fn dynamic_prefix() -> Self {
+        Self::for_windows(0, 0, 0, true).expect("native control prefix fits the call bound")
+    }
+
     pub(super) fn for_forward(target: &JitDirectCallee) -> Option<Self> {
         target
             .plan

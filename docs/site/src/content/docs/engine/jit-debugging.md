@@ -610,6 +610,11 @@ deopt. An own iterator, prototype replacement, accessor, or non-Array source
 misses before observable work and resumes the materialized opcode path. A
 generated-call deopt at that guard is therefore a semantic fallback, while
 repeated deopts at the default Array collection PCs indicate a regression.
+Ordinary-call `inlineCandidate.bakeRejection.kind` distinguishes `polymorphic`
+(a retained bounded target population) from `megamorphic` (saturated feedback).
+An inline rejection does not by itself describe the final call implementation;
+join it with direct-call planning/lowering and compile outcome events.
+
 Forwarded intrinsic `apply` calls use `argumentMode: "forward"` and the same
 linkage regions. `targetIndex` / `targetCount` identify the bounded candidate
 population at each planning/lowering stage. A target that fails layout admission

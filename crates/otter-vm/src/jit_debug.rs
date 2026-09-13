@@ -172,8 +172,10 @@ pub enum JitDebugCompileOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum JitInlineRejectionReason {
-    /// The call site observed multiple possible callees.
+    /// The call site retains a bounded population of multiple callees.
     Polymorphic,
+    /// The ordinary-call population saturated; no bounded target list remains.
+    Megamorphic,
     /// The monomorphic target is a static native handled by dedicated leaf
     /// codegen rather than bytecode-body inlining.
     StaticNative {

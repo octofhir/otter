@@ -643,6 +643,19 @@ No larger target cap, duplicate registry, full gate or new benchmark baseline.
 The authoritative handoff was shortened; superseded history is preserved in
 `scratchpad/JIT_LANE_HISTORY_2026_09_13.md`.
 
+Saturated ordinary feedback now has a distinct `megamorphic` inline-rejection
+tag. A nine-distinct-body forwarding corpus preserves mapped inputs and exact
+checksums across all tiers, and requires the explicit saturation event. The
+existing two-target replan regression keeps bounded polymorphism distinct.
+Current-generation plan selection also reads the registry-owned publication
+directly instead of scanning all historical generation cells. Cell retention and
+single-mutator publication remain the authority; no reverse index was added.
+Final forwarding9/9, the extended publication/lifetime unit and VM lib clippy
+pass; the new fixture also passed GC+verify1 before the lookup-only edit. Evidence:
+`benchmarks/results/s2-20260913-saturated-targets/README.md`.
+These changes establish diagnosis/lookup for general dispatch, not native
+execution of saturated calls. Shared dynamic linkage and Machine CFG are open.
+
 The intended replacement path remains:
 
 ```text

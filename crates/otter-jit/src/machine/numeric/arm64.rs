@@ -102,6 +102,8 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_bytecode::opcode_schema::{
     BindingRead, BindingSemantics, BindingWrite, BindingWriteCheck,
 };
+pub(super) mod inline_calls;
+
 use otter_vm::{
     JitCompileSnapshot, JitElementAccess, UPVALUE_CELL_TYPE_TAG, Value,
     deopt::DeoptRuntime,
@@ -2888,6 +2890,21 @@ pub(super) fn emit(
                     )?;
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
+                    let packet = super::value_packet_frame(sequence)?;
+                    let inline_start = packet
+                        .raw_start
+                        .checked_add(packet.raw_words)
+                        .ok_or(Unsupported::OperandShape("inline native frame start"))?;
+                    let publication_fail = ops.new_dynamic_label();
+                    inline_calls::enter(
+                        &mut ops,
+                        view,
+                        frame,
+                        instruction,
+                        site,
+                        inline_start,
+                        publication_fail,
+                    )?;
                     let result_index = descriptor.arguments.len();
                     // An explicit-receiver call carries its receiver as
                     // operand one; the linkage takes it through the call form
@@ -3097,6 +3114,7 @@ pub(super) fn emit(
                                 // x17 is outside regalloc2's allocatable bank and
                                 // survives the activation-root descriptor cleanup.
                                 dynasm!(ops ; .arch aarch64 ; mov x17, x0);
+                                inline_calls::leave(ops, frame, instruction, inline_start)?;
                                 emit_clear_machine_roots(ops);
                                 emit_reload_safepoint_roots(ops, frame, site)?;
                                 dynasm!(ops ; .arch aarch64 ; mov x0, x17);
@@ -3291,6 +3309,10 @@ pub(super) fn emit(
                             dynasm!(ops ; .arch aarch64 ; b =>deopt);
                         }
                     }
+                    dynasm!(ops ; .arch aarch64 ; b =>direct_bail ; =>publication_fail);
+                    emit_clear_machine_roots(&mut ops);
+                    emit_reload_safepoint_roots(&mut ops, frame, site)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>deopt);
                     dynasm!(ops
                         ; .arch aarch64
                         ; =>direct_bail

@@ -756,6 +756,7 @@ mod tests {
         }]);
         let safepoints = [SafepointRecord {
             inline_frames: Box::default(),
+            inline_frames_published: false,
             id: 3,
             frame_state: 0,
             tagged_locations: vec![TaggedLocation::frame_slot(1)],

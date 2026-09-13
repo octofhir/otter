@@ -9,6 +9,8 @@
 //! - Every descendant value comes from its exact allocator root save slot.
 //! - Source PCs belong to each frame's function, independently of property facts.
 //! - Only suspended parents adjust an after-call PC back to its call site.
+//! - Generated construct calls mark physical publication in the same record;
+//!   runtime decoding never republishes those descendants.
 
 use super::*;
 use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry};
@@ -116,6 +118,8 @@ pub(super) fn prepare_safepoints(
             .get_mut(safepoint_id as usize)
             .ok_or(Unsupported::OperandShape("inline reentry record"))?;
         record.inline_frames = frames;
+        record.inline_frames_published = matches!(cold.opcode, MachineOpcode::Call(descriptor)
+            if matches!(sequence.call_descriptors()[descriptor as usize].target, CallTarget::Direct { .. }));
     }
     Ok(())
 }

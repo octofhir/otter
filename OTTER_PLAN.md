@@ -580,10 +580,23 @@ construct-call sibling, while hits enter the body with this/closure/new.target.
 Parameter and body exits reconstruct that same receiver. Constructor field
 programs are source-owned; base object-return selection and the cold-call result
 join in SSA. No second allocator or emitter-hidden runtime call is introduced.
-Next: allow the enclosing helper to splice across that explicit cold construct
-call with correct source/argument ownership; add incoming-argument recipes and
-contextual initialize.apply specialization, then alias-preserving virtual-object
-materialization and escape analysis. No allocation-elimination or speed claim.
+Enclosing helpers now splice across that explicit cold construct call. Fixed
+argument spans and source-owned direct targets are remapped into the outer SSA
+graph. Its reserved stack area publishes canonical parent NativeFrames only
+around the cold generated call; the existing activation cursor traces moving
+values and supplies exact source stacks. Safepoint inlineFramesPublished records
+that publication, preventing duplicate runtime reconstruction. Generated callee
+deopt validates the actual helper source/PC and all physical parents against the
+outer generation's exact safepoint, instead of requiring source and owner ids to
+be equal. Four-frame construction/deopt is covered with one allocated receiver.
+Next: explicit closure-cell operands for captured reads in spliced bodies, then
+incoming-argument recipes and contextual initialize.apply specialization;
+alias-preserving virtual-object materialization and escape analysis follow.
+A cold outer compile can also precede callee target availability: contextual
+feedback refresh must make such missed opportunities revisitable. Do not mask
+that admission issue with performance claims from warmed fixtures.
+No compatibility protocol, allocation-elimination or speed claim.
+Evidence: benchmarks/results/a2-20260913-inline-construct-calls/README.md.
 Evidence: benchmarks/results/a2-20260913-construct-frames/README.md.
 Current constructor slice: benchmarks/results/a2-20260913-constructor-splice/README.md.
 Evidence: benchmarks/results/a2-20260913-context-audit/README.md. No timing claim.

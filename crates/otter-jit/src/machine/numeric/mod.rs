@@ -246,12 +246,14 @@ pub(crate) fn try_compile(
             .iter()
             .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let method_packet = value_packet_frame(&sequence)?;
+    let inline_frame_words = arm64::inline_calls::frame_words(&sequence)?;
     let frame = arm64::frame_layout_with_raw_slots(
         &allocation,
         machine_safepoints.root_slot_count(),
         method_packet
             .raw_start
             .checked_add(method_packet.raw_words)
+            .and_then(|words| words.checked_add(inline_frame_words))
             .ok_or(Unsupported::OperandShape("scalar value-span packet frame"))?,
     )?;
     let deopt_table = lower_deopt_table(
@@ -2198,7 +2200,13 @@ fn select_with_packed_double_view_caches(
                     });
                     let descriptor = direct_call_descriptor(
                         target,
-                        hir,
+                        hir.frame_states
+                            .iter()
+                            .find(|state| state.point == NumericFramePoint::Node(node_value))
+                            .and_then(|state| state.frames.last())
+                            .filter(|frame| frame.byte_pc == byte_pc)
+                            .ok_or(super::VerificationError::InvalidValue(result))?
+                            .function_id,
                         logical_pc,
                         byte_pc,
                         argument_mode,
@@ -2343,6 +2351,19 @@ fn select_with_packed_double_view_caches(
                         ));
                     }
                 }
+            }
+            if matches!(node, NumericNode::DirectCall { .. }) {
+                let state_index = *frame_state_indices
+                    .get(&frame_point)
+                    .ok_or(super::VerificationError::InvalidValue(result))?;
+                inline_reentry::select_frames(
+                    hir,
+                    state_index,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    &mut instruction,
+                );
             }
             attach_safepoint_roots(&representations, &mut instruction);
             instructions.push(instruction);
@@ -2937,7 +2958,7 @@ fn generic_element_call_descriptor(
 
 fn direct_call_descriptor(
     target: &NumericDirectCallTarget,
-    hir: &NumericFunction,
+    caller_function_id: u32,
     logical_pc: u32,
     byte_pc: u32,
     argument_mode: DirectCallArgumentMode,
@@ -2970,7 +2991,7 @@ fn direct_call_descriptor(
                     callee: candidate.callee,
                 })
                 .collect(),
-            caller_function_id: hir.function_id,
+            caller_function_id,
             logical_pc,
             byte_pc,
         },

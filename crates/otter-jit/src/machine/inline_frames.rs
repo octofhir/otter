@@ -1,10 +1,11 @@
-//! Boxed inline-frame operands at committed Machine reentry.
+//! Boxed inline-frame operands at Machine reentry and generated calls.
 //!
 //! # Contents
 //! - Verification of the shared frame schema against explicit safepoint roots.
 //!
 //! # Invariants
-//! - Only committed named-property and binding cold calls carry these recipes.
+//! - Committed property/binding calls and single-target generated constructors
+//!   carry complete descendant recipes at their exact safepoint.
 //! - The published caller is represented by source identity, never copied slots.
 //! - Every descendant value is tagged and an explicit allocator-visible root.
 
@@ -22,12 +23,16 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
             return Err(invalid());
         };
         let descriptor = &sequence.call_descriptors[descriptor as usize];
-        if !matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
+        let direct = matches!(&descriptor.target, CallTarget::Direct {
+            kind: DirectCallKind::Construct, argument_mode: DirectCallArgumentMode::Fixed, candidates, ..
+        } if candidates.len() == 1);
+        if (!direct
+            && !matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
             if target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY
                 || target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE
-                || target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY)
+                || target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY))
             || instruction.safepoint.is_none()
-            || instruction.deopt.is_some()
+            || instruction.deopt.is_some() != direct
             || frames.len() < 2
             || frames[0].entry.is_some()
             || !frames[0].slots.is_empty()
@@ -36,6 +41,15 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
         }
         let current = frames.last().ok_or_else(invalid)?;
         match descriptor.target {
+            CallTarget::Direct {
+                caller_function_id,
+                byte_pc,
+                ..
+            } => {
+                if (current.function_id, current.byte_pc) != (caller_function_id, byte_pc) {
+                    return Err(invalid());
+                }
+            }
             CallTarget::CommittedRuntime {
                 target, byte_pc, ..
             } if target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE => {

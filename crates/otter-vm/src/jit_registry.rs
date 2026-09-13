@@ -14,7 +14,7 @@
 //! - Dependency registration, exact-epoch entry consistency, and monotonic
 //!   invalidation.
 //! - `resolve_jit_registry_safepoint` — the machine-visible resolver behind
-//!   the published view.
+//!   the published view; borrowed safepoint records also validate inline callers.
 //!
 //! # Invariants
 //! - The registry is heap-boxed once at interpreter construction; its view and
@@ -752,12 +752,20 @@ impl JitCodeRegistry {
         affected.into_iter().collect()
     }
 
-    fn resolve(&self, code_object_id: u64, safepoint_id: SafepointId) -> *const SafepointRecord {
-        // Invalid code still resolves: an active frame may be executing it and
-        // its allocating stubs must keep rooting precisely until it retires.
+    /// Resolve immutable source/root metadata retained by an active generation.
+    pub(crate) fn safepoint_record(
+        &self,
+        code_object_id: u64,
+        safepoint_id: SafepointId,
+    ) -> Option<&SafepointRecord> {
+        // Invalid code still resolves: active frames keep rooting until retirement.
         self.codes
             .get(&code_object_id)
             .and_then(|registered| registered.code.safepoint_record(safepoint_id))
+    }
+
+    fn resolve(&self, code_object_id: u64, safepoint_id: SafepointId) -> *const SafepointRecord {
+        self.safepoint_record(code_object_id, safepoint_id)
             .map_or(std::ptr::null(), std::ptr::from_ref)
     }
 }

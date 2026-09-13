@@ -30,10 +30,10 @@
 //! - Descriptor changes that do not alter shape are still guarded: inherited
 //!   writable-data replay rechecks the direct prototype slot's writability.
 //! - Native lowering is narrower than VM replay: it admits a null receiver
-//!   prototype or a missing-key chain of at most two prototypes, and the
-//!   generated guard bound-checks the appended slot against the receiver's
-//!   live storage. Deeper chains and inherited writable data stay on the
-//!   runtime stub.
+//!   prototype, a missing-key chain of at most two prototypes, or direct
+//!   inherited writable data with an unmodified descriptor and no sidecar.
+//!   Generated guards bound-check the appended slot against live storage.
+//!   Deeper missing-key chains remain on the runtime stub.
 //! - Accessors, proxies, string wrapper objects, deep prototype hits,
 //!   non-writable inherited data, and dictionary-compatible objects remain
 //!   fallback paths.
@@ -83,13 +83,16 @@ pub(crate) struct StorePropertyTransition {
 pub(crate) struct LowerableStoreTransition {
     /// Parent shape guarded before the append.
     pub(crate) from_shape: ShapeHandle,
-    /// Direct-prototype shape for a missing-property proof, or null when the
+    /// Direct-prototype shape for the selected proof, or null when the
     /// receiver itself has a null prototype.
     pub(crate) prototype_shape: ShapeHandle,
     /// Shape of the direct prototype's own prototype when the missing-key
     /// chain is two links long, or null when the direct prototype is the
-    /// chain's end (or the receiver has no prototype).
+    /// chain's end (or the receiver has no prototype). Writable-data proofs
+    /// leave this null and impose no constraint on later links.
     pub(crate) prototype_chain_shape: ShapeHandle,
+    /// Native proof that permits creating the receiver's own property.
+    pub(crate) prototype_guard: crate::jit::JitPropertyIcPrototypeGuard,
     /// Canonical child shape published after the value append.
     pub(crate) to_shape: ShapeHandle,
     /// New inline own-slot index.
@@ -159,12 +162,13 @@ impl StorePropertyTransition {
             return None;
         }
 
-        let (prototype_shape, prototype_chain_shape) = match &self.kind {
+        use crate::jit::JitPropertyIcPrototypeGuard::{Missing, WritableData};
+        let (prototype_shape, prototype_chain_shape, prototype_guard) = match &self.kind {
             StorePropertyTransitionKind::OwnAdd => {
                 if prototype_value(obj, heap).is_some() {
                     return None;
                 }
-                (ShapeHandle::null(), ShapeHandle::null())
+                (ShapeHandle::null(), ShapeHandle::null(), Missing)
             }
             StorePropertyTransitionKind::PrototypeChainMissing { chain } => {
                 if chain.len() > 2 {
@@ -195,15 +199,31 @@ impl StorePropertyTransition {
                 if prototype_value(proto, heap).is_some() {
                     return None;
                 }
-                (shapes[0], shapes[1])
+                (shapes[0], shapes[1], Missing)
             }
-            StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => return None,
+            StorePropertyTransitionKind::DirectPrototypeWritableData { prototype_hit } => {
+                let proto = super::prototype(obj, heap)?;
+                if !super::supports_fast_property_ic(proto, heap)
+                    || !has_writable_own_data_slot_atom(proto, heap, self.atom_id, *prototype_hit)
+                    || !heap.read_payload(proto, |body| {
+                        !body.slot_attrs_overridden && body.exotic.handle.is_null()
+                    })
+                {
+                    return None;
+                }
+                let shape = object_shape(proto, heap);
+                if shape.is_null() || shape.offset() == 0 {
+                    return None;
+                }
+                (shape, ShapeHandle::null(), WritableData)
+            }
         };
 
         Some(LowerableStoreTransition {
             from_shape,
             prototype_shape,
             prototype_chain_shape,
+            prototype_guard,
             to_shape,
             slot: self.slot,
         })

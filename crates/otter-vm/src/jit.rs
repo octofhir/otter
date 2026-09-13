@@ -798,6 +798,18 @@ pub struct JitInlinePropertyHop {
     pub value_byte: u32,
 }
 
+/// Prototype proof used before an own-property add transition.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JitPropertyIcPrototypeGuard {
+    /// The complete guarded chain lacks the key (including a null prototype).
+    #[default]
+    Missing = 0,
+    /// The direct prototype owns writable data; its shape and unmodified
+    /// descriptor state suffice, regardless of later prototype links.
+    WritableData = 1,
+}
+
 /// One cache program lowered to the form generated code executes inline.
 ///
 /// This is the single description of a property fast path: the interpreter's
@@ -812,7 +824,7 @@ pub struct JitPropertyIcWay {
     pub receiver_shape: u32,
     /// Guarded shape of the direct prototype. For an existing-slot program it
     /// owns the loaded slot; `0` means the receiver owns the slot. For an add
-    /// transition it proves the property absent on that direct prototype;
+    /// transition it guards the direct prototype under `prototype_guard`;
     /// `0` means the receiver instead has a null prototype.
     pub holder_shape: u32,
     /// Byte offset of the slot inside the holder's value slab.
@@ -822,14 +834,18 @@ pub struct JitPropertyIcWay {
     /// changes the program into an append: `receiver_shape` is then the parent
     /// shape, `value_byte` is the new own slot, and `holder_shape` is either
     /// zero for a null receiver prototype or the guarded direct-prototype
-    /// shape for a completely missing property.
+    /// shape checked under `prototype_guard`.
     pub transition_shape: u32,
     /// For an add transition whose missing-key chain is two prototypes long,
     /// the guarded shape of the direct prototype's own prototype; `0` means
     /// the direct prototype (or the receiver) ends the chain. The guard
     /// proves the object after the last guarded link is null, so every
     /// object that ordinary `[[Set]]` would consult has a checked shape.
+    /// Writable-data programs leave this zero without constraining later links.
     pub chain_shape: u32,
+    /// Selects the prototype proof for an add transition; existing slots use
+    /// `Missing`. Writable-data programs never use `chain_shape`.
+    pub prototype_guard: JitPropertyIcPrototypeGuard,
 }
 
 impl JitPropertyIcWay {
@@ -846,13 +862,15 @@ impl JitPropertyIcWay {
     }
 }
 
-const _: [(); 20] = [(); std::mem::size_of::<JitPropertyIcWay>()];
+const _: [(); 24] = [(); std::mem::size_of::<JitPropertyIcWay>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitPropertyIcWay>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitPropertyIcWay, receiver_shape)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitPropertyIcWay, holder_shape)];
 const _: [(); 8] = [(); std::mem::offset_of!(JitPropertyIcWay, value_byte)];
 const _: [(); 12] = [(); std::mem::offset_of!(JitPropertyIcWay, transition_shape)];
 const _: [(); 16] = [(); std::mem::offset_of!(JitPropertyIcWay, chain_shape)];
+
+const _: [(); 20] = [(); std::mem::offset_of!(JitPropertyIcWay, prototype_guard)];
 
 /// One monomorphic native leaf call selected from ordinary-call feedback.
 ///

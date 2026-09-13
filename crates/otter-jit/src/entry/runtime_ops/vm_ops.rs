@@ -75,6 +75,7 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIc
         ways[slot].holder_shape = way.holder_shape;
         ways[slot].transition_shape = way.transition_shape;
         ways[slot].chain_shape = way.chain_shape;
+        ways[slot].prototype_guard = way.prototype_guard;
         ways[slot].receiver_shape = way.receiver_shape;
     }
 }
@@ -507,6 +508,7 @@ mod tests {
                     value_byte: 40,
                     transition_shape: 29,
                     chain_shape: 31,
+                    prototype_guard: otter_vm::jit::JitPropertyIcPrototypeGuard::WritableData,
                 },
             );
         }
@@ -515,5 +517,9 @@ mod tests {
         assert_eq!(cell.ways[0].transition_shape, 29);
         assert_eq!(cell.ways[0].chain_shape, 31);
         assert_eq!(cell.ways[0].receiver_shape, 17);
+        assert_eq!(
+            cell.ways[0].prototype_guard,
+            otter_vm::jit::JitPropertyIcPrototypeGuard::WritableData
+        );
     }
 }

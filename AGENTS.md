@@ -468,9 +468,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     no-allocation add-property transitions. A transition proves the parent
     shape, complete supported prototype topology, receiver extensibility, and
     inline slot capacity before publishing the child shape and value. The
-    current transition program covers null prototypes and a fast direct
-    terminal prototype; dictionary-backed `%Object.prototype%` additions stay
-    on the canonical store boundary. Runtime success or throw commits exactly
+    current transition program covers null prototypes, missing-key chains of
+    at most two fast prototypes, and direct inherited writable data with
+    guarded shape, descriptor state, and no exotic sidecar. Dictionary-backed
+    `%Object.prototype%` additions stay on the canonical store boundary. Runtime success or throw commits exactly
     once; a property miss never deoptimizes and replays the source operation.
     Property operations protected by a local catch remain on the Template tier
     until their fast probe and committed cold call become explicit Machine CFG

@@ -9,9 +9,8 @@
 //!   canonical store boundary without object corruption.
 //! - Same-layout descriptor invalidation after cell fill: a data load becomes
 //!   an accessor and a writable store becomes non-writable.
-//! - A local `try`/`catch` fixture that stays on Template until the property
-//!   fast probe and committed cold call are explicit Machine CFG before
-//!   register allocation.
+//! - A local `try`/`catch` fixture whose throwing getter reaches the Machine
+//!   landing pad through explicit committed status control without deopt.
 //!
 //! # Invariants
 //! - A cold named-property site stays in the complete Machine body; its first
@@ -497,7 +496,7 @@ function machineGenericPropertyCaught(target) {
   try {
     return target.value;
   } catch (error) {
-    return "caught:" + error.message;
+    return error.message;
   }
 }
 
@@ -553,7 +552,9 @@ fn runtime(artifacts: bool) -> Runtime {
         .jit_selection(JitSelection::ProductionTiered)
         .jit_osr_threshold(u32::MAX);
     if artifacts {
-        builder.jit_debug(JitDebugRequest::artifacts()).build()
+        builder
+            .jit_debug(JitDebugRequest::artifacts().with_events(true))
+            .build()
     } else {
         builder.build()
     }
@@ -944,7 +945,7 @@ fn accessor_and_proxy_effects_execute_once_and_preserve_moving_roots() {
 }
 
 #[test]
-fn generic_named_property_inside_local_catch_remains_non_machine() {
+fn generic_named_load_inside_local_catch_uses_explicit_machine_status() {
     let mut runtime = runtime(true);
     let setup = runtime
         .run_script(SourceInput::from_javascript(CATCH_SETUP), CATCH_MODULE)
@@ -965,13 +966,11 @@ fn generic_named_property_inside_local_catch_remains_non_machine() {
         "local-catch fixture must publish a materialized native artifact"
     );
     assert!(
-        function_bundles.iter().all(|bundle| {
-            bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .is_some_and(|file| !file.contents().starts_with(MACHINE_IR_HEADER))
-                || bundle.file(JitArtifactFileName::OptimizedIr).is_none()
-        }),
-        "a propagating named-property Machine call must not bypass a local catch"
+        function_bundles.iter().any(|bundle| bundle
+            .file(JitArtifactFileName::OptimizedIr)
+            .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))),
+        "local catch must use the Machine property cold/status CFG: {:?}",
+        setup.jit_debug_report()
     );
     drop(setup);
 
@@ -980,9 +979,17 @@ fn generic_named_property_inside_local_catch_remains_non_machine() {
         CATCH_PROBE,
         "jit-machine-generic-properties-catch-probe.js",
     );
-    assert_eq!(caught, r#"["caught:named-getter",1]"#);
+    assert_eq!(caught, r#"["named-getter",1]"#);
+    assert!(
+        delta.optimized_entries > 0,
+        "throwing getter must execute the Machine body: {delta:?}"
+    );
     assert_eq!(
-        delta.runtime_property_stubs, 1,
-        "the throwing named load must execute exactly once: {delta:?}"
+        delta.optimized_deopts, 0,
+        "property throw must remain in the Machine catch CFG: {delta:?}"
+    );
+    assert_eq!(
+        delta.runtime_property_stubs, 2,
+        "target.value and catch error.message each complete once: {delta:?}"
     );
 }

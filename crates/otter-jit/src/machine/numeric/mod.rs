@@ -6,6 +6,7 @@
 //!   reentrant calls, and catch landing pads.
 //! - `frame_state` — source-owned activation chains and complete SSA liveness.
 //! - `inlining` — guarded scalar callee CFG splicing before selection/allocation.
+//! - `property_cfg` — explicit named-load probe/cold/status/landing/join blocks.
 //! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - Derived-this committed operations split into generated and cold CFG
@@ -45,8 +46,11 @@
 //!   precise moving roots and effect-once completion. Tagged and generic
 //!   committed accesses inside local catch regions remain materialized until
 //!   Machine committed-throw landing is explicit.
-//! - Settled own-data property accesses likewise consume tagged late locations;
-//!   metadata and shape misses deopt at the original operation before effects.
+//! - Named-load probes consume tagged late locations and return payload, hit
+//!   and stable IC-address SSA values without a call or safepoint. Misses enter
+//!   an explicit rooted committed pair call; Success joins, Throw enters the
+//!   local catch or propagates, and Fatal exits. No property effect replays.
+//!   Stores retain a guarded committed boundary.
 //!   Stores whose pre-boxing scalar type proves a non-cell value omit both the
 //!   post-commit conditional generational barrier and its call clobbers.
 //! - Every schema-owned binding read, write, and delete expands before
@@ -95,6 +99,7 @@ mod boxed_arithmetic;
 mod frame_state;
 mod hir;
 mod inlining;
+mod property_cfg;
 mod semantics;
 
 use otter_vm::{
@@ -312,7 +317,6 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
         transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT),
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT),
-        transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
         transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
         transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
         transitions.entry(STUB_JIT_CALL_WITH_THIS_VALUE),
@@ -476,6 +480,12 @@ fn select_with_packed_double_view_caches(
             },
         );
     }
+    let property_values = selection_cfg
+        .properties
+        .keys()
+        .map(|&block| (block, property_cfg::Values::new(&mut representations)))
+        .collect::<BTreeMap<_, _>>();
+    let mut property_inputs = BTreeMap::new();
     let mut binding_inputs = BTreeMap::<usize, [Option<MachineValue>; 2]>::new();
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
     let mut call_descriptors = Vec::<CallDescriptor>::new();
@@ -499,6 +509,27 @@ fn select_with_packed_double_view_caches(
         let first = MachineInstructionId(instructions.len() as u32);
         let block_index = match *selected {
             SelectedBlock::Original(block_index) => block_index,
+            SelectedBlock::PropertyHit(block_index)
+            | SelectedBlock::PropertyCold(block_index)
+            | SelectedBlock::PropertySuccess(block_index)
+            | SelectedBlock::PropertyThrow(block_index)
+            | SelectedBlock::PropertyFatal(block_index)
+            | SelectedBlock::PropertyJoin(block_index) => {
+                blocks.push(property_cfg::select_block(
+                    *selected,
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    property_values[&block_index],
+                    property_inputs[&block_index],
+                    &values,
+                    &representations,
+                    &mut call_descriptors,
+                    &mut next_safepoint,
+                    &mut instructions,
+                )?);
+                continue;
+            }
             SelectedBlock::BindingHit(block_index) => {
                 blocks.push(select_binding_hit_block(
                     hir,
@@ -602,12 +633,19 @@ fn select_with_packed_double_view_caches(
                         Vec::new(),
                     ));
                 }
+                let property_exception = (property_cfg::exceptional(hir, predecessor)
+                    == Some(edge))
+                .then(|| property_cfg::site(hir, predecessor))
+                .flatten();
                 let binding_exception = binding_site(hir, predecessor)
                     .filter(|(_, _, exceptional)| *exceptional == Some(edge));
                 let successor_arguments = hir.blocks[predecessor].successor_arguments[edge]
                     .iter()
                     .zip(&hir.blocks[successor].parameters)
                     .map(|(&argument, &parameter)| {
+                        if property_exception == Some(argument) {
+                            return Ok(property_values[&predecessor].cold_payload);
+                        }
                         if let Some((binding, _, _)) = binding_exception
                             && argument == binding
                         {
@@ -631,7 +669,9 @@ fn select_with_packed_double_view_caches(
                 blocks.push(MachineBlockData {
                     first,
                     end,
-                    predecessors: vec![if binding_exception.is_some() {
+                    predecessors: vec![if property_exception.is_some() {
+                        selection_cfg.properties[&predecessor].cold
+                    } else if binding_exception.is_some() {
                         selection_cfg.bindings[&predecessor].cold
                     } else {
                         selection_cfg.normal_exit(predecessor)
@@ -695,6 +735,76 @@ fn select_with_packed_double_view_caches(
         for &node_value in &block.nodes {
             let result = values[node_value.0];
             let node = hir.nodes[node_value.0];
+            if let NumericNode::PropertyLoad {
+                receiver,
+                byte_pc,
+                exotic_length,
+                ..
+            } = node
+            {
+                if block.nodes.last().copied() != Some(node_value) {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(first));
+                }
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                property_inputs.insert(block_index, receiver);
+                let outputs = property_values[&block_index];
+                let mut probe = MachineInstruction::plain(
+                    MachineOpcode::PropertyLoad {
+                        site: Box::new(
+                            owned_property_site(hir, node_value, byte_pc)
+                                .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?
+                                .clone(),
+                        ),
+                        exotic_length,
+                    },
+                    vec![
+                        MachineOperand::location_input(receiver),
+                        MachineOperand::register_output(outputs.payload),
+                        MachineOperand::register_output(outputs.hit),
+                        MachineOperand::register_output(outputs.cell),
+                    ],
+                );
+                probe.clobbers = property_load_clobbers();
+                instructions.push(probe);
+                let mut branch = MachineInstruction::plain(
+                    MachineOpcode::BranchIf(true),
+                    vec![MachineOperand::register_input(outputs.hit)],
+                );
+                branch.control = ControlFlow::Branch;
+                instructions.push(branch);
+                let selected = selection_cfg.properties[&block_index];
+                let mut predecessors = incoming_edges(hir, block_index)
+                    .into_iter()
+                    .map(|(predecessor, edge)| {
+                        selection_cfg
+                            .split_edges
+                            .get(&(predecessor, edge))
+                            .copied()
+                            .unwrap_or_else(|| selection_cfg.normal_exit(predecessor))
+                    })
+                    .collect::<Vec<_>>();
+                predecessors.sort_unstable();
+                blocks.push(MachineBlockData {
+                    first,
+                    end: MachineInstructionId(instructions.len() as u32),
+                    predecessors,
+                    successors: vec![selected.hit, selected.cold],
+                    successor_arguments: vec![vec![], vec![]],
+                    parameters: block
+                        .parameters
+                        .iter()
+                        .map(|&value| machine_value(&values, value))
+                        .collect(),
+                });
+                selected_binding_guard = true;
+                break;
+            }
             if let NumericNode::Binding {
                 semantics,
                 inputs,
@@ -1458,41 +1568,8 @@ fn select_with_packed_double_view_caches(
                         .expect("bounded scalar function safepoint count");
                     call
                 }
-                NumericNode::PropertyLoad {
-                    receiver,
-                    byte_pc,
-                    exotic_length,
-                } => {
-                    let receiver = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        receiver,
-                    );
-                    let mut load = MachineInstruction::plain(
-                        MachineOpcode::PropertyLoad {
-                            site: Box::new(
-                                owned_property_site(hir, node_value, byte_pc)
-                                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(
-                                        MachineInstructionId(instructions.len() as u32),
-                                    ))?
-                                    .clone(),
-                            ),
-                            exotic_length,
-                        },
-                        vec![
-                            MachineOperand::location_input(receiver),
-                            MachineOperand::register_output(result),
-                            MachineOperand::tagged_root(receiver),
-                        ],
-                    );
-                    load.clobbers = property_load_clobbers();
-                    load.safepoint = Some(super::SafepointId(next_safepoint));
-                    next_safepoint = next_safepoint
-                        .checked_add(1)
-                        .expect("bounded scalar function safepoint count");
-                    load
+                NumericNode::PropertyLoad { .. } => {
+                    unreachable!("property probe is selected before ordinary nodes")
                 }
                 NumericNode::PropertyStore {
                     receiver,
@@ -2640,7 +2717,7 @@ fn owned_property_site(
 }
 
 fn property_load_clobbers() -> Vec<PhysicalRegister> {
-    TargetRegisterFile::aarch64_scalar_call_clobbers()
+    (9..=16).map(PhysicalRegister::integer).collect()
 }
 
 fn property_store_clobbers(_value_is_non_cell: bool) -> Vec<PhysicalRegister> {
@@ -3087,6 +3164,12 @@ enum SelectedBlock {
         edge: usize,
         successor: usize,
     },
+    PropertyHit(usize),
+    PropertyCold(usize),
+    PropertySuccess(usize),
+    PropertyThrow(usize),
+    PropertyFatal(usize),
+    PropertyJoin(usize),
     BindingHit(usize),
     BindingCold(usize),
     BindingSuccess(usize),
@@ -3110,6 +3193,7 @@ struct SelectionCfg {
     originals: Vec<MachineBlock>,
     split_edges: BTreeMap<(usize, usize), MachineBlock>,
     bindings: BTreeMap<usize, BindingSelectedBlocks>,
+    properties: BTreeMap<usize, property_cfg::Blocks>,
 }
 
 impl SelectionCfg {
@@ -3121,6 +3205,7 @@ impl SelectionCfg {
         let mut originals = vec![MachineBlock(u32::MAX); hir.blocks.len()];
         let mut split_edges = BTreeMap::new();
         let mut bindings = BTreeMap::new();
+        let mut properties = BTreeMap::new();
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
                 if is_critical_edge(hir, predecessor, successor)
@@ -3143,6 +3228,37 @@ impl SelectionCfg {
             }
             *original = MachineBlock(order.len() as u32);
             order.push(SelectedBlock::Original(successor));
+            if property_cfg::site(hir, successor).is_some() {
+                let hit = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::PropertyHit(successor));
+                let cold = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::PropertyCold(successor));
+                let success = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::PropertySuccess(successor));
+                let throw = property_cfg::exceptional(hir, successor)
+                    .is_none()
+                    .then(|| {
+                        let block = MachineBlock(order.len() as u32);
+                        order.push(SelectedBlock::PropertyThrow(successor));
+                        block
+                    });
+                let fatal = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::PropertyFatal(successor));
+                let join = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::PropertyJoin(successor));
+                properties.insert(
+                    successor,
+                    property_cfg::Blocks {
+                        hit,
+                        cold,
+                        success,
+                        throw,
+                        fatal,
+                        join,
+                    },
+                );
+                continue;
+            }
             let Some((_, target, exceptional_edge)) = binding_site(hir, successor) else {
                 continue;
             };
@@ -3181,13 +3297,19 @@ impl SelectionCfg {
             originals,
             split_edges,
             bindings,
+            properties,
         }
     }
 
     fn normal_exit(&self, block: usize) -> MachineBlock {
-        self.bindings
+        self.properties
             .get(&block)
-            .map_or(self.originals[block], |binding| binding.join)
+            .map(|property| property.join)
+            .unwrap_or_else(|| {
+                self.bindings
+                    .get(&block)
+                    .map_or(self.originals[block], |binding| binding.join)
+            })
     }
 }
 
@@ -3214,7 +3336,10 @@ fn binding_site(
 fn is_exceptional_hir_edge(hir: &NumericFunction, predecessor: usize, edge: usize) -> bool {
     hir.blocks[predecessor].nodes.iter().any(|value| {
         let exceptional_edge = match hir.nodes[value.0] {
-            NumericNode::Binding {
+            NumericNode::PropertyLoad {
+                exceptional_edge, ..
+            }
+            | NumericNode::Binding {
                 exceptional_edge, ..
             }
             | NumericNode::CommittedValue {
@@ -6409,6 +6534,7 @@ mod tests {
                     receiver: value(0),
                     byte_pc: 24,
                     exotic_length: false,
+                    exceptional_edge: None,
                 },
                 NumericNode::PropertyStore {
                     receiver: value(0),
@@ -6416,17 +6542,30 @@ mod tests {
                     byte_pc: 40,
                 },
             ],
-            blocks: vec![hir::NumericBlock {
-                logical_pc: 0,
-                osr_entry_allowed: true,
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                parameter_registers: Vec::new(),
-                successor_arguments: Vec::new(),
-                nodes: (0..4).map(value).collect(),
-                terminator: NumericTerminator::Return(value(2)),
-            }],
+            blocks: vec![
+                hir::NumericBlock {
+                    logical_pc: 0,
+                    osr_entry_allowed: true,
+                    predecessors: vec![],
+                    successors: vec![1],
+                    parameters: vec![],
+                    parameter_registers: vec![],
+                    successor_arguments: vec![vec![]],
+                    nodes: (0..3).map(value).collect(),
+                    terminator: NumericTerminator::Jump,
+                },
+                hir::NumericBlock {
+                    logical_pc: 1,
+                    osr_entry_allowed: false,
+                    predecessors: vec![0],
+                    successors: Vec::new(),
+                    parameters: Vec::new(),
+                    parameter_registers: Vec::new(),
+                    successor_arguments: Vec::new(),
+                    nodes: vec![value(3)],
+                    terminator: NumericTerminator::Return(value(2)),
+                },
+            ],
             frame_states: [
                 hir::NumericFrameState {
                     point: NumericFramePoint::Node(value(2)),
@@ -7911,7 +8050,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_settled_properties_with_tagged_late_locations_and_exact_deopts() {
+    fn selects_properties_with_explicit_load_completion_and_exact_store_state() {
         let hir = property_selection_hir();
         let sequence = select(&hir).expect("property Machine IR");
 
@@ -7931,7 +8070,7 @@ mod tests {
             &load.operands[..2],
             &[
                 MachineOperand::location_input(load_receiver),
-                MachineOperand::register_output(MachineValue(2)),
+                MachineOperand::register_output(load.operands[1].value),
             ]
         );
         assert_eq!(
@@ -7939,19 +8078,27 @@ mod tests {
             MachineRepresentation::Tagged
         );
         assert_eq!(load.clobbers, property_load_clobbers());
-        assert_eq!(load.deopt, Some(DeoptId(0)));
-        assert!(load.safepoint.is_some());
+        assert!(load.deopt.is_none());
+        assert!(load.safepoint.is_none());
+        assert_eq!(load.operands.len(), 4);
+        let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
+            MachineOpcode::Call(index) => matches!(sequence.call_descriptors()[index as usize].target, CallTarget::CommittedRuntime { target, .. } if target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
+            _ => false,
+        }).expect("explicit named-load cold call");
+        assert!(cold.safepoint.is_some());
+        assert!(cold.deopt.is_none());
         assert_eq!(
-            load.operands[3..]
-                .iter()
-                .map(|operand| (operand.value, operand.purpose))
-                .collect::<Vec<_>>(),
-            [
-                (MachineValue(0), OperandPurpose::Deopt),
-                (MachineValue(1), OperandPurpose::Deopt),
-            ]
+            cold.operands[0],
+            MachineOperand::location_input(load_receiver)
         );
-        assert_eq!(load.operands[2], MachineOperand::tagged_root(load_receiver));
+        assert_eq!(
+            cold.operands[1],
+            MachineOperand::location_input(load.operands[3].value)
+        );
+        assert!(
+            cold.operands
+                .contains(&MachineOperand::tagged_root(load_receiver))
+        );
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::BoxInt32
                 && instruction.operands.last().map(|operand| operand.value) == Some(load_receiver)
@@ -7992,7 +8139,7 @@ mod tests {
             MachineRepresentation::Tagged
         );
         assert_eq!(store.clobbers, property_store_clobbers(true));
-        assert_eq!(store.deopt, Some(DeoptId(1)));
+        assert_eq!(store.deopt, Some(DeoptId(0)));
         assert!(store.safepoint.is_some());
         assert_eq!(
             store.operands[2],
@@ -8114,6 +8261,37 @@ mod tests {
     }
 
     #[test]
+    fn property_load_selects_explicit_cold_status_cfg() {
+        let view = numeric_view(
+            1,
+            2,
+            vec![
+                (
+                    Op::LoadProperty,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        let hir = NumericFunction::build(&view).unwrap();
+        let sequence = select(&hir).expect("explicit property CFG");
+        assert!(
+            sequence
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.opcode, MachineOpcode::BranchNativeStatus))
+        );
+        let allocation = sequence
+            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .expect("property CFG allocation");
+        assert!(!allocation.normalized().is_empty());
+    }
+
+    #[test]
     fn property_selection_rejects_a_program_from_a_different_activation() {
         let mut hir = property_selection_hir();
         hir.property_sites
@@ -8207,7 +8385,7 @@ mod tests {
         )
         .expect("property deopt table");
         let exit = table
-            .lookup(DeoptExitId(1))
+            .lookup(DeoptExitId(0))
             .expect("property-store exit")
             .outermost();
         assert_eq!(exit.slots[0].repr, otter_vm::deopt::DeoptRepr::Int32);

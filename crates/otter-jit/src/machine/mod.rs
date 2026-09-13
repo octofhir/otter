@@ -34,15 +34,18 @@
 //!   Machine CFG before allocation, then verification proves the same liveness
 //!   independently of deoptimization metadata or the lowering path that
 //!   selected the call.
+//! - Named loads expose a no-call probe and a committed cold/status CFG.
+//!   Only the cold call roots tagged state; its raw IC pointer must come from
+//!   a property probe. Local catches consume the pure exception payload.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
 //!   and constructor targets remain monomorphic; an explicit-receiver call
 //!   and a base construct own at most one candidate and otherwise the generic
 //!   value call. A cold call exit owns no
 //!   inputs, effects, clobbers, roots, or safepoint and must carry an exact
 //!   pre-call deoptimization state.
-//! - Committed runtime calls own zero to two true tagged inputs and one GC
+//! - Committed runtime calls own zero to two explicit inputs and one GC
 //!   safepoint. Ordinary committed descriptors expose the tagged completion and
-//!   one exceptional edge; the binding descriptor instead exposes the physical
+//!   one exceptional edge; binding and named-load descriptors expose the physical
 //!   tagged payload plus descriptor-domain status to explicit Machine control.
 //!   Neither form can report a guard miss or request deoptimization/replay.
 //!   Trailing `TaggedRoot` metadata contains every true input plus the complete
@@ -551,9 +554,9 @@ pub enum CallTarget {
         /// Source byte offset for artifacts and exact pre-call deoptimization.
         byte_pc: u32,
     },
-    /// Effect-once JavaScript semantic completion through the fixed boxed-value
-    /// ABI. The physical entry always receives two values; operands beyond the
-    /// semantic arity are canonical `undefined` and are not Machine inputs.
+    /// Effect-once completion through a VM-declared fixed ABI. Boxed-value
+    /// entries pad omitted inputs with `undefined`; named loads instead take
+    /// one boxed receiver and a stable, untraced code-owned IC-cell address.
     /// Trailing `TaggedRoot` operands independently publish the complete live
     /// moving state, including unrelated values at a zero-arity operation. A
     /// descriptor may either collapse the committed status into an exceptional
@@ -566,7 +569,8 @@ pub enum CallTarget {
         logical_pc: u32,
         /// Source byte offset used by artifacts.
         byte_pc: u32,
-        /// Number of true boxed-value operands, in the range zero through two.
+        /// Number of explicit target inputs, in the range zero through two.
+        /// Named loads count the receiver and IC-cell address.
         semantic_arity: u8,
     },
     /// VM-planned JavaScript callee chain entered through generated stack-owned
@@ -684,7 +688,7 @@ fn is_explicit_committed_runtime_call(descriptor: &CallDescriptor) -> bool {
     matches!(
         &descriptor.target,
         CallTarget::CommittedRuntime { target, .. }
-            if target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
+            if (target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2 || *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY)
                 && target.result_abi
                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
                 && target.result_domain
@@ -918,7 +922,8 @@ pub enum MachineOpcode {
     },
     /// Clear every persistent packed-double view word at one semantic boundary.
     ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason),
-    /// Probe one source-owned named load, then commit its boxed cold boundary.
+    /// Probe one source-owned named load without allocation or reentry.
+    /// Outputs are the boxed payload, hit Boolean and stable IC-cell address.
     PropertyLoad {
         /// Owned source identity and settled program from this compilation site.
         site: Box<MachinePropertySite>,
@@ -2173,10 +2178,33 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
-                if matches!(
-                    instruction.opcode,
-                    MachineOpcode::PropertyLoad { .. } | MachineOpcode::PropertyStore { .. }
-                ) {
+                if matches!(instruction.opcode, MachineOpcode::PropertyLoad { .. }) {
+                    let [receiver, payload, hit, cell] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    if *receiver != MachineOperand::location_input(receiver.value)
+                        || self.representations[receiver.value.0 as usize]
+                            != MachineRepresentation::Tagged
+                        || [
+                            (*payload, MachineRepresentation::Tagged),
+                            (*hit, MachineRepresentation::Boolean),
+                            (*cell, MachineRepresentation::Int64),
+                        ]
+                        .iter()
+                        .any(|(operand, repr)| {
+                            *operand != MachineOperand::register_output(operand.value)
+                                || self.representations[operand.value.0 as usize] != *repr
+                        })
+                        || instruction.clobbers
+                            != (9..=16).map(PhysicalRegister::integer).collect::<Vec<_>>()
+                        || instruction.deopt.is_some()
+                        || instruction.safepoint.is_some()
+                        || instruction.control != ControlFlow::None
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(instruction.opcode, MachineOpcode::PropertyStore { .. }) {
                     let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
                     else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2450,6 +2478,8 @@ impl InstructionSequence {
                             ..
                         } => {
                             let semantic_arity = usize::from(*semantic_arity);
+                            let named_load =
+                                *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY;
                             let complete_effects = CallEffects::READS_HEAP
                                 .union(CallEffects::WRITES_HEAP)
                                 .union(CallEffects::INVALIDATES_SHAPES)
@@ -2470,16 +2500,15 @@ impl InstructionSequence {
                                 .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
                                 .map(|operand| operand.value)
                                 .collect::<std::collections::BTreeSet<_>>();
-                            let collapses_status = descriptor.results
-                                == [MachineRepresentation::Tagged]
+                            let collapses_status = !named_load
+                                && descriptor.results == [MachineRepresentation::Tagged]
                                 && descriptor.exceptional != ExceptionalEdge::None
                                 && *target != otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
                             let exposes_committed_status =
                                 is_explicit_committed_runtime_call(descriptor);
                             semantic_arity <= 2
-                                && target.signature
-                                    == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
-                                && target.argument_count == 2
+                                && (named_load || target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2)
+                                && target.argument_count == if named_load { 1 } else { 2 }
                                 && target.result_abi
                                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
                                 && target.result_domain
@@ -2489,9 +2518,7 @@ impl InstructionSequence {
                                 && target.exception
                                     == otter_vm::native_abi::RuntimeStubException::Status
                                 && descriptor.arguments.len() == semantic_arity
-                                && descriptor.arguments.iter().all(|representation| {
-                                    *representation == MachineRepresentation::Tagged
-                                })
+                                && (if named_load { descriptor.arguments == [MachineRepresentation::Tagged, MachineRepresentation::Int64] } else { descriptor.arguments.iter().all(|representation| *representation == MachineRepresentation::Tagged) })
                                 && (collapses_status || exposes_committed_status)
                                 && descriptor.effects == complete_effects
                                 && descriptor.clobbers
@@ -2499,9 +2526,12 @@ impl InstructionSequence {
                                 && descriptor.safepoint == SafepointKind::Gc
                                 && instruction.deopt.is_none()
                                 && inputs.len() == semantic_arity
+                                && (!named_load || self.instructions[..id.0 as usize].iter().any(|producer|
+                                    matches!(producer.opcode, MachineOpcode::PropertyLoad { .. })
+                                    && producer.operands.get(3).is_some_and(|cell| cell.value == inputs[1].value)))
                                 && inputs.iter().all(|operand| {
                                     **operand == MachineOperand::location_input(operand.value)
-                                        && roots.contains(&operand.value)
+                                        && (roots.contains(&operand.value) || (named_load && operand.value == inputs[1].value && self.representations[operand.value.0 as usize] == MachineRepresentation::Int64))
                                 })
                                 && outputs.iter().all(|operand| {
                                     operand.role == OperandRole::Definition

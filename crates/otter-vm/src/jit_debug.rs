@@ -8,6 +8,7 @@
 //!   materialization.
 //! - [`JitDebugReport`] — one owned current-format batch of events.
 //! - [`JitDebugState`] — isolate-local event storage used by the interpreter.
+//! - `property_runtime` — bounded per-site runtime store counters.
 //!
 //! # Invariants
 //! - Capture is disabled by default and a disabled [`JitDebugState`] owns no
@@ -15,7 +16,8 @@
 //! - Event payload construction is lazy: [`JitDebugState::record`] accepts a
 //!   closure and never calls it while capture is disabled.
 //! - Each batch retains at most [`JIT_DEBUG_EVENT_LIMIT`] events. Once full it
-//!   counts drops without invoking further payload builders.
+//!   counts drops without invoking further payload builders. Existing property
+//!   counters continue updating in place; their event position is first use.
 //! - Every public DTO owns its strings and collections. No event contains a raw
 //!   VM handle, isolate borrow, executable pointer, sink, lock, or registry.
 //! - Reports and events are output-only serialized DTOs. Their public
@@ -28,6 +30,10 @@
 //! - [`crate::Interpreter`] for the isolate that owns the corresponding state.
 
 use serde::{Deserialize, Serialize};
+
+mod property_runtime;
+pub use property_runtime::JitPropertyStorePath;
+use property_runtime::PropertyRuntimeIndices;
 
 /// Maximum number of events retained by one isolate capture batch.
 pub const JIT_DEBUG_EVENT_LIMIT: usize = 16_384;
@@ -457,6 +463,23 @@ pub enum JitDebugEvent {
         /// Monomorphic method bodies baked into the snapshot.
         inline_methods: u32,
     },
+    /// Aggregate runtime store observations; positioned at first observation.
+    PropertyStoreRuntime {
+        /// Global function id owning the source store.
+        function_id: u32,
+        /// Logical instruction PC, not an encoded byte offset.
+        instruction_pc: u32,
+        /// Owned property spelling from the validated executable instruction.
+        property_name: String,
+        /// Selected runtime path; failures name the path that failed.
+        path: JitPropertyStorePath,
+        /// The selected operation returned an error; prior effects are retained.
+        failed: bool,
+        /// Success offered a native IC way; this does not assert cell reuse.
+        native_way: bool,
+        /// Completed observations for this site/path/completion in this batch.
+        count: u64,
+    },
     /// One property site whose feedback settled into a guard chain the backend
     /// can emit from immediates, without loading the site's cache cell.
     ///
@@ -737,6 +760,7 @@ pub(crate) struct JitDebugState {
     request: JitDebugRequest,
     events: Option<Vec<JitDebugEvent>>,
     dropped_events: u64,
+    property_runtime: PropertyRuntimeIndices,
 }
 
 impl Default for JitDebugState {
@@ -752,6 +776,7 @@ impl JitDebugState {
             request,
             events: request.events_enabled().then(Vec::new),
             dropped_events: 0,
+            property_runtime: PropertyRuntimeIndices::default(),
         }
     }
 
@@ -767,11 +792,13 @@ impl JitDebugState {
     pub(crate) fn set_request(&mut self, request: JitDebugRequest) {
         self.request = request;
         self.events = request.events_enabled().then(Vec::new);
+        self.property_runtime = PropertyRuntimeIndices::default();
         self.dropped_events = 0;
     }
 
     /// Start a fresh top-level capture while preserving enabled-buffer capacity.
     pub(crate) fn begin_batch(&mut self) {
+        self.property_runtime.clear();
         if let Some(events) = self.events.as_mut() {
             events.clear();
         }
@@ -816,6 +843,7 @@ impl JitDebugState {
     /// when no events were recorded, so callers can distinguish an empty capture
     /// from diagnostics that were never requested.
     pub(crate) fn take_report(&mut self) -> Option<JitDebugReport> {
+        self.property_runtime.clear();
         self.events.as_mut().map(|events| {
             let dropped_events = std::mem::take(&mut self.dropped_events);
             JitDebugReport::from_captured(std::mem::take(events), dropped_events)

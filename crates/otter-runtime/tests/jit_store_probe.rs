@@ -4,6 +4,7 @@
 //! - A hot direct-prototype-data transition that requires the runtime IC.
 //! - Read-only, setter, own-slot, non-extensible and Proxy invalidations.
 //! - Nested allocating getter/setter scopes, object throws and later reuse.
+//! - Bounded runtime path counters and isolation of later capture batches.
 //!
 //! # Invariants
 //! - Cached writes validate their complete guard program before effects.
@@ -68,4 +69,81 @@ fn property_handles_survive_nested_and_abrupt_reentry() {
             assert!(runtime.execution_stats().jit_runtime_property_stubs > 1000);
         }
     }
+}
+
+#[test]
+fn store_diagnostics_count_paths_without_replaying_effects() {
+    use otter_runtime::{JitDebugEvent, JitDebugRequest};
+
+    let source = include_str!("../../otter-difftest/corpus/property_handle_reentry.js");
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::Template)
+        .jit_debug(JitDebugRequest::events())
+        .build()
+        .expect("runtime");
+    let result = runtime
+        .run_script(SourceInput::from_javascript(source), "property-counts.js")
+        .expect("captured property reentry");
+    assert_eq!(result.completion_string(), "[16,12,7,66]");
+    let report = result.jit_debug_report().expect("captured report");
+    assert!(!report.truncated());
+    let mut cached = 0;
+    let mut failed = 0;
+    let mut counters = 0;
+    for event in report.events() {
+        if let JitDebugEvent::PropertyStoreRuntime {
+            property_name,
+            path,
+            failed: did_fail,
+            native_way,
+            count,
+            ..
+        } = event
+        {
+            counters += 1;
+            if property_name == "x" {
+                if *did_fail {
+                    failed += count;
+                }
+                if matches!(path, otter_vm::jit_debug::JitPropertyStorePath::Cached) && !native_way
+                {
+                    cached += count;
+                }
+            }
+        }
+    }
+    assert!(
+        cached > 1000,
+        "hot unsupported native ways must aggregate: {:?}",
+        report
+            .events()
+            .iter()
+            .filter(|event| matches!(event, JitDebugEvent::PropertyStoreRuntime { .. }))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(failed, 3, "only the three throwing setters enter a store");
+    assert!(
+        counters < 100,
+        "hot entries must not consume individual events"
+    );
+
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "copyProperty({x: {marker: 7}}, Object.create(prototype)).marker",
+            ),
+            "property-counts-next.js",
+        )
+        .expect("later script");
+    assert_eq!(result.completion_string(), "7");
+    let next = result.jit_debug_report().expect("later report");
+    let count: u64 = next
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            JitDebugEvent::PropertyStoreRuntime { count, .. } => Some(*count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(count, 1, "later capture must not inherit old counters");
 }

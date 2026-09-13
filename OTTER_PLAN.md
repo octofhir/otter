@@ -529,11 +529,28 @@ became 1322 ± 7 (+40.79%), same program hash, median RSS unchanged. Report:
 `benchmarks/results/s1-20260913-property-handles/README.md`. No full gate or
 comparison-engine baseline was repeated, and no engine-wide win is claimed.
 
-Next: attribute the remaining store recipes by site/key/miss reason before
-expanding generated-way coverage; compile snapshot events are not frequency
-counters. Forwarded generated calls, spread packets, Machine coverage and root
-scanning follow the handoff order. Reuse successful checks and recorded
-baselines; profiling/docs do not need a new gate.
+Bounded `propertyStoreRuntime` counters now attribute generated runtime entries
+by function/logical PC, property name, path, error and offered native way.
+They share the event cap, update existing rows in place and reset with the
+owning batch. A constant capture specialization of the single store body keeps
+observation bookkeeping out of disabled execution. Twenty-six focused tests,
+scoped clippy, GC stress and release exact-effect capture validate the change.
+
+RayTrace capture records 10,330,955 runtime stores in 117 rows, without drops.
+79.01% are six initializer fields: Vector x/y/z and Color red/green/blue.
+Installed recipe hits without a native way dominate. Their source prototypes
+contain writable data fields, while native lowering rejects direct-prototype
+writable-data transitions. This identifies the next guard/lowering candidate;
+the counters do not classify every native rejection. Report:
+`benchmarks/results/s1-20260913-store-counters-fast/README.md`.
+
+Disabled-capture timing is 1311 ± 1 versus saved 1322 ± 7 (-0.83%, overlapping
+sample ranges), five valid processes and identical program hash. No zero-cost
+claim or additional throughput win is made. The initial 1130 ± 39 candidate
+was rejected; only its correction required another build, not a repeated gate
+or rebuilt baseline. Next: complete and test the native writable-prototype
+transition proof, then follow the handoff order for forwarded generated calls,
+spread packets, Machine coverage and root scanning.
 
 The intended replacement path remains:
 

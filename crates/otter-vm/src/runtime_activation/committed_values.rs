@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Typed operation families for object-protocol and scalar bytecodes,
-//!   including site-bound string fill and derived-`this` binding.
+//!   including error allocation, throw origins and derived-`this` binding.
 //! - Rooted value kernels shared by interpreter and compiled callers.
 //! - [`RuntimeCall`] site decoding with no opcode/register ABI.
 //! - Side-channel-free JavaScript exception materialization for the committed
@@ -97,6 +97,12 @@ pub enum ScalarValueOp {
     ArrayLength,
     /// Read one string's UTF-16 code-unit length.
     LoadLength,
+    /// Capture an explicit throw origin before native frames unwind.
+    PrepareThrow,
+    /// Intrinsic Error allocation with observable message coercion.
+    NewError,
+    /// Intrinsic native-error allocation selected by the published constant.
+    NewBuiltinError,
     /// Bind the completed `super()` result as derived-constructor `this`.
     BindThisValue,
 }
@@ -112,6 +118,9 @@ impl ScalarValueOp {
             Op::IsArray => Ok(Self::IsArray),
             Op::ArrayLength => Ok(Self::ArrayLength),
             Op::LoadLength => Ok(Self::LoadLength),
+            Op::Throw => Ok(Self::PrepareThrow),
+            Op::NewError => Ok(Self::NewError),
+            Op::NewBuiltinError => Ok(Self::NewBuiltinError),
             Op::BindThisValue => Ok(Self::BindThisValue),
             _ => Err(VmError::InvalidOperand),
         }
@@ -259,7 +268,10 @@ impl Interpreter {
         }
 
         result = match operation {
-            ScalarValueOp::BindThisValue => {
+            ScalarValueOp::BindThisValue
+            | ScalarValueOp::NewError
+            | ScalarValueOp::NewBuiltinError
+            | ScalarValueOp::PrepareThrow => {
                 // This operation consumes activation metadata and is completed
                 // by `RuntimeCall::scalar_values`.
                 return Err(VmError::InvalidOperand);
@@ -404,6 +416,40 @@ impl RuntimeCall<'_> {
         if operation == ScalarValueOp::BindThisValue {
             self.bind_derived_this_value(value0)?;
             return Ok(value0);
+        }
+        if operation == ScalarValueOp::PrepareThrow {
+            let vm = unsafe { &mut *self.vm.as_ptr() };
+            vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+            if vm.pending_uncaught_frames.is_none() {
+                vm.pending_uncaught_frames = Some(vm.snapshot_active_frames(
+                    unsafe { self.context.as_ref() },
+                    unsafe { self.stack.as_ref() },
+                    usize::MAX,
+                ));
+            }
+            return Ok(value0);
+        }
+        if matches!(
+            operation,
+            ScalarValueOp::NewError | ScalarValueOp::NewBuiltinError
+        ) {
+            let context = unsafe { self.context.as_ref() };
+            let kind = if operation == ScalarValueOp::NewError {
+                crate::ErrorKind::Error
+            } else {
+                let constant = self
+                    .published_const_index(1)
+                    .map_err(CommittedValueError::Fatal)?;
+                context
+                    .string_constant_str_for_function(self.function_id(), constant)
+                    .and_then(crate::ErrorKind::from_class_name)
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?
+            };
+            let vm = unsafe { &mut *self.vm.as_ptr() };
+            vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+            return vm
+                .new_error_value(context, unsafe { &mut *self.stack.as_ptr() }, kind, value0)
+                .map_err(CommittedValueError::JavaScript);
         }
         let new_target = if operation == ScalarValueOp::LoadNewTarget {
             self.with_frame(|frame| Ok(frame.new_target_value()))

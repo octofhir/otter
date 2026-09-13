@@ -2096,10 +2096,15 @@ fn select_with_packed_double_view_caches(
                     &values, condition,
                 ))],
             ),
-            NumericTerminator::Return(value) => {
+            NumericTerminator::Return(value) | NumericTerminator::Throw(value) => {
+                let exit_opcode = if matches!(block.terminator, NumericTerminator::Throw(_)) {
+                    MachineOpcode::Throw
+                } else {
+                    MachineOpcode::Return
+                };
                 if hir.nodes[value.0].value_type() == NumericType::Tagged {
                     let mut ret = MachineInstruction::plain(
-                        MachineOpcode::Return,
+                        exit_opcode,
                         vec![MachineOperand::register_input(machine_value(
                             &values, value,
                         ))],
@@ -2133,7 +2138,7 @@ fn select_with_packed_double_view_caches(
                     ],
                 ));
                 let mut ret = MachineInstruction::plain(
-                    MachineOpcode::Return,
+                    exit_opcode,
                     vec![MachineOperand::register_input(boxed)],
                 );
                 ret.control = ControlFlow::Return;

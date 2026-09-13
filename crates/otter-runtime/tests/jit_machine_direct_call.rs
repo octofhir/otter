@@ -1349,9 +1349,9 @@ fn callee_throw_restores_publication_and_caller_is_reusable() {
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, r#"["boom",42]"#);
     assert_machine_direct_call(&compiled);
-    assert!(
-        compiled.stats.jit_generated_call_deopts > 0,
-        "unsupported throw opcode must resume the already-started generated callee"
+    assert_eq!(
+        compiled.stats.jit_generated_call_deopts, 0,
+        "pure native throw must not materialize the already-started callee"
     );
 }
 

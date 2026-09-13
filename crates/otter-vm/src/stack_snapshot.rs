@@ -5,8 +5,10 @@
 //! module keeps both paths on one frame-resolution implementation.
 //!
 //! # Contents
-//! - [`visit_frame_snapshots`] — visit borrowed frame metadata, innermost first.
-//! - [`snapshot_frames`] — collect the complete active stack into owned DTOs.
+//! - [`visit_frame_snapshot`] — resolve one exact source instruction.
+//! - [`visit_frame_snapshots`] — visit materialized frames, innermost first.
+//! - [`snapshot_frames`] — collect the materialized stack into owned DTOs.
+//! - `native_stack_snapshot` merges compiled owners through this same resolver.
 //!
 //! # Invariants
 //! - Foreign function ids are resolved through their owning execution context.
@@ -45,50 +47,12 @@ pub(crate) fn visit_frame_snapshots(
     mut visit: impl FnMut(StackFrameSnapshotView<'_>) -> bool,
 ) {
     for (depth, frame) in stack.iter().rev().take(limit).enumerate() {
-        let owner = context.for_function(frame.function_id).ok();
-        let owner = owner.as_deref();
-        let function = owner.and_then(|owner| owner.function(frame.function_id));
-        let exec_function = owner.and_then(|owner| owner.exec_function(frame.function_id));
-        let function_name = function.map_or("<unknown>", |function| function.name.as_str());
-
-        // A frame with a callee above it advanced past the call before pushing
-        // that callee. Report the call site, not the following instruction.
         let instruction = if depth == 0 {
-            frame.pc as usize
+            frame.pc
         } else {
-            (frame.pc as usize).saturating_sub(1)
+            frame.pc.saturating_sub(1)
         };
-        let byte_pc = exec_function
-            .and_then(|function| function.instruction_byte_pc(instruction))
-            .unwrap_or(0);
-        let span = exec_function
-            .and_then(|function| {
-                let spans = function.byte_spans();
-                let index = spans.partition_point(|span| span.pc <= byte_pc);
-                if index == 0 {
-                    spans.first().map(|span| span.span)
-                } else {
-                    Some(spans[index - 1].span)
-                }
-            })
-            .or_else(|| function.map(|function| function.span))
-            .unwrap_or((0, 0));
-        let module = function
-            .filter(|function| !function.module_url.is_empty())
-            .map_or_else(
-                || {
-                    owner
-                        .map(ExecutionContext::module_name)
-                        .unwrap_or_else(|| context.module_name())
-                },
-                |function| function.module_url.as_str(),
-            );
-        if !visit(StackFrameSnapshotView {
-            function_id: frame.function_id,
-            function_name,
-            module,
-            span,
-        }) {
+        if !visit_frame_snapshot(context, frame.function_id, instruction as usize, &mut visit) {
             break;
         }
     }
@@ -110,4 +74,50 @@ pub(crate) fn snapshot_frames(
         true
     });
     frames
+}
+
+/// Resolve one exact logical instruction into the shared borrowed stack view.
+pub(crate) fn visit_frame_snapshot(
+    context: &ExecutionContext,
+    function_id: u32,
+    instruction: usize,
+    visit: impl FnOnce(StackFrameSnapshotView<'_>) -> bool,
+) -> bool {
+    let owner = context.for_function(function_id).ok();
+    let owner = owner.as_deref();
+    let function = owner.and_then(|owner| owner.function(function_id));
+    let exec_function = owner.and_then(|owner| owner.exec_function(function_id));
+    let function_name = function.map_or("<unknown>", |function| function.name.as_str());
+
+    let byte_pc = exec_function
+        .and_then(|function| function.instruction_byte_pc(instruction))
+        .unwrap_or(0);
+    let span = exec_function
+        .and_then(|function| {
+            let spans = function.byte_spans();
+            let index = spans.partition_point(|span| span.pc <= byte_pc);
+            if index == 0 {
+                spans.first().map(|span| span.span)
+            } else {
+                Some(spans[index - 1].span)
+            }
+        })
+        .or_else(|| function.map(|function| function.span))
+        .unwrap_or((0, 0));
+    let module = function
+        .filter(|function| !function.module_url.is_empty())
+        .map_or_else(
+            || {
+                owner
+                    .map(ExecutionContext::module_name)
+                    .unwrap_or_else(|| context.module_name())
+            },
+            |function| function.module_url.as_str(),
+        );
+    visit(StackFrameSnapshotView {
+        function_id,
+        function_name,
+        module,
+        span,
+    })
 }

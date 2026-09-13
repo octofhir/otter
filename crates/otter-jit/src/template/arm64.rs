@@ -931,19 +931,20 @@ pub(super) fn compile(
                 );
             }
             TemplateOp::Throw { src } => {
-                exceptions::emit_exception_op(
+                scalar::emit_scalar_value(
                     &mut ops,
                     &mut relocations,
                     transitions,
-                    Op::Throw as u8,
-                    u64::from(src),
-                    0,
-                    0,
-                    bail,
-                    returned,
+                    view,
+                    otter_vm::native_abi::ScalarValueOp::PrepareThrow,
+                    src,
+                    Some(src),
+                    None,
                     committed_throw,
                     fatal,
-                );
+                )?;
+                values::emit_load_reg(&mut ops, 0, src)?;
+                dynasm!(ops ; .arch aarch64 ; b =>committed_throw);
             }
             TemplateOp::TdzError { local_index } => {
                 exceptions::emit_exception_op(

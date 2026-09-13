@@ -165,18 +165,22 @@ impl Interpreter {
             self.frame_release_cold(&mut frame);
             return Err(error);
         }
-        self.with_materialized_generated_call_depth(|interp| {
-            let floor = stack.floor();
-            stack.push(frame);
-            let materialized = stack
-                .last_mut()
-                .expect("generated deopt frame was just published");
-            debug_assert!(materialized.eval_env.is_null());
-            std::mem::swap(&mut materialized.eval_env, &mut native.eval_env);
-            let result = interp.dispatch_loop_above_rooted(context, stack, floor);
-            interp.release_frames_above(stack, floor);
-            result
-        })?
+        self.with_materialized_native_frame(
+            std::ptr::from_mut(native) as usize,
+            stack.len(),
+            |interp| {
+                let floor = stack.floor();
+                stack.push(frame);
+                let materialized = stack
+                    .last_mut()
+                    .expect("generated deopt frame was just published");
+                debug_assert!(materialized.eval_env.is_null());
+                std::mem::swap(&mut materialized.eval_env, &mut native.eval_env);
+                let result = interp.dispatch_loop_above_rooted(context, stack, floor);
+                interp.release_frames_above(stack, floor);
+                result
+            },
+        )?
     }
 
     /// Materialize a nested inline deopt chain and run it to completion.

@@ -277,7 +277,7 @@ impl Interpreter {
             .count();
         u32::try_from(published)
             .unwrap_or(u32::MAX)
-            .saturating_sub(self.jit_materialized_generated_call_depth)
+            .saturating_sub(self.jit_materialized_generated_calls.len() as u32)
     }
 
     /// Trace every canonical native activation currently capable of crossing a

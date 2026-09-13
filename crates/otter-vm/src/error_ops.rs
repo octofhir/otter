@@ -15,6 +15,8 @@
 //! - VM-raised errors use the top bytecode frame's `[[Realm]]`; linked
 //!   function metadata carries only scalar realm ids, and the existing traced
 //!   realm swap owns all moving-GC state.
+//! - Message coercion and error allocation share one rooted value kernel.
+//!   Construction stacks include published native frames and deopt owners once.
 //! - Native failures synthesized inside a runtime turn retain that turn's
 //!   activation stack as the allocation root set.
 //!
@@ -23,12 +25,12 @@
 //! - [`crate::executable`]
 
 use crate::activation_stack::ActivationStack;
+use crate::rooting::RootScopeExt;
 use smallvec::SmallVec;
 
 use crate::{
     ActiveFrameMut, ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError, Value,
-    VmError, error_classes, object, read_register, snapshot_frames, symbol_dispatch,
-    write_register,
+    VmError, error_classes, object, read_register, symbol_dispatch, write_register,
 };
 
 impl Interpreter {
@@ -42,16 +44,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let value = *read_register(frame, msg_reg)?;
-        let owned_message = self.coerce_error_message(stack, context, &value)?;
-        let obj = self.make_error_instance_with_stack_roots(
-            stack,
-            ErrorKind::Error,
-            owned_message,
-            &value,
-        )?;
-        self.capture_error_stack_frames(context, stack, obj);
+        let value = self.new_error_value(context, stack, ErrorKind::Error, value)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::object(obj))?;
+        write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
     }
@@ -74,13 +69,32 @@ impl Interpreter {
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
         let value = *read_register(frame, msg_reg)?;
-        let owned_message = self.coerce_error_message(stack, context, &value)?;
-        let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
-        self.capture_error_stack_frames(context, stack, obj);
+        let value = self.new_error_value(context, stack, kind, value)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::object(obj))?;
+        write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
+    }
+
+    /// Construct an intrinsic Error from a current boxed message. The message
+    /// stays rooted through observable ToString and the canonical allocation.
+    pub(crate) fn new_error_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        kind: ErrorKind,
+        mut message: Value,
+    ) -> Result<Value, VmError> {
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: message predates the scope and stays stationary until return.
+        unsafe {
+            roots.add_value(&mut message);
+        }
+        let owned_message = self.coerce_error_message(stack, context, &message)?;
+        let obj =
+            self.make_error_instance_with_stack_roots(stack, kind, owned_message, &message)?;
+        self.capture_error_stack_frames(context, stack, obj);
+        Ok(Value::object(obj))
     }
 
     /// Record the construction-site JS call stack (top-of-stack first,
@@ -97,10 +111,7 @@ impl Interpreter {
         if limit == 0 {
             return;
         }
-        let mut frames = snapshot_frames(context, stack);
-        if frames.len() > limit {
-            frames.truncate(limit);
-        }
+        let frames = self.snapshot_active_frames(context, stack, limit);
         if !frames.is_empty() {
             object::set_error_stack_frames(obj, self.gc_heap_mut(), frames);
         }

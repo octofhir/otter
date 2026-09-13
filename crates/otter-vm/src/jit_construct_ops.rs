@@ -1,18 +1,17 @@
 //! Compiled allocating-construction transitions.
 //!
 //! # Contents
-//! - `CollectRest`, `NewError`, `NewBuiltinError`, `ArrayPush`, `NewWeakRef`,
+//! - `CollectRest`, `ArrayPush`, `NewWeakRef`,
 //!   `NewFinalizationRegistry`, and `NewCollection` completion through the VM's
 //!   allocating construction helpers.
 //!
 //! # Invariants
 //! - No construction semantics are duplicated in JIT code; each opcode calls the
 //!   same `run_*` helper the interpreter dispatches.
-//! - The published frame is the moving-GC root for the array/error allocation
+//! - The published frame is the moving-GC root for the array/collection allocation
 //!   each helper performs.
 //!
 //! # See also
-//! - [`crate::Interpreter::run_new_error_regs`]
 //! - [`crate::Interpreter::run_array_push_regs`]
 
 use otter_bytecode::Op;
@@ -41,19 +40,6 @@ impl Interpreter {
         match opcode {
             value if value == Op::CollectRest as u8 => {
                 self.materialized_collect_rest(stack, frame_index, arg0 as u16)?;
-            }
-            value if value == Op::NewError as u8 => {
-                self.run_new_error_regs(context, stack, frame_index, arg0 as u16, arg1 as u16)?;
-            }
-            value if value == Op::NewBuiltinError as u8 => {
-                self.run_new_builtin_error_regs(
-                    context,
-                    stack,
-                    frame_index,
-                    arg0 as u16,
-                    arg1 as u32,
-                    arg2 as u16,
-                )?;
             }
             value if value == Op::ArrayPush as u8 => {
                 self.run_array_push_regs(stack, frame_index, arg0 as u16, arg1 as u16)?;

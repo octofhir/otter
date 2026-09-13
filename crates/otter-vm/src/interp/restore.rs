@@ -145,7 +145,7 @@ impl Interpreter {
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
-            jit_materialized_generated_call_depth: 0,
+            jit_materialized_generated_calls: Vec::new(),
             allow_blocking_atomics_wait: false,
             microtasks: crate::MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),

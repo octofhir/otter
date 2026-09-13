@@ -766,7 +766,8 @@ impl Interpreter {
                     // unwind path clears `pending_uncaught_frames`
                     // through [`Self::clear_pending_uncaught_frames`].
                     if self.pending_uncaught_frames.is_none() {
-                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                        self.pending_uncaught_frames =
+                            Some(self.snapshot_active_frames(context, stack, usize::MAX));
                     }
                     let unwind = self.unwind_throw_above(context, stack, floor, value);
                     if unwind.is_ok() {
@@ -789,7 +790,7 @@ impl Interpreter {
                         Some((crate::cold_frame::ParkedFinally::Throw(value), _)) => {
                             if self.pending_uncaught_frames.is_none() {
                                 self.pending_uncaught_frames =
-                                    Some(snapshot_frames(context, stack));
+                                    Some(self.snapshot_active_frames(context, stack, usize::MAX));
                             }
                             let unwind = self.unwind_throw_above(context, stack, floor, value);
                             if unwind.is_ok() {

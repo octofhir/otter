@@ -687,8 +687,26 @@ Moving redundant readiness checking from native hits to cold completion recovers
 RSS151420928 (-0.55%). Custom-apply and Machine exception tests pass, including
 GC1/4/16. This semantically verified checkpoint remains1.62% below the best
 2035 +/-4 baseline; performance debt stays open. Current release binary is the
-2002 candidate. Next source work targets observed Throw/NewError declines in
-subtract/renderScene through existing Machine/value contracts.
+2002 candidate at that checkpoint.
+
+Machine Throw/NewError admission subsequently passes focused source, GC1/4/16
+and12 release comparisons. Local throws feed catch SSA; escaping throws use
+existing scalar completion and the Machine Throw terminator. Intrinsic errors
+share one rooted value kernel across interpreter and both compiled tiers.
+Native diagnostics merge exact materialized owners, preserving caller frames
+without duplicated cold-deopt entries. The old Template register-window error
+construction path is removed. Real subtract558 and renderScene589/OSR27 compile;
+the recorded2912 events contain no compile declines or overflow.
+
+The single new release build measures1933 +/-9 across five valid processes,
+range1890–1943, median RSS152092672. This is3.45% below previous2002 and5.01%
+below best2035; performance acceptance fails. A short regression profile confirms
+native subtract execution at constructor preparation, but only two isolate
+samples cannot establish cost. Saved Machine IR has two common-path truthiness
+leaf calls; generated truthiness is the next concrete structural investigation.
+No tier-disable heuristic or repeat of unchanged gates. Artifacts54MB are archived
+to5.6MB and verified before raw removal. Evidence:
+`benchmarks/results/s4-20260913-machine-errors/README.md`.
 No full gate, bisect, second build tree or repeated
 other-engine baseline. Evidence:
 `benchmarks/results/s2-20260913-machine-forwarding/README.md`.
@@ -751,9 +769,9 @@ through generated linkage promote through the registry's hot-function word,
 every producer of a constructor's receiver shares one preparation contract
 and every baked field transition proves its storage, sloppy callees bind an
 object receiver in generated code, and only a native-function cell leaves a
-nullish comparison. The Machine HIR still admits 80 of 188 opcodes and one
-unsupported opcode declines the whole function; over the hot Octane
-functions it refused, the remaining blockers are `Throw`/`NewError`,
+nullish comparison. An unsupported Machine HIR opcode still declines the whole function.
+Throw and intrinsic error allocation are admitted; remaining families to audit
+across the wider Octane workload include
 `MakeClosure`/`StoreUpvalue`, `CollectArguments`, object and array
 literals, and catch regions around named-property misses. Recompilation
 never reads the recorded bail PCs, so a failed speculation is re-emitted

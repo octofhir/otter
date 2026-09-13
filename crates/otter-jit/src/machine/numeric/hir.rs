@@ -56,6 +56,10 @@
 //!   compare directly with a static nullish literal, but the node retains an
 //!   exact pre-operation state so a native-function cell can deopt for HTMLDDA
 //!   semantics.
+//! - Explicit throws transfer the existing SSA value directly to local catches.
+//!   Escaping throws capture the native origin through the committed value
+//!   boundary, then use the existing Machine Throw terminator. Intrinsic errors
+//!   use the same rooted coercion/allocation kernel as Template and interpreter.
 //! - Literal allocation keeps boxed operand spans and a precise root state;
 //!   it cannot invoke JavaScript or replay an allocation after completion.
 //! - `ArrayConstruct` accepts only zero arguments or one exact Int32 length.
@@ -659,6 +663,8 @@ pub(super) enum NumericTerminator {
         when_true: bool,
     },
     Return(NumericValue),
+    /// Pure exception payload after its origin was captured.
+    Throw(NumericValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -766,6 +772,7 @@ enum RawTerminator {
     Branch { when_true: bool },
     ReturnValue,
     ReturnUndefined,
+    Throw,
 }
 
 #[derive(Debug, Clone)]
@@ -1092,6 +1099,13 @@ impl NumericFunction {
                 if pc == terminal_pc && raw.exceptional_edge.is_some() {
                     exceptional_pre_state = Some(registers.clone());
                 }
+                if op == Op::Throw && raw.exceptional_edge.is_some() {
+                    // A local catch receives the existing value directly. No
+                    // native unwind or throw-origin allocation is necessary.
+                    exceptional_value =
+                        Some(read_value(&registers, register(instruction, code, 0)?)?);
+                    break;
+                }
                 let lowered = lower_instruction(
                     decline,
                     instruction,
@@ -1151,6 +1165,13 @@ impl NumericFunction {
                     NumericTerminator::Branch {
                         condition,
                         when_true,
+                    }
+                }
+                RawTerminator::Throw => {
+                    if raw.exceptional_edge.is_some() {
+                        NumericTerminator::Jump
+                    } else {
+                        NumericTerminator::Throw(*block_nodes.last()?)
                     }
                 }
                 RawTerminator::ReturnValue => {
@@ -1754,16 +1775,18 @@ fn build_raw_blocks(
                     when_true: op == Op::JumpIfTrue,
                 },
             ),
+            Op::Throw => (Vec::new(), RawTerminator::Throw),
             Op::Return | Op::ReturnValue => (Vec::new(), RawTerminator::ReturnValue),
             Op::ReturnUndefined => (Vec::new(), RawTerminator::ReturnUndefined),
             _ => (vec![*by_pc.get(&end)?], RawTerminator::Jump),
         };
-        let exceptional = instruction_semantics
-            .get(terminal_pc as usize)?
-            .has_implicit_exception_side_exit(op)
-            .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
-            .flatten()
-            .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
+        let exceptional = (op == Op::Throw
+            || instruction_semantics
+                .get(terminal_pc as usize)?
+                .has_implicit_exception_side_exit(op))
+        .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
+        .flatten()
+        .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
         let (exceptional_edge, exception_register) = if let Some((handler, register)) = exceptional
         {
             let edge = successors.len();

@@ -102,11 +102,17 @@ fn source_snapshot(root: &JitCompileSnapshot, function_id: u32) -> Option<&JitCo
                 .values()
                 .map(|callee| callee.body.as_ref()),
         );
-        let mut methods = view.inline_methods.values().collect::<Vec<_>>();
-        while let Some(method) = methods.pop() {
-            pending.push(method.body.as_ref());
-            methods.extend(method.nested_methods.values());
-        }
+        pending.extend(
+            view.inline_methods
+                .values()
+                .map(|method| method.body.as_ref()),
+        );
+        pending.extend(
+            view.inline_poly_methods
+                .values()
+                .flatten()
+                .map(|method| method.body.as_ref()),
+        );
     }
     None
 }
@@ -155,10 +161,11 @@ mod tests {
             },
             prop_offsets: Default::default(),
             prop_shapes: Default::default(),
-            nested_methods: Default::default(),
         };
         let mut parent = method(3, 12);
-        parent.nested_methods.insert(12, method(4, 16));
+        Arc::make_mut(&mut parent.body)
+            .inline_methods
+            .insert(12, method(4, 16));
         root.inline_methods.insert(8, parent);
         assert_eq!(resume_pc(&root, 3, 12), Some(0));
         assert_eq!(resume_pc(&root, 4, 16), Some(0));

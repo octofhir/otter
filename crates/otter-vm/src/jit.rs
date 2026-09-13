@@ -719,6 +719,7 @@ pub struct JitMethodGuard {
 pub struct JitInlineMethod {
     /// Fully baked compile inputs for the method body, resolved against the
     /// method's own constant pool and feedback rather than the caller's.
+    /// Nested plain and method candidates live in this snapshot's own tables.
     pub body: Arc<JitCompileSnapshot>,
     /// Exact receiver/prototype/method-slot guard shared with generated calls.
     pub guard: JitMethodGuard,
@@ -732,10 +733,6 @@ pub struct JitInlineMethod {
     /// slot load/store. A receiver property is absent here — the entry
     /// `CheckMethodIdentity` already proves its shape.
     pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
-    /// Body `CallMethodValue` byte-PC → the monomorphic method it resolves to,
-    /// baked recursively. Lets the inliner splice a nested call's body inline
-    /// with bounded recursion.
-    pub nested_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
 }
 
 impl JitInlineMethod {

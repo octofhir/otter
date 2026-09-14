@@ -431,30 +431,24 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `machineScalarFunction` structural region. A function that Machine cannot
     compile stays on the Template tier; there is no second optimizing IR,
     allocator, or emitter fallback.
-    Machine direct data access is attributed by `machineElementLoad` /
-    `machineElementStore`, `machinePackedDoubleElementLoad` /
-    `machinePackedDoubleElementStore`, and `machinePropertyLoad` /
-  `machinePropertyStore`, each with `bytePc`; direct captured/global cell reads
+    Machine indexed access is attributed by `machineElementView`,
+    `machineElementAddress`, `machineElementValueLoad`,
+    `machineElementValueGuard`, and `machineElementValueStore`; named access
+    uses the `machineCacheIr*` regions. Each carries `bytePc`; direct captured/global cell reads
   and writes use the `machineBinding*` family, while prepared literals use
-    `machineStringConstantLoad`. Ordinary packed-double Array operations prove the
-    exact exotic and physical-kind guards, keep the element payload in Float64
-    SSA, and use an exact Float64-to-Uint32 index check. Integral values and
-    `-0` stay generated; fractions, negatives, NaN, and values beyond Uint32
-    deopt before the access. The hit performs a direct FP load/store with no
-    hole test, Number box/decode, or write barrier.
-    An indexed access without a usable direct snapshot remains inside the same
-    Machine body as `machineGenericElementLoad` / `machineGenericElementStore`.
-    These regions clear raw view caches, publish precise moving roots, and call
-    the canonical fixed boxed-value `[[Get]]` / `[[Set]]` boundary. Success or
-    throw commits exactly once; it never deoptimizes and replays the source
-    operation. Generic accesses protected by a local catch remain on the
-    Template tier until the fast probe and committed cold call are represented
-    as explicit Machine CFG before register allocation. The fixed boundary
-    already returns a pure exception value and must not stay hidden inside an
-    emitter pseudo-operation.
+    `machineStringConstantLoad`. Ordinary packed-double Array operations prove
+    receiver/view identity, exact index/bounds, and element representation in
+    separate SSA nodes. A generated load publishes a normal tagged value;
+    numeric consumers decode it independently. Fractions, negatives, NaN,
+    values beyond Uint32, holes, detached/resized views, and unprepared sites
+    enter the one committed boxed-value `[[Get]]` / `[[Set]]` sibling. That
+    sibling clears raw view caches, publishes precise moving roots, and exposes
+    Success/Throw/Fatal control before register allocation. A store occurs only
+    after every miss-capable proof and is never replayed. Local catches consume
+    the pure exception SSA edge directly.
     Reducible non-reentrant loops may group invariant packed-double receivers
     into bounded native-stack view caches. `optimized-ir.txt` reports
-    `packed-double-view-caches=<N>` and annotates each packed access with its
+    `packed-double-view-caches=<N>` and annotates each `ElementView` with its
     cache id; `machinePackedDoubleViewCacheClear` marks an external loop-entry
     reset. Each cache owns an untraced raw base/length pair, proves the complete
     receiver/layout program lazily on first use, and retains the pair only over
@@ -605,10 +599,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `directCallLowered` reports `unprofitable` instead of presenting that
     decision as a layout failure.
     Non-simple class-chain fields and exact ordinary function-constructor
-    fields may expose `machineConstructorFieldTransition`; this region guards
-    the receiver and complete ordinary prototype chain before committing one
-    VM-interned child shape and pre-reserved slot at the original
-    `StoreProperty`. Ordinary functions are admitted only when `new.target` is
+    fields use the same `machineCacheIrGuardShape`,
+    `machineCacheIrGuardExtensible`, `machineCacheIrLoadPrototype`,
+    `machineCacheIrGuardPrototypeNull`, `machineCacheIrStoreField`,
+    `machineCacheIrPublishShape`, and `machineCacheIrWriteBarrier` operations
+    as other named stores. Every guard precedes the no-fail store, publication,
+    and barriers at the original `StoreProperty`. Ordinary functions are
+    admitted only when `new.target` is
     the entered function; a distinct ordinary target retains the canonical
     path. Generated
     constructor semantics additionally expose `machineClassSuperLoad`,

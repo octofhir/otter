@@ -5,8 +5,8 @@
 //!   attribution for both generated element operations.
 //! - A packed-to-tagged receiver transition proving exact resume without
 //!   replaying an effect, followed by clean reuse of the runtime.
-//! - A delete-driven hole transition whose canonical read observes an inherited
-//!   index, advances feedback, and replaces the stale packed generation once.
+//! - A delete-driven hole transition whose committed canonical read observes
+//!   an inherited index while the reusable Machine generation stays installed.
 //! - Fixed-length typed-array load/store misses after resizable-buffer
 //!   shrinkage, including regrowth proof that an out-of-bounds store never ran.
 //! - A generated constructor with fresh capture cells between element
@@ -15,11 +15,10 @@
 //!
 //! # Invariants
 //! - Every production fixture publishes the named hot function through the
-//!   scalar Machine IR backend, with family-specific load/store regions in
-//!   that exact function's code map.
-//! - Generated packed-element guards deopt at the original bytecode before
-//!   mutation; canonical resume executes each effect once and does not evict
-//!   the reusable numeric body.
+//!   scalar Machine IR backend, with independent view, address, value-guard,
+//!   load, store, and committed-call regions in that exact function's code map.
+//! - Generated packed-element misses enter the committed canonical sibling;
+//!   each effect executes once without deopt/replay or body eviction.
 //! - A fixed typed view is wholly out of bounds when its original extent no
 //!   longer fits its live backing buffer, even when the selected index remains
 //!   inside the buffer's retained prefix.
@@ -289,15 +288,15 @@ fn assert_machine_element_artifact(
     let regions = code_map["regions"]
         .as_array()
         .expect("Machine element code-map regions");
-    let (load_kind, store_kind) = match shape {
-        MachineArtifactShape::PackedDoubleElements
-        | MachineArtifactShape::PackedDoubleElementsAroundConstructCapture => (
-            "machinePackedDoubleElementLoad",
-            "machinePackedDoubleElementStore",
-        ),
-        MachineArtifactShape::GenericElements => ("machineElementLoad", "machineElementStore"),
-    };
-    for kind in ["machineScalarFunction", load_kind, store_kind] {
+    for kind in [
+        "machineScalarFunction",
+        "machineElementView",
+        "machineElementAddress",
+        "machineElementValueLoad",
+        "machineElementValueGuard",
+        "machineElementValueStore",
+        "machineCommittedValueEffect",
+    ] {
         let matching = regions
             .iter()
             .filter(|region| region["kind"] == kind)
@@ -312,21 +311,6 @@ fn assert_machine_element_artifact(
                     .iter()
                     .all(|region| region["bytePc"].as_u64().is_some()),
                 "{function_name} must attribute every {kind} to bytecode: {code_map}"
-            );
-        }
-    }
-    if matches!(shape, MachineArtifactShape::GenericElements) {
-        for kind in [
-            "machineElementLoadFast",
-            "machineElementLoadCold",
-            "machineElementStoreFast",
-            "machineElementStoreCold",
-        ] {
-            assert!(
-                regions
-                    .iter()
-                    .any(|region| region["kind"] == kind && region["bytePc"].is_u64()),
-                "{function_name} must expose its committed fast/cold access: {code_map}"
             );
         }
     }
@@ -491,7 +475,7 @@ fn dense_numeric_rmw_uses_machine_element_regions_without_deopt() {
 }
 
 #[test]
-fn packed_to_tagged_transition_deopts_once_without_replay_and_keeps_runtime_reusable() {
+fn packed_to_tagged_transition_deopts_later_conversion_without_replaying_store() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         NO_REPLAY_SETUP,
@@ -519,12 +503,12 @@ fn packed_to_tagged_transition_deopts_once_without_replay_and_keeps_runtime_reus
     );
     assert_eq!(
         compiled.optimized_deopts, 1,
-        "the tagged transition must deopt once, execute each effect once, and not storm on reuse: {compiled:?}"
+        "the later numeric conversion may deopt once without replaying the prior store: {compiled:?}"
     );
 }
 
 #[test]
-fn hole_transition_reads_the_prototype_and_recompiles_without_a_deopt_storm() {
+fn hole_transition_reads_the_prototype_without_deopt_or_recompile() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         HOLE_TRANSITION_SETUP,
@@ -551,13 +535,11 @@ fn hole_transition_reads_the_prototype_and_recompiles_without_a_deopt_storm() {
         "the first hole probe must reach the stale packed generation: {compiled:?}"
     );
     assert_eq!(
-        compiled.optimized_deopts, 1,
-        "the hole layout transition must advance feedback after one exact miss, not deopt once per call: {compiled:?}"
+        compiled.optimized_deopts, 0,
+        "the hole layout transition must commit once without a post-proof replay deopt: {compiled:?}"
     );
-    assert!(
-        compiled.compile_attempts > 0 && compiled.code_generations > 0,
-        "the feedback epoch change must admit a replacement generation: {compiled:?}"
-    );
+    assert_eq!(compiled.compile_attempts, 0, "{compiled:?}");
+    assert_eq!(compiled.code_generations, 0, "{compiled:?}");
 }
 
 #[test]

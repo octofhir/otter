@@ -237,31 +237,16 @@ pub(super) enum NumericNode {
         receiver: NumericValue,
         index: NumericValue,
         byte_pc: u32,
-        access: NumericElementAccess,
+        access: Option<NumericElementAccess>,
+        exceptional_edge: Option<u16>,
     },
     ElementStore {
         receiver: NumericValue,
         index: NumericValue,
         value: NumericValue,
         byte_pc: u32,
-        access: NumericElementAccess,
-    },
-    GenericElementLoad {
-        receiver: NumericValue,
-        index: NumericValue,
-        logical_pc: u32,
-        byte_pc: u32,
-    },
-    GenericElementStore {
-        receiver: NumericValue,
-        index: NumericValue,
-        value: NumericValue,
-        logical_pc: u32,
-        byte_pc: u32,
-    },
-    CheckedFloat64ToElementIndex {
-        value: NumericValue,
-        byte_pc: u32,
+        access: Option<NumericElementAccess>,
+        exceptional_edge: Option<u16>,
     },
     LiteralAllocation {
         target: otter_vm::native_abi::RuntimeStubDescriptor,
@@ -575,18 +560,13 @@ impl NumericNode {
             | Self::PropertyLoad { .. }
             | Self::PropertyStore { .. }
             | Self::ElementStore { .. }
-            | Self::GenericElementLoad { .. }
-            | Self::GenericElementStore { .. }
             | Self::ArrayConstruct { .. }
             | Self::LiteralAllocation { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
             | Self::ColdCallExit { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
-            Self::ElementLoad {
-                access: NumericElementAccess::Tagged,
-                ..
-            } => NumericType::Tagged,
+            Self::ElementLoad { .. } => NumericType::Tagged,
             Self::IntegerConstant(..)
             | Self::TaggedToInt32(..)
             | Self::FloatToInt32(..)
@@ -605,9 +585,9 @@ impl NumericNode {
             | Self::IntegerNot(..)
             | Self::IntegerAndImmediate(..)
             | Self::BlockParameter(NumericType::Int32) => NumericType::Int32,
-            Self::IntegerShiftRightLogical(..)
-            | Self::CheckedFloat64ToElementIndex { .. }
-            | Self::BlockParameter(NumericType::Uint32) => NumericType::Uint32,
+            Self::IntegerShiftRightLogical(..) | Self::BlockParameter(NumericType::Uint32) => {
+                NumericType::Uint32
+            }
             Self::ConstructReceiverHit(..)
             | Self::LessThan(..)
             | Self::Equal(..)
@@ -634,10 +614,6 @@ impl NumericNode {
             Self::BooleanConstant(..) => NumericType::Boolean,
             Self::Parameter { value_type, .. } | Self::NativeLeaf { value_type, .. } => value_type,
             Self::BlockParameter(NumericType::Number)
-            | Self::ElementLoad {
-                access: NumericElementAccess::PackedDouble,
-                ..
-            }
             | Self::TaggedToNumber(..)
             | Self::Constant(..)
             | Self::WidenInt32(..)
@@ -655,14 +631,12 @@ impl NumericNode {
     /// Authoritative selection use of an attached frame state.
     pub(super) const fn frame_state_purpose(self) -> Option<NumericFrameStatePurpose> {
         match self {
-            Self::PropertyLoad { .. } | Self::PropertyStore { .. } => {
-                Some(NumericFrameStatePurpose::TaggedRoots)
-            }
+            Self::PropertyLoad { .. }
+            | Self::PropertyStore { .. }
+            | Self::ElementLoad { .. }
+            | Self::ElementStore { .. } => Some(NumericFrameStatePurpose::TaggedRoots),
             Self::CommittedValue { .. } | Self::Binding { .. } | Self::LiteralAllocation { .. } => {
                 Some(NumericFrameStatePurpose::TaggedRoots)
-            }
-            Self::GenericElementLoad { .. } | Self::GenericElementStore { .. } => {
-                Some(NumericFrameStatePurpose::RuntimeMetadata)
             }
             Self::ColdCallExit { .. }
             | Self::InlineConstructGuard { .. }
@@ -672,9 +646,6 @@ impl NumericNode {
             | Self::TaggedToInt32(..)
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
-            | Self::ElementLoad { .. }
-            | Self::ElementStore { .. }
-            | Self::CheckedFloat64ToElementIndex { .. }
             | Self::ArrayConstruct { .. }
             | Self::DirectCall { .. }
             | Self::NativeLeaf { .. }
@@ -869,13 +840,13 @@ impl NumericFunction {
                             NumericNode::ElementLoad {
                                 receiver,
                                 byte_pc,
-                                access: NumericElementAccess::PackedDouble,
+                                access: Some(NumericElementAccess::PackedDouble),
                                 ..
                             }
                             | NumericNode::ElementStore {
                                 receiver,
                                 byte_pc,
-                                access: NumericElementAccess::PackedDouble,
+                                access: Some(NumericElementAccess::PackedDouble),
                                 ..
                             } => Some((receiver, byte_pc)),
                             _ => None,
@@ -1026,8 +997,8 @@ impl NumericFunction {
         let mut requires_mixed_join = false;
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
-            let (mut registers, mut parameters, mut parameter_regs) = if block_index == 0 {
-                (entry.clone(), Vec::new(), Vec::new())
+            let merged = if block_index == 0 {
+                Some((entry.clone(), Vec::new(), Vec::new()))
             } else if raw
                 .predecessors
                 .iter()
@@ -1049,7 +1020,7 @@ impl NumericFunction {
                     &mut nodes,
                     phi_types,
                     &mut requires_mixed_join,
-                )?
+                )
             } else {
                 merge_predecessors(
                     &raw.predecessors,
@@ -1061,7 +1032,11 @@ impl NumericFunction {
                     &mut nodes,
                     phi_types,
                     &mut requires_mixed_join,
-                )?
+                )
+            };
+            let Some((mut registers, mut parameters, mut parameter_regs)) = merged else {
+                note_structural(decline, "predecessor state merge");
+                return None;
             };
             if raw
                 .predecessors
@@ -1079,14 +1054,19 @@ impl NumericFunction {
                     &mut requires_mixed_join,
                 )?;
             }
-            force_exception_parameters(
+            if force_exception_parameters(
                 block_index,
                 &raw_blocks,
                 &mut registers,
                 &mut parameters,
                 &mut parameter_regs,
                 &mut nodes,
-            )?;
+            )
+            .is_none()
+            {
+                note_structural(decline, "exception parameter merge");
+                return None;
+            }
             let mut block_nodes = if block_index == 0 {
                 entry_nodes.clone()
             } else {
@@ -1223,8 +1203,14 @@ impl NumericFunction {
                 // explicitly publish the `NativeResultPair` exception value; guessing
                 // it from operand zero aliases stores and other non-result
                 // operations with an unrelated receiver.
-                (Some(_), Some(_), Some(_), None) => return None,
-                _ => return None,
+                (Some(_), Some(_), Some(_), None) => {
+                    note_structural(decline, "missing pure exception value");
+                    return None;
+                }
+                _ => {
+                    note_structural(decline, "inconsistent exceptional block state");
+                    return None;
+                }
             };
             out_states.push(registers);
             exceptional_out_states.push(exceptional_state);
@@ -1501,7 +1487,7 @@ fn packed_double_cache_loop_is_safe(
                             | NumericNode::ConstructorFieldStore { .. }
                             | NumericNode::PropertyStore { .. }
                             | NumericNode::ElementStore {
-                                access: NumericElementAccess::Tagged,
+                                access: None | Some(NumericElementAccess::Tagged),
                                 ..
                             }
                     )
@@ -1800,7 +1786,12 @@ fn build_raw_blocks(
                 .enclosing_exception_region(pc)
                 .and_then(|region| region.catch_pc)
                 .is_some();
-        if (binding || matches!(op, Op::LoadProperty | Op::StoreProperty) || protected_throw)
+        if (binding
+            || matches!(
+                op,
+                Op::LoadProperty | Op::StoreProperty | Op::LoadElement | Op::StoreElement
+            )
+            || protected_throw)
             && usize::try_from(pc + 1).ok()? < view.instructions.len()
         {
             starts.insert(pc + 1);
@@ -2284,8 +2275,12 @@ fn force_exception_parameters(
         if parameter_registers.contains(&register) {
             continue;
         }
-        let RegisterState::Value(value) = *registers.get(usize::from(register))? else {
-            return None;
+        let state = *registers.get(usize::from(register))?;
+        let RegisterState::Value(value) = state else {
+            // A catch binding that is dead on entry needs no phi or edge
+            // argument even though every throwing predecessor owns a pure
+            // exception payload.
+            continue;
         };
         if value_type(nodes, value)? != NumericType::Tagged {
             return None;
@@ -2548,6 +2543,8 @@ fn lower_instruction(
                 | Op::CallForwardArguments
                 | Op::CallSpread
                 | Op::CallMethodValue
+                | Op::LoadElement
+                | Op::StoreElement
                 | Op::New
                 | Op::NewSpread
                 | Op::SuperConstruct
@@ -2748,7 +2745,7 @@ fn lower_instruction(
         }
         Op::LoadElement => {
             let receiver = read_value(registers, register(instruction, code, 1)?)?;
-            let mut index = read_value(registers, register(instruction, code, 2)?)?;
+            let index = read_value(registers, register(instruction, code, 2)?)?;
             let receiver_type = value_type(nodes, receiver)?;
             let index_type = value_type(nodes, index)?;
             let access = element_access_kind(element_accesses, instruction.byte_pc, cage_available);
@@ -2760,68 +2757,7 @@ fn lower_instruction(
                         | NumericType::Uint32
                         | NumericType::Number
                 );
-            let Some(access) = access.filter(|_| direct) else {
-                // A committed generic miss may throw after performing
-                // canonical lookup. Until Machine owns a committed-throw
-                // landing contract, keep it out of a local catch.
-                if exceptional_edge.is_some() {
-                    return None;
-                }
-                let value = push(
-                    nodes,
-                    NumericNode::GenericElementLoad {
-                        receiver,
-                        index,
-                        logical_pc,
-                        byte_pc: instruction.byte_pc,
-                    },
-                );
-                block_nodes.push(value);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(value),
-                    function_id,
-                    instruction.byte_pc,
-                    registers,
-                    live_in,
-                );
-                write(
-                    registers,
-                    register(instruction, code, 0)?,
-                    RegisterState::Value(value),
-                )?;
-                return Some(());
-            };
-            if access == NumericElementAccess::Tagged && exceptional_edge.is_some() {
-                note_decline(
-                    decline,
-                    op,
-                    logical_pc,
-                    "tagged element access inside a local catch",
-                );
-                return None;
-            }
-            if access == NumericElementAccess::PackedDouble
-                && value_type(nodes, index)? == NumericType::Number
-            {
-                let checked = push(
-                    nodes,
-                    NumericNode::CheckedFloat64ToElementIndex {
-                        value: index,
-                        byte_pc: instruction.byte_pc,
-                    },
-                );
-                block_nodes.push(checked);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(checked),
-                    function_id,
-                    instruction.byte_pc,
-                    registers,
-                    live_in,
-                );
-                index = checked;
-            }
+            let access = access.filter(|_| direct);
             let value = push(
                 nodes,
                 NumericNode::ElementLoad {
@@ -2829,8 +2765,10 @@ fn lower_instruction(
                     index,
                     byte_pc: instruction.byte_pc,
                     access,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
                 },
             );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
             block_nodes.push(value);
             push_frame_state(
                 frame_states,
@@ -2849,7 +2787,7 @@ fn lower_instruction(
         }
         Op::StoreElement => {
             let receiver = read_value(registers, register(instruction, code, 0)?)?;
-            let mut index = read_value(registers, register(instruction, code, 1)?)?;
+            let index = read_value(registers, register(instruction, code, 1)?)?;
             let source_register = register(instruction, code, 2)?;
             let mut stored = read_value(registers, source_register)?;
             let receiver_type = value_type(nodes, receiver)?;
@@ -2867,78 +2805,20 @@ fn lower_instruction(
                 Some(NumericElementAccess::Tagged) => true,
                 Some(NumericElementAccess::PackedDouble) => match stored_type {
                     NumericType::Number | NumericType::Int32 | NumericType::Uint32 => true,
-                    NumericType::Tagged => instruction.arith_feedback().is_numeric_only(),
+                    NumericType::Tagged => true,
                     NumericType::Boolean => false,
                 },
                 None => false,
             };
-            let Some(access) = access
-                .filter(|_| receiver_type == NumericType::Tagged && direct_index && direct_value)
-            else {
-                // Keep generic stores under the same all-or-nothing exception
-                // boundary as loads: canonical reentry cannot exact-deopt into
-                // a local handler after the operation has started.
-                if exceptional_edge.is_some() {
-                    return None;
-                }
-                let value = push(
-                    nodes,
-                    NumericNode::GenericElementStore {
-                        receiver,
-                        index,
-                        value: stored,
-                        logical_pc,
-                        byte_pc: instruction.byte_pc,
-                    },
-                );
-                block_nodes.push(value);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(value),
-                    function_id,
-                    instruction.byte_pc,
-                    registers,
-                    live_in,
-                );
-                return Some(());
-            };
-            if access == NumericElementAccess::Tagged && exceptional_edge.is_some() {
-                note_decline(
-                    decline,
-                    op,
-                    logical_pc,
-                    "tagged element access inside a local catch",
-                );
-                return None;
-            }
-            if access == NumericElementAccess::PackedDouble
-                && value_type(nodes, index)? == NumericType::Number
-            {
-                let checked = push(
-                    nodes,
-                    NumericNode::CheckedFloat64ToElementIndex {
-                        value: index,
-                        byte_pc: instruction.byte_pc,
-                    },
-                );
-                block_nodes.push(checked);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(checked),
-                    function_id,
-                    instruction.byte_pc,
-                    registers,
-                    live_in,
-                );
-                index = checked;
-            }
-            if access == NumericElementAccess::PackedDouble {
+            let access = access
+                .filter(|_| receiver_type == NumericType::Tagged && direct_index && direct_value);
+            if access == Some(NumericElementAccess::PackedDouble) {
                 stored = match value_type(nodes, stored)? {
                     NumericType::Number => stored,
                     NumericType::Int32 | NumericType::Uint32 => {
                         widen_to_number(stored, nodes, block_nodes)?
                     }
-                    NumericType::Tagged if instruction.arith_feedback().is_numeric_only() => {
+                    NumericType::Tagged => {
                         let decoded = read_number(
                             decode_site,
                             nodes,
@@ -2949,7 +2829,7 @@ fn lower_instruction(
                         )?;
                         widen_to_number(decoded, nodes, block_nodes)?
                     }
-                    NumericType::Tagged | NumericType::Boolean => return None,
+                    NumericType::Boolean => return None,
                 };
             }
             let value = push(
@@ -2960,6 +2840,7 @@ fn lower_instruction(
                     value: stored,
                     byte_pc: instruction.byte_pc,
                     access,
+                    exceptional_edge: exceptional_edge.map(u16::try_from).transpose().ok()?,
                 },
             );
             block_nodes.push(value);
@@ -2971,6 +2852,7 @@ fn lower_instruction(
                 registers,
                 live_in,
             );
+            record_exceptional_value(exceptional_value, exceptional_edge, value)?;
             return Some(());
         }
         Op::LoadInt32 => NumericNode::IntegerConstant(instruction.imm32(code, 1)?),
@@ -4580,14 +4462,16 @@ mod tests {
                 receiver: value(1),
                 index: value(2),
                 byte_pc: 24,
-                access: NumericElementAccess::PackedDouble,
+                access: Some(NumericElementAccess::PackedDouble),
+                exceptional_edge: None,
             },
             NumericNode::ElementStore {
                 receiver: value(1),
                 index: value(2),
                 value: value(3),
                 byte_pc: 32,
-                access: NumericElementAccess::PackedDouble,
+                access: Some(NumericElementAccess::PackedDouble),
+                exceptional_edge: None,
             },
             NumericNode::BooleanConstant(true),
         ];
@@ -5322,9 +5206,9 @@ mod tests {
             .nodes
             .iter()
             .enumerate()
-            .find_map(|(index, node)| match node {
+            .find_map(|(position, node)| match node {
                 NumericNode::ArrayConstruct { length, byte_pc: 0 } => {
-                    Some((NumericValue(index), *length))
+                    Some((NumericValue(position), *length))
                 }
                 _ => None,
             })
@@ -6193,7 +6077,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_double_elements_keep_payloads_unboxed_and_check_number_indices() {
+    fn packed_double_elements_box_loads_and_decode_stores_as_separate_values() {
         let mut incomplete = packed_double_number_index_element_view();
         incomplete
             .element_accesses
@@ -6201,12 +6085,16 @@ mod tests {
             .expect("packed load access")
             .guards[1] = None;
         let incomplete = NumericFunction::build(&incomplete)
-            .expect("malformed direct metadata keeps the canonical generic element path");
+            .expect("malformed direct metadata keeps the explicit canonical cold edge");
         assert!(
-            incomplete
-                .nodes
-                .iter()
-                .any(|node| matches!(node, NumericNode::GenericElementLoad { byte_pc: 8, .. })),
+            incomplete.nodes.iter().any(|node| matches!(
+                node,
+                NumericNode::ElementLoad {
+                    byte_pc: 8,
+                    access: None,
+                    ..
+                }
+            )),
             "raw Float64 InBody storage must never select the direct packed path"
         );
 
@@ -6218,141 +6106,100 @@ mod tests {
             .position(|node| matches!(node, NumericNode::Mul(..)))
             .map(NumericValue)
             .expect("guarded Float64 product");
-        let checks = hir
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| match node {
-                NumericNode::CheckedFloat64ToElementIndex { value, byte_pc }
-                    if *value == product =>
-                {
-                    Some((NumericValue(index), *byte_pc))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            checks
-                .iter()
-                .map(|(_, byte_pc)| *byte_pc)
-                .collect::<Vec<_>>(),
-            [8, 16]
-        );
-        for &(check, byte_pc) in &checks {
-            assert_eq!(hir.nodes[check.0].value_type(), NumericType::Uint32);
-            let state = hir
-                .frame_states
-                .iter()
-                .find(|state| state.point == NumericFramePoint::Node(check))
-                .expect("exact pre-element index conversion state");
-            assert_eq!(state.frames[0].byte_pc, byte_pc);
-            assert_eq!(state.frames[0].slots[3], NumericFrameSlot::Value(product));
-        }
-
         let load = hir
             .nodes
             .iter()
             .enumerate()
-            .find_map(|(index, node)| match node {
+            .find_map(|(position, node)| match node {
                 NumericNode::ElementLoad {
-                    index: checked,
-                    access: NumericElementAccess::PackedDouble,
+                    index,
+                    access: Some(NumericElementAccess::PackedDouble),
                     ..
-                } => Some((NumericValue(index), *checked)),
+                } if *index == product => Some(NumericValue(position)),
                 _ => None,
             })
             .expect("PackedDouble element load");
-        assert_eq!(load.1, checks[0].0);
-        assert_eq!(hir.nodes[load.0.0].value_type(), NumericType::Number);
-        assert!(
-            !hir.nodes.contains(&NumericNode::TaggedToNumber(load.0)),
-            "the packed load must not immediately decode its own result"
-        );
+        assert_eq!(hir.nodes[load.0].value_type(), NumericType::Tagged);
 
-        let store = hir
+        let stored = hir
             .nodes
             .iter()
-            .find(|node| {
-                matches!(
-                    node,
-                    NumericNode::ElementStore {
-                        index,
-                        value,
-                        access: NumericElementAccess::PackedDouble,
-                        ..
-                    } if *index == checks[1].0 && *value == load.0
-                )
+            .find_map(|node| {
+                let NumericNode::ElementStore {
+                    index,
+                    value,
+                    access: Some(NumericElementAccess::PackedDouble),
+                    ..
+                } = node
+                else {
+                    return None;
+                };
+                (*index == product).then_some(*value)
             })
             .expect("PackedDouble element store");
-        assert_eq!(store.value_type(), NumericType::Tagged);
+        assert_eq!(hir.nodes[stored.0].value_type(), NumericType::Number);
+        assert!(
+            matches!(hir.nodes[stored.0], NumericNode::TaggedToNumber(source) if source == load)
+        );
     }
 
     #[test]
-    fn unprepared_elements_use_generic_value_calls_but_local_catches_stay_on_template_baseline() {
+    fn unprepared_elements_use_explicit_cold_cfg_and_local_catches() {
         let mut view = number_index_element_view();
         view.element_accesses.clear();
-        let hir = NumericFunction::build(&view).expect("generic element HIR");
+        let hir = NumericFunction::build(&view).expect("cold-only element HIR");
         let load = hir
             .nodes
             .iter()
             .position(|node| {
                 matches!(
                     node,
-                    NumericNode::GenericElementLoad {
-                        logical_pc: 1,
+                    NumericNode::ElementLoad {
                         byte_pc: 8,
+                        access: None,
                         ..
                     }
                 )
             })
             .map(NumericValue)
-            .expect("generic element load");
+            .expect("cold-only element load");
         let store = hir
             .nodes
             .iter()
             .position(|node| {
                 matches!(
                     node,
-                    NumericNode::GenericElementStore {
-                        logical_pc: 2,
+                    NumericNode::ElementStore {
                         byte_pc: 16,
+                        access: None,
                         ..
                     }
                 )
             })
             .map(NumericValue)
-            .expect("generic element store");
+            .expect("cold-only element store");
         for (point, byte_pc) in [(load, 8), (store, 16)] {
             let state = hir
                 .frame_states
                 .iter()
                 .find(|state| state.point == NumericFramePoint::Node(point))
-                .expect("generic element pre-operation state");
+                .expect("cold-only element pre-operation state");
             assert_eq!(state.frames[0].byte_pc, byte_pc);
         }
 
         let mut caught = catch_liveness_view();
         caught.element_accesses.clear();
-        assert!(
-            NumericFunction::build(&caught).is_err(),
-            "a generic value call inside a local catch stays on the Template baseline"
-        );
+        NumericFunction::build(&caught).expect("cold-only element inside local catch");
 
         for store in [false, true] {
             let mut caught = catch_liveness_view_with_element_store(store);
-            assert!(
-                NumericFunction::build(&caught).is_err(),
-                "a prepared tagged element committed miss inside a local catch stays on the Template baseline"
-            );
+            NumericFunction::build(&caught).expect("prepared tagged element inside local catch");
 
             let byte_pc = caught.instructions[7].byte_pc;
             caught
                 .element_accesses
                 .insert(byte_pc, JitElementAccess::packed_double_array());
-            assert!(
-                NumericFunction::build(&caught).is_err(),
-                "a may-throw element needs an explicit committed exception value before entering a local catch"
-            );
+            NumericFunction::build(&caught).expect("packed element inside local catch");
         }
     }
 
@@ -6363,10 +6210,7 @@ mod tests {
         caught
             .element_accesses
             .insert(byte_pc, JitElementAccess::packed_double_array());
-        assert!(
-            NumericFunction::build(&caught).is_err(),
-            "StoreElement operand zero is its receiver, not a NativeResultPair exception result"
-        );
+        NumericFunction::build(&caught).expect("store exception value inside local catch");
     }
 
     #[test]
@@ -6642,45 +6486,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_only_frame_state_is_not_misclassified_as_exact_deopt() {
-        let view = JitCompileSnapshot::without_feedback(
-            127,
-            0,
-            1,
-            vec![
-                JitTestInstruction::new(
-                    Op::EnterTry,
-                    0,
-                    0,
-                    vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(NO_HANDLER_OFFSET),
-                        Operand::Register(0),
-                    ],
-                ),
-                JitTestInstruction::new(Op::Nop, 1, 8, Vec::new()),
-                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
-                JitTestInstruction::new(Op::ReturnUndefined, 3, 24, Vec::new()),
-                JitTestInstruction::new(Op::ReturnUndefined, 4, 32, Vec::new()),
-            ],
-        );
-        let node = NumericNode::GenericElementLoad {
-            receiver: NumericValue(1),
-            index: NumericValue(2),
-            logical_pc: 1,
-            byte_pc: 8,
-        };
-        assert_eq!(
-            node.frame_state_purpose(),
-            Some(NumericFrameStatePurpose::RuntimeMetadata)
-        );
-        let hir = NumericFunction::build(&view).expect("metadata-only protected frame state");
-        assert!(hir.nodes.iter().all(|node| {
-            node.frame_state_purpose() != Some(NumericFrameStatePurpose::ExactDeopt)
-        }));
-    }
-
-    #[test]
     fn packed_double_view_cache_groups_identity_phi_sites_and_records_entries() {
         let (function, view, load, store) = packed_double_cache_function(false, false);
         let plan = function.plan_packed_double_view_caches(&view);
@@ -6717,12 +6522,12 @@ mod tests {
             .filter_map(|(index, node)| match node {
                 NumericNode::ElementLoad {
                     byte_pc: 32,
-                    access: NumericElementAccess::PackedDouble,
+                    access: Some(NumericElementAccess::PackedDouble),
                     ..
                 }
                 | NumericNode::ElementStore {
                     byte_pc: 40,
-                    access: NumericElementAccess::PackedDouble,
+                    access: Some(NumericElementAccess::PackedDouble),
                     ..
                 } => Some(NumericValue(index)),
                 _ => None,
@@ -7272,14 +7077,12 @@ mod tests {
             "LoadProperty may throw to the catch that reads the redefined value"
         );
 
-        assert!(
-            NumericFunction::build(&view).is_err(),
-            "a runtime-backed property operation inside a local catch stays on the Template baseline"
-        );
+        NumericFunction::build(&view)
+            .expect("the explicit property completion routes its pure exception to the catch");
     }
 
     #[test]
-    fn catch_only_definition_remains_live_at_rejected_committed_element() {
+    fn catch_only_definition_remains_live_at_explicit_committed_element() {
         let view = catch_liveness_view();
         let semantics = classify_snapshot(&view).expect("element semantics");
         let raw_blocks = build_raw_blocks(&view, &semantics).expect("exception-aware raw blocks");
@@ -7304,9 +7107,7 @@ mod tests {
             "the later catch side exit must retain the redefined value across the boundary"
         );
 
-        assert!(
-            NumericFunction::build(&view).is_err(),
-            "a prepared tagged element miss cannot enter a local catch before committed-throw landing exists"
-        );
+        NumericFunction::build(&view)
+            .expect("the explicit element completion routes its pure exception to the catch");
     }
 }

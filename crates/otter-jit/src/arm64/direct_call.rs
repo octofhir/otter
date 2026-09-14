@@ -58,7 +58,9 @@
 mod completion;
 mod receiver_allocation;
 use receiver_allocation::emit_generated_receiver_allocation;
-pub(crate) use receiver_allocation::emit_receiver_probe;
+pub(crate) use receiver_allocation::{
+    emit_receiver_candidate_probe, emit_receiver_publication_effect,
+};
 mod forward_bindings;
 mod layout;
 mod runtime_forward;

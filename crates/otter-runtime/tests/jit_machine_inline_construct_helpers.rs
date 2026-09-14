@@ -42,9 +42,12 @@ for(var i=0;i<70000;i++)outer(p);
         .map(|f| String::from_utf8_lossy(f.contents()).into_owned())
         .collect::<Vec<_>>();
     assert!(
-        irs.iter().any(|ir| ir.contains("InlineCallGuard")
-            && ir.contains("InlineConstructGuard")
-            && ir.contains("ConstructReceiver {")),
+        irs.iter()
+            .any(|ir| ir.contains("GuardCallTarget { guard: Plain")
+                && ir.contains("GuardCallTarget { guard: Construct")
+                && ir.contains("AllocateObject {")
+                && ir.contains("AllocationHit")
+                && ir.contains("PublishObject {")),
         "outer must contain both bodies: {irs:#?}; {:?}",
         warm.jit_debug_report()
     );
@@ -124,7 +127,10 @@ for(var i=0;i<70000;i++)outer(p);
             b.manifest().function_name() == "outer"
                 && b.file(JitArtifactFileName::OptimizedIr).is_some_and(|f| {
                     let ir = String::from_utf8_lossy(f.contents());
-                    ir.contains("InlineCallGuard") && ir.contains("ConstructReceiver {")
+                    ir.contains("GuardCallTarget { guard: Plain")
+                        && ir.contains("GuardCallTarget { guard: Construct")
+                        && ir.contains("AllocateObject {")
+                        && ir.contains("PublishObject {")
                 })
         })
         .map(|b| b.manifest().code_object_id())

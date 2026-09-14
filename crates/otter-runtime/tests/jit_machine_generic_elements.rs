@@ -1,19 +1,20 @@
 //! Machine IR generic computed-element value-call coverage.
 //!
 //! # Contents
-//! - One mixed function whose prepared packed-double load/store remain direct
-//!   while cold computed accesses use the reentrant generic value boundary.
+//! - One mixed function whose prepared packed-double access is expressed as
+//!   view/address/value nodes while cold computed accesses use the same
+//!   committed reentrant value boundary.
 //! - Ordinary-object, proxy, and observable key-coercion probes with exact
 //!   effect and runtime-transition counts across feedback maturation.
-//! - A local `try`/`catch` fixture that retains its Template baseline until
-//!   Machine exceptional continuation is explicit.
+//! - A local `try`/`catch` fixture proving the committed Machine throw edge
+//!   reaches the JavaScript catch exactly once.
 //!
 //! # Invariants
 //! - A never-taken generic branch does not deopt or enter either element stub.
 //! - A taken generic load/store executes each coercion, proxy trap, and store
 //!   exactly once; it never reconstructs and replays the source bytecode.
-//! - Element-family feedback may replace the current generation once, but a
-//!   stable generic family does not cause a compile or deopt storm.
+//! - Element-family misses remain in the explicit committed cold sibling and
+//!   do not cause a compile or deopt storm.
 //! - Local catches are never bypassed by a propagating Machine runtime call.
 //!
 //! # See also
@@ -188,15 +189,17 @@ for (let warm = 0; warm < 5000; warm++) {
 "#;
 
 const CATCH_PROBE: &str = r#"
+globalThis.__machineGenericThrowingKeyCalls = 0;
 globalThis.__machineGenericThrowingKey = {
   toString() {
+    __machineGenericThrowingKeyCalls++;
     throw new Error("key-coercion");
   }
 };
-machineGenericElementCaught(
+JSON.stringify([machineGenericElementCaught(
   __machineGenericCatchWarm,
   __machineGenericThrowingKey
-);
+), __machineGenericThrowingKeyCalls]);
 "#;
 
 #[derive(Clone, Copy, Debug)]
@@ -302,7 +305,13 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
             .contents(),
     )
     .expect("UTF-8 mixed generic-element optimized IR");
-    for opcode in ["PackedDoubleElementLoad", "PackedDoubleElementStore"] {
+    for opcode in [
+        "ElementView",
+        "ElementAddress",
+        "ElementValueLoad",
+        "ElementValueGuard",
+        "ElementValueStore",
+    ] {
         assert!(
             optimized_ir.contains(opcode),
             "mixed function must retain {opcode}: {optimized_ir}"
@@ -329,11 +338,13 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
 
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"].as_array().expect("code-map regions");
-    for kind in [
-        "machinePackedDoubleElementLoad",
-        "machinePackedDoubleElementStore",
-        "machineGenericElementLoad",
-        "machineGenericElementStore",
+    for (kind, expected) in [
+        ("machineElementView", 2),
+        ("machineElementAddress", 2),
+        ("machineElementValueLoad", 1),
+        ("machineElementValueGuard", 1),
+        ("machineElementValueStore", 1),
+        ("machineCommittedValueEffect", 4),
     ] {
         let matching = regions
             .iter()
@@ -341,8 +352,8 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
             .collect::<Vec<_>>();
         assert_eq!(
             matching.len(),
-            1,
-            "mixed function must expose exactly one {kind}: {code_map}"
+            expected,
+            "mixed function must expose exactly {expected} {kind} regions: {code_map}"
         );
         assert!(
             matching[0]["bytePc"].as_u64().is_some(),
@@ -438,18 +449,13 @@ fn cold_generic_value_calls_preserve_direct_hot_sites_and_execute_effects_once()
         rebuild_delta.reentrant_stub_transitions, 0,
         "{rebuild_delta:?}"
     );
-    assert!(
-        rebuild_delta.compile_attempts > 0 && rebuild_delta.code_generations > 0,
-        "mature generic feedback must admit one replacement generation: {rebuild_delta:?}"
-    );
     assert_eq!(
         (
             rebuild_delta.compile_attempts,
             rebuild_delta.code_generations
         ),
-        (2, 2),
-        "one feedback change must publish exactly one template/optimizing replacement pair: \
-         {rebuild_delta:?}"
+        (0, 0),
+        "the explicit committed cold sibling must remain reusable: {rebuild_delta:?}"
     );
 
     completion(
@@ -479,7 +485,7 @@ fn cold_generic_value_calls_preserve_direct_hot_sites_and_execute_effects_once()
 }
 
 #[test]
-fn generic_element_inside_local_catch_stays_on_template_and_catches_key_throw() {
+fn generic_element_inside_local_catch_uses_machine_and_catches_key_throw() {
     let mut runtime = runtime(JitSelection::ProductionTiered, true);
     let setup = runtime
         .run_script(SourceInput::from_javascript(CATCH_SETUP), CATCH_MODULE)
@@ -502,10 +508,13 @@ fn generic_element_inside_local_catch_stays_on_template_and_catches_key_throw() 
         "local-catch fixture must retain its Template baseline"
     );
     assert!(
-        function_bundles
-            .iter()
-            .all(|bundle| bundle.manifest().tier() != JitDebugTier::Optimizing),
-        "Machine rejection must not select a second optimizing backend"
+        function_bundles.iter().any(|bundle| {
+            bundle.manifest().tier() == JitDebugTier::Optimizing
+                && bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+        }),
+        "the local catch must use the explicit Machine committed-throw CFG"
     );
     drop(setup);
 
@@ -514,13 +523,14 @@ fn generic_element_inside_local_catch_stays_on_template_and_catches_key_throw() 
         CATCH_PROBE,
         "jit-machine-generic-elements-catch-probe.js",
     );
-    assert_eq!(caught, "caught:key-coercion");
+    assert_eq!(caught, r#"["caught:key-coercion",1]"#);
     assert_eq!(
-        delta.runtime_property_stubs, 1,
-        "the throwing computed load must execute once: {delta:?}"
+        delta.runtime_property_stubs, 2,
+        "the computed load and error.message read must each execute once: {delta:?}"
     );
     assert_eq!(
         delta.reentrant_stub_transitions, 2,
-        "the computed load and local catch transition must each execute once: {delta:?}"
+        "the computed load and error.message read must each cross the committed boundary once: \
+         {delta:?}"
     );
 }

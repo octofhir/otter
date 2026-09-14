@@ -568,6 +568,25 @@ pub enum DirectCallKind {
     DerivedSuperConstruct,
 }
 
+/// One reusable generated callable-identity proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineCallGuard {
+    /// Exact ordinary closure identity.
+    Plain {
+        /// Canonical bytecode function identity.
+        function_id: u32,
+        /// Already-profiled ordinary `this` policy to prove before entry.
+        this_mode: otter_vm::JitDirectCallThisMode,
+    },
+    /// Class-wrapper unwrapping followed by exact constructor identity.
+    Construct {
+        /// Canonical bytecode constructor identity.
+        function_id: u32,
+    },
+    /// Exact receiver/prototype/slot method program.
+    Method(Box<otter_vm::jit::JitMethodGuard>),
+}
+
 /// Maximum complete guarded method chain accepted by the Machine backend.
 ///
 /// The VM may retain a larger bounded feedback chain for other tiers. Machine
@@ -765,7 +784,12 @@ fn is_explicit_committed_runtime_call(descriptor: &CallDescriptor) -> bool {
     matches!(
         &descriptor.target,
         CallTarget::CommittedRuntime { target, .. }
-            if (target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2 || *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY || *target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY)
+            if (matches!(
+                target.signature,
+                otter_vm::native_abi::RuntimeStubSignature::CommittedValue2
+                    | otter_vm::native_abi::RuntimeStubSignature::ReentrantValue2
+                    | otter_vm::native_abi::RuntimeStubSignature::ReentrantValue3
+            ) || *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY || *target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY)
                 && target.result_abi
                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
                 && target.result_domain
@@ -794,32 +818,32 @@ pub enum MachineOpcode {
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
     EntryThis,
-    /// Re-read a method's receiver/prototype/slot proof and return its callable.
-    InlineMethodGuard {
-        /// One source-owned immutable method identity program.
-        guard: Box<otter_vm::jit::JitMethodGuard>,
+    /// Prove one callable identity without resolving its `this` binding.
+    GuardCallTarget {
+        /// Immutable identity proof selected from source-owned feedback.
+        guard: MachineCallGuard,
     },
-    /// Unwrap a class when present, prove constructor identity, and return its callable.
-    InlineConstructGuard {
-        /// Canonical bytecode target identity.
-        function_id: u32,
-    },
-    /// Prove a plain inline callable and produce its exact this binding.
-    InlineCallGuard {
-        /// Canonical bytecode target identity.
-        function_id: u32,
-        /// Ordinary call this-binding policy.
+    /// Resolve the `this` value from an already-proven ordinary callable.
+    ResolveCallThis {
+        /// Ordinary call binding policy already accepted by its guard.
         this_mode: otter_vm::JitDirectCallThisMode,
     },
-    /// Probe the shared nursery allocator; undefined means no committed allocation.
-    ConstructReceiver {
+    /// Reserve and fully initialize one unpublished receiver candidate from
+    /// the shared nursery; undefined means no candidate was available.
+    AllocateObject {
         /// Source byte PC for generated allocation attribution.
         byte_pc: u32,
         /// One immutable live-prototype/shape allocation program.
         plan: otter_vm::jit::JitReceiverAllocationPlan,
     },
     /// Test the successful receiver result of a nursery probe.
-    ConstructReceiverHit,
+    AllocationHit,
+    /// Publish an initialized allocation by advancing the nursery frontier and
+    /// committing its accounting and weak observation. A false hit is a no-op.
+    PublishObject {
+        /// Source bytecode offset for effect attribution.
+        byte_pc: u32,
+    },
     /// Return an object result, or substitute the allocated base receiver.
     BaseConstructResult,
     /// Commit an unbound stack-owned derived this, returning whether it hit.
@@ -889,11 +913,6 @@ pub enum MachineOpcode {
     Uint32ToFloat64,
     /// Convert an unboxed Float64 through ECMAScript ToInt32.
     Float64ToInt32,
-    /// Prove that one Float64 is an exact unsigned dense-element index.
-    ///
-    /// The conversion deoptimizes at the owning element operation for a
-    /// fraction, non-finite value, negative value, or value outside Uint32.
-    CheckedFloat64ToElementIndex(u32),
     /// Reinterpret canonical Boolean bits as Int32.
     BooleanToInt32,
     /// Floating-point addition.
@@ -995,29 +1014,39 @@ pub enum MachineOpcode {
         /// Stable traced-cell target copied from the compile snapshot.
         target: otter_vm::jit::JitStringConstantCell,
     },
-    /// Guard and load one VM-baked indexed element. Every guard, bounds, or
-    /// hole miss boxes a scalar index only on the cold sibling and completes
-    /// once through the canonical reentrant element boundary; the source
-    /// operation is never exact-deopted and replayed.
-    ElementLoad(u32),
-    /// Guard and store one VM-baked indexed element. Every miss branches before
-    /// the first effect to the canonical committed store boundary; a scalar
-    /// index boxes only after that branch.
-    ElementStore(u32),
-    /// Guard and directly load one ordinary Array PackedDouble element.
-    PackedDoubleElementLoad {
-        /// Source bytecode offset used by artifacts and exact deoptimization.
+    /// Prove receiver identity and representation and materialize its live raw
+    /// base/length pair. A miss only clears the Boolean result.
+    ElementView {
+        /// Source bytecode offset selecting immutable layout metadata.
         byte_pc: u32,
         /// Optional loop-scoped raw view cache.
         cache: Option<PackedDoubleViewCacheId>,
     },
-    /// Guard and directly store one ordinary Array PackedDouble element.
-    PackedDoubleElementStore {
-        /// Source bytecode offset used by artifacts and exact deoptimization.
+    /// Prove an exact integer index is in bounds and derive one raw address
+    /// from a prior view. This operation has no heap effect.
+    ElementAddress {
+        /// Source bytecode offset selecting element stride and length width.
         byte_pc: u32,
-        /// Optional loop-scoped raw view cache.
-        cache: Option<PackedDoubleViewCacheId>,
     },
+    /// Read one addressed element and independently prove slot presence.
+    ElementValueLoad {
+        /// Source bytecode offset selecting the physical representation.
+        byte_pc: u32,
+    },
+    /// Prove that a value can be written directly to one addressed element.
+    /// No store is performed by this guard.
+    ElementValueGuard {
+        /// Source bytecode offset selecting the physical representation.
+        byte_pc: u32,
+    },
+    /// Commit one already-proven element store. This no-fail effect has no
+    /// guard, exit, call, or hidden control transfer.
+    ElementValueStore {
+        /// Source bytecode offset selecting the physical representation.
+        byte_pc: u32,
+    },
+    /// Require a composed Boolean proof. Failure is an exact pre-effect exit.
+    GuardCondition,
     /// Clear every persistent packed-double view word at one semantic boundary.
     ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason),
     /// Materialize a Boolean constant for explicit guard composition.
@@ -1125,13 +1154,6 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Whether the source operation is a store.
         store: bool,
-    },
-    /// Apply one VM-baked constructor-owned add-property transition.
-    ConstructorFieldStore {
-        /// Source operation within the innermost activation.
-        byte_pc: u32,
-        /// Source-owned transition, independent of the outer compilation snapshot.
-        transition: Box<otter_vm::jit::JitConstructorFieldTransition>,
     },
     /// Target ABI call through a call descriptor.
     Call(u32),
@@ -1610,57 +1632,6 @@ impl InstructionSequence {
             }
         }
         output
-    }
-
-    /// Recover the VM-semantic value behind selection-only exact conversions.
-    ///
-    /// Packed element instructions consume checked indices and widened Number
-    /// temporaries that intentionally do not appear in the pre-operation VM
-    /// state. Their source does. Parameter-entry decodes are not unwrapped:
-    /// that HIR parameter itself is the deopt value and its guard has no deopt
-    /// identity. This bounded walk lets the verifier prove that every semantic
-    /// operand, rather than merely some metadata, is reconstructible.
-    fn semantic_deopt_source_before(
-        &self,
-        before: MachineInstructionId,
-        mut value: MachineValue,
-    ) -> MachineValue {
-        for _ in 0..self.representations.len() {
-            let Some(definition) =
-                self.instructions[..before.0 as usize]
-                    .iter()
-                    .rev()
-                    .find(|instruction| {
-                        instruction.operands.iter().any(|operand| {
-                            operand.value == value
-                                && operand.role == OperandRole::Definition
-                                && operand.purpose == OperandPurpose::Output
-                        })
-                    })
-            else {
-                break;
-            };
-            let unwrap = matches!(
-                definition.opcode,
-                MachineOpcode::CheckedFloat64ToElementIndex(..)
-                    | MachineOpcode::Int32ToFloat64
-                    | MachineOpcode::Uint32ToFloat64
-            ) || (definition.opcode == MachineOpcode::DecodeNumber
-                && !definition.exits.is_empty());
-            if !unwrap {
-                break;
-            }
-            let Some(source) = definition.operands.iter().find(|operand| {
-                operand.role == OperandRole::Use && operand.purpose == OperandPurpose::Input
-            }) else {
-                break;
-            };
-            if source.value == value {
-                break;
-            }
-            value = source.value;
-        }
-        value
     }
 
     fn exceptional_target(&self, instruction: &MachineInstruction) -> Option<MachineBlock> {
@@ -2488,27 +2459,30 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::ConstructReceiver { .. }
-                    | MachineOpcode::ConstructReceiverHit
+                    MachineOpcode::AllocateObject { .. }
+                    | MachineOpcode::AllocationHit
                     | MachineOpcode::BaseConstructResult => {
-                        let (inputs, result, clobbers) = match instruction.opcode {
-                            MachineOpcode::ConstructReceiver { .. } => (
+                        let (inputs, outputs, result, clobbers) = match instruction.opcode {
+                            MachineOpcode::AllocateObject { .. } => (
                                 1,
+                                2,
                                 MachineRepresentation::Tagged,
                                 TargetClobberSet::ConstructReceiver,
                             ),
-                            MachineOpcode::ConstructReceiverHit => (
+                            MachineOpcode::AllocationHit => (
+                                1,
                                 1,
                                 MachineRepresentation::Boolean,
                                 TargetClobberSet::ConstructReceiverHit,
                             ),
                             _ => (
                                 2,
+                                1,
                                 MachineRepresentation::Tagged,
                                 TargetClobberSet::BaseConstructResult,
                             ),
                         };
-                        if instruction.operands.len() != inputs + 1
+                        if instruction.operands.len() != inputs + outputs
                             || !instruction
                                 .operands
                                 .iter()
@@ -2521,7 +2495,13 @@ impl InstructionSequence {
                                             MachineOperand::register_output(operand.value)
                                         }
                                         && self.representations[operand.value.0 as usize]
-                                            == if index < inputs {
+                                            == if matches!(
+                                                instruction.opcode,
+                                                MachineOpcode::AllocateObject { .. }
+                                            ) && index == inputs + 1
+                                            {
+                                                MachineRepresentation::Int64
+                                            } else if index < inputs {
                                                 MachineRepresentation::Tagged
                                             } else {
                                                 result
@@ -2534,15 +2514,44 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::InlineCallGuard { .. }
-                    | MachineOpcode::InlineConstructGuard { .. }
-                    | MachineOpcode::InlineMethodGuard { .. } => {
+                    MachineOpcode::PublishObject { .. } => {
+                        let [new_target, input, page, hit, output] =
+                            instruction.operands.as_slice()
+                        else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *new_target != MachineOperand::register_input(new_target.value)
+                            || *input != MachineOperand::register_input(input.value)
+                            || *page != MachineOperand::register_input(page.value)
+                            || *hit != MachineOperand::register_input(hit.value)
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[new_target.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || self.representations[input.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || self.representations[page.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || self.representations[hit.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::ConstructReceiver)
+                            || instruction.safepoint.is_some()
+                            || !instruction.exits.is_empty()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::GuardCallTarget { .. } => {
                         let [input, output, late @ ..] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
                         let clobbers = if matches!(
                             instruction.opcode,
-                            MachineOpcode::InlineMethodGuard { .. }
+                            MachineOpcode::GuardCallTarget {
+                                guard: MachineCallGuard::Method(_),
+                            }
                         ) {
                             TargetClobberSet::InlineMethodGuard
                         } else {
@@ -2559,6 +2568,24 @@ impl InstructionSequence {
                             })
                             || instruction.clobbers != target_spec.clobbers(clobbers)
                             || instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::ResolveCallThis { .. } => {
+                        let [input, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *input != MachineOperand::register_input(input.value)
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[input.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::InlineCallGuard)
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2871,99 +2898,6 @@ impl InstructionSequence {
                 }
                 if matches!(
                     instruction.opcode,
-                    MachineOpcode::ElementLoad(..) | MachineOpcode::ElementStore(..)
-                ) {
-                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(3)
-                    else {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    };
-                    let receiver = ordinary[0];
-                    let fast_index = ordinary[1];
-                    let payload = ordinary[2];
-                    let receiver_is_tagged_location = receiver
-                        == MachineOperand::location_input(receiver.value)
-                        && self.representations[receiver.value.0 as usize]
-                            == MachineRepresentation::Tagged;
-                    let fast_index_representation =
-                        self.representations[fast_index.value.0 as usize];
-                    let fast_index_is_location = fast_index
-                        == MachineOperand::location_input(fast_index.value)
-                        && matches!(
-                            fast_index_representation,
-                            MachineRepresentation::Tagged
-                                | MachineRepresentation::Int32
-                                | MachineRepresentation::Uint32
-                        );
-                    let payload_signature = match instruction.opcode {
-                        MachineOpcode::ElementLoad(..) => {
-                            payload == MachineOperand::register_output(payload.value)
-                                && self.representations[payload.value.0 as usize]
-                                    == MachineRepresentation::Tagged
-                        }
-                        MachineOpcode::ElementStore(..) => {
-                            payload == MachineOperand::location_input(payload.value)
-                                && self.representations[payload.value.0 as usize]
-                                    == MachineRepresentation::Tagged
-                        }
-                        _ => false,
-                    };
-                    let metadata_shape = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::tagged_root(operand.value)
-                            || *operand == MachineOperand::frame_value(operand.value)
-                    });
-                    let root_values = metadata
-                        .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-                        .map(|operand| operand.value)
-                        .collect::<std::collections::BTreeSet<_>>();
-                    let root_count = metadata
-                        .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-                        .count();
-                    let roots_are_tagged = metadata
-                        .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-                        .all(|operand| {
-                            self.representations[operand.value.0 as usize]
-                                == MachineRepresentation::Tagged
-                        });
-                    let mut deopt_values = std::collections::BTreeSet::new();
-                    let deopts_are_unique = metadata
-                        .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::FrameState)
-                        .all(|operand| deopt_values.insert(operand.value));
-                    let deopt_tagged_values_are_rooted = metadata
-                        .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::FrameState)
-                        .filter(|operand| {
-                            self.representations[operand.value.0 as usize]
-                                == MachineRepresentation::Tagged
-                        })
-                        .all(|operand| root_values.contains(&operand.value));
-                    let required_roots = root_values.contains(&receiver.value)
-                        && (fast_index_representation != MachineRepresentation::Tagged
-                            || root_values.contains(&fast_index.value))
-                        && (!matches!(instruction.opcode, MachineOpcode::ElementStore(..))
-                            || root_values.contains(&payload.value));
-                    if !receiver_is_tagged_location
-                        || !fast_index_is_location
-                        || !payload_signature
-                        || !metadata_shape
-                        || root_count != root_values.len()
-                        || !roots_are_tagged
-                        || !deopts_are_unique
-                        || !deopt_tagged_values_are_rooted
-                        || !required_roots
-                        || instruction.clobbers != target_spec.clobbers(TargetClobberSet::Element)
-                        || instruction.exits.is_empty()
-                        || instruction.safepoint.is_none()
-                        || instruction.control != ControlFlow::None
-                    {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    }
-                }
-                if matches!(
-                    instruction.opcode,
                     MachineOpcode::ClearPackedDoubleViewCaches(..)
                 ) && (!instruction.operands.is_empty()
                     || !instruction.clobbers.is_empty()
@@ -2973,116 +2907,152 @@ impl InstructionSequence {
                 {
                     return Err(VerificationError::OpcodeSignatureMismatch(id));
                 }
-                if matches!(
-                    instruction.opcode,
-                    MachineOpcode::CheckedFloat64ToElementIndex(..)
-                ) {
-                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(2)
+                if let MachineOpcode::ElementView {
+                    cache: Some(cache), ..
+                } = instruction.opcode
+                    && cache.index() >= usize::from(self.packed_double_view_cache_count)
+                {
+                    return Err(VerificationError::InvalidPackedDoubleViewCache(id, cache));
+                }
+                if matches!(instruction.opcode, MachineOpcode::ElementView { .. }) {
+                    let [receiver, base, length, hit] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let valid = *receiver == MachineOperand::location_input(receiver.value)
+                        && *base == MachineOperand::register_output(base.value)
+                        && *length == MachineOperand::register_output(length.value)
+                        && *hit == MachineOperand::register_output(hit.value)
+                        && self.representations[receiver.value.0 as usize]
+                            == MachineRepresentation::Tagged
+                        && self.representations[base.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[length.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[hit.value.0 as usize]
+                            == MachineRepresentation::Boolean;
+                    if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(instruction.opcode, MachineOpcode::ElementAddress { .. }) {
+                    let [base, length, index, active, address, hit] =
+                        instruction.operands.as_slice()
                     else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let input = ordinary[0];
-                    let output = ordinary[1];
-                    let ordinary_signature = input == MachineOperand::register_input(input.value)
-                        && self.representations[input.value.0 as usize]
-                            == MachineRepresentation::Float64
-                        && output == MachineOperand::register_output(output.value)
-                        && self.representations[output.value.0 as usize]
-                            == MachineRepresentation::Uint32;
-                    let mut deopt_values = std::collections::BTreeSet::new();
-                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::frame_value(operand.value)
-                            && operand.value != output.value
-                            && deopt_values.insert(operand.value)
-                    });
-                    if !ordinary_signature
-                        || !metadata_is_exact_deopt
-                        || !deopt_values.contains(&input.value)
-                        || instruction.exits.is_empty()
-                        || instruction.safepoint.is_some()
-                        || instruction.clobbers
-                            != target_spec.clobbers(TargetClobberSet::FloatElementIndex)
-                    {
+                    let valid = [base, length, index]
+                        .into_iter()
+                        .all(|operand| *operand == MachineOperand::location_input(operand.value))
+                        && *active == MachineOperand::register_input(active.value)
+                        && *address == MachineOperand::register_output(address.value)
+                        && *hit == MachineOperand::register_output(hit.value)
+                        && self.representations[base.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[length.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[index.value.0 as usize]
+                            == MachineRepresentation::Tagged
+                        && self.representations[active.value.0 as usize]
+                            == MachineRepresentation::Boolean
+                        && self.representations[address.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[hit.value.0 as usize]
+                            == MachineRepresentation::Boolean;
+                    if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(instruction.opcode, MachineOpcode::ElementValueLoad { .. }) {
+                    let [address, active, value, hit] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let valid = *address == MachineOperand::location_input(address.value)
+                        && *active == MachineOperand::register_input(active.value)
+                        && *value == MachineOperand::register_output(value.value)
+                        && *hit == MachineOperand::register_output(hit.value)
+                        && self.representations[address.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[active.value.0 as usize]
+                            == MachineRepresentation::Boolean
+                        && self.representations[value.value.0 as usize]
+                            == MachineRepresentation::Tagged
+                        && self.representations[hit.value.0 as usize]
+                            == MachineRepresentation::Boolean;
+                    if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(instruction.opcode, MachineOpcode::ElementValueGuard { .. }) {
+                    let [address, value, active, hit] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let value_representation = self.representations[value.value.0 as usize];
+                    let valid = *address == MachineOperand::location_input(address.value)
+                        && *value == MachineOperand::location_input(value.value)
+                        && *active == MachineOperand::register_input(active.value)
+                        && *hit == MachineOperand::register_output(hit.value)
+                        && self.representations[address.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && matches!(
+                            value_representation,
+                            MachineRepresentation::Tagged | MachineRepresentation::Float64
+                        )
+                        && self.representations[active.value.0 as usize]
+                            == MachineRepresentation::Boolean
+                        && self.representations[hit.value.0 as usize]
+                            == MachineRepresentation::Boolean;
+                    if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if matches!(instruction.opcode, MachineOpcode::ElementValueStore { .. }) {
+                    let [address, value] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let valid = *address == MachineOperand::location_input(address.value)
+                        && *value == MachineOperand::location_input(value.value)
+                        && self.representations[address.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && matches!(
+                            self.representations[value.value.0 as usize],
+                            MachineRepresentation::Tagged | MachineRepresentation::Float64
+                        );
+                    if !valid {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
                 if matches!(
                     instruction.opcode,
-                    MachineOpcode::PackedDoubleElementLoad { .. }
-                        | MachineOpcode::PackedDoubleElementStore { .. }
-                ) {
-                    let cache = match instruction.opcode {
-                        MachineOpcode::PackedDoubleElementLoad { cache, .. }
-                        | MachineOpcode::PackedDoubleElementStore { cache, .. } => cache,
-                        _ => unreachable!("matched packed-double operation"),
-                    };
-                    if let Some(cache) = cache
-                        && cache.index() >= usize::from(self.packed_double_view_cache_count)
-                    {
-                        return Err(VerificationError::InvalidPackedDoubleViewCache(id, cache));
-                    }
-                    let Some((ordinary, metadata)) = instruction.operands.split_at_checked(3)
-                    else {
+                    MachineOpcode::ElementView { .. }
+                        | MachineOpcode::ElementAddress { .. }
+                        | MachineOpcode::ElementValueLoad { .. }
+                        | MachineOpcode::ElementValueGuard { .. }
+                        | MachineOpcode::ElementValueStore { .. }
+                ) && (instruction.clobbers != target_spec.clobbers(TargetClobberSet::Element)
+                    || instruction.safepoint.is_some()
+                    || !instruction.exits.is_empty()
+                    || instruction.control != ControlFlow::None)
+                {
+                    return Err(VerificationError::OpcodeSignatureMismatch(id));
+                }
+                if matches!(instruction.opcode, MachineOpcode::GuardCondition) {
+                    let Some((condition, state)) = instruction.operands.split_first() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let receiver = ordinary[0];
-                    let index = ordinary[1];
-                    let payload = ordinary[2];
-                    let receiver_is_tagged_location = receiver
-                        == MachineOperand::location_input(receiver.value)
-                        && self.representations[receiver.value.0 as usize]
-                            == MachineRepresentation::Tagged;
-                    let index_representation = self.representations[index.value.0 as usize];
-                    let index_is_scalar_location = index
-                        == MachineOperand::location_input(index.value)
-                        && matches!(
-                            index_representation,
-                            MachineRepresentation::Tagged
-                                | MachineRepresentation::Int32
-                                | MachineRepresentation::Uint32
-                        );
-                    let payload_signature = match instruction.opcode {
-                        MachineOpcode::PackedDoubleElementLoad { .. } => {
-                            payload == MachineOperand::register_output(payload.value)
-                                && self.representations[payload.value.0 as usize]
-                                    == MachineRepresentation::Float64
-                        }
-                        MachineOpcode::PackedDoubleElementStore { .. } => {
-                            payload == MachineOperand::register_input(payload.value)
-                                && self.representations[payload.value.0 as usize]
-                                    == MachineRepresentation::Float64
-                        }
-                        _ => false,
-                    };
-                    let output = matches!(
-                        instruction.opcode,
-                        MachineOpcode::PackedDoubleElementLoad { .. }
-                    )
-                    .then_some(payload.value);
-                    let mut deopt_values = std::collections::BTreeSet::new();
-                    let metadata_is_exact_deopt = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::frame_value(operand.value)
-                            && Some(operand.value) != output
-                            && deopt_values.insert(operand.value)
-                    });
-                    let semantic_receiver = self.semantic_deopt_source_before(id, receiver.value);
-                    let semantic_index = self.semantic_deopt_source_before(id, index.value);
-                    let semantic_payload = self.semantic_deopt_source_before(id, payload.value);
-                    let expected_clobbers = target_spec.clobbers(TargetClobberSet::Element);
-                    if !receiver_is_tagged_location
-                        || !index_is_scalar_location
-                        || !payload_signature
-                        || !metadata_is_exact_deopt
-                        || !deopt_values.contains(&semantic_receiver)
-                        || !deopt_values.contains(&semantic_index)
-                        || (matches!(
-                            instruction.opcode,
-                            MachineOpcode::PackedDoubleElementStore { .. }
-                        ) && !deopt_values.contains(&semantic_payload))
-                        || instruction.exits.is_empty()
-                        || instruction.safepoint.is_some()
-                        || instruction.clobbers != expected_clobbers
-                    {
+                    let mut values = std::collections::BTreeSet::new();
+                    let valid = *condition == MachineOperand::register_input(condition.value)
+                        && self.representations[condition.value.0 as usize]
+                            == MachineRepresentation::Boolean
+                        && state.iter().all(|operand| {
+                            *operand == MachineOperand::frame_value(operand.value)
+                                && values.insert(operand.value)
+                        })
+                        && !instruction.exits.is_empty()
+                        && instruction.clobbers
+                            == target_spec.clobbers(TargetClobberSet::StatusScratch)
+                        && instruction.safepoint.is_none()
+                        && instruction.control == ControlFlow::None;
+                    if !valid {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
@@ -3186,6 +3156,11 @@ impl InstructionSequence {
                             let named_store =
                                 *target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY;
                             let named_property = named_load || named_store;
+                            let element_load =
+                                *target == otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT;
+                            let element_store =
+                                *target == otter_vm::native_abi::STUB_JIT_STORE_ELEMENT;
+                            let element = element_load || element_store;
                             let cell_index = if named_store { 2 } else { 1 };
                             let complete_effects = CallEffects::READS_HEAP
                                 .union(CallEffects::WRITES_HEAP)
@@ -3208,14 +3183,23 @@ impl InstructionSequence {
                                 .map(|operand| operand.value)
                                 .collect::<std::collections::BTreeSet<_>>();
                             let collapses_status = !named_property
+                                && !element
                                 && descriptor.results == [MachineRepresentation::Tagged]
                                 && descriptor.exceptional != ExceptionalEdge::None
                                 && *target != otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
                             let exposes_committed_status =
                                 is_explicit_committed_runtime_call(descriptor);
-                            semantic_arity <= if named_store { 3 } else { 2 }
-                                && (named_property || target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2)
-                                && target.argument_count == if named_load { 1 } else { 2 }
+                            semantic_arity <= if named_store || element_store { 3 } else { 2 }
+                                && (named_property || element || target.signature == otter_vm::native_abi::RuntimeStubSignature::CommittedValue2)
+                                && target.argument_count == if named_load {
+                                    1
+                                } else if named_store {
+                                    2
+                                } else if element {
+                                    u8::try_from(semantic_arity).unwrap_or(u8::MAX)
+                                } else {
+                                    2
+                                }
                                 && target.result_abi
                                     == otter_vm::native_abi::RuntimeStubResultAbi::NativePair
                                 && target.result_domain
@@ -3990,28 +3974,27 @@ mod tests {
     #[test]
     fn verifier_rejects_packed_double_cache_outside_sequence() {
         let receiver = MachineValue(0);
-        let index = MachineValue(1);
-        let result = MachineValue(2);
+        let base = MachineValue(1);
+        let length = MachineValue(2);
+        let hit = MachineValue(3);
         let mut load = MachineInstruction::plain(
-            MachineOpcode::PackedDoubleElementLoad {
+            MachineOpcode::ElementView {
                 byte_pc: 24,
                 cache: PackedDoubleViewCacheId::new(0),
             },
             vec![
                 MachineOperand::location_input(receiver),
-                MachineOperand::location_input(index),
-                MachineOperand::register_output(result),
-                MachineOperand::frame_value(receiver),
-                MachineOperand::frame_value(index),
+                MachineOperand::register_output(base),
+                MachineOperand::register_output(length),
+                MachineOperand::register_output(hit),
             ],
         );
         load.clobbers = TargetSpec::aarch64()
             .clobbers(TargetClobberSet::Element)
             .to_vec();
-        load.set_test_exit(DeoptId(0), 0);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
-            vec![MachineOperand::register_input(result)],
+            vec![MachineOperand::register_input(receiver)],
         );
         ret.control = ControlFlow::Return;
         let mut sequence =
@@ -4020,8 +4003,9 @@ mod tests {
                 MachineBlock(0),
                 vec![
                     MachineRepresentation::Tagged,
-                    MachineRepresentation::Uint32,
-                    MachineRepresentation::Float64,
+                    MachineRepresentation::Int64,
+                    MachineRepresentation::Int64,
+                    MachineRepresentation::Boolean,
                 ],
                 Vec::new(),
                 vec![MachineFrameState {
@@ -4032,13 +4016,13 @@ mod tests {
                         entry: None,
                         slots: Box::new([
                             MachineFrameSlot::Value(receiver),
-                            MachineFrameSlot::Value(index),
+                            MachineFrameSlot::Value(receiver),
                         ]),
                     }]),
                 }],
                 vec![MachineBlockData {
                     first: MachineInstructionId(0),
-                    end: MachineInstructionId(4),
+                    end: MachineInstructionId(3),
                     predecessors: Vec::new(),
                     successors: Vec::new(),
                     parameters: Vec::new(),
@@ -4049,24 +4033,20 @@ mod tests {
                         MachineOpcode::EntryValue(0),
                         vec![MachineOperand::register_output(receiver)],
                     ),
-                    MachineInstruction::plain(
-                        MachineOpcode::IntegerConstant(0),
-                        vec![MachineOperand::register_output(index)],
-                    ),
                     load,
                     ret,
                 ],
                 1,
             )
             .expect("cached packed load");
-        sequence.instructions[2].opcode = MachineOpcode::PackedDoubleElementLoad {
+        sequence.instructions[1].opcode = MachineOpcode::ElementView {
             byte_pc: 24,
             cache: PackedDoubleViewCacheId::new(1),
         };
         assert_eq!(
             sequence.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidPackedDoubleViewCache(
-                MachineInstructionId(2),
+                MachineInstructionId(1),
                 PackedDoubleViewCacheId::new(1).expect("bounded id")
             ))
         );

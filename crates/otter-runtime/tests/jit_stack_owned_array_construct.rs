@@ -602,7 +602,10 @@ fn assert_machine_array_field_constructor(
     let regions = code_map["regions"].as_array().expect("constructor regions");
     for (kind, byte_pc) in [
         ("machineArrayConstruct", array_byte_pc),
-        ("machineConstructorFieldTransition", store_byte_pc),
+        ("machineCacheIrGuardExtensible", store_byte_pc),
+        ("machineCacheIrStoreField", store_byte_pc),
+        ("machineCacheIrPublishShape", store_byte_pc),
+        ("machineCacheIrWriteBarrier", store_byte_pc),
     ] {
         assert!(
             regions.iter().any(|region| {
@@ -683,20 +686,20 @@ fn assert_machine_constructor_field_regions(
         let regions = code_map["regions"]
             .as_array()
             .expect("constructor code-map regions");
-        let transition_byte_pcs = regions
+        let store_effect_byte_pcs = regions
             .iter()
-            .filter(|region| region["kind"] == "machineConstructorFieldTransition")
+            .filter(|region| region["kind"] == "machineCacheIrStoreField")
             .filter_map(|region| region["bytePc"].as_u64())
             .filter_map(|byte_pc| u32::try_from(byte_pc).ok())
             .collect::<Vec<_>>();
         if store_byte_pcs.iter().all(|byte_pc| {
-            transition_byte_pcs
+            store_effect_byte_pcs
                 .iter()
-                .any(|transition_pc| transition_pc == byte_pc)
+                .any(|effect_pc| effect_pc == byte_pc)
         }) {
             return;
         }
-        observed_machine_regions.push(transition_byte_pcs);
+        observed_machine_regions.push(store_effect_byte_pcs);
     }
     panic!(
         "missing complete Machine constructor field program for {module}:{function_name}; \
@@ -746,8 +749,8 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
         artifacts,
         MODULE,
         "arrayZeroAtEntry",
-        JitDebugTier::Template,
-        false,
+        JitDebugTier::Optimizing,
+        true,
     );
     assert_array_construct_backend(
         artifacts,
@@ -763,7 +766,7 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
     let delta = CounterDelta::between(before, runtime.execution_stats());
     assert_eq!(completion, "[0,4,0,7]");
     assert_clean_generated_returns(delta, 4);
-    assert!(delta.generated_template_entries > 0, "{delta:?}");
+    assert_eq!(delta.generated_template_entries, 0, "{delta:?}");
     assert!(delta.generated_optimizing_entries > 0, "{delta:?}");
     assert!(
         delta.alloc_value_stub_ok >= 4,

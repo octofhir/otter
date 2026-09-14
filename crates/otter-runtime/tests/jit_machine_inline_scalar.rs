@@ -48,7 +48,7 @@ for(var i=0;i<70000;i++) caller(2,mark);
             .contents(),
     );
     assert!(
-        ir.contains("InlineCallGuard"),
+        ir.contains("GuardCallTarget { guard: Plain"),
         "caller must contain spliced body: {ir}"
     );
     assert!(
@@ -151,7 +151,7 @@ for(var i=0;i<70000;i++) caller(2);
             .contents(),
     );
     assert!(
-        ir.matches("InlineCallGuard").count() >= 2,
+        ir.matches("GuardCallTarget { guard: Plain").count() >= 2,
         "both calls must splice: {ir}"
     );
     let fast = runtime
@@ -212,7 +212,10 @@ for(var i=0;i<70000;i++) caller(9,keep);
             .unwrap()
             .contents(),
     );
-    assert!(ir.contains("InlineCallGuard"), "caller must splice: {ir}");
+    assert!(
+        ir.contains("GuardCallTarget { guard: Plain"),
+        "caller must splice: {ir}"
+    );
     let result = runtime.run_script(SourceInput::from_javascript(r#"
 var conversions=0;
 var pair=caller({valueOf:function(){conversions++;var garbage=[];for(var j=0;j<100;j++)garbage.push({j:j});return 11;}},keep);
@@ -258,7 +261,10 @@ for(var i=0;i<70000;i++) loop(2,4);
             .unwrap()
             .contents(),
     );
-    assert!(ir.contains("InlineCallGuard"), "loop must splice: {ir}");
+    assert!(
+        ir.contains("GuardCallTarget { guard: Plain"),
+        "loop must splice: {ir}"
+    );
     let result = runtime
         .run_script(
             SourceInput::from_javascript(
@@ -308,7 +314,10 @@ for(var i=0;i<70000;i++) caller(2);
             .unwrap()
             .contents(),
     );
-    assert!(ir.contains("InlineCallGuard"), "arrow must splice: {ir}");
+    assert!(
+        ir.contains("GuardCallTarget { guard: Plain"),
+        "arrow must splice: {ir}"
+    );
     let cycles = runtime.heap_stats().gc_cycles;
     runtime.force_gc().unwrap();
     assert!(runtime.heap_stats().gc_cycles > cycles);

@@ -44,9 +44,13 @@ var payload={count:0,saved:null,value:1.25};for(var i=0;i<70000;i++)make(payload
             .map(|f| String::from_utf8_lossy(f.contents()).into_owned())
             .collect::<Vec<_>>();
         assert!(
-            irs.iter().any(|ir| ir.contains("ConstructReceiver {")
-                && ir.contains("BaseConstructResult")
-                && (ir.contains("PropertyStore {") || ir.contains("ConstructorFieldStore {"))),
+            irs.iter()
+                .any(|ir| ir.contains("GuardCallTarget { guard: Construct")
+                    && ir.contains("AllocateObject {")
+                    && ir.contains("AllocationHit")
+                    && ir.contains("PublishObject {")
+                    && ir.contains("BaseConstructResult")
+                    && ir.contains("CacheIrStoreField {")),
             "factory must splice constructor allocation and fields: {irs:#?}; {:?}",
             warm.jit_debug_report()
         );
@@ -145,8 +149,12 @@ for(var i=0;i<70000;i++)box(1.25);
             .any(|bundle| bundle.manifest().function_name() == "box"
                 && bundle
                     .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| String::from_utf8_lossy(file.contents())
-                        .contains("ConstructReceiver {"))),
+                    .is_some_and(|file| {
+                        let ir = String::from_utf8_lossy(file.contents());
+                        ir.contains("GuardCallTarget { guard: Construct")
+                            && ir.contains("AllocateObject {")
+                            && ir.contains("PublishObject {")
+                    })),
         "numeric constructor must be spliced"
     );
     let result = runtime
@@ -215,8 +223,12 @@ var p={saved:null,value:null};for(var i=0;i<70000;i++)cell(p);
             .any(|bundle| bundle.manifest().function_name() == "cell"
                 && bundle
                     .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| String::from_utf8_lossy(file.contents())
-                        .contains("ConstructReceiver {")))
+                    .is_some_and(|file| {
+                        let ir = String::from_utf8_lossy(file.contents());
+                        ir.contains("GuardCallTarget { guard: Construct")
+                            && ir.contains("AllocateObject {")
+                            && ir.contains("PublishObject {")
+                    }))
     );
     let before = runtime.execution_stats();
     let result=runtime.run_script(SourceInput::from_javascript(r#"

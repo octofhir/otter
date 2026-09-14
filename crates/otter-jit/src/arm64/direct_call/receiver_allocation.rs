@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - Class-wrapper and ordinary-closure prototype resolution before effects.
-//! - Existing nursery, accounting and complete object initialization program.
+//! - Existing nursery reservation and complete object initialization program.
+//! - Explicit publication/accounting after every pre-effect proof succeeds.
 //! - SSA probe completion with separately counted pre-effect misses.
 //!
 //! # Invariants
@@ -11,6 +12,8 @@
 //! - Descriptor/shape guards load the live own prototype slot, never a cached
 //!   prototype value. Every uncertain case reaches rooted canonical preparation.
 //! - Header, slots and prototype are initialized before publishing the bump.
+//! - The candidate helper mutates only bytes beyond the live bump cursor; the
+//!   publication helper is the first operation that makes the cell observable.
 //!
 //! # See also
 //! - `otter_vm::closure_construct` — canonical state and weak observation lifetime.
@@ -24,6 +27,33 @@ use crate::template::arm64::values::{CellTest, emit_cell_test};
 /// guard and nursery misses branch separately so their counters remain exact.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_generated_receiver_allocation(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    context_register: u8,
+    guard_miss: DynamicLabel,
+    space_miss: DynamicLabel,
+    ready: DynamicLabel,
+) {
+    let candidate_ready = ops.new_dynamic_label();
+    emit_receiver_candidate(
+        ops,
+        relocations,
+        view,
+        plan,
+        context_register,
+        guard_miss,
+        space_miss,
+        candidate_ready,
+    );
+    dynasm!(ops ; .arch aarch64 ; =>candidate_ready);
+    emit_receiver_publication(ops, view, context_register);
+    dynasm!(ops ; .arch aarch64 ; b =>ready);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_receiver_candidate(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -208,11 +238,32 @@ pub(super) fn emit_generated_receiver_allocation(
         ; .arch aarch64
         ; mov w14, plan.initial_field_count as u32
         ; strh w14, [x16, view.object_slab_len_byte]
+        ; mov x0, x16
+        ; mov x1, x13
+        ; b =>ready
+    );
+}
+
+/// Publish one completely initialized candidate from `x0` on page `x1`.
+///
+/// This operation cannot miss: every capacity, collector and heap-limit proof
+/// was completed by `emit_receiver_candidate`, and generated Machine code has
+/// no safepoint or reentry between candidate creation and this effect.
+fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot, context_register: u8) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x16, x0
+        ; mov x13, x1
+        ; sub x14, x16, x13
+        ; add x15, x14, view.object_cell_bytes
         ; str x15, [x13, PAGE_BUMP_CURSOR_OFFSET]
         ; ldr x14, [x13, PAGE_ALLOCATED_BYTES_OFFSET]
         ; add x14, x14, view.object_cell_bytes
         ; str x14, [x13, PAGE_ALLOCATED_BYTES_OFFSET]
+        ; ldr x10, [X(context_register), RECEIVER_ALLOC_TRACKED_BYTES_OFFSET]
         ; cbz x10, >cap_committed
+        ; ldr x9, [x10]
+        ; add x9, x9, view.object_cell_bytes
         ; str x9, [x10]
         ; cap_committed:
     );
@@ -239,13 +290,15 @@ pub(super) fn emit_generated_receiver_allocation(
         ; =>observation_done
     );
     emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GENERATED_OFFSET);
-    dynasm!(ops ; .arch aarch64 ; mov x0, x16 ; b =>ready);
+    dynasm!(ops ; .arch aarch64 ; mov x0, x16);
 }
 
-/// Complete a Machine receiver probe with undefined on either pre-effect miss.
-/// The allocation program, initialization and accounting remain shared with
-/// full construct linkage. x2 is the new.target input; x0 is the tagged result.
-pub(crate) fn emit_receiver_probe(
+/// Complete the allocation half of a Machine receiver probe.
+///
+/// `x2` is the new.target input. A hit returns the initialized unpublished cell
+/// in `x0` and its page in `x1`; either pre-effect miss returns undefined in
+/// `x0` and zero in `x1`.
+pub(crate) fn emit_receiver_candidate_probe(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -256,7 +309,7 @@ pub(crate) fn emit_receiver_probe(
     let space_miss = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
-    emit_generated_receiver_allocation(
+    emit_receiver_candidate(
         ops,
         relocations,
         view,
@@ -272,5 +325,15 @@ pub(crate) fn emit_receiver_probe(
     emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_SPACE_MISSES_OFFSET);
     dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_load_u64(ops, 0, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; mov x1, xzr);
     dynasm!(ops ; .arch aarch64 ; =>ready);
+}
+
+/// Commit one Machine receiver candidate after the probe's hit edge dominates.
+pub(crate) fn emit_receiver_publication_effect(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    context_register: u8,
+) {
+    emit_receiver_publication(ops, view, context_register);
 }

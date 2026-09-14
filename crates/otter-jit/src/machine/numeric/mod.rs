@@ -103,6 +103,8 @@
 
 mod arm64;
 mod boxed_arithmetic;
+mod constructor_effects;
+mod element_cfg;
 mod frame_state;
 mod hir;
 mod inline_reentry;
@@ -136,12 +138,13 @@ use super::is_explicit_committed_runtime_call;
 use super::{
     CallDescriptor, CallEffects, CallTarget, ColdCallKind, ControlFlow, DeoptId,
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
-    InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineExit,
-    MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput,
-    MachineOsrType, MachineRepresentation, MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
-    PackedDoubleViewCacheClearReason, PhysicalRegister, SafepointId, SafepointKind,
-    TargetCapability, TargetClobberSet, TargetSpec, binding_guard_clobbers, binding_hit_clobbers,
-    binding_write_barrier_clobbers, lower_deopt_table, lower_safepoints,
+    InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineCallGuard,
+    MachineExit, MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand,
+    MachineOsrInput, MachineOsrType, MachineRepresentation, MachineValue,
+    PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS, PackedDoubleViewCacheClearReason, PhysicalRegister,
+    SafepointId, SafepointKind, TargetCapability, TargetClobberSet, TargetSpec,
+    binding_guard_clobbers, binding_hit_clobbers, binding_write_barrier_clobbers,
+    lower_deopt_table, lower_safepoints,
 };
 use crate::{
     Unsupported,
@@ -365,8 +368,6 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-        transitions.entry(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT),
-        transitions.entry(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT),
         transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
         transitions.entry(STUB_JIT_CALL_WITH_THIS_VALUE),
         transitions.entry(STUB_JIT_CONSTRUCT_VALUE),
@@ -385,7 +386,6 @@ pub(crate) fn try_compile(
         relocations,
         osr_entries,
         osr_regions,
-        constructor_field_regions,
         structural_regions,
     } = emission;
 
@@ -408,14 +408,6 @@ pub(crate) fn try_compile(
         ));
         for &(logical_pc, start, end) in &osr_regions {
             code_map.record_osr(logical_pc, start, end);
-        }
-        for &(byte_pc, start, end) in &constructor_field_regions {
-            code_map.record(CodeRegion::structural_at_byte_pc(
-                "machineConstructorFieldTransition",
-                start,
-                end,
-                byte_pc,
-            ));
         }
         for &(kind, byte_pc, start, end) in &structural_regions {
             code_map.record(match byte_pc {
@@ -535,7 +527,13 @@ fn select_with_packed_double_view_caches(
         .keys()
         .map(|&block| (block, property_cfg::Values::new(&mut representations)))
         .collect::<BTreeMap<_, _>>();
+    let element_values = selection_cfg
+        .elements
+        .keys()
+        .map(|&block| (block, element_cfg::Values::new(&mut representations)))
+        .collect::<BTreeMap<_, _>>();
     let mut property_inputs = BTreeMap::new();
+    let mut element_inputs = BTreeMap::new();
     let mut binding_inputs = BTreeMap::<usize, [Option<MachineValue>; 2]>::new();
     let mut instructions = Vec::with_capacity(hir.nodes.len() + hir.parameter_count as usize + 4);
     let mut call_descriptors = Vec::<CallDescriptor>::new();
@@ -575,6 +573,28 @@ fn select_with_packed_double_view_caches(
                     block_index,
                     property_values[&block_index],
                     property_inputs[&block_index],
+                    &values,
+                    &mut representations,
+                    &mut call_descriptors,
+                    &mut next_safepoint,
+                    &mut instructions,
+                )?);
+                continue;
+            }
+            SelectedBlock::ElementHit(block_index)
+            | SelectedBlock::ElementCold(block_index)
+            | SelectedBlock::ElementSuccess(block_index)
+            | SelectedBlock::ElementThrow(block_index)
+            | SelectedBlock::ElementFatal(block_index)
+            | SelectedBlock::ElementJoin(block_index) => {
+                blocks.push(element_cfg::select_block(
+                    target_spec,
+                    *selected,
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    element_values[&block_index],
+                    element_inputs[&block_index],
                     &values,
                     &mut representations,
                     &mut call_descriptors,
@@ -698,12 +718,18 @@ fn select_with_packed_double_view_caches(
                 .flatten();
                 let binding_exception = binding_site(hir, predecessor)
                     .filter(|(_, _, exceptional)| *exceptional == Some(edge));
+                let element_exception = (element_cfg::exceptional(hir, predecessor) == Some(edge))
+                    .then(|| element_cfg::site(hir, predecessor))
+                    .flatten();
                 let successor_arguments = hir.blocks[predecessor].successor_arguments[edge]
                     .iter()
                     .zip(&hir.blocks[successor].parameters)
                     .map(|(&argument, &parameter)| {
                         if property_exception == Some(argument) {
                             return Ok(property_values[&predecessor].cold_payload);
+                        }
+                        if element_exception == Some(argument) {
+                            return Ok(element_values[&predecessor].cold_payload);
                         }
                         if let Some((binding, _, _)) = binding_exception
                             && argument == binding
@@ -730,6 +756,8 @@ fn select_with_packed_double_view_caches(
                     end,
                     predecessors: vec![if property_exception.is_some() {
                         selection_cfg.properties[&predecessor].cold
+                    } else if element_exception.is_some() {
+                        selection_cfg.elements[&predecessor].cold
                     } else if binding_exception.is_some() {
                         selection_cfg.bindings[&predecessor].cold
                     } else {
@@ -794,6 +822,97 @@ fn select_with_packed_double_view_caches(
         for &node_value in &block.nodes {
             let result = values[node_value.0];
             let node = hir.nodes[node_value.0];
+            if let NumericNode::InlineCallGuard {
+                source,
+                function_id,
+                this_mode,
+            } = node
+            {
+                let guarded = push_value(&mut representations, MachineRepresentation::Tagged);
+                let mut guard = MachineInstruction::plain(
+                    MachineOpcode::GuardCallTarget {
+                        guard: MachineCallGuard::Plain {
+                            function_id,
+                            this_mode,
+                        },
+                    },
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(guarded),
+                    ],
+                );
+                guard.clobbers = target_spec
+                    .clobbers(TargetClobberSet::InlineCallGuard)
+                    .to_vec();
+                let point = NumericFramePoint::Node(node_value);
+                let state_index = frame_state_indices[&point];
+                attach_frame_state(
+                    hir,
+                    &values,
+                    state_index,
+                    exit_specs[&point].clone(),
+                    &mut guard,
+                );
+                instructions.push(guard);
+                let mut resolve = MachineInstruction::plain(
+                    MachineOpcode::ResolveCallThis { this_mode },
+                    vec![
+                        MachineOperand::register_input(guarded),
+                        MachineOperand::register_output(result),
+                    ],
+                );
+                resolve.clobbers = target_spec
+                    .clobbers(TargetClobberSet::InlineCallGuard)
+                    .to_vec();
+                instructions.push(resolve);
+                continue;
+            }
+            if let NumericNode::ConstructorFieldStore {
+                object,
+                value,
+                byte_pc,
+            } = node
+            {
+                let object = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    object,
+                );
+                let value = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    value,
+                );
+                let (owner, transition) = hir
+                    .constructor_field_sites
+                    .get(&node_value)
+                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?;
+                let state_index = frame_state_indices[&NumericFramePoint::Node(node_value)];
+                let source = hir.frame_states[state_index]
+                    .frames
+                    .last()
+                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?;
+                if source.function_id != *owner || source.byte_pc != byte_pc {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(first));
+                }
+                constructor_effects::select(
+                    target_spec,
+                    hir,
+                    object,
+                    value,
+                    transition,
+                    state_index,
+                    exit_specs[&NumericFramePoint::Node(node_value)].clone(),
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                )?;
+                continue;
+            }
             if matches!(
                 node,
                 NumericNode::PropertyLoad { .. } | NumericNode::PropertyStore { .. }
@@ -867,6 +986,121 @@ fn select_with_packed_double_view_caches(
                 branch.control = ControlFlow::Branch;
                 instructions.push(branch);
                 let selected = selection_cfg.properties[&block_index];
+                let mut predecessors = incoming_edges(hir, block_index)
+                    .into_iter()
+                    .map(|(predecessor, edge)| {
+                        selection_cfg
+                            .split_edges
+                            .get(&(predecessor, edge))
+                            .copied()
+                            .unwrap_or_else(|| selection_cfg.normal_exit(predecessor))
+                    })
+                    .collect::<Vec<_>>();
+                predecessors.sort_unstable();
+                blocks.push(MachineBlockData {
+                    first,
+                    end: MachineInstructionId(instructions.len() as u32),
+                    predecessors,
+                    successors: vec![selected.hit, selected.cold],
+                    successor_arguments: vec![vec![], vec![]],
+                    parameters: block
+                        .parameters
+                        .iter()
+                        .map(|&value| machine_value(&values, value))
+                        .collect(),
+                });
+                selected_binding_guard = true;
+                break;
+            }
+            if matches!(
+                node,
+                NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. }
+            ) {
+                if block.nodes.last().copied() != Some(node_value) {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(first));
+                }
+                let (receiver, index, stored, access, byte_pc) = match node {
+                    NumericNode::ElementLoad {
+                        receiver,
+                        index,
+                        access,
+                        byte_pc,
+                        ..
+                    } => (receiver, index, None, access, byte_pc),
+                    NumericNode::ElementStore {
+                        receiver,
+                        index,
+                        value,
+                        access,
+                        byte_pc,
+                        ..
+                    } => (receiver, index, Some(value), access, byte_pc),
+                    _ => unreachable!(),
+                };
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                let index = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    index,
+                );
+                let stored_fast = stored.map(|value| {
+                    if access == Some(NumericElementAccess::PackedDouble)
+                        && hir.nodes[value.0].value_type() == NumericType::Number
+                    {
+                        machine_value(&values, value)
+                    } else {
+                        tagged_call_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            value,
+                        )
+                    }
+                });
+                let stored_tagged = stored.map(|value| {
+                    tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    )
+                });
+                let inputs = element_cfg::Inputs {
+                    receiver,
+                    index,
+                    stored_fast,
+                    stored_tagged,
+                };
+                element_inputs.insert(block_index, inputs);
+                element_cfg::select_probe(
+                    target_spec,
+                    byte_pc,
+                    access,
+                    packed_double_view_caches.cache_for(node_value),
+                    inputs,
+                    element_values[&block_index],
+                    &mut representations,
+                    &mut instructions,
+                )?;
+                let mut branch = MachineInstruction::plain(
+                    MachineOpcode::BranchIf(true),
+                    vec![MachineOperand::register_input(
+                        element_values[&block_index].hit,
+                    )],
+                );
+                branch.control = ControlFlow::Branch;
+                instructions.push(branch);
+                let selected = selection_cfg.elements[&block_index];
                 let mut predecessors = incoming_edges(hir, block_index)
                     .into_iter()
                     .map(|(predecessor, edge)| {
@@ -1100,8 +1334,8 @@ fn select_with_packed_double_view_caches(
                         return Err(invalid());
                     }
                     let mut guard = MachineInstruction::plain(
-                        MachineOpcode::InlineMethodGuard {
-                            guard: Box::new(program.clone()),
+                        MachineOpcode::GuardCallTarget {
+                            guard: MachineCallGuard::Method(Box::new(program.clone())),
                         },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),
@@ -1113,32 +1347,17 @@ fn select_with_packed_double_view_caches(
                         .to_vec();
                     guard
                 }
-                NumericNode::InlineCallGuard {
-                    source,
-                    function_id,
-                    this_mode,
-                } => {
-                    let mut guard = MachineInstruction::plain(
-                        MachineOpcode::InlineCallGuard {
-                            function_id,
-                            this_mode,
-                        },
-                        vec![
-                            MachineOperand::register_input(machine_value(&values, source)),
-                            MachineOperand::register_output(result),
-                        ],
-                    );
-                    guard.clobbers = target_spec
-                        .clobbers(TargetClobberSet::InlineCallGuard)
-                        .to_vec();
-                    guard
+                NumericNode::InlineCallGuard { .. } => {
+                    unreachable!("plain call guards select as guard plus this resolution")
                 }
                 NumericNode::InlineConstructGuard {
                     source,
                     function_id,
                 } => {
                     let mut guard = MachineInstruction::plain(
-                        MachineOpcode::InlineConstructGuard { function_id },
+                        MachineOpcode::GuardCallTarget {
+                            guard: MachineCallGuard::Construct { function_id },
+                        },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),
                             MachineOperand::register_output(result),
@@ -1154,21 +1373,50 @@ fn select_with_packed_double_view_caches(
                     plan,
                     byte_pc,
                 } => {
+                    let allocated = push_value(&mut representations, MachineRepresentation::Tagged);
+                    let page = push_value(&mut representations, MachineRepresentation::Int64);
                     let mut probe = MachineInstruction::plain(
-                        MachineOpcode::ConstructReceiver { plan, byte_pc },
+                        MachineOpcode::AllocateObject { plan, byte_pc },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),
-                            MachineOperand::register_output(result),
+                            MachineOperand::register_output(allocated),
+                            MachineOperand::register_output(page),
                         ],
                     );
                     probe.clobbers = target_spec
                         .clobbers(TargetClobberSet::ConstructReceiver)
                         .to_vec();
-                    probe
+                    instructions.push(probe);
+                    let hit = push_value(&mut representations, MachineRepresentation::Boolean);
+                    let mut test = MachineInstruction::plain(
+                        MachineOpcode::AllocationHit,
+                        vec![
+                            MachineOperand::register_input(allocated),
+                            MachineOperand::register_output(hit),
+                        ],
+                    );
+                    test.clobbers = target_spec
+                        .clobbers(TargetClobberSet::ConstructReceiverHit)
+                        .to_vec();
+                    instructions.push(test);
+                    let mut publish = MachineInstruction::plain(
+                        MachineOpcode::PublishObject { byte_pc },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_input(allocated),
+                            MachineOperand::register_input(page),
+                            MachineOperand::register_input(hit),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    publish.clobbers = target_spec
+                        .clobbers(TargetClobberSet::ConstructReceiver)
+                        .to_vec();
+                    publish
                 }
                 NumericNode::ConstructReceiverHit(receiver) => {
                     let mut test = MachineInstruction::plain(
-                        MachineOpcode::ConstructReceiverHit,
+                        MachineOpcode::AllocationHit,
                         vec![
                             MachineOperand::register_input(machine_value(&values, receiver)),
                             MachineOperand::register_output(result),
@@ -1414,305 +1662,11 @@ fn select_with_packed_double_view_caches(
                         .expect("bounded scalar function safepoint count");
                     call
                 }
-                NumericNode::ConstructorFieldStore {
-                    object,
-                    value,
-                    byte_pc,
-                } => {
-                    let object = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        object,
-                    );
-                    let value = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        value,
-                    );
-                    let invalid = || {
-                        super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
-                            instructions.len() as u32,
-                        ))
-                    };
-                    let (owner, transition) = hir
-                        .constructor_field_sites
-                        .get(&node_value)
-                        .ok_or_else(invalid)?;
-                    let state = hir
-                        .frame_states
-                        .iter()
-                        .find(|state| state.point == NumericFramePoint::Node(node_value))
-                        .and_then(|state| state.frames.last())
-                        .ok_or_else(invalid)?;
-                    if state.function_id != *owner || state.byte_pc != byte_pc {
-                        return Err(invalid());
-                    }
-                    let mut store = MachineInstruction::plain(
-                        MachineOpcode::ConstructorFieldStore {
-                            byte_pc,
-                            transition: Box::new(transition.clone()),
-                        },
-                        vec![
-                            MachineOperand::register_input(object),
-                            MachineOperand::register_input(value),
-                        ],
-                    );
-                    store.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
-                    store
+                NumericNode::ConstructorFieldStore { .. } => {
+                    unreachable!("constructor effects select before ordinary nodes")
                 }
-                NumericNode::ElementLoad {
-                    receiver,
-                    index,
-                    byte_pc,
-                    access,
-                } => {
-                    let index_type = hir.nodes[index.0].value_type();
-                    let index = if access == NumericElementAccess::Tagged
-                        && index_type == NumericType::Number
-                    {
-                        tagged_call_argument(
-                            hir,
-                            &values,
-                            &mut representations,
-                            &mut instructions,
-                            index,
-                        )
-                    } else {
-                        machine_value(&values, index)
-                    };
-                    if access == NumericElementAccess::PackedDouble
-                        && !matches!(
-                            index_type,
-                            NumericType::Tagged | NumericType::Int32 | NumericType::Uint32
-                        )
-                    {
-                        return Err(super::VerificationError::InvalidValue(index));
-                    }
-                    let receiver = machine_value(&values, receiver);
-                    match access {
-                        NumericElementAccess::Tagged => {
-                            let operands = vec![
-                                MachineOperand::location_input(receiver),
-                                MachineOperand::location_input(index),
-                                MachineOperand::register_output(result),
-                            ];
-                            let mut load = MachineInstruction::plain(
-                                MachineOpcode::ElementLoad(byte_pc),
-                                operands,
-                            );
-                            load.clobbers = element_clobbers(target_spec);
-                            load.safepoint = Some(super::SafepointId(next_safepoint));
-                            next_safepoint = next_safepoint
-                                .checked_add(1)
-                                .expect("bounded scalar function safepoint count");
-                            load
-                        }
-                        NumericElementAccess::PackedDouble => {
-                            let mut load = MachineInstruction::plain(
-                                MachineOpcode::PackedDoubleElementLoad {
-                                    byte_pc,
-                                    cache: packed_double_view_caches.cache_for(node_value),
-                                },
-                                vec![
-                                    MachineOperand::location_input(receiver),
-                                    MachineOperand::location_input(index),
-                                    MachineOperand::register_output(result),
-                                ],
-                            );
-                            load.clobbers = element_clobbers(target_spec);
-                            load
-                        }
-                    }
-                }
-                NumericNode::ElementStore {
-                    receiver,
-                    index,
-                    value,
-                    byte_pc,
-                    access,
-                } => {
-                    let value = if access == NumericElementAccess::PackedDouble {
-                        if hir.nodes[value.0].value_type() != NumericType::Number {
-                            return Err(super::VerificationError::InvalidValue(machine_value(
-                                &values, value,
-                            )));
-                        }
-                        machine_value(&values, value)
-                    } else {
-                        tagged_call_argument(
-                            hir,
-                            &values,
-                            &mut representations,
-                            &mut instructions,
-                            value,
-                        )
-                    };
-                    let index_type = hir.nodes[index.0].value_type();
-                    let index = if access == NumericElementAccess::Tagged
-                        && index_type == NumericType::Number
-                    {
-                        tagged_call_argument(
-                            hir,
-                            &values,
-                            &mut representations,
-                            &mut instructions,
-                            index,
-                        )
-                    } else {
-                        machine_value(&values, index)
-                    };
-                    if access == NumericElementAccess::PackedDouble
-                        && !matches!(
-                            index_type,
-                            NumericType::Tagged | NumericType::Int32 | NumericType::Uint32
-                        )
-                    {
-                        return Err(super::VerificationError::InvalidValue(index));
-                    }
-                    let receiver = machine_value(&values, receiver);
-                    match access {
-                        NumericElementAccess::Tagged => {
-                            let operands = vec![
-                                MachineOperand::location_input(receiver),
-                                MachineOperand::location_input(index),
-                                MachineOperand::location_input(value),
-                            ];
-                            let mut store = MachineInstruction::plain(
-                                MachineOpcode::ElementStore(byte_pc),
-                                operands,
-                            );
-                            store.clobbers = element_clobbers(target_spec);
-                            store.safepoint = Some(super::SafepointId(next_safepoint));
-                            next_safepoint = next_safepoint
-                                .checked_add(1)
-                                .expect("bounded scalar function safepoint count");
-                            store
-                        }
-                        NumericElementAccess::PackedDouble => {
-                            let mut store = MachineInstruction::plain(
-                                MachineOpcode::PackedDoubleElementStore {
-                                    byte_pc,
-                                    cache: packed_double_view_caches.cache_for(node_value),
-                                },
-                                vec![
-                                    MachineOperand::location_input(receiver),
-                                    MachineOperand::location_input(index),
-                                    MachineOperand::register_input(value),
-                                ],
-                            );
-                            store.clobbers = element_clobbers(target_spec);
-                            store
-                        }
-                    }
-                }
-                NumericNode::GenericElementLoad {
-                    receiver, index, ..
-                } => {
-                    let receiver = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        receiver,
-                    );
-                    let index = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        index,
-                    );
-                    let descriptor_index = intern_call_descriptor(
-                        &mut call_descriptors,
-                        generic_element_call_descriptor(
-                            target_spec,
-                            otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT,
-                            2,
-                        ),
-                    );
-                    let operands = vec![
-                        MachineOperand::register_input(receiver),
-                        MachineOperand::register_input(index),
-                        MachineOperand::register_output(result),
-                    ];
-                    let mut call = MachineInstruction::plain(
-                        MachineOpcode::Call(descriptor_index as u32),
-                        operands,
-                    );
-                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
-                    call.safepoint = Some(super::SafepointId(next_safepoint));
-                    next_safepoint = next_safepoint
-                        .checked_add(1)
-                        .expect("bounded scalar function safepoint count");
-                    call
-                }
-                NumericNode::GenericElementStore {
-                    receiver,
-                    index,
-                    value,
-                    ..
-                } => {
-                    let receiver = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        receiver,
-                    );
-                    let index = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        index,
-                    );
-                    let value = tagged_call_argument(
-                        hir,
-                        &values,
-                        &mut representations,
-                        &mut instructions,
-                        value,
-                    );
-                    let descriptor_index = intern_call_descriptor(
-                        &mut call_descriptors,
-                        generic_element_call_descriptor(
-                            target_spec,
-                            otter_vm::native_abi::STUB_JIT_STORE_ELEMENT,
-                            3,
-                        ),
-                    );
-                    let operands = vec![
-                        MachineOperand::register_input(receiver),
-                        MachineOperand::register_input(index),
-                        MachineOperand::register_input(value),
-                    ];
-                    let mut call = MachineInstruction::plain(
-                        MachineOpcode::Call(descriptor_index as u32),
-                        operands,
-                    );
-                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
-                    call.safepoint = Some(super::SafepointId(next_safepoint));
-                    next_safepoint = next_safepoint
-                        .checked_add(1)
-                        .expect("bounded scalar function safepoint count");
-                    call
-                }
-                NumericNode::CheckedFloat64ToElementIndex { value, byte_pc } => {
-                    let mut conversion = MachineInstruction::plain(
-                        MachineOpcode::CheckedFloat64ToElementIndex(byte_pc),
-                        vec![
-                            MachineOperand::register_input(machine_value(&values, value)),
-                            MachineOperand::register_output(result),
-                        ],
-                    );
-                    conversion.clobbers = target_spec
-                        .clobbers(TargetClobberSet::FloatElementIndex)
-                        .to_vec();
-                    conversion
+                NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. } => {
+                    unreachable!("element nodes select their explicit CFG before ordinary nodes")
                 }
                 NumericNode::ArrayConstruct { length, byte_pc: _ } => {
                     if hir.nodes[length.0].value_type() != NumericType::Int32 {
@@ -2391,10 +2345,7 @@ fn select_with_packed_double_view_caches(
                             &mut instruction,
                         );
                     }
-                    Some(
-                        NumericFrameStatePurpose::ExactDeopt
-                        | NumericFrameStatePurpose::RuntimeMetadata,
-                    ) => attach_frame_state(
+                    Some(NumericFrameStatePurpose::ExactDeopt) => attach_frame_state(
                         hir,
                         &values,
                         state_index,
@@ -3389,33 +3340,6 @@ fn caught_throw_acknowledgement_descriptor(target_spec: &TargetSpec) -> CallDesc
     }
 }
 
-fn generic_element_call_descriptor(
-    target_spec: &TargetSpec,
-    target: otter_vm::native_abi::RuntimeStubDescriptor,
-    argument_count: usize,
-) -> CallDescriptor {
-    debug_assert!(matches!(
-        target,
-        otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT | otter_vm::native_abi::STUB_JIT_STORE_ELEMENT
-    ));
-    let load = target == otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT;
-    CallDescriptor {
-        target: CallTarget::RuntimeStub(target),
-        arguments: vec![MachineRepresentation::Tagged; argument_count],
-        results: load
-            .then_some(MachineRepresentation::Tagged)
-            .into_iter()
-            .collect(),
-        effects: CallEffects::READS_HEAP
-            .union(CallEffects::WRITES_HEAP)
-            .union(CallEffects::INVALIDATES_SHAPES)
-            .union(CallEffects::REENTRANT),
-        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
-        exceptional: ExceptionalEdge::Propagate,
-        safepoint: SafepointKind::Gc,
-    }
-}
-
 fn direct_call_descriptor(
     target_spec: &TargetSpec,
     target: &NumericDirectCallTarget,
@@ -3670,12 +3594,6 @@ fn frame_state_exits(
             | NumericNode::IntegerSubImmediate(..) => {
                 &[(ExitReason::Int32Overflow, ExitAction::Recompile)]
             }
-            NumericNode::CheckedFloat64ToElementIndex { .. } => {
-                &[(ExitReason::InvalidElementIndex, ExitAction::Recompile)]
-            }
-            NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. } => {
-                &[(ExitReason::BoundsGuard, ExitAction::Recompile)]
-            }
             NumericNode::InlineConstructGuard { .. }
             | NumericNode::InlineCallGuard { .. }
             | NumericNode::InlineMethodGuard { .. }
@@ -3689,9 +3607,6 @@ fn frame_state_exits(
             }
             NumericNode::ConstructorFieldStore { .. } => {
                 &[(ExitReason::ShapeGuard, ExitAction::Recompile)]
-            }
-            NumericNode::GenericElementLoad { .. } | NumericNode::GenericElementStore { .. } => {
-                &[(ExitReason::RuntimeTransition, ExitAction::Resume)]
             }
             NumericNode::TaggedToNumber(..)
             | NumericNode::TaggedToInt32(..)
@@ -3765,6 +3680,12 @@ enum SelectedBlock {
     PropertyThrow(usize),
     PropertyFatal(usize),
     PropertyJoin(usize),
+    ElementHit(usize),
+    ElementCold(usize),
+    ElementSuccess(usize),
+    ElementThrow(usize),
+    ElementFatal(usize),
+    ElementJoin(usize),
     BindingHit(usize),
     BindingCold(usize),
     BindingSuccess(usize),
@@ -3789,6 +3710,7 @@ struct SelectionCfg {
     split_edges: BTreeMap<(usize, usize), MachineBlock>,
     bindings: BTreeMap<usize, BindingSelectedBlocks>,
     properties: BTreeMap<usize, property_cfg::Blocks>,
+    elements: BTreeMap<usize, element_cfg::Blocks>,
 }
 
 impl SelectionCfg {
@@ -3801,6 +3723,7 @@ impl SelectionCfg {
         let mut split_edges = BTreeMap::new();
         let mut bindings = BTreeMap::new();
         let mut properties = BTreeMap::new();
+        let mut elements = BTreeMap::new();
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
                 if is_critical_edge(hir, predecessor, successor)
@@ -3854,6 +3777,35 @@ impl SelectionCfg {
                 );
                 continue;
             }
+            if element_cfg::site(hir, successor).is_some() {
+                let hit = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::ElementHit(successor));
+                let cold = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::ElementCold(successor));
+                let success = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::ElementSuccess(successor));
+                let throw = element_cfg::exceptional(hir, successor).is_none().then(|| {
+                    let block = MachineBlock(order.len() as u32);
+                    order.push(SelectedBlock::ElementThrow(successor));
+                    block
+                });
+                let fatal = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::ElementFatal(successor));
+                let join = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::ElementJoin(successor));
+                elements.insert(
+                    successor,
+                    element_cfg::Blocks {
+                        hit,
+                        cold,
+                        success,
+                        throw,
+                        fatal,
+                        join,
+                    },
+                );
+                continue;
+            }
             let Some((_, target, exceptional_edge)) = binding_site(hir, successor) else {
                 continue;
             };
@@ -3893,6 +3845,7 @@ impl SelectionCfg {
             split_edges,
             bindings,
             properties,
+            elements,
         }
     }
 
@@ -3901,9 +3854,14 @@ impl SelectionCfg {
             .get(&block)
             .map(|property| property.join)
             .unwrap_or_else(|| {
-                self.bindings
+                self.elements
                     .get(&block)
-                    .map_or(self.originals[block], |binding| binding.join)
+                    .map(|element| element.join)
+                    .unwrap_or_else(|| {
+                        self.bindings
+                            .get(&block)
+                            .map_or(self.originals[block], |binding| binding.join)
+                    })
             })
     }
 }
@@ -3946,6 +3904,12 @@ fn exceptional_hir_edge_source(
                 exceptional_edge, ..
             }
             | NumericNode::CommittedValue {
+                exceptional_edge, ..
+            }
+            | NumericNode::ElementLoad {
+                exceptional_edge, ..
+            }
+            | NumericNode::ElementStore {
                 exceptional_edge, ..
             }
             | NumericNode::DirectCall {
@@ -6840,8 +6804,29 @@ mod tests {
         }
     }
 
-    fn element_selection_hir(store_value: bool) -> NumericFunction {
-        let value = |index| hir::NumericValue(index);
+    fn explicit_element_selection_hir(
+        access: Option<NumericElementAccess>,
+        store: bool,
+    ) -> NumericFunction {
+        let value = hir::NumericValue;
+        let element = if store {
+            NumericNode::ElementStore {
+                receiver: value(0),
+                index: value(1),
+                value: value(2),
+                byte_pc: 24,
+                access,
+                exceptional_edge: None,
+            }
+        } else {
+            NumericNode::ElementLoad {
+                receiver: value(0),
+                index: value(1),
+                byte_pc: 24,
+                access,
+                exceptional_edge: None,
+            }
+        };
         NumericFunction {
             property_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
@@ -6855,267 +6840,47 @@ mod tests {
                     register: 1,
                     value_type: NumericType::Tagged,
                 },
-                NumericNode::ElementLoad {
-                    receiver: value(0),
-                    index: value(1),
-                    byte_pc: 24,
-                    access: NumericElementAccess::Tagged,
+                NumericNode::BooleanConstant(true),
+                element,
+            ],
+            blocks: vec![
+                hir::NumericBlock {
+                    logical_pc: 0,
+                    osr_entry_allowed: true,
+                    predecessors: vec![],
+                    successors: vec![1],
+                    parameters: vec![],
+                    parameter_registers: vec![],
+                    successor_arguments: vec![vec![]],
+                    nodes: (0..4).map(value).collect(),
+                    terminator: NumericTerminator::Jump,
                 },
-                NumericNode::TaggedToNumber(value(2)),
-                NumericNode::TaggedToInt32(value(2)),
-                NumericNode::BooleanConstant(store_value),
-                NumericNode::ElementStore {
-                    receiver: value(0),
-                    index: value(1),
-                    value: value(5),
-                    byte_pc: 40,
-                    access: NumericElementAccess::Tagged,
+                hir::NumericBlock {
+                    logical_pc: 1,
+                    osr_entry_allowed: false,
+                    predecessors: vec![0],
+                    successors: vec![],
+                    parameters: vec![],
+                    parameter_registers: vec![],
+                    successor_arguments: vec![],
+                    nodes: vec![],
+                    terminator: NumericTerminator::Return(if store { value(0) } else { value(3) }),
                 },
             ],
-            blocks: vec![hir::NumericBlock {
-                logical_pc: 0,
-                osr_entry_allowed: true,
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                parameter_registers: Vec::new(),
-                successor_arguments: Vec::new(),
-                nodes: (0..7).map(value).collect(),
-                terminator: NumericTerminator::Return(value(2)),
-            }],
-            frame_states: [
-                (value(2), 24, vec![value(0), value(1)]),
-                (value(3), 32, vec![value(0), value(1), value(2)]),
-                (value(4), 36, vec![value(0), value(1), value(2)]),
-                (value(6), 40, vec![value(0), value(1), value(5)]),
-            ]
-            .into_iter()
-            .map(|(point, byte_pc, slots)| hir::NumericFrameState {
-                point: NumericFramePoint::Node(point),
+            frame_states: vec![hir::NumericFrameState {
+                point: NumericFramePoint::Node(value(3)),
                 frames: Box::new([otter_vm::deopt::DeoptFrame {
                     function_id: 93,
-                    byte_pc,
+                    byte_pc: 24,
                     entry: None,
-                    slots: (slots
-                        .into_iter()
-                        .map(hir::NumericFrameSlot::Value)
-                        .collect::<Vec<_>>())
+                    slots: vec![
+                        hir::NumericFrameSlot::Value(value(0)),
+                        hir::NumericFrameSlot::Value(value(1)),
+                        hir::NumericFrameSlot::Value(value(2)),
+                    ]
                     .into(),
                 }]),
-            })
-            .collect(),
-            direct_call_targets: Vec::new(),
-            operand_values: Vec::new(),
-            parameter_count: 2,
-            register_count: 3,
-            arithmetic_op_count: 0,
-        }
-    }
-
-    fn generic_element_selection_hir() -> NumericFunction {
-        let value = |index| hir::NumericValue(index);
-        NumericFunction {
-            property_sites: BTreeMap::new(),
-            constructor_field_sites: BTreeMap::new(),
-            function_id: 96,
-            nodes: vec![
-                NumericNode::Parameter {
-                    register: 0,
-                    value_type: NumericType::Tagged,
-                },
-                NumericNode::Parameter {
-                    register: 1,
-                    value_type: NumericType::Number,
-                },
-                NumericNode::BooleanConstant(true),
-                NumericNode::GenericElementLoad {
-                    receiver: value(0),
-                    index: value(1),
-                    logical_pc: 4,
-                    byte_pc: 24,
-                },
-                NumericNode::GenericElementStore {
-                    receiver: value(0),
-                    index: value(1),
-                    value: value(2),
-                    logical_pc: 5,
-                    byte_pc: 32,
-                },
-            ],
-            blocks: vec![hir::NumericBlock {
-                logical_pc: 0,
-                osr_entry_allowed: true,
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                parameter_registers: Vec::new(),
-                successor_arguments: Vec::new(),
-                nodes: (0..5).map(value).collect(),
-                terminator: NumericTerminator::Return(value(3)),
             }],
-            frame_states: [
-                (value(3), 24, vec![value(0), value(1), value(2)]),
-                (value(4), 32, vec![value(0), value(1), value(2)]),
-            ]
-            .into_iter()
-            .map(|(point, byte_pc, slots)| hir::NumericFrameState {
-                point: NumericFramePoint::Node(point),
-                frames: Box::new([otter_vm::deopt::DeoptFrame {
-                    function_id: 96,
-                    byte_pc,
-                    entry: None,
-                    slots: (slots
-                        .into_iter()
-                        .map(hir::NumericFrameSlot::Value)
-                        .collect::<Vec<_>>())
-                    .into(),
-                }]),
-            })
-            .collect(),
-            direct_call_targets: Vec::new(),
-            operand_values: Vec::new(),
-            parameter_count: 2,
-            register_count: 3,
-            arithmetic_op_count: 0,
-        }
-    }
-
-    fn packed_double_element_selection_hir() -> NumericFunction {
-        let value = |index| hir::NumericValue(index);
-        NumericFunction {
-            property_sites: BTreeMap::new(),
-            constructor_field_sites: BTreeMap::new(),
-            function_id: 94,
-            nodes: vec![
-                NumericNode::Parameter {
-                    register: 0,
-                    value_type: NumericType::Tagged,
-                },
-                NumericNode::Parameter {
-                    register: 1,
-                    value_type: NumericType::Number,
-                },
-                NumericNode::CheckedFloat64ToElementIndex {
-                    value: value(1),
-                    byte_pc: 24,
-                },
-                NumericNode::ElementLoad {
-                    receiver: value(0),
-                    index: value(2),
-                    byte_pc: 24,
-                    access: NumericElementAccess::PackedDouble,
-                },
-                NumericNode::CheckedFloat64ToElementIndex {
-                    value: value(1),
-                    byte_pc: 40,
-                },
-                NumericNode::ElementStore {
-                    receiver: value(0),
-                    index: value(4),
-                    value: value(3),
-                    byte_pc: 40,
-                    access: NumericElementAccess::PackedDouble,
-                },
-            ],
-            blocks: vec![hir::NumericBlock {
-                logical_pc: 0,
-                osr_entry_allowed: true,
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                parameter_registers: Vec::new(),
-                successor_arguments: Vec::new(),
-                nodes: (0..6).map(value).collect(),
-                terminator: NumericTerminator::Return(value(0)),
-            }],
-            frame_states: [
-                (value(2), 24, vec![value(0), value(1)]),
-                (value(3), 24, vec![value(0), value(1)]),
-                (value(4), 40, vec![value(0), value(1), value(3)]),
-                (value(5), 40, vec![value(0), value(1), value(3)]),
-            ]
-            .into_iter()
-            .map(|(point, byte_pc, slots)| hir::NumericFrameState {
-                point: NumericFramePoint::Node(point),
-                frames: Box::new([otter_vm::deopt::DeoptFrame {
-                    function_id: 94,
-                    byte_pc,
-                    entry: None,
-                    slots: (slots
-                        .into_iter()
-                        .map(hir::NumericFrameSlot::Value)
-                        .collect::<Vec<_>>())
-                    .into(),
-                }]),
-            })
-            .collect(),
-            direct_call_targets: Vec::new(),
-            operand_values: Vec::new(),
-            parameter_count: 2,
-            register_count: 3,
-            arithmetic_op_count: 0,
-        }
-    }
-
-    fn packed_double_tagged_index_selection_hir() -> NumericFunction {
-        let value = |index| hir::NumericValue(index);
-        NumericFunction {
-            property_sites: BTreeMap::new(),
-            constructor_field_sites: BTreeMap::new(),
-            function_id: 95,
-            nodes: vec![
-                NumericNode::Parameter {
-                    register: 0,
-                    value_type: NumericType::Tagged,
-                },
-                NumericNode::Parameter {
-                    register: 1,
-                    value_type: NumericType::Tagged,
-                },
-                NumericNode::ElementLoad {
-                    receiver: value(0),
-                    index: value(1),
-                    byte_pc: 24,
-                    access: NumericElementAccess::PackedDouble,
-                },
-                NumericNode::ElementStore {
-                    receiver: value(0),
-                    index: value(1),
-                    value: value(2),
-                    byte_pc: 40,
-                    access: NumericElementAccess::PackedDouble,
-                },
-            ],
-            blocks: vec![hir::NumericBlock {
-                logical_pc: 0,
-                osr_entry_allowed: true,
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                parameter_registers: Vec::new(),
-                successor_arguments: Vec::new(),
-                nodes: (0..4).map(value).collect(),
-                terminator: NumericTerminator::Return(value(2)),
-            }],
-            frame_states: [
-                (value(2), 24, vec![value(0), value(1)]),
-                (value(3), 40, vec![value(0), value(1), value(2)]),
-            ]
-            .into_iter()
-            .map(|(point, byte_pc, slots)| hir::NumericFrameState {
-                point: NumericFramePoint::Node(point),
-                frames: Box::new([otter_vm::deopt::DeoptFrame {
-                    function_id: 95,
-                    byte_pc,
-                    entry: None,
-                    slots: (slots
-                        .into_iter()
-                        .map(hir::NumericFrameSlot::Value)
-                        .collect::<Vec<_>>())
-                    .into(),
-                }]),
-            })
-            .collect(),
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
             parameter_count: 2,
@@ -7704,14 +7469,21 @@ mod tests {
             .unwrap()
             .1
             .to_shape = 17;
-        assert!(
-            sequence
-                .instructions()
-                .iter()
-                .any(|instruction| matches!(&instruction.opcode,
-            MachineOpcode::ConstructorFieldStore { byte_pc: 40, transition: selected }
-                if **selected == transition))
-        );
+        assert!(sequence.instructions().iter().any(|instruction| matches!(
+            instruction.opcode,
+            MachineOpcode::CacheIrGuardShape {
+                byte_pc: 40,
+                shape: 7
+            }
+        )));
+        assert!(sequence.instructions().iter().any(|instruction| matches!(
+            instruction.opcode,
+            MachineOpcode::CacheIrPublishShape {
+                byte_pc: 40,
+                shape: 11,
+                ..
+            }
+        )));
         hir.constructor_field_sites.get_mut(&site).unwrap().0 = 95;
         assert!(
             select(&hir).is_err(),
@@ -9096,786 +8868,96 @@ mod tests {
     }
 
     #[test]
-    fn selects_guarded_elements_with_committed_miss_keys_and_precise_roots() {
-        let hir = element_selection_hir(true);
-        let sequence = select(&hir).expect("element Machine IR");
-        let load = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
-            .expect("selected element load");
-        assert_eq!(
-            &load.operands[..3],
-            &[
-                MachineOperand::location_input(MachineValue(0)),
-                MachineOperand::location_input(MachineValue(1)),
-                MachineOperand::register_output(MachineValue(2)),
-            ]
-        );
-        assert_eq!(load.clobbers, element_clobbers(&TargetSpec::aarch64()));
-        assert_eq!(load.safepoint, Some(SafepointId(0)));
-        assert_eq!(load.deopt_id(), Some(DeoptId(0)));
-        let load_roots = load
-            .operands
-            .iter()
-            .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-            .map(|operand| operand.value)
-            .collect::<Vec<_>>();
-        assert_eq!(load_roots, [MachineValue(0), MachineValue(1)]);
-
-        let number_decode = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.opcode == MachineOpcode::DecodeNumber)
-            .expect("selected tagged Number decode");
-        assert_eq!(
-            &number_decode.operands[..2],
-            &[
-                MachineOperand::register_input(MachineValue(2)),
-                MachineOperand::register_output(MachineValue(3)),
-            ]
-        );
-        assert_eq!(number_decode.deopt_id(), Some(DeoptId(1)));
-
-        let int32_decode = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.opcode == MachineOpcode::DecodeInt32)
-            .expect("selected tagged Int32 decode");
-        assert_eq!(
-            &int32_decode.operands[..2],
-            &[
-                MachineOperand::register_input(MachineValue(2)),
-                MachineOperand::register_reuse_output(MachineValue(4), 0),
-            ]
-        );
-        assert_eq!(int32_decode.deopt_id(), Some(DeoptId(2)));
-
-        let store = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
-            .expect("selected element store");
-        let boxed_value = store.operands[2].value;
-        assert_eq!(
-            &store.operands[..3],
-            &[
-                MachineOperand::location_input(MachineValue(0)),
-                MachineOperand::location_input(MachineValue(1)),
-                MachineOperand::location_input(boxed_value),
-            ]
-        );
-        assert_eq!(
-            sequence.representations()[boxed_value.0 as usize],
-            MachineRepresentation::Tagged
-        );
-        assert_eq!(store.clobbers, element_clobbers(&TargetSpec::aarch64()));
-        assert_eq!(store.safepoint, Some(SafepointId(1)));
-        assert_eq!(store.deopt_id(), Some(DeoptId(3)));
-        let store_roots = store
-            .operands
-            .iter()
-            .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-            .map(|operand| operand.value)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            store_roots.iter().copied().collect::<BTreeSet<_>>().len(),
-            store_roots.len(),
-            "aliased receiver/index/value roots are emitted once per value"
-        );
-        assert_eq!(
-            store_roots.into_iter().collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                MachineValue(0),
-                MachineValue(1),
-                MachineValue(2),
-                boxed_value,
-            ])
-        );
-        assert!(sequence.instructions().iter().any(|instruction| {
-            instruction.opcode == MachineOpcode::BoxBoolean
-                && instruction.operands.last().map(|operand| operand.value) == Some(boxed_value)
-        }));
-
-        let normalized = sequence.normalized();
-        assert!(normalized.contains("ElementLoad(24)"));
-        assert!(normalized.contains("ElementStore(40)"));
-        sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("element late-location allocation");
-    }
-
-    #[test]
-    fn generic_elements_use_reentrant_value_calls_and_precise_gc_roots() {
-        let sequence =
-            select(&generic_element_selection_hir()).expect("generic element Machine IR");
-        let calls = sequence
-            .instructions()
-            .iter()
-            .filter_map(|instruction| {
-                let MachineOpcode::Call(descriptor) = instruction.opcode else {
-                    return None;
-                };
-                Some((
-                    instruction,
-                    &sequence.call_descriptors()[descriptor as usize],
-                ))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 2);
-        let (load, load_descriptor) = calls[0];
-        assert_eq!(
-            load_descriptor.target,
-            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT)
-        );
-        assert_eq!(load_descriptor.safepoint, SafepointKind::Gc);
-        assert_eq!(load_descriptor.exceptional, ExceptionalEdge::Propagate);
-        assert_eq!(load_descriptor.results, [MachineRepresentation::Tagged]);
-        assert_eq!(load.operands[0].constraint, OperandConstraint::Register);
-        assert_eq!(load.operands[1].constraint, OperandConstraint::Register);
-        assert_eq!(load.operands[2].constraint, OperandConstraint::Register);
-        assert!(load.safepoint.is_some());
-        assert!(load.deopt_id().is_some());
-
-        let (store, store_descriptor) = calls[1];
-        assert_eq!(
-            store_descriptor.target,
-            CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_STORE_ELEMENT)
-        );
-        assert!(store_descriptor.results.is_empty());
-        assert_eq!(store_descriptor.safepoint, SafepointKind::Gc);
-        assert_eq!(store_descriptor.exceptional, ExceptionalEdge::Propagate);
-        assert!(store.safepoint.is_some());
-        assert!(store.deopt_id().is_some());
-        for (instruction, argument_count) in [(load, 2_usize), (store, 3_usize)] {
-            let roots = instruction
-                .operands
+    fn elements_select_explicit_probe_effect_and_committed_status_cfg() {
+        for (access, store) in [
+            (NumericElementAccess::Tagged, false),
+            (NumericElementAccess::Tagged, true),
+            (NumericElementAccess::PackedDouble, false),
+        ] {
+            let sequence = select(&explicit_element_selection_hir(Some(access), store))
+                .expect("explicit element Machine IR");
+            let opcodes = sequence
+                .instructions()
                 .iter()
-                .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-                .map(|operand| operand.value)
-                .collect::<BTreeSet<_>>();
-            for operand in &instruction.operands[..argument_count] {
+                .map(|instruction| &instruction.opcode)
+                .collect::<Vec<_>>();
+            assert!(
+                opcodes
+                    .iter()
+                    .any(|opcode| matches!(opcode, MachineOpcode::ElementView { .. }))
+            );
+            assert!(
+                opcodes
+                    .iter()
+                    .any(|opcode| matches!(opcode, MachineOpcode::ElementAddress { .. }))
+            );
+            assert!(
+                opcodes
+                    .iter()
+                    .any(|opcode| matches!(opcode, MachineOpcode::BranchNativeStatus))
+            );
+            if store {
+                let guard = opcodes
+                    .iter()
+                    .position(|opcode| matches!(opcode, MachineOpcode::ElementValueGuard { .. }))
+                    .expect("pre-effect value guard");
+                let effect = opcodes
+                    .iter()
+                    .position(|opcode| matches!(opcode, MachineOpcode::ElementValueStore { .. }))
+                    .expect("no-fail element store");
+                assert!(guard < effect);
+                assert!(sequence.instructions()[effect].exits.is_empty());
+            } else {
                 assert!(
-                    roots.contains(&operand.value),
-                    "every boxed value argument must use the canonical moving root home"
+                    opcodes
+                        .iter()
+                        .any(|opcode| matches!(opcode, MachineOpcode::ElementValueLoad { .. }))
                 );
             }
-        }
-        sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("generic element allocation");
-    }
-
-    #[test]
-    fn verifier_rejects_malformed_committed_element_operands_and_roots() {
-        let sequence = select(&element_selection_hir(true)).expect("committed element Machine IR");
-        let load_id = sequence
-            .instructions()
-            .iter()
-            .position(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
-            .expect("committed element load");
-        let store_id = sequence
-            .instructions()
-            .iter()
-            .position(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
-            .expect("committed element store");
-        let expected = |index| {
-            Err(VerificationError::OpcodeSignatureMismatch(
-                MachineInstructionId(index as u32),
-            ))
-        };
-
-        let mut wrong_payload = sequence.clone();
-        wrong_payload.instructions[load_id].operands[2] =
-            MachineOperand::location_input(MachineValue(0));
-        assert_eq!(
-            wrong_payload.verify(&TargetSpec::aarch64()),
-            expected(load_id)
-        );
-
-        let mut missing_index_root = sequence.clone();
-        missing_index_root.instructions[load_id]
-            .operands
-            .retain(|operand| {
-                !(operand.purpose == OperandPurpose::TaggedRoot && operand.value == MachineValue(1))
-            });
-        assert_eq!(
-            missing_index_root.verify(&TargetSpec::aarch64()),
-            expected(load_id)
-        );
-
-        let mut duplicate_root = sequence.clone();
-        duplicate_root.instructions[load_id]
-            .operands
-            .push(MachineOperand::tagged_root(MachineValue(0)));
-        assert_eq!(
-            duplicate_root.verify(&TargetSpec::aarch64()),
-            expected(load_id)
-        );
-
-        let store_value = sequence.instructions[store_id].operands[2].value;
-        let mut missing_store_value_root = sequence.clone();
-        missing_store_value_root.instructions[store_id]
-            .operands
-            .retain(|operand| {
-                !(operand.purpose == OperandPurpose::TaggedRoot && operand.value == store_value)
-            });
-        assert_eq!(
-            missing_store_value_root.verify(&TargetSpec::aarch64()),
-            expected(store_id)
-        );
-
-        let mut missing_safepoint = sequence.clone();
-        missing_safepoint.instructions[load_id].safepoint = None;
-        assert_eq!(
-            missing_safepoint.verify(&TargetSpec::aarch64()),
-            expected(load_id)
-        );
-
-        let mut partial_clobbers = sequence;
-        partial_clobbers.instructions[store_id].clobbers.pop();
-        assert_eq!(
-            partial_clobbers.verify(&TargetSpec::aarch64()),
-            expected(store_id)
-        );
-    }
-
-    #[test]
-    fn committed_element_aliases_share_one_precise_root_home() {
-        let mut hir = element_selection_hir(true);
-        let NumericNode::ElementLoad { index, .. } = &mut hir.nodes[2] else {
-            panic!("element load fixture")
-        };
-        *index = hir::NumericValue(0);
-        let NumericNode::ElementStore { index, value, .. } = &mut hir.nodes[6] else {
-            panic!("element store fixture")
-        };
-        *index = hir::NumericValue(0);
-        *value = hir::NumericValue(0);
-        for state in &mut hir.frame_states {
-            if !matches!(
-                state.point,
-                NumericFramePoint::Node(hir::NumericValue(2) | hir::NumericValue(6))
-            ) {
-                continue;
-            }
-            for slot in state.frames.iter_mut().flat_map(|frame| &mut frame.slots) {
-                if matches!(
-                    *slot,
-                    hir::NumericFrameSlot::Value(hir::NumericValue(1) | hir::NumericValue(5))
-                ) {
-                    *slot = hir::NumericFrameSlot::Value(hir::NumericValue(0));
-                }
-            }
-        }
-
-        let sequence = select(&hir).expect("aliased committed element Machine IR");
-        let element_ids = sequence
-            .instructions()
-            .iter()
-            .enumerate()
-            .filter(|(_, instruction)| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::ElementLoad(..) | MachineOpcode::ElementStore(..)
-                )
-            })
-            .map(|(index, instruction)| {
-                let roots = instruction
-                    .operands
-                    .iter()
-                    .filter(|operand| operand.purpose == OperandPurpose::TaggedRoot)
-                    .map(|operand| operand.value)
-                    .collect::<Vec<_>>();
-                let live_through = match instruction.opcode {
-                    MachineOpcode::ElementLoad(..) => MachineValue(1),
-                    MachineOpcode::ElementStore(..) => MachineValue(2),
-                    _ => unreachable!("filtered committed element operation"),
-                };
-                assert_eq!(roots, [MachineValue(0), live_through]);
-                MachineInstructionId(index as u32)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(element_ids.len(), 2);
-
-        let allocation = sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("aliased committed element allocation");
-        let safepoints =
-            lower_safepoints(&sequence, &allocation).expect("aliased committed element safepoints");
-        for id in element_ids {
-            assert_eq!(
-                safepoints.site(id).expect("element safepoint").roots.len(),
-                2
-            );
-        }
-    }
-
-    #[test]
-    fn selects_direct_packed_double_payloads_and_exact_number_indices() {
-        let hir = packed_double_element_selection_hir();
-        let sequence = select(&hir).expect("PackedDouble Machine IR");
-
-        let conversions = sequence
-            .instructions()
-            .iter()
-            .filter(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::CheckedFloat64ToElementIndex(..)
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(conversions.len(), 2);
-        for conversion in conversions {
-            assert_eq!(
-                sequence.representations()[conversion.operands[0].value.0 as usize],
-                MachineRepresentation::Float64
-            );
-            assert_eq!(
-                sequence.representations()[conversion.operands[1].value.0 as usize],
-                MachineRepresentation::Uint32
-            );
-            assert_eq!(
-                conversion.clobbers,
-                TargetSpec::aarch64().clobbers(TargetClobberSet::FloatElementIndex)
-            );
-            assert!(conversion.deopt_id().is_some());
-        }
-
-        let load = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::PackedDoubleElementLoad {
-                        byte_pc: 24,
-                        cache: None
-                    }
-                )
-            })
-            .expect("selected PackedDouble load");
-        assert_eq!(
-            sequence.representations()[load.operands[2].value.0 as usize],
-            MachineRepresentation::Float64
-        );
-        assert_eq!(
-            load.operands[2],
-            MachineOperand::register_output(MachineValue(3))
-        );
-
-        let store = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::PackedDoubleElementStore {
-                        byte_pc: 40,
-                        cache: None
-                    }
-                )
-            })
-            .expect("selected PackedDouble store");
-        assert_eq!(
-            store.operands[2],
-            MachineOperand::register_input(MachineValue(3))
-        );
-        assert_eq!(store.clobbers, element_clobbers(&TargetSpec::aarch64()));
-        assert!(
-            !sequence
+            let committed = sequence
                 .instructions()
                 .iter()
-                .any(|instruction| instruction.opcode == MachineOpcode::BoxNumber),
-            "PackedDouble element data and indices must never box"
-        );
-        assert!(
-            !sequence.instructions().iter().any(|instruction| {
-                instruction.opcode == MachineOpcode::DecodeNumber
-                    && instruction.operands.first().map(|operand| operand.value)
-                        == Some(MachineValue(3))
-            }),
-            "the packed load result must remain Float64"
-        );
-
-        let normalized = sequence.normalized();
-        assert!(normalized.contains("CheckedFloat64ToElementIndex(24)"));
-        assert!(normalized.contains("PackedDoubleElementLoad { byte_pc: 24, cache: None }"));
-        assert!(normalized.contains("PackedDoubleElementStore { byte_pc: 40, cache: None }"));
-        sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("PackedDouble allocation");
-
-        let expected = Err(VerificationError::OpcodeSignatureMismatch(
-            MachineInstructionId(
-                sequence
-                    .instructions()
-                    .iter()
-                    .position(|instruction| {
-                        matches!(
-                            instruction.opcode,
-                            MachineOpcode::PackedDoubleElementLoad {
-                                byte_pc: 24,
-                                cache: None
-                            }
-                        )
-                    })
-                    .expect("PackedDouble load index") as u32,
-            ),
-        ));
-        let mut wrong_load_representation = sequence.clone();
-        wrong_load_representation.representations[3] = MachineRepresentation::Tagged;
-        assert_eq!(
-            wrong_load_representation.verify(&TargetSpec::aarch64()),
-            expected
-        );
-
-        let conversion_id = sequence
-            .instructions()
-            .iter()
-            .position(|instruction| {
-                instruction.opcode == MachineOpcode::CheckedFloat64ToElementIndex(24)
-            })
-            .expect("first checked index");
-        let mut conversion_without_semantic_input = sequence.clone();
-        conversion_without_semantic_input.instructions[conversion_id]
-            .operands
-            .retain(|operand| {
-                !(operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(1))
-            });
-        assert_eq!(
-            conversion_without_semantic_input.verify(&TargetSpec::aarch64()),
-            Err(VerificationError::OpcodeSignatureMismatch(
-                MachineInstructionId(conversion_id as u32)
-            ))
-        );
-
-        let load_id = sequence
-            .instructions()
-            .iter()
-            .position(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::PackedDoubleElementLoad {
-                        byte_pc: 24,
-                        cache: None
-                    }
-                )
-            })
-            .expect("PackedDouble load index");
-        let mut load_without_semantic_index = sequence.clone();
-        load_without_semantic_index.instructions[load_id]
-            .operands
-            .retain(|operand| {
-                !(operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(1))
-            });
-        assert_eq!(
-            load_without_semantic_index.verify(&TargetSpec::aarch64()),
-            Err(VerificationError::OpcodeSignatureMismatch(
-                MachineInstructionId(load_id as u32)
-            ))
-        );
-
-        let store_id = sequence
-            .instructions()
-            .iter()
-            .position(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    MachineOpcode::PackedDoubleElementStore {
-                        byte_pc: 40,
-                        cache: None
-                    }
-                )
-            })
-            .expect("PackedDouble store index");
-        let mut store_without_semantic_value = sequence;
-        store_without_semantic_value.instructions[store_id]
-            .operands
-            .retain(|operand| {
-                !(operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(3))
-            });
-        assert_eq!(
-            store_without_semantic_value.verify(&TargetSpec::aarch64()),
-            Err(VerificationError::OpcodeSignatureMismatch(
-                MachineInstructionId(store_id as u32)
-            ))
-        );
+                .find_map(|instruction| match instruction.opcode {
+                    MachineOpcode::Call(index) => sequence
+                        .call_descriptors()
+                        .get(index as usize)
+                        .filter(|descriptor| {
+                            matches!(
+                                descriptor.target,
+                                CallTarget::CommittedRuntime {
+                                    target: otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT
+                                        | otter_vm::native_abi::STUB_JIT_STORE_ELEMENT,
+                                    ..
+                                }
+                            )
+                        })
+                        .map(|_| instruction),
+                    _ => None,
+                })
+                .expect("committed canonical element call");
+            assert!(committed.exits.is_empty());
+            assert!(committed.safepoint.is_some());
+        }
     }
 
     #[test]
-    fn selects_packed_double_elements_with_exact_tagged_indices() {
-        let sequence = select(&packed_double_tagged_index_selection_hir())
-            .expect("PackedDouble tagged-index Machine IR");
-
-        for opcode in [
-            MachineOpcode::PackedDoubleElementLoad {
-                byte_pc: 24,
-                cache: None,
-            },
-            MachineOpcode::PackedDoubleElementStore {
-                byte_pc: 40,
-                cache: None,
-            },
-        ] {
-            let instruction = sequence
-                .instructions()
-                .iter()
-                .find(|instruction| instruction.opcode == opcode)
-                .expect("selected PackedDouble tagged-index operation");
-            assert_eq!(
-                instruction.operands[1],
-                MachineOperand::location_input(MachineValue(1))
-            );
-            assert_eq!(
-                sequence.representations()[instruction.operands[1].value.0 as usize],
-                MachineRepresentation::Tagged
-            );
-            assert!(instruction.operands.iter().any(|operand| {
-                operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(1)
-            }));
-        }
+    fn unprepared_element_is_cold_only_without_a_replay_exit() {
+        let sequence = select(&explicit_element_selection_hir(None, false))
+            .expect("cold-only element Machine IR");
         assert!(sequence.instructions().iter().all(|instruction| {
             !matches!(
                 instruction.opcode,
-                MachineOpcode::CheckedFloat64ToElementIndex(..)
+                MachineOpcode::ElementView { .. }
+                    | MachineOpcode::ElementAddress { .. }
+                    | MachineOpcode::ElementValueLoad { .. }
             )
         }));
-        sequence
-            .verify(&TargetSpec::aarch64())
-            .expect("valid tagged-index contract");
-        sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("PackedDouble tagged-index allocation");
-    }
-
-    #[test]
-    fn number_element_indices_box_for_the_probe_and_keep_float_deopt_state() {
-        let mut hir = element_selection_hir(true);
-        hir.nodes[1] = NumericNode::Parameter {
-            register: 1,
-            value_type: NumericType::Number,
-        };
-
-        let sequence = select(&hir).expect("Number-index element Machine IR");
-        let load = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
-            .expect("Number-index element load");
-        let store = sequence
-            .instructions()
-            .iter()
-            .find(|instruction| instruction.opcode == MachineOpcode::ElementStore(40))
-            .expect("Number-index element store");
-        for instruction in [load, store] {
-            let boxed_index = instruction.operands[1].value;
-            assert_eq!(
-                sequence.representations()[boxed_index.0 as usize],
-                MachineRepresentation::Tagged
-            );
-            assert!(
-                instruction
-                    .operands
-                    .iter()
-                    .any(|operand| { operand == &MachineOperand::tagged_root(boxed_index) })
-            );
-            assert!(sequence.instructions().iter().any(|instruction| {
-                instruction.opcode == MachineOpcode::BoxNumber
-                    && instruction.operands.first().map(|operand| operand.value)
-                        == Some(MachineValue(1))
-                    && instruction.operands.last().map(|operand| operand.value) == Some(boxed_index)
-            }));
-        }
-
-        let allocation = sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("Number-index element allocation");
-        let layout = arm64::frame_layout(&allocation, 0).expect("Number-index element frame");
-        let table = lower_deopt_table(
-            &sequence,
-            &allocation,
-            layout,
-            arm64::GPR_BUDGET,
-            arm64::FP_BUDGET,
-            &machine_frame_states(&hir),
-        )
-        .expect("Number-index element deopt table");
-        for exit in [0, 3] {
-            assert_eq!(
-                table
-                    .lookup(exit)
-                    .expect("Number-index element exit")
-                    .outermost()
-                    .slots[1]
-                    .repr,
-                otter_vm::deopt::DeoptRepr::Float64
-            );
-        }
-    }
-
-    #[test]
-    fn scalar_element_indices_box_only_in_the_committed_cold_sibling() {
-        for (value_type, representation) in [
-            (NumericType::Int32, MachineRepresentation::Int32),
-            (NumericType::Uint32, MachineRepresentation::Uint32),
-        ] {
-            let mut hir = element_selection_hir(true);
-            let fast_index = if value_type == NumericType::Uint32 {
-                let left = hir::NumericValue(hir.nodes.len());
-                hir.nodes.push(NumericNode::IntegerConstant(8));
-                let right = hir::NumericValue(hir.nodes.len());
-                hir.nodes.push(NumericNode::IntegerConstant(0));
-                let index = hir::NumericValue(hir.nodes.len());
-                hir.nodes
-                    .push(NumericNode::IntegerShiftRightLogical(left, right));
-                let NumericNode::ElementLoad {
-                    index: load_index, ..
-                } = &mut hir.nodes[2]
-                else {
-                    panic!("element load fixture")
-                };
-                *load_index = index;
-                let NumericNode::ElementStore {
-                    index: store_index, ..
-                } = &mut hir.nodes[6]
-                else {
-                    panic!("element store fixture")
-                };
-                *store_index = index;
-                hir.blocks[0].nodes = [
-                    hir::NumericValue(0),
-                    hir::NumericValue(1),
-                    left,
-                    right,
-                    index,
-                    hir::NumericValue(2),
-                    hir::NumericValue(3),
-                    hir::NumericValue(4),
-                    hir::NumericValue(5),
-                    hir::NumericValue(6),
-                ]
-                .into();
-                index
-            } else {
-                hir.nodes[1] = NumericNode::Parameter {
-                    register: 1,
-                    value_type,
-                };
-                hir::NumericValue(1)
-            };
-            let sequence = select(&hir).expect("scalar-index element Machine IR");
-            let allocation = sequence
-                .allocate(&TargetSpec::aarch64())
-                .expect("scalar-index committed element allocation");
-            for opcode in [
-                MachineOpcode::ElementLoad(24),
-                MachineOpcode::ElementStore(40),
-            ] {
-                let (instruction_index, instruction) = sequence
-                    .instructions()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, instruction)| instruction.opcode == opcode)
-                    .expect("scalar-index element instruction");
-                let selected_fast_index = instruction.operands[1].value;
-                assert_eq!(
-                    instruction.clobbers,
-                    element_clobbers(&TargetSpec::aarch64())
-                );
-                assert_eq!(selected_fast_index, MachineValue(fast_index.0 as u32));
-                assert_eq!(
-                    sequence.representations()[selected_fast_index.0 as usize],
-                    representation
-                );
-                assert!(
-                    instruction
-                        .operands
-                        .iter()
-                        .all(|operand| operand
-                            != &MachineOperand::tagged_root(selected_fast_index)),
-                    "a scalar key is not a moving GC root"
-                );
-                assert!(
-                    sequence.instructions().iter().all(|definition| {
-                        !matches!(
-                            definition.opcode,
-                            MachineOpcode::BoxInt32 | MachineOpcode::BoxUint32
-                        ) || definition.operands.first().map(|operand| operand.value)
-                            != Some(selected_fast_index)
-                    }),
-                    "the hot Machine path must not materialize a boxed scalar key"
-                );
-
-                let locations = allocation
-                    .instruction_locations(MachineInstructionId(instruction_index as u32))
-                    .expect("committed element allocation coverage");
-                match locations[1] {
-                    AllocatedLocation::Register(register) => assert!(
-                        register.is_integer()
-                            && !element_clobbers(&TargetSpec::aarch64()).contains(&register),
-                        "late scalar key home must survive the fast guard clobbers"
-                    ),
-                    AllocatedLocation::Stack(_) => {}
-                }
-            }
-            let load_id = sequence
-                .instructions()
-                .iter()
-                .position(|instruction| instruction.opcode == MachineOpcode::ElementLoad(24))
-                .expect("scalar-index element load");
-            let scalar_index = sequence.instructions()[load_id].operands[1].value;
-            let mut falsely_rooted = sequence.clone();
-            falsely_rooted.instructions[load_id]
-                .operands
-                .push(MachineOperand::tagged_root(scalar_index));
-            assert_eq!(
-                falsely_rooted.verify(&TargetSpec::aarch64()),
-                Err(VerificationError::OpcodeSignatureMismatch(
-                    MachineInstructionId(load_id as u32)
-                )),
-                "a raw scalar late home must never enter the moving-root table"
-            );
-            sequence
-                .verify(&TargetSpec::aarch64())
-                .expect("valid committed element key contract");
-        }
-    }
-
-    #[test]
-    fn element_store_deopt_preserves_boolean_value_semantics() {
-        for source in [false, true] {
-            let hir = element_selection_hir(source);
-            let sequence = select(&hir).expect("element Machine IR");
-            assert_eq!(
-                sequence.representations()[5],
-                MachineRepresentation::Boolean
-            );
-            let allocation = sequence
-                .allocate(&TargetSpec::aarch64())
-                .expect("element Boolean allocation");
-            let layout = arm64::frame_layout(&allocation, 0).expect("element Boolean frame");
-            let table = lower_deopt_table(
-                &sequence,
-                &allocation,
-                layout,
-                arm64::GPR_BUDGET,
-                arm64::FP_BUDGET,
-                &machine_frame_states(&hir),
-            )
-            .expect("element Boolean deopt table");
-            let slot = table
-                .lookup(3)
-                .expect("element-store exit")
-                .outermost()
-                .slots[2];
-            assert_eq!(slot.repr, otter_vm::deopt::DeoptRepr::Boolean);
-            assert_eq!(
-                slot.repr.reconstitute(u64::from(u8::from(source))),
-                Value::boolean(source)
-            );
-        }
+        assert!(sequence.instructions().iter().any(|instruction| {
+            matches!(instruction.opcode, MachineOpcode::BranchNativeStatus)
+        }));
+        assert!(sequence.instructions().iter().all(|instruction| {
+            !matches!(instruction.opcode, MachineOpcode::Call(_)) || instruction.exits.is_empty()
+        }));
     }
 
     #[test]

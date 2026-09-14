@@ -165,5 +165,5 @@ cat <<'NOTE'
 
 Axes are event counts, not time shares. Read them as "where the engine is
 doing work it should not have to", then take the top line into the next
-declaration. Record the result in scratchpad/LEDGER.md.
+declaration.
 NOTE

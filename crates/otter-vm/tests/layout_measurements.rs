@@ -8,7 +8,6 @@
 //! # Invariants
 //! - This test is intentionally non-ratcheting: it provides a fast
 //!   `--nocapture` measurement point without freezing unstable layouts.
-//! - The repository-level optimization direction is tracked in `OTTER_PLAN.md`.
 
 use std::mem::{align_of, size_of};
 

@@ -56,7 +56,7 @@ TIERS="${TIERS:-template production-tiered}" bash scripts/cost.sh
 
 cat <<'NOTE'
 
-Gate passed. Append a row to scratchpad/LEDGER.md: hand-written LOC added,
-measured % won, and the ratio. If the ratio is not falling across slices, the
-substrate is not paying for itself — revert, do not extend.
+Gate passed. Record hand-written LOC added, measured % won, and the ratio in
+the commit message. If the ratio is not falling across slices, the substrate
+is not paying for itself — refactor the mechanism, do not extend it.
 NOTE

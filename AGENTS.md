@@ -708,13 +708,10 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 
 ### Debug/Profiling Roadmap Rules
 
-- Track all repository-level work in `OTTER_PLAN.md`, including the
-  debug/trace/profiling section.
 - If a patch adds or changes debug/profiling behavior, update:
   1. Runtime behavior (Rust code)
   2. CLI/API surface
-  3. `OTTER_PLAN.md` diagnostics status checkboxes
-  4. This `AGENTS.md` section when developer workflow changes
+  3. This `AGENTS.md` section when developer workflow changes
 - Keep tooling default-off (minimal overhead unless explicitly enabled).
 - Prefer machine-readable outputs (`.trace.json`, `.cpuprofile`,
   `.heapsnapshot`, `.folded`) over ad-hoc text when adding new tooling.
@@ -858,4 +855,3 @@ a specific area, investigate for infinite loops before attempting other fixes.
 ## Key Files
 
 - `ES_CONFORMANCE.md` - ECMAScript conformance status by edition and feature
-- `OTTER_PLAN.md` - single repository-level implementation tracker

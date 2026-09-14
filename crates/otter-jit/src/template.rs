@@ -30,7 +30,6 @@
 //!   exists.
 //!
 //! # See also
-//! - `OTTER_PLAN.md` — active engine direction and verification gates.
 //! - [`crate::entry`] — the shared entry ABI, typed lowering, and runtime
 //!   transitions this compiler consumes.
 

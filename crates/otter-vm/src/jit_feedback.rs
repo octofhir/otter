@@ -51,6 +51,7 @@ use smallvec::SmallVec;
 use crate::Value;
 use crate::cache_ir::CacheStub;
 use crate::property_ic::{PropertyIcEntry, PropertyIcKind};
+use crate::tier_policy::PROFILED_CALL_TARGET_CAPACITY;
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -113,9 +114,6 @@ impl CallTargetTransition {
     }
 }
 
-/// Maximum distinct targets retained at one ordinary-call site.
-pub(crate) const MAX_CALL_TARGETS: usize = 8;
-
 /// Stable non-GC identity observed at an ordinary `Op::Call`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OrdinaryCallTarget {
@@ -137,7 +135,7 @@ pub(crate) struct CallTargetCount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CallSiteDistribution {
     Mono(CallTargetCount),
-    Poly(Box<SmallVec<[CallTargetCount; MAX_CALL_TARGETS]>>),
+    Poly(Box<SmallVec<[CallTargetCount; PROFILED_CALL_TARGET_CAPACITY]>>),
     Megamorphic,
 }
 
@@ -280,8 +278,8 @@ struct AtomicCallFeedback {
     sequence: AtomicU32,
     state: AtomicU8,
     count: AtomicU8,
-    kinds: [AtomicU8; MAX_CALL_TARGETS],
-    targets: [AtomicU64; MAX_CALL_TARGETS],
+    kinds: [AtomicU8; PROFILED_CALL_TARGET_CAPACITY],
+    targets: [AtomicU64; PROFILED_CALL_TARGET_CAPACITY],
 }
 
 impl Default for AtomicCallFeedback {
@@ -341,7 +339,7 @@ impl AtomicCallFeedback {
                         }),
                         Ordering::Relaxed,
                     );
-                } else if count < MAX_CALL_TARGETS {
+                } else if count < PROFILED_CALL_TARGET_CAPACITY {
                     self.kinds[count].store(observed_kind, Ordering::Relaxed);
                     self.targets[count].store(
                         pack_call_target(CallTargetCount {
@@ -377,8 +375,9 @@ impl AtomicCallFeedback {
             }
             let state = self.state.load(Ordering::Relaxed);
             let count = usize::from(self.count.load(Ordering::Relaxed));
-            let mut targets: SmallVec<[CallTargetCount; MAX_CALL_TARGETS]> = SmallVec::new();
-            for index in 0..count.min(MAX_CALL_TARGETS) {
+            let mut targets: SmallVec<[CallTargetCount; PROFILED_CALL_TARGET_CAPACITY]> =
+                SmallVec::new();
+            for index in 0..count.min(PROFILED_CALL_TARGET_CAPACITY) {
                 targets.push(unpack_call_target(
                     self.targets[index].load(Ordering::Relaxed),
                     self.kinds[index].load(Ordering::Relaxed),
@@ -527,18 +526,6 @@ impl PropertyFeedbackSlot<'_> {
             PropertyIcKind::Load => self.feedback.load_misses.fetch_add(1, Ordering::Relaxed),
             PropertyIcKind::Store => self.feedback.store_misses.fetch_add(1, Ordering::Relaxed),
         };
-        let became_megamorphic = self
-            .feedback
-            .with_entry_mut(PropertyIcEntry::record_guard_miss);
-        if became_megamorphic {
-            match self.feedback.kind {
-                PropertyIcKind::Load => self.feedback.load_disables.fetch_add(1, Ordering::Relaxed),
-                PropertyIcKind::Store => {
-                    self.feedback.store_disables.fetch_add(1, Ordering::Relaxed)
-                }
-            };
-            self.vector.bump_epoch();
-        }
         self.is_megamorphic()
     }
 
@@ -1437,12 +1424,14 @@ mod tests {
             assert!(!slot.record_guard_miss());
             assert_eq!(vector.epoch(), 4);
         }
-        assert!(slot.record_guard_miss());
+        assert!(!slot.record_guard_miss());
+        assert_eq!(vector.epoch(), 4);
+        slot.install(CacheStub::default());
+        assert!(slot.is_megamorphic(), "megamorphic is CodeBlock-terminal");
         assert_eq!(vector.epoch(), 5);
         for _ in 0..2048 {
             slot.record_uncached_miss();
         }
-        assert!(slot.is_megamorphic(), "megamorphic is CodeBlock-terminal");
         assert_eq!(vector.epoch(), 5);
 
         let stats = vector.property_stats();

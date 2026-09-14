@@ -26,7 +26,6 @@ struct RunResult {
 fn run(selection: JitSelection, source: &str, name: &str) -> String {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     runtime
@@ -44,7 +43,6 @@ fn run_warmed_probe(
 ) -> RunResult {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     let warm_name = format!("{name}-warm");

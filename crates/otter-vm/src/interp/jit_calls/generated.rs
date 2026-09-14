@@ -3,20 +3,19 @@
 //! # Contents
 //! - [`Interpreter::note_generated_call_deopt`] — validates one exact generated
 //!   code generation, emits its structured cold-deopt event, and feeds the
-//!   existing baseline entry-bail eviction policy.
+//!   shared cost policy.
 //!
 //! # Invariants
 //! - This module runs only after generated code reports a callee bailout.
 //!   Successful generated calls never transition through the VM.
-//! - Callee identity, tier, and generation-health counters come from the exact
+//! - Callee identity and tier come from the exact
 //!   retained [`crate::native_abi::CodeEntryCell`] generation.
 //! - The published stack-owned frame must agree with that generation before
 //!   diagnostics or policy state changes.
 //! - An inline caller is checked against its owning generation's exact safepoint
 //!   and the physical parent immediately preceding the bailed callee.
-//! - Aggregate deopt pressure is applied once per still-linked generation;
-//!   later deopts from already-active callers cannot consume more recompile
-//!   budget after invalidation unlinks the cell.
+//! - Exit cost is applied once per still-linked generation; later deopts from
+//!   already-active callers cannot invalidate an already-unlinked cell.
 //! - Event construction remains lazy and allocation-free while JIT event
 //!   capture is disabled.
 //!
@@ -151,10 +150,7 @@ impl Interpreter {
         else {
             return Err(VmError::InvalidOperand);
         };
-        if state.function_id != callee.header.function_id
-            || state.tier != callee.header.kind
-            || state.deopts == 0
-        {
+        if state.function_id != callee.header.function_id || state.tier != callee.header.kind {
             return Err(VmError::InvalidOperand);
         }
 
@@ -183,44 +179,21 @@ impl Interpreter {
         // an entry like any other, so it charges the same bounded
         // reoptimization budget the interpreter's entry paths do.
         if state.tier == NativeFrameKind::Optimizing {
-            self.note_jit_optimized_bail(callee_function_id, exit);
+            self.note_jit_optimized_bail(context, callee_function_id, exit);
+            // Generated deoptimization resumes the already-started callee in
+            // the interpreter, but it does not revisit the OSR dispatcher.
+            // Apply the same one-way arithmetic widening here so a later
+            // profitable generation cannot repeat an overflow speculation.
+            self.reoptimize_arith_overflow_bail(context, callee_function_id, exit);
             return Ok(());
         }
 
-        // Baseline generations participate in the bounded recompile/pin
-        // policy. A purely consecutive threshold misses workloads where a
-        // generated body succeeds just often enough to reset its streak while
-        // still deopting on a large fraction of entries. Aggregate pressure
-        // catches that case after a meaningful sample. Only a linked
-        // generation may consume policy budget: invalidation unlinks it, while
-        // already-active callers can still report later deopts during unwind.
+        // Only a linked generation may charge the shared cost policy:
+        // invalidation unlinks it, while already-active callers can still
+        // report later deopts during unwind.
         if state.tier == NativeFrameKind::Baseline && state.linked {
-            if generated_call_generation_is_unhealthy(state.entries, state.deopts) {
-                self.reopt_or_pin_jit_function(callee_function_id);
-            } else {
-                self.note_jit_entry_bail(callee_function_id);
-            }
+            self.note_jit_entry_bail(context, callee_function_id);
         }
         Ok(())
-    }
-}
-
-#[inline]
-fn generated_call_generation_is_unhealthy(entries: u64, deopts: u64) -> bool {
-    entries >= Interpreter::JIT_GENERATED_DEOPT_MIN_ENTRIES
-        && deopts.saturating_mul(Interpreter::JIT_GENERATED_DEOPT_RATE_DENOMINATOR) >= entries
-}
-
-#[cfg(test)]
-mod tests {
-    use super::generated_call_generation_is_unhealthy;
-
-    #[test]
-    fn aggregate_deopt_pressure_requires_sample_size_and_high_rate() {
-        assert!(!generated_call_generation_is_unhealthy(63, 63));
-        assert!(!generated_call_generation_is_unhealthy(64, 15));
-        assert!(generated_call_generation_is_unhealthy(64, 16));
-        assert!(generated_call_generation_is_unhealthy(10_000, 2_500));
-        assert!(!generated_call_generation_is_unhealthy(1_000_000, 64));
     }
 }

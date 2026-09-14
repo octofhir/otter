@@ -133,17 +133,16 @@ fn structured_jit_events_are_typed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let events_path = tmp.path().join("otter-jit-events.json");
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg("--jit-events")
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40)",
+             { s = s + i; } return s; } hot(400)",
         )
         .output()
         .expect("run with structured JIT events");
     assert_success(&output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "780");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "79800");
 
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(events_path).expect("read JIT events"))
@@ -170,12 +169,11 @@ fn abrupt_failure_still_writes_partial_jit_events() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let events_path = tmp.path().join("jit-events-error.json");
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-events={}", events_path.display()))
         .arg("--eval")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40); throw new Error('expected');",
+             { s = s + i; } return s; } hot(400); throw new Error('expected');",
         )
         .output()
         .expect("run abrupt JIT event capture");
@@ -220,13 +218,12 @@ fn late_timeout_preserves_earlier_file_jit_events() {
     std::fs::write(
         &first,
         "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-         { s = s + i; } return s; } hot(40);",
+         { s = s + i; } return s; } hot(400);",
     )
     .expect("write first entry");
     std::fs::write(&second, "while (true) {}").expect("write timed-out entry");
 
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg("--timeout=1")
         .arg(format!("--jit-events={}", events_path.display()))
         .arg("--allow-read=*")
@@ -256,13 +253,12 @@ fn late_input_error_preserves_earlier_file_jit_events() {
     std::fs::write(
         &first,
         "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-         { s = s + i; } return s; } hot(40);",
+         { s = s + i; } return s; } hot(400);",
     )
     .expect("write first entry");
     std::fs::create_dir(&invalid).expect("create invalid source directory");
 
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-events={}", events_path.display()))
         .arg("--allow-read=*")
         .arg("first.js")
@@ -288,17 +284,16 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let artifacts_path = tmp.path().join("artifacts");
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40)",
+             { s = s + i; } return s; } hot(400)",
         )
         .output()
         .expect("run with JIT artifact capture");
     assert_success(&output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "780");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "79800");
 
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(artifacts_path.join("index.json")).expect("read artifact index"),
@@ -434,12 +429,11 @@ fn capture_portable_production_code(
 ) -> (Vec<u8>, Vec<serde_json::Value>) {
     let artifacts_path = root.join(directory_name);
     let output = otter_command(root)
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40)",
+             { s = s + i; } return s; } hot(400)",
         )
         .output()
         .expect("run portable artifact capture");
@@ -486,12 +480,11 @@ fn abrupt_failure_still_writes_partial_jit_artifacts() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let artifacts_path = tmp.path().join("abrupt-artifacts");
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
         .arg("--eval")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40); throw new Error('expected-artifact-error');",
+             { s = s + i; } return s; } hot(400); throw new Error('expected-artifact-error');",
         )
         .output()
         .expect("run abrupt artifact capture");
@@ -528,12 +521,11 @@ fn existing_artifact_target_is_not_overwritten() {
     std::fs::write(&sentinel, "keep").expect("write sentinel");
 
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40)",
+             { s = s + i; } return s; } hot(400)",
         )
         .output()
         .expect("run against existing artifact target");
@@ -571,13 +563,12 @@ fn artifact_persistence_still_runs_when_event_write_fails() {
     std::fs::create_dir(&invalid_events_target).expect("create invalid event target");
 
     let output = otter_command(tmp.path())
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
         .arg(format!("--jit-events={}", invalid_events_target.display()))
         .arg(format!("--jit-artifacts={}", artifacts_path.display()))
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(40)",
+             { s = s + i; } return s; } hot(400)",
         )
         .output()
         .expect("run independent diagnostic writes");

@@ -250,20 +250,16 @@ impl Interpreter {
             jit_call_counts: rustc_hash::FxHashMap::default(),
             optimizing_tier_policy: tier_policy::TierPolicy::default(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
-            jit_entry_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_feedback_refresh_attempted: rustc_hash::FxHashSet::default(),
             jit_pending_direct_targets: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
-            jit_osr_threshold: Self::JIT_OSR_THRESHOLD,
             jit_code: rustc_hash::FxHashMap::default(),
-            jit_template_entry_retry_remaining: rustc_hash::FxHashMap::default(),
             jit_template_osr_fids: rustc_hash::FxHashSet::default(),
             jit_template_compiling: rustc_hash::FxHashSet::default(),
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
             jit_optimized_exit_profiles: std::collections::BTreeMap::new(),
-            jit_optimized_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
@@ -1339,17 +1335,6 @@ impl Interpreter {
         self.code_space.property_ic_stats()
     }
 
-    /// Override the back-edge count at which a hot loop tiers up via OSR.
-    ///
-    /// Embedders and differential harnesses use this to force loop tier-up
-    /// without ambient process configuration. Zero is rejected; the current
-    /// threshold is kept.
-    pub fn set_jit_osr_threshold(&mut self, threshold: u32) {
-        if threshold > 0 {
-            self.jit_osr_threshold = threshold;
-        }
-    }
-
     /// Install or remove the runtime-owned JIT compiler hook.
     ///
     /// `None` keeps interpreter-only behavior. A hook returning
@@ -1395,56 +1380,10 @@ impl Interpreter {
         self.method_feedback.collection_method_stats()
     }
 
-    /// Call-count at which a function body is offered to the JIT. Low enough
-    /// that genuinely hot functions tier up early, high enough that one-shot
-    /// calls never pay compile latency.
-    pub(crate) const JIT_TIER_UP_THRESHOLD: u32 = 50;
-
-    /// Ordinary entries skipped after a transient Template compiler failure.
-    /// This fixed finite delay prevents allocation/backend outages from
-    /// turning every call into a compile attempt without erasing accumulated
-    /// hotness or permanently disabling the function.
-    pub(crate) const JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES: u32 = 64;
-
-    /// Shared entry hotness at which a successful baseline generation gets one
-    /// feedback-driven rebuild. Target readiness is checked separately before
-    /// invalidation, so this window only needs to amortize one extra compile;
-    /// keeping it close to initial tier-up avoids hundreds of generic calls
-    /// after every observed callee already has a stable native entry.
-    pub(crate) const JIT_FEEDBACK_REFRESH_THRESHOLD: u32 = 128;
-
-    /// Entry-bail count at which an installed body is evicted and recompiled
-    /// against current feedback (see [`Self::note_jit_entry_bail`]). Low enough
-    /// that a body bailing on every call stops wasting entries quickly, high
-    /// enough that a handful of cold-path bails (a rare branch hitting an
-    /// unsupported region) never evicts a body that is fine on its hot path.
-    pub(crate) const JIT_ENTRY_BAIL_REOPT_THRESHOLD: u32 = 8;
-
-    /// Minimum generated entries before aggregate deopt pressure can evict an
-    /// exact code generation. This keeps small/cold samples from influencing
-    /// tier policy while bounding deopt-dominated hot generations quickly.
-    pub(crate) const JIT_GENERATED_DEOPT_MIN_ENTRIES: u64 = 64;
-
-    /// A generated code object is unhealthy when at least this fraction of its
-    /// entries deopt. Expressed as a denominator to keep the cold check integer
-    /// only: `deopts * DENOMINATOR >= entries`.
-    pub(crate) const JIT_GENERATED_DEOPT_RATE_DENOMINATOR: u64 = 4;
-
-    /// Recompile budget per function for entry-bail eviction. A body still
-    /// bail-looping after this many fresh-feedback recompiles is stuck on
-    /// something feedback cannot express; it is pinned to the interpreter
-    /// rather than thrashing the compiler.
-    pub(crate) const JIT_MAX_ENTRY_BAIL_REOPTS: u32 = 4;
-
     /// Number of compiled back-edges the fuel counter allows between cooperative
     /// budget checkpoints. Large enough to amortize the VM re-entry across a hot
     /// loop, small enough that a runtime budget is enforced within a bounded
     /// number of iterations. The interrupt flag is polled inline every back-edge,
     /// so cancellation latency is unaffected by this batch size.
     pub(crate) const JIT_BACKEDGE_POLL_BATCH: u64 = 4096;
-
-    /// Back-edge count at which a hot loop tiers up via OSR. Higher than the
-    /// call-count threshold: a loop iterating this many times amortizes the
-    /// compile cost many times over, while short loops never pay it.
-    pub(crate) const JIT_OSR_THRESHOLD: u32 = 1000;
 }

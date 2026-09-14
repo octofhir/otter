@@ -1685,6 +1685,7 @@ pub(super) fn compile(
     Ok(NativeCompileOutput {
         code,
         artifact,
+        ir_node_count: u64::try_from(plan.instructions.len()).unwrap_or(u64::MAX),
         diagnostics: direct_call_events
             .map(|events| events.into_values().collect::<Vec<_>>().into_boxed_slice())
             .unwrap_or_default(),

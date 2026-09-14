@@ -44,8 +44,8 @@
 //!   feedback transaction; no JIT-owned root token exists between those steps.
 //! - Return, caught-throw, and escaping-throw completion release every nested
 //!   call lifecycle resource so later compiled entries remain reusable.
-//! - Loop OSR is disabled, so observed direct calls cross whole-function
-//!   compiled entries rather than an independently tiered loop body.
+//! - Whole-function generated-call assertions remain valid when the shared
+//!   profitability policy also selects a loop OSR body.
 //!
 //! # See also
 //! - `jit_exception_regions.rs` — structured exception completion coverage.
@@ -56,7 +56,6 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 struct RunResult {
     completion: String,
     compile_attempts: u64,
-    osr_attempts: u64,
     reentrant_transitions: u64,
     generated_calls: u64,
     caller_invalidations: u64,
@@ -74,7 +73,6 @@ struct SplitRunResult {
 fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     let completion = runtime
@@ -86,7 +84,6 @@ fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
     RunResult {
         completion,
         compile_attempts: stats.jit_compile_attempts,
-        osr_attempts: stats.jit_osr_attempts,
         reentrant_transitions: stats.jit_reentrant_stub_transitions,
         generated_calls: stats.jit_generated_calls,
         caller_invalidations: stats.jit_caller_invalidations,
@@ -103,7 +100,6 @@ fn run_after_warmup(
 ) -> SplitRunResult {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     let setup_name = format!("{name}-setup.js");
@@ -182,10 +178,6 @@ fn assert_whole_function_compiled(result: &RunResult) {
     assert!(
         result.compile_attempts > 0,
         "fixture must compile whole-function entries"
-    );
-    assert_eq!(
-        result.osr_attempts, 0,
-        "fixture must not tier through loop OSR"
     );
 }
 

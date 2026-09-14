@@ -166,8 +166,6 @@ struct Args {
     surface: ExecutionSurfaceArg,
     #[arg(long, value_enum, default_value = "not-applicable")]
     jit_policy: JitPolicyArg,
-    #[arg(long)]
-    jit_osr_threshold: Option<u32>,
     #[arg(long, value_enum, default_value = "not-applicable")]
     gc_policy: GcPolicyArg,
     #[arg(long)]
@@ -402,7 +400,6 @@ fn main() {
         configuration: BenchmarkConfiguration {
             surface: args.surface.into(),
             jit_policy: args.jit_policy.into(),
-            jit_osr_threshold: args.jit_osr_threshold,
             gc_policy: args.gc_policy.into(),
             gc_stress_stride: args.gc_stress_stride,
             runtime_reuse: args.runtime_reuse.into(),

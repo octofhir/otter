@@ -224,8 +224,6 @@ pub struct BenchmarkConfiguration {
     pub surface: ExecutionSurface,
     /// Exact JIT policy.
     pub jit_policy: JitPolicy,
-    /// Explicit OSR threshold override.
-    pub jit_osr_threshold: Option<u32>,
     /// Collector policy.
     pub gc_policy: GcPolicy,
     /// Stress allocation stride when stress policy is active.
@@ -734,7 +732,6 @@ mod tests {
             configuration: BenchmarkConfiguration {
                 surface: ExecutionSurface::Vm,
                 jit_policy: JitPolicy::ProductionTiered,
-                jit_osr_threshold: None,
                 gc_policy: GcPolicy::Normal,
                 gc_stress_stride: None,
                 runtime_reuse: RuntimeReuse::ReusedAcrossSamples,

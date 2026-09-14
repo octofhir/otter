@@ -2083,6 +2083,8 @@ pub enum JitCompileStatus {
         artifact: Option<Box<crate::jit_artifact::JitArtifactBundle>>,
         /// Opt-in compiler-emitted events describing actual backend choices.
         diagnostics: Box<[crate::jit_debug::JitCompilerDiagnostic]>,
+        /// Number of lowered IR operations presented to native emission.
+        ir_node_count: u64,
     },
 }
 

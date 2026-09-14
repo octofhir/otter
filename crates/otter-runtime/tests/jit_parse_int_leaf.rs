@@ -127,7 +127,6 @@ fn run(
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
         // Warm the called function itself instead of inlining it into top-level OSR.
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("parseInt runtime");
     let result = runtime
@@ -211,7 +210,6 @@ fn exact_bootstrap_identity_guards_observable_global_replacement() {
 fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(4)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .expect("parseInt artifact runtime");

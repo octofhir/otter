@@ -38,7 +38,6 @@ JSON.stringify([
     ] {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_osr_threshold(u32::MAX)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .build()
             .expect("Machine literal runtime");
@@ -112,7 +111,6 @@ JSON.stringify([
         for selection in [JitSelection::InterpreterOnly, JitSelection::Template] {
             let mut runtime = Runtime::builder()
                 .jit_selection(selection)
-                .jit_osr_threshold(u32::MAX)
                 .jit_debug(JitDebugRequest::artifacts())
                 .build()
                 .expect("literal runtime");

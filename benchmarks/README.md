@@ -50,13 +50,12 @@ Tier choice is explicit whenever a workload permits tier selection:
 - `template` uses the production template compiler only.
 - `production-tiered` uses the current production tier policy.
 
-`call`, `kernel`, and `module` require `--jit-tier`; their optional
-`--jit-osr-threshold` records a deliberate threshold override. `jit-compile`
-requires `--compile-tier template|optimizing` and one or more explicit numeric
-`--argument` values. `memory` always measures the interpreter with a post-run
-full GC. `idle-memory` aggregates fresh-process interpreter runtimes at a
-forced-full-GC idle boundary. Do not infer a benchmark tier from legacy JIT
-environment variables.
+`call`, `kernel`, and `module` require `--jit-tier` and always exercise the
+production cost policy for that tier. `jit-compile` requires `--compile-tier
+template|optimizing` and one or more explicit numeric `--argument` values.
+`memory` always measures the interpreter with a post-run full GC.
+`idle-memory` aggregates fresh-process interpreter runtimes at a forced-full-GC
+idle boundary.
 
 ### JavaScript kernel corpus
 

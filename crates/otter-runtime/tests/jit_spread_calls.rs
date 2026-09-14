@@ -67,7 +67,6 @@ matrix(180);
 fn run(selection: JitSelection) -> (String, u64, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .build()
         .expect("runtime");
     let completion = runtime
@@ -117,7 +116,6 @@ String(stackOwnedCaller(5000));
 fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(8)
         .build()
         .expect("stack-owned spread runtime");
     let completion = runtime
@@ -183,7 +181,6 @@ fn custom_array_iterator_bails_before_observable_effects() {
 
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(8)
         .build()
         .expect("observable iterator runtime");
     let actual = runtime
@@ -221,7 +218,6 @@ String(count(200000, 0));
 fn run_deep_tail(selection: JitSelection) -> String {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .build()
         .expect("runtime");
     runtime

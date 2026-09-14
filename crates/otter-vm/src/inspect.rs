@@ -203,15 +203,10 @@ pub enum IcSiteKind {
 pub enum IcSiteState {
     /// No cache record has been installed yet.
     Empty,
-    /// One or more guarded entries are installed. `misses` is the
-    /// running probe-miss budget; reaching the disable threshold
-    /// while the entry list is full transitions the site to
-    /// [`Self::Megamorphic`].
+    /// One or more census-bounded guarded entries are installed.
     Polymorphic {
         /// Installed entries in install order.
         entries: Vec<IcEntrySnapshot>,
-        /// Probe misses observed since the most recent install.
-        misses: u32,
     },
     /// Site exceeded the polymorphic cache budget and falls through
     /// to the slow path on every dispatch.
@@ -387,7 +382,7 @@ pub(crate) fn snapshot_load_state(
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
         PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
-        PropertyIcEntry::Polymorphic { entries, misses } => {
+        PropertyIcEntry::Polymorphic { entries } => {
             let mapped = entries
                 .iter()
                 .map(|ic| {
@@ -418,10 +413,7 @@ pub(crate) fn snapshot_load_state(
                     }
                 })
                 .collect();
-            IcSiteState::Polymorphic {
-                entries: mapped,
-                misses: u32::from(*misses),
-            }
+            IcSiteState::Polymorphic { entries: mapped }
         }
     }
 }
@@ -438,7 +430,7 @@ pub(crate) fn snapshot_store_state(
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
         PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
-        PropertyIcEntry::Polymorphic { entries, misses } => {
+        PropertyIcEntry::Polymorphic { entries } => {
             let mapped = entries
                 .iter()
                 .map(|ic| {
@@ -478,10 +470,7 @@ pub(crate) fn snapshot_store_state(
                     }
                 })
                 .collect();
-            IcSiteState::Polymorphic {
-                entries: mapped,
-                misses: u32::from(*misses),
-            }
+            IcSiteState::Polymorphic { entries: mapped }
         }
     }
 }

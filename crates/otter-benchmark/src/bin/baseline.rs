@@ -207,7 +207,6 @@ fn configuration(
     BenchmarkConfiguration {
         surface,
         jit_policy,
-        jit_osr_threshold: None,
         gc_policy,
         gc_stress_stride: None,
         runtime_reuse,

@@ -37,8 +37,8 @@ const EAGER_DIRECT_TARGET_DEPTH: u8 = 2;
 /// Only [`TemplateCompileOutcome::Unsupported`] is stable enough to enter the
 /// function-wide canonical cache. Allocation, backend availability, hook,
 /// prewarm, and registry-admission failures are
-/// [`TemplateCompileOutcome::Deferred`] so execution can retry after a bounded
-/// cooling interval.
+/// [`TemplateCompileOutcome::Deferred`] so a later profitable policy decision
+/// can retry without caching a performance failure as unsupported semantics.
 #[derive(Debug, Clone)]
 pub(super) enum TemplateCompileOutcome {
     Installed(std::sync::Arc<dyn jit::JitFunctionCode>),
@@ -106,9 +106,8 @@ impl Interpreter {
     /// Publish one Template compile result into the single entry/OSR cache.
     ///
     /// A permanent unsupported verdict disables every OSR header. Deferred
-    /// failures retain no code/cache verdict and only arm the entry retry
-    /// countdown; each OSR header naturally waits for its next hotness
-    /// threshold before trying again.
+    /// failures retain no code/cache verdict; entry and OSR each wait until the
+    /// cost model again predicts positive payoff before trying again.
     pub(super) fn retain_template_compile_outcome(
         &mut self,
         fid: u32,
@@ -117,7 +116,6 @@ impl Interpreter {
         match &outcome {
             TemplateCompileOutcome::Installed(code) => {
                 self.jit_code.insert(fid, Some(code.clone()));
-                self.jit_template_entry_retry_remaining.remove(&fid);
                 if code.osr_only() {
                     self.jit_entry_osr_only.insert(fid);
                 } else {
@@ -126,34 +124,16 @@ impl Interpreter {
             }
             TemplateCompileOutcome::Unsupported => {
                 self.jit_code.insert(fid, None);
-                self.jit_template_entry_retry_remaining.remove(&fid);
                 self.jit_template_osr_fids.remove(&fid);
                 self.jit_entry_osr_only.remove(&fid);
                 self.jit_osr_disabled.insert((fid, u32::MAX));
                 self.jit_osr_counts
                     .retain(|(counted_fid, _), _| *counted_fid != fid);
             }
-            TemplateCompileOutcome::Deferred => {
-                self.jit_template_entry_retry_remaining
-                    .insert(fid, Self::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES);
-            }
+            TemplateCompileOutcome::Deferred => {}
         }
         self.jit_code_cache = None;
         outcome
-    }
-
-    /// Consume one ordinary entry from a transient-compile cooling interval.
-    /// Returns `true` exactly when compilation may be attempted now.
-    pub(super) fn template_entry_retry_ready(&mut self, fid: u32) -> bool {
-        let Some(remaining) = self.jit_template_entry_retry_remaining.get_mut(&fid) else {
-            return true;
-        };
-        if *remaining > 1 {
-            *remaining -= 1;
-            return false;
-        }
-        self.jit_template_entry_retry_remaining.remove(&fid);
-        true
     }
 
     fn record_jit_compile_prepared(
@@ -194,6 +174,16 @@ impl Interpreter {
             .iter()
             .filter(|instruction| instruction.op(&view.code_block) == Op::LoadGlobalOrThrow)
             .count();
+        let entry_count = u64::from(self.jit_call_counts.get(&fid).copied().unwrap_or(0))
+            .saturating_add(self.jit_code_registry.generated_entries_for_function(fid));
+        let exit_count = u64::from(self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0))
+            .saturating_add(
+                self.jit_optimized_exit_profiles
+                    .iter()
+                    .filter(|((profile_fid, _, _), _)| *profile_fid == fid)
+                    .map(|(_, profile)| u64::from(profile.count))
+                    .sum::<u64>(),
+            );
         let event = jit_debug::JitDebugEvent::CompilePrepared {
             function_id: fid,
             function_name,
@@ -201,6 +191,9 @@ impl Interpreter {
             target,
             register_count: u32::from(view.code_block.register_count),
             parameter_count: u32::from(view.code_block.param_count),
+            bytecode_instruction_count: u64::try_from(view.instructions.len()).unwrap_or(u64::MAX),
+            entry_count,
+            exit_count,
             call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
             method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
             global_load_sites: u32::try_from(global_load_sites).unwrap_or(u32::MAX),
@@ -279,34 +272,50 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         target: jit_debug::JitDebugTarget,
         code_object_id: u64,
+        compile_started_ns: u64,
+        queue_delay_ns: u64,
+        compile_duration_ns: u64,
         status: &Result<jit::JitCompileStatus, jit::JitCompileError>,
     ) {
         if !self.reserve_jit_debug_event() {
             return;
         }
-        let outcome = match status {
-            Ok(jit::JitCompileStatus::Compiled { code, .. }) => {
+        let (outcome, ir_node_count) = match status {
+            Ok(jit::JitCompileStatus::Compiled {
+                code,
+                ir_node_count,
+                ..
+            }) => (
                 jit_debug::JitDebugCompileOutcome::Compiled {
                     code_object_id,
                     code_bytes: u64::try_from(code.code_len()).unwrap_or(u64::MAX),
-                }
-            }
+                },
+                *ir_node_count,
+            ),
             Ok(jit::JitCompileStatus::Unavailable) => {
-                jit_debug::JitDebugCompileOutcome::Unavailable
+                (jit_debug::JitDebugCompileOutcome::Unavailable, 0)
             }
-            Ok(jit::JitCompileStatus::Unsupported { reason }) => {
+            Ok(jit::JitCompileStatus::Unsupported { reason }) => (
                 jit_debug::JitDebugCompileOutcome::Unsupported {
                     reason: reason.clone(),
-                }
-            }
-            Err(error) => jit_debug::JitDebugCompileOutcome::Error {
-                message: error.message.clone(),
-            },
+                },
+                0,
+            ),
+            Err(error) => (
+                jit_debug::JitDebugCompileOutcome::Error {
+                    message: error.message.clone(),
+                },
+                0,
+            ),
         };
         self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::CompileFinished {
             function_id: fid,
             tier,
             target,
+            compile_started_ns,
+            queue_delay_ns,
+            compile_duration_ns,
+            ir_node_count,
             outcome,
         });
         let Ok(jit::JitCompileStatus::Compiled { diagnostics, .. }) = status else {
@@ -500,6 +509,9 @@ impl Interpreter {
                 });
         let function = snapshot.code_block.clone();
         let code_object_id = self.jit_next_code_object_id;
+        let queued_ns = self.jit_debug.monotonic_ns();
+        let compile_started_ns = self.jit_debug.monotonic_ns();
+        let compile_started = std::time::Instant::now();
         let status = hook.compile_optimized_function(jit::JitCompileRequest {
             snapshot,
             debug: self.jit_debug.request(),
@@ -507,11 +519,23 @@ impl Interpreter {
             osr_pc,
             code_object_id,
         });
+        let compile_duration_ns = compile_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        self.optimizing_tier_policy.record_compile_duration(
+            fid,
+            crate::tier_policy::CostedTier::Optimizing,
+            compile_duration_ns,
+        );
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Optimizing,
             target,
             code_object_id,
+            compile_started_ns,
+            compile_started_ns.saturating_sub(queued_ns),
+            compile_duration_ns,
             &status,
         );
         match status {
@@ -699,6 +723,9 @@ impl Interpreter {
                         .unwrap_or_else(|| "<unknown>".to_string()),
                     module: view.code_block.module_url().to_string(),
                 });
+        let queued_ns = self.jit_debug.monotonic_ns();
+        let compile_started_ns = self.jit_debug.monotonic_ns();
+        let compile_started = std::time::Instant::now();
         let status = hook.compile_function(jit::JitCompileRequest {
             snapshot: view,
             debug: self.jit_debug.request(),
@@ -706,11 +733,23 @@ impl Interpreter {
             osr_pc,
             code_object_id,
         });
+        let compile_duration_ns = compile_started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        self.optimizing_tier_policy.record_compile_duration(
+            fid,
+            crate::tier_policy::CostedTier::Template,
+            compile_duration_ns,
+        );
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Template,
             target,
             code_object_id,
+            compile_started_ns,
+            compile_started_ns.saturating_sub(queued_ns),
+            compile_duration_ns,
             &status,
         );
         match status {
@@ -733,6 +772,11 @@ impl Interpreter {
                 if installed {
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
+                    self.optimizing_tier_policy.observe_template_generation(
+                        fid,
+                        u64::from(self.jit_call_counts.get(&fid).copied().unwrap_or(0)),
+                        self.code_space.feedback_epoch(fid),
+                    );
                 }
                 if installed {
                     TemplateCompileOutcome::Installed(code)
@@ -1281,6 +1325,26 @@ impl Interpreter {
             return Some(plan);
         }
         if eager_depth == 0 || self.jit_code.contains_key(&function.id) {
+            return None;
+        }
+        let executions = u64::from(self.jit_call_counts.get(&function.id).copied().unwrap_or(0))
+            .saturating_add(
+                self.jit_code_registry
+                    .generated_entries_for_function(function.id),
+            );
+        let resident_code_bytes = self.jit_code_residency().code_bytes;
+        if !self
+            .jit_tier_cost_decision(
+                context,
+                function.id,
+                crate::tier_policy::CostedTier::Template,
+                crate::tier_policy::TierTrigger::DirectCallTarget,
+                executions,
+                0,
+                resident_code_bytes,
+            )
+            .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
+        {
             return None;
         }
         self.jit_runtime_stats.compile_attempts =

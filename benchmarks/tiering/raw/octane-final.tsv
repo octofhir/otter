@@ -1,0 +1,6 @@
+workload	score	outcome	note
+regexp	151	pass	bounded final run
+code-load	2439	pass	bounded final run
+box2d	1552	pass	bounded final run
+pdfjs		fail	pre-existing TypeError conformance gap
+zlib		fail	pre-existing print ReferenceError harness gap

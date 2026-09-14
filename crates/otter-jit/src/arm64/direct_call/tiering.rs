@@ -13,13 +13,16 @@ use super::*;
 
 const ENABLED_OFFSET: u32 =
     std::mem::offset_of!(abi::CodeEntryCell, generated_tiering_enabled) as u32;
+const BREAK_EVEN_OFFSET: u32 =
+    std::mem::offset_of!(abi::CodeEntryCell, generated_tiering_break_even) as u32;
 
 pub(super) fn emit_entry(ops: &mut Assembler, context: u8) {
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_ENTRIES_OFFSET);
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x14, otter_vm::tier_policy::OPTIMIZING_HOTNESS_THRESHOLD
+        ; ldr x15, [x25, BREAK_EVEN_OFFSET]
+        ; cmp x14, x15
         ; b.lo =>done
         ; ldr w15, [x25, ENABLED_OFFSET]
         ; cbz w15, =>done
@@ -74,9 +77,8 @@ mod tests {
         thread.code_registry = std::ptr::from_mut(&mut registry) as u64;
         let mut context = vec![0_u64; THREAD_OFFSET as usize / 8 + 1];
         context[THREAD_OFFSET as usize / 8] = std::ptr::from_ref(&thread) as u64;
-        let cell = abi::CodeEntryCell::new(1, 1, 7, 0, 0, 0, 16);
-        cell.generated_entries
-            .set(u64::from(otter_vm::tier_policy::OPTIMIZING_HOTNESS_THRESHOLD) - 2);
+        let cell = abi::CodeEntryCell::new(1, 1, 7, 0, 0, 0, 16, 5);
+        cell.generated_entries.set(3);
         assert_eq!(call(&cell, context.as_ptr(), 7), 123);
         assert_eq!(registry.hot_function, 0);
         assert_eq!(call(&cell, context.as_ptr(), 7), 123);
@@ -90,9 +92,6 @@ mod tests {
         cell.generated_tiering_enabled.set(0);
         call(&cell, context.as_ptr(), 7);
         assert_eq!(registry.hot_function, 0, "cached decline must not resubmit");
-        assert_eq!(
-            cell.generated_entries.get(),
-            u64::from(otter_vm::tier_policy::OPTIMIZING_HOTNESS_THRESHOLD) + 2
-        );
+        assert_eq!(cell.generated_entries.get(), 7);
     }
 }

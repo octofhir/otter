@@ -1,0 +1,17 @@
+candidate	workload	metric	direction	value	reference	noise_percent	result
+old-fixed-policy	v8-richards	score	higher	297	297	3.0	pass
+old-fixed-policy	v8-deltablue	score	higher	1159	1159	3.0	pass
+old-fixed-policy	v8-splay	score	higher	1558	1558	3.0	pass
+call-capacity-4	v8-richards	score	higher	388	297	3.0	pass
+call-capacity-4	v8-deltablue	score	higher	246	1159	3.0	fail
+call-capacity-4	v8-splay	score	higher	1431	1558	3.0	fail
+old-fixed-policy	v8-richards	code_bytes	lower	810444	810444	0.0	pass
+old-fixed-policy	v8-deltablue	code_bytes	lower	1492332	1492332	0.0	pass
+old-fixed-policy	v8-splay	code_bytes	lower	693372	693372	0.0	pass
+step6-final	v8-richards	score	higher	297	297	3.0	pass
+step6-final	v8-richards	code_bytes	lower	638060	810444	0.0	pass
+step6-final	v8-deltablue	score	higher	1136	1159	3.0	pass
+step6-final	v8-deltablue	code_bytes	lower	1282596	1492332	0.0	pass
+step6-final	v8-splay	score	higher	1539	1558	3.0	pass
+step6-final	v8-splay	code_bytes	lower	260816	693372	0.0	pass
+step6-final	startup-mode-control	wall_ms	lower	310	300	5.0	pass

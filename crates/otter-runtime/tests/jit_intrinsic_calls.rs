@@ -35,7 +35,6 @@ intrinsics(180);
 fn run(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .build()
         .expect("runtime");
     let completion = runtime

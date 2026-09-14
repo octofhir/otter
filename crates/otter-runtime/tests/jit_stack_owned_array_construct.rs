@@ -340,7 +340,6 @@ impl CounterDelta {
 fn runtime() -> Runtime {
     Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(u32::MAX)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .expect("stack-owned ArrayConstruct runtime")

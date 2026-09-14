@@ -73,7 +73,6 @@ struct Run {
 fn run(selection: JitSelection) -> Run {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("string length runtime");
     runtime

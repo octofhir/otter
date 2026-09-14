@@ -33,7 +33,6 @@ JSON.stringify([exercise(false), exercise(true)]);
 fn run(jit: JitSelection) -> String {
     let mut runtime = Runtime::builder()
         .jit_selection(jit)
-        .jit_osr_threshold(1)
         .build()
         .expect("runtime");
     runtime

@@ -34,7 +34,6 @@ struct RunResult {
 fn run_after_full_gc(selection: JitSelection, setup: &str, probe: &str, name: &str) -> RunResult {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     let setup_name = format!("{name}-setup.js");

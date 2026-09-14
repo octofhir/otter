@@ -112,6 +112,10 @@ pub struct CodeEntryCell {
     /// immutable for this generation. Packing them once removes per-entry
     /// metadata decoding from generated call linkage.
     pub native_frame_header: VmFrameHeader,
+    /// Per-function execution count at which generated baseline calls wake the
+    /// cold optimizing cost policy. This is derived from the function's size
+    /// and calibrated coefficients when the generation is installed.
+    pub generated_tiering_break_even: u64,
     /// Whether this baseline generation may request optimizing compilation.
     /// Cold policy clears it after a cached compile outcome; a replacement
     /// generation starts fresh. Optimizing generations never request promotion.
@@ -141,6 +145,7 @@ impl CodeEntryCell {
         register_count: u16,
         flags: u32,
         generated_stack_frame_bytes: u32,
+        generated_tiering_break_even: u64,
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
         debug_assert_ne!(code_object_id, 0);
@@ -173,6 +178,7 @@ impl CodeEntryCell {
                 kind,
                 flags: frame_flags,
             },
+            generated_tiering_break_even,
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
             generated_throws: Cell::new(0),
@@ -277,8 +283,9 @@ const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
 
-const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
-const _: [(); 44] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
+const _: [(); 88] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_break_even)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
@@ -287,16 +294,16 @@ const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_fra
 const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
 const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, _native_frame_alignment)];
 const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
-const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cell() -> CodeEntryCell {
-        CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_HAS_SAFEPOINTS, 64)
+        CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_HAS_SAFEPOINTS, 64, 321)
     }
 
     #[test]
@@ -336,14 +343,14 @@ mod tests {
 
     #[test]
     fn parameter_prefix_generation_publishes_only_formals() {
-        let cell = CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_PARAMETER_PREFIX, 64);
+        let cell = CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_PARAMETER_PREFIX, 64, 321);
         assert_eq!(cell.native_frame_header.register_count, 2);
     }
 
     #[test]
     fn generation_cell_keeps_one_function_identity_in_a_compact_layout() {
         let cell = cell();
-        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 72);
+        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 88);
         assert_eq!(cell.native_frame_header.function_id, 9);
         assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 32);
     }

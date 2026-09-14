@@ -165,10 +165,9 @@ impl CounterDelta {
     }
 }
 
-fn runtime(osr_threshold: u32) -> Runtime {
+fn runtime() -> Runtime {
     Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(osr_threshold)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("packed-double cache runtime")
@@ -378,7 +377,7 @@ fn run_fresh_after_gc(runtime: &mut Runtime, module: &str) {
 
 #[test]
 fn packed_double_views_share_by_loop_receiver_and_refresh_after_gc() {
-    let mut runtime = runtime(u32::MAX);
+    let mut runtime = runtime();
     let setup_source = format!("{KERNEL}\n{ENTRY_SETUP}");
     let setup = runtime
         .run_script(SourceInput::from_javascript(setup_source), ENTRY_MODULE)
@@ -395,7 +394,7 @@ fn packed_double_views_share_by_loop_receiver_and_refresh_after_gc() {
 
 #[test]
 fn packed_double_views_start_cleared_at_osr_and_later_entry() {
-    let mut runtime = runtime(36);
+    let mut runtime = runtime();
     let setup_source = format!("{KERNEL}\n{OSR_SETUP}");
     let before = runtime.execution_stats();
     let setup = runtime

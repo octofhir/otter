@@ -35,7 +35,6 @@ pub(crate) struct CliExecutionConfig {
     jit_events_target: Option<String>,
     jit_artifacts_target: Option<String>,
     jit_selection: JitSelection,
-    jit_osr_threshold: Option<u32>,
     warning_options: WarningOptions,
     process_title: Option<String>,
     expose_gc: bool,
@@ -54,7 +53,6 @@ impl Default for CliExecutionConfig {
             jit_events_target: None,
             jit_artifacts_target: None,
             jit_selection: JitSelection::ProductionTiered,
-            jit_osr_threshold: None,
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
@@ -67,7 +65,7 @@ impl Default for CliExecutionConfig {
 }
 
 impl CliExecutionConfig {
-    /// Capture CLI arguments and the internal OSR diagnostic knob exactly once.
+    /// Capture CLI arguments exactly once.
     pub(crate) fn new(
         timeout_secs: Option<u64>,
         trace_target: Option<String>,
@@ -81,7 +79,6 @@ impl CliExecutionConfig {
             jit_events_target,
             jit_artifacts_target,
             jit_selection,
-            jit_osr_threshold: legacy_jit_osr_threshold(),
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
@@ -210,9 +207,6 @@ impl CliExecutionConfig {
             .expose_gc(self.expose_gc);
         if let Some(depth) = self.stack_depth() {
             builder = builder.max_stack_depth(depth);
-        }
-        if let Some(threshold) = self.jit_osr_threshold {
-            builder = builder.jit_osr_threshold(threshold);
         }
         if let Some(timeout) = self.timeout {
             builder = builder.timeout(timeout);
@@ -387,13 +381,6 @@ fn write_json_file(path: &Path, value: &impl serde::Serialize) -> io::Result<()>
     writer.flush()
 }
 
-fn legacy_jit_osr_threshold() -> Option<u32> {
-    std::env::var("OTTER_JIT_OSR_THRESHOLD")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|threshold| *threshold > 0)
-}
-
 /// Build a fresh writer per runtime isolate. `-` writes to stderr; any other
 /// target is truncated when that isolate constructs its tracer.
 fn trace_factory_for_target(target: &str) -> TracerFactory {
@@ -428,7 +415,6 @@ mod tests {
             jit_events_target: None,
             jit_artifacts_target: None,
             jit_selection: JitSelection::InterpreterOnly,
-            jit_osr_threshold: None,
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
@@ -453,7 +439,6 @@ mod tests {
             jit_events_target: None,
             jit_artifacts_target: None,
             jit_selection: JitSelection::InterpreterOnly,
-            jit_osr_threshold: None,
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
@@ -482,7 +467,6 @@ mod tests {
             jit_events_target: Some(target.clone()),
             jit_artifacts_target: None,
             jit_selection: JitSelection::Template,
-            jit_osr_threshold: Some(1),
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
@@ -502,7 +486,6 @@ mod tests {
             jit_events_target: None,
             jit_artifacts_target: Some("jit-artifacts".to_string()),
             jit_selection: JitSelection::Template,
-            jit_osr_threshold: Some(1),
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,

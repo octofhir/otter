@@ -22,7 +22,6 @@
   "configuration": {
     "surface": "runtime",
     "jitPolicy": "template",
-    "jitOsrThreshold": null,
     "gcPolicy": "normal",
     "gcStressStride": null,
     "runtimeReuse": "fresh-per-sample",

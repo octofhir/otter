@@ -46,7 +46,6 @@ fn commonjs_runtime(selection: JitSelection) -> Runtime {
         .capabilities(CapabilitySet::allow_all())
         .with_nodejs_modules()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("CommonJS runtime")
 }

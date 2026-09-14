@@ -813,6 +813,7 @@ struct RunResult {
     used_machine_inline_method: bool,
     used_machine_method_landing_ack: bool,
     used_machine_construct: bool,
+    used_machine_generic_construct: bool,
     used_generated_construct: bool,
     used_fast_construct_prepare: bool,
     used_observable_construct_prepare: bool,
@@ -832,9 +833,7 @@ struct RunResult {
 
 fn run(source: &'static str, name: &'static str, selection: JitSelection) -> RunResult {
     let artifacts = matches!(selection, JitSelection::ProductionTiered);
-    let builder = Runtime::builder()
-        .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX);
+    let builder = Runtime::builder().jit_selection(selection);
     let mut runtime = if artifacts {
         builder
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
@@ -921,6 +920,7 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
     });
     let used_machine_construct = artifact_has("\"callKind\": \"construct\"", true)
         || artifact_has("\"callKind\":\"construct\"", true);
+    let used_machine_generic_construct = code_map_has("machineGenericConstruct");
     let used_generated_construct = artifact_has("\"callKind\": \"construct\"", false)
         || artifact_has("\"callKind\":\"construct\"", false);
     let used_fast_construct_prepare = code_map_has("directConstructPrepareFast");
@@ -962,6 +962,7 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         used_machine_inline_method,
         used_machine_method_landing_ack,
         used_machine_construct,
+        used_machine_generic_construct,
         used_generated_construct,
         used_fast_construct_prepare,
         used_observable_construct_prepare,
@@ -989,13 +990,16 @@ fn assert_generated_spread_call(result: &RunResult) {
 }
 
 fn assert_machine_construct(result: &RunResult) {
-    assert_machine_direct_call(result);
     assert!(
-        result.used_machine_construct,
-        "fixture must publish a typed Machine IR construct target"
+        result.used_machine_construct || result.used_machine_generic_construct,
+        "fixture must publish a direct or committed generic Machine construct; diagnostics={:?}",
+        result.compile_diagnostics
     );
-    assert!(result.used_fast_construct_prepare);
-    assert!(result.used_observable_construct_prepare);
+    if result.used_machine_construct {
+        assert_machine_direct_call(result);
+        assert!(result.used_fast_construct_prepare);
+        assert!(result.used_observable_construct_prepare);
+    }
 }
 
 fn assert_machine_derived_construct(result: &RunResult) {
@@ -1184,9 +1188,9 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
         production.stats.jit_receiver_alloc_generated
             + production.stats.jit_receiver_alloc_space_misses
     );
-    assert_eq!(
-        production.stats.jit_receiver_alloc_cold_transitions,
-        production.stats.jit_receiver_alloc_space_misses
+    assert!(
+        production.stats.jit_receiver_alloc_cold_transitions
+            <= production.stats.jit_receiver_alloc_space_misses
     );
     assert_eq!(
         production.stats.jit_receiver_alloc_rust_transitions,
@@ -1215,7 +1219,7 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
         );
         assert_eq!(
             production.stats.jit_receiver_alloc_refills,
-            production.stats.jit_receiver_alloc_space_misses
+            production.stats.jit_receiver_alloc_cold_transitions
         );
         assert!(
             production.stats.jit_alloc_stub_transitions
@@ -1406,7 +1410,6 @@ fn stack_callee_deopt_rebuilds_local_catch_without_replaying_effects() {
 fn generated_call_carries_closure_eval_env_after_factory_frame_and_full_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(u32::MAX)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("eval-env direct-call runtime");
@@ -1455,7 +1458,6 @@ fn generated_call_carries_closure_eval_env_after_factory_frame_and_full_gc() {
 fn nested_machine_calls_rewrite_live_roots_during_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(u32::MAX)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("nested Machine direct-call runtime");
@@ -1620,7 +1622,6 @@ fn method_throw_enters_explicit_machine_landing_pad() {
 fn method_receiver_remains_rooted_during_moving_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(u32::MAX)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("Machine method-GC runtime");

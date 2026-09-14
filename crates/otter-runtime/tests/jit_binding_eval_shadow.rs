@@ -21,7 +21,6 @@ use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("binding-shadow runtime");
     let completion = runtime

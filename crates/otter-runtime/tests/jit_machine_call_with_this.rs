@@ -75,7 +75,6 @@ fn run(selection: JitSelection) -> (String, Vec<String>) {
     // accumulates optimizing-tier hotness today.
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("runtime");

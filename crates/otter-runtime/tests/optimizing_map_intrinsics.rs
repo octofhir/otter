@@ -83,7 +83,6 @@ JSON.stringify(result);
 fn run(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(4)
         .build()
         .expect("Map intrinsic runtime");
     let completion = runtime
@@ -121,7 +120,6 @@ fn optimizing_map_artifacts_expose_frame_free_machine_hits() {
 
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(4)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("Map artifact runtime");

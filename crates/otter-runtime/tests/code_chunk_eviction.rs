@@ -188,7 +188,6 @@ fn interpreter_and_jit_agree_after_hot_eval_code_is_evicted() {
         let mut runtime = Runtime::builder()
             .resource_account(account.clone())
             .jit_selection(selection)
-            .jit_osr_threshold(1)
             .build()
             .expect("runtime");
         runtime.set_code_eviction_high_water_bytes(0);

@@ -99,8 +99,7 @@ fn run(otter: &Path, source: &str, case: &str, mode: &Mode, timeout: Duration) -
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .env_remove("OTTER_GC_STRESS")
-        .env_remove("OTTER_GC_VERIFY")
-        .env_remove("OTTER_JIT_OSR_THRESHOLD");
+        .env_remove("OTTER_GC_VERIFY");
     // Tier selection is a CLI decision, not an environment one: the oracle asks
     // the binary for the interpreter alone (`--jitless` is the template
     // baseline tier, a code generator in its own right), so a renamed or

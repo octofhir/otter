@@ -215,9 +215,6 @@ enum Outcome {
 fn observe(module: BytecodeModule, jit: bool) -> Outcome {
     let mut interp = Interpreter::new();
     if jit {
-        // Threshold 1 makes the first back edge tier up, so the loop body runs
-        // compiled rather than interpreted for all but its first trip.
-        interp.set_jit_osr_threshold(1);
         Arc::new(OtterJitCompiler::default()).install(&mut interp);
     }
     let context = interp
@@ -273,7 +270,6 @@ fn tiering_actually_happens_for_these_artifacts() {
     // reports as at least one compiled entry.
     let probe = otter_jit::JitCompilerProbe::new(Arc::new(OtterJitCompiler::default()));
     let mut interp = Interpreter::new();
-    interp.set_jit_osr_threshold(1);
     probe.install(&mut interp);
     let context = interp
         .link_module(hot_loop_module(4_000))

@@ -95,10 +95,9 @@ for (let i = 0; i < 5000; i++) {
 JSON.stringify(callMethod(receiver, 9));
 "#;
 
-fn runtime_with_artifacts(selection: JitSelection, threshold: u32) -> Runtime {
+fn runtime_with_artifacts(selection: JitSelection) -> Runtime {
     Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(threshold)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("runtime with JIT artifacts")
@@ -298,7 +297,7 @@ fn relocation_target_kinds(batch: &JitArtifactBatch) -> BTreeSet<String> {
 
 #[test]
 fn template_osr_returns_a_current_owned_bundle_without_events() {
-    let mut runtime = runtime_with_artifacts(JitSelection::Template, 1);
+    let mut runtime = runtime_with_artifacts(JitSelection::Template);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(HOT_LOOP),
@@ -327,7 +326,7 @@ fn template_osr_returns_a_current_owned_bundle_without_events() {
 
 #[test]
 fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
-    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, u32::MAX);
+    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(TEMPLATE_INLINE_METHOD),
@@ -556,7 +555,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
 
 #[test]
 fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
-    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, 4);
+    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(OPTIMIZING_OSR),
@@ -618,7 +617,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
 
 #[test]
 fn optimizing_math_artifact_inlines_guarded_int32_abs() {
-    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered, 4);
+    let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(OPTIMIZING_MATH),
@@ -661,7 +660,7 @@ fn optimizing_math_artifact_inlines_guarded_int32_abs() {
 
 #[test]
 fn template_artifacts_type_every_active_non_stub_address_class() {
-    let mut runtime = runtime_with_artifacts(JitSelection::Template, 4);
+    let mut runtime = runtime_with_artifacts(JitSelection::Template);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(
@@ -720,7 +719,7 @@ String(hot(48));
 
 #[test]
 fn abrupt_throw_leaves_artifacts_available_for_explicit_drain() {
-    let mut runtime = runtime_with_artifacts(JitSelection::Template, 1);
+    let mut runtime = runtime_with_artifacts(JitSelection::Template);
     let source = format!("{HOT_LOOP}\nthrow new Error('after hot loop');");
 
     runtime
@@ -739,7 +738,7 @@ fn abrupt_throw_leaves_artifacts_available_for_explicit_drain() {
 
 #[test]
 fn owned_bundle_survives_full_gc_later_allocation_and_nested_jit() {
-    let mut runtime = runtime_with_artifacts(JitSelection::Template, 1);
+    let mut runtime = runtime_with_artifacts(JitSelection::Template);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(NESTED_JIT),
@@ -788,7 +787,6 @@ allocated.length;
 async fn async_success_and_abrupt_failure_transport_owned_artifacts() {
     let otter = Otter::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("async Otter");

@@ -52,7 +52,6 @@ run(1000);
 fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .build()
         .expect("runtime");
     let completion = runtime
@@ -68,7 +67,6 @@ fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats)
 fn run_with_events(source: &str, selection: JitSelection) -> (String, Vec<JitDebugEvent>) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("runtime");
@@ -251,7 +249,6 @@ fn generated_plain_method_and_construct_calls_own_stack_upvalue_spines() {
 fn direct_call_artifacts_publish_exact_upvalue_spine_contracts() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(8)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
         .expect("artifact runtime");

@@ -67,6 +67,7 @@ pub(crate) struct NativeCompileOutput<T> {
     pub(crate) code: T,
     pub(crate) artifact: Option<Box<JitArtifactBundle>>,
     pub(crate) diagnostics: Box<[otter_vm::JitCompilerDiagnostic]>,
+    pub(crate) ir_node_count: u64,
 }
 
 /// Machine-readable compact scratch assignment attached to an inline setup

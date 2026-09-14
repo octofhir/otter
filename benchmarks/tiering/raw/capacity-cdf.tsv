@@ -1,0 +1,5 @@
+family	upper_bound	observed_sites	cumulative_percent	observation
+property	1	21417	93.700	complete retained census
+property	3	22766	99.602	complete retained census
+property	4	22857	100.000	complete retained census
+ordinary-call	4	unknown	100.000	generated-plan stream is right-censored at the old eight-slot population

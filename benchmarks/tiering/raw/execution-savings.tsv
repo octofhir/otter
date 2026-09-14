@@ -1,0 +1,5 @@
+workload	iterations	loop_span_instructions	interpreter_ns	template_ns	optimizing_ns
+kernel-branch-phi	1000000	15	620781542	13677750	7365792
+kernel-boxed-double-property	1000000	13	511365291	15272000	10354833
+kernel-dense-array	1163264	11	740189833	12715000	7737250
+kernel-numeric-leaf	100000	12	150764083	17030980	10138583

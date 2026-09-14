@@ -223,7 +223,6 @@ JSON.stringify([result.value, result.after, caught.name, baseCalls - callsBefore
     let execute = |selection| {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_osr_threshold(u32::MAX)
             .jit_debug(JitDebugRequest::artifacts())
             .build()
             .expect("derived binding runtime");

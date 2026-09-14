@@ -194,9 +194,7 @@ fn run(
     selection: JitSelection,
     artifacts: bool,
 ) -> (String, u64, usize, usize, usize, usize, usize) {
-    let builder = Runtime::builder()
-        .jit_selection(selection)
-        .jit_osr_threshold(4);
+    let builder = Runtime::builder().jit_selection(selection);
     let mut runtime = if artifacts {
         builder
             .jit_debug(otter_runtime::JitDebugRequest::artifacts())

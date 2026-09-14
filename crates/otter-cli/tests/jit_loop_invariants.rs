@@ -65,11 +65,7 @@ var second = repeatedLoop(200);
 
 fn run(root: &std::path::Path, jitless: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_otter"));
-    command
-        .current_dir(root)
-        .env("OTTER_JIT_OSR_THRESHOLD", "1")
-        .arg("--print")
-        .arg(SOURCE);
+    command.current_dir(root).arg("--print").arg(SOURCE);
     if jitless {
         command.arg("--jitless");
     } else {

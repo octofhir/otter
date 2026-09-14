@@ -455,6 +455,7 @@ pub(crate) fn try_compile(
     Ok(NativeCompileOutput {
         code,
         artifact,
+        ir_node_count: u64::try_from(sequence.instructions().len()).unwrap_or(u64::MAX),
         diagnostics: if capture_events {
             inline_diagnostics
                 .into_iter()

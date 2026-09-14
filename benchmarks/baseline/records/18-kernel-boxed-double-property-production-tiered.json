@@ -24,7 +24,6 @@
   "configuration": {
     "surface": "vm",
     "jitPolicy": "production-tiered",
-    "jitOsrThreshold": null,
     "gcPolicy": "normal",
     "gcStressStride": null,
     "runtimeReuse": "not-applicable",

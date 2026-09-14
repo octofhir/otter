@@ -106,7 +106,6 @@ JSON.stringify([beforeReplacement, afterReplacement]);
 fn run_int32_math(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(4)
         .build()
         .expect("runtime");
     let completion = runtime

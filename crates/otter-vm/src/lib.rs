@@ -1177,18 +1177,9 @@ pub struct Interpreter {
     /// body that bails on every call — typically compiled early against
     /// feedback that later turned polymorphic — is worse than the interpreter:
     /// each call pays the compiled prologue, the failing guard, and the frame
-    /// hand-off, then interprets anyway. At
-    /// [`Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD`] the body is evicted so the next
-    /// resolve recompiles it against the richer feedback those interpreter
-    /// completions recorded.
+    /// hand-off, then interprets anyway. The cost policy evicts only after the
+    /// measured loss repays compilation and executable-memory cost.
     jit_entry_bail_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// How many times a function's body has been evicted for recompilation by
-    /// [`Self::note_jit_entry_bail`]. Bounded by
-    /// [`Self::JIT_MAX_ENTRY_BAIL_REOPTS`]: a body still bail-looping after
-    /// that many fresh-feedback recompiles is stuck on something feedback
-    /// cannot express, and is pinned to the interpreter instead of thrashing
-    /// the compiler.
-    jit_entry_reopt_counts: rustc_hash::FxHashMap<u32, u32>,
     /// Function ids whose one-shot successful-baseline refresh has been
     /// attempted. Unlike bail-driven recompilation, this refresh waits for hot
     /// call feedback and callee entry generations to mature, then rebuilds the
@@ -1204,8 +1195,7 @@ pub struct Interpreter {
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
     /// not the whole function — a later, genuinely-hot loop in the same function
     /// can still tier up. A `(fid, u32::MAX)` entry disables the whole function
-    /// (its body did not compile at all). Consulted only at a threshold crossing
-    /// (rare), so it adds no per-iteration cost.
+    /// only after a structural compiler rejection.
     jit_osr_disabled: rustc_hash::FxHashSet<(u32, u32)>,
     /// Per-`(function_id, loop_header_pc)` back-edge counters driving loop-OSR
     /// tier-up. A single shared counter let a frequently-back-edging callee
@@ -1216,19 +1206,11 @@ pub struct Interpreter {
     /// its header tiers up (or is recorded disabled), so the map holds only the
     /// handful of loop headers currently warming up.
     jit_osr_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
-    /// Back-edge count at which a hot loop tiers up via OSR. Defaults to
-    /// [`Self::JIT_OSR_THRESHOLD`]; embedders can override it explicitly through
-    /// [`Self::set_jit_osr_threshold`].
-    jit_osr_threshold: u32,
     /// Canonical Template code cache keyed by global function id and shared by
     /// ordinary entry and every loop-OSR header. `Some(code)` is the sole
     /// installed Template body for the function; `None` records a permanent
     /// unsupported/pinned verdict. Transient failures never enter this map.
     jit_code: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
-    /// Entry-resolution calls remaining before a transient Template compile
-    /// failure is retried. OSR uses its independent per-header back-edge
-    /// threshold as the retry clock and never consumes this countdown.
-    jit_template_entry_retry_remaining: rustc_hash::FxHashMap<u32, u32>,
     /// Function ids whose canonical Template body has been selected for loop
     /// OSR. This owns no executable code; it keeps residency category counts
     /// exact now that entry and OSR share the same `Arc`.
@@ -1248,10 +1230,6 @@ pub struct Interpreter {
     /// The same record owns the requested policy and current-generation count.
     jit_optimized_exit_profiles:
         std::collections::BTreeMap<(u32, u32, native_abi::ExitReason), jit::JitExitProfile>,
-    /// How many times each function's optimizing code has been discarded for
-    /// a bail loop. Past the cap the installed body is the best this
-    /// feedback produces and stays; the speculation-failure record remains.
-    jit_optimized_reopt_counts: rustc_hash::FxHashMap<u32, u32>,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot

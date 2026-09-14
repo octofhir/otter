@@ -24,7 +24,6 @@
   "configuration": {
     "surface": "runtime",
     "jitPolicy": "interpreter",
-    "jitOsrThreshold": null,
     "gcPolicy": "forced-full",
     "gcStressStride": null,
     "runtimeReuse": "fresh-per-sample",

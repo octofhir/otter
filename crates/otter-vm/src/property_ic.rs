@@ -3,9 +3,9 @@
 //! This module keeps IC state out of the bytecode format. Each executable
 //! property instruction owns exactly one cache state in its CodeBlock feedback
 //! slot.
-//! Each site holds up to four polymorphic entries (a fixed PIC) plus
-//! a megamorphic terminal state for sites whose receiver shape churn
-//! exceeds the PIC capacity.
+//! Each site holds the census-derived polymorphic population plus a
+//! megamorphic terminal state for sites whose receiver shape diversity
+//! exceeds that population.
 //!
 //! # Contents
 //! - [`PropertyIcEntry`] — per-site cache state and miss policy.
@@ -17,12 +17,9 @@
 //! - Proxies, accessors, symbols, computed keys, dictionary-compatible
 //!   objects, and deep prototype hits are not cached.
 //! - Cache guards include both shape identity and atom id.
-//! - PIC capacity is fixed at [`MAX_PIC_ENTRIES`]; a probe through all
-//!   entries that still misses contributes to the shared `misses`
-//!   counter on the site. Once `misses` reaches
-//!   [`PIC_GUARD_MISS_THRESHOLD`] **and** the PIC is full, the site
-//!   transitions to [`PropertyIcEntry::Megamorphic`] and is never
-//!   re-populated for the CodeBlock lifetime.
+//! - PIC capacity is derived from the checked-in tier census. A new shape that
+//!   cannot fit transitions directly to [`PropertyIcEntry::Megamorphic`];
+//!   there is no independent guard-miss budget or re-probation state.
 //! - Store transition guard semantics live in [`crate::object`]'s
 //!   shape-transition layer; this module stores only the frozen IC record.
 //!
@@ -33,16 +30,7 @@
 use otter_gc::raw::SlotVisitor;
 use smallvec::SmallVec;
 
-/// Maximum polymorphic entries stored per site before the site
-/// transitions to [`PropertyIcEntry::Megamorphic`]. Four matches the
-/// shape mix in real-world JS object factories (V8 Ignition, Boa,
-/// JSC) without ballooning per-site memory.
-pub(crate) const MAX_PIC_ENTRIES: usize = 4;
-
-/// Miss budget across all PIC entries before a full PIC transitions
-/// to megamorphic. Aligns with the pre-PIC monomorphic disable
-/// threshold so single-shape micro-benchmarks behave identically.
-const PIC_GUARD_MISS_THRESHOLD: u8 = 4;
+use crate::tier_policy::PROFILED_PROPERTY_PIC_CAPACITY;
 
 /// Aggregate inline-cache counters for named property loads and stores.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -115,17 +103,11 @@ pub(crate) enum PropertyIcEntry<T> {
     /// Site has not installed any IC yet.
     #[default]
     Empty,
-    /// Site holds 1..=[`MAX_PIC_ENTRIES`] guarded IC records. Probe
-    /// walks them in install order. `misses` counts probes whose
-    /// receiver shape did not match any entry; when it reaches the
-    /// threshold and the PIC is full, the site transitions to
-    /// [`Self::Megamorphic`].
+    /// Site holds the profiled guarded program population in install order.
     Polymorphic {
         /// Cached IC records, in install order. Capped at
-        /// [`MAX_PIC_ENTRIES`].
-        entries: SmallVec<[T; MAX_PIC_ENTRIES]>,
-        /// Guard misses since install across all entries.
-        misses: u8,
+        /// [`PROFILED_PROPERTY_PIC_CAPACITY`].
+        entries: SmallVec<[T; PROFILED_PROPERTY_PIC_CAPACITY]>,
     },
     /// Site saw more shape diversity than the PIC could absorb. This is a
     /// terminal state for the owning CodeBlock.
@@ -174,12 +156,11 @@ impl<T> PropertyIcEntry<T> {
             Self::Empty => {
                 let mut entries = SmallVec::new();
                 entries.push(ic);
-                *self = Self::Polymorphic { entries, misses: 0 };
+                *self = Self::Polymorphic { entries };
             }
-            Self::Polymorphic { entries, misses } => {
-                if entries.len() < MAX_PIC_ENTRIES {
+            Self::Polymorphic { entries } => {
+                if entries.len() < PROFILED_PROPERTY_PIC_CAPACITY {
                     entries.push(ic);
-                    *misses = 0;
                 } else {
                     *self = Self::Megamorphic;
                 }
@@ -193,25 +174,8 @@ impl<T> PropertyIcEntry<T> {
         *self = Self::Megamorphic;
     }
 
-    /// Record one guard miss. Returns `true` when this miss promoted
-    /// the site to `Megamorphic` (PIC was full and miss budget tipped
-    /// over).
-    pub(crate) fn record_guard_miss(&mut self) -> bool {
-        if matches!(self, Self::Megamorphic) {
-            return false;
-        }
-        let Self::Polymorphic { entries, misses } = self else {
-            return false;
-        };
-        *misses = misses.saturating_add(1);
-        if *misses < PIC_GUARD_MISS_THRESHOLD || entries.len() < MAX_PIC_ENTRIES {
-            return false;
-        }
-        *self = Self::Megamorphic;
-        true
-    }
-
-    /// Record a guard miss and update opcode-family counters.
+    /// Record a guard miss and update opcode-family counters. Shape diversity,
+    /// not a separate miss counter, owns the megamorphic transition.
     #[cfg(test)]
     pub(crate) fn record_guard_miss_with_stats(
         &mut self,
@@ -219,9 +183,6 @@ impl<T> PropertyIcEntry<T> {
         kind: PropertyIcKind,
     ) {
         stats.record_miss(kind);
-        if self.record_guard_miss() {
-            stats.record_disable(kind);
-        }
     }
 
     /// Record a miss when the site has no PIC entries yet. Megamorphic sites
@@ -233,7 +194,6 @@ impl<T> PropertyIcEntry<T> {
         kind: PropertyIcKind,
     ) {
         if self.is_megamorphic() {
-            self.record_guard_miss();
             return;
         }
         stats.record_miss(kind);
@@ -252,7 +212,7 @@ impl<T> PropertyIcEntry<T> {
             return;
         }
         let became_megamorphic = matches!(self, Self::Polymorphic { entries, .. }
-            if entries.len() >= MAX_PIC_ENTRIES);
+            if entries.len() >= PROFILED_PROPERTY_PIC_CAPACITY);
         self.install(ic);
         if became_megamorphic {
             stats.record_disable(kind);
@@ -299,24 +259,17 @@ mod tests {
     #[test]
     fn pic_grows_until_capacity_then_transitions_to_megamorphic() {
         let mut entry = PropertyIcEntry::Empty;
-        // Install MAX_PIC_ENTRIES distinct entries without ever
+        // Install the profiled population without exceeding it.
         // missing — the PIC fills but the site stays polymorphic.
-        for i in 0..super::MAX_PIC_ENTRIES as u8 {
+        for i in 0..super::PROFILED_PROPERTY_PIC_CAPACITY as u8 {
             entry.install(i);
         }
         assert!(entry.is_polymorphic());
-        assert_eq!(entry.entry_count(), super::MAX_PIC_ENTRIES);
+        assert_eq!(entry.entry_count(), super::PROFILED_PROPERTY_PIC_CAPACITY);
         assert_eq!(entry.entries(), &[0_u8, 1, 2, 3]);
 
-        // The PIC is full but only a fresh guard miss budgets toward
-        // promotion. The first three misses leave the site
-        // polymorphic.
-        assert!(!entry.record_guard_miss());
-        assert!(!entry.record_guard_miss());
-        assert!(!entry.record_guard_miss());
-
-        // Fourth miss tips the budget once the PIC is full → Megamorphic.
-        assert!(entry.record_guard_miss());
+        // A fifth distinct shape cannot fit and transitions immediately.
+        entry.install(4);
         assert!(entry.is_megamorphic());
         assert_eq!(entry.entries(), &[] as &[u8]);
 
@@ -324,16 +277,13 @@ mod tests {
         entry.install(99);
         assert!(entry.is_megamorphic());
         assert_eq!(entry.entries(), &[] as &[u8]);
-        for _ in 0..2048 {
-            assert!(!entry.record_guard_miss());
-        }
         assert!(entry.is_megamorphic(), "megamorphic never re-probates");
     }
 
     #[test]
     fn install_into_full_pic_transitions_to_megamorphic() {
         let mut entry = PropertyIcEntry::Empty;
-        for i in 0..super::MAX_PIC_ENTRIES as u8 {
+        for i in 0..super::PROFILED_PROPERTY_PIC_CAPACITY as u8 {
             entry.install(i);
         }
         // Direct install past capacity (no preceding miss) still
@@ -371,13 +321,10 @@ mod tests {
         entry.install_with_stats(&mut stats, PropertyIcKind::Load, 10_u8);
         assert_eq!(stats.load_installs, 4);
         assert_eq!(stats.load_disables, 0);
-        assert_eq!(entry.entry_count(), super::MAX_PIC_ENTRIES);
+        assert_eq!(entry.entry_count(), super::PROFILED_PROPERTY_PIC_CAPACITY);
 
-        // Now PIC is full — guard misses accumulate until threshold,
-        // then the site flips to Megamorphic.
-        for _ in 0..super::PIC_GUARD_MISS_THRESHOLD {
-            entry.record_guard_miss_with_stats(&mut stats, PropertyIcKind::Load);
-        }
+        // A distinct program beyond the measured population flips directly.
+        entry.install_with_stats(&mut stats, PropertyIcKind::Load, 11_u8);
         assert!(entry.is_megamorphic());
         assert_eq!(stats.load_disables, 1);
 
@@ -385,7 +332,7 @@ mod tests {
         // install / disable counters.
         let installs_before = stats.load_installs;
         let disables_before = stats.load_disables;
-        entry.install_with_stats(&mut stats, PropertyIcKind::Load, 11_u8);
+        entry.install_with_stats(&mut stats, PropertyIcKind::Load, 12_u8);
         entry.disable_with_stats(&mut stats, PropertyIcKind::Load);
         assert_eq!(stats.load_installs, installs_before);
         assert_eq!(stats.load_disables, disables_before);

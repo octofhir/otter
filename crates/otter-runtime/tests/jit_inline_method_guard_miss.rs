@@ -41,7 +41,6 @@ acc;
 fn run(selection: JitSelection) -> (String, usize) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(16)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("runtime");

@@ -1903,7 +1903,6 @@ pub(crate) struct RuntimeConfig {
     /// profiler uninstalled.
     cpu_profile_interval: Option<u64>,
     jit_selection: JitSelection,
-    jit_osr_threshold: Option<u32>,
     jit_debug: JitDebugRequest,
 }
 
@@ -2203,7 +2202,6 @@ impl Default for RuntimeConfig {
             tracer_factory: None,
             cpu_profile_interval: None,
             jit_selection: JitSelection::default(),
-            jit_osr_threshold: None,
             jit_debug: JitDebugRequest::default(),
         }
     }
@@ -2711,15 +2709,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Override the back-edge count at which a hot loop tiers up via OSR.
-    /// Differential and conformance harnesses set `1` to force compiled loop
-    /// coverage; production embedders keep the default.
-    #[must_use]
-    pub fn jit_osr_threshold(mut self, threshold: u32) -> Self {
-        self.config.jit_osr_threshold = Some(threshold);
-        self
-    }
-
     /// Configure default-off structured JIT diagnostics.
     #[must_use]
     pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
@@ -2933,9 +2922,6 @@ impl Runtime {
         // while the donor configuration carries tracing and JIT-diagnostics
         // requests. Reinstall them without re-running any realm installer.
         interp.set_jit_debug_request(config.jit_debug);
-        if let Some(threshold) = config.jit_osr_threshold {
-            interp.set_jit_osr_threshold(threshold);
-        }
         match config.jit_selection {
             JitSelection::ProductionTiered => {
                 interp.set_jit_compiler(Some(std::sync::Arc::new(
@@ -3170,9 +3156,6 @@ impl Runtime {
                     // Functions start in the interpreter and tier up through the
                     // explicitly configured compiler policy.
                     interp.set_jit_debug_request(config.jit_debug);
-                    if let Some(threshold) = config.jit_osr_threshold {
-                        interp.set_jit_osr_threshold(threshold);
-                    }
                     match config.jit_selection {
                         JitSelection::ProductionTiered => {
                             interp.set_jit_compiler(Some(std::sync::Arc::new(
@@ -7188,13 +7171,6 @@ impl OtterBuilder {
     #[must_use]
     pub fn jit_selection(mut self, selection: JitSelection) -> Self {
         self.runtime = self.runtime.jit_selection(selection);
-        self
-    }
-
-    /// [`RuntimeBuilder::jit_osr_threshold`].
-    #[must_use]
-    pub fn jit_osr_threshold(mut self, threshold: u32) -> Self {
-        self.runtime = self.runtime.jit_osr_threshold(threshold);
         self
     }
 

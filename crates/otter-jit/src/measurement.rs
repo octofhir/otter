@@ -296,6 +296,7 @@ impl ExactMeasuredCompiler {
             code: Arc::clone(&self.code),
             artifact: None,
             diagnostics: Box::default(),
+            ir_node_count: 0,
         })
     }
 }

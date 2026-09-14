@@ -7,8 +7,8 @@
 //! the template tier has no CLI or environment surface, so the structured
 //! builder selection is the only way to drive it end to end.
 //!
-//! Loop tier-up is forced through the structured OSR-threshold builder knob
-//! so short corpus loops actually enter compiled code.
+//! Corpus loops are sized to cross the production cost model, so the test does
+//! not replace policy decisions with a test-only threshold.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -49,7 +49,6 @@ fn run(source: &str, selection: JitSelection) -> Observation {
     let otter = Otter::builder()
         .console_sink(capture.clone())
         .jit_selection(selection)
-        .jit_osr_threshold(1)
         .build()
         .expect("otter build");
     let completion = otter

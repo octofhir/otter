@@ -307,9 +307,7 @@ struct BarrierRun {
 }
 
 fn runtime(selection: JitSelection) -> Runtime {
-    let builder = Runtime::builder()
-        .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX);
+    let builder = Runtime::builder().jit_selection(selection);
     if matches!(selection, JitSelection::ProductionTiered) {
         builder.jit_debug(JitDebugRequest::artifacts()).build()
     } else {

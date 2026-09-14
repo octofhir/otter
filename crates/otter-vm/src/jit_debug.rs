@@ -438,6 +438,12 @@ pub enum JitDebugEvent {
         register_count: u32,
         /// Number of declared parameters.
         parameter_count: u32,
+        /// Number of bytecode instructions supplied to this compile.
+        bytecode_instruction_count: u64,
+        /// Function entries observed before this compile request.
+        entry_count: u64,
+        /// Reasoned generated or optimizing exits observed before this compile.
+        exit_count: u64,
         /// Call sites carrying target feedback.
         call_feedback_sites: u32,
         /// Method sites carrying target feedback.
@@ -617,6 +623,17 @@ pub enum JitDebugEvent {
         tier: JitDebugTier,
         /// Function entry or loop-OSR target.
         target: JitDebugTarget,
+        /// Monotonic nanoseconds since this isolate's diagnostics clock began.
+        compile_started_ns: u64,
+        /// Delay between the ready compile request and synchronous hook entry.
+        /// This is currently measured and expected to be near zero; an
+        /// off-thread compiler may make it nonzero without changing schema.
+        queue_delay_ns: u64,
+        /// Monotonic wall duration of the compiler-hook invocation.
+        compile_duration_ns: u64,
+        /// Lowered IR operations presented to native emission, or zero when no
+        /// code object was produced.
+        ir_node_count: u64,
         /// Typed compiler result.
         outcome: JitDebugCompileOutcome,
     },
@@ -767,6 +784,7 @@ pub(crate) struct JitDebugState {
     events: Option<Vec<JitDebugEvent>>,
     dropped_events: u64,
     property_runtime: PropertyRuntimeIndices,
+    monotonic_origin: std::time::Instant,
 }
 
 impl Default for JitDebugState {
@@ -783,12 +801,21 @@ impl JitDebugState {
             events: request.events_enabled().then(Vec::new),
             dropped_events: 0,
             property_runtime: PropertyRuntimeIndices::default(),
+            monotonic_origin: std::time::Instant::now(),
         }
     }
 
     /// Return the request copied into compiler invocations.
     pub(crate) const fn request(&self) -> JitDebugRequest {
         self.request
+    }
+
+    /// Current isolate-relative monotonic timestamp for compile telemetry.
+    pub(crate) fn monotonic_ns(&self) -> u64 {
+        self.monotonic_origin
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     /// Replace the capture request and reset retained events.
@@ -925,6 +952,10 @@ mod tests {
             function_id: 7,
             tier: JitDebugTier::Template,
             target: JitDebugTarget::Entry,
+            compile_started_ns: 10,
+            queue_delay_ns: 2,
+            compile_duration_ns: 30,
+            ir_node_count: 0,
             outcome: JitDebugCompileOutcome::Unsupported {
                 reason: "unsupported opcode".to_string(),
             },
@@ -987,6 +1018,9 @@ mod tests {
             target: JitDebugTarget::Osr { pc: 4 },
             register_count: 8,
             parameter_count: 1,
+            bytecode_instruction_count: 9,
+            entry_count: 1_000,
+            exit_count: 2,
             call_feedback_sites: 2,
             method_feedback_sites: 3,
             global_load_sites: 6,
@@ -1016,6 +1050,9 @@ mod tests {
                     },
                     "registerCount": 8,
                     "parameterCount": 1,
+                    "bytecodeInstructionCount": 9,
+                    "entryCount": 1000,
+                    "exitCount": 2,
                     "callFeedbackSites": 2,
                     "methodFeedbackSites": 3,
                     "globalLoadSites": 6,

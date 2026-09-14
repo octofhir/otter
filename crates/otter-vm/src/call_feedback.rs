@@ -116,7 +116,8 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feedback::{CallSiteDistribution, CallTargetCount, MAX_CALL_TARGETS};
+    use crate::feedback::{CallSiteDistribution, CallTargetCount};
+    use crate::tier_policy::PROFILED_CALL_TARGET_CAPACITY;
 
     fn call_code_block() -> std::sync::Arc<CodeBlock> {
         CodeBlock::jit_test_stub(
@@ -139,7 +140,7 @@ mod tests {
     #[test]
     fn caller_invalidation_follows_bounded_target_growth() {
         let code_block = call_code_block();
-        for target in 0..=MAX_CALL_TARGETS as u32 {
+        for target in 0..=PROFILED_CALL_TARGET_CAPACITY as u32 {
             assert!(code_block.record_call_feedback(0, target).evict_for_reopt());
             assert!(!code_block.record_call_feedback(0, target).evict_for_reopt());
         }
@@ -184,7 +185,7 @@ mod tests {
             }
         );
 
-        for fid in 12..(10 + MAX_CALL_TARGETS as u32) {
+        for fid in 12..(10 + PROFILED_CALL_TARGET_CAPACITY as u32) {
             assert_eq!(
                 code_block.record_call_feedback(0, fid),
                 CallTargetTransition::BecamePolymorphic
@@ -193,7 +194,7 @@ mod tests {
         let Some(CallSiteDistribution::Poly(targets)) = code_block.call_distribution_at(0) else {
             panic!("the bounded target set must remain polymorphic at its cap");
         };
-        assert_eq!(targets.len(), MAX_CALL_TARGETS);
+        assert_eq!(targets.len(), PROFILED_CALL_TARGET_CAPACITY);
         assert_eq!(
             code_block.record_call_feedback(0, 17),
             CallTargetTransition::Unchanged
@@ -204,7 +205,7 @@ mod tests {
         assert_eq!(targets.last().map(|target| target.hits), Some(2));
 
         assert_eq!(
-            code_block.record_call_feedback(0, 10 + MAX_CALL_TARGETS as u32),
+            code_block.record_call_feedback(0, 10 + PROFILED_CALL_TARGET_CAPACITY as u32),
             CallTargetTransition::BecamePolymorphic
         );
         assert_eq!(
@@ -222,7 +223,7 @@ mod tests {
         let code_block = call_code_block();
         let mut interpreter = Interpreter::new();
 
-        for fid in 0..MAX_CALL_TARGETS as u32 {
+        for fid in 0..PROFILED_CALL_TARGET_CAPACITY as u32 {
             let transition = interpreter.record_ordinary_call_feedback(
                 &code_block,
                 0,
@@ -244,17 +245,23 @@ mod tests {
             ),
             CallTargetTransition::Unchanged
         );
-        assert_eq!(code_block.feedback_epoch(), MAX_CALL_TARGETS as u32);
+        assert_eq!(
+            code_block.feedback_epoch(),
+            PROFILED_CALL_TARGET_CAPACITY as u32
+        );
 
         assert_eq!(
             interpreter.record_ordinary_call_feedback(
                 &code_block,
                 0,
-                OrdinaryCallTarget::Bytecode(MAX_CALL_TARGETS as u32),
+                OrdinaryCallTarget::Bytecode(PROFILED_CALL_TARGET_CAPACITY as u32),
             ),
             CallTargetTransition::BecamePolymorphic
         );
-        assert_eq!(code_block.feedback_epoch(), MAX_CALL_TARGETS as u32 + 1);
+        assert_eq!(
+            code_block.feedback_epoch(),
+            PROFILED_CALL_TARGET_CAPACITY as u32 + 1
+        );
         assert!(matches!(
             code_block.call_distribution_at(0),
             Some(CallSiteDistribution::Megamorphic)
@@ -265,7 +272,10 @@ mod tests {
             0,
             OrdinaryCallTarget::Bytecode(u32::MAX),
         );
-        assert_eq!(code_block.feedback_epoch(), MAX_CALL_TARGETS as u32 + 1);
+        assert_eq!(
+            code_block.feedback_epoch(),
+            PROFILED_CALL_TARGET_CAPACITY as u32 + 1
+        );
     }
 
     #[test]

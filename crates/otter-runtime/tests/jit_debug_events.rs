@@ -46,7 +46,7 @@ function inner(limit) {
 
 function outer(limit) {
   let total = 0;
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 96; i++) {
     total += inner(limit + i);
   }
   return total;
@@ -58,7 +58,6 @@ outer(48);
 fn runtime_with_events() -> Runtime {
     Runtime::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("runtime with JIT debug events")
@@ -103,7 +102,6 @@ fn assert_ordered_template_compile(events: &[JitDebugEvent]) {
 fn jit_debug_reports_are_default_off() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .build()
         .expect("default runtime");
     let result = runtime
@@ -135,6 +133,24 @@ fn template_osr_emits_ordered_compile_events() {
 
     assert_eq!(result.completion_string(), "4560");
     assert_ordered_template_compile(report.events());
+    let (bytecode_instruction_count, entry_count, exit_count) = report
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            JitDebugEvent::CompilePrepared {
+                tier: JitDebugTier::Template,
+                target: JitDebugTarget::Osr { .. },
+                bytecode_instruction_count,
+                entry_count,
+                exit_count,
+                ..
+            } => Some((*bytecode_instruction_count, *entry_count, *exit_count)),
+            _ => None,
+        })
+        .expect("template compile inputs");
+    assert!(bytecode_instruction_count > 0);
+    assert_eq!(entry_count, 0, "script roots do not cross a call boundary");
+    assert_eq!(exit_count, 0);
     assert!(
         report.events().iter().any(|event| matches!(
             event,
@@ -144,8 +160,40 @@ fn template_osr_emits_ordered_compile_events() {
                 ..
             }
         )),
-        "threshold-one loop must exercise the template OSR request"
+        "cost-qualified loop must exercise the template OSR request"
     );
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (compile_started_ns, queue_delay_ns, compile_duration_ns, ir_node_count, code_bytes) =
+            report
+                .events()
+                .iter()
+                .find_map(|event| match event {
+                    JitDebugEvent::CompileFinished {
+                        tier: JitDebugTier::Template,
+                        target: JitDebugTarget::Osr { .. },
+                        compile_started_ns,
+                        queue_delay_ns,
+                        compile_duration_ns,
+                        ir_node_count,
+                        outcome: JitDebugCompileOutcome::Compiled { code_bytes, .. },
+                        ..
+                    } => Some((
+                        *compile_started_ns,
+                        *queue_delay_ns,
+                        *compile_duration_ns,
+                        *ir_node_count,
+                        *code_bytes,
+                    )),
+                    _ => None,
+                })
+                .expect("template compile telemetry");
+        assert!(compile_started_ns > 0);
+        assert!(queue_delay_ns <= compile_started_ns);
+        assert!(compile_duration_ns > 0);
+        assert!(ir_node_count > 0);
+        assert!(code_bytes > 0);
+    }
 }
 
 #[test]
@@ -153,7 +201,6 @@ fn template_osr_emits_ordered_compile_events() {
 fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("production-tiered runtime with events");
@@ -238,7 +285,6 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
 fn numeric_method_candidate_splices_into_optimizing_backend() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("production-tiered runtime with events");
@@ -293,6 +339,7 @@ engineKernel(128);
                 tier: JitDebugTier::Optimizing,
                 target: JitDebugTarget::Osr { .. },
                 outcome: JitDebugCompileOutcome::Compiled { .. },
+                ..
             } if *function_id == engine_kernel
         )),
         "optimizer must compile the method-inline body: {:?}",
@@ -317,7 +364,6 @@ engineKernel(128);
 fn optimized_method_deopt_preserves_this_overflow_invalidation_and_abrupt_completion() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("production-tiered runtime with events");
@@ -462,7 +508,6 @@ allocated.length;
 async fn async_otter_success_carries_owned_report() {
     let otter = Otter::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("async Otter");
@@ -479,7 +524,6 @@ async fn async_otter_success_carries_owned_report() {
 async fn async_otter_report_includes_jit_from_event_loop_callbacks() {
     let otter = Otter::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("async Otter");
@@ -514,7 +558,6 @@ setTimeout(() => {
 async fn async_otter_abrupt_failure_carries_partial_report() {
     let otter = Otter::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("async Otter");
@@ -538,7 +581,6 @@ async fn async_otter_abrupt_failure_carries_partial_report() {
 async fn concurrent_handle_commands_keep_jit_event_batches_isolated() {
     let otter = Otter::builder()
         .jit_selection(JitSelection::Template)
-        .jit_osr_threshold(1)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("async Otter");

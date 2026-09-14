@@ -25,7 +25,6 @@ String([same, reads() === g, Object.is(reads(), g), reads().Math === Math]);
 fn run(selection: JitSelection) -> String {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .build()
         .expect("runtime");
     runtime

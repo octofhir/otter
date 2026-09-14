@@ -126,9 +126,6 @@ use super::semantics::{
     packed_double_element_access_is_exact,
 };
 
-const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
-const MAX_FUNCTION_PARAMETERS: u16 = 16;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct NumericValue(pub(super) usize);
 
@@ -787,7 +784,11 @@ impl NumericFunction {
     pub(super) fn build(view: &JitCompileSnapshot) -> Result<Self, HirDecline> {
         let mut phi_types = PhiTypeOverrides::new();
         let mut decline = None;
-        for _ in 0..MAX_FUNCTION_INSTRUCTIONS {
+        // Each retry must monotonically widen at least one instruction-backed
+        // representation. Three scalar representations per instruction are
+        // therefore a structural convergence bound, not a performance limit.
+        let representation_retry_bound = view.instructions.len().saturating_mul(3).max(1);
+        for _ in 0..representation_retry_bound {
             let Some((mut function, next_phi_types, retry)) =
                 Self::build_attempt(view, &phi_types, &mut decline)
             else {
@@ -915,12 +916,8 @@ impl NumericFunction {
             note_structural(decline, "suspendable function");
             return None;
         }
-        if parameter_count > register_count
-            || parameter_count > MAX_FUNCTION_PARAMETERS
-            || view.instructions.is_empty()
-            || view.instructions.len() > MAX_FUNCTION_INSTRUCTIONS
-        {
-            note_structural(decline, "function size outside the Machine bounds");
+        if parameter_count > register_count || view.instructions.is_empty() {
+            note_structural(decline, "invalid or empty function layout");
             return None;
         }
         if code
@@ -1590,13 +1587,13 @@ fn infer_parameter_types(
 ) -> Option<Vec<NumericType>> {
     let code = view.code_block.as_ref();
     let width = usize::from(register_count);
-    let mut entry = vec![0_u16; width];
+    let mut entry = vec![BTreeSet::<u16>::new(); width];
     for parameter in 0..parameter_count {
-        entry[usize::from(parameter)] = 1_u16.checked_shl(u32::from(parameter))?;
+        entry[usize::from(parameter)].insert(parameter);
     }
-    let mut out_origins = vec![vec![0_u16; width]; blocks.len()];
-    let mut int32_parameters = 0_u16;
-    let mut number_parameters = 0_u16;
+    let mut out_origins = vec![vec![BTreeSet::<u16>::new(); width]; blocks.len()];
+    let mut int32_parameters = BTreeSet::new();
+    let mut number_parameters = BTreeSet::new();
 
     loop {
         let mut changed = false;
@@ -1604,10 +1601,10 @@ fn infer_parameter_types(
             let mut origins = if block_index == 0 {
                 entry.clone()
             } else {
-                let mut merged = vec![0_u16; width];
+                let mut merged = vec![BTreeSet::<u16>::new(); width];
                 for &predecessor in &block.predecessors {
-                    for (destination, &source) in merged.iter_mut().zip(&out_origins[predecessor]) {
-                        *destination |= source;
+                    for (destination, source) in merged.iter_mut().zip(&out_origins[predecessor]) {
+                        destination.extend(source.iter().copied());
                     }
                 }
                 merged
@@ -1630,10 +1627,9 @@ fn infer_parameter_types(
             return Some(
                 (0..parameter_count)
                     .map(|parameter| {
-                        let bit = 1_u16 << parameter;
-                        if int32_parameters & bit != 0 {
+                        if int32_parameters.contains(&parameter) {
                             NumericType::Int32
-                        } else if number_parameters & bit != 0 {
+                        } else if number_parameters.contains(&parameter) {
                             NumericType::Number
                         } else {
                             NumericType::Tagged
@@ -1648,13 +1644,13 @@ fn infer_parameter_types(
 fn infer_instruction_parameters(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
-    origins: &mut [u16],
-    int32_parameters: &mut u16,
-    number_parameters: &mut u16,
+    origins: &mut [BTreeSet<u16>],
+    int32_parameters: &mut BTreeSet<u16>,
+    number_parameters: &mut BTreeSet<u16>,
 ) -> Option<()> {
     let op = instruction.op(code);
     let (reads, writes) = instruction_accesses(instruction, code)?;
-    let read = |index: usize| origins.get(usize::from(*reads.get(index)?)).copied();
+    let read = |index: usize| origins.get(usize::from(*reads.get(index)?)).cloned();
     for &register in &reads {
         let _ = origins.get(usize::from(register))?;
     }
@@ -1673,21 +1669,21 @@ fn infer_instruction_parameters(
         }
         Op::ArrayConstruct => {
             if reads.len() == 1 {
-                *int32_parameters |= read(0)?;
+                int32_parameters.extend(read(0)?);
             }
         }
         Op::ToPrimitive | Op::ToNumeric | Op::ToNumber => {
             let source = read(0)?;
-            *number_parameters |= source;
+            number_parameters.extend(source.iter().copied());
             preserved_write = Some((*writes.first()?, source));
         }
         Op::Neg | Op::Increment | Op::AddImm | Op::SubImm => {
             let source = read(0)?;
             if !instruction.arith_feedback().is_empty() {
-                *number_parameters |= source;
+                number_parameters.extend(source.iter().copied());
             }
             if instruction.arith_feedback().is_int32_only() {
-                *int32_parameters |= source;
+                int32_parameters.extend(source.iter().copied());
                 preserved_write = Some((*writes.first()?, source));
             }
         }
@@ -1698,39 +1694,43 @@ fn infer_instruction_parameters(
         Op::Add | Op::Sub | Op::Mul => {
             let left = read(0)?;
             let right = read(1)?;
+            let mut inputs = left;
+            inputs.extend(right);
             if !instruction.arith_feedback().is_empty() {
-                *number_parameters |= left | right;
+                number_parameters.extend(inputs.iter().copied());
             }
             if instruction.arith_feedback().is_int32_only() {
-                *int32_parameters |= left | right;
-                preserved_write = Some((*writes.first()?, left | right));
+                int32_parameters.extend(inputs.iter().copied());
+                preserved_write = Some((*writes.first()?, inputs));
             }
         }
         Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual => {
-            let inputs = read(0)? | read(1)?;
+            let mut inputs = read(0)?;
+            inputs.extend(read(1)?);
             if instruction.arith_feedback().is_numeric_only() {
-                *number_parameters |= inputs;
+                number_parameters.extend(inputs.iter().copied());
                 if instruction.arith_feedback().is_int32_only() {
-                    *int32_parameters |= inputs;
+                    int32_parameters.extend(inputs);
                 }
             }
         }
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
-            let inputs = read(0)? | read(1)?;
+            let mut inputs = read(0)?;
+            inputs.extend(read(1)?);
             if !instruction.arith_feedback().is_empty() {
-                *number_parameters |= inputs;
+                number_parameters.extend(inputs.iter().copied());
             }
             if instruction.arith_feedback().is_int32_only() {
-                *int32_parameters |= inputs;
+                int32_parameters.extend(inputs);
             }
         }
         Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
             let source = read(0)?;
             if !instruction.arith_feedback().is_empty() {
-                *number_parameters |= source;
+                number_parameters.extend(source.iter().copied());
             }
             if instruction.arith_feedback().is_int32_only() {
-                *int32_parameters |= source;
+                int32_parameters.extend(source);
             }
         }
         Op::Div
@@ -1742,21 +1742,22 @@ fn infer_instruction_parameters(
         | Op::Shl
         | Op::Shr
         | Op::Ushr => {
-            let inputs = read(0)? | read(1)?;
+            let mut inputs = read(0)?;
+            inputs.extend(read(1)?);
             if !instruction.arith_feedback().is_empty() {
-                *number_parameters |= inputs;
+                number_parameters.extend(inputs);
             }
         }
         Op::BitwiseNot | Op::BitwiseAndImm => {
             let source = read(0)?;
             if !instruction.arith_feedback().is_empty() {
-                *number_parameters |= source;
+                number_parameters.extend(source);
             }
         }
         _ => {}
     }
     for register in writes {
-        *origins.get_mut(usize::from(register))? = 0;
+        origins.get_mut(usize::from(register))?.clear();
     }
     if let Some((register, origin)) = preserved_write {
         *origins.get_mut(usize::from(register))? = origin;
@@ -4088,6 +4089,61 @@ mod tests {
     use super::*;
     use crate::machine::TargetSpec;
 
+    fn parameter_origins(masks: &[u16]) -> Vec<BTreeSet<u16>> {
+        masks
+            .iter()
+            .map(|mask| {
+                (0..u16::BITS)
+                    .filter_map(|parameter| {
+                        (mask & (1_u16 << parameter) != 0).then_some(parameter as u16)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn machine_admits_functions_larger_than_the_removed_instruction_cap() {
+        let mut instructions = (0..600_u32)
+            .map(|pc| {
+                JitTestInstruction::new(
+                    Op::LoadInt32,
+                    pc,
+                    pc * 8,
+                    vec![Operand::Register(0), Operand::Imm32(pc as i32)],
+                )
+            })
+            .collect::<Vec<_>>();
+        instructions.push(JitTestInstruction::new(
+            Op::ReturnValue,
+            600,
+            4_800,
+            vec![Operand::Register(0)],
+        ));
+        let view = JitCompileSnapshot::without_feedback(120, 0, 1, instructions);
+
+        NumericFunction::build(&view)
+            .expect("Machine admission is structural, not capped by function length");
+    }
+
+    #[test]
+    fn machine_admits_more_than_sixteen_parameters() {
+        let view = JitCompileSnapshot::without_feedback(
+            121,
+            24,
+            24,
+            vec![JitTestInstruction::new(
+                Op::ReturnValue,
+                0,
+                0,
+                vec![Operand::Register(23)],
+            )],
+        );
+
+        NumericFunction::build(&view)
+            .expect("Machine admission is structural, not capped by parameter count");
+    }
+
     fn direct_callee(function_id: u32) -> JitDirectCallee {
         JitDirectCallee {
             plan: JitDirectCallPlan {
@@ -5447,9 +5503,9 @@ mod tests {
     fn global_load_inference_accesses_and_exception_liveness_are_exact() {
         let view = global_load_view();
         let code = view.code_block.as_ref();
-        let mut origins = vec![1, 2];
-        let mut int32_parameters = 0;
-        let mut number_parameters = 0;
+        let mut origins = parameter_origins(&[1, 2]);
+        let mut int32_parameters = BTreeSet::new();
+        let mut number_parameters = BTreeSet::new();
         infer_instruction_parameters(
             &view.instructions[0],
             code,
@@ -5458,9 +5514,9 @@ mod tests {
             &mut number_parameters,
         )
         .expect("global-load inference");
-        assert_eq!(origins, [1, 0]);
-        assert_eq!(int32_parameters, 0);
-        assert_eq!(number_parameters, 0);
+        assert_eq!(origins, parameter_origins(&[1, 0]));
+        assert!(int32_parameters.is_empty());
+        assert!(number_parameters.is_empty());
         assert_eq!(
             instruction_accesses(&view.instructions[0], code),
             Some((Vec::new(), vec![1]))
@@ -5550,9 +5606,9 @@ mod tests {
             Some((vec![0], Vec::new()))
         );
 
-        let mut origins = [1, 2, 4, 8];
-        let mut int32_parameters = 0;
-        let mut number_parameters = 0;
+        let mut origins = parameter_origins(&[1, 2, 4, 8]);
+        let mut int32_parameters = BTreeSet::new();
+        let mut number_parameters = BTreeSet::new();
         for instruction in &view.instructions[..4] {
             infer_instruction_parameters(
                 instruction,
@@ -5563,9 +5619,9 @@ mod tests {
             )
             .expect("schema-declared value operation must not need an inference mirror");
         }
-        assert_eq!(origins, [1, 2, 0, 0]);
-        assert_eq!(int32_parameters, 0);
-        assert_eq!(number_parameters, 0);
+        assert_eq!(origins, parameter_origins(&[1, 2, 0, 0]));
+        assert!(int32_parameters.is_empty());
+        assert!(number_parameters.is_empty());
     }
 
     #[test]
@@ -5873,9 +5929,9 @@ mod tests {
         let view = loose_nullish_view(Op::LooseEqual, Op::LoadNull, false);
         let code = view.code_block.as_ref();
         let comparison = &view.instructions[1];
-        let mut origins = vec![1, 2, 4];
-        let mut int32_parameters = 0;
-        let mut number_parameters = 0;
+        let mut origins = parameter_origins(&[1, 2, 4]);
+        let mut int32_parameters = BTreeSet::new();
+        let mut number_parameters = BTreeSet::new();
         infer_instruction_parameters(
             comparison,
             code,
@@ -5884,7 +5940,7 @@ mod tests {
             &mut number_parameters,
         )
         .expect("loose-equality inference");
-        assert_eq!(origins, [1, 2, 0]);
+        assert_eq!(origins, parameter_origins(&[1, 2, 0]));
         assert_eq!(
             instruction_accesses(comparison, code),
             Some((vec![0, 1], vec![2]))
@@ -6746,9 +6802,9 @@ mod tests {
     fn array_construct_inference_accesses_and_exception_liveness_are_exact() {
         let zero = array_construct_view(0);
         let zero_code = zero.code_block.as_ref();
-        let mut zero_origins = vec![1, 2, 4];
-        let mut zero_int32 = 0;
-        let mut zero_number = 0;
+        let mut zero_origins = parameter_origins(&[1, 2, 4]);
+        let mut zero_int32 = BTreeSet::new();
+        let mut zero_number = BTreeSet::new();
         infer_instruction_parameters(
             &zero.instructions[0],
             zero_code,
@@ -6757,8 +6813,8 @@ mod tests {
             &mut zero_number,
         )
         .expect("zero-argument inference");
-        assert_eq!(zero_origins, [1, 2, 0]);
-        assert_eq!(zero_int32, 0);
+        assert_eq!(zero_origins, parameter_origins(&[1, 2, 0]));
+        assert!(zero_int32.is_empty());
         assert_eq!(
             instruction_accesses(&zero.instructions[0], zero_code),
             Some((Vec::new(), vec![2]))
@@ -6766,9 +6822,9 @@ mod tests {
 
         let one = array_construct_view(1);
         let one_code = one.code_block.as_ref();
-        let mut one_origins = vec![1, 2, 4];
-        let mut one_int32 = 0;
-        let mut one_number = 0;
+        let mut one_origins = parameter_origins(&[1, 2, 4]);
+        let mut one_int32 = BTreeSet::new();
+        let mut one_number = BTreeSet::new();
         infer_instruction_parameters(
             &one.instructions[0],
             one_code,
@@ -6777,9 +6833,9 @@ mod tests {
             &mut one_number,
         )
         .expect("one-argument inference");
-        assert_eq!(one_origins, [1, 2, 0]);
-        assert_eq!(one_int32, 1);
-        assert_eq!(one_number, 0);
+        assert_eq!(one_origins, parameter_origins(&[1, 2, 0]));
+        assert_eq!(one_int32, BTreeSet::from([0]));
+        assert!(one_number.is_empty());
         assert_eq!(
             instruction_accesses(&one.instructions[0], one_code),
             Some((vec![0], vec![2]))
@@ -6814,9 +6870,9 @@ mod tests {
             instruction_accesses(&two.instructions[0], two_code),
             Some((vec![0, 1], vec![2]))
         );
-        let mut origins = [1, 2, 4];
-        let mut int32_parameters = 0;
-        let mut number_parameters = 0;
+        let mut origins = parameter_origins(&[1, 2, 4]);
+        let mut int32_parameters = BTreeSet::new();
+        let mut number_parameters = BTreeSet::new();
         infer_instruction_parameters(
             &two.instructions[0],
             two_code,
@@ -6825,9 +6881,9 @@ mod tests {
             &mut number_parameters,
         )
         .expect("multi-value ArrayConstruct uses the generic schema transfer");
-        assert_eq!(origins, [1, 2, 0]);
-        assert_eq!(int32_parameters, 0);
-        assert_eq!(number_parameters, 0);
+        assert_eq!(origins, parameter_origins(&[1, 2, 0]));
+        assert!(int32_parameters.is_empty());
+        assert!(number_parameters.is_empty());
     }
 
     #[test]
@@ -6930,9 +6986,9 @@ mod tests {
     fn property_inference_and_accesses_validate_constants_and_register_roles() {
         let view = property_view();
         let code = view.code_block.as_ref();
-        let mut origins = vec![1, 2, 4, 8];
-        let mut int32_parameters = 0;
-        let mut number_parameters = 0;
+        let mut origins = parameter_origins(&[1, 2, 4, 8]);
+        let mut int32_parameters = BTreeSet::new();
+        let mut number_parameters = BTreeSet::new();
 
         infer_instruction_parameters(
             &view.instructions[1],
@@ -6942,7 +6998,7 @@ mod tests {
             &mut number_parameters,
         )
         .expect("property load inference");
-        assert_eq!(origins, [1, 2, 0, 8]);
+        assert_eq!(origins, parameter_origins(&[1, 2, 0, 8]));
         assert_eq!(view.instructions[1].const_index(code, 2), Some(9));
         assert_eq!(
             instruction_accesses(&view.instructions[1], code),
@@ -6957,14 +7013,14 @@ mod tests {
             &mut number_parameters,
         )
         .expect("property store inference");
-        assert_eq!(origins, [1, 2, 0, 0]);
+        assert_eq!(origins, parameter_origins(&[1, 2, 0, 0]));
         assert_eq!(view.instructions[3].const_index(code, 1), Some(10));
         assert_eq!(
             instruction_accesses(&view.instructions[3], code),
             Some((vec![0, 1], vec![3]))
         );
-        assert_eq!(int32_parameters, 0);
-        assert_eq!(number_parameters, 0);
+        assert!(int32_parameters.is_empty());
+        assert!(number_parameters.is_empty());
     }
 
     #[test]

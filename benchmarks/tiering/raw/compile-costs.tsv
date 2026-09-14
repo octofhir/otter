@@ -1,0 +1,11 @@
+phase	workload	tier	statistic	compiles	bytecode_instructions	registers	parameters	ir_nodes	compile_duration_ns	queue_delay_ns	code_bytes
+review-baseline	direct-numeric-loop	template	median	30	13	12	2	0	7521	0	1308
+review-baseline	direct-numeric-loop	optimizing	median	30	13	12	2	0	38917	0	824
+step6-final	direct-numeric-loop	template	median	30	13	12	2	0	7542	0	1464
+step6-final	direct-numeric-loop	optimizing	median	30	13	12	2	0	46230	0	836
+step6-final	v8-richards	template	sum	45	3028	1655	66	3036	2938296	1628	411456
+step6-final	v8-richards	optimizing	sum	23	675	477	36	5195	16392334	788	226604
+step6-final	v8-deltablue	template	sum	87	4326	2232	83	4329	4567956	3922	703564
+step6-final	v8-deltablue	optimizing	sum	69	1649	961	63	7338	31295040	2419	579032
+step6-final	v8-splay	template	sum	13	408	216	13	416	633709	583	77140
+step6-final	v8-splay	optimizing	sum	14	494	265	9	3214	12824293	750	183676

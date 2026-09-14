@@ -73,7 +73,6 @@ fn run_source(
 ) -> (String, otter_runtime::RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(16)
         .build()
         .expect("runtime");
     let completion = runtime

@@ -108,7 +108,6 @@ machineExactDepthHot(256) + ":" + machineExactDepthOwner() + ":" + machineExactD
 fn run(selection: JitSelection) -> (String, RuntimeExecutionStats, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(8)
         .build()
         .expect("Machine binding runtime");
     runtime
@@ -152,7 +151,6 @@ fn inherited_eval_shadow_stays_committed_inside_machine() {
     ) -> (String, RuntimeExecutionStats, RuntimeExecutionStats) {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_osr_threshold(8)
             .build()
             .expect("Machine shadowed-binding runtime");
         runtime
@@ -198,7 +196,6 @@ fn shadowed_binding_stops_at_the_schema_encoded_eval_depth() {
     ) -> (String, RuntimeExecutionStats, RuntimeExecutionStats) {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_osr_threshold(8)
             .build()
             .expect("Machine exact-depth runtime");
         runtime

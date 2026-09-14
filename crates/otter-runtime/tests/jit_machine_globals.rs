@@ -37,9 +37,7 @@ for (let warm = 0; warm < 5000; warm++) {
 "#;
 
 fn runtime(selection: JitSelection, artifacts: bool) -> Runtime {
-    let builder = Runtime::builder()
-        .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX);
+    let builder = Runtime::builder().jit_selection(selection);
     if artifacts {
         builder.jit_debug(JitDebugRequest::artifacts()).build()
     } else {

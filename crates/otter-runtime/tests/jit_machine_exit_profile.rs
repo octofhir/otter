@@ -14,7 +14,7 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use otter_runtime::{JitSelection, Runtime, SourceInput};
+use otter_runtime::{JitDebugEvent, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 const SOURCE: &str = r#"
 // Both operands are always int32; only the product leaves the int32 range,
@@ -30,39 +30,77 @@ function drive(rounds) {
   for (let i = 0; i < rounds; i++) acc += grow(i + 30000);
   return acc;
 }
-drive(30000);
 "#;
 
-fn run(selection: JitSelection) -> (String, otter_runtime::RuntimeExecutionStats) {
+fn run(
+    selection: JitSelection,
+) -> (
+    String,
+    otter_runtime::RuntimeExecutionStats,
+    Vec<JitDebugEvent>,
+) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
+        .jit_debug(JitDebugRequest::events())
         .build()
         .expect("runtime");
-    let completion = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(SOURCE.to_string()),
             "jit-machine-exit-profile.js",
         )
-        .expect("overflowing multiply")
-        .completion_string()
-        .to_owned();
-    (completion, runtime.execution_stats())
+        .expect("install overflow workload");
+    let mut completion = String::new();
+    let mut events = Vec::new();
+    // Returning to the VM between activations lets the cold policy consume
+    // the generated-entry mailbox without adding a poll to the success path.
+    for round in 0..3 {
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript("drive(30000);".to_string()),
+                &format!("jit-machine-exit-profile-{round}.js"),
+            )
+            .expect("run overflow workload");
+        completion = result.completion_string().to_owned();
+        events.extend(
+            result
+                .jit_debug_report()
+                .expect("events enabled")
+                .events()
+                .iter()
+                .cloned(),
+        );
+    }
+    (completion, runtime.execution_stats(), events)
 }
 
 #[test]
 fn an_overflowing_int32_site_exits_once_per_budget_and_then_stays_float() {
-    let (oracle, _) = run(JitSelection::InterpreterOnly);
-    let (compiled, stats) = run(JitSelection::ProductionTiered);
+    let (oracle, _, _) = run(JitSelection::InterpreterOnly);
+    let (compiled, stats, events) = run(JitSelection::ProductionTiered);
+    let diagnostic_events = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                JitDebugEvent::CompilePrepared { .. }
+                    | JitDebugEvent::CompileFinished { .. }
+                    | JitDebugEvent::Bail { .. }
+                    | JitDebugEvent::GeneratedCallDeopt { .. }
+            )
+        })
+        .take(30)
+        .collect::<Vec<_>>();
     assert_eq!(compiled, oracle);
     assert!(
         stats.jit_optimized_entries + stats.jit_generated_optimizing_entries > 1000,
-        "the function must keep an optimizing generation: {stats:?}"
+        "the function must keep an optimizing generation: {stats:?}; events={diagnostic_events:?}"
     );
-    // The first generation may exit up to its reoptimization budget at the
-    // overflowing site; the rebuilt generation must not exit there again, and
-    // no third generation is ever needed.
+    // The first generated entry generation can exit once on overflow.
+    // Widening must prevent any later callee generation from repeating it;
+    // caller identity invalidation is an independent exit profile.
     assert!(
-        stats.jit_optimized_deopts <= 100,
-        "the rebuilt generation must not repeat the exited speculation: {stats:?}"
+        stats.jit_generated_call_deopts <= 1,
+        "the rebuilt generation must not repeat the exited speculation: {stats:?}; events={diagnostic_events:?}"
     );
 }

@@ -41,16 +41,6 @@ use crate::{
     rooting::RootScopeExt,
 };
 
-/// Deoptimizations one exit site absorbs before its generation is discarded
-/// and rebuilt against the feedback those bails refined. A body that bails
-/// occasionally across many sites never trips this; a per-iteration bail
-/// loop trips it in milliseconds.
-const OPTIMIZED_SITE_BAIL_REOPT_THRESHOLD: u32 = 100;
-
-/// Rebuilds a function is granted before its installed body is accepted as
-/// the best this feedback produces.
-const MAX_OPTIMIZED_REOPTIMIZATIONS: u32 = 3;
-
 #[derive(Debug, Default)]
 struct GeneratedFunctionFeedback {
     entries: u64,
@@ -63,6 +53,32 @@ mod deopt;
 mod generated;
 
 impl Interpreter {
+    pub(super) fn jit_tier_cost_decision(
+        &self,
+        context: &ExecutionContext,
+        fid: u32,
+        tier: crate::tier_policy::CostedTier,
+        trigger: crate::tier_policy::TierTrigger,
+        executions: u64,
+        exits: u64,
+        resident_code_bytes: u64,
+    ) -> Option<crate::tier_policy::TierCostDecision> {
+        let function = context.exec_function(fid)?;
+        Some(crate::tier_policy::TierCostModel::calibrated().decide(
+            crate::tier_policy::TierCostInput {
+                tier,
+                trigger,
+                executions,
+                exits,
+                bytecode_instructions: u64::try_from(function.code.len()).unwrap_or(u64::MAX),
+                register_count: u64::from(function.register_count),
+                parameter_count: u64::from(function.param_count),
+                resident_code_bytes,
+                cumulative_compile_ns: self.optimizing_tier_policy.cumulative_compile_ns(fid, tier),
+            },
+        ))
+    }
+
     /// Route a pure exception returned by generated code through the canonical
     /// rooted interpreter unwind. Nested-call provenance survives propagation
     /// and is cleared only when this unwind actually lands in a local handler
@@ -170,7 +186,7 @@ impl Interpreter {
                 // directly. Do not count the same exit again at this dispatch
                 // wrapper.
                 if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, exit) {
-                    self.note_jit_entry_bail(fid);
+                    self.note_jit_entry_bail(context, fid);
                 }
                 Ok(None)
             }
@@ -228,7 +244,63 @@ impl Interpreter {
             *c = c.saturating_add(1);
             *c
         };
-        if count < self.jit_osr_threshold {
+        let loop_span = context
+            .exec_function(key.0)
+            .and_then(|function| function.loop_latch(key.1).map(|latch| latch - key.1 + 1))
+            .map(u64::from)
+            .unwrap_or(1);
+        let trigger = crate::tier_policy::TierTrigger::LoopBackedge {
+            span_instructions: loop_span,
+        };
+        let optimizing_enabled = self
+            .jit_hook
+            .as_ref()
+            .is_some_and(|hook| hook.optimizing_tier_enabled());
+        let optimizing = optimizing_enabled
+            && self
+                .jit_tier_cost_decision(
+                    context,
+                    key.0,
+                    crate::tier_policy::CostedTier::Optimizing,
+                    trigger,
+                    u64::from(count),
+                    0,
+                    0,
+                )
+                .is_some_and(crate::tier_policy::TierCostDecision::should_compile);
+        let template = !optimizing_enabled
+            && self
+                .jit_tier_cost_decision(
+                    context,
+                    key.0,
+                    crate::tier_policy::CostedTier::Template,
+                    trigger,
+                    u64::from(count),
+                    0,
+                    0,
+                )
+                .is_some_and(crate::tier_policy::TierCostDecision::should_compile);
+        if !optimizing && !template {
+            return Ok(None);
+        }
+        let resident_code_bytes = self.jit_code_residency().code_bytes;
+        let selected = if optimizing {
+            crate::tier_policy::CostedTier::Optimizing
+        } else {
+            crate::tier_policy::CostedTier::Template
+        };
+        if !self
+            .jit_tier_cost_decision(
+                context,
+                key.0,
+                selected,
+                trigger,
+                u64::from(count),
+                0,
+                resident_code_bytes,
+            )
+            .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
+        {
             return Ok(None);
         }
         // Threshold reached: drop this header's counter (it tiers up now or is
@@ -236,7 +308,7 @@ impl Interpreter {
         // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
         self.jit_osr_counts.remove(&key);
-        self.maybe_osr(stack, context, top_idx, floor)
+        self.maybe_osr(stack, context, top_idx, floor, optimizing)
     }
 
     /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
@@ -254,6 +326,7 @@ impl Interpreter {
         context: &ExecutionContext,
         top_idx: usize,
         floor: ActivationFloor,
+        prefer_optimizing: bool,
     ) -> Result<Option<Option<Value>>, VmError> {
         let frame = &stack[top_idx];
         // Only ordinary bytecode frames; async/generator bodies resume through
@@ -279,8 +352,9 @@ impl Interpreter {
             .for_function(fid)
             .map_err(|_| VmError::InvalidOperand)?;
         let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
-        let optimized_outcome = self
-            .resolve_optimized_osr_code(context, fid, osr_pc)
+        let optimized_outcome = prefer_optimizing
+            .then(|| self.resolve_optimized_osr_code(context, fid, osr_pc))
+            .flatten()
             .filter(|code| self.jit_code_registry.is_current_for_entry(code.as_ref()))
             .and_then(|code| code.run_optimized_osr_entry(activation, osr_pc));
         let (outcome, optimized) = if let Some(outcome) = optimized_outcome {
@@ -291,7 +365,7 @@ impl Interpreter {
                 .optimized_osr_entries
                 .saturating_add(1);
             if let jit::JitExecOutcome::Bailed(exit) = outcome {
-                self.note_jit_optimized_bail(fid, exit);
+                self.note_jit_optimized_bail(context, fid, exit);
             }
             (outcome, true)
         } else {
@@ -339,7 +413,11 @@ impl Interpreter {
                 if self.reoptimize_arith_overflow_bail(context, fid, exit) {
                     return Ok(None);
                 }
-                if Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc) {
+                let tier_still_installed =
+                    !optimized || matches!(self.jit_optimized_code.get(&fid), Some(Some(_)));
+                if tier_still_installed
+                    && Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc)
+                {
                     self.jit_osr_disabled.insert((fid, osr_pc));
                 }
                 Ok(None)
@@ -395,8 +473,6 @@ impl Interpreter {
                 self.jit_code_cache = None;
                 self.jit_entry_osr_only.remove(&fid);
                 self.jit_template_osr_fids.remove(&fid);
-                self.jit_template_entry_retry_remaining
-                    .insert(fid, Self::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES);
                 TemplateCompileOutcome::Deferred
             }
             TemplateCompileOutcome::Unsupported => {
@@ -468,47 +544,43 @@ impl Interpreter {
         true
     }
 
-    /// Record one *entry* bail out of `fid`'s installed compiled body and
-    /// evict-for-recompile when it keeps happening.
-    ///
-    /// A body whose guard fails right after entry on every call (typically
-    /// compiled at the tier-up threshold against feedback that later turned
-    /// polymorphic) is strictly worse than interpreting: each call pays the
-    /// compiled prologue, the failing guard, and the bail hand-off, then
-    /// interprets anyway — and nothing evicts it, so it stays that way forever.
-    /// Each bailed call *does* complete in the interpreter, enriching the
-    /// property/method/arith feedback for exactly the sites that failed, so at
-    /// [`Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD`] the body is dropped and the
-    /// next resolve recompiles it against that richer snapshot. A function
-    /// that has been recompiled [`Self::JIT_MAX_ENTRY_BAIL_REOPTS`] times and
-    /// still bail-loops is pinned to the interpreter (`jit_code[fid] = None`,
-    /// the "uncompilable" verdict) instead of thrashing the compiler.
-    /// The count is of *consecutive* bails: a successful compiled completion
-    /// clears it (see [`Self::note_jit_entry_success`]), so a body whose rare
-    /// cold branch bails but whose hot path completes fine never accumulates
-    /// to the threshold — only a bail-dominated body is evicted.
-    pub(crate) fn note_jit_entry_bail(&mut self, fid: u32) {
+    /// Charge one baseline entry exit and replace the generation only after
+    /// the measured round-trip loss has repaid compilation and code memory.
+    pub(crate) fn note_jit_entry_bail(&mut self, context: &ExecutionContext, fid: u32) {
         let bails = self.jit_entry_bail_counts.entry(fid).or_insert(0);
         *bails = bails.saturating_add(1);
-        if *bails < Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD {
+        let exits = u64::from(*bails);
+        let profitable = self
+            .jit_tier_cost_decision(
+                context,
+                fid,
+                crate::tier_policy::CostedTier::Template,
+                crate::tier_policy::TierTrigger::FunctionEntry,
+                0,
+                exits,
+                0,
+            )
+            .is_some_and(crate::tier_policy::TierCostDecision::should_compile);
+        if !profitable {
             return;
         }
-        self.reopt_or_pin_jit_function(fid);
-    }
-
-    /// Invalidate one unhealthy generation and consume its bounded recompile
-    /// budget, pinning the function to the interpreter when recompilation has
-    /// repeatedly failed to produce a stable body.
-    pub(crate) fn reopt_or_pin_jit_function(&mut self, fid: u32) {
-        self.jit_entry_bail_counts.remove(&fid);
-        let reopts = self.jit_entry_reopt_counts.entry(fid).or_insert(0);
-        let exhausted = *reopts >= Self::JIT_MAX_ENTRY_BAIL_REOPTS;
-        *reopts = reopts.saturating_add(1);
-        self.invalidate_jit_function(fid);
-        if exhausted {
-            self.jit_code.insert(fid, None);
-            self.jit_osr_disabled.insert((fid, u32::MAX));
+        let resident_code_bytes = self.jit_code_residency().code_bytes;
+        if !self
+            .jit_tier_cost_decision(
+                context,
+                fid,
+                crate::tier_policy::CostedTier::Template,
+                crate::tier_policy::TierTrigger::FunctionEntry,
+                0,
+                exits,
+                resident_code_bytes,
+            )
+            .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
+        {
+            return;
         }
+        self.jit_entry_bail_counts.remove(&fid);
+        self.invalidate_jit_function(fid);
     }
 
     /// Clear `fid`'s consecutive-entry-bail count after a successful compiled
@@ -532,15 +604,17 @@ impl Interpreter {
     /// it — is discarded and the next hot entry recompiles against what
     /// execution actually does. Callers that bound the discarded entry
     /// directly drop with it; the function's template generation survives.
-    /// Past [`MAX_OPTIMIZED_REOPTIMIZATIONS`] rebuilds the speculation is the
-    /// one this feedback keeps producing and it keeps failing, so the body is
-    /// discarded rather than kept: an installed generation that exits is not a
-    /// slower generation, it is a round trip on every entry that reaches it.
-    /// The function drops to its template generation and is admitted again only
-    /// when its feedback epoch advances — the same "stop speculating until the
-    /// profile actually changes" rule V8 spells `DisableOptimization` and JSC
-    /// spells `jettison` plus an exit-site check.
-    pub(crate) fn note_jit_optimized_bail(&mut self, fid: u32, exit: native_abi::SideExit) {
+    /// When another compile cannot repay itself, the exiting body is discarded
+    /// immediately: retaining it would charge a deopt round trip on every
+    /// matching entry. The function drops to its template generation and is
+    /// A cost-deferred rebuild remains eligible once later executions make it
+    /// profitable; only a structural invalidation is cached by feedback epoch.
+    pub(crate) fn note_jit_optimized_bail(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        exit: native_abi::SideExit,
+    ) {
         let resume_pc = exit.logical_pc();
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
@@ -554,23 +628,44 @@ impl Interpreter {
         profile.action = profile.action.max(exit.action());
         profile.count = profile.count.saturating_add(1);
         let action = profile.action;
-        let count = profile.count;
+        // The OSR dispatcher owns the one semantic arithmetic widening before
+        // it decides whether this header remains usable. Do not pre-empt that
+        // repair with the general generation action below.
+        if matches!(
+            exit.reason(),
+            crate::native_abi::ExitReason::Int32Overflow
+                | crate::native_abi::ExitReason::NegativeZero
+        ) {
+            return;
+        }
         if action == native_abi::ExitAction::Resume {
             return;
         }
-        let reopts = self
-            .jit_optimized_reopt_counts
-            .get(&fid)
-            .copied()
-            .unwrap_or(0);
-        if action == native_abi::ExitAction::Invalidate || reopts >= MAX_OPTIMIZED_REOPTIMIZATIONS {
-            self.abandon_optimized_generation(fid);
+        if action == native_abi::ExitAction::Invalidate {
+            self.abandon_unsupported_optimized_generation(fid);
             return;
         }
-        if count < OPTIMIZED_SITE_BAIL_REOPT_THRESHOLD {
+        let exits = self
+            .jit_optimized_exit_profiles
+            .iter()
+            .filter(|((profile_fid, _, _), _)| *profile_fid == fid)
+            .map(|(_, profile)| u64::from(profile.count))
+            .sum::<u64>();
+        let profitable = self
+            .jit_tier_cost_decision(
+                context,
+                fid,
+                crate::tier_policy::CostedTier::Optimizing,
+                crate::tier_policy::TierTrigger::FunctionEntry,
+                0,
+                exits,
+                0,
+            )
+            .is_some_and(crate::tier_policy::TierCostDecision::should_compile);
+        if !profitable {
+            self.retire_unprofitable_optimized_generation(fid);
             return;
         }
-        self.jit_optimized_reopt_counts.insert(fid, reopts + 1);
         for (&(profile_fid, _, _), profile) in &mut self.jit_optimized_exit_profiles {
             if profile_fid == fid {
                 profile.count = 0;
@@ -592,16 +687,9 @@ impl Interpreter {
         self.discard_invalidated_jit_state(&dependents);
     }
 
-    /// Drop `fid`'s optimizing generation and refuse to build another one until
-    /// its feedback epoch advances.
-    ///
-    /// Reached when rebuilding has stopped paying: the same speculation keeps
-    /// being emitted and keeps exiting. Leaving the body installed would keep
-    /// charging every entry a compiled prologue plus a deoptimization, so the
-    /// entry paths would rather have the template generation. Recording the
-    /// current epoch as declined is what makes the refusal outlive this call
-    /// without making it permanent — new feedback readmits the function.
-    fn abandon_optimized_generation(&mut self, fid: u32) {
+    /// Drop a structurally invalid optimizing generation and cache the decline
+    /// until material feedback changes.
+    fn abandon_unsupported_optimized_generation(&mut self, fid: u32) {
         let dependents = match self.jit_optimized_code.get(&fid) {
             Some(Some(code)) => self
                 .jit_code_registry
@@ -611,6 +699,27 @@ impl Interpreter {
         self.jit_optimized_code.insert(fid, None);
         self.jit_optimized_declined_epoch
             .insert(fid, self.code_space.feedback_epoch(fid));
+        self.jit_optimized_code_cache = None;
+        let dependents: Vec<u32> = dependents
+            .into_iter()
+            .filter(|&dependent| dependent != fid)
+            .collect();
+        self.discard_invalidated_jit_state(&dependents);
+    }
+
+    /// Drop an unprofitable optimizing generation without turning a dynamic
+    /// cost decision into unsupported-function state. Accumulated compile cost
+    /// raises the next break-even point, while later executions can still make
+    /// a replacement profitable.
+    fn retire_unprofitable_optimized_generation(&mut self, fid: u32) {
+        let dependents = match self.jit_optimized_code.get(&fid) {
+            Some(Some(code)) => self
+                .jit_code_registry
+                .invalidate_code_object(code.metadata().id),
+            _ => return,
+        };
+        self.jit_optimized_code.remove(&fid);
+        self.jit_optimized_declined_epoch.remove(&fid);
         self.jit_optimized_code_cache = None;
         let dependents: Vec<u32> = dependents
             .into_iter()
@@ -644,8 +753,6 @@ impl Interpreter {
                 profile.count = 0;
             }
         }
-        self.jit_template_entry_retry_remaining
-            .retain(|fid, _| !affected.contains(fid));
         self.jit_template_osr_fids
             .retain(|fid| !affected.contains(fid));
         self.jit_osr_disabled
@@ -743,7 +850,7 @@ impl Interpreter {
                 // The optimizing entry helper already recorded this exit; this
                 // synchronous wrapper only owns template-entry accounting.
                 if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, exit) {
-                    self.note_jit_entry_bail(fid);
+                    self.note_jit_entry_bail(context, fid);
                 }
                 Ok(None)
             }
@@ -762,7 +869,7 @@ impl Interpreter {
     }
 
     /// Resolve installed compiled code for the bytecode frame at `top_idx`,
-    /// compiling once at the tier-up threshold. Returns `None` when the frame is
+    /// compiling once the measured payoff becomes positive. Returns `None` when the frame is
     /// ineligible (not a fresh ordinary bytecode entry), still cold, or known to
     /// be outside the compilable subset.
     pub(crate) fn resolve_jit_code(
@@ -788,6 +895,7 @@ impl Interpreter {
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Option<jit::JitExecOutcome> {
+        self.promote_hot_generated_callee(context);
         let frame = stack.get(top_idx)?;
         if frame.pc != 0 || self.frame_has_suspension_owner(frame) {
             return None;
@@ -812,7 +920,7 @@ impl Interpreter {
         let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
         if let jit::JitExecOutcome::Bailed(exit) = outcome {
-            self.note_jit_optimized_bail(fid, exit);
+            self.note_jit_optimized_bail(context, fid, exit);
         }
         Some(outcome)
     }
@@ -821,9 +929,9 @@ impl Interpreter {
     ///
     /// Generated direct calls never enter through the interpreter, so their
     /// callee's entry counter would stay cold forever; the linkage instead
-    /// counts entries into the callee's generation and, once that count
-    /// reaches the optimizing threshold, records the function in the code
-    /// registry's mailbox. This drain runs the ordinary decision for it: a
+    /// counts entries into the callee's generation and records the function in
+    /// the registry mailbox at its function-specific break-even point. This
+    /// drain runs the complete live decision for it: a
     /// promoted body publishes through the function's permanent entry cell,
     /// so every generated caller switches without recompiling.
     pub(crate) fn promote_hot_generated_callee(&mut self, context: &ExecutionContext) {
@@ -863,7 +971,23 @@ impl Interpreter {
         let code = if let Some(slot) = self.jit_optimized_code.get(&fid) {
             slot.clone()
         } else {
-            if self.optimizing_tier_decision(fid) != crate::tier_policy::OptimizingDecision::Promote
+            let function = context.exec_function(fid)?;
+            let instructions = u64::try_from(function.code.len()).unwrap_or(u64::MAX);
+            let registers = u64::from(function.register_count);
+            let parameters = u64::from(function.param_count);
+            if self.optimizing_tier_decision_for(fid, instructions, registers, parameters, 0)
+                != crate::tier_policy::OptimizingDecision::Promote
+            {
+                return None;
+            }
+            let resident_code_bytes = self.jit_code_residency().code_bytes;
+            if self.optimizing_tier_decision_for(
+                fid,
+                instructions,
+                registers,
+                parameters,
+                resident_code_bytes,
+            ) != crate::tier_policy::OptimizingDecision::Promote
             {
                 return None;
             }
@@ -881,7 +1005,7 @@ impl Interpreter {
         code
     }
 
-    /// Resolve (and compile-once at the tier-up threshold) the installed non-OSR
+    /// Resolve (and compile once profitable) the installed non-OSR
     /// baseline body for `fid`, independent of any stack frame. The lean
     /// callback loop uses this to tier up its callee without synthesizing a
     /// frame, then enters the cached body directly; [`Self::resolve_jit_code`]
@@ -914,7 +1038,31 @@ impl Interpreter {
             Some(Some(code)) => code.clone(),
             Some(None) => return None,
             None => {
-                if count < Self::JIT_TIER_UP_THRESHOLD || !self.template_entry_retry_ready(fid) {
+                let decision = self.jit_tier_cost_decision(
+                    context,
+                    fid,
+                    crate::tier_policy::CostedTier::Template,
+                    crate::tier_policy::TierTrigger::FunctionEntry,
+                    u64::from(count),
+                    0,
+                    0,
+                )?;
+                if !decision.should_compile() {
+                    return None;
+                }
+                let resident_code_bytes = self.jit_code_residency().code_bytes;
+                if !self
+                    .jit_tier_cost_decision(
+                        context,
+                        fid,
+                        crate::tier_policy::CostedTier::Template,
+                        crate::tier_policy::TierTrigger::FunctionEntry,
+                        u64::from(count),
+                        0,
+                        resident_code_bytes,
+                    )?
+                    .should_compile()
+                {
                     return None;
                 }
                 self.jit_runtime_stats.compile_attempts =
@@ -933,8 +1081,6 @@ impl Interpreter {
             self.jit_code_cache = None;
             self.jit_entry_osr_only.remove(&fid);
             self.jit_template_osr_fids.remove(&fid);
-            self.jit_template_entry_retry_remaining
-                .insert(fid, Self::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES);
             return None;
         }
         // The function-entry path never runs OSR-only code (compiled with
@@ -1140,9 +1286,19 @@ impl Interpreter {
         let Some(pending_targets) = self.jit_pending_direct_targets.get(&fid) else {
             return false;
         };
+        let executions = u64::from(self.jit_call_counts.get(&fid).copied().unwrap_or(0));
         !self.jit_feedback_refresh_attempted.contains(&fid)
-            && self.jit_call_counts.get(&fid).copied().unwrap_or(0)
-                >= Self::JIT_FEEDBACK_REFRESH_THRESHOLD
+            && self
+                .jit_tier_cost_decision(
+                    context,
+                    fid,
+                    crate::tier_policy::CostedTier::Template,
+                    crate::tier_policy::TierTrigger::FunctionEntry,
+                    executions,
+                    0,
+                    0,
+                )
+                .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
             && matches!(self.jit_code.get(&fid), Some(Some(code))
                 if self.jit_code_registry.is_current_for_entry(code.as_ref())
                     && !code.osr_only())
@@ -1188,7 +1344,6 @@ impl Interpreter {
                         .count() as u64,
                 );
         }
-        self.jit_template_entry_retry_remaining.remove(&fid);
         self.jit_template_osr_fids.remove(&fid);
         self.jit_osr_disabled
             .retain(|(disabled_fid, _)| *disabled_fid != fid);
@@ -1404,6 +1559,26 @@ mod tests {
 
     const FAKE_TEMPLATE_MAPPING_BYTES: usize = 4096;
 
+    fn template_entry_break_even(context: &ExecutionContext, fid: u32) -> u32 {
+        let function = context.exec_function(fid).expect("test function");
+        u32::try_from(
+            crate::tier_policy::TierCostModel::calibrated().minimum_profitable_executions(
+                crate::tier_policy::TierCostInput {
+                    tier: crate::tier_policy::CostedTier::Template,
+                    trigger: crate::tier_policy::TierTrigger::FunctionEntry,
+                    executions: 0,
+                    exits: 0,
+                    bytecode_instructions: u64::try_from(function.code.len()).unwrap_or(u64::MAX),
+                    register_count: u64::from(function.register_count),
+                    parameter_count: u64::from(function.param_count),
+                    resident_code_bytes: 0,
+                    cumulative_compile_ns: 0,
+                },
+            ),
+        )
+        .expect("fixture break-even fits u32")
+    }
+
     #[derive(Debug)]
     struct MultiOsrTemplateCode {
         code_object_id: u64,
@@ -1466,6 +1641,7 @@ mod tests {
             }),
             artifact: None,
             diagnostics: Box::default(),
+            ir_node_count: u64::try_from(request.snapshot.instructions.len()).unwrap_or(u64::MAX),
         }
     }
 
@@ -1531,6 +1707,11 @@ mod tests {
             code.push(Op::JumpIfFalse, &[Operand::Imm32(2), Operand::Register(0)]);
             code.push(Op::Nop, &[]);
             code.push(Op::Jump, &[Operand::Imm32(-3)]);
+        }
+        // Keep entry payoff positive under the measured size-sensitive model;
+        // this fixture tests shared ownership and retry, not tiny-body policy.
+        for _ in 0..8 {
+            code.push(Op::Nop, &[]);
         }
         code.push(Op::ReturnUndefined, &[]);
         let context = ExecutionContext::from_module(otter_bytecode::BytecodeModule {
@@ -1626,7 +1807,7 @@ mod tests {
         }));
         entry_first
             .jit_call_counts
-            .insert(0, Interpreter::JIT_TIER_UP_THRESHOLD - 1);
+            .insert(0, template_entry_break_even(&context, 0) - 1);
         let entry_body = entry_first
             .resolve_jit_code_for_fid(&context, 0)
             .expect("entry threshold compiles Template body");
@@ -1707,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_template_failure_retries_after_bounded_entry_cooling() {
+    fn transient_template_failure_retries_after_repaying_measured_compile_cost() {
         let (context, _) = multi_loop_context(1);
         let hook = Arc::new(DeferredOnceTemplateHook {
             requests: AtomicUsize::new(0),
@@ -1715,23 +1896,27 @@ mod tests {
         let mut vm = Interpreter::new();
         vm.jit_hook = Some(hook.clone());
         vm.jit_call_counts
-            .insert(0, Interpreter::JIT_TIER_UP_THRESHOLD - 1);
+            .insert(0, template_entry_break_even(&context, 0) - 1);
 
         assert!(vm.resolve_jit_code_for_fid(&context, 0).is_none());
         assert!(!vm.jit_code.contains_key(&0));
         assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            vm.jit_template_entry_retry_remaining.get(&0),
-            Some(&Interpreter::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES)
+        assert!(
+            vm.resolve_jit_code_for_fid(&context, 0).is_none(),
+            "actual failed-compile duration must prevent an immediate retry"
         );
-
-        for _ in 1..Interpreter::JIT_TEMPLATE_DEFERRED_RETRY_ENTRIES {
-            assert!(vm.resolve_jit_code_for_fid(&context, 0).is_none());
+        let mut installed = false;
+        for _ in 0..100_000 {
+            if vm.resolve_jit_code_for_fid(&context, 0).is_some() {
+                installed = true;
+                break;
+            }
         }
-        assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
-        assert!(vm.resolve_jit_code_for_fid(&context, 0).is_some());
+        assert!(
+            installed,
+            "new execution evidence eventually repays the failure"
+        );
         assert_eq!(hook.requests.load(Ordering::Relaxed), 2);
-        assert!(!vm.jit_template_entry_retry_remaining.contains_key(&0));
     }
 
     #[test]

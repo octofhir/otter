@@ -277,7 +277,7 @@ impl Interpreter {
                     .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
             })
             .transpose()?;
-        self.note_jit_optimized_bail(outermost.function_id, exit);
+        self.note_jit_optimized_bail(context, outermost.function_id, exit);
         // The speculation that exited lives in the innermost spliced body; its
         // own exit profile must learn the PC so the next bake of that body,
         // inline or standalone, widens the site.

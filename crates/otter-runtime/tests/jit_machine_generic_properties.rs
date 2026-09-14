@@ -593,9 +593,7 @@ impl CounterDelta {
 }
 
 fn runtime(artifacts: bool) -> Runtime {
-    let builder = Runtime::builder()
-        .jit_selection(JitSelection::ProductionTiered)
-        .jit_osr_threshold(u32::MAX);
+    let builder = Runtime::builder().jit_selection(JitSelection::ProductionTiered);
     if artifacts {
         builder
             .jit_debug(JitDebugRequest::artifacts().with_events(true))

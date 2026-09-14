@@ -56,7 +56,6 @@ JSON.stringify([caught, state.catches, state.effects, getterEffects]);
 fn run(selection: JitSelection) -> (String, u64, u64, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     let completion = runtime

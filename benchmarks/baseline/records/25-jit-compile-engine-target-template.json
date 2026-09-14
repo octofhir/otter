@@ -26,7 +26,6 @@
   "configuration": {
     "surface": "vm",
     "jitPolicy": "template",
-    "jitOsrThreshold": null,
     "gcPolicy": "normal",
     "gcStressStride": null,
     "runtimeReuse": "not-applicable",

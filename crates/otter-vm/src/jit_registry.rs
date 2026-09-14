@@ -81,8 +81,6 @@ pub(crate) struct GeneratedCallFeedback {
 pub(crate) struct GeneratedDeoptState {
     pub(crate) function_id: u32,
     pub(crate) tier: NativeFrameKind,
-    pub(crate) entries: u64,
-    pub(crate) deopts: u64,
     pub(crate) linked: bool,
 }
 
@@ -176,6 +174,7 @@ impl JitCodeRegistry {
             code,
             function.param_count,
             function.register_count,
+            function.code.len(),
         )
     }
 
@@ -187,6 +186,7 @@ impl JitCodeRegistry {
         code: Arc<dyn JitFunctionCode>,
         param_count: u16,
         register_count: u16,
+        instruction_count: usize,
     ) -> bool {
         let Some(entry_addr) = code.entry_addr() else {
             return false;
@@ -216,6 +216,19 @@ impl JitCodeRegistry {
             register_count,
             flags,
             code.generated_stack_frame_bytes().unwrap_or(0),
+            crate::tier_policy::TierCostModel::calibrated().minimum_profitable_executions(
+                crate::tier_policy::TierCostInput {
+                    tier: crate::tier_policy::CostedTier::Optimizing,
+                    trigger: crate::tier_policy::TierTrigger::DirectCallTarget,
+                    executions: 0,
+                    exits: 0,
+                    bytecode_instructions: u64::try_from(instruction_count).unwrap_or(u64::MAX),
+                    register_count: u64::from(register_count),
+                    parameter_count: u64::from(param_count),
+                    resident_code_bytes: 0,
+                    cumulative_compile_ns: 0,
+                },
+            ),
         ));
         self.register_inner(
             code_object_id,
@@ -648,7 +661,6 @@ impl JitCodeRegistry {
     /// Current generated-call health for one exact generation.
     pub(crate) fn generated_deopt_state(&self, code_object_id: u64) -> Option<GeneratedDeoptState> {
         let cell = self.entry_cells.get(&code_object_id)?;
-        let (entries, _, deopts, _) = cell.generated_feedback();
         let tier = if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
             NativeFrameKind::Baseline
         } else {
@@ -657,8 +669,6 @@ impl JitCodeRegistry {
         Some(GeneratedDeoptState {
             function_id: cell.native_frame_header.function_id,
             tier,
-            entries,
-            deopts,
             linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
         })
     }
@@ -958,7 +968,7 @@ mod tests {
     fn production_entry_cell_unlinks_before_code_retires_and_remains_a_tombstone() {
         let mut registry = JitCodeRegistry::new_boxed();
         let code = fake_code(13, Vec::new());
-        assert!(registry.register_generation(13, code.clone(), 2, 9));
+        assert!(registry.register_generation(13, code.clone(), 2, 9, 1));
         let cell_addr = registry.entry_cell_addr(13).expect("entry cell installed");
         assert_eq!(
             registry.entry_cell_addr_for_entry(code.as_ref()),
@@ -1004,7 +1014,7 @@ mod tests {
                 native_frame_bytes: 64,
                 parameter_prefix_entry: false,
             });
-            assert!(registry.register_generation(id, code, 0, 4));
+            assert!(registry.register_generation(id, code, 0, 4, 1));
             assert_eq!(
                 registry
                     .published_function_entry(7)
@@ -1054,7 +1064,7 @@ mod tests {
         });
 
         assert!(registry.published_function_entry(7).is_none());
-        assert!(registry.register_generation(101, baseline, 2, 9));
+        assert!(registry.register_generation(101, baseline, 2, 9, 1));
         assert_eq!(
             registry
                 .published_function_entry(7)
@@ -1063,14 +1073,14 @@ mod tests {
                 .code_object_id,
             101
         );
-        assert!(registry.register_generation(201, caller, 2, 12));
+        assert!(registry.register_generation(201, caller, 2, 12, 1));
         let stable_addr = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
         assert_eq!(
             registry.function_entry_cells[&7].current_generation(),
             registry.entry_cell_addr(101).unwrap()
         );
 
-        assert!(registry.register_generation(102, optimizing, 2, 9));
+        assert!(registry.register_generation(102, optimizing, 2, 9, 1));
         assert_eq!(
             registry
                 .published_function_entry(7)
@@ -1122,7 +1132,7 @@ mod tests {
             native_frame_bytes: 96,
             parameter_prefix_entry: true,
         });
-        assert!(registry.register_generation(103, optimizing_refresh, 2, 9));
+        assert!(registry.register_generation(103, optimizing_refresh, 2, 9, 1));
         assert_eq!(registry.invalidate_code_object(101), vec![7]);
         assert_eq!(
             registry.function_entry_cells[&7].current_generation(),

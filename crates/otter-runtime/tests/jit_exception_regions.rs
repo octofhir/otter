@@ -82,8 +82,8 @@ function compiledCaller(x, counters) {
 }
 
 // Warm both direct-call endpoints before the measured caller sequence. These
-// functions have no hot inner loop: with the OSR threshold held at u32::MAX,
-// execution can become native only through whole-function entry compilation.
+// functions have no hot inner loop, so execution becomes native only through
+// whole-function entry compilation.
 for (let i = 1; i < 80; i++) throwingCallee(i * 7 + 1, state);
 for (let i = 1; i < 80; i++) compiledCaller(i * 7 + 1, state);
 
@@ -109,7 +109,6 @@ JSON.stringify([
 fn run(selection: JitSelection) -> (String, u64, u64, u64, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .build()
         .expect("runtime");
     let completion = runtime
@@ -175,7 +174,6 @@ JSON.stringify([callCatch(catchProperty, bad), entered - before, inner, outer, g
     let execute = |selection| {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_osr_threshold(u32::MAX)
             .build()
             .expect("catch runtime");
         runtime

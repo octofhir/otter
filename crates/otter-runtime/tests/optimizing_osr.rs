@@ -68,7 +68,6 @@ const HOISTED_INVARIANT_READ: &str = r#"
 fn run(source: &str, selection: JitSelection, url: &str) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(4)
         .build()
         .expect("runtime");
     let completion = runtime

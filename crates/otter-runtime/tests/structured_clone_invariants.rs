@@ -38,7 +38,6 @@ fn install_structured_clone(runtime: &mut RuntimeExtensionContext<'_>) -> Result
 fn runtime(selection: JitSelection) -> Runtime {
     Runtime::builder()
         .jit_selection(selection)
-        .jit_osr_threshold(u32::MAX)
         .extension_installer(RuntimeExtensionInstaller::new(install_structured_clone))
         .build()
         .expect("structured-clone runtime")

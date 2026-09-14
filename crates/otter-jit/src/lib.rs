@@ -177,6 +177,8 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                     code,
                     artifact: None,
                     diagnostics: Box::default(),
+                    ir_node_count: u64::try_from(request.snapshot.instructions.len())
+                        .unwrap_or(u64::MAX),
                 },
             )
         };
@@ -185,6 +187,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 code: std::sync::Arc::new(output.code),
                 artifact: output.artifact,
                 diagnostics: output.diagnostics,
+                ir_node_count: output.ir_node_count,
             }),
             Err(Unsupported::Backend(_)) => Ok(otter_vm::JitCompileStatus::Unavailable),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
@@ -235,6 +238,8 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 code,
                 artifact: None,
                 diagnostics: Box::default(),
+                ir_node_count: u64::try_from(request.snapshot.instructions.len())
+                    .unwrap_or(u64::MAX),
             })
         };
         match compiled {
@@ -242,6 +247,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 code: std::sync::Arc::new(output.code),
                 artifact: output.artifact,
                 diagnostics: output.diagnostics,
+                ir_node_count: output.ir_node_count,
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in optimizing subset: {reason:?}"),

@@ -94,7 +94,6 @@ console.log(JSON.stringify([
     let mut runtime = Runtime::builder()
         .console_sink(capture.clone())
         .jit_selection(selection)
-        .jit_osr_threshold(1)
         .build()
         .expect("runtime");
     runtime.run_module(&entry).expect("run module graph");

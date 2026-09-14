@@ -172,7 +172,7 @@ impl Interpreter {
                                     // Foreign chunks linked after this loop
                                     // started (eval during this turn) carry
                                     // IC sites past the entry chunk's range.
-                                    self.ensure_property_ic_capacity(&owned);
+                                    self.ensure_method_feedback_context(&owned);
                                     Some(owned)
                                 }
                                 _ => None,
@@ -1128,10 +1128,13 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let site = instr
-                        .property_ic_site()
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    if self.drive_load_property(stack, context, dst, obj_reg, key, site)? {
+                    let slot = function
+                        .property_feedback_at(
+                            instr.instruction_pc as usize,
+                            crate::property_ic::PropertyIcKind::Load,
+                        )
+                        .ok_or(VmError::InvalidOperand)?;
+                    if self.drive_load_property(stack, context, dst, obj_reg, key, slot)? {
                         continue;
                     }
                     self.run_load_property_reg(context, &mut *stack, top_idx, dst, obj_reg, key)?;

@@ -416,8 +416,8 @@ impl ExecutionContext {
     }
 
     /// One past the highest dense named-property IC site id used by
-    /// this chunk. Doubles as the interpreter IC-table capacity needed
-    /// to dispatch this chunk.
+    /// this chunk. The range remains globally unique for generated property
+    /// cells and method-only feedback identities.
     #[must_use]
     pub(crate) fn property_ic_site_end(&self) -> usize {
         self.payload.executable.property_ic_site_end() as usize
@@ -454,8 +454,8 @@ impl ExecutionContext {
         stats
     }
 
-    /// Directory entries mapping this chunk's globally dense property site ids
-    /// to typed payloads in their owning CodeBlock feedback vectors.
+    /// Directory entries mapping this chunk's globally dense method site ids
+    /// to method markers in their owning CodeBlock feedback vectors.
     pub(crate) fn feedback_slot_addresses(
         &self,
     ) -> Vec<(usize, crate::executable::FeedbackSlotAddress)> {
@@ -469,6 +469,18 @@ impl ExecutionContext {
         self.exec_function(function_id)?
             .instr_at_index(pc as usize)?
             .property_ic_site()
+    }
+
+    /// Executable property-program slot at one function-local logical PC.
+    #[must_use]
+    pub(crate) fn property_feedback_slot(
+        &self,
+        function_id: u32,
+        pc: u32,
+        kind: crate::property_ic::PropertyIcKind,
+    ) -> Option<crate::feedback::PropertyFeedbackSlot<'_>> {
+        self.exec_function(function_id)?
+            .property_feedback_at(pc as usize, kind)
     }
 
     /// `true` when the function id points at an arrow function.

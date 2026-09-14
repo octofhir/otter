@@ -305,11 +305,7 @@ impl Interpreter {
         );
         push(
             "store_property_ics",
-            count(|v| {
-                for ic in self.store_property_ics_for_trace() {
-                    ic.trace_roots(v);
-                }
-            }),
+            count(|v| self.trace_property_ic_roots(v)),
         );
         push(
             "pending_throws",

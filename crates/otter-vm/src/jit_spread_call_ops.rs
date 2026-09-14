@@ -73,6 +73,11 @@ impl Interpreter {
                 return Err(interp.err_type((format!("Cannot read properties of {label}")).into()));
             }
             let feedback_site = context.property_ic_site(function_id, call_pc);
+            let property_slot = context.property_feedback_slot(
+                function_id,
+                call_pc,
+                crate::property_ic::PropertyIcKind::Load,
+            );
             let capture_site =
                 feedback_site.is_some_and(|site| !interp.method_site_feedback_saturated(site));
             let method_site = capture_site
@@ -94,7 +99,7 @@ impl Interpreter {
                 && let Some(obj) = receiver.as_object()
             {
                 if let Some(crate::method_ops::MethodCallIc::Ordinary(hit)) =
-                    interp.feedback_directory.method_ic(method_ic_site)
+                    interp.method_feedback.method_ic(method_ic_site)
                 {
                     if let Some(cached) =
                         crate::object::load_own_data_slot_by_shape(obj, &interp.gc_heap, hit)
@@ -102,21 +107,19 @@ impl Interpreter {
                     {
                         method = cached;
                     } else {
-                        interp.feedback_directory.clear_method_ic(method_ic_site);
+                        interp.method_feedback.clear_method_ic(method_ic_site);
                     }
                 }
                 if method.is_undefined()
                     && let Some(atomized_key) =
                         context.property_atom_for_function(function_id, name_index)
-                    && let Some(resolved) =
-                        interp.resolve_method_ic(obj, atomized_key, method_ic_site)
+                    && let Some(slot) = property_slot
+                    && let Some(resolved) = interp.resolve_method_ic(obj, atomized_key, slot)
                     && interp.is_callable_runtime(&resolved)
                 {
-                    if let Some(hit) = interp
-                        .feedback_directory
-                        .mono_load_own_data_hit(method_ic_site)
+                    if let Some(hit) = property_slot.and_then(|slot| slot.mono_load_own_data_hit())
                     {
-                        interp.feedback_directory.install_method_ic(
+                        interp.method_feedback.install_method_ic(
                             method_ic_site,
                             crate::method_ops::MethodCallIc::Ordinary(hit),
                         );

@@ -852,7 +852,7 @@ mod tests {
             .into();
         module.functions.push(outer);
         let context = vm.link_module(module).expect("valid bytecode fixture");
-        vm.ensure_property_ic_capacity(&context);
+        vm.ensure_method_feedback_context(&context);
         let mut receiver = vm
             .allocate_object_literal_value()
             .expect("ordinary receiver");
@@ -942,7 +942,7 @@ mod tests {
         let context = vm
             .link_module(wide_method_module())
             .expect("valid bytecode fixture");
-        vm.ensure_property_ic_capacity(&context);
+        vm.ensure_method_feedback_context(&context);
         let mut receiver = vm
             .allocate_object_literal_value()
             .expect("ordinary method receiver");
@@ -1033,7 +1033,7 @@ mod tests {
         let context = vm
             .link_module(named_property_module())
             .expect("valid bytecode fixture");
-        vm.ensure_property_ic_capacity(&context);
+        vm.ensure_method_feedback_context(&context);
         let mut first = vm
             .allocate_object_literal_value()
             .expect("first ordinary receiver");
@@ -1151,7 +1151,7 @@ mod tests {
         let context = vm
             .link_module(named_property_module())
             .expect("valid bytecode fixture");
-        vm.ensure_property_ic_capacity(&context);
+        vm.ensure_method_feedback_context(&context);
         let mut first = Value::undefined();
         let mut second = Value::undefined();
         let mut first_rhs = Value::undefined();
@@ -1306,7 +1306,7 @@ mod tests {
         let context = vm
             .link_module(named_property_module())
             .expect("valid bytecode fixture");
-        vm.ensure_property_ic_capacity(&context);
+        vm.ensure_method_feedback_context(&context);
         let mut prototype = Value::object(
             vm.alloc_runtime_rooted_object_with_roots(&[], &[])
                 .expect("clean terminal prototype"),
@@ -1386,7 +1386,7 @@ mod tests {
         let mut module = named_property_module();
         module.functions[0].is_strict = true;
         let context = vm.link_module(module).expect("valid bytecode fixture");
-        vm.ensure_property_ic_capacity(&context);
+        vm.ensure_method_feedback_context(&context);
         let receiver = vm
             .allocate_object_literal_value()
             .expect("ordinary receiver");

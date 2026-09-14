@@ -386,7 +386,7 @@ pub(crate) fn snapshot_load_state(
     use crate::property_ic::PropertyIcEntry;
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
-        PropertyIcEntry::Megamorphic { .. } => IcSiteState::Megamorphic,
+        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
         PropertyIcEntry::Polymorphic { entries, misses } => {
             let mapped = entries
                 .iter()
@@ -437,7 +437,7 @@ pub(crate) fn snapshot_store_state(
     use crate::property_ic::PropertyIcEntry;
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
-        PropertyIcEntry::Megamorphic { .. } => IcSiteState::Megamorphic,
+        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
         PropertyIcEntry::Polymorphic { entries, misses } => {
             let mapped = entries
                 .iter()

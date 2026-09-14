@@ -243,7 +243,7 @@ impl Interpreter {
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
             rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
-            feedback_directory: crate::interp::FeedbackDirectory::default(),
+            method_feedback: crate::interp::MethodFeedbackDirectory::default(),
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
             jit_artifacts: crate::jit_artifact::JitArtifactState::default(),
@@ -1323,20 +1323,20 @@ impl Interpreter {
 
     #[cfg(test)]
     pub(crate) fn load_property_ic_count(&self) -> usize {
-        self.feedback_directory
+        self.code_space
             .polymorphic_property_count(property_ic::PropertyIcKind::Load)
     }
 
     #[cfg(test)]
     pub(crate) fn store_property_ic_count(&self) -> usize {
-        self.feedback_directory
+        self.code_space
             .polymorphic_property_count(property_ic::PropertyIcKind::Store)
     }
 
     /// Return aggregate property inline-cache counters.
     #[must_use]
     pub fn property_ic_stats(&self) -> property_ic::PropertyIcStats {
-        self.feedback_directory.property_stats()
+        self.code_space.property_ic_stats()
     }
 
     /// Override the back-edge count at which a hot loop tiers up via OSR.
@@ -1392,7 +1392,7 @@ impl Interpreter {
     /// Return the current collection method IC summary.
     #[must_use]
     pub fn jit_collection_method_ic_stats(&self) -> JitCollectionMethodIcStats {
-        self.feedback_directory.collection_method_stats()
+        self.method_feedback.collection_method_stats()
     }
 
     /// Call-count at which a function body is offered to the JIT. Low enough

@@ -123,8 +123,8 @@ pub(crate) struct ExecutableModule {
     property_ic_site_end: u32,
 }
 
-/// Stable directory entry mapping a globally dense property/method site id
-/// back to its owning CodeBlock feedback slot or method marker.
+/// Stable directory entry mapping a globally dense method site id back to its
+/// owning CodeBlock method marker.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedbackSlotAddress {
     code_block: Arc<CodeBlock>,
@@ -132,16 +132,6 @@ pub(crate) struct FeedbackSlotAddress {
 }
 
 impl FeedbackSlotAddress {
-    #[must_use]
-    pub(crate) fn property(
-        &self,
-        kind: crate::property_ic::PropertyIcKind,
-    ) -> Option<crate::feedback::PropertyFeedbackSlot<'_>> {
-        self.code_block
-            .feedback
-            .property_slot(self.instruction_index, kind)
-    }
-
     #[must_use]
     pub(crate) fn is_method(&self) -> bool {
         self.code_block
@@ -203,12 +193,14 @@ impl ExecutableModule {
         total
     }
 
-    /// Build directory entries for the property/method sites in this chunk.
+    /// Build directory entries for method sites in this chunk.
     pub(crate) fn feedback_slot_addresses(&self) -> Vec<(usize, FeedbackSlotAddress)> {
         let mut slots = Vec::new();
         for code_block in &self.functions {
             for (instruction_index, instruction) in code_block.code.iter().enumerate() {
-                if let Some(site) = instruction.property_ic_site() {
+                if code_block.op(instruction) == Op::CallMethodValue
+                    && let Some(site) = instruction.property_ic_site()
+                {
                     slots.push((
                         site,
                         FeedbackSlotAddress {
@@ -220,6 +212,70 @@ impl ExecutableModule {
             }
         }
         slots
+    }
+
+    pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for code_block in &self.functions {
+            code_block.feedback.trace_property_roots(visitor);
+        }
+    }
+
+    pub(crate) fn property_ic_stats(&self) -> crate::property_ic::PropertyIcStats {
+        let mut total = crate::property_ic::PropertyIcStats::default();
+        for code_block in &self.functions {
+            let stats = code_block.feedback.property_stats();
+            total.load_hits = total.load_hits.saturating_add(stats.load_hits);
+            total.load_misses = total.load_misses.saturating_add(stats.load_misses);
+            total.load_installs = total.load_installs.saturating_add(stats.load_installs);
+            total.load_disables = total.load_disables.saturating_add(stats.load_disables);
+            total.store_hits = total.store_hits.saturating_add(stats.store_hits);
+            total.store_misses = total.store_misses.saturating_add(stats.store_misses);
+            total.store_installs = total.store_installs.saturating_add(stats.store_installs);
+            total.store_disables = total.store_disables.saturating_add(stats.store_disables);
+        }
+        total
+    }
+
+    #[cfg(test)]
+    pub(crate) fn polymorphic_property_count(
+        &self,
+        kind: crate::property_ic::PropertyIcKind,
+    ) -> usize {
+        self.functions
+            .iter()
+            .map(|code_block| code_block.feedback.polymorphic_property_count(kind))
+            .sum()
+    }
+
+    pub(crate) fn property_ic_snapshots(&self) -> Vec<crate::inspect::IcSiteSnapshot> {
+        let mut out = Vec::new();
+        for code_block in &self.functions {
+            for (instruction_index, instruction) in code_block.code.iter().enumerate() {
+                let Some(site) = instruction.property_ic_site() else {
+                    continue;
+                };
+                let (kind, inspect_kind) = match code_block.op(instruction) {
+                    Op::LoadProperty | Op::CallMethodValue => (
+                        crate::property_ic::PropertyIcKind::Load,
+                        crate::inspect::IcSiteKind::Load,
+                    ),
+                    Op::StoreProperty | Op::StorePropertyStrict => (
+                        crate::property_ic::PropertyIcKind::Store,
+                        crate::inspect::IcSiteKind::Store,
+                    ),
+                    _ => continue,
+                };
+                let Some(slot) = code_block.property_feedback_at(instruction_index, kind) else {
+                    continue;
+                };
+                out.push(crate::inspect::IcSiteSnapshot {
+                    site_index: site as u32,
+                    kind: inspect_kind,
+                    state: slot.snapshot_state(),
+                });
+            }
+        }
+        out
     }
 }
 
@@ -507,7 +563,6 @@ impl CodeBlock {
             is_derived_constructor: false,
             makes_function: false,
             needs_arguments: false,
-            uses_arguments_callee: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Box::new([]),
             is_module: false,
@@ -565,6 +620,15 @@ impl CodeBlock {
         index: usize,
     ) -> Option<crate::feedback::InstructionFeedbackRecorder<'_>> {
         self.feedback.recorder(index)
+    }
+
+    #[must_use]
+    pub(crate) fn property_feedback_at(
+        &self,
+        index: usize,
+        kind: crate::property_ic::PropertyIcKind,
+    ) -> Option<crate::feedback::PropertyFeedbackSlot<'_>> {
+        self.feedback.property_slot(index, kind)
     }
 
     /// Advance the shared epoch for isolate-owned feedback that changed
@@ -974,8 +1038,6 @@ pub struct CodeBlock {
     pub(crate) makes_function: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
-    /// Mirrors [`otter_bytecode::Function::uses_arguments_callee`].
-    pub(crate) uses_arguments_callee: bool,
     /// Arguments object shape requested by the compiler.
     pub(crate) arguments_object_kind: ArgumentsObjectKind,
     /// Compact mapped-arguments bindings without debug-only formal names.
@@ -1029,45 +1091,6 @@ pub struct CodeBlock {
     /// compile instead of refusing it for lack of a profile; a wrong annotation
     /// misses the guard the site already emits.
     pub(crate) class_hints: Box<[(u32, u32)]>,
-}
-
-impl Clone for CodeBlock {
-    fn clone(&self) -> Self {
-        Self {
-            id: self.id,
-            param_count: self.param_count,
-            register_count: self.register_count,
-            own_upvalue_count: self.own_upvalue_count,
-            inherited_upvalue_count: self.inherited_upvalue_count,
-            is_strict: self.is_strict,
-            is_arrow: self.is_arrow,
-            is_method: self.is_method,
-            has_rest: self.has_rest,
-            is_async: self.is_async,
-            is_generator: self.is_generator,
-            is_async_generator: self.is_async_generator,
-            is_derived_constructor: self.is_derived_constructor,
-            makes_function: self.makes_function,
-            needs_arguments: self.needs_arguments,
-            uses_arguments_callee: self.uses_arguments_callee,
-            arguments_object_kind: self.arguments_object_kind,
-            mapped_argument_bindings: self.mapped_argument_bindings.clone(),
-            is_module: self.is_module,
-            module_url: self.module_url.clone(),
-            direct_eval_bindings: self.direct_eval_bindings.clone(),
-            eval_sites: self.eval_sites.clone(),
-            contains_direct_eval: self.contains_direct_eval,
-            code: self.code.clone(),
-            overflow_operand_words: self.overflow_operand_words.clone(),
-            bytecode_byte_len: self.bytecode_byte_len,
-            control_flow: self.control_flow.clone(),
-            feedback: self.feedback.clone(),
-            byte_pcs: self.byte_pcs.clone(),
-            byte_spans: self.byte_spans.clone(),
-            number_hints: self.number_hints.clone(),
-            class_hints: self.class_hints.clone(),
-        }
-    }
 }
 
 impl CodeBlock {
@@ -1176,7 +1199,6 @@ impl CodeBlock {
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
             needs_arguments: function.needs_arguments,
-            uses_arguments_callee: function.uses_arguments_callee,
             arguments_object_kind: function.arguments_object_kind,
             mapped_argument_bindings,
             is_module: function.is_module,

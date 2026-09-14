@@ -1,13 +1,13 @@
-//! Interpreter inline-cache records for named property loads and stores.
+//! CodeBlock-owned inline-cache records for named property loads and stores.
 //!
-//! This module keeps IC state out of the bytecode format. Caches are
-//! interpreter-local, keyed by compiled function id plus bytecode pc.
+//! This module keeps IC state out of the bytecode format. Each executable
+//! property instruction owns exactly one cache state in its CodeBlock feedback
+//! slot.
 //! Each site holds up to four polymorphic entries (a fixed PIC) plus
 //! a megamorphic terminal state for sites whose receiver shape churn
 //! exceeds the PIC capacity.
 //!
 //! # Contents
-//!   transition cache.
 //! - [`PropertyIcEntry`] — per-site cache state and miss policy.
 //! - [`PropertyIcStats`] — aggregate IC counters for diagnostics/tests.
 //!
@@ -22,7 +22,7 @@
 //!   counter on the site. Once `misses` reaches
 //!   [`PIC_GUARD_MISS_THRESHOLD`] **and** the PIC is full, the site
 //!   transitions to [`PropertyIcEntry::Megamorphic`] and is never
-//!   re-populated for the interpreter lifetime.
+//!   re-populated for the CodeBlock lifetime.
 //! - Store transition guard semantics live in [`crate::object`]'s
 //!   shape-transition layer; this module stores only the frozen IC record.
 //!
@@ -43,22 +43,6 @@ pub(crate) const MAX_PIC_ENTRIES: usize = 4;
 /// to megamorphic. Aligns with the pre-PIC monomorphic disable
 /// threshold so single-shape micro-benchmarks behave identically.
 const PIC_GUARD_MISS_THRESHOLD: u8 = 4;
-
-/// Misses a megamorphic site absorbs before it is offered back to the cache.
-///
-/// A site goes megamorphic for two very different reasons. It may genuinely see
-/// unbounded shapes, or its receivers may simply have been *transitioning*: an
-/// object that gains a property gets a new shape, so a site reading four
-/// objects across one `o.x = v` sees eight shapes and exhausts a four-way PIC
-/// while the steady state it settles into is perfectly cacheable. Permanent
-/// megamorphism cannot tell those apart and condemns the second kind for the
-/// process lifetime — and with it every tier's inline probe, since generated
-/// code can only cache what this site still describes.
-///
-/// Re-probation resolves it empirically instead of guessing: absorb this many
-/// misses, then let the site try again. A truly megamorphic site pays one
-/// re-probation per budget and returns here; a settled one re-caches and stays.
-const PIC_REPROBATION_MISSES: u16 = 1024;
 
 /// Aggregate inline-cache counters for named property loads and stores.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +74,7 @@ pub(crate) enum PropertyIcKind {
     Store,
 }
 
+#[cfg(test)]
 impl PropertyIcStats {
     /// Record a guarded IC hit.
     pub(crate) fn record_hit(&mut self, kind: PropertyIcKind) {
@@ -142,13 +127,9 @@ pub(crate) enum PropertyIcEntry<T> {
         /// Guard misses since install across all entries.
         misses: u8,
     },
-    /// Site saw more shape diversity than the PIC could absorb and is
-    /// bypassed until its re-probation budget runs out, at which point it
-    /// returns to [`Self::Empty`] and caches again.
-    Megamorphic {
-        /// Misses absorbed since the site went megamorphic.
-        absorbed: u16,
-    },
+    /// Site saw more shape diversity than the PIC could absorb. This is a
+    /// terminal state for the owning CodeBlock.
+    Megamorphic,
 }
 
 impl<T> PropertyIcEntry<T> {
@@ -162,7 +143,7 @@ impl<T> PropertyIcEntry<T> {
     /// `true` when this site should not install any further IC entries.
     #[must_use]
     pub(crate) const fn is_megamorphic(&self) -> bool {
-        matches!(self, Self::Megamorphic { .. })
+        matches!(self, Self::Megamorphic)
     }
 
     /// Number of installed PIC entries (0 for `Empty` / `Megamorphic`).
@@ -170,7 +151,7 @@ impl<T> PropertyIcEntry<T> {
     pub(crate) fn entry_count(&self) -> usize {
         match self {
             Self::Polymorphic { entries, .. } => entries.len(),
-            Self::Empty | Self::Megamorphic { .. } => 0,
+            Self::Empty | Self::Megamorphic => 0,
         }
     }
 
@@ -180,7 +161,7 @@ impl<T> PropertyIcEntry<T> {
     pub(crate) fn entries(&self) -> &[T] {
         match self {
             Self::Polymorphic { entries, .. } => entries.as_slice(),
-            Self::Empty | Self::Megamorphic { .. } => &[],
+            Self::Empty | Self::Megamorphic => &[],
         }
     }
 
@@ -189,7 +170,7 @@ impl<T> PropertyIcEntry<T> {
     /// transitions to `Megamorphic` instead of evicting.
     pub(crate) fn install(&mut self, ic: T) {
         match self {
-            Self::Megamorphic { .. } => {}
+            Self::Megamorphic => {}
             Self::Empty => {
                 let mut entries = SmallVec::new();
                 entries.push(ic);
@@ -200,27 +181,23 @@ impl<T> PropertyIcEntry<T> {
                     entries.push(ic);
                     *misses = 0;
                 } else {
-                    *self = Self::Megamorphic { absorbed: 0 };
+                    *self = Self::Megamorphic;
                 }
             }
         }
     }
 
-    /// Permanently bypass this site for the interpreter lifetime.
+    /// Permanently bypass this site for the owning CodeBlock lifetime.
     #[cfg(test)]
     pub(crate) fn disable(&mut self) {
-        *self = Self::Megamorphic { absorbed: 0 };
+        *self = Self::Megamorphic;
     }
 
     /// Record one guard miss. Returns `true` when this miss promoted
     /// the site to `Megamorphic` (PIC was full and miss budget tipped
     /// over).
     pub(crate) fn record_guard_miss(&mut self) -> bool {
-        if let Self::Megamorphic { absorbed } = self {
-            *absorbed = absorbed.saturating_add(1);
-            if *absorbed >= PIC_REPROBATION_MISSES {
-                *self = Self::Empty;
-            }
+        if matches!(self, Self::Megamorphic) {
             return false;
         }
         let Self::Polymorphic { entries, misses } = self else {
@@ -230,11 +207,12 @@ impl<T> PropertyIcEntry<T> {
         if *misses < PIC_GUARD_MISS_THRESHOLD || entries.len() < MAX_PIC_ENTRIES {
             return false;
         }
-        *self = Self::Megamorphic { absorbed: 0 };
+        *self = Self::Megamorphic;
         true
     }
 
     /// Record a guard miss and update opcode-family counters.
+    #[cfg(test)]
     pub(crate) fn record_guard_miss_with_stats(
         &mut self,
         stats: &mut PropertyIcStats,
@@ -246,8 +224,9 @@ impl<T> PropertyIcEntry<T> {
         }
     }
 
-    /// Record a miss when the site has no PIC entries yet (Empty), or absorb
-    /// one against a megamorphic site's re-probation budget.
+    /// Record a miss when the site has no PIC entries yet. Megamorphic sites
+    /// remain terminal and have already stopped participating in miss policy.
+    #[cfg(test)]
     pub(crate) fn record_uncached_miss_with_stats(
         &mut self,
         stats: &mut PropertyIcStats,
@@ -262,6 +241,7 @@ impl<T> PropertyIcEntry<T> {
 
     /// Append a new entry to the site's PIC and update counters. No-op
     /// when the site is already megamorphic.
+    #[cfg(test)]
     pub(crate) fn install_with_stats(
         &mut self,
         stats: &mut PropertyIcStats,
@@ -344,6 +324,10 @@ mod tests {
         entry.install(99);
         assert!(entry.is_megamorphic());
         assert_eq!(entry.entries(), &[] as &[u8]);
+        for _ in 0..2048 {
+            assert!(!entry.record_guard_miss());
+        }
+        assert!(entry.is_megamorphic(), "megamorphic never re-probates");
     }
 
     #[test]

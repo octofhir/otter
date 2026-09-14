@@ -27,12 +27,18 @@ use otter_bytecode::Op;
 /// Decode one fixed named-property operation from its explicit source
 /// identity, independently of the published native activation. The immutable
 /// CodeBlock remains the authority for property spelling and feedback site.
-fn named_property_site(
-    context: &ExecutionContext,
+fn named_property_site<'a>(
+    context: &'a ExecutionContext,
     function_id: u32,
     instruction_pc: u32,
     expected_op: Op,
-) -> Result<(AtomizedPropertyKey<'_>, usize), VmError> {
+) -> Result<
+    (
+        AtomizedPropertyKey<'a>,
+        crate::feedback::PropertyFeedbackSlot<'a>,
+    ),
+    VmError,
+> {
     let function = context
         .exec_function(function_id)
         .ok_or(VmError::InvalidOperand)?;
@@ -53,10 +59,15 @@ fn named_property_site(
     let key = context
         .property_atom_for_function(function_id, name_index)
         .ok_or(VmError::InvalidOperand)?;
-    let site = instruction
-        .property_ic_site()
+    let kind = match expected_op {
+        Op::LoadProperty => PropertyIcKind::Load,
+        Op::StoreProperty => PropertyIcKind::Store,
+        _ => return Err(VmError::InvalidOperand),
+    };
+    let slot = function
+        .property_feedback_at(instruction_pc as usize, kind)
         .ok_or(VmError::InvalidOperand)?;
-    Ok((key, site))
+    Ok((key, slot))
 }
 
 impl Interpreter {
@@ -77,7 +88,7 @@ impl Interpreter {
         instruction_pc: u32,
         mut receiver: Value,
     ) -> Result<(Value, Option<crate::jit::JitPropertyIcWay>), VmError> {
-        let (atomized_key, site) =
+        let (atomized_key, slot) =
             named_property_site(context, function_id, instruction_pc, Op::LoadProperty)?;
         self.record_jit_runtime_property_stub();
         let scope_frame = crate::handles::HandleScopeFrame::enter(self);
@@ -90,48 +101,32 @@ impl Interpreter {
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok((result, None));
         };
-        if self
-            .feedback_directory
-            .property_is_megamorphic(site, PropertyIcKind::Load)
-            != Some(false)
-        {
+        if slot.is_megamorphic() {
             // A saturated site still reads one slot per receiver class. The
             // shared `(shape, atom)` table answers it without the ladder; only
             // a pair nothing has resolved falls through.
             if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
-                self.feedback_directory
-                    .record_property_hit(PropertyIcKind::Load);
+                slot.record_hit();
                 let result = resolved.value;
                 return Ok((result, None));
             }
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok((result, None));
         }
-        if let Some(value) =
-            self.feedback_directory
-                .probe_load(site, obj, &self.gc_heap, atomized_key)
-        {
-            self.feedback_directory
-                .record_property_hit(PropertyIcKind::Load);
+        if let Some(value) = slot.probe_load(obj, &self.gc_heap, atomized_key) {
+            slot.record_hit();
             // Compute feedback before committing the destination: register
             // allocation may legally alias `dst` with `obj_reg` (common in an
             // optimizing OSR transition). Reading the receiver after the write
             // would then inspect the loaded property value as an object.
-            let fill = self.whisker_load_cell_fill(site, obj, atomized_key);
+            let fill = self.whisker_load_cell_fill(slot, obj, atomized_key);
             let result = value;
             return Ok((result, fill));
         }
-        if self
-            .feedback_directory
-            .property_entry_count(site, PropertyIcKind::Load)
-            .unwrap_or_default()
-            > 0
-        {
-            self.feedback_directory
-                .record_property_guard_miss(site, PropertyIcKind::Load);
+        if slot.entry_count() > 0 {
+            slot.record_guard_miss();
         } else {
-            self.feedback_directory
-                .record_property_uncached_miss(site, PropertyIcKind::Load);
+            slot.record_uncached_miss();
         }
         // A dictionary-mode receiver has no hidden class for a guard to name, so
         // no cache program can describe an access on it. Bootstrap namespace
@@ -143,23 +138,18 @@ impl Interpreter {
         self.set_scoped(receiver_root, receiver);
         let obj = migrating;
         if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
-            if self
-                .feedback_directory
-                .property_is_megamorphic(site, PropertyIcKind::Load)
-                == Some(false)
-            {
+            if !slot.is_megamorphic() {
                 let ic = cache_ir::CacheStub::from_resolved_load(
                     object::shape_id(obj, &self.gc_heap),
                     &resolved,
                 );
-                self.feedback_directory
-                    .install_property_stub(site, PropertyIcKind::Load, ic);
+                slot.install(ic);
             }
             let current_obj = self
                 .escape_scoped(receiver_root)
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
-            let fill = self.whisker_load_cell_fill(site, current_obj, atomized_key);
+            let fill = self.whisker_load_cell_fill(slot, current_obj, atomized_key);
             let result = resolved.value;
             return Ok((result, fill));
         }
@@ -217,7 +207,7 @@ impl Interpreter {
         receiver: Value,
         value: Value,
     ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
-        let (atomized_key, site) =
+        let (atomized_key, slot) =
             named_property_site(context, function_id, instruction_pc, Op::StoreProperty)?;
         self.record_jit_runtime_property_stub();
         let strict = context.function_is_strict(function_id);
@@ -252,42 +242,29 @@ impl Interpreter {
                 )?;
                 return Ok(None);
             }
-            if let Some(entries_len) = self
-                .feedback_directory
-                .property_entry_count(site, PropertyIcKind::Store)
-            {
-                // An installed stub's guards are the authority for its own outcome
-                // — an own writable data slot or a captured add-transition — so a
-                // probe hit needs no semantic resolution, exactly as on the
-                // interpreter's store path.
-                path = Path::Cached;
-                if self.feedback_directory.probe_store(
-                    site,
-                    obj,
-                    &mut self.gc_heap,
+            let entries_len = slot.entry_count();
+            // An installed stub's guards are the authority for its own outcome
+            // — an own writable data slot or a captured add-transition — so a
+            // probe hit needs no semantic resolution, exactly as on the
+            // interpreter's store path.
+            path = Path::Cached;
+            if slot.probe_store(obj, &mut self.gc_heap, atomized_key, &value)? {
+                slot.record_hit();
+                let current_obj = self
+                    .escape_scoped(receiver_root)
+                    .as_object()
+                    .ok_or(VmError::InvalidOperand)?;
+                return Ok(self.whisker_store_cell_fill(
+                    slot,
+                    current_obj,
+                    &self.gc_heap,
                     atomized_key,
-                    &value,
-                )? {
-                    self.feedback_directory
-                        .record_property_hit(PropertyIcKind::Store);
-                    let current_obj = self
-                        .escape_scoped(receiver_root)
-                        .as_object()
-                        .ok_or(VmError::InvalidOperand)?;
-                    return Ok(self.whisker_store_cell_fill(
-                        site,
-                        current_obj,
-                        &self.gc_heap,
-                        atomized_key,
-                    ));
-                }
-                if entries_len > 0 {
-                    self.feedback_directory
-                        .record_property_guard_miss(site, PropertyIcKind::Store);
-                } else {
-                    self.feedback_directory
-                        .record_property_uncached_miss(site, PropertyIcKind::Store);
-                }
+                ));
+            }
+            if entries_len > 0 {
+                slot.record_guard_miss();
+            } else {
+                slot.record_uncached_miss();
             }
 
             // An uncached store needs canonical `[[Set]]` resolution before a
@@ -317,11 +294,7 @@ impl Interpreter {
                 .escape_scoped(receiver_root)
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
-            if self
-                .feedback_directory
-                .property_is_megamorphic(site, PropertyIcKind::Store)
-                == Some(false)
-            {
+            if !slot.is_megamorphic() {
                 if let Some(ic) = cache_ir::CacheStub::install_store_existing(
                     current_obj,
                     &self.gc_heap,
@@ -331,10 +304,9 @@ impl Interpreter {
                     .is_some()
                 {
                     path = Path::InstallExisting;
-                    self.feedback_directory
-                        .install_property_stub(site, PropertyIcKind::Store, ic);
+                    slot.install(ic);
                     return Ok(self.whisker_store_cell_fill(
-                        site,
+                        slot,
                         current_obj,
                         &self.gc_heap,
                         atomized_key,
@@ -351,17 +323,13 @@ impl Interpreter {
                     atomized_key,
                     &value,
                 )? {
-                    self.feedback_directory.install_property_stub(
-                        site,
-                        PropertyIcKind::Store,
-                        cache_ir::CacheStub::store_transition(transition),
-                    );
+                    slot.install(cache_ir::CacheStub::store_transition(transition));
                     let current_obj = self
                         .escape_scoped(receiver_root)
                         .as_object()
                         .ok_or(VmError::InvalidOperand)?;
                     return Ok(self.whisker_store_cell_fill(
-                        site,
+                        slot,
                         current_obj,
                         &self.gc_heap,
                         atomized_key,
@@ -402,12 +370,11 @@ impl Interpreter {
     /// to leave the access on the stub.
     pub(crate) fn whisker_load_cell_fill(
         &self,
-        site: usize,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
         obj: JsObject,
         atomized_key: AtomizedPropertyKey<'_>,
     ) -> Option<crate::jit::JitPropertyIcWay> {
-        self.feedback_directory
-            .whisker_load_cell_fill(site, obj, &self.gc_heap, atomized_key)
+        slot.whisker_fill(obj, &self.gc_heap, atomized_key)
     }
 
     /// Complete one computed `[[Get]]` from boxed values owned by generated
@@ -710,13 +677,12 @@ impl Interpreter {
     /// allocate or observe user code stays on the stub.
     pub(crate) fn whisker_store_cell_fill(
         &self,
-        site: usize,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
         obj: JsObject,
         heap: &otter_gc::GcHeap,
         atomized_key: AtomizedPropertyKey<'_>,
     ) -> Option<crate::jit::JitPropertyIcWay> {
-        self.feedback_directory
-            .whisker_store_cell_fill(site, obj, heap, atomized_key)
+        slot.whisker_fill(obj, heap, atomized_key)
     }
 
     /// Run the GC write barrier after an inline pointer-valued property store.

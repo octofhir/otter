@@ -1152,11 +1152,9 @@ pub struct Interpreter {
         std::sync::Arc<str>,
         std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
     >,
-    /// Isolate-owned high-level facade over CodeBlock lock-free feedback,
-    /// executable property/method IC banks, and method target distributions.
-    /// GC-bearing recipes stay behind this boundary and never enter CodeBlock
-    /// feedback DTOs.
-    feedback_directory: interp::FeedbackDirectory,
+    /// Isolate-owned method-only IC and target distributions. Executable
+    /// property programs live in their CodeBlock feedback slots instead.
+    method_feedback: interp::MethodFeedbackDirectory,
     /// Runtime-installed native-tier compiler hook. The hook lives behind a VM
     /// trait object so `otter-vm` never depends on executable-memory code.
     /// `Some` is also the tier-up gate: with no hook installed, all tier-up

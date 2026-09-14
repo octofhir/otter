@@ -54,7 +54,7 @@ impl Interpreter {
         dst: u16,
         obj_reg: u16,
         atomized_key: AtomizedPropertyKey<'_>,
-        site: usize,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
     ) -> Result<bool, VmError> {
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
@@ -65,41 +65,24 @@ impl Interpreter {
             // and its per-stub atom compare / receiver re-decompress. The shape
             // match fixes both the slot and the key. Falls through to the full
             // probe on a shape miss (polymorphic / prototype / dictionary).
-            if let Some(hit) = self.feedback_directory.mono_load_own_data_hit(site)
+            if let Some(hit) = slot.mono_load_own_data_hit()
                 && let Some(value) =
                     crate::object::load_own_data_slot_by_shape(obj, &self.gc_heap, hit)
             {
-                self.feedback_directory
-                    .record_property_hit(PropertyIcKind::Load);
+                slot.record_hit();
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
                 return Ok(true);
             }
-            let mut site_disabled = self
-                .feedback_directory
-                .property_is_megamorphic(site, PropertyIcKind::Load)
-                .unwrap_or(true);
-            if let Some(value) =
-                self.feedback_directory
-                    .probe_load(site, obj, &self.gc_heap, atomized_key)
-            {
-                self.feedback_directory
-                    .record_property_hit(PropertyIcKind::Load);
+            let mut site_disabled = slot.is_megamorphic();
+            if let Some(value) = slot.probe_load(obj, &self.gc_heap, atomized_key) {
+                slot.record_hit();
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
                 return Ok(true);
             }
-            if self
-                .feedback_directory
-                .property_entry_count(site, PropertyIcKind::Load)
-                .unwrap_or_default()
-                > 0
-            {
-                site_disabled = self
-                    .feedback_directory
-                    .record_property_guard_miss(site, PropertyIcKind::Load)
-                    .unwrap_or(true);
+            if slot.entry_count() > 0 {
+                site_disabled = slot.record_guard_miss();
             } else {
-                self.feedback_directory
-                    .record_property_uncached_miss(site, PropertyIcKind::Load);
+                slot.record_uncached_miss();
             }
             // The IC probing / miss bookkeeping above can materialise a rope
             // key and scavenge, relocating the receiver; re-read it from its
@@ -119,8 +102,7 @@ impl Interpreter {
                         object::shape_id(obj, &self.gc_heap),
                         &resolved,
                     );
-                    self.feedback_directory
-                        .install_property_stub(site, PropertyIcKind::Load, ic);
+                    slot.install(ic);
                 }
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, resolved.value)?;
                 return Ok(true);
@@ -901,6 +883,13 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
+        let property_slot = context
+            .property_feedback_slot(
+                stack[top_idx].function_id,
+                stack[top_idx].pc,
+                PropertyIcKind::Store,
+            )
+            .ok_or(VmError::InvalidOperand)?;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let value = *read_register(&stack[top_idx], src_reg)?;
         // §15.7.1 — Op::StorePropertyStrict forces strict PutValue
@@ -909,35 +898,19 @@ impl Interpreter {
         if let Some(obj) = receiver.as_object()
             && object::supports_fast_property_ic(obj, &self.gc_heap)
         {
-            let site = context
-                .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                .ok_or(VmError::InvalidOperand)?;
-            let entries_len = self
-                .feedback_directory
-                .property_entry_count(site, PropertyIcKind::Store)
-                .unwrap_or_default();
-            // The stub program is `&self`; only `gc_heap` is mutated by a store.
-            // The feedback directory and `gc_heap` are disjoint fields, so the
-            // stub slice and the `&mut gc_heap` a store writes through can be
-            // held at once — no per-store clone of the whole bank is needed.
-            if self.feedback_directory.probe_store(
-                site,
-                obj,
-                &mut self.gc_heap,
-                atomized_key,
-                &value,
-            )? {
-                self.feedback_directory
-                    .record_property_hit(PropertyIcKind::Store);
+            let entries_len = property_slot.entry_count();
+            // The CodeBlock-owned stub program is immutable during the probe;
+            // only `gc_heap` is mutated by a store. No per-store clone of the
+            // bounded program bank is needed.
+            if property_slot.probe_store(obj, &mut self.gc_heap, atomized_key, &value)? {
+                property_slot.record_hit();
                 Self::advance_property_fast_path(&mut stack[top_idx])?;
                 return Ok(true);
             }
             if entries_len > 0 {
-                self.feedback_directory
-                    .record_property_guard_miss(site, PropertyIcKind::Store);
+                property_slot.record_guard_miss();
             } else {
-                self.feedback_directory
-                    .record_property_uncached_miss(site, PropertyIcKind::Store);
+                property_slot.record_uncached_miss();
             }
         }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
@@ -1303,31 +1276,18 @@ impl Interpreter {
                         stack[top_idx].advance_pc()?;
                         return Ok(true);
                     };
-                    let site = context
-                        .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                        .ok_or(VmError::InvalidOperand)?;
-                    if self
-                        .feedback_directory
-                        .property_is_megamorphic(site, PropertyIcKind::Store)
-                        == Some(false)
+                    if !property_slot.is_megamorphic()
                         && object::supports_fast_property_ic(obj, &self.gc_heap)
                     {
                         if let Some(transition) = transition {
-                            self.feedback_directory.install_property_stub(
-                                site,
-                                PropertyIcKind::Store,
-                                cache_ir::CacheStub::store_transition(transition),
-                            );
+                            property_slot
+                                .install(cache_ir::CacheStub::store_transition(transition));
                         } else if let Some(ic) = cache_ir::CacheStub::install_store_existing(
                             obj,
                             &self.gc_heap,
                             atomized_key,
                         ) {
-                            self.feedback_directory.install_property_stub(
-                                site,
-                                PropertyIcKind::Store,
-                                ic,
-                            );
+                            property_slot.install(ic);
                         }
                     }
                 }

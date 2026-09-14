@@ -22,4 +22,4 @@ mod stats;
 mod tests;
 mod trace_roots;
 
-pub(crate) use feedback::FeedbackDirectory;
+pub(crate) use feedback::MethodFeedbackDirectory;

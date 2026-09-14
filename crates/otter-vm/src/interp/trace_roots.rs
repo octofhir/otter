@@ -257,11 +257,9 @@ impl Interpreter {
             .chain(self.arguments_shape_cache.values())
     }
 
-    /// Borrow store-property ICs for root tracing of cached GC shape handles.
-    pub(crate) fn store_property_ics_for_trace(
-        &self,
-    ) -> &[property_ic::PropertyIcEntry<cache_ir::CacheStub>] {
-        self.feedback_directory.store_ics_for_trace()
+    /// Trace cached transition shapes through live CodeBlock-owned IC slots.
+    pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.code_space.trace_property_ic_roots(visitor);
     }
 }
 

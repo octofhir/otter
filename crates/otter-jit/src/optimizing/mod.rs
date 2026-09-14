@@ -299,7 +299,9 @@ pub(crate) fn compile_optimized_with_artifacts(
     capture_events: bool,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
+    let target_spec = crate::machine::TargetSpec::aarch64();
     crate::machine::numeric::try_compile(
+        &target_spec,
         view,
         code_object_id,
         transitions,

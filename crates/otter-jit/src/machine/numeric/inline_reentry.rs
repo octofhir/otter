@@ -186,9 +186,7 @@ mod tests {
             );
             assert!(call.operands.contains(&MachineOperand::tagged_root(*value)));
         }
-        let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
-            .unwrap();
+        let allocation = sequence.allocate(&TargetSpec::aarch64()).unwrap();
         let safepoints = lower_safepoints(&sequence, &allocation).unwrap();
         let site = safepoints.site(MachineInstructionId(index as u32)).unwrap();
         assert!(
@@ -201,19 +199,19 @@ mod tests {
         missing_root.instructions[index]
             .operands
             .retain(|operand| *operand != MachineOperand::tagged_root(entry.closure.unwrap()));
-        assert!(missing_root.verify().is_err());
+        assert!(missing_root.verify(&TargetSpec::aarch64()).is_err());
         let mut foreign_source = sequence.clone();
         foreign_source.instructions[index].inline_frames[1].function_id += 1;
-        assert!(foreign_source.verify().is_err());
+        assert!(foreign_source.verify(&TargetSpec::aarch64()).is_err());
         let mut missing_closure = sequence.clone();
         missing_closure.instructions[index].inline_frames[1]
             .entry
             .as_mut()
             .unwrap()
             .closure = None;
-        assert!(missing_closure.verify().is_err());
+        assert!(missing_closure.verify(&TargetSpec::aarch64()).is_err());
         let mut copied_caller = sequence.clone();
         copied_caller.instructions[index].inline_frames[0].slots = Box::new([None]);
-        assert!(copied_caller.verify().is_err());
+        assert!(copied_caller.verify(&TargetSpec::aarch64()).is_err());
     }
 }

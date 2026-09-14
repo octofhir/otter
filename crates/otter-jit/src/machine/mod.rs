@@ -17,7 +17,8 @@
 //! - [`CallDescriptor`], [`CallTarget`], [`DirectCallCandidate`], and
 //!   [`DirectCallKind`] — complete semantic targets, guards, ABI, effects, and
 //!   normal/exceptional exits.
-//! - [`TargetRegisterFile`] — complete allocatable target register inventory.
+//! - [`TargetSpec`] — complete target ABI, frame, legalization, and register
+//!   contract.
 //! - [`AllocatedSequence`] — allocator edits, per-operand locations, and exact
 //!   safepoint/deoptimization locations.
 //! - [`MachineFrameLayout`] — aligned post-allocation spill-frame contract.
@@ -102,7 +103,10 @@ pub use safepoint::{
     MachineSafepointError, MachineSafepointRoot, MachineSafepointSite, MachineSafepointTable,
     lower_safepoints,
 };
-pub use target::{PhysicalRegister, TargetArchitecture, TargetRegisterFile};
+pub use target::{
+    PhysicalRegister, TargetArchitecture, TargetCapability, TargetClobberSet, TargetRegisterFile,
+    TargetSpec,
+};
 
 use std::fmt::Write as _;
 
@@ -651,18 +655,18 @@ fn binding_target_matches_semantics(
     )
 }
 
-fn binding_guard_clobbers() -> Vec<PhysicalRegister> {
-    (9..=16).map(PhysicalRegister::integer).collect()
+fn binding_guard_clobbers(target: &TargetSpec) -> Vec<PhysicalRegister> {
+    target.clobbers(TargetClobberSet::BindingGuard).to_vec()
 }
 
-fn binding_hit_clobbers() -> Vec<PhysicalRegister> {
-    vec![PhysicalRegister::integer(9)]
+fn binding_hit_clobbers(target: &TargetSpec) -> Vec<PhysicalRegister> {
+    target.clobbers(TargetClobberSet::BindingHit).to_vec()
 }
 
-fn binding_write_barrier_clobbers() -> Vec<PhysicalRegister> {
-    [0, 1, 2, 9, 11, 12, 14, 15, 16]
-        .map(PhysicalRegister::integer)
-        .into()
+fn binding_write_barrier_clobbers(target: &TargetSpec) -> Vec<PhysicalRegister> {
+    target
+        .clobbers(TargetClobberSet::BindingWriteBarrier)
+        .to_vec()
 }
 
 /// Complete target-neutral call contract.
@@ -1159,6 +1163,7 @@ impl std::error::Error for VerificationError {}
 impl InstructionSequence {
     /// Construct and verify one target-selected instruction sequence.
     pub fn new(
+        target: &TargetSpec,
         entry: MachineBlock,
         representations: Vec<MachineRepresentation>,
         call_descriptors: Vec<CallDescriptor>,
@@ -1166,6 +1171,7 @@ impl InstructionSequence {
         instructions: Vec<MachineInstruction>,
     ) -> Result<Self, VerificationError> {
         Self::new_with_packed_double_view_caches(
+            target,
             entry,
             representations,
             call_descriptors,
@@ -1177,6 +1183,7 @@ impl InstructionSequence {
 
     /// Construct and verify a sequence with bounded raw packed-double caches.
     pub fn new_with_packed_double_view_caches(
+        target: &TargetSpec,
         entry: MachineBlock,
         representations: Vec<MachineRepresentation>,
         call_descriptors: Vec<CallDescriptor>,
@@ -1192,7 +1199,7 @@ impl InstructionSequence {
             instructions,
             packed_double_view_cache_count,
         };
-        sequence.verify()?;
+        sequence.verify(target)?;
         Ok(sequence)
     }
 
@@ -1204,6 +1211,7 @@ impl InstructionSequence {
     /// construction still requires callers to provide exact root metadata and
     /// is verified without repair.
     pub(super) fn new_selected_with_packed_double_view_caches(
+        target: &TargetSpec,
         entry: MachineBlock,
         representations: Vec<MachineRepresentation>,
         call_descriptors: Vec<CallDescriptor>,
@@ -1219,17 +1227,14 @@ impl InstructionSequence {
             instructions,
             packed_double_view_cache_count,
         };
-        sequence.verify_structure()?;
+        sequence.verify_structure(target)?;
         sequence.complete_gc_root_liveness();
         sequence.verify_gc_root_liveness()?;
         Ok(sequence)
     }
 
     /// Allocate through regalloc2's Ion allocator and finalize exact metadata.
-    pub fn allocate(
-        &self,
-        target: &TargetRegisterFile,
-    ) -> Result<AllocatedSequence, AllocationError> {
+    pub fn allocate(&self, target: &TargetSpec) -> Result<AllocatedSequence, AllocationError> {
         regalloc::allocate(self, target)
     }
 
@@ -1561,7 +1566,7 @@ impl InstructionSequence {
         Ok(())
     }
 
-    fn verify_structure(&self) -> Result<(), VerificationError> {
+    fn verify_structure(&self, target_spec: &TargetSpec) -> Result<(), VerificationError> {
         if usize::from(self.packed_double_view_cache_count) > MAX_PACKED_DOUBLE_VIEW_CACHES {
             return Err(VerificationError::TooManyPackedDoubleViewCaches(
                 self.packed_double_view_cache_count,
@@ -1790,7 +1795,7 @@ impl InstructionSequence {
                         || target.cell_addr == 0
                         || target.cell_addr % std::mem::align_of::<otter_vm::Value>() != 0
                         || instruction.clobbers
-                            != [PhysicalRegister::integer(9), PhysicalRegister::integer(13)]
+                            != target_spec.clobbers(TargetClobberSet::StringConstantLoad)
                         || instruction.deopt.is_some()
                         || instruction.safepoint.is_some()
                     {
@@ -1801,16 +1806,22 @@ impl InstructionSequence {
                     MachineOpcode::ConstructReceiver { .. }
                     | MachineOpcode::ConstructReceiverHit
                     | MachineOpcode::BaseConstructResult => {
-                        let (inputs, result, scratch): (_, _, &[u8]) = match instruction.opcode {
+                        let (inputs, result, clobbers) = match instruction.opcode {
                             MachineOpcode::ConstructReceiver { .. } => (
                                 1,
                                 MachineRepresentation::Tagged,
-                                &[0, 2, 4, 9, 10, 11, 12, 13, 14, 15, 16],
+                                TargetClobberSet::ConstructReceiver,
                             ),
-                            MachineOpcode::ConstructReceiverHit => {
-                                (1, MachineRepresentation::Boolean, &[9, 10])
-                            }
-                            _ => (2, MachineRepresentation::Tagged, &[0, 9, 10, 11]),
+                            MachineOpcode::ConstructReceiverHit => (
+                                1,
+                                MachineRepresentation::Boolean,
+                                TargetClobberSet::ConstructReceiverHit,
+                            ),
+                            _ => (
+                                2,
+                                MachineRepresentation::Tagged,
+                                TargetClobberSet::BaseConstructResult,
+                            ),
                         };
                         if instruction.operands.len() != inputs + 1
                             || !instruction
@@ -1831,11 +1842,7 @@ impl InstructionSequence {
                                                 result
                                             }
                                 })
-                            || !instruction
-                                .clobbers
-                                .iter()
-                                .copied()
-                                .eq(scratch.iter().copied().map(PhysicalRegister::integer))
+                            || instruction.clobbers != target_spec.clobbers(clobbers)
                             || instruction.deopt.is_some()
                             || instruction.safepoint.is_some()
                         {
@@ -1848,13 +1855,13 @@ impl InstructionSequence {
                         let [input, output, late @ ..] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
-                        let scratch: &[u8] = if matches!(
+                        let clobbers = if matches!(
                             instruction.opcode,
                             MachineOpcode::InlineMethodGuard { .. }
                         ) {
-                            &[9, 10, 11, 12, 13, 14, 15]
+                            TargetClobberSet::InlineMethodGuard
                         } else {
-                            &[9, 10, 11, 12, 14]
+                            TargetClobberSet::InlineCallGuard
                         };
                         if late
                             .iter()
@@ -1865,11 +1872,7 @@ impl InstructionSequence {
                                 self.representations[operand.value.0 as usize]
                                     != MachineRepresentation::Tagged
                             })
-                            || !instruction
-                                .clobbers
-                                .iter()
-                                .copied()
-                                .eq(scratch.iter().copied().map(PhysicalRegister::integer))
+                            || instruction.clobbers != target_spec.clobbers(clobbers)
                             || instruction.deopt.is_none()
                             || instruction.safepoint.is_some()
                         {
@@ -2014,7 +2017,7 @@ impl InstructionSequence {
                             || !binding_target_matches_semantics(*semantics, *target)
                             || !raw_addresses_are_hit_local
                             || !writable
-                            || instruction.clobbers != binding_guard_clobbers()
+                            || instruction.clobbers != binding_guard_clobbers(target_spec)
                             || instruction.deopt.is_some()
                             || instruction.safepoint.is_some()
                         {
@@ -2058,7 +2061,7 @@ impl InstructionSequence {
                             || !valid_value
                             || !valid_output
                             || !binding_target_matches_semantics(*semantics, *target)
-                            || instruction.clobbers != binding_hit_clobbers()
+                            || instruction.clobbers != binding_hit_clobbers(target_spec)
                             || instruction.deopt.is_some()
                             || instruction.safepoint.is_some()
                         {
@@ -2075,7 +2078,7 @@ impl InstructionSequence {
                             || *value != MachineOperand::location_input(value.value)
                             || self.representations[value.value.0 as usize]
                                 != MachineRepresentation::Tagged
-                            || instruction.clobbers != binding_write_barrier_clobbers()
+                            || instruction.clobbers != binding_write_barrier_clobbers(target_spec)
                             || instruction.deopt.is_some()
                             || instruction.safepoint.is_some()
                         {
@@ -2121,7 +2124,8 @@ impl InstructionSequence {
                             || !committed_pair_status
                             || instruction.deopt.is_some()
                             || instruction.safepoint.is_some()
-                            || instruction.clobbers != [PhysicalRegister::integer(16)]
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::StatusScratch)
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
@@ -2174,7 +2178,8 @@ impl InstructionSequence {
                         || !deopt_values.contains(&input.value)
                         || instruction.deopt.is_none()
                         || instruction.safepoint.is_some()
-                        || instruction.clobbers != [PhysicalRegister::integer(16)]
+                        || instruction.clobbers
+                            != target_spec.clobbers(TargetClobberSet::StatusScratch)
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
@@ -2264,10 +2269,7 @@ impl InstructionSequence {
                         || !deopts_are_unique
                         || !deopt_tagged_values_are_rooted
                         || !required_roots
-                        || instruction.clobbers
-                            != std::iter::once(PhysicalRegister::integer(9))
-                                .chain((11..=16).map(PhysicalRegister::integer))
-                                .collect::<Vec<_>>()
+                        || instruction.clobbers != target_spec.clobbers(TargetClobberSet::Element)
                         || instruction.deopt.is_none()
                         || instruction.safepoint.is_none()
                         || instruction.control != ControlFlow::None
@@ -2293,7 +2295,7 @@ impl InstructionSequence {
                                 || self.representations[operand.value.0 as usize] != *repr
                         })
                         || instruction.clobbers
-                            != (9..=16).map(PhysicalRegister::integer).collect::<Vec<_>>()
+                            != target_spec.clobbers(TargetClobberSet::PropertyLoad)
                         || instruction.deopt.is_some()
                         || instruction.safepoint.is_some()
                         || instruction.control != ControlFlow::None
@@ -2318,7 +2320,7 @@ impl InstructionSequence {
                         *operand != MachineOperand::register_output(operand.value)
                             || self.representations[operand.value.0 as usize] != *repr
                     }) || instruction.clobbers
-                        != TargetRegisterFile::aarch64_scalar_call_clobbers()
+                        != target_spec.clobbers(TargetClobberSet::PropertyStore)
                         || instruction.deopt.is_some()
                         || instruction.safepoint.is_some()
                         || instruction.control != ControlFlow::None
@@ -2365,7 +2367,7 @@ impl InstructionSequence {
                         || instruction.deopt.is_none()
                         || instruction.safepoint.is_some()
                         || instruction.clobbers
-                            != [PhysicalRegister::integer(16), PhysicalRegister::float(31)]
+                            != target_spec.clobbers(TargetClobberSet::FloatElementIndex)
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
@@ -2432,9 +2434,7 @@ impl InstructionSequence {
                     let semantic_receiver = self.semantic_deopt_source_before(id, receiver.value);
                     let semantic_index = self.semantic_deopt_source_before(id, index.value);
                     let semantic_payload = self.semantic_deopt_source_before(id, payload.value);
-                    let expected_clobbers = std::iter::once(PhysicalRegister::integer(9))
-                        .chain((11..=16).map(PhysicalRegister::integer))
-                        .collect::<Vec<_>>();
+                    let expected_clobbers = target_spec.clobbers(TargetClobberSet::Element);
                     if !receiver_is_tagged_location
                         || !index_is_scalar_location
                         || !payload_signature
@@ -2457,12 +2457,14 @@ impl InstructionSequence {
                         && instruction.operands[0]
                             == MachineOperand::fixed_register_input(
                                 instruction.operands[0].value,
-                                PhysicalRegister::integer(1),
+                                target_spec
+                                    .integer_argument(1)
+                                    .ok_or(VerificationError::OpcodeSignatureMismatch(id))?,
                             )
                         && instruction.operands[1]
                             == MachineOperand::fixed_register_output(
                                 instruction.operands[1].value,
-                                PhysicalRegister::integer(0),
+                                target_spec.integer_result(),
                             )
                         && self
                             .representations
@@ -2505,7 +2507,7 @@ impl InstructionSequence {
                                 && descriptor.results.is_empty()
                                 && descriptor.effects == CallEffects::WRITES_HEAP
                                 && descriptor.clobbers
-                                    == TargetRegisterFile::aarch64_scalar_call_clobbers()
+                                    == target_spec.clobbers(TargetClobberSet::ScalarCall)
                                 && descriptor.exceptional == ExceptionalEdge::None
                                 && descriptor.safepoint == SafepointKind::None
                                 && instruction.operands.is_empty()
@@ -2530,14 +2532,14 @@ impl InstructionSequence {
                                 && descriptor.effects
                                     == CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP)
                                 && descriptor.clobbers
-                                    == TargetRegisterFile::aarch64_scalar_call_clobbers()
+                                    == target_spec.clobbers(TargetClobberSet::ScalarCall)
                                 && descriptor.exceptional == ExceptionalEdge::None
                                 && descriptor.safepoint == SafepointKind::Gc
                                 && instruction.safepoint.is_some()
                                 && instruction.deopt.is_none()
                         }
                         CallTarget::NativeLeaf { .. } => {
-                            native_leaf::is_valid(descriptor, instruction)
+                            native_leaf::is_valid(target_spec, descriptor, instruction)
                         }
                         CallTarget::CommittedRuntime {
                             target,
@@ -2593,7 +2595,7 @@ impl InstructionSequence {
                                 && (collapses_status || exposes_committed_status)
                                 && descriptor.effects == complete_effects
                                 && descriptor.clobbers
-                                    == TargetRegisterFile::aarch64_scalar_call_clobbers()
+                                    == target_spec.clobbers(TargetClobberSet::ScalarCall)
                                 && descriptor.safepoint == SafepointKind::Gc
                                 && instruction.deopt.is_none()
                                 && inputs.len() == semantic_arity
@@ -2760,8 +2762,8 @@ impl InstructionSequence {
         Ok(())
     }
 
-    pub(super) fn verify(&self) -> Result<(), VerificationError> {
-        self.verify_structure()?;
+    pub(super) fn verify(&self, target: &TargetSpec) -> Result<(), VerificationError> {
+        self.verify_structure(target)?;
         inline_frames::verify(self)?;
         self.verify_gc_root_liveness()
     }
@@ -2795,7 +2797,9 @@ mod tests {
         operands.push(MachineOperand::register_output(result));
         operands.extend(inputs.iter().copied().map(MachineOperand::tagged_root));
         let mut call = MachineInstruction::plain(MachineOpcode::Call(0), operands);
-        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::ScalarCall)
+            .to_vec();
         call.safepoint = Some(SafepointId(0));
         instructions.push(call);
         let mut ret = MachineInstruction::plain(
@@ -2811,6 +2815,7 @@ mod tests {
         let instruction_count = instructions.len() as u32;
 
         InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; usize::from(semantic_arity) + 1],
             vec![CallDescriptor {
@@ -2823,7 +2828,9 @@ mod tests {
                 arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
                 results: vec![MachineRepresentation::Tagged],
                 effects: complete_effects,
-                clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                clobbers: TargetSpec::aarch64()
+                    .clobbers(TargetClobberSet::ScalarCall)
+                    .to_vec(),
                 exceptional: ExceptionalEdge::Propagate,
                 safepoint: SafepointKind::Gc,
             }],
@@ -2886,6 +2893,7 @@ mod tests {
 
         assert_eq!(
             InstructionSequence::new(
+                &TargetSpec::aarch64(),
                 MachineBlock(0),
                 vec![MachineRepresentation::Tagged],
                 vec![descriptor],
@@ -2909,7 +2917,7 @@ mod tests {
     fn verifier_accepts_zero_to_two_true_committed_runtime_inputs() {
         for semantic_arity in 0..=2 {
             let sequence = committed_runtime_sequence(semantic_arity);
-            assert!(sequence.verify().is_ok());
+            assert!(sequence.verify(&TargetSpec::aarch64()).is_ok());
             assert!(
                 sequence
                     .normalized()
@@ -2929,7 +2937,9 @@ mod tests {
                 MachineOperand::tagged_root(unrelated),
             ],
         );
-        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::ScalarCall)
+            .to_vec();
         call.safepoint = Some(SafepointId(0));
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
@@ -2938,6 +2948,7 @@ mod tests {
         ret.control = ControlFlow::Return;
         let descriptor = committed_runtime_sequence(0).call_descriptors[0].clone();
         let sequence = InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; 2],
             vec![descriptor],
@@ -2960,7 +2971,7 @@ mod tests {
         )
         .expect("zero-arity committed call with unrelated root");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("zero-arity committed allocation");
         let safepoints =
             lower_safepoints(&sequence, &allocation).expect("zero-arity committed safepoints");
@@ -2980,7 +2991,7 @@ mod tests {
             .operands
             .push(MachineOperand::tagged_root(unrelated));
         assert_eq!(
-            duplicate.verify(),
+            duplicate.verify(&TargetSpec::aarch64()),
             Err(VerificationError::DuplicateTaggedRoot(
                 MachineInstructionId(1),
                 unrelated,
@@ -2992,7 +3003,7 @@ mod tests {
             .operands
             .retain(|operand| operand.purpose != OperandPurpose::TaggedRoot);
         assert_eq!(
-            missing.verify(),
+            missing.verify(&TargetSpec::aarch64()),
             Err(VerificationError::MissingLiveTaggedRoot(
                 MachineInstructionId(1),
                 unrelated,
@@ -3008,7 +3019,9 @@ mod tests {
             MachineOpcode::Call(0),
             vec![MachineOperand::register_output(result)],
         );
-        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::ScalarCall)
+            .to_vec();
         call.safepoint = Some(SafepointId(0));
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
@@ -3017,6 +3030,7 @@ mod tests {
         ret.control = ControlFlow::Return;
 
         let sequence = InstructionSequence::new_selected_with_packed_double_view_caches(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; 2],
             vec![committed_runtime_sequence(0).call_descriptors[0].clone()],
@@ -3050,7 +3064,7 @@ mod tests {
             [unrelated]
         );
         sequence
-            .verify()
+            .verify(&TargetSpec::aarch64())
             .expect("completed roots remain verifiable");
     }
 
@@ -3065,7 +3079,7 @@ mod tests {
         };
         *target = otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT;
         assert_eq!(
-            wrong_signature.verify(),
+            wrong_signature.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
         );
 
@@ -3077,7 +3091,7 @@ mod tests {
         };
         *target = otter_vm::native_abi::STUB_JIT_BINDING_VALUE;
         assert_eq!(
-            hidden_binding_status.verify(),
+            hidden_binding_status.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id)),
             "binding status must remain explicit Machine SSA"
         );
@@ -3090,7 +3104,7 @@ mod tests {
         };
         *semantic_arity = 3;
         assert_eq!(
-            too_wide.verify(),
+            too_wide.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
         );
 
@@ -3099,21 +3113,21 @@ mod tests {
             .operands
             .retain(|operand| operand != &MachineOperand::tagged_root(MachineValue(1)));
         assert_eq!(
-            missing_root.verify(),
+            missing_root.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
         );
 
         let mut local_replay = committed_runtime_sequence(2);
         local_replay.instructions[call_id.0 as usize].deopt = Some(DeoptId(0));
         assert_eq!(
-            local_replay.verify(),
+            local_replay.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
         );
 
         let mut no_throw_edge = committed_runtime_sequence(2);
         no_throw_edge.call_descriptors[0].exceptional = ExceptionalEdge::None;
         assert_eq!(
-            no_throw_edge.verify(),
+            no_throw_edge.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
         );
     }
@@ -3131,6 +3145,7 @@ mod tests {
         );
         ret.control = ControlFlow::Return;
         let mut sequence = InstructionSequence::new_with_packed_double_view_caches(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged],
             Vec::new(),
@@ -3161,14 +3176,16 @@ mod tests {
 
         sequence.packed_double_view_cache_count = 33;
         assert_eq!(
-            sequence.verify(),
+            sequence.verify(&TargetSpec::aarch64()),
             Err(VerificationError::TooManyPackedDoubleViewCaches(33))
         );
         sequence.packed_double_view_cache_count = 1;
-        clear.clobbers.push(PhysicalRegister::integer(9));
+        clear
+            .clobbers
+            .push(TargetSpec::aarch64().clobbers(TargetClobberSet::Element)[0]);
         sequence.instructions[1] = clear;
         assert_eq!(
-            sequence.verify(),
+            sequence.verify(&TargetSpec::aarch64()),
             Err(VerificationError::OpcodeSignatureMismatch(
                 MachineInstructionId(1)
             ))
@@ -3193,9 +3210,9 @@ mod tests {
                 MachineOperand::deopt(index),
             ],
         );
-        load.clobbers = std::iter::once(PhysicalRegister::integer(9))
-            .chain((11..=16).map(PhysicalRegister::integer))
-            .collect();
+        load.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::Element)
+            .to_vec();
         load.deopt = Some(DeoptId(0));
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
@@ -3203,6 +3220,7 @@ mod tests {
         );
         ret.control = ControlFlow::Return;
         let mut sequence = InstructionSequence::new_with_packed_double_view_caches(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![
                 MachineRepresentation::Tagged,
@@ -3238,7 +3256,7 @@ mod tests {
             cache: PackedDoubleViewCacheId::new(1),
         };
         assert_eq!(
-            sequence.verify(),
+            sequence.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidPackedDoubleViewCache(
                 MachineInstructionId(2),
                 PackedDoubleViewCacheId::new(1).expect("bounded id")
@@ -3259,6 +3277,7 @@ mod tests {
         );
         ret.control = ControlFlow::Return;
         InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged, result_representation],
             Vec::new(),
@@ -3297,11 +3316,13 @@ mod tests {
                 MachineOperand::deopt(input),
             ],
         );
-        compare.clobbers = vec![PhysicalRegister::integer(16)];
+        compare.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::StatusScratch)
+            .to_vec();
         let mut sequence = checked_instruction_sequence(MachineRepresentation::Boolean, compare);
         sequence.instructions[1].operands.pop();
         assert_eq!(
-            sequence.verify(),
+            sequence.verify(&TargetSpec::aarch64()),
             Err(VerificationError::OpcodeSignatureMismatch(
                 MachineInstructionId(1)
             ))

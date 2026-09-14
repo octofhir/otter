@@ -376,7 +376,7 @@ mod tests {
                 NumericValue(2)
             ]
         );
-        super::super::select_with_packed_double_view_caches(&hir, &Default::default()).unwrap();
+        super::super::select(&hir).unwrap();
     }
 
     #[test]

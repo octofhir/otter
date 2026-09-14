@@ -233,10 +233,12 @@ mod tests {
     use super::*;
     use crate::machine::{
         ControlFlow, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
-        MachineInstructionId, MachineOpcode, MachineOperand, TargetRegisterFile,
+        MachineInstructionId, MachineOpcode, MachineOperand, TargetSpec,
     };
 
-    fn allocated_exit() -> (InstructionSequence, AllocatedSequence, MachineFrameLayout) {
+    fn allocated_exit(
+        target: &TargetSpec,
+    ) -> (InstructionSequence, AllocatedSequence, MachineFrameLayout) {
         let integer = MachineValue(0);
         let float = MachineValue(1);
         let instructions = vec![
@@ -263,6 +265,7 @@ mod tests {
             },
         ];
         let sequence = InstructionSequence::new(
+            target,
             MachineBlock(0),
             vec![MachineRepresentation::Int32, MachineRepresentation::Float64],
             Vec::new(),
@@ -278,15 +281,16 @@ mod tests {
         )
         .expect("valid deopt sequence");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(target)
             .expect("deopt sequence allocation");
-        let layout = MachineFrameLayout::new(&allocation, 0, 16, 16).expect("deopt frame layout");
+        let layout = target
+            .frame_layout(&allocation, 0, 0)
+            .expect("deopt frame layout");
         (sequence, allocation, layout)
     }
 
     #[test]
     fn lowers_caller_callee_and_entry_from_one_allocation() {
-        let (sequence, allocation, layout) = allocated_exit();
         let integer = MachineFrameSlot::Value(MachineValue(0));
         let float = MachineFrameSlot::Value(MachineValue(1));
         let frames = Box::new([
@@ -308,42 +312,48 @@ mod tests {
                 slots: Box::new([float, integer]),
             },
         ]);
-        let table = lower_deopt_table(
-            &sequence,
-            &allocation,
-            layout,
-            16,
-            8,
-            &[MachineFrameState {
-                id: DeoptId(0),
-                frames,
-            }],
-        )
-        .unwrap();
-        let state = table.lookup(DeoptExitId(0)).unwrap();
-        assert_eq!(state.frames.len(), 2);
-        let caller = state.outermost();
-        let callee = state.innermost();
-        assert_eq!(callee.function_id, 72);
-        assert_eq!(callee.byte_pc, 8);
-        assert_eq!(callee.slots[0], caller.slots[1]);
-        assert_eq!(callee.slots[1], caller.slots[0]);
-        let entry = callee.entry.unwrap();
-        assert_eq!(entry.return_register, 1);
-        assert_eq!(entry.this, caller.slots[1]);
-        assert_eq!(entry.closure, caller.slots[0]);
-        assert_eq!(entry.new_target, caller.slots[1]);
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let (sequence, allocation, layout) = allocated_exit(&target);
+            let (gpr_budget, fp_budget) = target.deopt_register_budgets();
+            let table = lower_deopt_table(
+                &sequence,
+                &allocation,
+                layout,
+                gpr_budget,
+                fp_budget,
+                &[MachineFrameState {
+                    id: DeoptId(0),
+                    frames: frames.clone(),
+                }],
+            )
+            .unwrap();
+            let state = table.lookup(DeoptExitId(0)).unwrap();
+            assert_eq!(state.frames.len(), 2);
+            let caller = state.outermost();
+            let callee = state.innermost();
+            assert_eq!(callee.function_id, 72);
+            assert_eq!(callee.byte_pc, 8);
+            assert_eq!(callee.slots[0], caller.slots[1]);
+            assert_eq!(callee.slots[1], caller.slots[0]);
+            let entry = callee.entry.unwrap();
+            assert_eq!(entry.return_register, 1);
+            assert_eq!(entry.this, caller.slots[1]);
+            assert_eq!(entry.closure, caller.slots[0]);
+            assert_eq!(entry.new_target, caller.slots[1]);
+        }
     }
 
     #[test]
     fn lowers_exact_allocator_locations_and_literal_slots() {
-        let (sequence, allocation, layout) = allocated_exit();
+        let target = TargetSpec::aarch64();
+        let (sequence, allocation, layout) = allocated_exit(&target);
+        let (gpr_budget, fp_budget) = target.deopt_register_budgets();
         let table = lower_deopt_table(
             &sequence,
             &allocation,
             layout,
-            16,
-            8,
+            gpr_budget,
+            fp_budget,
             &[MachineFrameState {
                 id: DeoptId(0),
                 frames: Box::new([DeoptFrame {

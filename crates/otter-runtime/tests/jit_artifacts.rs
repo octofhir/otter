@@ -707,7 +707,7 @@ String(hot(48));
         "directCallEntryCell",
         "gcCageBase",
         "globalLexicalCell",
-        "propertyIcCell",
+        "propertySourceCell",
         "templateOperandSlice",
         "guardedHeapReference",
     ] {

@@ -284,25 +284,16 @@ pub struct JitCompileSnapshot {
     /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
     /// emitter stays layout-agnostic.
     pub array_layout: JitArrayLayout,
-    /// Property-load sites whose receiver shape and own slot are settled,
-    /// keyed by byte-PC. Generated code compares against the shape directly
-    /// instead of loading the site's cache cell.
-    pub property_loads: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
-    /// Property-store sites whose receiver shape and own slot are settled,
-    /// keyed by byte-PC. A store may not write through a prototype, so a
-    /// settled store needs no hop check either.
-    pub property_stores: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyLoad>>,
+    /// Complete CodeBlock-owned CacheIR programs, copied at the compilation
+    /// boundary and keyed by source byte PC. Every installed program must be
+    /// representable or the site is absent and uses its committed cold edge.
+    pub property_programs: rustc_hash::FxHashMap<u32, Vec<JitCacheIrProgram>>,
     /// Direct physical hit proofs for schema-owned binding sites, keyed by
     /// byte-PC. See [`BindingHitProof`].
     pub binding_hit_proofs: rustc_hash::FxHashMap<u32, BindingHitProof>,
     /// Constructor `StoreProperty` sites with a pre-reserved, guarded hidden
     /// class transition, keyed by byte-PC.
     pub constructor_field_transitions: rustc_hash::FxHashMap<u32, JitConstructorFieldTransition>,
-    /// Load sites whose every program reaches its slot through the receiver's
-    /// prototype, keyed by byte-PC. Guarding the receiver shape fixes which
-    /// prototype the hop reaches and guarding the holder shape fixes the slot,
-    /// so generated code runs the hop without the site's cache cell.
-    pub property_prototype_loads: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyHop>>,
     /// Typed reasons observed at each logical PC in earlier optimized
     /// generations. The reason identity remains available to later policy and
     /// lowering instead of collapsing distinct failures into a PC-only bit.
@@ -323,7 +314,7 @@ pub struct JitCompileSnapshot {
     pub upvalue_value_byte: u32,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
-    /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
+    /// emitter reads `[obj_ptr + object_shape_byte]` for CacheIR shape guards
     /// `LoadProperty` cell guard, staying layout-agnostic.
     pub object_shape_byte: u32,
     /// Byte offset from a decompressed object pointer to its dictionary-mode
@@ -791,96 +782,91 @@ pub enum JitDirectCallThisMode {
     DerivedConstructor,
 }
 
-/// A settled prototype-hop load: the two shapes it guards and the slot it
-/// reaches.
+/// One target-neutral operation copied from a CodeBlock-owned CacheIR program.
 ///
-/// Both shapes are compressed shape-handle offsets — stable tokens, since
-/// shapes are interned, immortal, and pinned in non-moving old space, so a
-/// descriptor holds no GC pointer and needs no tracing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct JitInlinePropertyHop {
-    /// Hidden class the receiver must still carry for the hop to reach this
-    /// prototype.
-    pub receiver_shape: u32,
-    /// Hidden class the prototype must still carry for the slot to be there.
-    pub holder_shape: u32,
-    /// Byte offset of the slot inside the holder's value slab.
-    pub value_byte: u32,
+/// Object operands are tiny CacheIR register ids: operand zero is the receiver
+/// and operand one is its direct prototype after `LoadPrototype`. Shape tokens
+/// are stable compressed offsets validated by the VM while the immutable
+/// compilation snapshot is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitCacheIrOp {
+    /// Continue only while the object has the expected fast hidden class.
+    GuardShape {
+        /// CacheIR object operand to inspect.
+        object: u8,
+        /// Stable compressed hidden-class token.
+        shape: u32,
+    },
+    /// Prove that the immutable shape mapping still authorizes the atom's data
+    /// slot and that no object-local descriptor or exotic state overrides it.
+    GuardAtomSlot {
+        /// CacheIR object operand whose slot metadata is guarded.
+        object: u8,
+        /// Isolate-global atom identity captured by the CacheIR program.
+        atom: u32,
+        /// Byte offset of the atom's value inside the object's value slab.
+        value_byte: u32,
+        /// Whether the terminal operation requires a writable data slot.
+        writable: bool,
+    },
+    /// Read an object's direct prototype into another CacheIR operand.
+    LoadPrototype {
+        /// CacheIR object operand whose prototype is read.
+        object: u8,
+        /// CacheIR object operand receiving the prototype.
+        result: u8,
+    },
+    /// Prove that an object's direct prototype is null.
+    GuardPrototypeNull {
+        /// CacheIR object operand whose prototype link is guarded.
+        object: u8,
+    },
+    /// Read one already-guarded own data field.
+    LoadField {
+        /// Already-guarded object operand owning the slot.
+        object: u8,
+        /// Byte offset inside its value slab.
+        value_byte: u32,
+    },
+    /// Write one already-guarded existing own data field.
+    StoreField {
+        /// Already-guarded receiver operand owning the slot.
+        object: u8,
+        /// Byte offset inside its value slab.
+        value_byte: u32,
+    },
+    /// Prove that an ordinary receiver can append the named slot without
+    /// allocating or changing storage representation.
+    GuardExtensible {
+        /// CacheIR object operand receiving the new own slot.
+        object: u8,
+        /// Byte offset of the slot that must be the exact next append.
+        value_byte: u32,
+    },
+    /// Publish the child hidden class and new logical slot length after every
+    /// miss-capable guard has completed.
+    PublishShape {
+        /// CacheIR object operand whose structure changes.
+        object: u8,
+        /// Stable compressed child hidden-class token.
+        shape: u32,
+        /// Logical value-slab length after the append.
+        new_len: u16,
+        /// Whether slot zero requires initializing the inline values pointer.
+        initialize_inline: bool,
+    },
 }
 
-/// Prototype proof used before an own-property add transition.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum JitPropertyIcPrototypeGuard {
-    /// The complete guarded chain lacks the key (including a null prototype).
-    #[default]
-    Missing = 0,
-    /// The direct prototype owns writable data; its shape and unmodified
-    /// descriptor state suffice, regardless of later prototype links.
-    WritableData = 1,
-}
-
-/// One cache program lowered to the form generated code executes inline.
+/// Complete immutable CacheIR program consumed by a native tier.
 ///
-/// This is the single description of a property fast path: the interpreter's
-/// [`crate::cache_ir::CacheStub`] lowers its op sequence to this, and every
-/// tier's emitted probe consumes exactly this. Nothing re-derives a slot or a
-/// guard on its own, so the tiers cannot disagree about what a site caches.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct JitPropertyIcWay {
-    /// Guarded receiver shape. `0` marks an empty way and never matches a live
-    /// receiver, so empty ways are skipped without a branch of their own.
-    pub receiver_shape: u32,
-    /// Guarded shape of the direct prototype. For an existing-slot program it
-    /// owns the loaded slot; `0` means the receiver owns the slot. For an add
-    /// transition it guards the direct prototype under `prototype_guard`;
-    /// `0` means the receiver instead has a null prototype.
-    pub holder_shape: u32,
-    /// Byte offset of the slot inside the holder's value slab.
-    pub value_byte: u32,
-    /// Canonical child shape installed by an add-property transition. `0`
-    /// keeps the existing-slot load/store meaning above. A non-zero token
-    /// changes the program into an append: `receiver_shape` is then the parent
-    /// shape, `value_byte` is the new own slot, and `holder_shape` is either
-    /// zero for a null receiver prototype or the guarded direct-prototype
-    /// shape checked under `prototype_guard`.
-    pub transition_shape: u32,
-    /// For an add transition whose missing-key chain is two prototypes long,
-    /// the guarded shape of the direct prototype's own prototype; `0` means
-    /// the direct prototype (or the receiver) ends the chain. The guard
-    /// proves the object after the last guarded link is null, so every
-    /// object that ordinary `[[Set]]` would consult has a checked shape.
-    /// Writable-data programs leave this zero without constraining later links.
-    pub chain_shape: u32,
-    /// Selects the prototype proof for an add transition; existing slots use
-    /// `Missing`. Writable-data programs never use `chain_shape`.
-    pub prototype_guard: JitPropertyIcPrototypeGuard,
+/// A site is publishable only when every installed stub can be represented.
+/// Unsupported CacheIR operations therefore keep the entire site on its
+/// committed canonical cold edge; a tier never executes a partial program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitCacheIrProgram {
+    /// Complete operation sequence in interpreter execution order.
+    pub ops: Box<[JitCacheIrOp]>,
 }
-
-impl JitPropertyIcWay {
-    /// Whether the program reaches the slot through the receiver's prototype.
-    #[must_use]
-    pub const fn hops_to_prototype(&self) -> bool {
-        self.transition_shape == 0 && self.holder_shape != 0
-    }
-
-    /// Whether the program appends one own slot and publishes a child shape.
-    #[must_use]
-    pub const fn is_add_transition(&self) -> bool {
-        self.transition_shape != 0
-    }
-}
-
-const _: [(); 24] = [(); std::mem::size_of::<JitPropertyIcWay>()];
-const _: [(); 4] = [(); std::mem::align_of::<JitPropertyIcWay>()];
-const _: [(); 0] = [(); std::mem::offset_of!(JitPropertyIcWay, receiver_shape)];
-const _: [(); 4] = [(); std::mem::offset_of!(JitPropertyIcWay, holder_shape)];
-const _: [(); 8] = [(); std::mem::offset_of!(JitPropertyIcWay, value_byte)];
-const _: [(); 12] = [(); std::mem::offset_of!(JitPropertyIcWay, transition_shape)];
-const _: [(); 16] = [(); std::mem::offset_of!(JitPropertyIcWay, chain_shape)];
-
-const _: [(); 20] = [(); std::mem::offset_of!(JitPropertyIcWay, prototype_guard)];
 
 /// One monomorphic native leaf call selected from ordinary-call feedback.
 ///
@@ -1266,27 +1252,6 @@ impl JitElementAccess {
     }
 }
 
-/// One receiver shape a property site resolves, with the own slot it reaches.
-///
-/// A site contributes one of these per installed cache program, so a
-/// monomorphic site is the one-element case of a polymorphic chain rather than
-/// a separate mechanism.
-///
-/// The runtime cache cell exists because a site's shape can change after the
-/// code is generated. A site the profile has settled on does not need it: the
-/// shape is a compile-time constant, so the probe compares against an
-/// immediate and reads a fixed slab offset instead of loading the cell and
-/// walking its ways. A receiver that stops matching misses to the same window
-/// transition the cell walk would have, which re-patches the cell and lets the
-/// next compile re-bake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JitInlinePropertyLoad {
-    /// Guarded receiver shape handle offset.
-    pub receiver_shape: u32,
-    /// Byte offset of the slot inside the receiver's own value slab.
-    pub value_byte: u32,
-}
-
 /// Ready-to-use byte offsets and tags for inline primitive string fast paths.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitStringLayout {
@@ -1479,11 +1444,9 @@ impl JitCompileSnapshot {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
-            property_loads: rustc_hash::FxHashMap::default(),
-            property_stores: rustc_hash::FxHashMap::default(),
+            property_programs: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
-            property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }

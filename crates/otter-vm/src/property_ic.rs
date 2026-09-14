@@ -284,9 +284,9 @@ impl PropertyIcEntry<crate::cache_ir::CacheStub> {
 #[cfg(test)]
 mod tests {
     use super::{PropertyIcEntry, PropertyIcKind, PropertyIcStats};
-    use crate::Value;
     use crate::object::{self, PropertyDescriptor};
     use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
+    use crate::{Value, jit::JitCacheIrOp};
 
     fn fresh_heap() -> otter_gc::GcHeap {
         otter_gc::GcHeap::new().expect("init heap")
@@ -453,5 +453,164 @@ mod tests {
         ));
 
         assert!(crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x")).is_none());
+    }
+
+    #[test]
+    fn cache_ir_snapshot_preserves_own_load_and_store_programs() {
+        let mut heap = fresh_heap();
+        let mut obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut obj, &mut heap, "x", Value::boolean(true));
+        let shape_id = object::shape_id(obj, &heap);
+        let shape = 101;
+        let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key("x")).unwrap();
+
+        let load = crate::cache_ir::CacheStub::from_resolved_load(shape_id, &resolved)
+            .snapshot_for_jit(|id| (id == shape_id).then_some(shape))
+            .expect("complete own-load snapshot");
+        assert_eq!(
+            load.ops.as_ref(),
+            &[
+                JitCacheIrOp::GuardShape { object: 0, shape },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 7,
+                    value_byte: 0,
+                    writable: false,
+                },
+                JitCacheIrOp::LoadField {
+                    object: 0,
+                    value_byte: 0,
+                },
+            ]
+        );
+
+        let store = crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x"))
+            .unwrap()
+            .snapshot_for_jit(|id| (id == shape_id).then_some(shape))
+            .expect("complete own-store snapshot");
+        assert_eq!(
+            store.ops.as_ref(),
+            &[
+                JitCacheIrOp::GuardShape { object: 0, shape },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 7,
+                    value_byte: 0,
+                    writable: true,
+                },
+                JitCacheIrOp::StoreField {
+                    object: 0,
+                    value_byte: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_ir_snapshot_preserves_prototype_program_order() {
+        let mut heap = fresh_heap();
+        let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
+        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set_prototype(receiver, &mut heap, Some(proto));
+        let receiver_id = object::shape_id(receiver, &heap);
+        let receiver_shape = 101;
+        let holder_id = object::shape_id(proto, &heap);
+        let holder_shape = 202;
+        let resolved = crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).unwrap();
+        let program = crate::cache_ir::CacheStub::from_resolved_load(receiver_id, &resolved)
+            .snapshot_for_jit(|id| match id {
+                id if id == receiver_id => Some(receiver_shape),
+                id if id == holder_id => Some(holder_shape),
+                _ => None,
+            })
+            .expect("complete prototype-load snapshot");
+        assert_eq!(
+            program.ops.as_ref(),
+            &[
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: receiver_shape,
+                },
+                JitCacheIrOp::LoadPrototype {
+                    object: 0,
+                    result: 1,
+                },
+                JitCacheIrOp::GuardShape {
+                    object: 1,
+                    shape: holder_shape,
+                },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 1,
+                    atom: 7,
+                    value_byte: 0,
+                    writable: false,
+                },
+                JitCacheIrOp::LoadField {
+                    object: 1,
+                    value_byte: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unresolved_transition_rejects_the_complete_cache_ir_program() {
+        let mut heap = fresh_heap();
+        let first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let transition = object::capture_store_property_transition(
+            first,
+            &mut heap,
+            key("x"),
+            &Value::boolean(false),
+        )
+        .expect("store transition");
+        let stub = crate::cache_ir::CacheStub::store_transition(transition);
+        assert!(stub.snapshot_for_jit(|_| None).is_none());
+    }
+
+    #[test]
+    fn shape_transition_snapshot_preserves_every_pre_effect_guard_and_publication() {
+        let from = object::ShapeId::from_raw(41);
+        let to = object::ShapeId::from_raw(42);
+        let transition = object::StorePropertyTransition {
+            from_shape_id: from,
+            atom_id: AtomId::from_global(7),
+            to_shape_id: to,
+            to_shape: std::cell::Cell::new(object::ShapeHandle::null()),
+            kind: object::StorePropertyTransitionKind::OwnAdd,
+            slot: 1,
+        };
+        let program = crate::cache_ir::CacheStub::store_transition(transition)
+            .snapshot_for_jit(|id| match id {
+                id if id == from => Some(101),
+                id if id == to => Some(202),
+                _ => None,
+            })
+            .expect("complete add-transition snapshot");
+        assert_eq!(
+            program.ops.as_ref(),
+            &[
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 101,
+                },
+                JitCacheIrOp::GuardPrototypeNull { object: 0 },
+                JitCacheIrOp::GuardExtensible {
+                    object: 0,
+                    value_byte: 8,
+                },
+                JitCacheIrOp::StoreField {
+                    object: 0,
+                    value_byte: 8,
+                },
+                JitCacheIrOp::PublishShape {
+                    object: 0,
+                    shape: 202,
+                    new_len: 2,
+                    initialize_inline: false,
+                },
+            ]
+        );
     }
 }

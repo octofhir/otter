@@ -37,7 +37,7 @@ use yaxpeax_arch::{Arch, Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::ARMv8;
 
 use super::relocation::{
-    DirectBranch, DirectBranchKind, GuardedHeapComponent, PropertyIcAccess, RelocationTarget,
+    DirectBranch, DirectBranchKind, GuardedHeapComponent, PropertySourceAccess, RelocationTarget,
     TemplateOperandArena, TemplateOperandRole, ValidatedRelocation, ValidatedRelocations,
     decode_direct_branch,
 };
@@ -504,11 +504,11 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         } => {
             format!("stringConstantCell(fid={function_id},bytePc={byte_pc})")
         }
-        RelocationTarget::PropertyIcCell { access, ordinal } => format!(
-            "propertyIcCell(access={},ordinal={ordinal})",
+        RelocationTarget::PropertySourceCell { access, ordinal } => format!(
+            "propertySourceCell(access={},ordinal={ordinal})",
             match access {
-                PropertyIcAccess::Load => "load",
-                PropertyIcAccess::Store => "store",
+                PropertySourceAccess::Load => "load",
+                PropertySourceAccess::Store => "store",
             }
         ),
         RelocationTarget::TemplateOperandSlice {

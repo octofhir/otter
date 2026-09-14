@@ -1,37 +1,38 @@
 //! Machine IR miss-capable named-property coverage.
 //!
 //! # Contents
-//! - One mixed scalar function with settled hot property operations and cold
-//!   named load/store sites backed by compiler-owned WhiskerIC cells.
+//! - One mixed scalar function with immutable hot CacheIR programs and cold
+//!   named load/store sites backed by compiler-owned source-identity cells.
 //! - Ordinary shape reuse, an add-property transition, accessors, proxies, and
 //!   allocating reentry under moving collection.
 //! - Non-extensible and inline-capacity overflow receivers that stay on the
 //!   canonical store boundary without object corruption.
-//! - Same-layout descriptor invalidation after cell fill: a data load becomes
+//! - Same-layout descriptor invalidation after snapshot: a data load becomes
 //!   an accessor and a writable store becomes non-writable.
+//! - A store followed by two loads keeps the first tagged payload live across
+//!   the second CacheIR probe's Boolean SSA plumbing.
 //! - A local `try`/`catch` fixture whose throwing getter reaches the Machine
 //!   landing pad through explicit committed status control without deopt.
 //!
 //! # Invariants
-//! - A cold named-property site stays in the complete Machine body; its first
-//!   ordinary miss calls the fixed boxed-value boundary exactly once and fills
-//!   the code-owned cell, while the same shape reuses that cell without a stub,
-//!   exact deopt, or replacement compilation.
+//! - A cold named-property site stays in the complete Machine body and calls
+//!   the fixed boxed-value boundary exactly once per source operation. A
+//!   published body never learns semantic proof data after compilation.
 //! - Getter, setter, and proxy effects execute exactly once. A committed store
 //!   transition is never replayed, and every boxed operand/result remains a
 //!   moving-GC root across reentrant calls.
-//! - A cached add transition never bypasses receiver extensibility or an
+//! - A snapshot add transition never bypasses receiver extensibility or an
 //!   allocation-requiring slot-slab growth; those stores complete canonically
 //!   once and leave all existing keys and values intact.
 //! - Descriptor changes invalidate stale slot programs even if the receiver's
 //!   shape token is otherwise reusable; accessors and rejected writes remain
 //!   authoritative and execute exactly once.
 //! - Named-property Machine regions retain bytecode attribution and stable
-//!   IC-cell relocations; execution never takes an exact-deopt exit for the
+//!   source-cell relocations; execution never takes an exact-deopt exit for the
 //!   source property operations.
 //!
 //! # See also
-//! - `crates/otter-jit/src/machine/numeric` owns property selection, cell probes,
+//! - `crates/otter-jit/src/machine/numeric` owns property selection, CacheIR nodes,
 //!   safepoints, and AArch64 emission.
 //! - `crates/otter-vm/src/runtime_activation/value_ops.rs` owns the fixed value
 //!   boundary used by generated named-property misses.
@@ -50,6 +51,50 @@ const MIXED_MODULE: &str = "jit-machine-generic-properties-setup.js";
 const MIXED_FUNCTION: &str = "machineGenericPropertyBoundary";
 const CATCH_MODULE: &str = "jit-machine-generic-properties-catch-setup.js";
 const CATCH_FUNCTION: &str = "machineGenericPropertyCaught";
+
+const LIVE_PAYLOAD_SETUP: &str = r#"
+globalThis.__machineCacheIrLiveObject = { a: 1, b: 2, c: 0 };
+function machineCacheIrLivePayload(target) {
+  target.c = target.a + target.b;
+  return target.c + target.a;
+}
+let livePayloadWarm = "";
+for (let warm = 0; warm < 4010; warm++) {
+  livePayloadWarm += "machineCacheIrLivePayload(__machineCacheIrLiveObject);";
+}
+eval(livePayloadWarm);
+JSON.stringify([
+  __machineCacheIrLiveObject.c,
+  machineCacheIrLivePayload(__machineCacheIrLiveObject)
+]);
+"#;
+
+const WARMED_TRANSITION_SETUP: &str = r#"
+function machineSnapshotAddNull(target, value) {
+  target.added = value;
+  return value;
+}
+function machineSnapshotAddDefault(target, value) {
+  target.added = value;
+  return value;
+}
+globalThis.__snapshotWritablePrototype = Object.create(null);
+__snapshotWritablePrototype.added = 0;
+function machineSnapshotAddInherited(target, value) {
+  target.added = value;
+  return value;
+}
+for (let warm = 0; warm < 5000; warm++) {
+  const nullTarget = Object.create(null);
+  nullTarget.anchor = warm;
+  machineSnapshotAddNull(nullTarget, warm);
+  const defaultTarget = { anchor: warm };
+  machineSnapshotAddDefault(defaultTarget, warm);
+  const inheritedTarget = Object.create(__snapshotWritablePrototype);
+  inheritedTarget.anchor = warm;
+  machineSnapshotAddInherited(inheritedTarget, warm);
+}
+"#;
 
 const MIXED_SETUP: &str = r#"
 function machineGenericPropertyBoundary(hot, takeCold, source, target, next) {
@@ -623,8 +668,8 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
     let regions = code_map["regions"].as_array().expect("code-map regions");
     let mut property_byte_pcs = BTreeSet::new();
     for (kind, expected) in [
-        ("machinePropertyLoad", 2usize),
-        ("machinePropertyStore", 2usize),
+        ("machinePropertyLoadCold", 2usize),
+        ("machinePropertyStoreCold", 2usize),
     ] {
         let matching = regions
             .iter()
@@ -633,7 +678,7 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
         assert_eq!(
             matching.len(),
             expected,
-            "mixed function must retain both settled and cold {kind} regions: {code_map}"
+            "mixed function must retain both committed {kind} regions: {code_map}"
         );
         for region in matching {
             property_byte_pcs.insert(
@@ -678,10 +723,10 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
     for access in ["load", "store"] {
         assert!(
             relocations.iter().any(|relocation| {
-                relocation["target"]["kind"] == "propertyIcCell"
+                relocation["target"]["kind"] == "propertySourceCell"
                     && relocation["target"]["access"] == access
             }),
-            "mixed Machine body must own a stable {access} WhiskerIC cell: {relocations:?}"
+            "mixed Machine body must own a stable {access} source cell: {relocations:?}"
         );
     }
 
@@ -726,7 +771,26 @@ fn assert_exact_runtime_pair(delta: CounterDelta, operation: &str) {
 }
 
 #[test]
-fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
+fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
+    let mut runtime = runtime(false);
+    let (result, delta) = run_with_delta(
+        &mut runtime,
+        LIVE_PAYLOAD_SETUP,
+        "jit-machine-cache-ir-live-payload.js",
+    );
+    assert_eq!(result, "[3,4]");
+    assert!(
+        delta.optimized_entries > 0,
+        "the live-payload regression must execute Machine code: {delta:?}"
+    );
+    assert_eq!(
+        delta.optimized_deopts, 0,
+        "Boolean SSA helpers must not clobber a tagged load result: {delta:?}"
+    );
+}
+
+#[test]
+fn post_compile_property_misses_remain_committed_without_learning_proof_data() {
     let mut runtime = runtime(true);
     let setup = runtime
         .run_script(SourceInput::from_javascript(MIXED_SETUP), MIXED_MODULE)
@@ -743,7 +807,7 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         HOT_ONLY,
         "jit-machine-generic-properties-hot-only.js",
     );
-    assert_machine_entry_without_deopt(hot_delta, "settled hot-only property path");
+    assert_machine_entry_without_deopt(hot_delta, "snapshot hot-only property path");
     assert_eq!(hot_delta.runtime_property_stubs, 0, "{hot_delta:?}");
     assert_eq!(hot_delta.reentrant_stub_transitions, 0, "{hot_delta:?}");
 
@@ -761,14 +825,9 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         "jit-machine-generic-properties-ordinary-reuse.js",
     );
     assert_eq!(reuse, r#"[true,8,true,42,"anchor,added",5003]"#);
-    assert_machine_entry_without_deopt(reuse_delta, "same-shape WhiskerIC reuse");
-    assert_eq!(
-        reuse_delta.runtime_property_stubs, 0,
-        "same load shape and add transition must hit both code-owned cells: {reuse_delta:?}"
-    );
-    assert_eq!(
-        reuse_delta.reentrant_stub_transitions, 0,
-        "same-shape reuse must not enter either runtime boundary: {reuse_delta:?}"
+    assert_exact_runtime_pair(
+        reuse_delta,
+        "same-shape post-compile miss without semantic self-patching",
     );
 
     let (frozen, frozen_delta) = run_with_delta(
@@ -777,16 +836,7 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         "jit-machine-generic-properties-non-extensible.js",
     );
     assert_eq!(frozen, r#"[true,9,false,3,"anchor",false,5004]"#);
-    assert_machine_entry_without_deopt(frozen_delta, "non-extensible add rejection");
-    assert_eq!(
-        frozen_delta.runtime_property_stubs, 1,
-        "the cached transition must reject non-extensible receivers before the canonical store: \
-         {frozen_delta:?}"
-    );
-    assert_eq!(
-        frozen_delta.reentrant_stub_transitions, 1,
-        "the rejected add must complete through exactly one store boundary: {frozen_delta:?}"
-    );
+    assert_exact_runtime_pair(frozen_delta, "non-extensible add rejection");
 
     let (overflow_first, overflow_first_delta) = run_with_delta(
         &mut runtime,
@@ -797,18 +847,9 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         overflow_first,
         r#"[true,10,true,1,2,3,44,"first,second,third,added",5005]"#
     );
-    assert_machine_entry_without_deopt(
+    assert_exact_runtime_pair(
         overflow_first_delta,
-        "inline-capacity overflow add transition",
-    );
-    assert_eq!(
-        overflow_first_delta.runtime_property_stubs, 1,
-        "slab growth must execute exactly one canonical store: {overflow_first_delta:?}"
-    );
-    assert_eq!(
-        overflow_first_delta.reentrant_stub_transitions, 1,
-        "slab growth must cross exactly one reentrant store boundary: \
-         {overflow_first_delta:?}"
+        "inline-capacity overflow property pair",
     );
 
     let (overflow_reuse, overflow_reuse_delta) = run_with_delta(
@@ -820,18 +861,9 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         overflow_reuse,
         r#"[true,11,true,4,5,6,45,"first,second,third,added",5006]"#
     );
-    assert_machine_entry_without_deopt(
+    assert_exact_runtime_pair(
         overflow_reuse_delta,
-        "repeated inline-capacity overflow add transition",
-    );
-    assert_eq!(
-        overflow_reuse_delta.runtime_property_stubs, 1,
-        "an allocation-requiring transition must remain on one canonical store per object: \
-         {overflow_reuse_delta:?}"
-    );
-    assert_eq!(
-        overflow_reuse_delta.reentrant_stub_transitions, 1,
-        "the repeated growth path must not replay or enter twice: {overflow_reuse_delta:?}"
+        "repeated inline-capacity overflow property pair",
     );
 
     let (existing, existing_delta) = run_with_delta(
@@ -840,15 +872,7 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         "jit-machine-generic-properties-existing-store-fill.js",
     );
     assert_eq!(existing, "[true,12,true,46,5007]");
-    assert_machine_entry_without_deopt(existing_delta, "existing writable store cell fill");
-    assert_eq!(
-        existing_delta.runtime_property_stubs, 1,
-        "the new existing-slot shape must fill one store cell way: {existing_delta:?}"
-    );
-    assert_eq!(
-        existing_delta.reentrant_stub_transitions, 1,
-        "the existing-slot fill must enter the store boundary once: {existing_delta:?}"
-    );
+    assert_exact_runtime_pair(existing_delta, "existing writable property pair");
 
     let (readonly, readonly_delta) = run_with_delta(
         &mut runtime,
@@ -856,16 +880,7 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         "jit-machine-generic-properties-non-writable.js",
     );
     assert_eq!(readonly, "[true,13,true,90,false,5008]");
-    assert_machine_entry_without_deopt(readonly_delta, "non-writable descriptor invalidation");
-    assert_eq!(
-        readonly_delta.runtime_property_stubs, 1,
-        "a stale writable-slot cell must miss before the canonical rejected store: \
-         {readonly_delta:?}"
-    );
-    assert_eq!(
-        readonly_delta.reentrant_stub_transitions, 1,
-        "the rejected non-writable store must execute exactly once: {readonly_delta:?}"
-    );
+    assert_exact_runtime_pair(readonly_delta, "non-writable descriptor property pair");
 
     let (invalidated_load, invalidated_load_delta) = run_with_delta(
         &mut runtime,
@@ -873,24 +888,14 @@ fn ordinary_misses_fill_code_owned_cells_and_same_shapes_reuse_without_stub() {
         "jit-machine-generic-properties-accessor-invalidation.js",
     );
     assert_eq!(invalidated_load, "[true,15,true,48,1,5009]");
-    assert_machine_entry_without_deopt(
+    assert_exact_runtime_pair(
         invalidated_load_delta,
-        "own-data to accessor load invalidation",
-    );
-    assert_eq!(
-        invalidated_load_delta.runtime_property_stubs, 1,
-        "a stale data-load cell must miss and invoke the getter canonically once: \
-         {invalidated_load_delta:?}"
-    );
-    assert_eq!(
-        invalidated_load_delta.reentrant_stub_transitions, 1,
-        "the getter must be reached through one reentrant load boundary: \
-         {invalidated_load_delta:?}"
+        "own-data to accessor invalidation property pair",
     );
 }
 
 #[test]
-fn default_object_prototype_adds_fill_and_reuse_the_guarded_transition() {
+fn post_compile_default_prototype_adds_stay_on_the_committed_boundary() {
     let mut runtime = runtime(false);
     completion(&mut runtime, MIXED_SETUP, MIXED_MODULE);
 
@@ -903,7 +908,7 @@ fn default_object_prototype_adds_fill_and_reuse_the_guarded_transition() {
     assert_machine_entry_without_deopt(first_delta, "first default-prototype add");
     assert_eq!(
         first_delta.runtime_property_stubs, 2,
-        "the first call needs one load fill plus one canonical default-prototype store: \
+        "the first call needs one load plus one canonical default-prototype store: \
          {first_delta:?}"
     );
     assert_eq!(first_delta.reentrant_stub_transitions, 2, "{first_delta:?}");
@@ -914,12 +919,81 @@ fn default_object_prototype_adds_fill_and_reuse_the_guarded_transition() {
         "jit-machine-generic-properties-default-reuse.js",
     );
     assert_eq!(reuse, r#"[true,17,true,50,"anchor,added",5002]"#);
-    assert_machine_entry_without_deopt(reuse_delta, "second default-prototype add");
-    assert_eq!(
-        reuse_delta.runtime_property_stubs, 0,
-        "the settled load and supported default-prototype add must both hit: {reuse_delta:?}"
+    assert_exact_runtime_pair(
+        reuse_delta,
+        "second post-compile default-prototype property pair",
     );
-    assert_eq!(reuse_delta.reentrant_stub_transitions, 0, "{reuse_delta:?}");
+}
+
+#[test]
+fn warmed_add_transitions_execute_from_immutable_cache_ir_without_reentry() {
+    let mut runtime = runtime(false);
+    completion(
+        &mut runtime,
+        WARMED_TRANSITION_SETUP,
+        "jit-machine-cache-ir-transition-setup.js",
+    );
+    let (null_result, null_delta) = run_with_delta(
+        &mut runtime,
+        r#"
+globalThis.__snapshotNull = Object.create(null);
+__snapshotNull.anchor = 1;
+const nullResult = machineSnapshotAddNull(__snapshotNull, 41);
+JSON.stringify([nullResult, __snapshotNull.added, Object.keys(__snapshotNull).join(",")]);
+"#,
+        "jit-machine-cache-ir-null-transition-probe.js",
+    );
+    assert_eq!(null_result, r#"[41,41,"anchor,added"]"#);
+    assert_machine_entry_without_deopt(null_delta, "immutable null-prototype transition");
+    assert_eq!(
+        null_delta.runtime_property_stubs, 0,
+        "the warmed null-prototype transition must remain generated: {null_delta:?}"
+    );
+    assert_eq!(
+        null_delta.reentrant_stub_transitions, 0,
+        "generated null-prototype publication must not reenter: {null_delta:?}"
+    );
+
+    let (default_result, default_delta) = run_with_delta(
+        &mut runtime,
+        r#"
+globalThis.__snapshotDefault = { anchor: 2 };
+const defaultResult = machineSnapshotAddDefault(__snapshotDefault, 42);
+JSON.stringify([defaultResult, __snapshotDefault.added, Object.keys(__snapshotDefault).join(",")]);
+"#,
+        "jit-machine-cache-ir-default-transition-probe.js",
+    );
+    assert_eq!(default_result, r#"[42,42,"anchor,added"]"#);
+    assert_machine_entry_without_deopt(default_delta, "immutable default-prototype transition");
+    assert_eq!(
+        default_delta.runtime_property_stubs, 1,
+        "dictionary-backed Object.prototype must reject the whole program: {default_delta:?}"
+    );
+    assert_eq!(
+        default_delta.reentrant_stub_transitions, 1,
+        "the unsupported program must commit once through the canonical boundary: {default_delta:?}"
+    );
+
+    let (inherited_result, inherited_delta) = run_with_delta(
+        &mut runtime,
+        r#"
+globalThis.__snapshotInherited = Object.create(__snapshotWritablePrototype);
+__snapshotInherited.anchor = 3;
+const inheritedResult = machineSnapshotAddInherited(__snapshotInherited, 43);
+JSON.stringify([inheritedResult, __snapshotInherited.added, Object.keys(__snapshotInherited).join(",")]);
+"#,
+        "jit-machine-cache-ir-inherited-transition-probe.js",
+    );
+    assert_eq!(inherited_result, r#"[43,43,"anchor,added"]"#);
+    assert_machine_entry_without_deopt(inherited_delta, "immutable inherited-writable transition");
+    assert_eq!(
+        inherited_delta.runtime_property_stubs, 0,
+        "the warmed inherited-writable transition must remain generated: {inherited_delta:?}"
+    );
+    assert_eq!(
+        inherited_delta.reentrant_stub_transitions, 0,
+        "generated inherited-writable publication must not reenter: {inherited_delta:?}"
+    );
 }
 
 #[test]

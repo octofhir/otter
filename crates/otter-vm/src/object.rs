@@ -30,7 +30,7 @@
 //!   write resolved through the prototype chain (write data, invoke
 //!   setter, or reject).
 //! - [`StorePropertyTransition`] / [`StorePropertyTransitionKind`] and
-//!   [`LowerableStoreTransition`] — guarded StoreProperty replay records and
+//!   guarded StoreProperty replay records and
 //!   their allocation-free native subset.
 //! - [`ShapeCacheMode`] — fast-shape eligibility marker for current and future
 //!   dictionary-compatible object storage.
@@ -110,7 +110,7 @@ pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
 pub(crate) use shape_transition::capture_store_property_transition;
 pub(crate) use shape_transition::{
-    LowerableStoreTransition, StorePropertyTransition, StorePropertyTransitionKind,
+    StorePropertyTransition, StorePropertyTransitionKind,
     capture_store_property_transition_with_shape, replay_store_property_transition,
 };
 

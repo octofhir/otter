@@ -11,7 +11,7 @@
 //! # Contents
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
-//! - [`MachinePropertySite`] — source-owned immutable named-access proofs.
+//! - [`MachineCacheIrSite`] — source-owned immutable CacheIR programs.
 //! - [`MachineOpcode`] — scalar operations, guarded element accesses, control
 //!   flow, and descriptor-backed calls.
 //! - [`CallDescriptor`], [`CallTarget`], [`DirectCallCandidate`], and
@@ -92,7 +92,7 @@ pub use deopt::{
     MachineDeoptError, MachineFrameSlot, MachineFrameState, lower_deopt_table, undefined_slot,
 };
 pub use frame::{FrameLayoutError, MachineFrameLayout};
-pub use property::MachinePropertySite;
+pub use property::MachineCacheIrSite;
 pub use regalloc::{
     AllocatedLocation, AllocatedMetadata, AllocatedSequence, AllocationEdit, AllocationError,
     AllocationPoint,
@@ -467,6 +467,58 @@ impl CallEffects {
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+}
+
+/// Heap dependency class carried by an explicit CacheIR Machine operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineAliasClass {
+    /// Hidden-class and fast-object state.
+    Shape,
+    /// Atom-to-slot descriptor state selected by an immutable hidden class.
+    PropertyMetadata,
+    /// An object's direct prototype link.
+    Prototype,
+    /// String-keyed value-slab contents.
+    PropertyField,
+    /// Remembered-set and incremental-marking metadata.
+    GcBarrier,
+}
+
+/// Optimizer-visible effects of one explicit CacheIR Machine operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineCacheIrEffects {
+    /// Alias class read by the operation, if any.
+    pub reads: Option<MachineAliasClass>,
+    /// Alias class written by the operation, if any.
+    pub writes: Option<MachineAliasClass>,
+    /// Whether the operation may allocate.
+    pub allocates: bool,
+    /// Whether the operation may throw.
+    pub throws: bool,
+    /// Whether the operation is a safepoint.
+    pub safepoint: bool,
+}
+
+impl MachineCacheIrEffects {
+    const fn read(alias: MachineAliasClass) -> Self {
+        Self {
+            reads: Some(alias),
+            writes: None,
+            allocates: false,
+            throws: false,
+            safepoint: false,
+        }
+    }
+
+    const fn write(alias: MachineAliasClass) -> Self {
+        Self {
+            reads: None,
+            writes: Some(alias),
+            allocates: false,
+            throws: false,
+            safepoint: false,
+        }
     }
 }
 
@@ -968,23 +1020,111 @@ pub enum MachineOpcode {
     },
     /// Clear every persistent packed-double view word at one semantic boundary.
     ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason),
-    /// Probe one source-owned named load without allocation or reentry.
-    /// Outputs are the boxed payload, hit Boolean and stable IC-cell address.
-    PropertyLoad {
-        /// Owned source identity and settled program from this compilation site.
-        site: Box<MachinePropertySite>,
-        /// Whether the property name is `length` and should first try the
-        /// dense-array/primitive-string layout program.
-        exotic_length: bool,
+    /// Materialize a Boolean constant for explicit guard composition.
+    BooleanConstant(bool),
+    /// Combine two canonical Boolean guard results.
+    BooleanOr,
+    /// Select one tagged SSA value without reentry or memory effects.
+    TaggedSelect,
+    /// Materialize the stable source cell used only by the committed property
+    /// boundary to recover function/logical-PC identity.
+    PropertySource {
+        /// Bytecode function owning the site.
+        function_id: u32,
+        /// Canonical instruction index in that function.
+        logical_pc: u32,
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Whether this is a store rather than a load.
+        store: bool,
     },
-    /// Probe and commit one source-owned named store without allocating or reentry.
-    /// Outputs are a hit Boolean and stable IC-cell address; a miss has no effect.
-    PropertyStore {
-        /// Owned source identity and settled program from this compilation site.
-        site: Box<MachinePropertySite>,
-        /// Whether scalar typing proves the boxed value cannot be a GC cell,
-        /// allowing emission to omit the conditional generational barrier.
+    /// Prove an ordinary fast object has one expected hidden class. A false
+    /// incoming condition keeps the result false without touching the object.
+    CacheIrGuardShape {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Stable compressed hidden-class token.
+        shape: u32,
+    },
+    /// Prove that an atom's immutable shape slot is not overridden by
+    /// object-local descriptor or exotic state.
+    CacheIrGuardAtomSlot {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Isolate-global atom identity captured in the CacheIR program.
+        atom: u32,
+        /// Byte offset of the guarded value slot.
+        value_byte: u32,
+        /// Whether the terminal operation requires a writable data slot.
+        writable: bool,
+    },
+    /// Read a direct prototype under a prior CacheIR condition.
+    CacheIrLoadPrototype {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+    },
+    /// Prove that an object's direct prototype is null under a prior CacheIR
+    /// condition.
+    CacheIrGuardPrototypeNull {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+    },
+    /// Read one own data field under a complete CacheIR guard chain.
+    CacheIrLoadField {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Byte offset inside the object's value slab.
+        value_byte: u32,
+    },
+    /// Commit one existing own-data field store under a complete CacheIR guard
+    /// chain. The parent address output is valid only for the immediately
+    /// following write barrier and never crosses a safepoint.
+    CacheIrStoreField {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Byte offset inside the receiver's value slab.
+        value_byte: u32,
+    },
+    /// Prove that an append targets the exact next slot, the receiver remains
+    /// extensible, and existing storage has capacity for the write.
+    CacheIrGuardExtensible {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Byte offset of the exact next slot.
+        value_byte: u32,
+    },
+    /// Publish an add-transition's child shape and logical slot length. Every
+    /// miss-capable guard and the value store precedes this no-fail effect.
+    CacheIrPublishShape {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Stable compressed child hidden-class token.
+        shape: u32,
+        /// Logical slot length after publication.
+        new_len: u16,
+        /// Whether to initialize the inline values pointer for slot zero.
+        initialize_inline: bool,
+    },
+    /// Apply the post-store generational/incremental barrier. A false incoming
+    /// condition is a no-op; no miss or exit is possible after the store.
+    CacheIrWriteBarrier {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Scalar typing proves the stored value cannot be a GC cell.
         value_is_non_cell: bool,
+    },
+    /// Try the non-CacheIR dense-array/primitive-string `.length` program.
+    ExoticLength {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+    },
+    /// Copy the completed CacheIR payload/hit pair into the property CFG's
+    /// canonical values before branching to hit or committed cold control.
+    CacheIrJoin {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Whether the source operation is a store.
+        store: bool,
     },
     /// Apply one VM-baked constructor-owned add-property transition.
     ConstructorFieldStore {
@@ -1020,6 +1160,32 @@ pub enum MachineOpcode {
     Fatal,
     /// Function return.
     Return,
+}
+
+impl MachineOpcode {
+    /// Return the complete optimizer-visible effect declaration for an
+    /// explicit CacheIR operation. Non-CacheIR operations return `None` and
+    /// retain their existing family-specific contracts.
+    #[must_use]
+    pub const fn cache_ir_effects(&self) -> Option<MachineCacheIrEffects> {
+        use MachineAliasClass::{GcBarrier, PropertyField, PropertyMetadata, Prototype, Shape};
+        match self {
+            Self::CacheIrGuardShape { .. } => Some(MachineCacheIrEffects::read(Shape)),
+            Self::CacheIrGuardAtomSlot { .. } => {
+                Some(MachineCacheIrEffects::read(PropertyMetadata))
+            }
+            Self::CacheIrLoadPrototype { .. } => Some(MachineCacheIrEffects::read(Prototype)),
+            Self::CacheIrGuardPrototypeNull { .. } => Some(MachineCacheIrEffects::read(Prototype)),
+            Self::CacheIrLoadField { .. } => Some(MachineCacheIrEffects::read(PropertyField)),
+            Self::CacheIrStoreField { .. } => Some(MachineCacheIrEffects::write(PropertyField)),
+            Self::CacheIrGuardExtensible { .. } => {
+                Some(MachineCacheIrEffects::read(PropertyMetadata))
+            }
+            Self::CacheIrPublishShape { .. } => Some(MachineCacheIrEffects::write(Shape)),
+            Self::CacheIrWriteBarrier { .. } => Some(MachineCacheIrEffects::write(GcBarrier)),
+            _ => None,
+        }
+    }
 }
 
 /// Control-flow role of a selected instruction.
@@ -2027,6 +2193,301 @@ impl InstructionSequence {
                     }
                 }
                 match &instruction.opcode {
+                    MachineOpcode::BooleanConstant(_) => {
+                        let [output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::BooleanOr => {
+                        let [left, right, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if [left, right].iter().any(|operand| {
+                            **operand != MachineOperand::register_input(operand.value)
+                                || self.representations[operand.value.0 as usize]
+                                    != MachineRepresentation::Boolean
+                        }) || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::TaggedSelect => {
+                        let [condition, if_true, if_false, output] =
+                            instruction.operands.as_slice()
+                        else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *condition != MachineOperand::register_input(condition.value)
+                            || self.representations[condition.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || [if_true, if_false].iter().any(|operand| {
+                                **operand != MachineOperand::register_input(operand.value)
+                                    || self.representations[operand.value.0 as usize]
+                                        != MachineRepresentation::Tagged
+                            })
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::PropertySource { .. } => {
+                        let [output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrGuardShape { shape, .. } => {
+                        let [object, active, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *shape == 0
+                            || *object != MachineOperand::location_input(object.value)
+                            || self.representations[object.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrGuardAtomSlot {
+                        atom, value_byte, ..
+                    } => {
+                        let [object, active, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *atom == u32::MAX
+                            || *value_byte % 8 != 0
+                            || *object != MachineOperand::location_input(object.value)
+                            || self.representations[object.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrGuardPrototypeNull { .. }
+                    | MachineOpcode::CacheIrGuardExtensible { .. } => {
+                        let [object, active, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if matches!(
+                            &instruction.opcode,
+                            MachineOpcode::CacheIrGuardExtensible { value_byte, .. }
+                                if *value_byte % 8 != 0
+                        ) || *object != MachineOperand::location_input(object.value)
+                            || self.representations[object.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrLoadPrototype { .. }
+                    | MachineOpcode::CacheIrLoadField { .. } => {
+                        let [object, active, payload, hit] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *object != MachineOperand::location_input(object.value)
+                            || self.representations[object.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *payload != MachineOperand::register_output(payload.value)
+                            || self.representations[payload.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *hit != MachineOperand::register_output(hit.value)
+                            || self.representations[hit.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrStoreField { .. } => {
+                        let [object, value, active, owner, hit] = instruction.operands.as_slice()
+                        else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if [object, value].iter().any(|operand| {
+                            **operand != MachineOperand::location_input(operand.value)
+                                || self.representations[operand.value.0 as usize]
+                                    != MachineRepresentation::Tagged
+                        }) || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *owner != MachineOperand::register_output(owner.value)
+                            || self.representations[owner.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || *hit != MachineOperand::register_output(hit.value)
+                            || self.representations[hit.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyStore)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrPublishShape { shape, new_len, .. } => {
+                        let [owner, active] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *shape == 0
+                            || *new_len == 0
+                            || *owner != MachineOperand::location_input(owner.value)
+                            || self.representations[owner.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyStore)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrWriteBarrier { .. } => {
+                        let [owner, value, active] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *owner != MachineOperand::location_input(owner.value)
+                            || self.representations[owner.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || *value != MachineOperand::location_input(value.value)
+                            || self.representations[value.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyStore)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::ExoticLength { .. } => {
+                        let [receiver, payload, hit] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *receiver != MachineOperand::location_input(receiver.value)
+                            || self.representations[receiver.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *payload != MachineOperand::register_output(payload.value)
+                            || self.representations[payload.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *hit != MachineOperand::register_output(hit.value)
+                            || self.representations[hit.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrJoin { store, .. } => {
+                        let valid = if *store {
+                            let [input, output] = instruction.operands.as_slice() else {
+                                return Err(VerificationError::OpcodeSignatureMismatch(id));
+                            };
+                            *input == MachineOperand::register_input(input.value)
+                                && *output == MachineOperand::register_output(output.value)
+                                && [input, output].iter().all(|operand| {
+                                    self.representations[operand.value.0 as usize]
+                                        == MachineRepresentation::Boolean
+                                })
+                        } else {
+                            let [payload, hit, output_payload, output_hit] =
+                                instruction.operands.as_slice()
+                            else {
+                                return Err(VerificationError::OpcodeSignatureMismatch(id));
+                            };
+                            *payload == MachineOperand::register_input(payload.value)
+                                && *hit == MachineOperand::register_input(hit.value)
+                                && *output_payload
+                                    == MachineOperand::register_output(output_payload.value)
+                                && *output_hit == MachineOperand::register_output(output_hit.value)
+                                && self.representations[payload.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                                && self.representations[output_payload.value.0 as usize]
+                                    == MachineRepresentation::Tagged
+                                && self.representations[hit.value.0 as usize]
+                                    == MachineRepresentation::Boolean
+                                && self.representations[output_hit.value.0 as usize]
+                                    == MachineRepresentation::Boolean
+                        };
+                        if !valid
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
                     MachineOpcode::ConstructReceiver { .. }
                     | MachineOpcode::ConstructReceiverHit
                     | MachineOpcode::BaseConstructResult => {
@@ -2501,57 +2962,6 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
-                if matches!(instruction.opcode, MachineOpcode::PropertyLoad { .. }) {
-                    let [receiver, payload, hit, cell] = instruction.operands.as_slice() else {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    };
-                    if *receiver != MachineOperand::location_input(receiver.value)
-                        || self.representations[receiver.value.0 as usize]
-                            != MachineRepresentation::Tagged
-                        || [
-                            (*payload, MachineRepresentation::Tagged),
-                            (*hit, MachineRepresentation::Boolean),
-                            (*cell, MachineRepresentation::Int64),
-                        ]
-                        .iter()
-                        .any(|(operand, repr)| {
-                            *operand != MachineOperand::register_output(operand.value)
-                                || self.representations[operand.value.0 as usize] != *repr
-                        })
-                        || instruction.clobbers
-                            != target_spec.clobbers(TargetClobberSet::PropertyLoad)
-                        || !instruction.exits.is_empty()
-                        || instruction.safepoint.is_some()
-                        || instruction.control != ControlFlow::None
-                    {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    }
-                }
-                if matches!(instruction.opcode, MachineOpcode::PropertyStore { .. }) {
-                    let [receiver, value, hit, cell] = instruction.operands.as_slice() else {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    };
-                    if [receiver, value].iter().any(|operand| {
-                        **operand != MachineOperand::location_input(operand.value)
-                            || self.representations[operand.value.0 as usize]
-                                != MachineRepresentation::Tagged
-                    }) || [
-                        (*hit, MachineRepresentation::Boolean),
-                        (*cell, MachineRepresentation::Int64),
-                    ]
-                    .iter()
-                    .any(|(operand, repr)| {
-                        *operand != MachineOperand::register_output(operand.value)
-                            || self.representations[operand.value.0 as usize] != *repr
-                    }) || instruction.clobbers
-                        != target_spec.clobbers(TargetClobberSet::PropertyStore)
-                        || !instruction.exits.is_empty()
-                        || instruction.safepoint.is_some()
-                        || instruction.control != ControlFlow::None
-                    {
-                        return Err(VerificationError::OpcodeSignatureMismatch(id));
-                    }
-                }
                 if matches!(
                     instruction.opcode,
                     MachineOpcode::ClearPackedDoubleViewCaches(..)
@@ -2824,8 +3234,8 @@ impl InstructionSequence {
                                 && instruction.exits.is_empty()
                                 && inputs.len() == semantic_arity
                                 && (!named_property || self.instructions[..id.0 as usize].iter().any(|producer|
-                                    (if named_store { matches!(producer.opcode, MachineOpcode::PropertyStore { .. }) } else { matches!(producer.opcode, MachineOpcode::PropertyLoad { .. }) })
-                                    && producer.operands.get(3).is_some_and(|cell| cell.value == inputs[cell_index].value)))
+                                    matches!(producer.opcode, MachineOpcode::PropertySource { store, .. } if store == named_store)
+                                    && producer.operands.first().is_some_and(|cell| cell.value == inputs[cell_index].value)))
                                 && inputs.iter().all(|operand| {
                                     **operand == MachineOperand::location_input(operand.value)
                                         && (roots.contains(&operand.value) || (named_property && operand.value == inputs[cell_index].value && self.representations[operand.value.0 as usize] == MachineRepresentation::Int64))
@@ -3012,6 +3422,91 @@ impl InstructionSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_cache_ir_opcode_declares_one_explicit_alias_effect() {
+        use MachineAliasClass::{GcBarrier, PropertyField, PropertyMetadata, Prototype, Shape};
+        let rows = [
+            (
+                MachineOpcode::CacheIrGuardShape {
+                    byte_pc: 0,
+                    shape: 1,
+                },
+                Some(Shape),
+                None,
+            ),
+            (
+                MachineOpcode::CacheIrGuardAtomSlot {
+                    byte_pc: 0,
+                    atom: 1,
+                    value_byte: 0,
+                    writable: false,
+                },
+                Some(PropertyMetadata),
+                None,
+            ),
+            (
+                MachineOpcode::CacheIrLoadPrototype { byte_pc: 0 },
+                Some(Prototype),
+                None,
+            ),
+            (
+                MachineOpcode::CacheIrGuardPrototypeNull { byte_pc: 0 },
+                Some(Prototype),
+                None,
+            ),
+            (
+                MachineOpcode::CacheIrLoadField {
+                    byte_pc: 0,
+                    value_byte: 0,
+                },
+                Some(PropertyField),
+                None,
+            ),
+            (
+                MachineOpcode::CacheIrStoreField {
+                    byte_pc: 0,
+                    value_byte: 0,
+                },
+                None,
+                Some(PropertyField),
+            ),
+            (
+                MachineOpcode::CacheIrGuardExtensible {
+                    byte_pc: 0,
+                    value_byte: 0,
+                },
+                Some(PropertyMetadata),
+                None,
+            ),
+            (
+                MachineOpcode::CacheIrPublishShape {
+                    byte_pc: 0,
+                    shape: 1,
+                    new_len: 1,
+                    initialize_inline: true,
+                },
+                None,
+                Some(Shape),
+            ),
+            (
+                MachineOpcode::CacheIrWriteBarrier {
+                    byte_pc: 0,
+                    value_is_non_cell: false,
+                },
+                None,
+                Some(GcBarrier),
+            ),
+        ];
+        for (opcode, reads, writes) in rows {
+            let effects = opcode.cache_ir_effects().expect("CacheIR effect row");
+            assert_eq!(effects.reads, reads, "{opcode:?}");
+            assert_eq!(effects.writes, writes, "{opcode:?}");
+            assert!(!effects.allocates, "{opcode:?}");
+            assert!(!effects.throws, "{opcode:?}");
+            assert!(!effects.safepoint, "{opcode:?}");
+        }
+    }
 
     #[test]
     fn selectors_do_not_maintain_independent_tagged_root_lists() {

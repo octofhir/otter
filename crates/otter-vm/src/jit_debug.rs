@@ -393,7 +393,7 @@ pub enum JitCompilerDiagnostic {
     },
 }
 
-/// Whether a settled property site reads or writes its slot.
+/// Whether a compiled property CacheIR site reads or writes its slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JitDebugPropertyAccess {
@@ -403,13 +403,13 @@ pub enum JitDebugPropertyAccess {
     Store,
 }
 
-/// One hidden class a property site settled on, and the slot it resolves to.
+/// Entry shape and terminal field summarized from one CacheIR program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct JitDebugPropertyWay {
-    /// Hidden-class handle the receiver must carry for this way to hold.
+pub struct JitDebugPropertyProgram {
+    /// Hidden-class handle the program's first receiver guard requires.
     pub shape: u32,
-    /// Byte offset of the slot in the holder's value slab.
+    /// Byte offset of the program's terminal value field.
     pub value_byte: u32,
 }
 
@@ -482,14 +482,12 @@ pub enum JitDebugEvent {
         /// Completed observations for this site/path/completion in this batch.
         count: u64,
     },
-    /// One property site whose feedback settled into a guard chain the backend
-    /// can emit from immediates, without loading the site's cache cell.
+    /// One property site whose complete immutable CacheIR bank the backend can
+    /// transpile into explicit guards and effects.
     ///
-    /// The way list is the whole declaration a settled site carries: how many
-    /// hidden classes the guard must distinguish, and which slot each one
-    /// resolves to. A site absent from this stream is one the backend still
-    /// serves through its cache cell.
-    PropertySiteSettled {
+    /// A site absent from this stream contains an unsupported program and stays
+    /// on its committed canonical boundary as a whole.
+    PropertyCacheIrSite {
         /// Global bytecode function id containing the site.
         function_id: u32,
         /// Tier the snapshot was baked for.
@@ -498,8 +496,8 @@ pub enum JitDebugEvent {
         byte_pc: u32,
         /// Whether the site reads or writes the slot.
         access: JitDebugPropertyAccess,
-        /// One way per settled hidden class, in installed order.
-        ways: Vec<JitDebugPropertyWay>,
+        /// One summary per immutable CacheIR program, in installed order.
+        programs: Vec<JitDebugPropertyProgram>,
     },
     /// One plain-call inline candidate was made available or rejected by the
     /// VM.

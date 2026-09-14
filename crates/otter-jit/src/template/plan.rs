@@ -281,7 +281,7 @@ pub(crate) enum TemplateOp {
         index: u16,
         value: u16,
     },
-    /// `r<dst> = r<object>.name` through the inline WhiskerIC probe. A miss
+    /// `r<dst> = r<object>.name` through transpiled CacheIR. A miss
     /// completes the VM's full `[[Get]]` semantics in the window transition;
     /// it never exact-side-exits after invoking a getter or proxy trap.
     LoadProperty {
@@ -291,7 +291,7 @@ pub(crate) enum TemplateOp {
         site: u64,
         array_length: bool,
     },
-    /// `r<object>.name = r<value>` through the inline WhiskerIC probe. A miss
+    /// `r<object>.name = r<value>` through transpiled CacheIR. A miss
     /// completes the VM's full `[[Set]]` semantics in the window transition;
     /// it never side-exits after invoking user code or committing a store.
     StoreProperty {

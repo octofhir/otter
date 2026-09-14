@@ -13,9 +13,9 @@
 //! # Invariants
 //! - Every hot function publishes through the scalar Machine IR backend and
 //!   attributes every property region to its source bytecode PC.
-//! - Every Machine property site owns a stable code-object WhiskerIC cell after
-//!   its immutable snapshot program. A miss completes canonically and may fill
-//!   that cell without invalidating the generated body.
+//! - Every Machine property site lowers its immutable CacheIR snapshot to
+//!   ordinary guard, field, and barrier instructions. A miss completes once
+//!   through the canonical cold sibling.
 //! - Accessors fire once, and already committed earlier property effects are
 //!   never replayed through an exact-deopt transition.
 //! - Generated cell stores preserve the collector barrier contract across
@@ -373,23 +373,44 @@ fn assert_machine_property_artifact(
             .any(|region| region["kind"] == "machineScalarFunction"),
         "{function_name} must expose its Machine scalar body: {code_map}"
     );
-    for (kind, minimum) in [
-        ("machinePropertyLoad", minimum_loads),
-        ("machinePropertyStore", minimum_stores),
+    for (kind, cold_kind, minimum) in [
+        (
+            "machineCacheIrLoadField",
+            "machinePropertyLoadCold",
+            minimum_loads,
+        ),
+        (
+            "machineCacheIrStoreField",
+            "machinePropertyStoreCold",
+            minimum_stores,
+        ),
     ] {
-        let matching = regions
+        let generated = regions
             .iter()
             .filter(|region| region["kind"] == kind)
             .collect::<Vec<_>>();
         assert!(
-            matching.len() >= minimum,
-            "{function_name} must expose at least {minimum} {kind} regions: {code_map}"
+            minimum == 0 || !generated.is_empty(),
+            "{function_name} must expose generated {kind} regions: {code_map}"
         );
         assert!(
-            matching
+            generated
                 .iter()
                 .all(|region| region["bytePc"].as_u64().is_some()),
             "{function_name} must attribute every {kind} to bytecode: {code_map}"
+        );
+        let cold = regions
+            .iter()
+            .filter(|region| region["kind"] == cold_kind)
+            .collect::<Vec<_>>();
+        assert!(
+            cold.len() >= minimum,
+            "{function_name} must retain {minimum} committed {cold_kind} siblings: {code_map}"
+        );
+        assert!(
+            cold.iter()
+                .all(|region| region["bytePc"].as_u64().is_some()),
+            "{function_name} must attribute every {cold_kind} to bytecode: {code_map}"
         );
     }
 
@@ -407,7 +428,7 @@ fn assert_machine_property_artifact(
         let matching = relocations
             .iter()
             .filter(|relocation| {
-                relocation["target"]["kind"] == "propertyIcCell"
+                relocation["target"]["kind"] == "propertySourceCell"
                     && relocation["target"]["access"] == access
             })
             .count();
@@ -618,7 +639,7 @@ fn monomorphic_numeric_rmw_uses_machine_properties_without_deopt() {
             compiled.reentrant_stub_transitions
         ),
         (0, 0),
-        "the settled snapshot program must not enter its cold boundary: {compiled:?}"
+        "the immutable snapshot program must not enter its cold boundary: {compiled:?}"
     );
 }
 
@@ -653,7 +674,7 @@ fn two_shape_load_store_and_boolean_existing_slot_stay_generated() {
     );
     assert_eq!(
         compiled.optimized_deopts, 0,
-        "both settled shapes and the Boolean existing slot must hit: {compiled:?}"
+        "both snapshot shapes and the Boolean existing slot must hit: {compiled:?}"
     );
     assert_eq!(
         (
@@ -877,6 +898,6 @@ fn old_parent_young_child_store_survives_full_gc_and_machine_reuse() {
             compiled.reuse.reentrant_stub_transitions
         ),
         (0, 0),
-        "post-GC reuse must stay on the settled program: {compiled:?}"
+        "post-GC reuse must stay on the immutable program: {compiled:?}"
     );
 }

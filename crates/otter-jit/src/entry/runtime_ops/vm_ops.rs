@@ -1,7 +1,7 @@
 //! Property, element, binding, and collection VM slow paths.
 //!
 //! # Contents
-//! - Self-patching property IC cells and miss handlers.
+//! - Immutable property source cells and committed cold handlers.
 //! - Effect-once boxed-span method-call completion.
 //! - Element/global/upvalue/object runtime operations.
 //!
@@ -10,10 +10,10 @@
 //! and named-property entries instead receive fixed boxed-value operands and
 //! return a committed value/exception pair. Method calls copy their complete receiver/argument
 //! packet before reentry. Named operations derive their immutable property
-//! name and feedback site from the immutable source identity in their IC cell;
+//! name and feedback site from the immutable source identity in their source cell;
 //! the published activation supplies execution ownership, not property lookup.
-//! IC cells store the VM-owned `JitPropertyIcWay` directly; the generated stride
-//! derives from that same type. Inline frame recipes belong to the code-owned
+//! Property source cells contain identity only; semantic CacheIR is transpiled
+//! before allocation and cannot be patched into generated code. Inline frame recipes belong to the code-owned
 //! safepoint record selected by the current precise root publication. They
 //! publish descendants only on cold reentry and normalize exceptions before those frames are removed.
 //! Allocating or throwing operations keep precise
@@ -31,66 +31,17 @@ use otter_vm::{
     native_abi::{NativeResultPair, NativeResultStatus},
 };
 
-/// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
-/// always misses to the stub. Four matches the polymorphism most real sites
-/// reach (V8 / JSC use the same width); a bimorphic site (e.g. two object
-/// layouts alternating through one loop) then stays fully inline instead of
-/// thrashing a single cell.
-pub(crate) const IC_WAYS: usize = 4;
-
-/// Byte stride of the VM-owned program, shared by the cell and emitted probes.
-pub(crate) const WHISKER_IC_WAY_BYTES: u32 =
-    std::mem::size_of::<otter_vm::JitPropertyIcWay>() as u32;
-
-/// WhiskerIC self-patching cell for one named-property site (one per
-/// `LoadProperty` / `StoreProperty` op in the compiled function). Emitted code
-/// walks the [`IC_WAYS`] ways comparing each `shape` (a `0` shape never matches
-/// a live receiver, so empty ways are skipped for free); on a hit it reads the
-/// matched way's `value_byte`. On a monomorphic own-data inline-slot miss the
-/// stub fills the next empty way, so a poly site caches every shape it sees up
-/// to the width. The cell holds stable shape offsets and immutable source ids
-/// (no GC pointers), so it needs no tracing. Shape offsets are stable tokens:
-/// shapes are immortal and pinned in old space.
+/// Immutable source identity for one compiled named-property site.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub(crate) struct WhiskerIcCell {
-    ways: [otter_vm::JitPropertyIcWay; IC_WAYS],
-    // Only the cold stub reads this immutable identity. Keep ways first so
-    // generated probes retain the shared VM-owned program layout.
+pub(crate) struct PropertySourceCell {
     source: Option<(u32, u32)>,
 }
 
-impl WhiskerIcCell {
+impl PropertySourceCell {
     /// Set once during emission, before the code object is published.
     pub(crate) fn set_source(&mut self, function_id: u32, instruction_pc: u32) {
         self.source = Some((function_id, instruction_pc));
-    }
-}
-
-/// Self-patch one IC cell with a lowered cache program: fill the first empty
-/// way, or evict way 0 when all are full (the site is more polymorphic than the
-/// cache is wide). The guard token is invalidated before rewriting an occupied
-/// way and published last, so the complete program is installed before its
-/// receiver guard becomes live. Patching and probing belong to the same
-/// isolate thread; this cell is not a cross-thread synchronization primitive.
-///
-/// # Safety
-/// `cell` must be a valid, stable [`WhiskerIcCell`] pointer (a site's cell from
-/// the owning code object's backing slice).
-unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIcWay) {
-    unsafe {
-        let ways = &mut (*cell).ways;
-        let slot = ways
-            .iter()
-            .position(|w| w.receiver_shape == 0 || w.receiver_shape == way.receiver_shape)
-            .unwrap_or(0);
-        ways[slot].receiver_shape = 0;
-        ways[slot].value_byte = way.value_byte;
-        ways[slot].holder_shape = way.holder_shape;
-        ways[slot].transition_shape = way.transition_shape;
-        ways[slot].chain_shape = way.chain_shape;
-        ways[slot].prototype_guard = way.prototype_guard;
-        ways[slot].receiver_shape = way.receiver_shape;
     }
 }
 
@@ -98,13 +49,13 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, way: otter_vm::JitPropertyIc
 ///
 /// The code-owned cell supplies function/logical-PC identity; the VM validates
 /// the opcode and derives its property name and feedback site. Success returns
-/// the loaded value and may patch `cell`. Failure returns either a pure
+/// the loaded value without mutating compiled proof state. Failure returns either a pure
 /// JavaScript exception or a structural Fatal; this boundary never requests
 /// replay or exact deoptimization.
 pub(crate) extern "C" fn jit_load_property_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
-    cell: *mut WhiskerIcCell,
+    cell: *mut PropertySourceCell,
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -113,29 +64,19 @@ pub(crate) extern "C" fn jit_load_property_stub(
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
         let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
-        // Decode immutable recipes before reentry can patch the same IC ways.
-        // No cell reference survives the semantic call.
+        // Decode immutable recipes before reentry. No cell reference survives
+        // the semantic call.
         let mut frames = super::inline_frames::decode(ctx)?;
         let mut call = ctx.runtime_call()?;
         call.with_inline_activations(&mut frames, |call| {
             match call.load_property_value(function_id, pc, Value::from_bits(receiver_bits)) {
-                Ok((value, fill)) => Ok((NativeResultPair::success(value), fill)),
-                Err(error) => call
-                    .take_js_throw(error)
-                    .map(|value| (NativeResultPair::throw_value(value), None)),
+                Ok(value) => Ok(NativeResultPair::success(value)),
+                Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
             }
         })?
     })();
     match result {
-        Ok((pair, fill)) => {
-            if let Some(way) = fill {
-                // SAFETY: stable per-site cell address baked into this code.
-                unsafe {
-                    whisker_ic_fill(cell, way);
-                }
-            }
-            pair
-        }
+        Ok(pair) => pair,
         Err(err) => committed_vm_result(ctx, Err(err)),
     }
 }
@@ -143,14 +84,13 @@ pub(crate) extern "C" fn jit_load_property_stub(
 /// Complete the exact published `StoreProperty` from boxed receiver/value
 /// operands.
 ///
-/// A successful return means the full store committed once and may patch
-/// `cell`; a setter/proxy exception is returned as a pure exception value
-/// without replay.
+/// A successful return means the full store committed once; a setter/proxy
+/// exception is returned as a pure exception value without replay.
 pub(crate) extern "C" fn jit_store_property_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
     value_bits: u64,
-    cell: *mut WhiskerIcCell,
+    cell: *mut PropertySourceCell,
 ) -> NativeResultPair {
     // SAFETY: as `jit_load_property_stub`.
     let ctx = unsafe { &mut *ctx };
@@ -167,23 +107,13 @@ pub(crate) extern "C" fn jit_store_property_stub(
                 Value::from_bits(receiver_bits),
                 Value::from_bits(value_bits),
             ) {
-                Ok(fill) => Ok((NativeResultPair::success(Value::undefined()), fill)),
-                Err(error) => call
-                    .take_js_throw(error)
-                    .map(|value| (NativeResultPair::throw_value(value), None)),
+                Ok(()) => Ok(NativeResultPair::success(Value::undefined())),
+                Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
             }
         })?
     })();
     match result {
-        Ok((pair, fill)) => {
-            if let Some(way) = fill {
-                // SAFETY: stable per-site cell address baked into this code.
-                unsafe {
-                    whisker_ic_fill(cell, way);
-                }
-            }
-            pair
-        }
+        Ok(pair) => pair,
         Err(err) => committed_vm_result(ctx, Err(err)),
     }
 }
@@ -386,13 +316,16 @@ mod tests {
 
     #[test]
     fn named_property_entries_use_fixed_committed_pair_abi() {
-        let _load_abi: extern "C" fn(*mut JitCtx, u64, *mut WhiskerIcCell) -> NativeResultPair =
-            jit_load_property_stub;
+        let _load_abi: extern "C" fn(
+            *mut JitCtx,
+            u64,
+            *mut PropertySourceCell,
+        ) -> NativeResultPair = jit_load_property_stub;
         let _store_abi: extern "C" fn(
             *mut JitCtx,
             u64,
             u64,
-            *mut WhiskerIcCell,
+            *mut PropertySourceCell,
         ) -> NativeResultPair = jit_store_property_stub;
 
         let mut registers = [Value::undefined()];
@@ -426,7 +359,7 @@ mod tests {
             receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
-        let mut cell = WhiskerIcCell::default();
+        let mut cell = PropertySourceCell::default();
 
         let loaded = jit_load_property_stub(&mut ctx, Value::undefined().to_bits(), &mut cell);
         assert_eq!(
@@ -501,33 +434,5 @@ mod tests {
             Some(NativeResultStatus::Fatal)
         );
         assert!(matches!(error, Some(VmError::InvalidOperand)));
-    }
-
-    #[test]
-    fn named_property_cell_fill_keeps_metadata_and_publishes_guard() {
-        let mut cell = WhiskerIcCell::default();
-        // SAFETY: `cell` is a live stable cell owned by this test.
-        unsafe {
-            whisker_ic_fill(
-                &mut cell,
-                otter_vm::JitPropertyIcWay {
-                    receiver_shape: 17,
-                    holder_shape: 23,
-                    value_byte: 40,
-                    transition_shape: 29,
-                    chain_shape: 31,
-                    prototype_guard: otter_vm::jit::JitPropertyIcPrototypeGuard::WritableData,
-                },
-            );
-        }
-        assert_eq!(cell.ways[0].value_byte, 40);
-        assert_eq!(cell.ways[0].holder_shape, 23);
-        assert_eq!(cell.ways[0].transition_shape, 29);
-        assert_eq!(cell.ways[0].chain_shape, 31);
-        assert_eq!(cell.ways[0].receiver_shape, 17);
-        assert_eq!(
-            cell.ways[0].prototype_guard,
-            otter_vm::jit::JitPropertyIcPrototypeGuard::WritableData
-        );
     }
 }

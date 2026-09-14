@@ -461,17 +461,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     generated backedges. Function entry, every OSR trampoline, and every
     external edge into the selected loop start with an empty cache. No loaded
     value or GC reference is cached.
-    Named-property regions first consume any immutable snapshot shape/slot
-    chain, then probe a code-owned `propertyIcCell`, and finally call the fixed
-    boxed-value `jit_load_property_value` / `jit_store_property_value` boundary.
-    The cell caches own/prototype loads, existing-slot stores, and guarded
-    no-allocation add-property transitions. A transition proves the parent
-    shape, complete supported prototype topology, receiver extensibility, and
-    inline slot capacity before publishing the child shape and value. The
-    current transition program covers null prototypes, missing-key chains of
-    at most two fast prototypes, and direct inherited writable data with
-    guarded shape, descriptor state, and no exotic sidecar. Dictionary-backed
-    `%Object.prototype%` additions stay on the canonical store boundary. Runtime success or throw commits exactly
+    Named-property regions transpile immutable CacheIR snapshots into explicit
+    `machineCacheIr*` guards, prototype loads, field accesses, publication, and
+    barrier operations. A code-owned `propertySourceCell` carries only
+    function/logical-PC identity for the fixed boxed-value
+    `jit_load_property_value` / `jit_store_property_value` boundary; it never
+    caches semantic proof data. A generated add transition proves the parent
+    shape, complete supported prototype topology, receiver extensibility, exact
+    append position, and existing storage capacity before storing the value and
+    publishing the child shape. Dictionary and allocation-requiring transitions
+    stay on the canonical store boundary. Runtime success or throw commits exactly
     once; a property miss never deoptimizes and replays the source operation.
     Named loads and stores expose their probe, hit edge,
     `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
@@ -545,7 +544,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Property and global-read cold calls resolve one code-owned safepoint recipe
     through the active registry generation. `safepoints.json` exposes
     `inlineFrames`: slots and entry this/closure/newTarget are spill-root indices, with
-    null meaning undefined. IC cells own property source/programs only.
+    null meaning undefined. Property source cells own identity only; immutable
+    CacheIR snapshots own compiled proof programs.
     Suspended outer root records never supply a callee's recipe; getter/error
     normalization runs before inline frames are removed.
     `deopt.json` records the complete outermost-first caller/callee chain.

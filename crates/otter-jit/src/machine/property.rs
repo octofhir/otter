@@ -1,7 +1,7 @@
 //! Source-owned named-property programs for Machine lowering.
 //!
 //! # Contents
-//! - Immutable source identity and settled receiver/slot proofs per operation.
+//! - Immutable source identity and complete CacheIR programs per operation.
 //! - Snapshot capture before selection loses the callee's compilation context.
 //!
 //! # Invariants
@@ -14,11 +14,11 @@
 //! - `numeric::hir` retains these programs across graph transformations.
 
 use otter_bytecode::Op;
-use otter_vm::{JitCompileSnapshot, JitInlinePropertyLoad};
+use otter_vm::{JitCacheIrProgram, JitCompileSnapshot};
 
 /// Immutable semantic source and generated hit program for a named access.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachinePropertySite {
+pub struct MachineCacheIrSite {
     /// Bytecode owner of the property name and feedback slot.
     pub function_id: u32,
     /// Instruction index in that function.
@@ -26,24 +26,27 @@ pub struct MachinePropertySite {
     /// Encoded source offset, used for artifact attribution.
     pub byte_pc: u32,
     /// Prepared receiver-shape/slot alternatives from this compilation site.
-    pub program: Box<[JitInlinePropertyLoad]>,
+    pub program: Box<[JitCacheIrProgram]>,
 }
 
-impl MachinePropertySite {
+impl MachineCacheIrSite {
     pub(crate) fn capture(view: &JitCompileSnapshot, byte_pc: u32, op: Op) -> Option<Self> {
         let logical_pc = view.instructions.iter().position(|instruction| {
             instruction.byte_pc == byte_pc && instruction.op(&view.code_block) == op
         })?;
-        let programs = match op {
-            Op::LoadProperty => &view.property_loads,
-            Op::StoreProperty => &view.property_stores,
-            _ => return None,
-        };
+        if !matches!(op, Op::LoadProperty | Op::StoreProperty) {
+            return None;
+        }
         Some(Self {
             function_id: view.code_block.id,
             logical_pc: u32::try_from(logical_pc).ok()?,
             byte_pc,
-            program: programs.get(&byte_pc).cloned().unwrap_or_default().into(),
+            program: view
+                .property_programs
+                .get(&byte_pc)
+                .cloned()
+                .unwrap_or_default()
+                .into(),
         })
     }
 }

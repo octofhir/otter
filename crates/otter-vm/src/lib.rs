@@ -291,14 +291,14 @@ pub use handles::{HandleArena, Local, ObjectLayout, PendingValue, PendingValues}
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayLayout, JitBodyGuard, JitClosureCallLayout, JitCodeGenerationSnapshot,
-    JitCodeResidency, JitCollectionLayout, JitCompileError, JitCompileRequest, JitCompileSnapshot,
-    JitCompileStatus, JitCompilerHook, JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee,
-    JitElementAccess, JitElementBase, JitElementFamily, JitElementRepr, JitExecOutcome,
-    JitFunctionCode, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee,
-    JitInlineMethod, JitInlinePropertyHop, JitInlinePropertyLoad, JitInstructionMetadata,
-    JitMapTableLayout, JitPropertyIcWay, JitRuntimeStubBinding, JitStaticNativeCall,
-    JitStringLayout, VmRuntimeActivation,
+    JitArrayLayout, JitBodyGuard, JitCacheIrOp, JitCacheIrProgram, JitClosureCallLayout,
+    JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionLayout, JitCompileError,
+    JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitDirectCallKind,
+    JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase, JitElementFamily,
+    JitElementRepr, JitExecOutcome, JitFunctionCode, JitGuardWidth, JitGuardedMethodCall,
+    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
+    JitMapTableLayout, JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout,
+    VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,

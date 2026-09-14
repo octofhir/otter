@@ -369,23 +369,22 @@ and exact regalloc2 output; its `code-map.json` owns one
 VM keeps the Template code object instead of invoking a second optimizing IR,
 allocator, or emitter.
 
-Scalar Machine bundles attribute direct data access with
-`machineElementLoad`, `machineElementStore`, `machinePropertyLoad`, and
-`machinePropertyStore` regions. Ordinary packed-double arrays instead use
+Scalar Machine bundles attribute direct element access with
+`machineElementLoad` and `machineElementStore` regions. Ordinary packed-double arrays use
 `machinePackedDoubleElementLoad` and `machinePackedDoubleElementStore`. Each
 region carries the source `bytePc`.
-Property regions execute an immutable settled shape/slot chain when one is
-available, then a code-owned `propertyIcCell`, then the fixed boxed-value named
-property boundary. The cell can learn own/prototype loads, existing-slot
-stores, and guarded no-allocation add-property transitions. Transition hits
-prove the parent shape, supported prototype topology, receiver extensibility,
-and inline slot capacity before publishing the child shape and value. The
-current transition program supports null prototypes, missing-key chains of at
-most two fast prototypes, and direct inherited writable data. The latter proves
-the live prototype shape, unmodified descriptor state, and absence of an exotic
-sidecar; deeper prototype links need no guard because the own writable property
-ends `[[Set]]` lookup. Dictionary-backed `%Object.prototype%` additions remain
-canonical.
+Property regions transpile immutable CacheIR programs into
+`machineCacheIrGuardShape`, `machineCacheIrGuardAtomSlot`,
+`machineCacheIrLoadPrototype`, `machineCacheIrGuardPrototypeNull`,
+`machineCacheIrGuardExtensible`, `machineCacheIrLoadField`,
+`machineCacheIrStoreField`, `machineCacheIrPublishShape`, and
+`machineCacheIrWriteBarrier` regions. Unsupported programs use the fixed
+boxed-value boundary as a whole. A code-owned `propertySourceCell` carries only
+function/logical-PC identity for that boundary; it never learns semantic proof
+data. Generated add transitions prove their complete prototype contract,
+receiver extensibility, exact append position, and existing storage capacity
+before storing the value and publishing the child shape. Dictionary transitions
+and other allocation-requiring programs remain canonical.
 Success or throw commits once; named-property misses do not exact-deopt and
 replay the source operation. Both named loads and stores split their generated
 probe/commit and rooted cold call before register allocation. Cold calls expose
@@ -498,7 +497,7 @@ presence of this region never means a cold transition may retain a raw
 receiver pointer. Element and global reads may coexist with the cache only
 when compile-time feedback prepared a generated hit path; an always-slow read
 keeps the loop uncached. Property reads use their generated exotic-length or
-self-patching IC probe and apply the same invalidation on its semantic miss.
+immutable CacheIR program and apply the same invalidation on its semantic miss.
 
 ### Template leaf-inline regions
 
@@ -774,7 +773,7 @@ run the decoder, format assembly, or perform artifact filesystem I/O.
 `relocations.json` uses `offsetBasis: "code.bin"`. Each sorted record describes the exact
 `MOVZ`/`MOVK` range, destination register, emitted chunk shape, and a typed
 symbolic target such as a runtime-stub descriptor, call trampoline, GC cage
-base, property IC cell, or code-owned operand slice. Chunk immediates and
+base, property source cell, or code-owned operand slice. Chunk immediates and
 resolved pointer values are deliberately absent. Typed targets use camel-case
 fields consistently. A direct-call entry-cell target additionally carries the
 planning-time `directCall` generation/layout object shown above while the

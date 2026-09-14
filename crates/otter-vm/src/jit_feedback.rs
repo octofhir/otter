@@ -594,41 +594,23 @@ impl PropertyFeedbackSlot<'_> {
             .flatten()
     }
 
-    pub(crate) fn settled_property_slots(self) -> Option<Vec<(crate::object::ShapeId, u32, u16)>> {
+    /// Copy every installed CacheIR program into owned compile metadata.
+    /// Returning `None` rejects the complete site when any installed program
+    /// contains an unsupported op or an unresolved shape token.
+    pub(crate) fn jit_programs(
+        self,
+        mut resolve_shape: impl FnMut(crate::object::ShapeId) -> Option<u32>,
+    ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
         self.feedback.snapshot(|entry| {
             let stubs = entry.entries();
-            let settled: Vec<_> = stubs
+            if stubs.is_empty() {
+                return None;
+            }
+            stubs
                 .iter()
-                .filter_map(CacheStub::settled_own_slot)
-                .collect();
-            (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
+                .map(|stub| stub.snapshot_for_jit(&mut resolve_shape))
+                .collect()
         })
-    }
-
-    pub(crate) fn settled_prototype_slots(
-        self,
-    ) -> Option<Vec<(crate::object::ShapeId, crate::object::ShapeId, u32, u16)>> {
-        self.feedback.snapshot(|entry| {
-            let stubs = entry.entries();
-            let settled: Vec<_> = stubs
-                .iter()
-                .filter_map(CacheStub::settled_prototype_slot)
-                .collect();
-            (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
-        })
-    }
-
-    pub(crate) fn whisker_fill(
-        self,
-        obj: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
-    ) -> Option<crate::jit::JitPropertyIcWay> {
-        self.feedback
-            .entry()
-            .entries()
-            .iter()
-            .find_map(|stub| stub.lower_jit_way(obj, heap, key))
     }
 }
 

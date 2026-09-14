@@ -175,7 +175,7 @@ fn assert_machine_global_artifact(bundle: &JitArtifactBundle) {
     );
     assert!(
         relocations.iter().all(|relocation| {
-            relocation["target"]["kind"] != "propertyIcCell"
+            relocation["target"]["kind"] != "propertySourceCell"
                 && (relocation["target"]["kind"] != "runtimeStub"
                     || relocation["target"]["name"] == "jit_deopt_rebuild_frames"
                     || relocation["target"]["name"] == "jit_finish_error"

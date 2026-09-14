@@ -377,6 +377,55 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
+error[E0277]: `*const SymbolBody` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const SymbolBody` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const SymbolBody`
+note: required because it appears within the type `PhantomData<*const SymbolBody>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `otter_gc::compressed::Gc<SymbolBody>`
+ --> $WORKSPACE/crates/otter-gc/src/compressed.rs
+  |
+  | pub struct Gc<T: ?Sized> {
+  |            ^^
+note: required because it appears within the type `JsSymbol`
+ --> src/symbol.rs
+  |
+  | pub struct JsSymbol {
+  |            ^^^^^^^^
+note: required because it appears within the type `Option<JsSymbol>`
+ --> $RUST/core/src/option.rs
+  |
+  | pub enum Option<T> {
+  |          ^^^^^^
+note: required because it appears within the type `Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*mut otter_gc::header::GcHeader` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
@@ -587,6 +636,65 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
+error[E0277]: `*const JsStringBody` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const JsStringBody` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const JsStringBody`
+note: required because it appears within the type `PhantomData<*const JsStringBody>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `otter_gc::compressed::Gc<JsStringBody>`
+ --> $WORKSPACE/crates/otter-gc/src/compressed.rs
+  |
+  | pub struct Gc<T: ?Sized> {
+  |            ^^
+note: required because it appears within the type `JsString`
+ --> src/string/mod.rs
+  |
+  | pub struct JsString {
+  |            ^^^^^^^^
+note: required because it appears within the type `Option<JsString>`
+ --> $RUST/core/src/option.rs
+  |
+  | pub enum Option<T> {
+  |          ^^^^^^
+note: required because it appears within the type `JsSymbol`
+ --> src/symbol.rs
+  |
+  | pub struct JsSymbol {
+  |            ^^^^^^^^
+note: required because it appears within the type `Option<JsSymbol>`
+ --> $RUST/core/src/option.rs
+  |
+  | pub enum Option<T> {
+  |          ^^^^^^
+note: required because it appears within the type `Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*const otter_vm::eval_env::EvalEnvBody` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
@@ -630,70 +738,6 @@ note: required because it appears within the type `ActivationStack`
   | pub struct ActivationStack {
   |            ^^^^^^^^^^^^^^^
   = note: required because it appears within the type `&'static mut ActivationStack`
-note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeTurn<'rt> {
-  |                   ^^^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `*const SymbolBody` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const SymbolBody` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*const SymbolBody`
-note: required because it appears within the type `PhantomData<*const SymbolBody>`
- --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `otter_gc::compressed::Gc<SymbolBody>`
- --> $WORKSPACE/crates/otter-gc/src/compressed.rs
-  |
-  | pub struct Gc<T: ?Sized> {
-  |            ^^
-note: required because it appears within the type `JsSymbol`
- --> src/symbol.rs
-  |
-  | pub struct JsSymbol {
-  |            ^^^^^^^^
-note: required because it appears within the type `PhantomData<JsSymbol>`
- --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `alloc::raw_vec::RawVec<JsSymbol>`
- --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
-note: required because it appears within the type `Vec<JsSymbol>`
- --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
-note: required because it appears within the type `WellKnownSymbols`
- --> src/symbol.rs
-  |
-  | pub struct WellKnownSymbols {
-  |            ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
 note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
  --> src/runtime_cx.rs
   |
@@ -775,43 +819,49 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
-error[E0277]: `*const JsStringBody` cannot be sent between threads safely
+error[E0277]: `*const JsClosureBody` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
 6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const JsStringBody` cannot be sent between threads safely
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const JsClosureBody` cannot be sent between threads safely
   |
-  = help: within `otter_gc::compressed::Gc<JsStringBody>`, the trait `Send` is not implemented for `*const JsStringBody`
-note: required because it appears within the type `PhantomData<*const JsStringBody>`
+  = help: within `Vec<otter_vm::constructor_profile::PendingConstructorSample>`, the trait `Send` is not implemented for `*const JsClosureBody`
+note: required because it appears within the type `PhantomData<*const JsClosureBody>`
  --> $RUST/core/src/marker.rs
   |
   | pub struct PhantomData<T: PointeeSized>;
   |            ^^^^^^^^^^^
-note: required because it appears within the type `otter_gc::compressed::Gc<JsStringBody>`
+note: required because it appears within the type `otter_gc::compressed::Gc<JsClosureBody>`
  --> $WORKSPACE/crates/otter-gc/src/compressed.rs
   |
   | pub struct Gc<T: ?Sized> {
   |            ^^
-  = note: required for `Cell<otter_gc::compressed::Gc<JsStringBody>>` to implement `Send`
-note: required because it appears within the type `otter_vm::object::shape_runtime::ShapeKey`
- --> src/object/shape_runtime.rs
+note: required because it appears within the type `Option<otter_gc::compressed::Gc<JsClosureBody>>`
+ --> $RUST/core/src/option.rs
   |
-  | struct ShapeKey {
-  |        ^^^^^^^^
-  = note: required because it appears within the type `(Box<str>, otter_vm::object::shape_runtime::ShapeKey)`
-  = note: required for `hashbrown::raw::RawTable<(Box<str>, otter_vm::object::shape_runtime::ShapeKey)>` to implement `Send`
-note: required because it appears within the type `hashbrown::map::HashMap<Box<str>, otter_vm::object::shape_runtime::ShapeKey, rustc_hash::FxBuildHasher>`
- --> /rust/deps/hashbrown-0.17.1/src/map.rs:182:11
-note: required because it appears within the type `HashMap<Box<str>, otter_vm::object::shape_runtime::ShapeKey, rustc_hash::FxBuildHasher>`
- --> $RUST/std/src/collections/hash/map.rs
+  | pub enum Option<T> {
+  |          ^^^^^^
+note: required because it appears within the type `otter_vm::constructor_profile::PendingConstructorSample`
+ --> src/constructor_profile.rs
   |
-  | pub struct HashMap<
-  |            ^^^^^^^
-note: required because it appears within the type `otter_vm::object::shape_runtime::ShapeRuntime`
- --> src/object/shape_runtime.rs
+  | pub(crate) struct PendingConstructorSample {
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `PhantomData<otter_vm::constructor_profile::PendingConstructorSample>`
+ --> $RUST/core/src/marker.rs
   |
-  | pub(crate) struct ShapeRuntime {
-  |                   ^^^^^^^^^^^^
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `alloc::raw_vec::RawVec<otter_vm::constructor_profile::PendingConstructorSample>`
+ --> $RUST/alloc/src/raw_vec/mod.rs
+  |
+  | pub(crate) struct RawVec<T, A: Allocator = Global> {
+  |                   ^^^^^^
+note: required because it appears within the type `Vec<otter_vm::constructor_profile::PendingConstructorSample>`
+ --> $RUST/alloc/src/vec/mod.rs
+  |
+  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
+  |            ^^^
+  = note: required for `RefCell<Vec<otter_vm::constructor_profile::PendingConstructorSample>>` to implement `Send`
 note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |

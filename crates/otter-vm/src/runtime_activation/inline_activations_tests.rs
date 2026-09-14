@@ -247,7 +247,6 @@ fn inline_activation_validation_and_unwind_leave_caller_published() {
     assert!(failure.is_err());
     assert_eq!(call.function_id(), 0);
     assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
-    drop(call);
     vm.jit_pop_native_activation();
 }
 
@@ -295,7 +294,6 @@ fn inline_activation_nested_scopes_restore_the_same_parent() {
     .unwrap();
     assert_eq!(call.function_id(), 0);
     assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
-    drop(call);
     vm.jit_pop_native_activation();
 }
 

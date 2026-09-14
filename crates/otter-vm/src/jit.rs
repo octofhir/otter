@@ -2198,7 +2198,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 40);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 60);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -2236,6 +2236,26 @@ mod layout_tests {
         assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
             36
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, own_props_byte),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, prototype_shape_byte),
+            44
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, prototype_slot_byte),
+            48
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, learned_instance_fields_byte),
+            52
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, last_instance_byte),
+            56
         );
     }
 

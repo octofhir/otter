@@ -33,6 +33,7 @@
 //! - [`crate::bigint`]
 
 use otter_bytecode::Op;
+use otter_bytecode::scalar_semantics::NumericBinaryOp;
 
 use crate::{
     Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops,
@@ -201,6 +202,80 @@ impl NumericRuntimeOp {
 }
 
 impl Interpreter {
+    /// Execute one shared numeric-binary semantic operation from frame
+    /// registers. The operation identity comes from the bytecode-owned scalar
+    /// descriptor used by every tier; this layer supplies only the canonical
+    /// Number and BigInt kernels.
+    pub(crate) fn run_numeric_binary_regs(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
+        registers: [u16; 3],
+        operation: NumericBinaryOp,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
+    ) -> Result<(), VmError> {
+        let [dst, lhs, rhs] = registers;
+        match operation {
+            NumericBinaryOp::Sub => self.run_numeric_regs(
+                stack,
+                context,
+                top_idx,
+                dst,
+                lhs,
+                rhs,
+                number::sub,
+                bigint_sub_op,
+                feedback,
+            ),
+            NumericBinaryOp::Mul => self.run_numeric_regs(
+                stack,
+                context,
+                top_idx,
+                dst,
+                lhs,
+                rhs,
+                number::mul,
+                bigint_mul_op,
+                feedback,
+            ),
+            NumericBinaryOp::Div => self.run_numeric_regs(
+                stack,
+                context,
+                top_idx,
+                dst,
+                lhs,
+                rhs,
+                number::div,
+                bigint::ops::div,
+                feedback,
+            ),
+            NumericBinaryOp::Rem => self.run_numeric_regs(
+                stack,
+                context,
+                top_idx,
+                dst,
+                lhs,
+                rhs,
+                number::rem,
+                bigint::ops::rem,
+                feedback,
+            ),
+            NumericBinaryOp::Pow => self.run_numeric_regs(
+                stack,
+                context,
+                top_idx,
+                dst,
+                lhs,
+                rhs,
+                number::pow,
+                bigint::ops::pow,
+                feedback,
+            ),
+            NumericBinaryOp::Add => Err(VmError::InvalidOperand),
+        }
+    }
+
     /// Convert both operands of a binary operator through `ToPrimitive`, left
     /// operand first.
     ///

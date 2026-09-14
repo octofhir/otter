@@ -92,6 +92,7 @@ const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
 use crate::template::{
     ACCUMULATOR_DREG, ArithKind, BitwiseKind, CompareKind, FusedArithKind, FusedChainStep,
 };
+use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
 
 /// Emit `Add`/`Sub`/`Mul`/`Div`/`Rem` over tagged numbers.
 ///
@@ -111,13 +112,8 @@ pub(super) fn emit_binary_arith(
     kind: ArithKind,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
-    let opcode = match kind {
-        ArithKind::Sub => Op::Sub,
-        ArithKind::Mul => Op::Mul,
-        ArithKind::Div => Op::Div,
-        ArithKind::Rem => Op::Rem,
-        ArithKind::Pow => Op::Pow,
-    };
+    let semantics = kind.semantics();
+    let opcode = kind.opcode();
     let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, lhs, u64::from(rhs), opcode);
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
@@ -182,6 +178,7 @@ pub(super) fn emit_binary_arith(
             return Ok(());
         }
         ArithKind::Sub | ArithKind::Mul => {}
+        ArithKind::Add => unreachable!("addition has its own template operation"),
     }
     let float_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -205,6 +202,21 @@ pub(super) fn emit_binary_arith(
         ),
         _ => unreachable!("Div/Rem returned above"),
     }
+    if matches!(
+        semantics.int32_result,
+        Int32ResultPolicy::PromoteOverflowOrNegativeZero(
+            NegativeZeroCondition::OppositeOperandSigns
+        )
+    ) {
+        let publish_int32 = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbnz w13, =>publish_int32
+            ; eor w14, w9, w10
+            ; tbnz w14, #31, =>float_path
+            ; =>publish_int32
+        );
+    }
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
@@ -213,6 +225,7 @@ pub(super) fn emit_binary_arith(
     match kind {
         ArithKind::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
         ArithKind::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
+        ArithKind::Add => unreachable!("addition has its own template operation"),
         _ => unreachable!("Div/Rem returned above"),
     }
     emit_box_double(ops, 2, 13);

@@ -132,3 +132,48 @@ JSON.stringify([matches, gets, conversions, concatenated, subtracted, integer(pl
     ), "boxed-call-exit.js").unwrap();
     assert_eq!(exit.completion_string(), "[1,10,2.5]");
 }
+
+#[test]
+fn multiplication_preserves_signed_zero_in_every_compiled_tier() {
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+function mul(pair) { return pair.left * pair.right; }
+var pair = {left: 3, right: 4};
+for (var i = 0; i < 70000; i++) mul(pair);
+function isProduct(left, right, expected) {
+  pair.left = left;
+  pair.right = right;
+  return Object.is(mul(pair), expected);
+}
+[
+  isProduct(1, 0, 0),
+  isProduct(-1, 0, -0),
+  isProduct(1, -0, -0),
+  isProduct(-1, -0, 0),
+  isProduct(0, -1, -0),
+  isProduct(-0, 1, -0),
+  isProduct(-0, -1, 0)
+].join(',');
+"#,
+                ),
+                "jit-multiply-signed-zero.js",
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "true,true,true,true,true,true,true",
+            "{selection:?}"
+        );
+        if matches!(selection, JitSelection::ProductionTiered) {
+            let stats = runtime.execution_stats();
+            assert!(
+                stats.jit_optimized_entries + stats.jit_generated_optimizing_entries > 0,
+                "the production assertion must execute optimizing code"
+            );
+        }
+    }
+}

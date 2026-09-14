@@ -190,23 +190,7 @@ fn visit_inputs(
         } => {
             visit(receiver, true);
             visit(index, false);
-            visit(value, access == NumericElementAccess::Tagged);
-        }
-        GenericElementLoad {
-            receiver, index, ..
-        } => {
-            visit(receiver, true);
-            visit(index, true);
-        }
-        GenericElementStore {
-            receiver,
-            index,
-            value,
-            ..
-        } => {
-            visit(receiver, true);
-            visit(index, true);
-            visit(value, true);
+            visit(value, access != Some(NumericElementAccess::PackedDouble));
         }
         LiteralAllocation {
             argument_start,
@@ -249,7 +233,6 @@ fn visit_inputs(
         | ClassSuperConstructor(value)
         | TaggedToBoolean(value)
         | TaggedNullishEqual { value, .. }
-        | CheckedFloat64ToElementIndex { value, .. }
         | ArrayConstruct { length: value, .. }
         | WidenInt32(value)
         | WidenUint32(value)

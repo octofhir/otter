@@ -713,8 +713,6 @@ pub(crate) fn emit_exotic_length_fast(
 pub(crate) enum DenseIndexForm {
     /// A boxed `Value` whose int32 payload the guard must still prove.
     Tagged,
-    /// A raw int32 the site has already proven by representation.
-    Int32,
 }
 
 /// Whether a family is baked for the indexed-element program.
@@ -790,6 +788,120 @@ where
         ),
     }
     dynasm!(ops ; .arch aarch64 ; ldr x16, [x13, base_byte]);
+    Ok(())
+}
+
+/// Prove an indexed receiver and materialize its current raw element view.
+///
+/// On success `x16` is the element base and `x14` is the zero-extended live
+/// element count. The selected index is deliberately not inspected here:
+/// Machine lowering represents bounds as a separate dependent operation.
+///
+/// Clobbers `x9`, `x11`-`x16`.
+pub(crate) fn emit_element_view<R>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    access: &JitElementAccess,
+    load_receiver: R,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    if matches!(access.base, JitElementBase::InBody { .. }) {
+        return emit_dense_element_view(ops, relocations, view, access, load_receiver, miss);
+    }
+    load_receiver(ops, 9)?;
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64 ; mov w12, w9);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12
+        ; ldrb w14, [x13]
+        ; cmp w14, access.type_tag as u32
+        ; b.ne =>miss
+    );
+    for guard in access.guards.iter().flatten() {
+        emit_body_guard(ops, *guard, miss);
+    }
+    match access.length_width {
+        JitGuardWidth::Byte => dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, access.length_byte]),
+        JitGuardWidth::Word32 => dynasm!(ops ; .arch aarch64 ; ldr w14, [x13, access.length_byte]),
+        JitGuardWidth::Word64 => dynasm!(ops ; .arch aarch64 ; ldr x14, [x13, access.length_byte]),
+    }
+    let shift = access.element.stride_shift();
+    match access.base {
+        JitElementBase::None | JitElementBase::InBody { .. } => {
+            return Err(Unsupported::OperandShape("element view base"));
+        }
+        JitElementBase::ThroughLocalBuffer {
+            storage_tag_byte,
+            local_tag,
+            handle_byte,
+            detached_byte,
+            data_ptr_byte,
+            byte_len_byte,
+            view_offset_byte,
+        } => {
+            dynasm!(ops ; .arch aarch64 ; ldr w15, [x13, storage_tag_byte]);
+            emit_load_u64(ops, 12, u64::from(local_tag));
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp w15, w12
+                ; b.ne =>miss
+                ; ldr w12, [x13, handle_byte]
+                ; cbz w12, =>miss
+            );
+            emit_load_symbol_u64(
+                ops,
+                relocations,
+                11,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x11, x11, x12
+                ; ldrb w15, [x11, detached_byte]
+                ; cbnz w15, =>miss
+                ; ldr x15, [x13, view_offset_byte]
+            );
+            match shift {
+                2 => dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x12, x14, #62
+                    ; cbnz x12, =>miss
+                    ; lsl x12, x14, #2
+                ),
+                _ => dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x12, x14, #61
+                    ; cbnz x12, =>miss
+                    ; lsl x12, x14, #3
+                ),
+            }
+            dynasm!(ops
+                ; .arch aarch64
+                ; adds x12, x15, x12
+                ; b.cs =>miss
+                ; ldr x15, [x11, byte_len_byte]
+                ; cmp x12, x15
+                ; b.hi =>miss
+                ; ldr x16, [x11, data_ptr_byte]
+                ; cbz x16, =>miss
+                ; ldr x15, [x13, view_offset_byte]
+                ; add x16, x16, x15
+            );
+        }
+    }
     Ok(())
 }
 
@@ -872,146 +984,8 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    if matches!(access.base, JitElementBase::InBody { .. }) {
-        emit_dense_element_view(ops, relocations, view, access, load_receiver, miss)?;
-        return emit_element_address_from_dense_view(ops, access, load_index, index_form, miss);
-    }
-    load_receiver(ops, 9)?;
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
-    dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x13, x13, x12        // x13 = GcHeader ptr
-        ; ldrb w14, [x13]
-        ; cmp w14, access.type_tag as u32
-        ; b.ne =>miss
-    );
-    for guard in access.guards.iter().flatten() {
-        emit_body_guard(ops, *guard, miss);
-    }
-    load_index(ops, 15)?;
-    if index_form == DenseIndexForm::Tagged {
-        dynasm!(ops
-            ; .arch aarch64
-            ; lsr x11, x15, #48
-            ; movz x12, NUMBER_TAG_HI16
-            ; cmp x11, x12
-            ; b.ne =>miss          // index is not an int32 payload
-        );
-    }
-    // Bounds. The index is compared unsigned, so a negative int32 becomes a
-    // large positive and misses like any out-of-range read.
-    let length_byte = access.length_byte;
-    match access.length_width {
-        // A count that fits 32 bits compares directly against the index's
-        // 32-bit view; a pointer-width one needs the index zero-extended
-        // first, which is the only reason the two forms differ.
-        JitGuardWidth::Byte => dynasm!(ops
-            ; .arch aarch64
-            ; ldrb w16, [x13, length_byte]
-            ; cmp w15, w16
-            ; b.hs =>miss
-        ),
-        JitGuardWidth::Word32 => dynasm!(ops
-            ; .arch aarch64
-            ; ldr w16, [x13, length_byte]
-            ; cmp w15, w16
-            ; b.hs =>miss
-        ),
-        JitGuardWidth::Word64 => dynasm!(ops
-            ; .arch aarch64
-            ; ldr x16, [x13, length_byte]
-            ; mov w15, w15
-            ; cmp x15, x16
-            ; b.hs =>miss
-        ),
-    }
-    let shift = access.element.stride_shift();
-    match access.base {
-        JitElementBase::None => return Err(Unsupported::OperandShape("element base")),
-        JitElementBase::InBody { byte } => {
-            dynasm!(ops ; .arch aarch64 ; ldr x16, [x13, byte]);
-        }
-        JitElementBase::ThroughLocalBuffer {
-            storage_tag_byte,
-            local_tag,
-            handle_byte,
-            detached_byte,
-            data_ptr_byte,
-            byte_len_byte,
-            view_offset_byte,
-        } => {
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr w14, [x13, storage_tag_byte]
-            );
-            emit_load_u64(ops, 12, u64::from(local_tag));
-            dynasm!(ops
-                ; .arch aarch64
-                ; cmp w14, w12
-                ; b.ne =>miss              // not an in-heap local buffer
-                ; ldr w12, [x13, handle_byte]
-                ; cbz w12, =>miss
-            );
-            emit_load_symbol_u64(
-                ops,
-                relocations,
-                11,
-                view.cage_base as u64,
-                RelocationTarget::GcCageBase,
-            );
-            dynasm!(ops
-                ; .arch aarch64
-                ; add x11, x11, x12        // x11 = buffer GcHeader ptr
-                ; ldrb w14, [x11, detached_byte]
-                ; cbnz w14, =>miss         // a detach leaves the view's length alone
-                ; ldr x14, [x13, view_offset_byte]
-            );
-            // A fixed-length view becomes wholly out of bounds when shrinkage
-            // leaves any part of its original extent outside the backing
-            // buffer. Checking only the selected index would incorrectly keep
-            // an in-prefix element accessible. Reject both the stride shift
-            // and the following offset addition if either overflows `usize`.
-            match shift {
-                2 => dynasm!(ops
-                    ; .arch aarch64
-                    ; lsr x12, x16, #62
-                    ; cbnz x12, =>miss
-                    ; lsl x12, x16, #2
-                ),
-                _ => dynasm!(ops
-                    ; .arch aarch64
-                    ; lsr x12, x16, #61
-                    ; cbnz x12, =>miss
-                    ; lsl x12, x16, #3
-                ),
-            }
-            dynasm!(ops
-                ; .arch aarch64
-                ; adds x12, x14, x12
-                ; b.cs =>miss
-                ; ldr x14, [x11, byte_len_byte]
-                ; cmp x12, x14
-                ; b.hi =>miss
-                ; ldr x16, [x11, data_ptr_byte]
-                ; cbz x16, =>miss
-                ; ldr x14, [x13, view_offset_byte]
-                ; add x16, x16, x14
-            );
-        }
-    }
-    match shift {
-        2 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #2),
-        _ => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #3),
-    }
-    Ok(())
+    emit_element_view(ops, relocations, view, access, load_receiver, miss)?;
+    emit_element_address_from_dense_view(ops, access, load_index, index_form, miss)
 }
 
 /// Read the element whose address [`emit_element_address`] left in `x16` into
@@ -1073,11 +1047,23 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
 /// non-cell value, because a cell would owe the generational write barrier that
 /// only the stub runs. Clobbers `x11`, `x12`, `x14`.
 pub(crate) fn emit_element_write(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
+    emit_element_write_guard(ops, element, miss);
+    emit_element_write_proven(ops, element);
+}
+
+/// Prove that boxed value `x9` is directly storable in `element`.
+///
+/// This helper has no heap effect. It is the reusable guard half used by
+/// decomposed Machine stores before their no-fail write node.
+pub(crate) fn emit_element_write_guard(
+    ops: &mut Assembler,
+    element: JitElementRepr,
+    miss: DynamicLabel,
+) {
     match element {
         JitElementRepr::Boxed => {
             // A heap cell would owe the generational barrier only the stub runs.
             emit_cell_test(ops, 9, 11, CellTest::IsCell, miss);
-            dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
         }
         JitElementRepr::Int32 => {
             // Only a value already boxed as an int32 stores exactly. A double
@@ -1088,7 +1074,6 @@ pub(crate) fn emit_element_write(ops: &mut Assembler, element: JitElementRepr, m
                 ; movz x12, NUMBER_TAG_HI16
                 ; cmp x11, x12
                 ; b.ne =>miss
-                ; str w9, [x16]
             );
         }
         JitElementRepr::Float64 => {
@@ -1105,11 +1090,24 @@ pub(crate) fn emit_element_write(ops: &mut Assembler, element: JitElementRepr, m
                 ; movz x14, NUMBER_TAG_HI16
                 ; cmp x12, x14
                 ; b.eq =>miss              // int32-boxed, not a double
-                ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
-                ; sub x9, x9, x11
-                ; str x9, [x16]
             );
         }
+    }
+}
+
+/// Store boxed value `x9` after [`emit_element_write_guard`] succeeded.
+///
+/// The operation contains no condition or exit. `x16` is the proved address.
+pub(crate) fn emit_element_write_proven(ops: &mut Assembler, element: JitElementRepr) {
+    match element {
+        JitElementRepr::Boxed => dynasm!(ops ; .arch aarch64 ; str x9, [x16]),
+        JitElementRepr::Int32 => dynasm!(ops ; .arch aarch64 ; str w9, [x16]),
+        JitElementRepr::Float64 => dynasm!(ops
+            ; .arch aarch64
+            ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
+            ; sub x9, x9, x11
+            ; str x9, [x16]
+        ),
     }
 }
 

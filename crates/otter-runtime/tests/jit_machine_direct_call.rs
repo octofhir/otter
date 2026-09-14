@@ -808,7 +808,9 @@ struct RunResult {
     completion: String,
     stats: RuntimeExecutionStats,
     used_machine_direct_call: bool,
+    used_machine_inline_call: bool,
     used_machine_method_call: bool,
+    used_machine_inline_method: bool,
     used_machine_method_landing_ack: bool,
     used_machine_construct: bool,
     used_generated_construct: bool,
@@ -876,9 +878,24 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
             })
         })
     };
+    let optimized_ir_has = |needle: &str| {
+        result.jit_artifacts().is_some_and(|batch| {
+            batch.bundles().iter().any(|bundle| {
+                bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .is_some_and(|file| {
+                        file.contents().starts_with(MACHINE_IR_HEADER)
+                            && std::str::from_utf8(file.contents())
+                                .is_ok_and(|text| text.contains(needle))
+                    })
+            })
+        })
+    };
     let used_machine_direct_call = artifact_has("directCallEntryCell", true);
+    let used_machine_inline_call = optimized_ir_has("GuardCallTarget { guard: Plain");
     let used_machine_method_call = artifact_has("\"callKind\": \"method\"", true)
         || artifact_has("\"callKind\":\"method\"", true);
+    let used_machine_inline_method = optimized_ir_has("GuardCallTarget { guard: Method");
     let used_machine_method_landing_ack = result.jit_artifacts().is_some_and(|batch| {
         batch.bundles().iter().any(|bundle| {
             bundle.manifest().function_name() == "landingCaller"
@@ -918,7 +935,9 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         || artifact_has("\"callKind\":\"superConstruct\"", false);
     let used_machine_spread_arguments = artifact_has("\"argumentMode\": \"spread\"", false)
         || artifact_has("\"argumentMode\":\"spread\"", false);
-    let used_machine_constructor_field = code_map_has("machineConstructorFieldTransition");
+    let used_machine_constructor_field = code_map_has("machineCacheIrStoreField")
+        && code_map_has("machineCacheIrPublishShape")
+        && code_map_has("machineCacheIrWriteBarrier");
     let used_machine_class_super_load = code_map_has("machineClassSuperLoad");
     let used_machine_derived_this_bind =
         code_map_has("machineDerivedThisBindFast") && code_map_has("machineDerivedThisBindCold");
@@ -938,7 +957,9 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         completion: result.completion_string().to_owned(),
         stats: runtime.execution_stats(),
         used_machine_direct_call,
+        used_machine_inline_call,
         used_machine_method_call,
+        used_machine_inline_method,
         used_machine_method_landing_ack,
         used_machine_construct,
         used_generated_construct,
@@ -998,20 +1019,24 @@ fn assert_machine_derived_construct(result: &RunResult) {
 fn assert_machine_method_call(result: &RunResult) {
     assert_machine_direct_call(result);
     assert!(
-        result.used_machine_method_call,
-        "fixture must publish a typed Machine IR method-call target"
+        result.used_machine_method_call || result.used_machine_inline_method,
+        "fixture must publish a direct or spliced Machine method target"
     );
 }
 
 fn assert_machine_direct_call(result: &RunResult) {
     assert!(
-        result.stats.jit_generated_calls > 0,
-        "fixture must enter a generated callee; diagnostics={:?}",
+        result.stats.jit_generated_calls > 0
+            || result.used_machine_inline_call
+            || result.used_machine_inline_method,
+        "fixture must enter or splice a generated callee; diagnostics={:?}",
         result.compile_diagnostics
     );
     assert!(
-        result.used_machine_direct_call,
-        "fixture must publish a Machine IR body containing direct linkage: {:?}",
+        result.used_machine_direct_call
+            || result.used_machine_inline_call
+            || result.used_machine_inline_method,
+        "fixture must publish a Machine IR body containing direct linkage or an explicit call-target guard: {:?}",
         result.compile_diagnostics
     );
 }
@@ -1328,8 +1353,8 @@ fn callee_overflow_deopt_resumes_without_replaying_call() {
     assert_eq!(compiled.completion, "[2147483648,42]");
     assert_machine_direct_call(&compiled);
     assert!(
-        compiled.stats.jit_generated_call_deopts > 0,
-        "overflow must resume the already-started generated callee"
+        compiled.stats.jit_generated_call_deopts > 0 || compiled.stats.jit_optimized_deopts > 0,
+        "overflow must resume the generated or spliced callee without replay"
     );
 }
 

@@ -26,7 +26,7 @@ use otter_bytecode::{
     opcode_schema::{ControlFlow, OpcodeEffects, opcode_schema},
 };
 use otter_vm::{
-    JitCompileSnapshot, JitElementBase,
+    JitCompileSnapshot,
     native_abi::{ObjectProtocolValueOp, ScalarValueOp},
 };
 
@@ -117,26 +117,6 @@ fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<Commit
     })
 }
 
-fn has_exact_packed_double_access(
-    view: &JitCompileSnapshot,
-    logical_pc: usize,
-    byte_pc: u32,
-) -> bool {
-    let Ok(logical_pc) = u32::try_from(logical_pc) else {
-        return false;
-    };
-    view.code_block
-        .control_flow()
-        .enclosing_exception_region(logical_pc)
-        .is_none()
-        && view.cage_base != 0
-        && view.element_accesses.get(&byte_pc).is_some_and(|access| {
-            access.type_tag != 0
-                && !matches!(access.base, JitElementBase::None)
-                && packed_double_element_access_is_exact(access)
-        })
-}
-
 /// Whether immutable element metadata proves the exact packed-double family.
 pub(super) fn packed_double_element_access_is_exact(access: &otter_vm::JitElementAccess) -> bool {
     access.is_packed_double_array()
@@ -174,11 +154,6 @@ fn classify_instruction(
                 if view
                     .constructor_field_transitions
                     .contains_key(&instruction.byte_pc) =>
-            {
-                EFFECTS_NONE
-            }
-            Op::LoadElement | Op::StoreElement
-                if has_exact_packed_double_access(view, logical_pc, instruction.byte_pc) =>
             {
                 EFFECTS_NONE
             }

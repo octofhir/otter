@@ -304,7 +304,9 @@ pub(super) fn allocate(
                     instruction: id,
                     safepoint: matches!(
                         operand.purpose,
-                        OperandPurpose::TaggedRoot | OperandPurpose::CellRoot
+                        OperandPurpose::TaggedRoot
+                            | OperandPurpose::RuntimeRoot
+                            | OperandPurpose::CellRoot
                     )
                     .then_some(instruction.safepoint)
                     .flatten(),
@@ -458,7 +460,7 @@ mod tests {
         SafepointId, SafepointKind, TargetClobberSet,
     };
 
-    fn sequence(target: &TargetSpec) -> InstructionSequence {
+    fn sequence_with_root(target: &TargetSpec, runtime_root: bool) -> InstructionSequence {
         let tagged = MachineValue(0);
         let integer = MachineValue(1);
         let result = MachineValue(2);
@@ -473,14 +475,20 @@ mod tests {
         );
         entry_integer.operands[0].constraint =
             OperandConstraint::Fixed(target.integer_argument(1).expect("target argument 1"));
+        let mut roots = vec![MachineOperand::tagged_root(tagged)];
+        if runtime_root {
+            roots.push(MachineOperand::runtime_root(tagged));
+        }
         let mut call = MachineInstruction::plain(
             MachineOpcode::Call(0),
-            vec![
+            [
                 MachineOperand::register_input(tagged),
                 MachineOperand::register_input(tagged),
                 MachineOperand::register_input(tagged),
-                MachineOperand::tagged_root(tagged),
-            ],
+            ]
+            .into_iter()
+            .chain(roots)
+            .collect(),
         );
         call.safepoint = Some(SafepointId(0));
         call.frame_state = Some(0);
@@ -544,6 +552,10 @@ mod tests {
         .expect("valid selected function")
     }
 
+    fn sequence(target: &TargetSpec) -> InstructionSequence {
+        sequence_with_root(target, false)
+    }
+
     #[test]
     fn both_targets_allocate_identical_metadata_contract() {
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
@@ -588,6 +600,22 @@ mod tests {
             }
             AllocatedLocation::Stack(_) => {}
         }
+    }
+
+    #[test]
+    fn runtime_root_retains_the_call_safepoint_identity() {
+        let target = TargetSpec::aarch64();
+        let allocated = sequence_with_root(&target, true)
+            .allocate(&target)
+            .expect("allocation succeeds");
+        let root = allocated
+            .metadata()
+            .iter()
+            .find(|metadata| metadata.purpose == OperandPurpose::RuntimeRoot)
+            .copied()
+            .expect("runtime root metadata");
+        assert_eq!(root.purpose, OperandPurpose::RuntimeRoot);
+        assert_eq!(root.safepoint, Some(SafepointId(0)));
     }
 
     #[test]

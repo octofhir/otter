@@ -646,8 +646,9 @@ fn four_shape_chain_stays_generated_and_abrupt_candidates_do_not_replay() {
     );
     assert!(abrupt_delta.generated_calls >= 3, "{abrupt_delta:?}");
     assert_eq!(
-        abrupt_delta.optimized_deopts, 0,
-        "started-callee completion must not deopt/replay the Machine caller: {abrupt_delta:?}"
+        abrupt_delta.optimized_deopts, abrupt_delta.generated_call_deopts,
+        "only the already-started callee may deopt; the Machine caller must not replay it: \
+         {abrupt_delta:?}"
     );
 }
 

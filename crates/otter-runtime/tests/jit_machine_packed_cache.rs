@@ -9,14 +9,14 @@
 //!   entry into the same code object.
 //!
 //! # Invariants
-//! - Ten direct packed-double sites share exactly four loop-scoped raw views:
+//! - Ten decomposed packed-double sites share exactly four loop-scoped raw views:
 //!   one per receiver and natural loop.
 //! - Function entry, OSR entry, and every external inner-loop entry start from
 //!   cleared raw base words; a cache survives only a generated backedge.
 //! - Cached words are untraced base/length data, never GC roots. A later call
 //!   after moving collection must prove and publish each fresh Array view.
-//! - Supported packed-double inputs execute without a generic element stub or
-//!   an optimizing deoptimization.
+//! - Supported packed-double inputs execute without entering the committed
+//!   element sibling or taking an optimizing deoptimization.
 //!
 //! # See also
 //! - `otter_jit::machine::numeric` owns cache planning, Machine selection, raw
@@ -273,30 +273,26 @@ fn assert_machine_cache_artifact(artifacts: &JitArtifactBatch, module: &str, exp
         "the Machine frame must own exactly four two-word views: {optimized_ir}"
     );
 
-    let load_lines = optimized_ir
+    let view_lines = optimized_ir
         .lines()
-        .filter(|line| line.contains("PackedDoubleElementLoad {"))
+        .filter(|line| line.contains("ElementView {"))
         .collect::<Vec<_>>();
-    let store_lines = optimized_ir
-        .lines()
-        .filter(|line| line.contains("PackedDoubleElementStore {"))
-        .collect::<Vec<_>>();
-    assert_eq!(load_lines.len(), 8, "eight direct FP loads: {optimized_ir}");
-    assert_eq!(store_lines.len(), 2, "two direct FP stores: {optimized_ir}");
-
-    let packed_lines = load_lines
-        .iter()
-        .chain(&store_lines)
-        .copied()
-        .collect::<Vec<_>>();
+    assert_eq!(
+        view_lines.len(),
+        10,
+        "ten receiver-view proofs: {optimized_ir}"
+    );
+    assert_eq!(optimized_ir.matches(" ElementValueLoad {").count(), 8);
+    assert_eq!(optimized_ir.matches(" ElementValueGuard {").count(), 2);
+    assert_eq!(optimized_ir.matches(" ElementValueStore {").count(), 2);
     assert!(
-        packed_lines
+        view_lines
             .iter()
             .all(|line| line.contains("cache: Some(PackedDoubleViewCacheId(")),
         "every packed site must use a persistent loop view: {optimized_ir}"
     );
     let mut sites_per_cache = BTreeMap::<usize, usize>::new();
-    for line in &packed_lines {
+    for line in &view_lines {
         *sites_per_cache.entry(cache_id(line)).or_default() += 1;
     }
     assert_eq!(
@@ -326,8 +322,11 @@ fn assert_machine_cache_artifact(artifacts: &JitArtifactBatch, module: &str, exp
         .as_array()
         .expect("packed-cache code-map regions");
     for (kind, expected_count) in [
-        ("machinePackedDoubleElementLoad", 8),
-        ("machinePackedDoubleElementStore", 2),
+        ("machineElementView", 10),
+        ("machineElementAddress", 10),
+        ("machineElementValueLoad", 8),
+        ("machineElementValueGuard", 2),
+        ("machineElementValueStore", 2),
         ("machinePackedDoubleViewCacheClear", 2),
     ] {
         let matching = regions
@@ -351,23 +350,13 @@ fn assert_machine_cache_artifact(artifacts: &JitArtifactBatch, module: &str, exp
     let relocations = relocations["relocations"]
         .as_array()
         .expect("packed-cache relocations");
-    assert!(
-        relocations.iter().all(|relocation| {
-            relocation["target"]["kind"] != "runtimeStub"
-                || !matches!(
-                    relocation["target"]["name"].as_str(),
-                    Some("jit_load_element" | "jit_store_element")
-                )
-        }),
-        "cached packed sites must not retain generic element stubs: {relocations:?}"
-    );
     assert_eq!(
         relocations
             .iter()
             .filter(|relocation| relocation["target"]["kind"] == "gcCageBase")
             .count(),
-        packed_lines.len(),
-        "each exact-deopt site currently owns one skipped lazy-miss proof; the hot path shares four published views"
+        view_lines.len(),
+        "each receiver-view proof owns one cage relocation while the hot path shares four published views"
     );
 }
 

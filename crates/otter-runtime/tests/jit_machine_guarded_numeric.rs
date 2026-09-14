@@ -1,31 +1,29 @@
 //! Machine IR guarded-number coverage for cold numeric operations and mixed phis.
 //!
 //! # Contents
-//! - A compact Navier-shaped packed-double loop whose accumulator joins the
-//!   first unboxed element with numeric backedges.
+//! - A compact Navier-shaped packed-double loop whose element guards, address
+//!   derivation, load/store effects, and committed cold siblings are explicit.
 //! - Arithmetic and relational operations that remain unseen until after the
 //!   Machine body is published, including exact object/Symbol deoptimization.
 //! - A baseline-prepared element family whose still-unseen multiplication
-//!   supplies a Float64 index, including direct exact-Uint32 conversion and a
-//!   fractional exit before indexed effects.
+//!   supplies a Number index, including exact-Uint32 proof and a committed
+//!   fractional cold completion.
 //! - A packed-double element family whose dynamic index remains tagged,
 //!   including direct int32 hits and exact string/fractional misses.
 //! - A Delta-shaped constructor whose `initialValue || 0` join deliberately
 //!   retains its Template baseline while field transitions stay live.
 //!
 //! # Invariants
-//! - Packed-double loads produce Float64 SSA values and stores consume Float64
-//!   SSA values without a connected `DecodeNumber` / `BoxNumber` round trip.
-//!   Empty-feedback numeric parameter sites still use guarded decodes rather
-//!   than a cold-value exit.
+//! - Element receiver, bounds/address, representation, load/store, and cold
+//!   effects remain separate Machine operations. Empty-feedback numeric
+//!   parameter sites still use guarded decodes rather than a cold-value exit.
 //! - Numeric inputs stay generated; a coercive cell exits at its original
 //!   operation exactly once, and already-committed element effects never replay.
 //! - A packed-array Float64 index is checked at each indexed use. Exact Uint32
 //!   values, including negative zero as property key `"0"`, remain generated;
-//!   fractional values resume the canonical operation without replaying an
-//!   earlier effect.
-//! - A tagged packed-array index proves an int32 payload in generated code;
-//!   every other property-key representation exits before the indexed effect.
+//!   fractional values use the committed canonical sibling without replay.
+//! - A tagged packed-array index proves an exact index in generated code;
+//!   every other property-key representation enters that same cold sibling.
 //! - Constructor field-transition lowering does not force a heterogeneous
 //!   tagged/value join into Machine IR; rejection retains the Template body.
 //!
@@ -658,122 +656,83 @@ fn machine_representation(optimized_ir: &str, value: u32) -> &str {
         .unwrap_or_else(|| panic!("missing representation for {marker} in: {optimized_ir}"))
 }
 
-fn assert_packed_double_element_flow(optimized_ir: &str) {
+fn assert_decomposed_element_flow(
+    optimized_ir: &str,
+    expected_loads: usize,
+    expected_stores: usize,
+) {
     let machine_ir = optimized_ir
         .split_once("allocation target=")
         .map_or(optimized_ir, |(machine_ir, _)| machine_ir);
     let lines = machine_ir.lines().collect::<Vec<_>>();
-    let mut load_outputs = std::collections::BTreeSet::new();
-    let mut store_inputs = std::collections::BTreeSet::new();
-
-    for line in &lines {
-        let operation = if line.contains(" PackedDoubleElementLoad {") {
-            "load"
-        } else if line.contains(" PackedDoubleElementStore {") {
-            "store"
-        } else {
-            continue;
-        };
+    let count = |opcode: &str| {
+        let marker = format!(" {opcode} {{");
+        lines.iter().filter(|line| line.contains(&marker)).count()
+    };
+    let sites = expected_loads + expected_stores;
+    assert_eq!(
+        count("ElementView"),
+        sites,
+        "one view proof per site: {optimized_ir}"
+    );
+    assert_eq!(
+        count("ElementAddress"),
+        sites,
+        "one bounds/address proof per site: {optimized_ir}"
+    );
+    assert_eq!(
+        count("ElementValueLoad"),
+        expected_loads,
+        "one direct load effect per load: {optimized_ir}"
+    );
+    assert_eq!(
+        count("ElementValueGuard"),
+        expected_stores,
+        "one value proof per store: {optimized_ir}"
+    );
+    assert_eq!(
+        count("ElementValueStore"),
+        expected_stores,
+        "one no-fail store effect per store: {optimized_ir}"
+    );
+    for line in lines
+        .iter()
+        .filter(|line| line.contains(" ElementValueLoad {"))
+    {
         let values = machine_values(line);
-        assert!(
-            values.len() >= 3,
-            "packed-double {operation} must expose receiver, index, and payload: {line}"
-        );
-        assert_eq!(
-            machine_representation(machine_ir, values[0]),
-            "Tagged",
-            "packed-double {operation} receiver must retain tagged identity: {line}"
-        );
-        assert!(
-            matches!(
-                machine_representation(machine_ir, values[1]),
-                "Int32" | "Uint32"
-            ),
-            "packed-double {operation} index must be directly addressable: {line}"
-        );
         assert_eq!(
             machine_representation(machine_ir, values[2]),
-            "Float64",
-            "packed-double {operation} payload must remain unboxed: {line}"
+            "Tagged",
+            "the representation-specific load must publish a normal tagged SSA value: {line}"
         );
-        if operation == "load" {
-            load_outputs.insert(values[2]);
-        } else {
-            store_inputs.insert(values[2]);
-        }
     }
-    assert!(
-        !load_outputs.is_empty() && !store_inputs.is_empty(),
-        "Navier Machine IR must contain packed-double loads and stores: {optimized_ir}"
-    );
-    assert!(
-        lines
-            .iter()
-            .all(|line| !line.contains(" ElementLoad(") && !line.contains(" ElementStore(")),
-        "the packed Navier body must not retain generic element opcodes: {optimized_ir}"
-    );
-
-    for line in &lines {
-        let values = machine_values(line);
-        if line.contains(" DecodeNumber ") && values.len() >= 2 {
-            assert!(
-                !load_outputs.contains(&values[0]),
-                "a packed load must not feed DecodeNumber: {line}\n{optimized_ir}"
-            );
-        }
-        if line.contains(" BoxNumber ") && values.len() >= 2 {
-            assert!(
-                !store_inputs.contains(&values[1]),
-                "BoxNumber must not feed a packed store: {line}\n{optimized_ir}"
-            );
-        }
+    for forbidden in [
+        "PackedDoubleElementLoad",
+        "PackedDoubleElementStore",
+        " ElementLoad(",
+        " ElementStore(",
+        "CheckedFloat64ToElementIndex",
+    ] {
+        assert!(
+            !machine_ir.contains(forbidden),
+            "decomposed element IR must not retain {forbidden}: {optimized_ir}"
+        );
     }
 }
 
-fn checked_number_element_byte_pc(optimized_ir: &str, opcode: &str) -> u64 {
+fn element_byte_pcs(optimized_ir: &str, opcode: &str) -> Vec<u64> {
     let machine_ir = optimized_ir
         .split_once("allocation target=")
         .map_or(optimized_ir, |(machine_ir, _)| machine_ir);
-    let lines = machine_ir.lines().collect::<Vec<_>>();
     let opcode_marker = format!(" {opcode} {{ byte_pc: ");
-    for element_line in &lines {
-        if !element_line.contains(&opcode_marker) {
-            continue;
-        }
-        let element = machine_values(element_line);
-        let byte_pc = element_line
-            .split_once(&opcode_marker)
-            .and_then(|(_, tail)| tail.split_once([',', ' ']))
-            .and_then(|(byte_pc, _)| byte_pc.parse::<u64>().ok())
-            .unwrap_or_else(|| panic!("invalid {opcode} byte PC: {element_line}"));
-        let index = *element
-            .get(1)
-            .unwrap_or_else(|| panic!("missing {opcode} index: {element_line}"));
-        let conversion_marker = format!(" CheckedFloat64ToElementIndex({byte_pc})");
-        let Some(conversion) = lines.iter().find(|line| {
-            if !line.contains(&conversion_marker) {
-                return false;
-            }
-            machine_values(line).get(1) == Some(&index)
-        }) else {
-            // The same function may contain constant/integer packed accesses.
-            // This helper selects the one fed by the Number-index conversion.
-            continue;
-        };
-        let conversion_values = machine_values(conversion);
-        assert_eq!(
-            machine_representation(machine_ir, conversion_values[0]),
-            "Float64",
-            "Number index source must stay unboxed: {conversion}"
-        );
-        assert_eq!(
-            machine_representation(machine_ir, conversion_values[1]),
-            "Uint32",
-            "checked Number index must feed direct addressing: {conversion}"
-        );
-        return byte_pc;
-    }
-    panic!("missing checked {opcode} in Number-index Machine IR: {optimized_ir}")
+    machine_ir
+        .lines()
+        .filter_map(|line| {
+            line.split_once(&opcode_marker)
+                .and_then(|(_, tail)| tail.split_once([',', ' ']))
+                .and_then(|(byte_pc, _)| byte_pc.parse::<u64>().ok())
+        })
+        .collect()
 }
 
 fn instruction_byte_pc(bundle: &JitArtifactBundle, opcode: &str) -> u64 {
@@ -814,15 +773,18 @@ fn assert_machine_navier_artifact(artifacts: &JitArtifactBatch) {
         !optimized_ir.contains("ColdValueExit"),
         "empty feedback must use numeric guards, not a cold-value exit: {optimized_ir}"
     );
-    assert_packed_double_element_flow(optimized_ir);
+    assert_decomposed_element_flow(optimized_ir, 3, 2);
 
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"]
         .as_array()
         .expect("guarded Navier code-map regions");
     for kind in [
-        "machinePackedDoubleElementLoad",
-        "machinePackedDoubleElementStore",
+        "machineElementView",
+        "machineElementAddress",
+        "machineElementValueLoad",
+        "machineElementValueGuard",
+        "machineElementValueStore",
     ] {
         let matching = regions
             .iter()
@@ -837,35 +799,31 @@ fn assert_machine_navier_artifact(artifacts: &JitArtifactBatch) {
         );
     }
 
-    let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
-    let relocations = relocations["relocations"]
-        .as_array()
-        .expect("guarded Navier relocations");
-    for forbidden in ["jit_load_element", "jit_store_element"] {
-        assert!(
-            relocations.iter().all(|relocation| {
-                relocation["target"]["kind"] != "runtimeStub"
-                    || relocation["target"]["name"] != forbidden
-            }),
-            "guarded Navier must not retain generic {forbidden}: {relocations:?}"
-        );
-    }
-
     let comparison_byte_pc = instruction_byte_pc(bundle, "GreaterThan");
     let division_byte_pc = instruction_byte_pc(bundle, "Div");
     let deopt = artifact_json(bundle, JitArtifactFileName::Deopt);
     let exits = deopt["exits"]
         .as_array()
         .expect("guarded Navier deopt exits");
+    let frame_states = deopt["frameStates"]
+        .as_array()
+        .expect("guarded Navier frame states");
     for (operation, byte_pc) in [
         ("empty-feedback comparison", comparison_byte_pc),
         ("empty-feedback division", division_byte_pc),
     ] {
         assert!(
-            exits
-                .iter()
-                .flat_map(|exit| exit["frames"].as_array().into_iter().flatten())
-                .any(|frame| frame["bytePc"].as_u64() == Some(byte_pc)),
+            exits.iter().any(|exit| {
+                let frame_state_id = exit["frameStateId"].as_u64();
+                frame_states.iter().any(|state| {
+                    state["id"].as_u64() == frame_state_id
+                        && state["frames"].as_array().is_some_and(|frames| {
+                            frames
+                                .iter()
+                                .any(|frame| frame["bytePc"].as_u64() == Some(byte_pc))
+                        })
+                })
+            }),
             "{operation} must retain its exact pre-operation frame at bytePc={byte_pc}: {deopt}"
         );
     }
@@ -880,21 +838,18 @@ fn assert_packed_navier_artifact(artifacts: &JitArtifactBatch) {
             .contents(),
     )
     .expect("UTF-8 packed Navier optimized IR");
-    assert_packed_double_element_flow(optimized_ir);
-    for forbidden in [" DecodeNumber ", " BoxNumber "] {
-        assert!(
-            !optimized_ir.contains(forbidden),
-            "packed Navier must not round-trip any element payload through {forbidden}: {optimized_ir}"
-        );
-    }
+    assert_decomposed_element_flow(optimized_ir, 3, 1);
 
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"]
         .as_array()
         .expect("packed Navier code-map regions");
     for (kind, expected_count) in [
-        ("machinePackedDoubleElementLoad", 3),
-        ("machinePackedDoubleElementStore", 1),
+        ("machineElementView", 4),
+        ("machineElementAddress", 4),
+        ("machineElementValueLoad", 3),
+        ("machineElementValueGuard", 1),
+        ("machineElementValueStore", 1),
     ] {
         let matching = regions
             .iter()
@@ -912,20 +867,6 @@ fn assert_packed_navier_artifact(artifacts: &JitArtifactBatch) {
             "packed Navier must bytecode-attribute every {kind}: {code_map}"
         );
     }
-
-    let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
-    let relocations = relocations["relocations"]
-        .as_array()
-        .expect("packed Navier relocations");
-    for forbidden in ["jit_load_element", "jit_store_element"] {
-        assert!(
-            relocations.iter().all(|relocation| {
-                relocation["target"]["kind"] != "runtimeStub"
-                    || relocation["target"]["name"] != forbidden
-            }),
-            "packed Navier must not retain generic {forbidden}: {relocations:?}"
-        );
-    }
 }
 
 fn assert_machine_number_index_artifact(artifacts: &JitArtifactBatch) {
@@ -940,9 +881,11 @@ fn assert_machine_number_index_artifact(artifacts: &JitArtifactBatch) {
     for opcode in [
         "DecodeNumber",
         "FloatMul",
-        "CheckedFloat64ToElementIndex",
-        "PackedDoubleElementLoad",
-        "PackedDoubleElementStore",
+        "ElementView",
+        "ElementAddress",
+        "ElementValueLoad",
+        "ElementValueGuard",
+        "ElementValueStore",
         "BoxNumber",
     ] {
         assert!(
@@ -955,95 +898,26 @@ fn assert_machine_number_index_artifact(artifacts: &JitArtifactBatch) {
         "the unseen multiplication must remain guarded Float64 work: {optimized_ir}"
     );
 
-    assert_packed_double_element_flow(optimized_ir);
-    let load_byte_pc = checked_number_element_byte_pc(optimized_ir, "PackedDoubleElementLoad");
-    let store_byte_pc = checked_number_element_byte_pc(optimized_ir, "PackedDoubleElementStore");
+    assert_decomposed_element_flow(optimized_ir, 2, 2);
 
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"]
         .as_array()
         .expect("Number-index code-map regions");
-    for (kind, byte_pc) in [
-        ("machinePackedDoubleElementLoad", load_byte_pc),
-        ("machinePackedDoubleElementStore", store_byte_pc),
+    for (kind, expected) in [
+        ("machineElementValueLoad", 2),
+        ("machineElementValueStore", 2),
+        ("machineCommittedValueEffect", 4),
     ] {
-        assert!(
-            regions.iter().any(|region| {
-                region["kind"] == kind && region["bytePc"].as_u64() == Some(byte_pc)
-            }),
-            "Number-index {kind} must retain bytePc={byte_pc}: {code_map}"
-        );
-    }
-
-    let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
-    let relocations = relocations["relocations"]
-        .as_array()
-        .expect("Number-index relocations");
-    for forbidden in ["jit_load_element", "jit_store_element"] {
-        assert!(
-            relocations.iter().all(|relocation| {
-                relocation["target"]["kind"] != "runtimeStub"
-                    || relocation["target"]["name"] != forbidden
-            }),
-            "Number-index Machine body must not retain {forbidden}: {relocations:?}"
-        );
-    }
-
-    let deopt = artifact_json(bundle, JitArtifactFileName::Deopt);
-    let exits = deopt["exits"].as_array().expect("Number-index deopt exits");
-    for (operation, byte_pc) in [
-        ("Number-index load", load_byte_pc),
-        ("Number-index store", store_byte_pc),
-    ] {
-        assert!(
-            exits
+        assert_eq!(
+            regions
                 .iter()
-                .flat_map(|exit| exit["frames"].as_array().into_iter().flatten())
-                .any(|frame| frame["bytePc"].as_u64() == Some(byte_pc)),
-            "{operation} must retain its exact pre-operation frame: {deopt}"
+                .filter(|region| region["kind"] == kind)
+                .count(),
+            expected,
+            "Number-index body must expose {expected} {kind} regions: {code_map}"
         );
     }
-}
-
-fn tagged_packed_element(optimized_ir: &str, opcode: &str) -> (u64, u32) {
-    let machine_ir = optimized_ir
-        .split_once("allocation target=")
-        .map_or(optimized_ir, |(machine_ir, _)| machine_ir);
-    let opcode_marker = format!(" {opcode} {{ byte_pc: ");
-    let matching = machine_ir
-        .lines()
-        .filter_map(|line| {
-            if !line.contains(&opcode_marker) {
-                return None;
-            }
-            let values = machine_values(line);
-            if values.len() < 3 || machine_representation(machine_ir, values[1]) != "Tagged" {
-                return None;
-            }
-            let byte_pc = line
-                .split_once(&opcode_marker)
-                .and_then(|(_, tail)| tail.split_once([',', ' ']))
-                .and_then(|(byte_pc, _)| byte_pc.parse::<u64>().ok())
-                .unwrap_or_else(|| panic!("invalid tagged-index {opcode} byte PC: {line}"));
-            assert_eq!(
-                machine_representation(machine_ir, values[0]),
-                "Tagged",
-                "tagged-index {opcode} receiver must retain identity: {line}"
-            );
-            assert_eq!(
-                machine_representation(machine_ir, values[2]),
-                "Float64",
-                "tagged-index {opcode} payload must remain unboxed: {line}"
-            );
-            Some((byte_pc, values[2]))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        matching.len(),
-        1,
-        "expected one Tagged-index {opcode}: {optimized_ir}"
-    );
-    matching[0]
 }
 
 fn assert_machine_tagged_index_artifact(artifacts: &JitArtifactBatch) {
@@ -1055,39 +929,17 @@ fn assert_machine_tagged_index_artifact(artifacts: &JitArtifactBatch) {
             .contents(),
     )
     .expect("UTF-8 tagged-index optimized IR");
-    let (load_byte_pc, load_output) =
-        tagged_packed_element(optimized_ir, "PackedDoubleElementLoad");
-    let (store_byte_pc, store_input) =
-        tagged_packed_element(optimized_ir, "PackedDoubleElementStore");
-    assert!(
-        !optimized_ir.contains(" CheckedFloat64ToElementIndex(")
-            && !optimized_ir.contains(" ElementLoad(")
-            && !optimized_ir.contains(" ElementStore("),
-        "a Tagged packed index must use its direct payload guard and no generic element op: {optimized_ir}"
-    );
-    for line in optimized_ir.lines() {
-        let values = machine_values(line);
-        if line.contains(" DecodeNumber ") && values.len() >= 2 {
-            assert_ne!(
-                values[0], load_output,
-                "the packed load must not feed DecodeNumber: {line}\n{optimized_ir}"
-            );
-        }
-        if line.contains(" BoxNumber ") && values.len() >= 2 {
-            assert_ne!(
-                values[1], store_input,
-                "BoxNumber must not feed the packed store: {line}\n{optimized_ir}"
-            );
-        }
-    }
+    assert_decomposed_element_flow(optimized_ir, 1, 1);
+    let load_byte_pc = element_byte_pcs(optimized_ir, "ElementValueLoad")[0];
+    let store_byte_pc = element_byte_pcs(optimized_ir, "ElementValueStore")[0];
 
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"]
         .as_array()
         .expect("tagged-index code-map regions");
     for (kind, byte_pc) in [
-        ("machinePackedDoubleElementLoad", load_byte_pc),
-        ("machinePackedDoubleElementStore", store_byte_pc),
+        ("machineElementValueLoad", load_byte_pc),
+        ("machineElementValueStore", store_byte_pc),
     ] {
         assert!(
             regions.iter().any(|region| {
@@ -1102,35 +954,6 @@ fn assert_machine_tagged_index_artifact(artifacts: &JitArtifactBatch) {
         }),
         "Tagged-index Machine code must not retain generic element regions: {code_map}"
     );
-
-    let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
-    let relocations = relocations["relocations"]
-        .as_array()
-        .expect("tagged-index relocations");
-    for forbidden in ["jit_load_element", "jit_store_element"] {
-        assert!(
-            relocations.iter().all(|relocation| {
-                relocation["target"]["kind"] != "runtimeStub"
-                    || relocation["target"]["name"] != forbidden
-            }),
-            "Tagged-index Machine body must not retain {forbidden}: {relocations:?}"
-        );
-    }
-
-    let deopt = artifact_json(bundle, JitArtifactFileName::Deopt);
-    let exits = deopt["exits"].as_array().expect("tagged-index deopt exits");
-    for (operation, byte_pc) in [
-        ("Tagged-index load", load_byte_pc),
-        ("Tagged-index store", store_byte_pc),
-    ] {
-        assert!(
-            exits
-                .iter()
-                .flat_map(|exit| exit["frames"].as_array().into_iter().flatten())
-                .any(|frame| frame["bytePc"].as_u64() == Some(byte_pc)),
-            "{operation} must retain its exact pre-operation frame: {deopt}"
-        );
-    }
 }
 
 fn prepared_navier(selection: JitSelection, artifacts: bool) -> Runtime {
@@ -1243,7 +1066,7 @@ fn assert_delta_constructor_compiles_with_ordered_fields(artifacts: &JitArtifact
 }
 
 #[test]
-fn packed_navier_keeps_dense_payloads_float64_without_round_trips() {
+fn packed_navier_uses_decomposed_element_effects() {
     let mut oracle = prepared_packed_navier(JitSelection::InterpreterOnly, false);
     let expected = completion(
         &mut oracle,
@@ -1347,7 +1170,7 @@ fn guarded_object_and_symbol_exits_coerce_or_throw_once_without_replay() {
 }
 
 #[test]
-fn guarded_number_element_indices_check_uint32_and_exact_deopt_fractional() {
+fn guarded_number_element_indices_use_direct_or_committed_cold_paths() {
     let mut oracle = prepared_number_index(JitSelection::InterpreterOnly, false);
     let expected_integral = completion(
         &mut oracle,
@@ -1402,7 +1225,8 @@ fn guarded_number_element_indices_check_uint32_and_exact_deopt_fractional() {
     );
     assert_eq!(
         fractional_delta.optimized_deopts, 1,
-        "fractional index must exact-deopt once before one element update: {fractional_delta:?}"
+        "the element operation must commit once before the later numeric result guard exits: \
+         {fractional_delta:?}"
     );
 
     let (negative_zero, negative_zero_delta) = run_with_delta(
@@ -1437,7 +1261,7 @@ fn guarded_number_element_indices_check_uint32_and_exact_deopt_fractional() {
 }
 
 #[test]
-fn tagged_packed_double_indices_hit_int32_and_exact_deopt_other_property_keys() {
+fn tagged_packed_double_indices_use_direct_or_committed_cold_paths() {
     let mut oracle = prepared_tagged_index(JitSelection::InterpreterOnly, false);
     let expected_integral = completion(
         &mut oracle,
@@ -1491,8 +1315,8 @@ fn tagged_packed_double_indices_hit_int32_and_exact_deopt_other_property_keys() 
         "a string index must first enter Machine code: {string_delta:?}"
     );
     assert_eq!(
-        string_delta.optimized_deopts, 1,
-        "a string index must exact-deopt once before one indexed effect: {string_delta:?}"
+        string_delta.optimized_deopts, 0,
+        "a string index must use the committed cold sibling without deopt: {string_delta:?}"
     );
 
     let (fractional, fractional_delta) = run_with_delta(
@@ -1507,7 +1331,8 @@ fn tagged_packed_double_indices_hit_int32_and_exact_deopt_other_property_keys() 
     );
     assert_eq!(
         fractional_delta.optimized_deopts, 1,
-        "a fractional tagged index must exact-deopt once before one indexed effect: {fractional_delta:?}"
+        "the element operation must commit once before the later numeric result guard exits: \
+         {fractional_delta:?}"
     );
 
     let (reuse, reuse_delta) = run_with_delta(

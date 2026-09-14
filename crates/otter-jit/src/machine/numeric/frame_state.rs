@@ -59,8 +59,6 @@ pub(super) enum NumericFrameStatePurpose {
     ExactDeopt,
     /// A committed effect needs complete live tagged roots but no deopt.
     TaggedRoots,
-    /// An effect-once emitter uses the state only to publish source identity.
-    RuntimeMetadata,
 }
 
 pub(super) fn resume_pc(root: &JitCompileSnapshot, function_id: u32, byte_pc: u32) -> Option<u32> {

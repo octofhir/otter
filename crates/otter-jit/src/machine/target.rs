@@ -330,7 +330,9 @@ impl TargetSpec {
                 vec![integer(16)].into_boxed_slice(),
                 (9..=15).map(integer).collect(),
                 [9, 10, 11, 12, 14].map(integer).into(),
-                [0, 2, 4, 9, 10, 11, 12, 13, 14, 15, 16].map(integer).into(),
+                [0, 1, 2, 4, 9, 10, 11, 12, 13, 14, 15, 16]
+                    .map(integer)
+                    .into(),
                 [9, 10].map(integer).into(),
                 [0, 9, 10, 11].map(integer).into(),
                 [integer(16), float(31)].into(),
@@ -519,6 +521,14 @@ mod tests {
             let (gpr, fp) = target.deopt_register_budgets();
             assert!(gpr > 0 && fp > 0);
         }
+    }
+
+    #[test]
+    fn receiver_candidate_results_are_declared_clobbers() {
+        let target = TargetSpec::aarch64();
+        let clobbers = target.clobbers(TargetClobberSet::ConstructReceiver);
+        assert!(clobbers.contains(&PhysicalRegister::integer(0)));
+        assert!(clobbers.contains(&PhysicalRegister::integer(1)));
     }
 
     #[test]

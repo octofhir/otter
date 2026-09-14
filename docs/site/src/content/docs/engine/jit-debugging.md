@@ -142,10 +142,12 @@ never replays prototype lookup or `super(...)`.
 
 Non-simple class-constructor fields and exact ordinary function-constructor
 fields that can append an own data slot remain at their original bytecode
-position. `machineConstructorFieldTransition` identifies the generated
-guard-and-commit region: it proves the receiver and complete ordinary prototype
-chain, publishes the VM-interned child shape into pre-reserved storage, stores
-the live value, and runs the required barriers. Ordinary functions use this
+position. They use the ordinary `machineCacheIrGuardShape`,
+`machineCacheIrGuardExtensible`, `machineCacheIrLoadPrototype`,
+`machineCacheIrGuardPrototypeNull`, `machineCacheIrStoreField`,
+`machineCacheIrPublishShape`, and `machineCacheIrWriteBarrier` regions. The
+complete guard chain precedes the no-fail store, shape publication, and
+barriers. Ordinary functions use this
 path only when `new.target` is the entered function; a distinct ordinary target
 retains the canonical path. Allocation caches only the immutable plan and
 reserved capacity; a guard miss deoptimizes before the source `StoreProperty`
@@ -369,10 +371,11 @@ and exact regalloc2 output; its `code-map.json` owns one
 VM keeps the Template code object instead of invoking a second optimizing IR,
 allocator, or emitter.
 
-Scalar Machine bundles attribute direct element access with
-`machineElementLoad` and `machineElementStore` regions. Ordinary packed-double arrays use
-`machinePackedDoubleElementLoad` and `machinePackedDoubleElementStore`. Each
-region carries the source `bytePc`.
+Scalar Machine bundles express indexed access through `machineElementView`,
+`machineElementAddress`, `machineElementValueLoad`,
+`machineElementValueGuard`, and `machineElementValueStore`. Each region carries
+the source `bytePc`. Misses use `machineCommittedValueEffect` plus explicit
+Success/Throw/Fatal successors; a committed indexed operation is never replayed.
 Property regions transpile immutable CacheIR programs into
 `machineCacheIrGuardShape`, `machineCacheIrGuardAtomSlot`,
 `machineCacheIrLoadPrototype`, `machineCacheIrGuardPrototypeNull`,
@@ -398,23 +401,22 @@ through SSA; protected stores still require HIR exception-operand admission.
 Indexed element regions similarly guard a baked dense layout before direct
 access.
 Packed-double Array regions additionally prove the ordinary receiver's exotic
-state and exact physical storage kind. Their payload remains Float64 across the
-load, arithmetic, and store, with no adjacent Number box/decode, hole test, or
-write barrier. A Float64 index uses an exact Uint32 check: integral values and
-`-0` address directly (`-0` is key 0), while fractional, negative, NaN, or
-out-of-Uint32 values leave before the element access.
+state and exact physical storage kind. `ElementView` publishes the raw base and
+live length, `ElementAddress` proves an exact Uint32 key and bounds, and the
+representation-specific value node performs the load or proves a store. A
+generated load returns tagged payload; later numeric decoding is an independent
+guard. Integral values and `-0` address directly (`-0` is key 0), while
+fractional, negative, NaN, or out-of-Uint32 values select the cold sibling.
 Missing or incompatible direct element metadata does not reject the surrounding
-Machine function. `machineGenericElementLoad` and
-`machineGenericElementStore` identify a fixed boxed-value runtime call with
-precise moving roots and source `bytePc`. The call performs canonical
-`[[Get]]` / `[[Set]]` exactly once and returns either success or a throw;
-there is no post-call deopt that could replay a proxy trap, getter, setter, or
-key coercion. A local-catch generic access currently stays on Template until
-the fast probe and committed cold call are explicit Machine CFG before register
-allocation; the fixed boundary already returns a pure exception value.
+Machine function. `machineCommittedValueEffect` identifies the fixed boxed-value
+runtime call with precise moving roots and source `bytePc`. The call performs
+canonical `[[Get]]` / `[[Set]]` exactly once and feeds explicit
+Success/Throw/Fatal successors; there is no post-call deopt that could replay a
+proxy trap, getter, setter, or key coercion. A local catch receives the pure
+exception SSA value from that CFG.
 When a reducible non-reentrant loop has an invariant packed-double receiver,
-the normalized header reports `packed-double-view-caches=<N>` and packed access
-opcodes name `cache: Some(...)`. The first access proves the complete receiver
+the normalized header reports `packed-double-view-caches=<N>` and `ElementView`
+nodes name `cache: Some(...)`. The first access proves the complete receiver
 and physical layout, then stores only an untraced raw base/length pair in the
 native frame. Later backedge iterations retain that pair while still checking
 the current index and bounds. `machinePackedDoubleViewCacheClear` regions mark

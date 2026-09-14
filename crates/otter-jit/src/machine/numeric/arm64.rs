@@ -105,7 +105,7 @@ use otter_bytecode::opcode_schema::{
 pub(super) mod inline_calls;
 
 use otter_vm::{
-    JitCompileSnapshot, JitElementAccess, UPVALUE_CELL_TYPE_TAG, Value,
+    JitCompileSnapshot, UPVALUE_CELL_TYPE_TAG, Value,
     deopt::DeoptRuntime,
     native_abi::{
         ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
@@ -113,20 +113,19 @@ use otter_vm::{
         STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE,
         STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
         STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY,
-        STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF,
-        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
-        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
+        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
     },
 };
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallDescriptor,
     CallTarget, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
-    InstructionSequence, MachineBindingTarget, MachineFrameLayout, MachineInstructionId,
-    MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation, MachineSafepointSite,
-    MachineSafepointTable, MachineValue, OperandPurpose, PackedDoubleViewCacheId,
-    binding_target_matches_semantics, is_explicit_committed_runtime_call,
+    InstructionSequence, MachineBindingTarget, MachineCallGuard, MachineFrameLayout,
+    MachineInstructionId, MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation,
+    MachineSafepointSite, MachineSafepointTable, MachineValue, OperandPurpose,
+    PackedDoubleViewCacheId, binding_target_matches_semantics, is_explicit_committed_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -145,17 +144,17 @@ use crate::{
         MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
         NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
-        PropertySourceCell, THREAD_OFFSET, TransitionTable, VALUE_HOLE, VALUE_NULL,
-        VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
+        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16, PropertySourceCell, THREAD_OFFSET,
+        TransitionTable, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
         VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, element_access_for, emit_check_shape_identity, emit_dense_element_view,
-        emit_element_address, emit_element_address_from_dense_view, emit_element_read,
-        emit_element_write, emit_exotic_length_fast, emit_load_header, emit_load_object_header,
-        emit_shape_state_guard,
+        DenseIndexForm, element_access_for, emit_check_shape_identity,
+        emit_element_address_from_dense_view, emit_element_read, emit_element_view,
+        emit_element_write_guard, emit_element_write_proven, emit_exotic_length_fast,
+        emit_load_header, emit_load_object_header, emit_shape_state_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_initialize_inline_values_ptr,
@@ -174,15 +173,6 @@ pub(super) const GPR_BUDGET: u16 = AARCH64_DEOPT_GPR_BUDGET;
 pub(super) const FP_BUDGET: u16 = AARCH64_DEOPT_FP_BUDGET;
 const BASE_FIXED_FRAME_BYTES: u32 = AARCH64_BASE_FIXED_FRAME_BYTES;
 const DEOPT_DUMP_BYTES: u32 = (GPR_BUDGET as u32 + FP_BUDGET as u32) * 8;
-const COMMITTED_ELEMENT_CALLER_SAVE_BYTES: u32 = 144;
-const COMMITTED_ELEMENT_ROOT_RECORD_BYTES: u32 = MACHINE_ROOT_RECORD_SIZE;
-const COMMITTED_ELEMENT_COLD_STACK_BYTES: u32 =
-    COMMITTED_ELEMENT_CALLER_SAVE_BYTES + COMMITTED_ELEMENT_ROOT_RECORD_BYTES;
-const COMMITTED_ELEMENT_GPR_SAVE_PAIRS: [(u8, u8, u32); 5] =
-    [(0, 1, 0), (2, 3, 16), (4, 5, 32), (6, 7, 48), (8, 10, 64)];
-const COMMITTED_ELEMENT_FP_SAVE_PAIRS: [(u8, u8, u32); 4] =
-    [(0, 1, 80), (2, 3, 96), (4, 5, 112), (6, 7, 128)];
-const _: () = assert!(COMMITTED_ELEMENT_COLD_STACK_BYTES <= DEOPT_DUMP_BYTES);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SavedFrame {
@@ -229,7 +219,6 @@ pub(super) struct Emission {
     pub(super) relocations: RelocationCapture,
     pub(super) osr_entries: BTreeMap<u32, usize>,
     pub(super) osr_regions: Vec<(u32, usize, usize)>,
-    pub(super) constructor_field_regions: Vec<(u32, usize, usize)>,
     pub(super) structural_regions: Vec<(&'static str, Option<u32>, usize, usize)>,
 }
 
@@ -375,297 +364,6 @@ fn emit_clear_packed_double_view_caches(
         dynasm!(ops ; .arch aarch64 ; str xzr, [sp, base_offset]);
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_packed_double_element_address<R, I>(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    frame: MachineFrameLayout,
-    access: &JitElementAccess,
-    cache: Option<PackedDoubleViewCacheId>,
-    load_receiver: R,
-    load_index: I,
-    index_form: DenseIndexForm,
-    deopt: DynamicLabel,
-) -> Result<(), Unsupported>
-where
-    R: FnOnce(&mut dynasmrt::aarch64::Assembler, u8) -> Result<(), Unsupported>,
-    I: FnOnce(&mut dynasmrt::aarch64::Assembler, u8) -> Result<(), Unsupported>,
-{
-    let Some(cache) = cache else {
-        return emit_element_address(
-            ops,
-            relocations,
-            view,
-            access,
-            load_receiver,
-            load_index,
-            index_form,
-            deopt,
-        );
-    };
-    let (base_offset, length_offset) = packed_double_view_cache_offsets(frame, cache)?;
-    if base_offset > 32_760
-        || length_offset > 32_760
-        || !base_offset.is_multiple_of(8)
-        || !length_offset.is_multiple_of(8)
-    {
-        return Err(Unsupported::OperandShape(
-            "packed-double view-cache access offset",
-        ));
-    }
-    let cached = ops.new_dynamic_label();
-    let ready = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x16, [sp, base_offset]
-        ; cbnz x16, =>cached
-    );
-    emit_dense_element_view(ops, relocations, view, access, load_receiver, deopt)?;
-    // Publish base last. A zero base remains the inactive sentinel even if a
-    // cold proof exits before the pair is complete.
-    dynasm!(ops
-        ; .arch aarch64
-        ; str x14, [sp, length_offset]
-        ; str x16, [sp, base_offset]
-        ; b =>ready
-        ; =>cached
-        ; ldr x14, [sp, length_offset]
-        ; =>ready
-    );
-    emit_element_address_from_dense_view(ops, access, load_index, index_form, deopt)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommittedElementKey {
-    Tagged(MachineValue),
-    Int32(AllocatedLocation),
-    Uint32(AllocatedLocation),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CommittedElementArguments {
-    receiver: MachineValue,
-    key: CommittedElementKey,
-    value: Option<MachineValue>,
-    preserve_caller_bank: bool,
-}
-
-fn committed_element_key(
-    representation: MachineRepresentation,
-    value: MachineValue,
-    location: AllocatedLocation,
-) -> Result<CommittedElementKey, Unsupported> {
-    match representation {
-        MachineRepresentation::Tagged => Ok(CommittedElementKey::Tagged(value)),
-        MachineRepresentation::Int32 => Ok(CommittedElementKey::Int32(location)),
-        MachineRepresentation::Uint32 => Ok(CommittedElementKey::Uint32(location)),
-        _ => Err(Unsupported::OperandShape(
-            "scalar committed element index representation",
-        )),
-    }
-}
-
-fn direct_committed_element_arguments(
-    sequence: &InstructionSequence,
-    instruction: &super::super::MachineInstruction,
-    locations: &[AllocatedLocation],
-    load: bool,
-) -> Result<CommittedElementArguments, Unsupported> {
-    let expected_operands = 3;
-    if instruction.operands.len() < expected_operands || locations.len() < expected_operands {
-        return Err(Unsupported::OperandShape(
-            "scalar committed element operands",
-        ));
-    }
-    let receiver = instruction.operands[0].value;
-    let index = instruction.operands[1].value;
-    let representation = sequence
-        .representations()
-        .get(index.0 as usize)
-        .copied()
-        .ok_or(Unsupported::OperandShape(
-            "scalar committed element index representation",
-        ))?;
-    let key = committed_element_key(representation, index, locations[1])?;
-    let scalar_key_home_survives_cold_entry = match key {
-        CommittedElementKey::Tagged(_) => true,
-        CommittedElementKey::Int32(AllocatedLocation::Stack(_))
-        | CommittedElementKey::Uint32(AllocatedLocation::Stack(_)) => true,
-        CommittedElementKey::Int32(AllocatedLocation::Register(register))
-        | CommittedElementKey::Uint32(AllocatedLocation::Register(register)) => {
-            register.is_integer() && !instruction.clobbers.contains(&register)
-        }
-    };
-    if !scalar_key_home_survives_cold_entry {
-        return Err(Unsupported::OperandShape(
-            "scalar committed element late index home",
-        ));
-    }
-    Ok(CommittedElementArguments {
-        receiver,
-        key,
-        value: (!load).then_some(instruction.operands[2].value),
-        preserve_caller_bank: true,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_committed_element_value_call(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    relocations: &mut RelocationCapture,
-    sequence: &InstructionSequence,
-    frame: MachineFrameLayout,
-    instruction: &super::super::MachineInstruction,
-    id: MachineInstructionId,
-    safepoints: &MachineSafepointTable,
-    deopt_runtime: &DeoptRuntime,
-    arguments: CommittedElementArguments,
-    target: RuntimeStubDescriptor,
-    entry: u64,
-    throw_value: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<u32, Unsupported> {
-    let load = target == STUB_JIT_LOAD_ELEMENT;
-    if !matches!(target, STUB_JIT_LOAD_ELEMENT | STUB_JIT_STORE_ELEMENT)
-        || load != arguments.value.is_none()
-        || sequence
-            .representations()
-            .get(arguments.receiver.0 as usize)
-            .copied()
-            != Some(MachineRepresentation::Tagged)
-        || arguments.value.is_some_and(|value| {
-            sequence.representations().get(value.0 as usize).copied()
-                != Some(MachineRepresentation::Tagged)
-        })
-        || matches!(arguments.key, CommittedElementKey::Tagged(value)
-            if sequence.representations().get(value.0 as usize).copied()
-                != Some(MachineRepresentation::Tagged))
-        || (!arguments.preserve_caller_bank
-            && matches!(
-                arguments.key,
-                CommittedElementKey::Int32(_) | CommittedElementKey::Uint32(_)
-            ))
-    {
-        return Err(Unsupported::OperandShape(
-            "scalar committed element value call",
-        ));
-    }
-    let deopt = instruction.deopt_id().ok_or(Unsupported::OperandShape(
-        "scalar committed element frame state",
-    ))?;
-    let exit = deopt_runtime
-        .exits
-        .get(deopt.0 as usize)
-        .ok_or(Unsupported::OperandShape(
-            "scalar committed element deopt exit",
-        ))?;
-    let logical_pc = *exit.resume_pcs.first().ok_or(Unsupported::OperandShape(
-        "scalar committed element logical PC",
-    ))?;
-    let byte_pc = deopt_runtime
-        .table
-        .lookup(exit.state)
-        .map(|state| state.innermost().byte_pc)
-        .ok_or(Unsupported::OperandShape(
-            "scalar committed element byte PC",
-        ))?;
-    let site = safepoints
-        .site(id)
-        .filter(|site| instruction.safepoint == Some(site.id))
-        .ok_or(Unsupported::OperandShape(
-            "scalar committed element safepoint",
-        ))?;
-
-    // Raw view caches contain host pointers and therefore cannot cross this
-    // reentrant boundary. Canonical moving roots must be saved at the Machine
-    // frame's original SP before the cold-only caller bank changes it.
-    emit_clear_packed_double_view_caches(ops, frame, sequence.packed_double_view_cache_count())?;
-    emit_save_safepoint_roots(ops, frame, site)?;
-    let caller_save_bias = if arguments.preserve_caller_bank {
-        emit_save_committed_element_caller_bank(ops);
-        COMMITTED_ELEMENT_CALLER_SAVE_BYTES
-    } else {
-        0
-    };
-    match arguments.key {
-        CommittedElementKey::Tagged(_) => {}
-        CommittedElementKey::Int32(location) => {
-            emit_load_allocated_integer(ops, frame, location, 2, caller_save_bias)?;
-            // Integer producers define through W registers, but normalize the
-            // upper word explicitly before installing the exact Int32 tag.
-            dynasm!(ops
-                ; .arch aarch64
-                ; mov w2, w2
-                ; movz x16, NUMBER_TAG_HI16, lsl #48
-                ; orr x2, x2, x16
-            );
-        }
-        CommittedElementKey::Uint32(location) => {
-            emit_load_allocated_integer(ops, frame, location, 2, caller_save_bias)?;
-            emit_box_uint32(ops, 2, 2);
-        }
-    }
-    emit_publish_machine_roots_with_bias(ops, frame, site, caller_save_bias)?;
-    let argument_bias = caller_save_bias
-        .checked_add(MACHINE_ROOT_RECORD_SIZE)
-        .ok_or(Unsupported::OperandShape(
-            "scalar committed element argument stack bias",
-        ))?;
-    emit_load_safepoint_root(ops, frame, site, arguments.receiver, 1, argument_bias)?;
-    match arguments.key {
-        CommittedElementKey::Tagged(key) => {
-            emit_load_safepoint_root(ops, frame, site, key, 2, argument_bias)?
-        }
-        CommittedElementKey::Int32(_) | CommittedElementKey::Uint32(_) => {}
-    }
-    if let Some(value) = arguments.value {
-        emit_load_safepoint_root(ops, frame, site, value, 3, argument_bias)?;
-    }
-    emit_load_u64(ops, 15, u64::from(logical_pc));
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
-        ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
-        ; mov x0, x19
-    );
-    emit_load_symbolic_u64(
-        ops,
-        relocations,
-        16,
-        entry,
-        RelocationTarget::runtime_stub(target),
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        // x17 is outside the allocator's bank. Preserve the committed result
-        // while the collector-rewritten canonical homes are restored.
-        ; mov x17, x0
-        ; mov x15, x1
-    );
-    emit_clear_machine_roots(ops);
-    if arguments.preserve_caller_bank {
-        emit_restore_committed_element_caller_bank(ops);
-    }
-    // Reload collector-rewritten roots last: their canonical values must win
-    // over the exact pre-call register bank restored above.
-    emit_reload_safepoint_roots(ops, frame, site)?;
-    // The fixed committed element ABI completes exactly once. A JavaScript
-    // throw is a pure value in x17; structural failures alone use ctx.error.
-    let completed = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz x15, =>completed
-        ; cmp x15, NativeResultStatus::Throw as u32
-        ; b.ne =>fatal
-        ; mov x0, x17
-        ; b =>throw_value
-        ; =>completed
-    );
-    Ok(byte_pc)
 }
 
 fn emit_landing_pad_transfer(
@@ -920,9 +618,13 @@ fn emit_committed_pair_call(
     let semantic_arity = usize::from(*semantic_arity);
     let named_store = *target == STUB_JIT_STORE_PROPERTY;
     let named_property = *target == STUB_JIT_LOAD_PROPERTY || named_store;
+    let element_store = *target == otter_vm::native_abi::STUB_JIT_STORE_ELEMENT;
+    let element = *target == otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT || element_store;
     if !is_explicit_committed_runtime_call(descriptor)
-        || semantic_arity > if named_store { 3 } else { 2 }
-        || (!named_property && target.signature != RuntimeStubSignature::CommittedValue2)
+        || semantic_arity > if named_store || element_store { 3 } else { 2 }
+        || (!named_property
+            && !element
+            && target.signature != RuntimeStubSignature::CommittedValue2)
         || target.result_abi != RuntimeStubResultAbi::NativePair
         || target.result_domain != NativeResultDomain::Committed
         || descriptor.arguments.len() != semantic_arity
@@ -1303,26 +1005,6 @@ fn emit_binding_hit(
     Ok(())
 }
 
-fn emit_save_committed_element_caller_bank(ops: &mut dynasmrt::aarch64::Assembler) {
-    dynasm!(ops ; .arch aarch64 ; sub sp, sp, COMMITTED_ELEMENT_CALLER_SAVE_BYTES);
-    for &(first, second, offset) in &COMMITTED_ELEMENT_GPR_SAVE_PAIRS {
-        dynasm!(ops ; .arch aarch64 ; stp X(first), X(second), [sp, offset as i32]);
-    }
-    for &(first, second, offset) in &COMMITTED_ELEMENT_FP_SAVE_PAIRS {
-        dynasm!(ops ; .arch aarch64 ; stp D(first), D(second), [sp, offset as i32]);
-    }
-}
-
-fn emit_restore_committed_element_caller_bank(ops: &mut dynasmrt::aarch64::Assembler) {
-    for &(first, second, offset) in &COMMITTED_ELEMENT_GPR_SAVE_PAIRS {
-        dynasm!(ops ; .arch aarch64 ; ldp X(first), X(second), [sp, offset as i32]);
-    }
-    for &(first, second, offset) in &COMMITTED_ELEMENT_FP_SAVE_PAIRS {
-        dynasm!(ops ; .arch aarch64 ; ldp D(first), D(second), [sp, offset as i32]);
-    }
-    dynasm!(ops ; .arch aarch64 ; add sp, sp, COMMITTED_ELEMENT_CALLER_SAVE_BYTES);
-}
-
 pub(super) fn emit(
     view: &JitCompileSnapshot,
     sequence: &InstructionSequence,
@@ -1347,8 +1029,6 @@ pub(super) fn emit(
     number_to_int32_entry: u64,
     strict_eq_entry: u64,
     to_boolean_entry: u64,
-    load_element_entry: u64,
-    store_element_entry: u64,
     call_method_value_entry: u64,
     call_with_this_value_entry: u64,
     construct_value_entry: u64,
@@ -1377,7 +1057,6 @@ pub(super) fn emit(
         .map(|_| ops.new_dynamic_label())
         .collect::<Vec<_>>();
     let mut relocations = RelocationCapture::new(capture_artifacts);
-    let mut constructor_field_regions = Vec::new();
     let mut structural_regions = Vec::new();
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
@@ -1578,7 +1257,9 @@ pub(super) fn emit(
             MachineOpcode::TaggedConstant(bits) => {
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
             }
-            MachineOpcode::InlineMethodGuard { ref guard } => {
+            MachineOpcode::GuardCallTarget {
+                guard: MachineCallGuard::Method(ref guard),
+            } => {
                 let start = ops.offset().0;
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
@@ -1594,11 +1275,14 @@ pub(super) fn emit(
                     miss,
                 )?;
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                structural_regions.push(("machineInlineMethodGuard", None, start, ops.offset().0));
+                structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
-            MachineOpcode::InlineCallGuard {
-                function_id,
-                this_mode,
+            MachineOpcode::GuardCallTarget {
+                guard:
+                    MachineCallGuard::Plain {
+                        function_id,
+                        this_mode,
+                    },
             } => {
                 let start = ops.offset().0;
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
@@ -1612,10 +1296,12 @@ pub(super) fn emit(
                     19,
                     miss,
                 );
-                emit_store_allocated_tagged(&mut ops, frame, locations[1], 12, 0)?;
-                structural_regions.push(("machineInlineCallGuard", None, start, ops.offset().0));
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
-            MachineOpcode::InlineConstructGuard { function_id } => {
+            MachineOpcode::GuardCallTarget {
+                guard: MachineCallGuard::Construct { function_id },
+            } => {
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 let callable = ops.new_dynamic_label();
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
@@ -1635,23 +1321,66 @@ pub(super) fn emit(
                 crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
             }
-            MachineOpcode::ConstructReceiver { plan, byte_pc } => {
+            MachineOpcode::ResolveCallThis { this_mode } => {
+                let impossible = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                crate::arm64::inline_guard::emit_inline_this(
+                    &mut ops,
+                    view,
+                    this_mode,
+                    &mut relocations,
+                    19,
+                    impossible,
+                );
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 12, 0)?;
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>impossible ; b =>fatal ; =>done);
+            }
+            MachineOpcode::AllocateObject { plan, byte_pc } => {
                 let start = ops.offset().0;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 2, 0)?;
-                crate::arm64::emit_receiver_probe(&mut ops, &mut relocations, view, plan, 19);
+                crate::arm64::emit_receiver_candidate_probe(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    plan,
+                    19,
+                );
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 1, 0)?;
                 structural_regions.push((
-                    "machineConstructReceiver",
+                    "machineAllocateObject",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::ConstructReceiverHit => {
+            MachineOpcode::AllocationHit => {
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
                 let output = integer_register(locations[1])?;
                 dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; cset W(output), ne);
+            }
+            MachineOpcode::PublishObject { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let hit = integer_register(locations[3])?;
+                dynasm!(ops ; .arch aarch64 ; cbz W(hit), =>miss);
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 2, 0)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 0, 0)?;
+                emit_load_allocated_integer(&mut ops, frame, locations[2], 1, 0)?;
+                crate::arm64::emit_receiver_publication_effect(&mut ops, view, 19);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_tagged(&mut ops, frame, locations[4], 0, 0)?;
+                structural_regions.push((
+                    "machinePublishObject",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::BaseConstructResult => {
                 let ready = ops.new_dynamic_label();
@@ -1746,24 +1475,6 @@ pub(super) fn emit(
                     return Err(Unsupported::OperandShape("numeric ToInt32 leaf ABI"));
                 }
                 emit_float_to_int32_leaf(&mut ops, &mut relocations, number_to_int32_entry);
-            }
-            MachineOpcode::CheckedFloat64ToElementIndex(_) => {
-                let source = float_register(locations[0])?;
-                let destination = integer_register(locations[1])?;
-                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
-                // `fcvtzu` saturates non-finite, negative, fractional, and
-                // out-of-range values away from an exact round trip. Positive
-                // zero and negative zero compare equal, which is the ordinary
-                // Array property-key behavior. The following element bounds
-                // check rejects every converted index outside the live prefix.
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; fcvtzu w16, D(source)
-                    ; ucvtf d31, w16
-                    ; fcmp D(source), d31
-                    ; b.ne =>deopt
-                    ; mov W(destination), w16
-                );
             }
             MachineOpcode::FloatNeg => {
                 let source = float_register(locations[0])?;
@@ -2158,8 +1869,8 @@ pub(super) fn emit(
                 integer_register(locations[1])?,
             ),
             MachineOpcode::BooleanConstant(value) => {
-                emit_load_u64(&mut ops, 9, u64::from(value));
-                emit_store_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                emit_load_u64(&mut ops, 16, u64::from(value));
+                emit_store_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
             }
             MachineOpcode::BooleanOr => {
                 let left = integer_register(locations[0])?;
@@ -2209,11 +1920,11 @@ pub(super) fn emit(
                 emit_load_symbolic_u64(
                     &mut ops,
                     &mut relocations,
-                    9,
+                    16,
                     cell_addr as u64,
                     RelocationTarget::PropertySourceCell { access, ordinal },
                 );
-                emit_store_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
             }
             MachineOpcode::CacheIrGuardShape { byte_pc, shape } => {
                 let start = ops.offset().0;
@@ -2544,186 +2255,188 @@ pub(super) fn emit(
             }
             MachineOpcode::CacheIrJoin { store, .. } => {
                 if store {
-                    emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
-                    emit_store_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                    emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                    emit_store_allocated_integer(&mut ops, frame, locations[1], 16, 0)?;
                 } else {
-                    emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                    emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
-                    emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
-                    emit_store_allocated_integer(&mut ops, frame, locations[3], 9, 0)?;
+                    // These are a parallel pair of SSA copies. Keep both inputs
+                    // in non-allocatable scratch registers until both outputs
+                    // have been materialized; otherwise an output assigned x9
+                    // can be overwritten while loading the second input.
+                    emit_load_allocated_tagged(&mut ops, frame, locations[0], 16, 0)?;
+                    emit_load_allocated_integer(&mut ops, frame, locations[1], 17, 0)?;
+                    emit_store_allocated_tagged(&mut ops, frame, locations[2], 16, 0)?;
+                    emit_store_allocated_integer(&mut ops, frame, locations[3], 17, 0)?;
                 }
             }
-            MachineOpcode::PackedDoubleElementLoad { byte_pc, cache } => {
-                let access =
-                    element_access_for(view, byte_pc)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar packed-double element load access",
-                        ))?;
-                if !super::semantics::packed_double_element_access_is_exact(&access) {
-                    return Err(Unsupported::OperandShape(
-                        "scalar packed-double element load representation",
-                    ));
-                }
-                let index_value = instruction
-                    .operands
-                    .get(1)
-                    .ok_or(Unsupported::OperandShape(
-                        "scalar packed-double element load index",
-                    ))?
-                    .value;
-                let index_form =
-                    dense_index_form(sequence, index_value).ok_or(Unsupported::OperandShape(
-                        "scalar packed-double element load index representation",
-                    ))?;
-                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
-                let start = ops.offset().0;
-                emit_packed_double_element_address(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    frame,
-                    &access,
-                    cache,
-                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
-                    |ops, target| emit_load_allocated_integer(ops, frame, locations[1], target, 0),
-                    index_form,
-                    deopt,
-                )?;
-                let destination = float_register(locations[2])?;
-                dynasm!(ops ; .arch aarch64 ; ldr D(destination), [x16]);
-                structural_regions.push((
-                    "machinePackedDoubleElementLoad",
-                    Some(byte_pc),
-                    start,
-                    ops.offset().0,
-                ));
-            }
-            MachineOpcode::PackedDoubleElementStore { byte_pc, cache } => {
-                let access =
-                    element_access_for(view, byte_pc)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar packed-double element store access",
-                        ))?;
-                if !super::semantics::packed_double_element_access_is_exact(&access) {
-                    return Err(Unsupported::OperandShape(
-                        "scalar packed-double element store representation",
-                    ));
-                }
-                let index_value = instruction
-                    .operands
-                    .get(1)
-                    .ok_or(Unsupported::OperandShape(
-                        "scalar packed-double element store index",
-                    ))?
-                    .value;
-                let index_form =
-                    dense_index_form(sequence, index_value).ok_or(Unsupported::OperandShape(
-                        "scalar packed-double element store index representation",
-                    ))?;
-                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
-                let start = ops.offset().0;
-                emit_packed_double_element_address(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    frame,
-                    &access,
-                    cache,
-                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
-                    |ops, target| emit_load_allocated_integer(ops, frame, locations[1], target, 0),
-                    index_form,
-                    deopt,
-                )?;
-                let source = float_register(locations[2])?;
-                // This is the first and final effect. Every receiver, kind,
-                // index, bounds, and base proof is complete before the store.
-                dynasm!(ops ; .arch aarch64 ; str D(source), [x16]);
-                structural_regions.push((
-                    "machinePackedDoubleElementStore",
-                    Some(byte_pc),
-                    start,
-                    ops.offset().0,
-                ));
-            }
-            MachineOpcode::ElementLoad(byte_pc) => {
+            MachineOpcode::ElementView { byte_pc, cache } => {
                 let access = element_access_for(view, byte_pc)
                     .copied()
-                    .ok_or(Unsupported::OperandShape("scalar element load access"))?;
-                if locations.len() < 3 {
-                    return Err(Unsupported::OperandShape(
-                        "scalar committed element load locations",
-                    ));
-                }
-                let index_value = instruction
-                    .operands
-                    .get(1)
-                    .ok_or(Unsupported::OperandShape("scalar element load index"))?
-                    .value;
-                let index_form = dense_index_form(sequence, index_value).ok_or(
-                    Unsupported::OperandShape("scalar element load index representation"),
-                )?;
-                let start = ops.offset().0;
-                let fast_start = start;
-                let cold = ops.new_dynamic_label();
+                    .ok_or(Unsupported::OperandShape("scalar element view access"))?;
+                let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                emit_element_address(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    &access,
-                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
-                    |ops, target| emit_load_allocated_integer(ops, frame, locations[1], target, 0),
-                    index_form,
-                    cold,
-                )?;
-                emit_element_read(&mut ops, access.element, cold);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
-                dynasm!(ops ; .arch aarch64 ; b =>done);
-                let fast_end = ops.offset().0;
-
-                dynasm!(ops ; .arch aarch64 ; =>cold);
-                let cold_start = ops.offset().0;
-                let arguments =
-                    direct_committed_element_arguments(sequence, instruction, locations, true)?;
-                let semantic_byte_pc = emit_committed_element_value_call(
-                    &mut ops,
-                    &mut relocations,
-                    sequence,
-                    frame,
-                    instruction,
-                    id,
-                    safepoints,
-                    deopt_runtime,
-                    arguments,
-                    STUB_JIT_LOAD_ELEMENT,
-                    load_element_entry,
-                    throw_value,
-                    fatal,
-                )?;
-                if semantic_byte_pc != byte_pc {
-                    return Err(Unsupported::OperandShape(
-                        "scalar committed element load byte PC",
-                    ));
+                let start = ops.offset().0;
+                if let Some(cache) = cache {
+                    let (base_offset, length_offset) =
+                        packed_double_view_cache_offsets(frame, cache)?;
+                    let uncached = ops.new_dynamic_label();
+                    dynasm!(ops ; .arch aarch64 ; ldr x16, [sp, base_offset] ; cbz x16, =>uncached ; ldr x14, [sp, length_offset] ; b >have_view ; =>uncached);
+                    emit_element_view(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        &access,
+                        |ops, target| {
+                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
+                        },
+                        miss,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; str x14, [sp, length_offset] ; str x16, [sp, base_offset] ; have_view:);
+                } else {
+                    emit_element_view(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        &access,
+                        |ops, target| {
+                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
+                        },
+                        miss,
+                    )?;
                 }
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 17, 0)?;
-                let cold_end = ops.offset().0;
+                emit_store_allocated_integer(&mut ops, frame, locations[1], 16, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 14, 0)?;
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
                 dynasm!(ops ; .arch aarch64 ; =>done);
-                let end = ops.offset().0;
-                structural_regions.push(("machineElementLoad", Some(byte_pc), start, end));
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 9, 0)?;
                 structural_regions.push((
-                    "machineElementLoadFast",
+                    "machineElementView",
                     Some(byte_pc),
-                    fast_start,
-                    fast_end,
+                    start,
+                    ops.offset().0,
                 ));
+            }
+            MachineOpcode::ElementAddress { byte_pc } => {
+                let access = element_access_for(view, byte_pc)
+                    .copied()
+                    .ok_or(Unsupported::OperandShape("scalar element address access"))?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let start = ops.offset().0;
+                emit_load_allocated_integer(&mut ops, frame, locations[3], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 14, 0)?;
+                emit_element_address_from_dense_view(
+                    &mut ops,
+                    &access,
+                    |ops, target| emit_load_allocated_integer(ops, frame, locations[2], target, 0),
+                    DenseIndexForm::Tagged,
+                    miss,
+                )?;
+                emit_store_allocated_integer(&mut ops, frame, locations[4], 16, 0)?;
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[5], 9, 0)?;
                 structural_regions.push((
-                    "machineElementLoadCold",
+                    "machineElementAddress",
                     Some(byte_pc),
-                    cold_start,
-                    cold_end,
+                    start,
+                    ops.offset().0,
                 ));
+            }
+            MachineOpcode::ElementValueLoad { byte_pc } => {
+                let access =
+                    element_access_for(view, byte_pc)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar element value load access",
+                        ))?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let start = ops.offset().0;
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                emit_element_read(&mut ops, access.element, miss);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 10, 0)?;
+                structural_regions.push((
+                    "machineElementValueLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::ElementValueGuard { byte_pc } => {
+                let access =
+                    element_access_for(view, byte_pc)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar element value guard access",
+                        ))?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let start = ops.offset().0;
+                emit_load_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                if access.element == otter_vm::JitElementRepr::Boxed {
+                    emit_element_read(&mut ops, access.element, miss);
+                }
+                if access.element != otter_vm::JitElementRepr::Float64 {
+                    emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                    emit_element_write_guard(&mut ops, access.element, miss);
+                }
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 10, 0)?;
+                structural_regions.push((
+                    "machineElementValueGuard",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::ElementValueStore { byte_pc } => {
+                let access =
+                    element_access_for(view, byte_pc)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape(
+                            "scalar element value store access",
+                        ))?;
+                let start = ops.offset().0;
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                match access.element {
+                    otter_vm::JitElementRepr::Float64 => {
+                        let source = float_register(locations[1])?;
+                        dynasm!(ops ; .arch aarch64 ; str D(source), [x16]);
+                    }
+                    _ => {
+                        emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                        emit_element_write_proven(&mut ops, access.element);
+                    }
+                }
+                structural_regions.push((
+                    "machineElementValueStore",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::GuardCondition => {
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
             }
             MachineOpcode::ClearPackedDoubleViewCaches(_) => {
                 let start = ops.offset().0;
@@ -2738,241 +2451,6 @@ pub(super) fn emit(
                     start,
                     ops.offset().0,
                 ));
-            }
-            MachineOpcode::ElementStore(byte_pc) => {
-                let access = element_access_for(view, byte_pc)
-                    .copied()
-                    .ok_or(Unsupported::OperandShape("scalar element store access"))?;
-                if locations.len() < 3 {
-                    return Err(Unsupported::OperandShape(
-                        "scalar committed element store locations",
-                    ));
-                }
-                let index_value = instruction
-                    .operands
-                    .get(1)
-                    .ok_or(Unsupported::OperandShape("scalar element store index"))?
-                    .value;
-                let index_form = dense_index_form(sequence, index_value).ok_or(
-                    Unsupported::OperandShape("scalar element store index representation"),
-                )?;
-                let value = instruction
-                    .operands
-                    .get(2)
-                    .ok_or(Unsupported::OperandShape("scalar element store value"))?;
-                let value_representation = sequence
-                    .representations()
-                    .get(value.value.0 as usize)
-                    .copied()
-                    .ok_or(Unsupported::OperandShape(
-                        "scalar element store value representation",
-                    ))?;
-                let start = ops.offset().0;
-                let fast_start = start;
-                let cold = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                // The address/hole program owns every caller-saved guard
-                // scratch. Preserve the fast-path value in non-allocatable
-                // x17 before entering it; the cold sibling deliberately
-                // ignores this copy and reloads the moving canonical root.
-                emit_load_allocated_tagged(&mut ops, frame, locations[2], 17, 0)?;
-                emit_element_address(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    &access,
-                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
-                    |ops, target| emit_load_allocated_integer(ops, frame, locations[1], target, 0),
-                    index_form,
-                    cold,
-                )?;
-                // A boxed hole is an absent property, so both reads and writes
-                // must prove that the indexed slot already exists before the
-                // generated store can commit its first effect.
-                emit_element_read(&mut ops, access.element, cold);
-                if value_representation != MachineRepresentation::Tagged {
-                    return Err(Unsupported::OperandShape(
-                        "scalar element store tagged value",
-                    ));
-                }
-                dynasm!(ops ; .arch aarch64 ; mov x9, x17);
-                emit_element_write(&mut ops, access.element, cold);
-                dynasm!(ops ; .arch aarch64 ; b =>done);
-                let fast_end = ops.offset().0;
-
-                dynasm!(ops ; .arch aarch64 ; =>cold);
-                let cold_start = ops.offset().0;
-                let arguments =
-                    direct_committed_element_arguments(sequence, instruction, locations, false)?;
-                let semantic_byte_pc = emit_committed_element_value_call(
-                    &mut ops,
-                    &mut relocations,
-                    sequence,
-                    frame,
-                    instruction,
-                    id,
-                    safepoints,
-                    deopt_runtime,
-                    arguments,
-                    STUB_JIT_STORE_ELEMENT,
-                    store_element_entry,
-                    throw_value,
-                    fatal,
-                )?;
-                if semantic_byte_pc != byte_pc {
-                    return Err(Unsupported::OperandShape(
-                        "scalar committed element store byte PC",
-                    ));
-                }
-                let cold_end = ops.offset().0;
-                dynasm!(ops ; .arch aarch64 ; =>done);
-                let end = ops.offset().0;
-                structural_regions.push(("machineElementStore", Some(byte_pc), start, end));
-                structural_regions.push((
-                    "machineElementStoreFast",
-                    Some(byte_pc),
-                    fast_start,
-                    fast_end,
-                ));
-                structural_regions.push((
-                    "machineElementStoreCold",
-                    Some(byte_pc),
-                    cold_start,
-                    cold_end,
-                ));
-            }
-            MachineOpcode::ConstructorFieldStore {
-                byte_pc,
-                ref transition,
-            } => {
-                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
-                let start = ops.offset().0;
-                // x9-x16 are emitter scratch registers, and regalloc may also
-                // place the field value in x9. Preserve the early-use value
-                // in the non-allocatable x17 before the receiver guards
-                // overwrite any allocator-owned scratch home.
-                emit_load_allocated_tagged(&mut ops, frame, locations[1], 17, 0)?;
-                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; movz x11, NUMBER_TAG_HI16, lsl #48
-                    ; orr x11, x11, #0x2
-                    ; tst x9, x11
-                    ; b.ne =>deopt
-                    ; mov w11, w9
-                );
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    12,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; add x13, x12, x11
-                    ; ldrb w16, [x13]
-                    ; cmp w16, OBJECT_BODY_TYPE_TAG
-                    ; b.ne =>deopt
-                    ; ldr w16, [x13, view.object_shape_byte]
-                );
-                emit_load_u64(&mut ops, 15, u64::from(transition.from_shape));
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp w16, w15
-                    ; b.ne =>deopt
-                    // An intervening call in a non-simple constructor may
-                    // freeze `this` after the transition plan was baked.
-                    // Adding an own field to a non-extensible receiver would
-                    // bypass the canonical StoreProperty semantics, so prove
-                    // the live flag before any shape/length mutation.
-                    ; ldrb w16, [x13, view.object_extensible_byte]
-                    ; cbz w16, =>deopt
-                    ; ldrh w16, [x13, view.object_slab_len_byte]
-                    ; cmp w16, transition.slot as u32
-                    ; b.ne =>deopt
-                );
-                // The appended slot must already own a word. Receiver
-                // preparation normally reserves the whole transition program's
-                // capacity, but a receiver can reach this body from any
-                // construct path — a foreign `new.target`, an interpreter
-                // construct, a prepared receiver whose program was cut short —
-                // so the live storage is proved here, before any mutation: a
-                // spilled slab must hold the slot below its capacity and an
-                // inline object must still have an inline word. Anything else
-                // deopts to the canonical store, which grows the slab.
-                let storage_fits = ops.new_dynamic_label();
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr w16, [x13, view.object_slab_handle_byte]
-                    ; cbz w16, >inline_storage
-                    ; add x14, x12, x16
-                    ; ldr w14, [x14, view.object_slab_capacity_byte]
-                    ; cmp w14, transition.slot as u32
-                    ; b.ls =>deopt
-                    ; b =>storage_fits
-                    ; inline_storage:
-                );
-                if u32::from(transition.slot) >= view.object_inline_slot_cap {
-                    dynasm!(ops ; .arch aarch64 ; b =>deopt);
-                }
-                dynasm!(ops ; .arch aarch64 ; =>storage_fits);
-                for &prototype_shape in &transition.prototype_shapes {
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; ldr w11, [x13, view.jit_proto_byte]
-                        ; cbz w11, =>deopt
-                        ; add x13, x12, x11
-                        ; ldrb w16, [x13]
-                        ; cmp w16, OBJECT_BODY_TYPE_TAG
-                        ; b.ne =>deopt
-                        ; ldr w16, [x13, view.object_shape_byte]
-                    );
-                    emit_load_u64(&mut ops, 15, u64::from(prototype_shape));
-                    dynasm!(ops ; .arch aarch64 ; cmp w16, w15 ; b.ne =>deopt);
-                }
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr w11, [x13, view.jit_proto_byte]
-                    ; cbnz w11, =>deopt
-                );
-
-                // Recompute the receiver after walking the prototype chain;
-                // every observable guard precedes the first mutation.
-                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                dynasm!(ops ; .arch aarch64 ; mov w11, w9 ; add x13, x12, x11);
-                emit_load_u64(&mut ops, 14, u64::from(transition.to_shape));
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; str w14, [x13, view.object_shape_byte]
-                    ; mov w15, transition.slot as u32 + 1
-                    ; strh w15, [x13, view.object_slab_len_byte]
-                    ; mov x12, x13
-                );
-                if transition.slot == 0 {
-                    emit_initialize_inline_values_ptr(&mut ops, view, 13, 16);
-                }
-                dynasm!(ops ; .arch aarch64 ; mov x10, x17);
-                dynasm!(ops ; .arch aarch64 ; mov x13, x12);
-                emit_slab_base(&mut ops, view, 13, 14);
-                let slot_byte = u32::from(transition.slot) * 8;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; str x10, [x13, slot_byte]
-                    ; sub sp, sp, #16
-                    ; stp x12, x10, [sp]
-                );
-                // The barrier implementation owns x14-x16 as scratch, so the
-                // raw shape handle must live in a disjoint argument register
-                // if marking makes this call take its slow sibling.
-                emit_load_u64(&mut ops, 3, u64::from(transition.to_shape));
-                emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 3, 19);
-                dynasm!(ops ; .arch aarch64 ; ldp x12, x10, [sp] ; add sp, sp, #16);
-                let value_barrier_done = ops.new_dynamic_label();
-                emit_cell_test(&mut ops, 10, 14, CellTest::IsNotCell, value_barrier_done);
-                emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 10, 19);
-                dynasm!(ops ; .arch aarch64 ; =>value_barrier_done);
-                constructor_field_regions.push((byte_pc, start, ops.offset().0));
             }
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;
@@ -3722,80 +3200,6 @@ pub(super) fn emit(
                         }
                         continue;
                     }
-                    if let CallTarget::RuntimeStub(target) = descriptor.target
-                        && matches!(target, STUB_JIT_LOAD_ELEMENT | STUB_JIT_STORE_ELEMENT)
-                    {
-                        let load = target == STUB_JIT_LOAD_ELEMENT;
-                        let argument_count = if load { 2 } else { 3 };
-                        if descriptor.arguments.len() != argument_count
-                            || locations.len() < argument_count + usize::from(load)
-                        {
-                            return Err(Unsupported::OperandShape(
-                                "scalar generic element value call",
-                            ));
-                        }
-                        let start = ops.offset().0;
-                        let argument_values = instruction
-                            .operands
-                            .iter()
-                            .take(argument_count)
-                            .map(|operand| operand.value)
-                            .collect::<Vec<_>>();
-                        let arguments = CommittedElementArguments {
-                            receiver: argument_values[0],
-                            key: CommittedElementKey::Tagged(argument_values[1]),
-                            value: if load { None } else { Some(argument_values[2]) },
-                            preserve_caller_bank: false,
-                        };
-                        let entry = if load {
-                            load_element_entry
-                        } else {
-                            store_element_entry
-                        };
-                        let byte_pc = emit_committed_element_value_call(
-                            &mut ops,
-                            &mut relocations,
-                            sequence,
-                            frame,
-                            instruction,
-                            id,
-                            safepoints,
-                            deopt_runtime,
-                            arguments,
-                            target,
-                            entry,
-                            throw_value,
-                            fatal,
-                        )?;
-                        if load {
-                            emit_store_allocated_tagged(
-                                &mut ops,
-                                frame,
-                                locations[argument_count],
-                                17,
-                                0,
-                            )?;
-                        }
-                        structural_regions.push((
-                            if load {
-                                "machineGenericElementLoad"
-                            } else {
-                                "machineGenericElementStore"
-                            },
-                            Some(byte_pc),
-                            start,
-                            ops.offset().0,
-                        ));
-                        if !is_terminator {
-                            emit_edits(
-                                &mut ops,
-                                allocation.edits(),
-                                AllocationPoint::After(id),
-                                frame,
-                            )?;
-                        }
-                        continue;
-                    }
                     if matches!(
                         descriptor.target,
                         CallTarget::RuntimeStub(target)
@@ -4184,16 +3588,6 @@ pub(super) fn emit(
     } else {
         DEOPT_DUMP_BYTES
     };
-    let committed_element_cold_bytes = if sequence.instructions().iter().any(|instruction| {
-        matches!(
-            instruction.opcode,
-            MachineOpcode::ElementLoad(..) | MachineOpcode::ElementStore(..)
-        )
-    }) {
-        COMMITTED_ELEMENT_COLD_STACK_BYTES
-    } else {
-        0
-    };
     let committed_runtime_cold_bytes = if sequence.call_descriptors().iter().any(|descriptor| {
         matches!(
             &descriptor.target,
@@ -4204,9 +3598,7 @@ pub(super) fn emit(
     } else {
         0
     };
-    let cold_dump_bytes = deopt_cold_bytes
-        .max(committed_element_cold_bytes)
-        .max(committed_runtime_cold_bytes);
+    let cold_dump_bytes = deopt_cold_bytes.max(committed_runtime_cold_bytes);
     let generated_stack_frame_bytes =
         frame
             .frame_bytes()
@@ -4220,7 +3612,6 @@ pub(super) fn emit(
         relocations,
         osr_entries,
         osr_regions,
-        constructor_field_regions,
         structural_regions,
     })
 }
@@ -5116,14 +4507,6 @@ fn integer_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
     }
 }
 
-fn dense_index_form(sequence: &InstructionSequence, value: MachineValue) -> Option<DenseIndexForm> {
-    match sequence.representations().get(value.0 as usize).copied()? {
-        MachineRepresentation::Tagged => Some(DenseIndexForm::Tagged),
-        MachineRepresentation::Int32 | MachineRepresentation::Uint32 => Some(DenseIndexForm::Int32),
-        _ => None,
-    }
-}
-
 fn float_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
     match location {
         AllocatedLocation::Register(register) if register.is_float() => Ok(register.encoding()),
@@ -5135,12 +4518,7 @@ fn float_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        COMMITTED_ELEMENT_CALLER_SAVE_BYTES, COMMITTED_ELEMENT_COLD_STACK_BYTES,
-        COMMITTED_ELEMENT_FP_SAVE_PAIRS, COMMITTED_ELEMENT_GPR_SAVE_PAIRS,
-        COMMITTED_ELEMENT_ROOT_RECORD_BYTES, CommittedElementKey, RelocationCapture,
-        committed_element_key, emit, emit_binding_guard, emit_load_u64, frame_layout,
-    };
+    use super::{RelocationCapture, emit, emit_binding_guard, emit_load_u64, frame_layout};
     use crate::{
         entry::TransitionTable,
         machine::{
@@ -5415,60 +4793,6 @@ mod tests {
     }
 
     #[test]
-    fn committed_element_key_boxes_scalar_late_home_only_on_cold_path() {
-        let value = MachineValue(11);
-        let location = AllocatedLocation::Stack(7);
-        assert_eq!(
-            committed_element_key(MachineRepresentation::Tagged, value, location)
-                .expect("tagged key"),
-            CommittedElementKey::Tagged(value)
-        );
-        assert_eq!(
-            committed_element_key(MachineRepresentation::Int32, value, location)
-                .expect("Int32 key"),
-            CommittedElementKey::Int32(location)
-        );
-        assert_eq!(
-            committed_element_key(MachineRepresentation::Uint32, value, location)
-                .expect("Uint32 key"),
-            CommittedElementKey::Uint32(location)
-        );
-    }
-
-    #[test]
-    fn committed_element_cold_stack_preserves_alignment_and_deopt_reservation() {
-        assert_eq!(COMMITTED_ELEMENT_CALLER_SAVE_BYTES, 144);
-        assert_eq!(COMMITTED_ELEMENT_ROOT_RECORD_BYTES, 32);
-        assert_eq!(COMMITTED_ELEMENT_COLD_STACK_BYTES, 176);
-        assert_eq!(COMMITTED_ELEMENT_CALLER_SAVE_BYTES % 16, 0);
-        assert_eq!(COMMITTED_ELEMENT_COLD_STACK_BYTES % 16, 0);
-        assert_eq!(
-            COMMITTED_ELEMENT_GPR_SAVE_PAIRS
-                .iter()
-                .flat_map(|&(first, second, _)| [first, second])
-                .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 10]
-        );
-        assert_eq!(
-            COMMITTED_ELEMENT_FP_SAVE_PAIRS
-                .iter()
-                .flat_map(|&(first, second, _)| [first, second])
-                .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7]
-        );
-        assert_eq!(
-            COMMITTED_ELEMENT_GPR_SAVE_PAIRS
-                .iter()
-                .chain(&COMMITTED_ELEMENT_FP_SAVE_PAIRS)
-                .map(|&(_, _, offset)| offset)
-                .collect::<Vec<_>>(),
-            (0..COMMITTED_ELEMENT_CALLER_SAVE_BYTES)
-                .step_by(16)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn committed_runtime_emitter_owns_effect_and_preserving_pc_resume_regions() {
         let transitions = TransitionTable::resolve();
         for semantic_arity in 0..=2 {
@@ -5505,8 +4829,6 @@ mod tests {
                 &DeoptRuntime::default(),
                 &safepoints,
                 &transitions,
-                1,
-                1,
                 1,
                 1,
                 1,
@@ -5601,8 +4923,6 @@ mod tests {
             &DeoptRuntime::default(),
             &safepoints,
             &transitions,
-            1,
-            1,
             1,
             1,
             1,

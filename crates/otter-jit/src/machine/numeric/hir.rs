@@ -3124,17 +3124,7 @@ fn lower_instruction(
             if !explicit_receiver
                 && exceptional_edge.is_none()
                 && let Some(target) = view.static_native_calls.get(&instruction.byte_pc).copied()
-                && crate::template::arm64::ic_probe::native_leaf_call_is_supported(
-                    view,
-                    target.leaf_stub_id,
-                    argument_count,
-                )
-                && super::super::native_leaf::descriptor(
-                    target,
-                    instruction.byte_pc,
-                    crate::machine::MachineRepresentation::Tagged,
-                )
-                .is_some()
+                && super::super::native_leaf::supports_site(view, target, argument_count)
             {
                 let value_type = if super::super::native_leaf::supports_int32(target.leaf_stub_id)
                     && arguments
@@ -4214,6 +4204,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::machine::TargetSpec;
 
     fn direct_callee(function_id: u32) -> JitDirectCallee {
         JitDirectCallee {
@@ -4345,11 +4336,14 @@ mod tests {
                     "result is not defined on a miss"
                 );
                 let sequence = super::super::select_with_packed_double_view_caches(
+                    &TargetSpec::aarch64(),
                     &hir,
                     &NumericPackedDoubleViewCachePlan::default(),
                 )
                 .expect("verified native leaf Machine IR");
-                sequence.verify().expect("complete ABI verification");
+                sequence
+                    .verify(&TargetSpec::aarch64())
+                    .expect("complete ABI verification");
                 let (instruction, descriptor) = sequence
                     .instructions()
                     .iter()
@@ -4362,17 +4356,29 @@ mod tests {
                             .then_some((instruction, descriptor))
                     })
                     .expect("selected leaf descriptor");
-                assert!(native_leaf::is_valid(descriptor, instruction));
+                assert!(native_leaf::is_valid(
+                    &TargetSpec::aarch64(),
+                    descriptor,
+                    instruction
+                ));
                 let mut invalid = descriptor.clone();
                 invalid.effects = CallEffects::REENTRANT;
-                assert!(!native_leaf::is_valid(&invalid, instruction));
+                assert!(!native_leaf::is_valid(
+                    &TargetSpec::aarch64(),
+                    &invalid,
+                    instruction
+                ));
                 let mut invalid = instruction.clone();
                 invalid.deopt = None;
-                assert!(!native_leaf::is_valid(descriptor, &invalid));
+                assert!(!native_leaf::is_valid(
+                    &TargetSpec::aarch64(),
+                    descriptor,
+                    &invalid
+                ));
                 invalid = instruction.clone();
                 invalid.operands.swap(0, 1);
                 assert!(
-                    !native_leaf::is_valid(descriptor, &invalid),
+                    !native_leaf::is_valid(&TargetSpec::aarch64(), descriptor, &invalid),
                     "callee and argument ABI words cannot alias"
                 );
             }

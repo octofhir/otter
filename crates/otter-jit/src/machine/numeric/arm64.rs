@@ -164,11 +164,15 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+use super::super::target::{
+    AARCH64_BASE_FIXED_FRAME_BYTES, AARCH64_DEOPT_FP_BUDGET, AARCH64_DEOPT_GPR_BUDGET,
+};
+
 // The deopt namespace preserves physical encodings. It includes one unused
 // x29 slot so the following FP bank remains naturally 16-byte aligned.
-pub(super) const GPR_BUDGET: u16 = 30;
-pub(super) const FP_BUDGET: u16 = 16;
-const BASE_FIXED_FRAME_BYTES: u32 = 32;
+pub(super) const GPR_BUDGET: u16 = AARCH64_DEOPT_GPR_BUDGET;
+pub(super) const FP_BUDGET: u16 = AARCH64_DEOPT_FP_BUDGET;
+const BASE_FIXED_FRAME_BYTES: u32 = AARCH64_BASE_FIXED_FRAME_BYTES;
 const DEOPT_DUMP_BYTES: u32 = (GPR_BUDGET as u32 + FP_BUDGET as u32) * 8;
 const COMMITTED_ELEMENT_CALLER_SAVE_BYTES: u32 = 144;
 const COMMITTED_ELEMENT_ROOT_RECORD_BYTES: u32 = MACHINE_ROOT_RECORD_SIZE;
@@ -331,28 +335,9 @@ pub(super) fn frame_layout(
     allocation: &AllocatedSequence,
     root_slots: u16,
 ) -> Result<MachineFrameLayout, Unsupported> {
-    MachineFrameLayout::new(
-        allocation,
-        root_slots,
-        SavedFrame::from_allocation(allocation).fixed_bytes(),
-        16,
-    )
-    .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
-}
-
-pub(super) fn frame_layout_with_raw_slots(
-    allocation: &AllocatedSequence,
-    root_slots: u16,
-    raw_slots: u16,
-) -> Result<MachineFrameLayout, Unsupported> {
-    MachineFrameLayout::new_with_raw_slots(
-        allocation,
-        root_slots,
-        raw_slots,
-        SavedFrame::from_allocation(allocation).fixed_bytes(),
-        16,
-    )
-    .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
+    super::TargetSpec::aarch64()
+        .frame_layout(allocation, root_slots, 0)
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
 }
 
 fn packed_double_view_cache_offsets(
@@ -4944,7 +4929,7 @@ mod tests {
             ExceptionalEdge, InstructionSequence, MachineBindingTarget, MachineBlock,
             MachineBlockData, MachineInstruction, MachineInstructionId, MachineOpcode,
             MachineOperand, MachineRepresentation, MachineValue, PhysicalRegister, SafepointId,
-            SafepointKind, TargetRegisterFile, lower_safepoints,
+            SafepointKind, TargetClobberSet, TargetSpec, lower_safepoints,
         },
     };
     use otter_bytecode::opcode_schema::{BindingMissing, BindingRead, BindingSemantics};
@@ -4980,7 +4965,9 @@ mod tests {
         operands.extend(inputs.iter().copied().map(MachineOperand::tagged_root));
         operands.extend(unrelated_root.map(MachineOperand::tagged_root));
         let mut call = MachineInstruction::plain(MachineOpcode::Call(0), operands);
-        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::ScalarCall)
+            .to_vec();
         call.safepoint = Some(SafepointId(0));
         instructions.push(call);
         let mut ret = MachineInstruction::plain(
@@ -4995,6 +4982,7 @@ mod tests {
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT);
         InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; result.0 as usize + 1],
             vec![CallDescriptor {
@@ -5007,7 +4995,9 @@ mod tests {
                 arguments: vec![MachineRepresentation::Tagged; usize::from(semantic_arity)],
                 results: vec![MachineRepresentation::Tagged],
                 effects: complete_effects,
-                clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                clobbers: TargetSpec::aarch64()
+                    .clobbers(TargetClobberSet::ScalarCall)
+                    .to_vec(),
                 exceptional: ExceptionalEdge::Propagate,
                 safepoint: SafepointKind::Gc,
             }],
@@ -5036,7 +5026,9 @@ mod tests {
                 MachineOperand::tagged_root(source),
             ],
         );
-        call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        call.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::ScalarCall)
+            .to_vec();
         call.safepoint = Some(SafepointId(0));
         let mut call_jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
         call_jump.control = ControlFlow::Branch;
@@ -5046,7 +5038,9 @@ mod tests {
         );
         normal_branch.control = ControlFlow::Branch;
         let mut acknowledge = MachineInstruction::plain(MachineOpcode::Call(1), Vec::new());
-        acknowledge.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+        acknowledge.clobbers = TargetSpec::aarch64()
+            .clobbers(TargetClobberSet::ScalarCall)
+            .to_vec();
         let mut exceptional_edge = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
         exceptional_edge.control = ControlFlow::Branch;
         let mut alternative_edge = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
@@ -5070,6 +5064,7 @@ mod tests {
             .union(CallEffects::REENTRANT);
 
         InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![
                 MachineRepresentation::Tagged,
@@ -5088,7 +5083,9 @@ mod tests {
                     arguments: Vec::new(),
                     results: vec![MachineRepresentation::Tagged],
                     effects: complete_effects,
-                    clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                    clobbers: TargetSpec::aarch64()
+                        .clobbers(TargetClobberSet::ScalarCall)
+                        .to_vec(),
                     exceptional: ExceptionalEdge::LandingPad(MachineBlock(2)),
                     safepoint: SafepointKind::Gc,
                 },
@@ -5099,7 +5096,9 @@ mod tests {
                     arguments: Vec::new(),
                     results: Vec::new(),
                     effects: CallEffects::WRITES_HEAP,
-                    clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                    clobbers: TargetSpec::aarch64()
+                        .clobbers(TargetClobberSet::ScalarCall)
+                        .to_vec(),
                     exceptional: ExceptionalEdge::None,
                     safepoint: SafepointKind::None,
                 },
@@ -5236,7 +5235,7 @@ mod tests {
         for semantic_arity in 0..=2 {
             let sequence = committed_runtime_sequence(semantic_arity);
             let allocation = sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("committed-runtime allocation");
             let safepoints =
                 lower_safepoints(&sequence, &allocation).expect("committed-runtime safepoints");
@@ -5321,7 +5320,7 @@ mod tests {
     fn committed_runtime_landing_handles_distinct_exception_phi_home() {
         let sequence = committed_runtime_landing_sequence();
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("committed-runtime landing allocation");
         let call_id = MachineInstructionId(2);
         let call_result_home = allocation
@@ -5442,7 +5441,7 @@ mod tests {
     fn upvalue_binding_guard_materializes_the_value_field_offset() {
         let sequence = committed_runtime_sequence(0);
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("fixture allocation");
         let frame = frame_layout(&allocation, 1).expect("fixture frame");
         let mut view = JitCompileSnapshot::without_feedback(19, 0, 1, Vec::new());
@@ -5485,7 +5484,7 @@ mod tests {
     fn global_binding_guards_defensively_reject_a_missing_cage() {
         let sequence = committed_runtime_sequence(0);
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("fixture allocation");
         let frame = frame_layout(&allocation, 1).expect("fixture frame");
         let view = JitCompileSnapshot::without_feedback(20, 0, 1, Vec::new());

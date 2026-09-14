@@ -17,6 +17,10 @@
 //!   fixed ABI operands and call clobbers remain visible before allocation.
 //! - [`try_compile`] — the sole production optimizing-tier entry.
 //!
+//! # See also
+//! - [`crate::machine::TargetSpec`] — immutable target input to selection and allocation.
+//! - [`crate::optimizing`] — tier policy and the production AArch64 target choice.
+//!
 //! # Invariants
 //! - Bytecode is inspected only while building HIR; Machine IR and the emitter
 //!   contain no bytecode operations.
@@ -135,7 +139,7 @@ use super::{
     MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType,
     MachineRepresentation, MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
     PackedDoubleViewCacheClearReason, PhysicalRegister, SafepointId, SafepointKind,
-    TargetRegisterFile, binding_guard_clobbers, binding_hit_clobbers,
+    TargetCapability, TargetClobberSet, TargetSpec, binding_guard_clobbers, binding_hit_clobbers,
     binding_write_barrier_clobbers, lower_deopt_table, lower_safepoints,
 };
 use crate::{
@@ -204,6 +208,7 @@ pub(super) fn value_packet_frame(
 }
 
 pub(crate) fn try_compile(
+    target_spec: &TargetSpec,
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
@@ -218,8 +223,9 @@ pub(crate) fn try_compile(
     })?;
     let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
     let packed_double_view_caches = hir.plan_packed_double_view_caches(view);
-    let sequence = select_with_packed_double_view_caches(&hir, &packed_double_view_caches)
-        .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
+    let sequence =
+        select_with_packed_double_view_caches(target_spec, &hir, &packed_double_view_caches)
+            .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
     let load_property_sites = sequence
         .instructions()
         .iter()
@@ -235,7 +241,7 @@ pub(crate) fn try_compile(
     let mut store_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
     let allocation = sequence
-        .allocate(&TargetRegisterFile::aarch64_scalar_function())
+        .allocate(target_spec)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
     let mut machine_safepoints = lower_safepoints(&sequence, &allocation)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR safepoint lowering"))?;
@@ -247,21 +253,24 @@ pub(crate) fn try_compile(
             .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let method_packet = value_packet_frame(&sequence)?;
     let inline_frame_words = arm64::inline_calls::frame_words(&sequence)?;
-    let frame = arm64::frame_layout_with_raw_slots(
-        &allocation,
-        machine_safepoints.root_slot_count(),
-        method_packet
-            .raw_start
-            .checked_add(method_packet.raw_words)
-            .and_then(|words| words.checked_add(inline_frame_words))
-            .ok_or(Unsupported::OperandShape("scalar value-span packet frame"))?,
-    )?;
+    let frame = target_spec
+        .frame_layout(
+            &allocation,
+            machine_safepoints.root_slot_count(),
+            method_packet
+                .raw_start
+                .checked_add(method_packet.raw_words)
+                .and_then(|words| words.checked_add(inline_frame_words))
+                .ok_or(Unsupported::OperandShape("scalar value-span packet frame"))?,
+        )
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))?;
+    let (gpr_budget, fp_budget) = target_spec.deopt_register_budgets();
     let deopt_table = lower_deopt_table(
         &sequence,
         &allocation,
         frame,
-        arm64::GPR_BUDGET,
-        arm64::FP_BUDGET,
+        gpr_budget,
+        fp_budget,
         &machine_frame_states(&hir),
     )
     .map_err(|_| Unsupported::OperandShape("scalar Machine IR deopt lowering"))?;
@@ -288,7 +297,7 @@ pub(crate) fn try_compile(
     let deopt_runtime = Box::new(DeoptRuntime {
         table: deopt_table,
         exits: exits.into_boxed_slice(),
-        gpr_budget: arm64::GPR_BUDGET,
+        gpr_budget,
     });
     let emission = arm64::emit(
         view,
@@ -432,6 +441,7 @@ pub(crate) fn try_compile(
 }
 
 fn select_with_packed_double_view_caches(
+    target_spec: &TargetSpec,
     hir: &NumericFunction,
     packed_double_view_caches: &NumericPackedDoubleViewCachePlan,
 ) -> Result<InstructionSequence, super::VerificationError> {
@@ -522,6 +532,7 @@ fn select_with_packed_double_view_caches(
             | SelectedBlock::PropertyFatal(block_index)
             | SelectedBlock::PropertyJoin(block_index) => {
                 blocks.push(property_cfg::select_block(
+                    target_spec,
                     *selected,
                     hir,
                     &selection_cfg,
@@ -538,6 +549,7 @@ fn select_with_packed_double_view_caches(
             }
             SelectedBlock::BindingHit(block_index) => {
                 blocks.push(select_binding_hit_block(
+                    target_spec,
                     hir,
                     &selection_cfg,
                     block_index,
@@ -549,6 +561,7 @@ fn select_with_packed_double_view_caches(
             }
             SelectedBlock::BindingCold(block_index) => {
                 blocks.push(select_binding_cold_block(
+                    target_spec,
                     hir,
                     &selection_cfg,
                     block_index,
@@ -608,7 +621,7 @@ fn select_with_packed_double_view_caches(
                 if is_exceptional_hir_edge(hir, predecessor, edge) {
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
-                        caught_throw_acknowledgement_descriptor(),
+                        caught_throw_acknowledgement_descriptor(target_spec),
                     );
                     let mut acknowledgement = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
@@ -624,7 +637,7 @@ fn select_with_packed_double_view_caches(
                     let mut poll =
                         MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
                     attach_frame_state(hir, &values, state_index, deopt, &mut poll);
-                    poll.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                    poll.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                     instructions.push(poll);
                 }
                 if packed_double_view_caches
@@ -812,9 +825,9 @@ fn select_with_packed_double_view_caches(
                     operands,
                 );
                 probe.clobbers = if stored.is_some() {
-                    property_store_clobbers(non_cell)
+                    property_store_clobbers(target_spec, non_cell)
                 } else {
-                    property_load_clobbers()
+                    property_load_clobbers(target_spec)
                 };
                 instructions.push(probe);
                 let mut branch = MachineInstruction::plain(
@@ -899,7 +912,7 @@ fn select_with_packed_double_view_caches(
                     },
                     operands,
                 );
-                guard.clobbers = binding_guard_clobbers();
+                guard.clobbers = binding_guard_clobbers(target_spec);
                 instructions.push(guard);
                 let selected_blocks = selection_cfg.bindings[&block_index];
                 let (terminator, successors) = if let Some(hit) = selected_blocks.hit {
@@ -947,23 +960,40 @@ fn select_with_packed_double_view_caches(
                 break;
             }
             if let NumericNode::FloatToInt32(source) = node {
+                if !target_spec.supports(TargetCapability::Float64ToInt32) {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(
+                        MachineInstructionId(instructions.len() as u32),
+                    ));
+                }
                 let mut call = MachineInstruction::plain(
                     MachineOpcode::Float64ToInt32,
                     vec![
                         MachineOperand::fixed_register_input(
                             machine_value(&values, source),
-                            PhysicalRegister::float(0),
+                            target_spec
+                                .float_argument(0)
+                                .ok_or(super::VerificationError::InvalidEntry)?,
                         ),
-                        MachineOperand::fixed_register_output(result, PhysicalRegister::integer(0)),
+                        MachineOperand::fixed_register_output(result, target_spec.integer_result()),
                     ],
                 );
-                call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                call.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                 call.clobbers
-                    .retain(|register| *register != PhysicalRegister::integer(0));
+                    .retain(|register| *register != target_spec.integer_result());
                 instructions.push(call);
                 continue;
             }
             if let NumericNode::Rem(left, right) | NumericNode::Pow(left, right) = node {
+                let capability = if matches!(node, NumericNode::Rem(..)) {
+                    TargetCapability::FloatRemainder
+                } else {
+                    TargetCapability::FloatPower
+                };
+                if !target_spec.supports(capability) {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(
+                        MachineInstructionId(instructions.len() as u32),
+                    ));
+                }
                 let opcode = if matches!(node, NumericNode::Rem(..)) {
                     MachineOpcode::FloatRem
                 } else {
@@ -974,18 +1004,22 @@ fn select_with_packed_double_view_caches(
                     vec![
                         MachineOperand::fixed_register_input(
                             machine_value(&values, left),
-                            PhysicalRegister::float(0),
+                            target_spec
+                                .float_argument(0)
+                                .ok_or(super::VerificationError::InvalidEntry)?,
                         ),
                         MachineOperand::fixed_register_input(
                             machine_value(&values, right),
-                            PhysicalRegister::float(1),
+                            target_spec
+                                .float_argument(1)
+                                .ok_or(super::VerificationError::InvalidEntry)?,
                         ),
-                        MachineOperand::fixed_register_output(result, PhysicalRegister::float(0)),
+                        MachineOperand::fixed_register_output(result, target_spec.float_result()),
                     ],
                 );
-                call.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                call.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                 call.clobbers
-                    .retain(|register| *register != PhysicalRegister::float(0));
+                    .retain(|register| *register != target_spec.float_result());
                 instructions.push(call);
                 continue;
             }
@@ -1044,7 +1078,9 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    guard.clobbers = (9..=15).map(PhysicalRegister::integer).collect();
+                    guard.clobbers = target_spec
+                        .clobbers(TargetClobberSet::InlineMethodGuard)
+                        .to_vec();
                     guard
                 }
                 NumericNode::InlineCallGuard {
@@ -1062,7 +1098,9 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    guard.clobbers = [9, 10, 11, 12, 14].map(PhysicalRegister::integer).to_vec();
+                    guard.clobbers = target_spec
+                        .clobbers(TargetClobberSet::InlineCallGuard)
+                        .to_vec();
                     guard
                 }
                 NumericNode::InlineConstructGuard {
@@ -1076,7 +1114,9 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    guard.clobbers = [9, 10, 11, 12, 14].map(PhysicalRegister::integer).to_vec();
+                    guard.clobbers = target_spec
+                        .clobbers(TargetClobberSet::InlineCallGuard)
+                        .to_vec();
                     guard
                 }
                 NumericNode::ConstructReceiver {
@@ -1091,8 +1131,8 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    probe.clobbers = [0, 2, 4, 9, 10, 11, 12, 13, 14, 15, 16]
-                        .map(PhysicalRegister::integer)
+                    probe.clobbers = target_spec
+                        .clobbers(TargetClobberSet::ConstructReceiver)
                         .to_vec();
                     probe
                 }
@@ -1104,7 +1144,9 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    test.clobbers = [9, 10].map(PhysicalRegister::integer).to_vec();
+                    test.clobbers = target_spec
+                        .clobbers(TargetClobberSet::ConstructReceiverHit)
+                        .to_vec();
                     test
                 }
                 NumericNode::BaseConstructResult {
@@ -1119,7 +1161,9 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    select.clobbers = [0, 9, 10, 11].map(PhysicalRegister::integer).to_vec();
+                    select.clobbers = target_spec
+                        .clobbers(TargetClobberSet::BaseConstructResult)
+                        .to_vec();
                     select
                 }
                 NumericNode::BoxTagged(source) => MachineInstruction::plain(
@@ -1172,7 +1216,7 @@ fn select_with_packed_double_view_caches(
                     );
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
-                        class_super_constructor_descriptor(),
+                        class_super_constructor_descriptor(target_spec),
                     );
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
@@ -1189,7 +1233,7 @@ fn select_with_packed_double_view_caches(
                         MachineOpcode::StringConstantCellLoad { byte_pc, target },
                         vec![MachineOperand::register_output(result)],
                     );
-                    load.clobbers = string_constant_cell_load_clobbers();
+                    load.clobbers = string_constant_cell_load_clobbers(target_spec);
                     load
                 }
                 NumericNode::Binding { .. } => {
@@ -1232,7 +1276,7 @@ fn select_with_packed_double_view_caches(
                             arguments: vec![MachineRepresentation::Tagged; inputs.len()],
                             results: vec![MachineRepresentation::Tagged],
                             effects: CallEffects::READS_HEAP.union(CallEffects::WRITES_HEAP),
-                            clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+                            clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
                             exceptional: ExceptionalEdge::None,
                             safepoint: SafepointKind::Gc,
                         },
@@ -1286,6 +1330,7 @@ fn select_with_packed_double_view_caches(
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
                         committed_value_descriptor(
+                            target_spec,
                             operation,
                             logical_pc,
                             byte_pc,
@@ -1388,7 +1433,7 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_input(value),
                         ],
                     );
-                    store.clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
+                    store.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                     store
                 }
                 NumericNode::ElementLoad {
@@ -1439,7 +1484,7 @@ fn select_with_packed_double_view_caches(
                                 MachineOpcode::ElementLoad(byte_pc),
                                 operands,
                             );
-                            load.clobbers = element_clobbers();
+                            load.clobbers = element_clobbers(target_spec);
                             load.safepoint = Some(super::SafepointId(next_safepoint));
                             next_safepoint = next_safepoint
                                 .checked_add(1)
@@ -1458,7 +1503,7 @@ fn select_with_packed_double_view_caches(
                                     MachineOperand::register_output(result),
                                 ],
                             );
-                            load.clobbers = element_clobbers();
+                            load.clobbers = element_clobbers(target_spec);
                             load
                         }
                     }
@@ -1528,7 +1573,7 @@ fn select_with_packed_double_view_caches(
                                 MachineOpcode::ElementStore(byte_pc),
                                 operands,
                             );
-                            store.clobbers = element_clobbers();
+                            store.clobbers = element_clobbers(target_spec);
                             store.safepoint = Some(super::SafepointId(next_safepoint));
                             next_safepoint = next_safepoint
                                 .checked_add(1)
@@ -1547,7 +1592,7 @@ fn select_with_packed_double_view_caches(
                                     MachineOperand::register_input(value),
                                 ],
                             );
-                            store.clobbers = element_clobbers();
+                            store.clobbers = element_clobbers(target_spec);
                             store
                         }
                     }
@@ -1572,6 +1617,7 @@ fn select_with_packed_double_view_caches(
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
                         generic_element_call_descriptor(
+                            target_spec,
                             otter_vm::native_abi::STUB_JIT_LOAD_ELEMENT,
                             2,
                         ),
@@ -1623,6 +1669,7 @@ fn select_with_packed_double_view_caches(
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
                         generic_element_call_descriptor(
+                            target_spec,
                             otter_vm::native_abi::STUB_JIT_STORE_ELEMENT,
                             3,
                         ),
@@ -1652,8 +1699,9 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    conversion.clobbers =
-                        vec![PhysicalRegister::integer(16), PhysicalRegister::float(31)];
+                    conversion.clobbers = target_spec
+                        .clobbers(TargetClobberSet::FloatElementIndex)
+                        .to_vec();
                     conversion
                 }
                 NumericNode::ArrayConstruct { length, byte_pc: _ } => {
@@ -1668,7 +1716,7 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_input(machine_value(&values, length)),
                             MachineOperand::fixed_register_output(
                                 boxed_length,
-                                PhysicalRegister::integer(2),
+                                target_spec.integer_argument(2).expect("target argument 2"),
                             ),
                         ],
                     ));
@@ -1678,7 +1726,7 @@ fn select_with_packed_double_view_caches(
                         MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
                         vec![MachineOperand::fixed_register_output(
                             undefined_this,
-                            PhysicalRegister::integer(3),
+                            target_spec.integer_argument(3).expect("target argument 3"),
                         )],
                     ));
                     let undefined_new_target =
@@ -1687,31 +1735,31 @@ fn select_with_packed_double_view_caches(
                         MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
                         vec![MachineOperand::fixed_register_output(
                             undefined_new_target,
-                            PhysicalRegister::integer(4),
+                            target_spec.integer_argument(4).expect("target argument 4"),
                         )],
                     ));
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
-                        array_construct_call_descriptor(),
+                        array_construct_call_descriptor(target_spec),
                     );
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         vec![
                             MachineOperand::fixed_register_input(
                                 boxed_length,
-                                PhysicalRegister::integer(2),
+                                target_spec.integer_argument(2).expect("target argument 2"),
                             ),
                             MachineOperand::fixed_register_input(
                                 undefined_this,
-                                PhysicalRegister::integer(3),
+                                target_spec.integer_argument(3).expect("target argument 3"),
                             ),
                             MachineOperand::fixed_register_input(
                                 undefined_new_target,
-                                PhysicalRegister::integer(4),
+                                target_spec.integer_argument(4).expect("target argument 4"),
                             ),
                             MachineOperand::fixed_register_output(
                                 result,
-                                PhysicalRegister::integer(0),
+                                target_spec.integer_result(),
                             ),
                         ],
                     );
@@ -1929,6 +1977,7 @@ fn select_with_packed_double_view_caches(
                         vec![MachineOperand::register_output(padding)],
                     ));
                     let descriptor_index = intern_leaf_boolean_call_descriptor(
+                        target_spec,
                         &mut call_descriptors,
                         otter_vm::native_abi::STUB_TO_BOOLEAN_LEAF,
                         2,
@@ -1938,15 +1987,15 @@ fn select_with_packed_double_view_caches(
                         vec![
                             MachineOperand::fixed_register_input(
                                 machine_value(&values, source),
-                                PhysicalRegister::integer(1),
+                                target_spec.integer_argument(1).expect("target argument 1"),
                             ),
                             MachineOperand::fixed_register_input(
                                 padding,
-                                PhysicalRegister::integer(2),
+                                target_spec.integer_argument(2).expect("target argument 2"),
                             ),
                             MachineOperand::fixed_register_output(
                                 result,
-                                PhysicalRegister::integer(0),
+                                target_spec.integer_result(),
                             ),
                         ],
                     );
@@ -1965,7 +2014,7 @@ fn select_with_packed_double_view_caches(
                             MachineOperand::register_output(result),
                         ],
                     );
-                    compare.clobbers = tagged_nullish_equal_clobbers();
+                    compare.clobbers = tagged_nullish_equal_clobbers(target_spec);
                     compare
                 }
                 NumericNode::TaggedStrictEqual(left, right) => {
@@ -1984,6 +2033,7 @@ fn select_with_packed_double_view_caches(
                         right,
                     );
                     let descriptor_index = intern_leaf_boolean_call_descriptor(
+                        target_spec,
                         &mut call_descriptors,
                         otter_vm::native_abi::STUB_STRICT_EQ_LEAF,
                         2,
@@ -1993,15 +2043,15 @@ fn select_with_packed_double_view_caches(
                         vec![
                             MachineOperand::fixed_register_input(
                                 left,
-                                PhysicalRegister::integer(1),
+                                target_spec.integer_argument(1).expect("target argument 1"),
                             ),
                             MachineOperand::fixed_register_input(
                                 right,
-                                PhysicalRegister::integer(2),
+                                target_spec.integer_argument(2).expect("target argument 2"),
                             ),
                             MachineOperand::fixed_register_output(
                                 result,
-                                PhysicalRegister::integer(0),
+                                target_spec.integer_result(),
                             ),
                         ],
                     );
@@ -2030,26 +2080,26 @@ fn select_with_packed_double_view_caches(
                     ));
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
-                        string_concat_call_descriptor(),
+                        string_concat_call_descriptor(target_spec),
                     );
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         vec![
                             MachineOperand::fixed_register_input(
                                 left,
-                                PhysicalRegister::integer(2),
+                                target_spec.integer_argument(2).expect("target argument 2"),
                             ),
                             MachineOperand::fixed_register_input(
                                 right,
-                                PhysicalRegister::integer(3),
+                                target_spec.integer_argument(3).expect("target argument 3"),
                             ),
                             MachineOperand::fixed_register_input(
                                 padding,
-                                PhysicalRegister::integer(4),
+                                target_spec.integer_argument(4).expect("target argument 4"),
                             ),
                             MachineOperand::fixed_register_output(
                                 result,
-                                PhysicalRegister::integer(0),
+                                target_spec.integer_result(),
                             ),
                         ],
                     );
@@ -2068,6 +2118,7 @@ fn select_with_packed_double_view_caches(
                     byte_pc,
                 } => {
                     let descriptor = super::native_leaf::descriptor(
+                        target_spec,
                         target,
                         byte_pc,
                         if value_type == NumericType::Int32 {
@@ -2088,7 +2139,7 @@ fn select_with_packed_double_view_caches(
                     );
                     let mut operands = vec![MachineOperand::fixed_register_input(
                         source,
-                        PhysicalRegister::integer(9),
+                        target_spec.callee_register(),
                     )];
                     let start = argument_start as usize;
                     let end = start
@@ -2114,12 +2165,14 @@ fn select_with_packed_double_view_caches(
                         };
                         operands.push(MachineOperand::fixed_register_input(
                             argument,
-                            PhysicalRegister::integer(index as u8 + 1),
+                            target_spec
+                                .integer_argument(index + 1)
+                                .expect("target static-native argument"),
                         ));
                     }
                     operands.push(MachineOperand::fixed_register_output(
                         result,
-                        PhysicalRegister::integer(0),
+                        target_spec.integer_result(),
                     ));
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
@@ -2199,6 +2252,7 @@ fn select_with_packed_double_view_caches(
                         receiver
                     });
                     let descriptor = direct_call_descriptor(
+                        target_spec,
                         target,
                         hir.frame_states
                             .iter()
@@ -2457,6 +2511,7 @@ fn select_with_packed_double_view_caches(
     }
 
     super::committed_probe::expand(
+        target_spec,
         &mut representations,
         &mut call_descriptors,
         &committed_probes,
@@ -2470,6 +2525,7 @@ fn select_with_packed_double_view_caches(
         &mut instructions,
     );
     InstructionSequence::new_selected_with_packed_double_view_caches(
+        target_spec,
         selection_cfg.originals[0],
         representations,
         call_descriptors,
@@ -2489,6 +2545,7 @@ fn machine_binding_target(target: NumericBindingTarget) -> MachineBindingTarget 
 }
 
 fn select_binding_hit_block(
+    target_spec: &TargetSpec,
     hir: &NumericFunction,
     cfg: &SelectionCfg,
     block_index: usize,
@@ -2536,7 +2593,7 @@ fn select_binding_hit_block(
         },
         operands,
     );
-    hit.clobbers = binding_hit_clobbers();
+    hit.clobbers = binding_hit_clobbers(target_spec);
     instructions.push(hit);
     if matches!(
         semantics,
@@ -2551,7 +2608,7 @@ fn select_binding_hit_block(
                 ),
             ],
         );
-        barrier.clobbers = binding_write_barrier_clobbers();
+        barrier.clobbers = binding_write_barrier_clobbers(target_spec);
         instructions.push(barrier);
     }
     let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
@@ -2571,6 +2628,7 @@ fn select_binding_hit_block(
 
 #[allow(clippy::too_many_arguments)]
 fn select_binding_cold_block(
+    target_spec: &TargetSpec,
     hir: &NumericFunction,
     cfg: &SelectionCfg,
     block_index: usize,
@@ -2598,7 +2656,7 @@ fn select_binding_cold_block(
     let inputs = inputs.into_iter().flatten().collect::<Vec<_>>();
     let semantic_arity = u8::try_from(inputs.len())
         .map_err(|_| super::VerificationError::OpcodeSignatureMismatch(first))?;
-    let descriptor = binding_value_descriptor(logical_pc, byte_pc, semantic_arity);
+    let descriptor = binding_value_descriptor(target_spec, logical_pc, byte_pc, semantic_arity);
     let descriptor_index = intern_call_descriptor(call_descriptors, descriptor);
     let mut operands = inputs
         .iter()
@@ -2631,7 +2689,9 @@ fn select_binding_cold_block(
         MachineOpcode::BranchNativeStatus,
         vec![MachineOperand::register_input(values.status)],
     );
-    branch.clobbers = vec![PhysicalRegister::integer(16)];
+    branch.clobbers = target_spec
+        .clobbers(TargetClobberSet::StatusScratch)
+        .to_vec();
     branch.control = ControlFlow::Branch;
     instructions.push(branch);
     let end = MachineInstructionId(instructions.len() as u32);
@@ -2813,24 +2873,27 @@ fn select_binding_join_block(
 
 #[cfg(test)]
 fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::VerificationError> {
-    select_with_packed_double_view_caches(hir, &NumericPackedDoubleViewCachePlan::default())
+    select_with_packed_double_view_caches(
+        &TargetSpec::aarch64(),
+        hir,
+        &NumericPackedDoubleViewCachePlan::default(),
+    )
 }
 
 fn intern_leaf_boolean_call_descriptor(
+    target_spec: &TargetSpec,
     descriptors: &mut Vec<CallDescriptor>,
     target: otter_vm::native_abi::RuntimeStubDescriptor,
     argument_count: usize,
 ) -> usize {
     intern_call_descriptor(
         descriptors,
-        leaf_boolean_call_descriptor(target, argument_count),
+        leaf_boolean_call_descriptor(target_spec, target, argument_count),
     )
 }
 
-fn element_clobbers() -> Vec<PhysicalRegister> {
-    std::iter::once(PhysicalRegister::integer(9))
-        .chain((11..=16).map(PhysicalRegister::integer))
-        .collect()
+fn element_clobbers(target_spec: &TargetSpec) -> Vec<PhysicalRegister> {
+    target_spec.clobbers(TargetClobberSet::Element).to_vec()
 }
 
 /// Select a site's own immutable program only when its frame recipe names
@@ -2851,12 +2914,19 @@ fn owned_property_site(
         .then_some(site)
 }
 
-fn property_load_clobbers() -> Vec<PhysicalRegister> {
-    (9..=16).map(PhysicalRegister::integer).collect()
+fn property_load_clobbers(target_spec: &TargetSpec) -> Vec<PhysicalRegister> {
+    target_spec
+        .clobbers(TargetClobberSet::PropertyLoad)
+        .to_vec()
 }
 
-fn property_store_clobbers(_value_is_non_cell: bool) -> Vec<PhysicalRegister> {
-    TargetRegisterFile::aarch64_scalar_call_clobbers()
+fn property_store_clobbers(
+    target_spec: &TargetSpec,
+    _value_is_non_cell: bool,
+) -> Vec<PhysicalRegister> {
+    target_spec
+        .clobbers(TargetClobberSet::PropertyStore)
+        .to_vec()
 }
 
 const fn property_store_value_is_non_cell(value_type: NumericType) -> bool {
@@ -2866,12 +2936,16 @@ const fn property_store_value_is_non_cell(value_type: NumericType) -> bool {
     )
 }
 
-fn string_constant_cell_load_clobbers() -> Vec<PhysicalRegister> {
-    [9, 13].into_iter().map(PhysicalRegister::integer).collect()
+fn string_constant_cell_load_clobbers(target_spec: &TargetSpec) -> Vec<PhysicalRegister> {
+    target_spec
+        .clobbers(TargetClobberSet::StringConstantLoad)
+        .to_vec()
 }
 
-fn tagged_nullish_equal_clobbers() -> Vec<PhysicalRegister> {
-    vec![PhysicalRegister::integer(16)]
+fn tagged_nullish_equal_clobbers(target_spec: &TargetSpec) -> Vec<PhysicalRegister> {
+    target_spec
+        .clobbers(TargetClobberSet::StatusScratch)
+        .to_vec()
 }
 
 fn intern_call_descriptor(
@@ -2888,9 +2962,9 @@ fn intern_call_descriptor(
     descriptors.len() - 1
 }
 
-fn string_concat_call_descriptor() -> CallDescriptor {
-    let mut clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
-    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+fn string_concat_call_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
+    let mut clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
+    clobbers.retain(|register| *register != target_spec.integer_result());
     CallDescriptor {
         target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC),
         arguments: vec![MachineRepresentation::Tagged; 3],
@@ -2902,9 +2976,9 @@ fn string_concat_call_descriptor() -> CallDescriptor {
     }
 }
 
-fn array_construct_call_descriptor() -> CallDescriptor {
-    let mut clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
-    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+fn array_construct_call_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
+    let mut clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
+    clobbers.retain(|register| *register != target_spec.integer_result());
     CallDescriptor {
         target: CallTarget::RuntimeStub(STUB_ARRAY_CONSTRUCT_ALLOC),
         arguments: vec![MachineRepresentation::Tagged; 3],
@@ -2916,7 +2990,7 @@ fn array_construct_call_descriptor() -> CallDescriptor {
     }
 }
 
-fn caught_throw_acknowledgement_descriptor() -> CallDescriptor {
+fn caught_throw_acknowledgement_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW),
         arguments: Vec::new(),
@@ -2924,13 +2998,14 @@ fn caught_throw_acknowledgement_descriptor() -> CallDescriptor {
         // This leaf mutates VM-owned diagnostic provenance. Describe it as a
         // write so it cannot be treated as a freely movable pure computation.
         effects: CallEffects::WRITES_HEAP,
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: ExceptionalEdge::None,
         safepoint: SafepointKind::None,
     }
 }
 
 fn generic_element_call_descriptor(
+    target_spec: &TargetSpec,
     target: otter_vm::native_abi::RuntimeStubDescriptor,
     argument_count: usize,
 ) -> CallDescriptor {
@@ -2950,13 +3025,14 @@ fn generic_element_call_descriptor(
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: ExceptionalEdge::Propagate,
         safepoint: SafepointKind::Gc,
     }
 }
 
 fn direct_call_descriptor(
+    target_spec: &TargetSpec,
     target: &NumericDirectCallTarget,
     caller_function_id: u32,
     logical_pc: u32,
@@ -3001,7 +3077,7 @@ fn direct_call_descriptor(
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
@@ -3038,6 +3114,7 @@ fn cold_call_exit_descriptor(
 }
 
 fn committed_value_descriptor(
+    target_spec: &TargetSpec,
     operation: CommittedValueOperation,
     logical_pc: u32,
     byte_pc: u32,
@@ -3063,7 +3140,7 @@ fn committed_value_descriptor(
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
@@ -3071,7 +3148,12 @@ fn committed_value_descriptor(
     }
 }
 
-fn binding_value_descriptor(logical_pc: u32, byte_pc: u32, semantic_arity: u8) -> CallDescriptor {
+fn binding_value_descriptor(
+    target_spec: &TargetSpec,
+    logical_pc: u32,
+    byte_pc: u32,
+    semantic_arity: u8,
+) -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::CommittedRuntime {
             target: otter_vm::native_abi::STUB_JIT_BINDING_VALUE,
@@ -3088,19 +3170,19 @@ fn binding_value_descriptor(logical_pc: u32, byte_pc: u32, semantic_arity: u8) -
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: ExceptionalEdge::None,
         safepoint: SafepointKind::Gc,
     }
 }
 
-fn class_super_constructor_descriptor() -> CallDescriptor {
+fn class_super_constructor_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(otter_vm::native_abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
         arguments: vec![MachineRepresentation::Tagged],
         results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP,
-        clobbers: TargetRegisterFile::aarch64_scalar_call_clobbers(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: ExceptionalEdge::None,
         safepoint: SafepointKind::None,
     }
@@ -3160,11 +3242,12 @@ fn attach_safepoint_roots(
 }
 
 fn leaf_boolean_call_descriptor(
+    target_spec: &TargetSpec,
     target: otter_vm::native_abi::RuntimeStubDescriptor,
     argument_count: usize,
 ) -> CallDescriptor {
-    let mut clobbers = TargetRegisterFile::aarch64_scalar_call_clobbers();
-    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+    let mut clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
+    clobbers.retain(|register| *register != target_spec.integer_result());
     CallDescriptor {
         target: CallTarget::RuntimeStub(target),
         arguments: vec![MachineRepresentation::Tagged; argument_count],
@@ -3717,10 +3800,13 @@ mod tests {
             direct_call_targets: vec![],
             operand_values: vec![],
         };
-        let sequence = select_with_packed_double_view_caches(&hir, &Default::default()).unwrap();
-        let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
-            .unwrap();
+        let sequence = select_with_packed_double_view_caches(
+            &TargetSpec::aarch64(),
+            &hir,
+            &Default::default(),
+        )
+        .unwrap();
+        let allocation = sequence.allocate(&TargetSpec::aarch64()).unwrap();
         let layout = crate::machine::MachineFrameLayout::new(&allocation, 0, 16, 16).unwrap();
         let table = lower_deopt_table(
             &sequence,
@@ -4183,14 +4269,14 @@ mod tests {
                 count as u16
             );
             let allocation = sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("literal allocation");
             let table = lower_safepoints(&sequence, &allocation).expect("literal root table");
             assert_eq!(table.records().len(), 1);
             let mut invalid = sequence.clone();
             invalid.instructions[id].safepoint = None;
             assert!(
-                invalid.verify().is_err(),
+                invalid.verify(&TargetSpec::aarch64()).is_err(),
                 "allocation cannot omit its safepoint"
             );
             if count > 0 {
@@ -4205,7 +4291,7 @@ mod tests {
                         byte_pc: 24,
                     };
                 assert!(
-                    invalid.verify().is_err(),
+                    invalid.verify(&TargetSpec::aarch64()).is_err(),
                     "object allocation cannot consume array elements"
                 );
             }
@@ -6191,8 +6277,15 @@ mod tests {
         transitions: &TransitionTable,
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
-        try_compile(view, 7001, transitions, false, artifact_request)
-            .expect("numeric Machine IR code generation")
+        try_compile(
+            &TargetSpec::aarch64(),
+            view,
+            7001,
+            transitions,
+            false,
+            artifact_request,
+        )
+        .expect("numeric Machine IR code generation")
     }
 
     fn execute(
@@ -7275,7 +7368,7 @@ mod tests {
 
             if argument_count == 8 {
                 let allocation = sequence
-                    .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                    .allocate(&TargetSpec::aarch64())
                     .expect("wide generic method allocation");
                 let safepoints = lower_safepoints(&sequence, &allocation)
                     .expect("deduplicated method safepoints");
@@ -7304,6 +7397,7 @@ mod tests {
 
     #[test]
     fn array_construct_selection_uses_typed_allocating_abi_and_exact_state() {
+        let target = TargetSpec::aarch64();
         let sequence = select(&array_construct_selection_hir()).expect("ArrayConstruct Machine IR");
         assert_eq!(sequence.call_descriptors().len(), 1);
         let descriptor = &sequence.call_descriptors()[0];
@@ -7321,9 +7415,11 @@ mod tests {
         assert_eq!(descriptor.safepoint, SafepointKind::Gc);
         assert_eq!(
             descriptor.clobbers,
-            TargetRegisterFile::aarch64_scalar_call_clobbers()
+            target
+                .clobbers(TargetClobberSet::ScalarCall)
+                .to_vec()
                 .into_iter()
-                .filter(|register| *register != PhysicalRegister::integer(0))
+                .filter(|register| *register != target.integer_result())
                 .collect::<Vec<_>>()
         );
 
@@ -7334,10 +7430,13 @@ mod tests {
             .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(0)))
             .map(|(index, instruction)| (MachineInstructionId(index as u32), instruction))
             .expect("typed allocating call");
-        for (operand, register) in call.operands[..4]
-            .iter()
-            .zip([2_u8, 3, 4, 0].map(PhysicalRegister::integer))
-        {
+        let expected_registers = [
+            target.integer_argument(2).expect("argument 2"),
+            target.integer_argument(3).expect("argument 3"),
+            target.integer_argument(4).expect("argument 4"),
+            target.integer_result(),
+        ];
+        for (operand, register) in call.operands[..4].iter().zip(expected_registers) {
             assert_eq!(operand.constraint, OperandConstraint::Fixed(register));
         }
         assert_ne!(
@@ -7350,7 +7449,7 @@ mod tests {
             instruction.opcode == MachineOpcode::BoxInt32
                 && instruction.operands[1].value == call.operands[0].value
                 && instruction.operands[1].constraint
-                    == OperandConstraint::Fixed(PhysicalRegister::integer(2))
+                    == OperandConstraint::Fixed(target.integer_argument(2).expect("argument 2"))
         }));
         for padding in [&call.operands[1], &call.operands[2]] {
             assert!(sequence.instructions().iter().any(|instruction| {
@@ -7361,15 +7460,12 @@ mod tests {
         }
 
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&target)
             .expect("ArrayConstruct allocation");
         let locations = allocation
             .instruction_locations(call_id)
             .expect("ArrayConstruct call locations");
-        for (&location, register) in locations[..4]
-            .iter()
-            .zip([2_u8, 3, 4, 0].map(PhysicalRegister::integer))
-        {
+        for (&location, register) in locations[..4].iter().zip(expected_registers) {
             assert_eq!(location, AllocatedLocation::Register(register));
         }
     }
@@ -7428,7 +7524,7 @@ mod tests {
                 &sequence.call_descriptors()[descriptor as usize]
             ));
             let allocation = sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("all SSA critical edges are split");
             assert!(allocation.used_register_count() > 0);
             lower_safepoints(&sequence, &allocation)
@@ -7437,7 +7533,7 @@ mod tests {
             let branch = malformed.blocks[probe_block].end.0 as usize - 1;
             malformed.instructions[branch].opcode = MachineOpcode::BranchIf(false);
             assert!(
-                malformed.verify().is_err(),
+                malformed.verify(&TargetSpec::aarch64()).is_err(),
                 "a successful bind must bypass the cold call"
             );
         }
@@ -7524,7 +7620,9 @@ mod tests {
                 BTreeSet::from([MachineValue(0), MachineValue(1), MachineValue(2)]),
                 "the unrelated live tagged value is rooted with both semantic inputs"
             );
-            sequence.verify().expect("committed sequence verification");
+            sequence
+                .verify(&TargetSpec::aarch64())
+                .expect("committed sequence verification");
         }
     }
 
@@ -7574,7 +7672,7 @@ mod tests {
             )
         }));
         assert_eq!(
-            sequence.verify(),
+            sequence.verify(&TargetSpec::aarch64()),
             Ok(()),
             "cold call i{call_id} retains a valid exact deopt contract"
         );
@@ -7603,7 +7701,7 @@ mod tests {
                 };
                 mutate(kind, candidates);
                 assert_eq!(
-                    sequence.verify(),
+                    sequence.verify(&TargetSpec::aarch64()),
                     Err(crate::machine::VerificationError::InvalidCallTarget(
                         MachineInstructionId(call_id as u32)
                     ))
@@ -7615,7 +7713,7 @@ mod tests {
             panic!("direct method target")
         };
         candidates.clear();
-        assert_eq!(generic.verify(), Ok(()));
+        assert_eq!(generic.verify(&TargetSpec::aarch64()), Ok(()));
 
         assert_invalid(valid.clone(), &|kind, candidates| {
             candidates.clear();
@@ -7667,7 +7765,7 @@ mod tests {
         let mut missing_deopt = valid.clone();
         missing_deopt.instructions[call_id].deopt = None;
         assert_eq!(
-            missing_deopt.verify(),
+            missing_deopt.verify(&TargetSpec::aarch64()),
             Err(crate::machine::VerificationError::InvalidCallTarget(
                 MachineInstructionId(call_id as u32)
             ))
@@ -7679,7 +7777,7 @@ mod tests {
         };
         effectful.call_descriptors[descriptor_index as usize].effects = CallEffects::READS_HEAP;
         assert_eq!(
-            effectful.verify(),
+            effectful.verify(&TargetSpec::aarch64()),
             Err(crate::machine::VerificationError::InvalidCallTarget(
                 MachineInstructionId(call_id as u32)
             ))
@@ -7788,7 +7886,7 @@ mod tests {
         assert!(normalized.contains("BindingHit { byte_pc: 32"));
         assert!(normalized.contains("BranchNativeStatus"));
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("binding CFG allocation");
     }
 
@@ -7838,7 +7936,7 @@ mod tests {
             write_hits.len()
         );
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("binding-write allocation");
     }
 
@@ -7853,7 +7951,7 @@ mod tests {
         )));
         let sequence = select(&hir).expect("binding-to-deopt Machine CFG");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("binding-to-deopt allocation");
         let safepoints =
             lower_safepoints(&sequence, &allocation).expect("binding-to-deopt safepoints");
@@ -7941,7 +8039,7 @@ mod tests {
                 schema.op
             );
             sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .unwrap_or_else(|error| panic!("allocate {:?}: {error:?}", schema.op));
         }
         assert!(covered > 0, "opcode schema must expose the binding family");
@@ -8006,7 +8104,7 @@ mod tests {
                 .all(|instruction| instruction.opcode != MachineOpcode::Throw)
         );
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("caught binding allocation");
     }
 
@@ -8031,19 +8129,22 @@ mod tests {
             load.operands,
             [MachineOperand::register_output(MachineValue(0))]
         );
-        assert_eq!(load.clobbers, string_constant_cell_load_clobbers());
+        assert_eq!(
+            load.clobbers,
+            string_constant_cell_load_clobbers(&TargetSpec::aarch64())
+        );
         assert_eq!(load.deopt, None);
         assert_eq!(load.safepoint, None);
         assert_eq!(sequence.representations()[0], MachineRepresentation::Tagged);
         assert!(sequence.normalized().contains("StringConstantCellLoad"));
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("string-cell allocation");
 
         let mut malformed = sequence;
         malformed.instructions[load_id].clobbers.clear();
         assert_eq!(
-            malformed.verify(),
+            malformed.verify(&TargetSpec::aarch64()),
             Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
                 MachineInstructionId(load_id as u32)
             ))
@@ -8064,7 +8165,7 @@ mod tests {
                 },
             };
             assert_eq!(
-                malformed.verify(),
+                malformed.verify(&TargetSpec::aarch64()),
                 Err(crate::machine::VerificationError::OpcodeSignatureMismatch(
                     MachineInstructionId(load_id as u32)
                 )),
@@ -8091,7 +8192,7 @@ mod tests {
             .push(MachineRepresentation::NativeStatus);
         malformed.instructions[branch_id].operands[0] =
             MachineOperand::register_input(unowned_status);
-        assert_eq!(malformed.verify(), expected);
+        assert_eq!(malformed.verify(&TargetSpec::aarch64()), expected);
     }
 
     #[test]
@@ -8125,7 +8226,7 @@ mod tests {
         safepoint_escape.instructions[cold_call]
             .operands
             .push(MachineOperand::tagged_root(owner));
-        assert_eq!(safepoint_escape.verify(), expected);
+        assert_eq!(safepoint_escape.verify(&TargetSpec::aarch64()), expected);
 
         let mut edge_escape = valid;
         let guard_block = edge_escape
@@ -8143,7 +8244,7 @@ mod tests {
         edge_escape.blocks[join.0 as usize]
             .parameters
             .push(escaped_parameter);
-        assert_eq!(edge_escape.verify(), expected);
+        assert_eq!(edge_escape.verify(&TargetSpec::aarch64()), expected);
     }
 
     #[test]
@@ -8174,7 +8275,10 @@ mod tests {
                 sequence.representations()[compare.operands[1].value.0 as usize],
                 MachineRepresentation::Boolean
             );
-            assert_eq!(compare.clobbers, [PhysicalRegister::integer(16)]);
+            assert_eq!(
+                compare.clobbers,
+                TargetSpec::aarch64().clobbers(TargetClobberSet::StatusScratch)
+            );
             assert_eq!(compare.deopt, Some(DeoptId(0)));
             assert_eq!(compare.safepoint, None);
             assert!(sequence.instructions().iter().any(|instruction| {
@@ -8189,7 +8293,7 @@ mod tests {
                 "TaggedNullishEqual {{ byte_pc: 24, equal: {equal} }}"
             )));
             sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("tagged nullish equality allocation");
         }
     }
@@ -8210,44 +8314,53 @@ mod tests {
 
         let mut missing_input = valid.clone();
         missing_input.instructions[compare_id].operands.remove(0);
-        assert_eq!(missing_input.verify(), expected);
+        assert_eq!(missing_input.verify(&TargetSpec::aarch64()), expected);
 
         let mut wrong_input_representation = valid.clone();
         wrong_input_representation.representations[0] = MachineRepresentation::Int32;
-        assert_eq!(wrong_input_representation.verify(), expected);
+        assert_eq!(
+            wrong_input_representation.verify(&TargetSpec::aarch64()),
+            expected
+        );
 
         let mut spilled_input = valid.clone();
         spilled_input.instructions[compare_id].operands[0] =
             MachineOperand::location_input(MachineValue(0));
-        assert_eq!(spilled_input.verify(), expected);
+        assert_eq!(spilled_input.verify(&TargetSpec::aarch64()), expected);
 
         let mut wrong_output_representation = valid.clone();
         wrong_output_representation.representations[1] = MachineRepresentation::Tagged;
-        assert_eq!(wrong_output_representation.verify(), expected);
+        assert_eq!(
+            wrong_output_representation.verify(&TargetSpec::aarch64()),
+            expected
+        );
 
         let mut output_in_preop_state = valid.clone();
         output_in_preop_state.instructions[compare_id]
             .operands
             .push(MachineOperand::deopt(MachineValue(1)));
-        assert_eq!(output_in_preop_state.verify(), expected);
+        assert_eq!(
+            output_in_preop_state.verify(&TargetSpec::aarch64()),
+            expected
+        );
 
         let mut duplicate_deopt = valid.clone();
         duplicate_deopt.instructions[compare_id]
             .operands
             .push(MachineOperand::deopt(MachineValue(0)));
-        assert_eq!(duplicate_deopt.verify(), expected);
+        assert_eq!(duplicate_deopt.verify(&TargetSpec::aarch64()), expected);
 
         let mut missing_deopt = valid.clone();
         missing_deopt.instructions[compare_id].deopt = None;
-        assert_eq!(missing_deopt.verify(), expected);
+        assert_eq!(missing_deopt.verify(&TargetSpec::aarch64()), expected);
 
         let mut spurious_safepoint = valid.clone();
         spurious_safepoint.instructions[compare_id].safepoint = Some(SafepointId(9));
-        assert_eq!(spurious_safepoint.verify(), expected);
+        assert_eq!(spurious_safepoint.verify(&TargetSpec::aarch64()), expected);
 
         let mut wrong_clobber = valid;
         wrong_clobber.instructions[compare_id].clobbers.clear();
-        assert_eq!(wrong_clobber.verify(), expected);
+        assert_eq!(wrong_clobber.verify(&TargetSpec::aarch64()), expected);
     }
 
     #[test]
@@ -8278,7 +8391,10 @@ mod tests {
             sequence.representations()[load_receiver.0 as usize],
             MachineRepresentation::Tagged
         );
-        assert_eq!(load.clobbers, property_load_clobbers());
+        assert_eq!(
+            load.clobbers,
+            property_load_clobbers(&TargetSpec::aarch64())
+        );
         assert!(load.deopt.is_none());
         assert!(load.safepoint.is_none());
         assert_eq!(load.operands.len(), 4);
@@ -8333,7 +8449,10 @@ mod tests {
             sequence.representations()[store_value.0 as usize],
             MachineRepresentation::Tagged
         );
-        assert_eq!(store.clobbers, property_store_clobbers(true));
+        assert_eq!(
+            store.clobbers,
+            property_store_clobbers(&TargetSpec::aarch64(), true)
+        );
         assert!(store.deopt.is_none() && store.safepoint.is_none());
         assert_eq!(store.operands.len(), 4);
         let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
@@ -8367,7 +8486,7 @@ mod tests {
         assert!(normalized.contains("PropertyLoad { site: MachinePropertySite { function_id: 94, logical_pc: 0, byte_pc: 24, program: [] }, exotic_length: false }"));
         assert!(normalized.contains("PropertyStore { site: MachinePropertySite { function_id: 94, logical_pc: 1, byte_pc: 40, program: [] }, value_is_non_cell: true }"));
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("property late-location allocation");
     }
 
@@ -8404,7 +8523,9 @@ mod tests {
         );
         assert_eq!(
             store.clobbers,
-            TargetRegisterFile::aarch64_scalar_call_clobbers()
+            TargetSpec::aarch64()
+                .clobbers(TargetClobberSet::ScalarCall)
+                .to_vec()
         );
         assert!(sequence.instructions().iter().all(|instruction| {
             instruction.opcode != MachineOpcode::BoxBoolean
@@ -8482,7 +8603,7 @@ mod tests {
                 .any(|instruction| matches!(instruction.opcode, MachineOpcode::BranchNativeStatus))
         );
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("property CFG allocation");
         assert!(!allocation.normalized().is_empty());
     }
@@ -8567,9 +8688,7 @@ mod tests {
     fn property_store_cold_call_does_not_create_a_replay_exit() {
         let hir = property_selection_hir();
         let sequence = select(&hir).expect("property Machine IR");
-        let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
-            .unwrap();
+        let allocation = sequence.allocate(&TargetSpec::aarch64()).unwrap();
         let layout = arm64::frame_layout(&allocation, 0).unwrap();
         let table = lower_deopt_table(
             &sequence,
@@ -8606,7 +8725,7 @@ mod tests {
                 MachineOperand::register_output(MachineValue(2)),
             ]
         );
-        assert_eq!(load.clobbers, element_clobbers());
+        assert_eq!(load.clobbers, element_clobbers(&TargetSpec::aarch64()));
         assert_eq!(load.safepoint, Some(SafepointId(0)));
         assert_eq!(load.deopt, Some(DeoptId(0)));
         let load_roots = load
@@ -8663,7 +8782,7 @@ mod tests {
             sequence.representations()[boxed_value.0 as usize],
             MachineRepresentation::Tagged
         );
-        assert_eq!(store.clobbers, element_clobbers());
+        assert_eq!(store.clobbers, element_clobbers(&TargetSpec::aarch64()));
         assert_eq!(store.safepoint, Some(SafepointId(1)));
         assert_eq!(store.deopt, Some(DeoptId(3)));
         let store_roots = store
@@ -8695,7 +8814,7 @@ mod tests {
         assert!(normalized.contains("ElementLoad(24)"));
         assert!(normalized.contains("ElementStore(40)"));
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("element late-location allocation");
     }
 
@@ -8756,7 +8875,7 @@ mod tests {
             }
         }
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("generic element allocation");
     }
 
@@ -8782,7 +8901,10 @@ mod tests {
         let mut wrong_payload = sequence.clone();
         wrong_payload.instructions[load_id].operands[2] =
             MachineOperand::location_input(MachineValue(0));
-        assert_eq!(wrong_payload.verify(), expected(load_id));
+        assert_eq!(
+            wrong_payload.verify(&TargetSpec::aarch64()),
+            expected(load_id)
+        );
 
         let mut missing_index_root = sequence.clone();
         missing_index_root.instructions[load_id]
@@ -8790,13 +8912,19 @@ mod tests {
             .retain(|operand| {
                 !(operand.purpose == OperandPurpose::TaggedRoot && operand.value == MachineValue(1))
             });
-        assert_eq!(missing_index_root.verify(), expected(load_id));
+        assert_eq!(
+            missing_index_root.verify(&TargetSpec::aarch64()),
+            expected(load_id)
+        );
 
         let mut duplicate_root = sequence.clone();
         duplicate_root.instructions[load_id]
             .operands
             .push(MachineOperand::tagged_root(MachineValue(0)));
-        assert_eq!(duplicate_root.verify(), expected(load_id));
+        assert_eq!(
+            duplicate_root.verify(&TargetSpec::aarch64()),
+            expected(load_id)
+        );
 
         let store_value = sequence.instructions[store_id].operands[2].value;
         let mut missing_store_value_root = sequence.clone();
@@ -8805,15 +8933,24 @@ mod tests {
             .retain(|operand| {
                 !(operand.purpose == OperandPurpose::TaggedRoot && operand.value == store_value)
             });
-        assert_eq!(missing_store_value_root.verify(), expected(store_id));
+        assert_eq!(
+            missing_store_value_root.verify(&TargetSpec::aarch64()),
+            expected(store_id)
+        );
 
         let mut missing_safepoint = sequence.clone();
         missing_safepoint.instructions[load_id].safepoint = None;
-        assert_eq!(missing_safepoint.verify(), expected(load_id));
+        assert_eq!(
+            missing_safepoint.verify(&TargetSpec::aarch64()),
+            expected(load_id)
+        );
 
         let mut partial_clobbers = sequence;
         partial_clobbers.instructions[store_id].clobbers.pop();
-        assert_eq!(partial_clobbers.verify(), expected(store_id));
+        assert_eq!(
+            partial_clobbers.verify(&TargetSpec::aarch64()),
+            expected(store_id)
+        );
     }
 
     #[test]
@@ -8875,7 +9012,7 @@ mod tests {
         assert_eq!(element_ids.len(), 2);
 
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("aliased committed element allocation");
         let safepoints =
             lower_safepoints(&sequence, &allocation).expect("aliased committed element safepoints");
@@ -8914,7 +9051,7 @@ mod tests {
             );
             assert_eq!(
                 conversion.clobbers,
-                [PhysicalRegister::integer(16), PhysicalRegister::float(31)]
+                TargetSpec::aarch64().clobbers(TargetClobberSet::FloatElementIndex)
             );
             assert!(conversion.deopt.is_some());
         }
@@ -8958,7 +9095,7 @@ mod tests {
             store.operands[2],
             MachineOperand::register_input(MachineValue(3))
         );
-        assert_eq!(store.clobbers, element_clobbers());
+        assert_eq!(store.clobbers, element_clobbers(&TargetSpec::aarch64()));
         assert!(
             !sequence
                 .instructions()
@@ -8980,7 +9117,7 @@ mod tests {
         assert!(normalized.contains("PackedDoubleElementLoad { byte_pc: 24, cache: None }"));
         assert!(normalized.contains("PackedDoubleElementStore { byte_pc: 40, cache: None }"));
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("PackedDouble allocation");
 
         let expected = Err(VerificationError::OpcodeSignatureMismatch(
@@ -9002,7 +9139,10 @@ mod tests {
         ));
         let mut wrong_load_representation = sequence.clone();
         wrong_load_representation.representations[3] = MachineRepresentation::Tagged;
-        assert_eq!(wrong_load_representation.verify(), expected);
+        assert_eq!(
+            wrong_load_representation.verify(&TargetSpec::aarch64()),
+            expected
+        );
 
         let conversion_id = sequence
             .instructions()
@@ -9018,7 +9158,7 @@ mod tests {
                 !(operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(1))
             });
         assert_eq!(
-            conversion_without_semantic_input.verify(),
+            conversion_without_semantic_input.verify(&TargetSpec::aarch64()),
             Err(VerificationError::OpcodeSignatureMismatch(
                 MachineInstructionId(conversion_id as u32)
             ))
@@ -9044,7 +9184,7 @@ mod tests {
                 !(operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(1))
             });
         assert_eq!(
-            load_without_semantic_index.verify(),
+            load_without_semantic_index.verify(&TargetSpec::aarch64()),
             Err(VerificationError::OpcodeSignatureMismatch(
                 MachineInstructionId(load_id as u32)
             ))
@@ -9070,7 +9210,7 @@ mod tests {
                 !(operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(3))
             });
         assert_eq!(
-            store_without_semantic_value.verify(),
+            store_without_semantic_value.verify(&TargetSpec::aarch64()),
             Err(VerificationError::OpcodeSignatureMismatch(
                 MachineInstructionId(store_id as u32)
             ))
@@ -9115,9 +9255,11 @@ mod tests {
                 MachineOpcode::CheckedFloat64ToElementIndex(..)
             )
         }));
-        sequence.verify().expect("valid tagged-index contract");
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .verify(&TargetSpec::aarch64())
+            .expect("valid tagged-index contract");
+        sequence
+            .allocate(&TargetSpec::aarch64())
             .expect("PackedDouble tagged-index allocation");
     }
 
@@ -9161,7 +9303,7 @@ mod tests {
         }
 
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("Number-index element allocation");
         let layout = arm64::frame_layout(&allocation, 0).expect("Number-index element frame");
         let table = lower_deopt_table(
@@ -9238,7 +9380,7 @@ mod tests {
             };
             let sequence = select(&hir).expect("scalar-index element Machine IR");
             let allocation = sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("scalar-index committed element allocation");
             for opcode in [
                 MachineOpcode::ElementLoad(24),
@@ -9251,7 +9393,10 @@ mod tests {
                     .find(|(_, instruction)| instruction.opcode == opcode)
                     .expect("scalar-index element instruction");
                 let selected_fast_index = instruction.operands[1].value;
-                assert_eq!(instruction.clobbers, element_clobbers());
+                assert_eq!(
+                    instruction.clobbers,
+                    element_clobbers(&TargetSpec::aarch64())
+                );
                 assert_eq!(selected_fast_index, MachineValue(fast_index.0 as u32));
                 assert_eq!(
                     sequence.representations()[selected_fast_index.0 as usize],
@@ -9281,7 +9426,8 @@ mod tests {
                     .expect("committed element allocation coverage");
                 match locations[1] {
                     AllocatedLocation::Register(register) => assert!(
-                        register.is_integer() && !element_clobbers().contains(&register),
+                        register.is_integer()
+                            && !element_clobbers(&TargetSpec::aarch64()).contains(&register),
                         "late scalar key home must survive the fast guard clobbers"
                     ),
                     AllocatedLocation::Stack(_) => {}
@@ -9298,14 +9444,14 @@ mod tests {
                 .operands
                 .push(MachineOperand::tagged_root(scalar_index));
             assert_eq!(
-                falsely_rooted.verify(),
+                falsely_rooted.verify(&TargetSpec::aarch64()),
                 Err(VerificationError::OpcodeSignatureMismatch(
                     MachineInstructionId(load_id as u32)
                 )),
                 "a raw scalar late home must never enter the moving-root table"
             );
             sequence
-                .verify()
+                .verify(&TargetSpec::aarch64())
                 .expect("valid committed element key contract");
         }
     }
@@ -9320,7 +9466,7 @@ mod tests {
                 MachineRepresentation::Boolean
             );
             let allocation = sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("element Boolean allocation");
             let layout = arm64::frame_layout(&allocation, 0).expect("element Boolean frame");
             let table = lower_deopt_table(
@@ -9602,6 +9748,7 @@ mod tests {
 
     #[test]
     fn tagged_truthiness_has_explicit_probe_and_cold_leaf_cfg() {
+        let target = TargetSpec::aarch64();
         let view = tagged_truthiness_branch_view();
         let hir = NumericFunction::build(&view).expect("tagged truthiness HIR");
         assert_eq!(hir.frame_states.len(), 1);
@@ -9658,11 +9805,11 @@ mod tests {
             .expect("tagged truthiness call");
         assert_eq!(
             call.operands[0].constraint,
-            OperandConstraint::Fixed(PhysicalRegister::integer(1))
+            OperandConstraint::Fixed(target.integer_argument(1).expect("argument 1"))
         );
         assert_eq!(
             call.operands[2].constraint,
-            OperandConstraint::Fixed(PhysicalRegister::integer(0))
+            OperandConstraint::Fixed(target.integer_result())
         );
         assert!(call.deopt.is_some());
         assert_eq!(
@@ -9673,18 +9820,18 @@ mod tests {
             3
         );
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&target)
             .expect("tagged truthiness allocation");
         let locations = allocation
             .instruction_locations(call_id)
             .expect("tagged truthiness locations");
         assert_eq!(
             locations[0],
-            AllocatedLocation::Register(PhysicalRegister::integer(1))
+            AllocatedLocation::Register(target.integer_argument(1).expect("argument 1"))
         );
         assert_eq!(
             locations[2],
-            AllocatedLocation::Register(PhysicalRegister::integer(0))
+            AllocatedLocation::Register(target.integer_result())
         );
     }
 
@@ -9764,6 +9911,7 @@ mod tests {
 
     #[test]
     fn tagged_strict_equality_uses_verified_leaf_call_and_boxes_scalars() {
+        let target = TargetSpec::aarch64();
         let view = tagged_mixed_strict_equality_view();
         let hir = NumericFunction::build(&view).expect("tagged strict equality HIR");
         assert_eq!(hir.frame_states.len(), 1);
@@ -9802,23 +9950,22 @@ mod tests {
             .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(0)))
             .map(|(index, instruction)| (MachineInstructionId(index as u32), instruction))
             .expect("tagged strict equality call");
-        for (operand, register) in call.operands[..3]
-            .iter()
-            .zip([1_u8, 2, 0].map(PhysicalRegister::integer))
-        {
+        let expected_registers = [
+            target.integer_argument(1).expect("argument 1"),
+            target.integer_argument(2).expect("argument 2"),
+            target.integer_result(),
+        ];
+        for (operand, register) in call.operands[..3].iter().zip(expected_registers) {
             assert_eq!(operand.constraint, OperandConstraint::Fixed(register));
         }
         assert!(call.deopt.is_some());
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&target)
             .expect("tagged strict equality allocation");
         let locations = allocation
             .instruction_locations(call_id)
             .expect("tagged strict equality locations");
-        for (&location, register) in locations[..3]
-            .iter()
-            .zip([1_u8, 2, 0].map(PhysicalRegister::integer))
-        {
+        for (&location, register) in locations[..3].iter().zip(expected_registers) {
             assert_eq!(location, AllocatedLocation::Register(register));
         }
     }
@@ -9948,7 +10095,7 @@ mod tests {
         }));
 
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("tagged string-concat allocation");
         let safepoints =
             lower_safepoints(&sequence, &allocation).expect("allocator-driven tagged safepoints");
@@ -9977,7 +10124,7 @@ mod tests {
             .expect("pressure string-concat HIR");
         let sequence = select(&hir).expect("pressure string-concat Machine IR");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("pressure string-concat allocation");
         let safepoints =
             lower_safepoints(&sequence, &allocation).expect("pressure allocator-driven safepoints");
@@ -10266,7 +10413,7 @@ mod tests {
         )));
         let sequence = select(&hir).expect("typed parameter loop Machine IR");
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("typed parameter loop allocation");
 
         let code = compile_output(&view, None).code;
@@ -10368,7 +10515,7 @@ mod tests {
             let predecessor = &sequence.blocks()[split.predecessors[0].0 as usize];
             assert!(predecessor.successor_arguments[0].is_empty());
             sequence
-                .allocate(&TargetRegisterFile::aarch64_scalar_function())
+                .allocate(&TargetSpec::aarch64())
                 .expect("representation-conversion allocation");
         }
     }
@@ -10426,7 +10573,7 @@ mod tests {
             MachineRepresentation::Tagged
         );
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("tagged backedge conversion allocation");
     }
 
@@ -10582,7 +10729,7 @@ mod tests {
             assert_eq!(predecessor.successor_arguments[edge].len(), 2);
         }
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("loop Machine IR allocation");
 
         let code = compile_output(&view, None).code;
@@ -10679,7 +10826,7 @@ mod tests {
                 })
         }));
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("branch-phi Machine IR allocation");
         assert!(
             allocation
@@ -10879,7 +11026,7 @@ mod tests {
 
         let sequence = select(&hir).expect("bitwise-loop Machine IR");
         sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("bitwise-loop Machine IR allocation");
 
         let output = crate::optimizing::compile_optimized_with_artifacts(
@@ -11095,7 +11242,7 @@ mod tests {
         let rem_hir = NumericFunction::build(&rem_view).expect("remainder numeric HIR");
         let rem_sequence = select(&rem_hir).expect("remainder Machine IR");
         rem_sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("remainder allocation");
 
         for (op, left, right, expected) in [
@@ -11222,7 +11369,7 @@ mod tests {
         let hir = NumericFunction::build(&view).expect("typed leaf overflow numeric HIR");
         let sequence = select(&hir).expect("typed leaf overflow Machine IR");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("typed leaf overflow allocation");
         assert!(allocation.metadata().iter().any(|metadata| {
             metadata.deopt.is_some()
@@ -11314,7 +11461,7 @@ mod tests {
         );
         let sequence = select(&hir).expect("integer-scalar Machine IR");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("integer-scalar allocation");
         let frame = arm64::frame_layout(&allocation, 0).expect("integer-scalar frame");
         lower_deopt_table(
@@ -11364,6 +11511,7 @@ mod tests {
 
     #[test]
     fn publishes_float_leaf_loop_through_machine_ir_backend() {
+        let target = TargetSpec::aarch64();
         let view = float_leaf_loop_view();
         let hir = NumericFunction::build(&view).expect("float-leaf-loop numeric HIR");
         assert!(
@@ -11404,19 +11552,18 @@ mod tests {
                 .map(|operand| operand.constraint)
                 .collect::<Vec<_>>(),
             [
-                OperandConstraint::Fixed(PhysicalRegister::float(0)),
-                OperandConstraint::Fixed(PhysicalRegister::float(1)),
-                OperandConstraint::Fixed(PhysicalRegister::float(0)),
+                OperandConstraint::Fixed(target.float_argument(0).expect("float argument 0")),
+                OperandConstraint::Fixed(target.float_argument(1).expect("float argument 1")),
+                OperandConstraint::Fixed(target.float_result()),
             ]
         );
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&target)
             .expect("float-leaf-loop allocation");
         assert!(
-            allocation.used_registers().any(|register| {
-                (register.is_integer() && (20..=28).contains(&register.encoding()))
-                    || (register.is_float() && (8..=15).contains(&register.encoding()))
-            }),
+            allocation
+                .used_registers()
+                .any(|register| target.is_callee_saved(register)),
             "values live across leaf calls must occupy callee-saved registers"
         );
         let output = crate::optimizing::compile_optimized_with_artifacts(
@@ -11483,6 +11630,7 @@ mod tests {
 
     #[test]
     fn publishes_float_bitwise_loop_through_machine_ir_backend() {
+        let target = TargetSpec::aarch64();
         let view = float_bitwise_loop_view();
         let hir = NumericFunction::build(&view).expect("float-bitwise-loop numeric HIR");
         assert!(
@@ -11504,18 +11652,17 @@ mod tests {
                 .map(|operand| operand.constraint)
                 .collect::<Vec<_>>(),
             [
-                OperandConstraint::Fixed(PhysicalRegister::float(0)),
-                OperandConstraint::Fixed(PhysicalRegister::integer(0)),
+                OperandConstraint::Fixed(target.float_argument(0).expect("float argument 0")),
+                OperandConstraint::Fixed(target.integer_result()),
             ]
         );
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&target)
             .expect("float-bitwise-loop allocation");
         assert!(
-            allocation.used_registers().any(|register| {
-                (register.is_integer() && (20..=28).contains(&register.encoding()))
-                    || (register.is_float() && (8..=15).contains(&register.encoding()))
-            }),
+            allocation
+                .used_registers()
+                .any(|register| target.is_callee_saved(register)),
             "loop-carried values live across ToInt32 leaves must occupy callee-saved registers"
         );
 
@@ -11743,7 +11890,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(osr_pcs, [1]);
-        sequence.verify().expect("nested-loop Machine verification");
+        sequence
+            .verify(&TargetSpec::aarch64())
+            .expect("nested-loop Machine verification");
     }
 
     #[test]
@@ -11963,7 +12112,7 @@ mod tests {
             .map(|index| MachineInstructionId(index as u32))
             .expect("OSR spill-pressure marker");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("OSR spill-pressure allocation");
         assert!(
             allocation

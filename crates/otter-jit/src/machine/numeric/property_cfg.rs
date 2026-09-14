@@ -67,6 +67,7 @@ pub(super) fn exceptional(hir: &NumericFunction, block: usize) -> Option<usize> 
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_block(
+    target_spec: &TargetSpec,
     selected: SelectedBlock,
     hir: &NumericFunction,
     cfg: &SelectionCfg,
@@ -97,6 +98,7 @@ pub(super) fn select_block(
         SelectedBlock::PropertyCold(_) => {
             let source = &hir.property_sites[&node];
             let mut descriptor = binding_value_descriptor(
+                target_spec,
                 source.logical_pc,
                 source.byte_pc,
                 if stored.is_some() { 3 } else { 2 },
@@ -154,7 +156,9 @@ pub(super) fn select_block(
                 MachineOpcode::BranchNativeStatus,
                 vec![MachineOperand::register_input(values.status)],
             );
-            branch.clobbers = vec![PhysicalRegister::integer(16)];
+            branch.clobbers = target_spec
+                .clobbers(TargetClobberSet::StatusScratch)
+                .to_vec();
             branch.control = ControlFlow::Branch;
             instructions.push(branch);
             result.predecessors = vec![cfg.originals[block_index]];

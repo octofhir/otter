@@ -11,6 +11,10 @@
 //! - A metadata operand is a late use, so its allocation is valid through the
 //!   safepoint/deopt instruction and cannot overlap a declared clobber.
 //! - Allocation edits are retained in program-point order for final emission.
+//!
+//! # See also
+//! - [`crate::machine::TargetSpec`] — register inventory and ABI constraints.
+//! - [`crate::machine::MachineFrameLayout`] — target-owned post-allocation frame.
 
 use std::fmt::Write as _;
 
@@ -22,7 +26,7 @@ use regalloc2::{
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineInstructionId, MachineOperand, MachineValue,
     OperandConstraint, OperandPurpose, OperandRole, OperandTiming, PhysicalRegister, SafepointId,
-    TargetRegisterFile, VerificationError,
+    TargetSpec, VerificationError,
 };
 
 /// Final register or stack location assigned by regalloc2.
@@ -82,6 +86,12 @@ pub struct AllocatedSequence {
 }
 
 impl AllocatedSequence {
+    /// Architecture whose register namespace owns this allocation.
+    #[must_use]
+    pub const fn architecture(&self) -> super::TargetArchitecture {
+        self.architecture
+    }
+
     /// Number of word-sized spill slots reserved by allocation.
     #[must_use]
     pub const fn spill_slots(&self) -> u32 {
@@ -261,16 +271,16 @@ impl Function for RegallocFunction<'_> {
 
 pub(super) fn allocate(
     sequence: &InstructionSequence,
-    target: &TargetRegisterFile,
+    target: &TargetSpec,
 ) -> Result<AllocatedSequence, AllocationError> {
-    sequence.verify()?;
+    sequence.verify(target)?;
     let function = build_regalloc_function(sequence);
     let options = RegallocOptions {
         verbose_log: false,
         validate_ssa: true,
         algorithm: regalloc2::Algorithm::Ion,
     };
-    let output = regalloc2::run(&function, &target.environment(), &options)
+    let output = regalloc2::run(&function, &target.registers().environment(), &options)
         .map_err(AllocationError::RegisterAllocation)?;
     let spill_slots =
         u32::try_from(output.num_spillslots).map_err(|_| AllocationError::SpillSlotOverflow)?;
@@ -442,12 +452,12 @@ mod tests {
     use super::*;
     use crate::machine::{
         CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, ExceptionalEdge,
-        InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction, MachineOpcode,
-        MachineOperand, MachineRepresentation, OperandConstraint, OperandPurpose, OperandRole,
-        OperandTiming, SafepointId, SafepointKind,
+        FrameLayoutError, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
+        MachineOpcode, MachineOperand, MachineRepresentation, OperandConstraint, OperandPurpose,
+        OperandRole, OperandTiming, SafepointId, SafepointKind, TargetClobberSet,
     };
 
-    fn sequence() -> InstructionSequence {
+    fn sequence(target: &TargetSpec) -> InstructionSequence {
         let tagged = MachineValue(0);
         let integer = MachineValue(1);
         let result = MachineValue(2);
@@ -455,14 +465,13 @@ mod tests {
             MachineOpcode::EntryValue(0),
             vec![MachineOperand::register_output(tagged)],
         );
-        entry_tagged.operands[0].constraint =
-            OperandConstraint::Fixed(PhysicalRegister::integer(0));
+        entry_tagged.operands[0].constraint = OperandConstraint::Fixed(target.integer_result());
         let mut entry_integer = MachineInstruction::plain(
             MachineOpcode::IntegerConstant(7),
             vec![MachineOperand::register_output(integer)],
         );
         entry_integer.operands[0].constraint =
-            OperandConstraint::Fixed(PhysicalRegister::integer(1));
+            OperandConstraint::Fixed(target.integer_argument(1).expect("target argument 1"));
         let mut call = MachineInstruction::plain(
             MachineOpcode::Call(0),
             vec![
@@ -473,7 +482,7 @@ mod tests {
             ],
         );
         call.safepoint = Some(SafepointId(0));
-        call.clobbers = (0..=18).map(PhysicalRegister::integer).collect();
+        call.clobbers = target.clobbers(TargetClobberSet::ScalarCall).to_vec();
         let call_clobbers = call.clobbers.clone();
         let mut add = MachineInstruction::plain(
             MachineOpcode::IntegerAdd,
@@ -492,6 +501,7 @@ mod tests {
         );
         ret.control = ControlFlow::Return;
         InstructionSequence::new(
+            target,
             MachineBlock(0),
             vec![
                 MachineRepresentation::Tagged,
@@ -522,8 +532,8 @@ mod tests {
 
     #[test]
     fn both_targets_allocate_identical_metadata_contract() {
-        let sequence = sequence();
-        for target in [TargetRegisterFile::aarch64(), TargetRegisterFile::x86_64()] {
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let sequence = sequence(&target);
             let allocated = sequence.allocate(&target).expect("allocation succeeds");
             assert_eq!(allocated.metadata().len(), 3);
             assert_eq!(allocated.metadata()[0].safepoint, Some(SafepointId(0)));
@@ -537,15 +547,30 @@ mod tests {
     }
 
     #[test]
+    fn frame_layout_rejects_a_foreign_allocation() {
+        let source = TargetSpec::aarch64();
+        let allocation = sequence(&source).allocate(&source).expect("allocation");
+        assert_eq!(
+            TargetSpec::x86_64().frame_layout(&allocation, 0, 0),
+            Err(FrameLayoutError::TargetMismatch)
+        );
+    }
+
+    #[test]
     fn call_clobbers_force_the_tagged_root_out_of_caller_saved_registers() {
-        let allocated = sequence()
-            .allocate(&TargetRegisterFile::aarch64())
+        let target = TargetSpec::aarch64();
+        let allocated = sequence(&target)
+            .allocate(&target)
             .expect("allocation succeeds");
         let root = allocated.metadata()[0];
         assert_eq!(root.purpose, OperandPurpose::TaggedRoot);
         match root.location {
             AllocatedLocation::Register(register) => {
-                assert!(!(0..=18).contains(&register.encoding()));
+                assert!(
+                    !target
+                        .clobbers(TargetClobberSet::ScalarCall)
+                        .contains(&register)
+                );
             }
             AllocatedLocation::Stack(_) => {}
         }
@@ -553,10 +578,10 @@ mod tests {
 
     #[test]
     fn normalized_ir_and_allocation_are_deterministic() {
-        let first = sequence();
-        let second = sequence();
+        let target = TargetSpec::aarch64();
+        let first = sequence(&target);
+        let second = sequence(&target);
         assert_eq!(first.normalized(), second.normalized());
-        let target = TargetRegisterFile::aarch64();
         assert_eq!(
             first.allocate(&target).expect("first").normalized(),
             second.allocate(&target).expect("second").normalized()
@@ -572,6 +597,7 @@ mod tests {
         let mut ret = MachineInstruction::plain(MachineOpcode::Return, vec![invalid]);
         ret.control = ControlFlow::Return;
         let error = InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged],
             vec![],

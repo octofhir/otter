@@ -14,6 +14,10 @@
 //!   aligned to the target ABI requirement.
 //! - Spill offsets are relative to the post-prologue stack pointer and never
 //!   overlap target-owned fixed frame state.
+//!
+//! # See also
+//! - [`crate::machine::TargetSpec`] — the sole owner of target frame inputs.
+//! - [`crate::machine::regalloc`] — the allocation result framed here.
 
 use super::AllocatedSequence;
 
@@ -22,6 +26,8 @@ const SPILL_SLOT_BYTES: u32 = 8;
 /// Failure to construct or query one machine frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameLayoutError {
+    /// Allocation and frame specifications name different targets.
+    TargetMismatch,
     /// Alignment must be a non-zero power of two.
     InvalidAlignment,
     /// Frame byte arithmetic exceeded the metadata width.
@@ -187,7 +193,7 @@ mod tests {
     use crate::machine::{
         ControlFlow, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
         MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation, MachineValue,
-        TargetRegisterFile,
+        TargetSpec,
     };
 
     #[test]
@@ -226,6 +232,7 @@ mod tests {
         instructions.push(ret);
         let end = MachineInstructionId(instructions.len() as u32);
         let sequence = InstructionSequence::new(
+            &TargetSpec::aarch64(),
             MachineBlock(0),
             representations,
             Vec::new(),
@@ -241,7 +248,7 @@ mod tests {
         )
         .expect("valid pressure sequence");
         let allocation = sequence
-            .allocate(&TargetRegisterFile::aarch64_scalar_function())
+            .allocate(&TargetSpec::aarch64())
             .expect("pressure sequence allocates");
         assert!(allocation.spill_slots() > 0);
 

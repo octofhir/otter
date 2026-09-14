@@ -23,7 +23,7 @@
 use super::{
     CallDescriptor, CallTarget, ControlFlow, ExceptionalEdge, MachineBlock, MachineBlockData,
     MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation,
-    MachineValue, OperandPurpose, PhysicalRegister, VerificationError,
+    MachineValue, OperandPurpose, TargetClobberSet, TargetSpec, VerificationError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub(super) enum ProbeKind {
 }
 
 pub(super) fn expand(
+    target_spec: &TargetSpec,
     representations: &mut Vec<MachineRepresentation>,
     descriptors: &mut [CallDescriptor],
     sites: &std::collections::BTreeMap<u32, ProbeKind>,
@@ -173,11 +174,13 @@ pub(super) fn expand(
                         vec![
                             MachineOperand::fixed_register_input(
                                 inputs[0],
-                                PhysicalRegister::integer(1),
+                                target_spec
+                                    .integer_argument(1)
+                                    .ok_or(VerificationError::InvalidEntry)?,
                             ),
                             MachineOperand::fixed_register_output(
                                 condition,
-                                PhysicalRegister::integer(0),
+                                target_spec.integer_result(),
                             ),
                         ],
                     ));
@@ -228,7 +231,9 @@ pub(super) fn expand(
                 vec![MachineOperand::register_input(status)],
             );
             status_branch.control = ControlFlow::Branch;
-            status_branch.clobbers = vec![PhysicalRegister::integer(16)];
+            status_branch.clobbers = target_spec
+                .clobbers(TargetClobberSet::StatusScratch)
+                .to_vec();
             bodies.push(vec![call, status_branch]);
             bodies.push(vec![jump.clone()]);
             bodies.push(vec![jump]);

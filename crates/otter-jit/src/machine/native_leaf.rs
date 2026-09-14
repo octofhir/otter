@@ -11,9 +11,8 @@
 //!   inputs and result; the abs overflow miss precedes the result definition.
 //! - Leaves cannot allocate, collect, throw, or reenter JavaScript. Identity or
 //!   operand misses deoptimize before the source call has any observable effect.
-//! - The callee occupies x9, arguments x1/x2, and result x0. Identity-guard
-//!   scratch never overlaps the argument registers; all call clobbers are
-//!   visible to the allocator, including on the status-miss edge.
+//! - The target specification owns the callee, argument, result, and clobber
+//!   registers. Identity-guard scratch never overlaps the arguments.
 //!
 //! # See also
 //! - [`otter_vm::jit_static_native`] — authoritative builtin declarations.
@@ -23,10 +22,25 @@ pub(super) mod arm64;
 
 use super::{
     CallDescriptor, CallEffects, CallTarget, ExceptionalEdge, MachineInstruction,
-    MachineRepresentation, OperandConstraint, OperandPurpose, PhysicalRegister, SafepointKind,
-    TargetRegisterFile,
+    MachineRepresentation, OperandConstraint, OperandPurpose, SafepointKind, TargetCapability,
+    TargetClobberSet, TargetSpec,
 };
 use otter_vm::JitStaticNativeCall;
+
+pub(super) fn supports_site(
+    view: &otter_vm::JitCompileSnapshot,
+    target: JitStaticNativeCall,
+    argument_count: usize,
+) -> bool {
+    let Some(declaration) = otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)
+    else {
+        return false;
+    };
+    view.native_ref_byte != 0
+        && argument_count == usize::from(declaration.argument_count)
+        && otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)
+            .is_some_and(|stub| stub.is_valid())
+}
 
 pub(super) fn supports_int32(stub: otter_vm::native_abi::RuntimeStubId) -> bool {
     use otter_vm::native_abi::{STUB_MATH_ABS_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF};
@@ -39,15 +53,18 @@ pub(super) fn supports_int32(stub: otter_vm::native_abi::RuntimeStubId) -> bool 
 }
 
 pub(super) fn descriptor(
+    target_spec: &TargetSpec,
     target: JitStaticNativeCall,
     byte_pc: u32,
     representation: MachineRepresentation,
 ) -> Option<CallDescriptor> {
     let declaration = otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)?;
-    if !matches!(
-        representation,
-        MachineRepresentation::Tagged | MachineRepresentation::Int32
-    ) || (representation == MachineRepresentation::Int32 && !supports_int32(target.leaf_stub_id))
+    if !target_spec.supports(TargetCapability::NativeLeaf)
+        || !matches!(
+            representation,
+            MachineRepresentation::Tagged | MachineRepresentation::Int32
+        )
+        || (representation == MachineRepresentation::Int32 && !supports_int32(target.leaf_stub_id))
         || target.argument_count > 2
         || declaration.argument_count != target.argument_count
         || !otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)
@@ -56,11 +73,13 @@ pub(super) fn descriptor(
         return None;
     }
     let mut clobbers = if representation == MachineRepresentation::Int32 {
-        (12..=14).map(PhysicalRegister::integer).collect()
+        target_spec
+            .clobbers(TargetClobberSet::NativeLeafInt32)
+            .to_vec()
     } else {
-        TargetRegisterFile::aarch64_scalar_call_clobbers()
+        target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec()
     };
-    clobbers.retain(|register| *register != PhysicalRegister::integer(0));
+    clobbers.retain(|register| *register != target_spec.integer_result());
     Some(CallDescriptor {
         target: CallTarget::NativeLeaf { target, byte_pc },
         arguments: std::iter::once(MachineRepresentation::Tagged)
@@ -77,14 +96,18 @@ pub(super) fn descriptor(
     })
 }
 
-pub(super) fn is_valid(call: &CallDescriptor, instruction: &MachineInstruction) -> bool {
+pub(super) fn is_valid(
+    target_spec: &TargetSpec,
+    call: &CallDescriptor,
+    instruction: &MachineInstruction,
+) -> bool {
     let CallTarget::NativeLeaf { target, byte_pc } = call.target else {
         return false;
     };
     let [representation] = call.results.as_slice() else {
         return false;
     };
-    if descriptor(target, byte_pc, *representation).as_ref() != Some(call)
+    if descriptor(target_spec, target, byte_pc, *representation).as_ref() != Some(call)
         || instruction.deopt.is_none()
         || instruction.safepoint.is_some()
     {
@@ -99,17 +122,19 @@ pub(super) fn is_valid(call: &CallDescriptor, instruction: &MachineInstruction) 
             }
             _ => None,
         });
-    let input = |register| {
-        (
-            OperandPurpose::Input,
-            OperandConstraint::Fixed(PhysicalRegister::integer(register)),
-        )
+    let input = |register| (OperandPurpose::Input, OperandConstraint::Fixed(register));
+    let callee = target_spec.callee_register();
+    let Some(arguments) = (1..=usize::from(target.argument_count))
+        .map(|index| target_spec.integer_argument(index))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
     };
-    let expected = std::iter::once(input(9))
-        .chain((1..=target.argument_count).map(input))
+    let expected = std::iter::once(input(callee))
+        .chain(arguments.into_iter().map(input))
         .chain(std::iter::once((
             OperandPurpose::Output,
-            OperandConstraint::Fixed(PhysicalRegister::integer(0)),
+            OperandConstraint::Fixed(target_spec.integer_result()),
         )));
     actual.eq(expected)
 }

@@ -164,7 +164,7 @@ impl Interpreter {
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
             rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
-            feedback_directory: crate::interp::FeedbackDirectory::default(),
+            method_feedback: crate::interp::MethodFeedbackDirectory::default(),
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
             jit_artifacts: crate::jit_artifact::JitArtifactState::default(),

@@ -65,7 +65,7 @@ impl Interpreter {
             STUB_ARRAY_UNSHIFT_ALLOC,
         };
 
-        let ic = match self.feedback_directory.method_ic(site)? {
+        let ic = match self.method_feedback.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) | MethodCallIc::Ordinary(_) => return None,
         };
@@ -171,7 +171,7 @@ impl Interpreter {
         site: usize,
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
-        let ic = match self.feedback_directory.method_ic(site)? {
+        let ic = match self.method_feedback.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) | MethodCallIc::Ordinary(_) => return None,
         };

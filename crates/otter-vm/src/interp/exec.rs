@@ -140,7 +140,7 @@ impl Interpreter {
         self.function_non_extensible.retain(outside);
         self.function_deleted_metadata.retain(|(id, _)| outside(id));
         self.optimizing_tier_policy.evict_function_range(start, end);
-        self.feedback_directory.evict_site_range(
+        self.method_feedback.evict_site_range(
             candidate.property_ic_site_base,
             candidate.property_ic_site_end,
         );
@@ -345,7 +345,7 @@ impl Interpreter {
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
         self.pending_uncaught_frames = None;
-        self.ensure_property_ic_capacity(context);
+        self.ensure_method_feedback_context(context);
         match self.run_inner(context) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError {
@@ -1163,7 +1163,7 @@ impl Interpreter {
         floor: ActivationFloor,
     ) -> Result<Value, VmError> {
         debug_assert!(stack.is_runtime_rooted_by(self));
-        self.ensure_property_ic_capacity(context);
+        self.ensure_method_feedback_context(context);
         self.begin_runtime_budget_turn();
         let result = (|| -> Result<Value, VmError> {
             loop {

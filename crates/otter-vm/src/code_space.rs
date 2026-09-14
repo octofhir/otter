@@ -618,6 +618,75 @@ impl CodeSpace {
             .map(crate::executable::CodeBlock::feedback_epoch)
     }
 
+    pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for current in self.chunks().iter() {
+            if let Some(payload) = current
+                .payload
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                payload.executable.trace_property_ic_roots(visitor);
+            }
+        }
+    }
+
+    pub(crate) fn property_ic_stats(&self) -> crate::property_ic::PropertyIcStats {
+        let mut total = crate::property_ic::PropertyIcStats::default();
+        for current in self.chunks().iter() {
+            let payload = current
+                .payload
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(payload) = payload.as_ref() else {
+                continue;
+            };
+            let stats = payload.executable.property_ic_stats();
+            total.load_hits = total.load_hits.saturating_add(stats.load_hits);
+            total.load_misses = total.load_misses.saturating_add(stats.load_misses);
+            total.load_installs = total.load_installs.saturating_add(stats.load_installs);
+            total.load_disables = total.load_disables.saturating_add(stats.load_disables);
+            total.store_hits = total.store_hits.saturating_add(stats.store_hits);
+            total.store_misses = total.store_misses.saturating_add(stats.store_misses);
+            total.store_installs = total.store_installs.saturating_add(stats.store_installs);
+            total.store_disables = total.store_disables.saturating_add(stats.store_disables);
+        }
+        total
+    }
+
+    #[cfg(test)]
+    pub(crate) fn polymorphic_property_count(
+        &self,
+        kind: crate::property_ic::PropertyIcKind,
+    ) -> usize {
+        self.chunks()
+            .iter()
+            .filter_map(|current| {
+                current
+                    .payload
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|payload| payload.executable.polymorphic_property_count(kind))
+            })
+            .sum()
+    }
+
+    pub(crate) fn property_ic_snapshots(&self) -> Vec<crate::inspect::IcSiteSnapshot> {
+        let mut out = Vec::new();
+        for current in self.chunks().iter() {
+            if let Some(payload) = current
+                .payload
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                out.extend(payload.executable.property_ic_snapshots());
+            }
+        }
+        out
+    }
+
     /// Snapshot reclaimable payloads, largest first with base as a stable tie
     /// breaker. A payload with a retained context is omitted: its physical
     /// tables and lease cannot be released even if no function id is live.
@@ -928,6 +997,54 @@ mod tests {
         assert_eq!(second.property_ic_site_end(), 2);
         assert_eq!(first.property_ic_site(0, 0), Some(0));
         assert_eq!(second.property_ic_site(1, 0), Some(1));
+    }
+
+    #[test]
+    fn evicting_chunk_drops_its_owned_property_program_and_snapshot() {
+        let space = Arc::new(CodeSpace::default());
+        let mut module = module_with_functions(1);
+        module.functions[0].code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadProperty,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            },
+            Instruction {
+                pc: 1,
+                op: Op::ReturnUndefined,
+                operands: Vec::new(),
+            },
+        ]
+        .into();
+        module.constants = vec![Constant::String {
+            utf16: "x".encode_utf16().collect(),
+        }];
+        module.module_inits.clear();
+
+        let context = space
+            .link_evictable_module(module, &unlimited())
+            .expect("evictable property chunk links");
+        context
+            .property_feedback_slot(0, 0, crate::property_ic::PropertyIcKind::Load)
+            .expect("CodeBlock property slot")
+            .install(crate::cache_ir::CacheStub::default());
+        assert_eq!(space.property_ic_snapshots().len(), 1);
+        drop(context);
+
+        let candidate = space
+            .eviction_candidates()
+            .into_iter()
+            .next()
+            .expect("unretained chunk is evictable");
+        assert!(matches!(
+            space.evict_candidate(candidate),
+            super::ChunkEvictionResult::Evicted { .. }
+        ));
+        assert!(space.property_ic_snapshots().is_empty());
     }
 
     #[test]

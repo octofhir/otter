@@ -1,18 +1,15 @@
 //! Isolate feedback ownership and high-level inline-cache operations.
 //!
 //! # Contents
-//! - Dense global property-site directory installation.
-//! - Executable property and builtin-method IC banks.
-//! - Intent-level IC accounting, installation, snapshots, and tracing views.
-//! - Narrow lookup helpers for lock-free CodeBlock feedback slots.
+//! - Dense global method-site directory installation.
+//! - Executable builtin-method IC banks.
 //! - Single-writer bounded method-target distributions.
 //! - Range purge for tombstoned code chunks.
 //!
 //! # Invariants
-//! - All mutable executable IC state is owned by the isolate and reached
-//!   through this directory; the interpreter exposes no parallel IC vectors.
-//! - CodeBlock property/call summaries contain atomics and stable numeric ids
-//!   only. GC-bearing executable recipes never cross that boundary.
+//! - Property IC programs live only in their owning CodeBlock feedback slot.
+//!   This directory retains method-only state keyed by the existing global
+//!   site identity.
 //! - A site id maps to exactly one canonical instruction for the lifetime of
 //!   a live chunk. Tombstoned ranges remain reserved and hold no slot address
 //!   or executable IC state.
@@ -25,29 +22,20 @@
 //! - [`crate::executable::FeedbackSlotAddress`]
 
 use crate::executable::FeedbackSlotAddress;
-use crate::feedback::PropertyFeedbackState;
 use crate::method_ops::MethodCallIc;
-use crate::property_ic::{PropertyIcEntry, PropertyIcKind, PropertyIcStats};
 use crate::{
     ExecutionContext, Interpreter, JitCollectionMethodIcStats, MAX_POLY_METHOD_TARGETS,
     MethodCallFeedback, MethodSite, PolyMethodTarget,
 };
 use smallvec::SmallVec;
 
-type ExecutablePropertyIc = PropertyIcEntry<crate::cache_ir::CacheStub>;
-
-/// Isolate-local facade mapping global executable site ids to canonical typed
-/// feedback slots and executable IC state. Atomic publication, GC-bearing
-/// recipes, accounting, and opcode-selected storage do not escape this
-/// boundary; every mutation is performed by the isolate VM thread.
+/// Isolate-local method-feedback directory. Property programs and counters are
+/// owned directly by CodeBlock slots and never enter this structure.
 #[derive(Default)]
-pub(crate) struct FeedbackDirectory {
+pub(crate) struct MethodFeedbackDirectory {
     slots: Vec<Option<FeedbackSlotAddress>>,
     method_targets: Vec<Option<MethodCallFeedback>>,
-    load_ics: Vec<ExecutablePropertyIc>,
-    store_ics: Vec<ExecutablePropertyIc>,
     method_ics: Vec<Option<MethodCallIc>>,
-    property_stats: PropertyIcStats,
     /// Chunks whose slot addresses are already installed, keyed by executable
     /// address. A chunk's sites are immutable once linked, so installation
     /// happens once per chunk, not once per dispatch entry, and the membership
@@ -59,15 +47,13 @@ pub(crate) struct FeedbackDirectory {
         rustc_hash::FxHashMap<usize, std::sync::Weak<crate::executable::ExecutableModule>>,
 }
 
-impl FeedbackDirectory {
+impl MethodFeedbackDirectory {
     pub(crate) fn evict_site_range(&mut self, start: u32, end: u32) {
         let start = start as usize;
         let end = (end as usize).min(self.slots.len());
         for site in start..end {
             self.slots[site] = None;
             self.method_targets[site] = None;
-            self.load_ics[site] = PropertyIcEntry::Empty;
-            self.store_ics[site] = PropertyIcEntry::Empty;
             self.method_ics[site] = None;
         }
         self.installed_chunks
@@ -97,12 +83,6 @@ impl FeedbackDirectory {
         if self.method_targets.len() < site_count {
             self.method_targets.resize_with(site_count, || None);
         }
-        if self.load_ics.len() < site_count {
-            self.load_ics.resize(site_count, PropertyIcEntry::Empty);
-        }
-        if self.store_ics.len() < site_count {
-            self.store_ics.resize(site_count, PropertyIcEntry::Empty);
-        }
         if self.method_ics.len() < site_count {
             self.method_ics.resize(site_count, None);
         }
@@ -117,224 +97,9 @@ impl FeedbackDirectory {
         self.slots.get(site)?.as_ref()
     }
 
-    fn property_bank(&self, kind: PropertyIcKind) -> &[ExecutablePropertyIc] {
-        match kind {
-            PropertyIcKind::Load => &self.load_ics,
-            PropertyIcKind::Store => &self.store_ics,
-        }
-    }
-
-    fn property_bank_with_stats_mut(
-        &mut self,
-        kind: PropertyIcKind,
-    ) -> (&mut [ExecutablePropertyIc], &mut PropertyIcStats) {
-        match kind {
-            PropertyIcKind::Load => (&mut self.load_ics, &mut self.property_stats),
-            PropertyIcKind::Store => (&mut self.store_ics, &mut self.property_stats),
-        }
-    }
-
-    fn property_stubs(
-        &self,
-        site: usize,
-        kind: PropertyIcKind,
-    ) -> Option<&[crate::cache_ir::CacheStub]> {
-        self.property_bank(kind)
-            .get(site)
-            .map(PropertyIcEntry::entries)
-    }
-
-    /// Probe a named load site. Miss accounting and installation remain
-    /// explicit operations so semantic slow paths can decide when a failed
-    /// probe is cache-representable.
-    pub(crate) fn probe_load(
-        &self,
-        site: usize,
-        obj: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
-    ) -> Option<crate::Value> {
-        self.property_stubs(site, PropertyIcKind::Load)?
-            .iter()
-            .find_map(|stub| stub.run_load(obj, heap, key))
-    }
-
-    /// Probe a named store site and execute the first matching recipe.
-    pub(crate) fn probe_store(
-        &self,
-        site: usize,
-        obj: crate::object::JsObject,
-        heap: &mut otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
-        value: &crate::Value,
-    ) -> Result<bool, otter_gc::OutOfMemory> {
-        let Some(stubs) = self.property_stubs(site, PropertyIcKind::Store) else {
-            return Ok(false);
-        };
-        for stub in stubs {
-            if stub.run_store(obj, heap, key, value)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Every settled own-slot program installed at a site, in install order.
-    ///
-    /// This is the site's cache as a compile-time declaration: one shape and
-    /// one slot per installed program. Generated code turns it into a guard
-    /// chain and never loads the runtime cell.
-    pub(crate) fn settled_property_slots(
-        &self,
-        site: usize,
-        kind: PropertyIcKind,
-    ) -> Option<Vec<(crate::object::ShapeId, u32, u16)>> {
-        let stubs = self.property_stubs(site, kind)?;
-        let settled: Vec<_> = stubs
-            .iter()
-            .filter_map(crate::cache_ir::CacheStub::settled_own_slot)
-            .collect();
-        (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
-    }
-
-    /// Receiver shape, holder shape and slot for a load site every one of whose
-    /// programs reaches its slot through the receiver's prototype.
-    pub(crate) fn settled_prototype_slots(
-        &self,
-        site: usize,
-    ) -> Option<Vec<(crate::object::ShapeId, crate::object::ShapeId, u32, u16)>> {
-        let stubs = self.property_stubs(site, PropertyIcKind::Load)?;
-        let settled: Vec<_> = stubs
-            .iter()
-            .filter_map(crate::cache_ir::CacheStub::settled_prototype_slot)
-            .collect();
-        (!settled.is_empty() && settled.len() == stubs.len()).then_some(settled)
-    }
-
-    /// Lower this load site's cache program to the way generated code runs.
-    ///
-    /// Whatever the stub's op sequence is — own data, or a guarded hop to the
-    /// receiver's prototype — the lowering walks it. A shape the site has never
-    /// seen, or a program with an op that has no inline form yet, yields `None`
-    /// and leaves the access on the stub.
-    pub(crate) fn whisker_load_cell_fill(
-        &self,
-        site: usize,
-        obj: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
-    ) -> Option<crate::jit::JitPropertyIcWay> {
-        self.property_stubs(site, PropertyIcKind::Load)?
-            .iter()
-            .find_map(|stub| stub.lower_jit_way(obj, heap, key))
-    }
-
-    /// Lower this store site's cache program the same way.
-    pub(crate) fn whisker_store_cell_fill(
-        &self,
-        site: usize,
-        obj: crate::object::JsObject,
-        heap: &otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
-    ) -> Option<crate::jit::JitPropertyIcWay> {
-        self.property_stubs(site, PropertyIcKind::Store)?
-            .iter()
-            .find_map(|stub| stub.lower_jit_way(obj, heap, key))
-    }
-
-    #[must_use]
-    pub(crate) fn property_entry_count(&self, site: usize, kind: PropertyIcKind) -> Option<usize> {
-        self.property_bank(kind)
-            .get(site)
-            .map(PropertyIcEntry::entry_count)
-    }
-
-    #[must_use]
-    pub(crate) fn property_is_megamorphic(
-        &self,
-        site: usize,
-        kind: PropertyIcKind,
-    ) -> Option<bool> {
-        self.property_bank(kind)
-            .get(site)
-            .map(PropertyIcEntry::is_megamorphic)
-    }
-
-    pub(crate) fn record_property_hit(&mut self, kind: PropertyIcKind) {
-        self.property_stats.record_hit(kind);
-    }
-
-    /// Record a failed guarded probe and return the site's resulting terminal
-    /// state. `None` means the site was not installed in this isolate.
-    pub(crate) fn record_property_guard_miss(
-        &mut self,
-        site: usize,
-        kind: PropertyIcKind,
-    ) -> Option<bool> {
-        let (bank, stats) = self.property_bank_with_stats_mut(kind);
-        let entry = bank.get_mut(site)?;
-        entry.record_guard_miss_with_stats(stats, kind);
-        Some(entry.is_megamorphic())
-    }
-
-    pub(crate) fn record_property_uncached_miss(&mut self, site: usize, kind: PropertyIcKind) {
-        let (bank, stats) = self.property_bank_with_stats_mut(kind);
-        if let Some(entry) = bank.get_mut(site) {
-            entry.record_uncached_miss_with_stats(stats, kind);
-        }
-    }
-
-    pub(crate) fn install_property_stub(
-        &mut self,
-        site: usize,
-        kind: PropertyIcKind,
-        stub: crate::cache_ir::CacheStub,
-    ) {
-        let (bank, stats) = self.property_bank_with_stats_mut(kind);
-        if let Some(entry) = bank.get_mut(site) {
-            entry.install_with_stats(stats, kind, stub);
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn property_stats(&self) -> PropertyIcStats {
-        self.property_stats
-    }
-
-    #[cfg(test)]
-    pub(crate) fn polymorphic_property_count(&self, kind: PropertyIcKind) -> usize {
-        self.property_bank(kind)
-            .iter()
-            .filter(|entry| entry.is_polymorphic())
-            .count()
-    }
-
-    /// GC root view for store transition stubs. This is deliberately the only
-    /// raw-bank view: the collector needs to rewrite cached shape handles.
-    pub(crate) fn store_ics_for_trace(&self) -> &[ExecutablePropertyIc] {
-        &self.store_ics
-    }
-
     #[must_use]
     pub(crate) fn method_ic(&self, site: usize) -> Option<MethodCallIc> {
         self.method_ics.get(site).copied().flatten()
-    }
-
-    /// The monomorphic own-data hit recorded by the property-load IC at `site`,
-    /// if the site holds exactly one stub resolving to an own data property.
-    /// Lets a load or method call take a shape-guarded direct slab read instead
-    /// of walking the stub list and re-comparing the atom. Returns `None` when
-    /// the site is polymorphic or the property lives on the prototype.
-    #[must_use]
-    pub(crate) fn mono_load_own_data_hit(
-        &self,
-        site: usize,
-    ) -> Option<crate::object::AtomOwnPropertyHit> {
-        let stubs = self.property_stubs(site, PropertyIcKind::Load)?;
-        if stubs.len() != 1 {
-            return None;
-        }
-        stubs.iter().find_map(|stub| stub.own_data_hit())
     }
 
     pub(crate) fn install_method_ic(&mut self, site: usize, ic: MethodCallIc) -> bool {
@@ -371,42 +136,6 @@ impl FeedbackDirectory {
             }
         }
         stats
-    }
-
-    #[must_use]
-    pub(crate) fn ic_snapshot(&self) -> Vec<crate::inspect::IcSiteSnapshot> {
-        let mut out = Vec::with_capacity(self.load_ics.len() + self.store_ics.len());
-        for (index, entry) in self.load_ics.iter().enumerate() {
-            out.push(crate::inspect::IcSiteSnapshot {
-                site_index: index as u32,
-                kind: crate::inspect::IcSiteKind::Load,
-                state: crate::inspect::snapshot_load_state(entry),
-            });
-        }
-        for (index, entry) in self.store_ics.iter().enumerate() {
-            out.push(crate::inspect::IcSiteSnapshot {
-                site_index: index as u32,
-                kind: crate::inspect::IcSiteKind::Store,
-                state: crate::inspect::snapshot_store_state(entry),
-            });
-        }
-        out
-    }
-
-    fn publish_property(&self, site: usize, kind: PropertyIcKind) {
-        let Some(entry) = self.property_bank(kind).get(site) else {
-            return;
-        };
-        if let Some(slot) = self
-            .address(site)
-            .and_then(|address| address.property(kind))
-        {
-            slot.publish(entry);
-        }
-    }
-
-    fn property_state(&self, site: usize, kind: PropertyIcKind) -> Option<PropertyFeedbackState> {
-        self.address(site)?.property(kind).map(|slot| slot.state())
     }
 
     fn method_targets(&self, site: usize) -> Option<MethodCallFeedback> {
@@ -585,52 +314,18 @@ fn record_method_distribution(
 }
 
 impl Interpreter {
-    pub(crate) fn ensure_property_ic_capacity(&mut self, context: &ExecutionContext) {
-        self.feedback_directory.install_context(context);
-    }
-
-    /// Publish a stable compile/profile summary after mutating a runtime IC.
-    pub(crate) fn publish_property_feedback(
-        &self,
-        site: usize,
-        kind: crate::property_ic::PropertyIcKind,
-    ) {
-        self.feedback_directory.publish_property(site, kind);
-    }
-
-    #[must_use]
-    pub(crate) fn property_feedback_state(
-        &self,
-        site: usize,
-        kind: PropertyIcKind,
-    ) -> Option<PropertyFeedbackState> {
-        self.feedback_directory.property_state(site, kind)
-    }
-
-    /// Refresh stable property summaries at the compile boundary. Runtime IC
-    /// probes stay lock-free; the CodeBlock atomic slot receives a stable
-    /// numeric snapshot only when a tier is about to consume it.
-    pub(crate) fn publish_property_feedback_for_view(&self, view: &crate::jit::JitCompileSnapshot) {
-        for instruction in &view.instructions {
-            let kind = match instruction.op(&view.code_block) {
-                otter_bytecode::Op::LoadProperty => crate::property_ic::PropertyIcKind::Load,
-                otter_bytecode::Op::StoreProperty => crate::property_ic::PropertyIcKind::Store,
-                _ => continue,
-            };
-            if let Some(site) = instruction.property_ic_site(&view.code_block) {
-                self.publish_property_feedback(site, kind);
-            }
-        }
+    pub(crate) fn ensure_method_feedback_context(&mut self, context: &ExecutionContext) {
+        self.method_feedback.install_context(context);
     }
 
     #[must_use]
     pub(crate) fn method_target_feedback(&self, site: usize) -> Option<MethodCallFeedback> {
-        self.feedback_directory.method_targets(site)
+        self.method_feedback.method_targets(site)
     }
 
     #[must_use]
     pub(crate) fn method_target_feedback_saturated(&self, site: usize) -> bool {
-        self.feedback_directory.method_targets_saturated(site)
+        self.method_feedback.method_targets_saturated(site)
     }
 
     /// Record that one `Op::CallMethodValue` site resolved to a declared native
@@ -645,7 +340,7 @@ impl Interpreter {
         stub_id: crate::native_abi::RuntimeStubId,
         method_site: MethodSite,
     ) -> bool {
-        self.feedback_directory
+        self.method_feedback
             .record_method_native_leaf(site, stub_id, method_site)
     }
 
@@ -655,7 +350,7 @@ impl Interpreter {
         method_fid: u32,
         method_site: MethodSite,
     ) -> bool {
-        self.feedback_directory
+        self.method_feedback
             .record_method_target(site, method_fid, method_site)
     }
 }

@@ -1518,7 +1518,8 @@ impl JitCompileSnapshot {
         kind: otter_bytecode::ArgumentsObjectKind,
         bindings: &[(u16, otter_bytecode::ArgumentBindingStorage)],
     ) {
-        let code = std::sync::Arc::make_mut(&mut self.code_block);
+        let code = std::sync::Arc::get_mut(&mut self.code_block)
+            .expect("backend test snapshot uniquely owns its CodeBlock");
         code.arguments_object_kind = kind;
         code.mapped_argument_bindings = bindings
             .iter()

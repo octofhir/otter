@@ -512,7 +512,7 @@ impl Interpreter {
     /// borrow.
     #[must_use]
     pub fn ic_snapshot(&self) -> Vec<inspect::IcSiteSnapshot> {
-        self.feedback_directory.ic_snapshot()
+        self.code_space.property_ic_snapshots()
     }
 
     /// Snapshot the active hidden-class transition tree. Nodes

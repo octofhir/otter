@@ -458,13 +458,17 @@ impl Interpreter {
         let method_site = context
             .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
             .unwrap_or(usize::MAX);
+        let property_slot = context.property_feedback_slot(
+            stack[top_idx].function_id,
+            stack[top_idx].pc,
+            PropertyIcKind::Load,
+        );
         // Fast monomorphic ordinary-method call: the callee is an own data slot
         // whose receiver shape was cached on the first resolution below. The hot
         // guard is a single shape compare plus a slab read — no property-atom
         // resolution, no load-IC stub walk, no `is_callable` string dispatch.
         if method_site != usize::MAX
-            && let Some(MethodCallIc::Ordinary(hit)) =
-                self.feedback_directory.method_ic(method_site)
+            && let Some(MethodCallIc::Ordinary(hit)) = self.method_feedback.method_ic(method_site)
         {
             if let Some(obj) = recv_value.as_object()
                 && let Some(method) =
@@ -477,7 +481,7 @@ impl Interpreter {
             // The receiver shape moved on or the slot is no longer a callable
             // data property; drop the cache and fall back to full resolution,
             // which reinstalls only while the site stays monomorphic.
-            self.feedback_directory.clear_method_ic(method_site);
+            self.method_feedback.clear_method_ic(method_site);
         }
         // Method-resolution inline cache. An ordinary object's method is a data
         // slot on its own object or its prototype, so the receiver shape keys
@@ -495,15 +499,16 @@ impl Interpreter {
             && method_site != usize::MAX
             && let Some(atomized_key) =
                 context.property_atom_for_function(stack[top_idx].function_id, name_idx)
-            && let Some(method) = self.resolve_method_ic(obj, atomized_key, method_site)
+            && let Some(slot) = property_slot
+            && let Some(method) = self.resolve_method_ic(obj, atomized_key, slot)
             && self.is_callable_runtime(&method)
         {
             // Seed the ordinary method-call IC so later monomorphic calls take
             // the shape-guarded fast path above. Only installed while the
             // property load site is monomorphic and the method is an own data
             // slot; prototype methods and polymorphic sites leave it empty.
-            if let Some(hit) = self.feedback_directory.mono_load_own_data_hit(method_site) {
-                self.feedback_directory
+            if let Some(hit) = property_slot.and_then(|slot| slot.mono_load_own_data_hit()) {
+                self.method_feedback
                     .install_method_ic(method_site, MethodCallIc::Ordinary(hit));
             }
             stack[top_idx].advance_pc()?;
@@ -742,9 +747,12 @@ impl Interpreter {
                 // compiled/warmed site exists.
                 if let Some(atomized_key) =
                     context.property_atom_for_function(stack[top_idx].function_id, name_idx)
-                    && let Some(site) =
-                        context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                    && let Some(method) = self.resolve_method_ic(proto, atomized_key, site)
+                    && let Some(slot) = context.property_feedback_slot(
+                        stack[top_idx].function_id,
+                        stack[top_idx].pc,
+                        PropertyIcKind::Load,
+                    )
+                    && let Some(method) = self.resolve_method_ic(proto, atomized_key, slot)
                     && self.is_callable_runtime(&method)
                 {
                     stack[top_idx].advance_pc()?;
@@ -1190,7 +1198,7 @@ impl Interpreter {
         // the slot hash. The cached slot offset is only sound while the
         // prototype keeps the recorded shape (guarded on the fast path).
         if let Some(hit) = hit {
-            self.feedback_directory.install_method_ic(
+            self.method_feedback.install_method_ic(
                 site,
                 MethodCallIc::Array(ArrayMethodCallIc {
                     proto_shape: hit.shape_id,
@@ -1219,7 +1227,7 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Option<Result<Value, VmError>> {
-        let ic = match self.feedback_directory.method_ic(site)? {
+        let ic = match self.method_feedback.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
             MethodCallIc::Ordinary(_) => return None,
@@ -1228,7 +1236,7 @@ impl Interpreter {
             // The receiver is no longer an array: drop the cache so the direct
             // compiled-call path (skipped while the IC was live) resumes for
             // whatever this site now sees.
-            self.feedback_directory.clear_method_ic(site);
+            self.method_feedback.clear_method_ic(site);
             return None;
         };
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
@@ -1266,14 +1274,14 @@ impl Interpreter {
         site: usize,
         recv: Value,
     ) -> Option<CollectionFastTarget> {
-        let ic = match self.feedback_directory.method_ic(site)? {
+        let ic = match self.method_feedback.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
             MethodCallIc::Ordinary(_) => return None,
         };
         let proto = if let Some(map) = recv.as_map() {
             if !ic.op.is_map() {
-                self.feedback_directory.clear_method_ic(site);
+                self.method_feedback.clear_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.map_prototype()?;
@@ -1287,7 +1295,7 @@ impl Interpreter {
             proto
         } else if let Some(set) = recv.as_set() {
             if !ic.op.is_set() {
-                self.feedback_directory.clear_method_ic(site);
+                self.method_feedback.clear_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.set_prototype()?;
@@ -1300,7 +1308,7 @@ impl Interpreter {
             }
             proto
         } else {
-            self.feedback_directory.clear_method_ic(site);
+            self.method_feedback.clear_method_ic(site);
             return None;
         };
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
@@ -1390,7 +1398,7 @@ impl Interpreter {
                 mutating_stub_id: op.mutating_stub_id(),
                 alloc_stub_id: op.alloc_stub_id(),
             };
-            self.feedback_directory
+            self.method_feedback
                 .install_method_ic(site, MethodCallIc::Collection(ic));
         }
         Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))
@@ -1680,13 +1688,9 @@ impl Interpreter {
         &mut self,
         obj: crate::object::JsObject,
         key: AtomizedPropertyKey<'_>,
-        site: usize,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
     ) -> Option<Value> {
-        if self
-            .feedback_directory
-            .property_is_megamorphic(site, PropertyIcKind::Load)
-            != Some(false)
-        {
+        if slot.is_megamorphic() {
             // The site has given up, but the receiver's class and the method
             // name still name one slot. Answer from the shared table rather
             // than sending a megamorphic call site down the `[[Get]]` ladder.
@@ -1694,38 +1698,22 @@ impl Interpreter {
                 .resolve_property_data_slot(obj, key)
                 .map(|resolved| resolved.value);
         }
-        if let Some(value) = self
-            .feedback_directory
-            .probe_load(site, obj, &self.gc_heap, key)
-        {
-            self.feedback_directory
-                .record_property_hit(PropertyIcKind::Load);
+        if let Some(value) = slot.probe_load(obj, &self.gc_heap, key) {
+            slot.record_hit();
             return Some(value);
         }
-        if self
-            .feedback_directory
-            .property_entry_count(site, PropertyIcKind::Load)
-            .unwrap_or_default()
-            > 0
-        {
-            self.feedback_directory
-                .record_property_guard_miss(site, PropertyIcKind::Load);
+        if slot.entry_count() > 0 {
+            slot.record_guard_miss();
         } else {
-            self.feedback_directory
-                .record_property_uncached_miss(site, PropertyIcKind::Load);
+            slot.record_uncached_miss();
         }
         let resolved = self.resolve_property_data_slot(obj, key)?;
-        if self
-            .feedback_directory
-            .property_is_megamorphic(site, PropertyIcKind::Load)
-            == Some(false)
-        {
+        if !slot.is_megamorphic() {
             let ic = cache_ir::CacheStub::from_resolved_load(
                 crate::object::shape_id(obj, &self.gc_heap),
                 &resolved,
             );
-            self.feedback_directory
-                .install_property_stub(site, PropertyIcKind::Load, ic);
+            slot.install(ic);
         }
         Some(resolved.value)
     }

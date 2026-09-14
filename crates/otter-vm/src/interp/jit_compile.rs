@@ -447,7 +447,6 @@ impl Interpreter {
         let context = &*owner;
         self.prewarm_string_constant_cells(context, fid)?;
         let mut snapshot = context.jit_compile_snapshot(fid)?;
-        self.publish_property_feedback_for_view(&snapshot);
         // The optimizing tier consumes the same baked compile inputs as the
         // template tier: without the cage base and body offsets no inline access
         // can be emitted at all, and without monomorphic call-site candidates
@@ -647,7 +646,6 @@ impl Interpreter {
         let Some(mut view) = context.jit_compile_snapshot(fid) else {
             return TemplateCompileOutcome::Deferred;
         };
-        self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         if self
@@ -771,19 +769,24 @@ impl Interpreter {
             .map(|instr| {
                 (
                     instr.byte_pc,
+                    instr.instruction_pc(&view.code_block),
                     instr.op(&view.code_block),
-                    instr.property_ic_site(&view.code_block),
                 )
             })
             .collect();
-        for (byte_pc, op, site) in sites {
-            let Some(site) = site else { continue };
+        for (byte_pc, instruction_pc, op) in sites {
             let kind = if op == Op::LoadProperty {
                 crate::property_ic::PropertyIcKind::Load
             } else {
                 crate::property_ic::PropertyIcKind::Store
             };
-            let Some(slots) = self.feedback_directory.settled_property_slots(site, kind) else {
+            let Some(slot) = view
+                .code_block
+                .property_feedback_at(instruction_pc as usize, kind)
+            else {
+                continue;
+            };
+            let Some(slots) = slot.settled_property_slots() else {
                 continue;
             };
             let slot_count = slots.len();
@@ -868,14 +871,19 @@ impl Interpreter {
             .iter()
             .filter(|instr| instr.op(&view.code_block) == Op::LoadProperty)
             .filter(|instr| !instr.load_array_length)
-            .map(|instr| (instr.byte_pc, instr.property_ic_site(&view.code_block)))
+            .map(|instr| (instr.byte_pc, instr.instruction_pc(&view.code_block)))
             .collect();
-        for (byte_pc, site) in sites {
-            let Some(site) = site else { continue };
+        for (byte_pc, instruction_pc) in sites {
             if view.property_loads.contains_key(&byte_pc) {
                 continue;
             }
-            let Some(slots) = self.feedback_directory.settled_prototype_slots(site) else {
+            let Some(slot) = view.code_block.property_feedback_at(
+                instruction_pc as usize,
+                crate::property_ic::PropertyIcKind::Load,
+            ) else {
+                continue;
+            };
+            let Some(slots) = slot.settled_prototype_slots() else {
                 continue;
             };
             let chain: Vec<_> = slots
@@ -1052,7 +1060,6 @@ impl Interpreter {
         context: &ExecutionContext,
         code_block: &CodeBlock,
         instruction: &jit::JitInstructionMetadata,
-        site: usize,
     ) -> Option<(u32, u32)> {
         const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         let op = instruction.op(code_block);
@@ -1061,8 +1068,11 @@ impl Interpreter {
             Op::StoreProperty => crate::property_ic::PropertyIcKind::Store,
             _ => return None,
         };
-        self.publish_property_feedback(site, kind);
-        match self.property_feedback_state(site, kind)? {
+        let instruction_pc = instruction.instruction_pc(code_block) as usize;
+        match code_block
+            .property_feedback_at(instruction_pc, kind)?
+            .state()
+        {
             crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } => {
                 let shape = self.shape_runtime.handle_for_id(shape_id)?;
                 Some((shape.offset(), u32::from(slot) * SLOT_BYTES))
@@ -1578,7 +1588,6 @@ impl Interpreter {
         let result = (|| {
             self.prewarm_string_constant_cells(context, fid)?;
             let mut body = context.jit_compile_snapshot(fid)?;
-            self.publish_property_feedback_for_view(&body);
             Self::bake_typed_array_layout(&mut body);
             Self::bake_string_layout(&mut body);
             self.bake_string_constant_cells(&mut body, context, fid)?;
@@ -2256,13 +2265,8 @@ impl Interpreter {
             // Not a receiver property: use the op's own monomorphic own-data site
             // feedback (shape offset, slot byte). Anything else — polymorphic,
             // prototype, accessor, or unobserved — is not inlinable.
-            let site = instr.property_ic_site(&method_view.code_block)?;
-            let (shape_off, value_byte) = self.monomorphic_own_property_feedback(
-                context,
-                &method_view.code_block,
-                instr,
-                site,
-            )?;
+            let (shape_off, value_byte) =
+                self.monomorphic_own_property_feedback(context, &method_view.code_block, instr)?;
             prop_offsets.insert(instr.byte_pc, value_byte);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }

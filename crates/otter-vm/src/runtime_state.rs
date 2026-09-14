@@ -183,10 +183,8 @@ impl<'a> RuntimeState<'a> {
             let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
-        // 7b) Store-property ICs can retain cached GC shape transitions.
-        for ic in interp.store_property_ics_for_trace() {
-            ic.trace_roots(visitor);
-        }
+        // 7b) Live CodeBlock property slots can retain cached shape transitions.
+        interp.trace_property_ic_roots(visitor);
         // 8) Pending throw side-channels retain arbitrary JS values. They are
         //    roots even while no frame or job queue references the thrown
         //    value, and a moving collection must rewrite their slots in place.

@@ -617,7 +617,8 @@ impl ShapeId {
         self.0
     }
 
-    /// Rebuild a stable VM-local identity read from an atomic feedback slot.
+    /// Rebuild a stable VM-local identity in tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn from_raw(raw: u64) -> Self {
         Self(raw)

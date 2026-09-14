@@ -116,6 +116,7 @@ use otter_bytecode::opcode_schema::{
     BindingRead, BindingSemantics, BindingWrite, OperandKind, RegisterAccess, RegisterSource,
     opcode_schema, operand_spec_at,
 };
+use otter_bytecode::scalar_semantics::{NumericBinaryOp, numeric_binary_semantics};
 use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, JitElementBase, JitElementRepr, JitInstructionMetadata};
 
@@ -3536,17 +3537,21 @@ fn lower_instruction(
             return Some(());
         }
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => {
+            let operation = numeric_binary_semantics(op)?.operation;
             let feedback = instruction.arith_feedback();
             if !feedback.is_numeric_only() && !feedback.is_empty() {
                 note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
-            let tagged_decode =
-                if matches!(op, Op::Add | Op::Sub | Op::Mul) && feedback.is_int32_only() {
-                    TaggedNumericDecode::Int32
-                } else {
-                    TaggedNumericDecode::Number
-                };
+            let tagged_decode = if matches!(
+                operation,
+                NumericBinaryOp::Add | NumericBinaryOp::Sub | NumericBinaryOp::Mul
+            ) && feedback.is_int32_only()
+            {
+                TaggedNumericDecode::Int32
+            } else {
+                TaggedNumericDecode::Number
+            };
             let left = read_number(
                 decode_site,
                 nodes,
@@ -3564,28 +3569,29 @@ fn lower_instruction(
                 tagged_decode,
             )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            if matches!(op, Op::Add | Op::Sub | Op::Mul)
-                && feedback.is_int32_only()
+            if matches!(
+                operation,
+                NumericBinaryOp::Add | NumericBinaryOp::Sub | NumericBinaryOp::Mul
+            ) && feedback.is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
-                match op {
-                    Op::Add => NumericNode::IntegerAdd(left, right),
-                    Op::Sub => NumericNode::IntegerSub(left, right),
-                    Op::Mul => NumericNode::IntegerMul(left, right),
+                match operation {
+                    NumericBinaryOp::Add => NumericNode::IntegerAdd(left, right),
+                    NumericBinaryOp::Sub => NumericNode::IntegerSub(left, right),
+                    NumericBinaryOp::Mul => NumericNode::IntegerMul(left, right),
                     _ => unreachable!("matched checked int32 arithmetic"),
                 }
             } else {
                 let left = widen_to_number(left, nodes, block_nodes)?;
                 let right = widen_to_number(right, nodes, block_nodes)?;
-                match op {
-                    Op::Add => NumericNode::Add(left, right),
-                    Op::Sub => NumericNode::Sub(left, right),
-                    Op::Mul => NumericNode::Mul(left, right),
-                    Op::Div => NumericNode::Div(left, right),
-                    Op::Rem => NumericNode::Rem(left, right),
-                    Op::Pow => NumericNode::Pow(left, right),
-                    _ => unreachable!("matched numeric binary operation"),
+                match operation {
+                    NumericBinaryOp::Add => NumericNode::Add(left, right),
+                    NumericBinaryOp::Sub => NumericNode::Sub(left, right),
+                    NumericBinaryOp::Mul => NumericNode::Mul(left, right),
+                    NumericBinaryOp::Div => NumericNode::Div(left, right),
+                    NumericBinaryOp::Rem => NumericNode::Rem(left, right),
+                    NumericBinaryOp::Pow => NumericNode::Pow(left, right),
                 }
             }
         }

@@ -43,6 +43,7 @@ pub mod encoding;
 pub mod method_id;
 pub mod opcode_audit;
 pub mod opcode_schema;
+pub mod scalar_semantics;
 pub mod verifier;
 pub mod wordcode;
 

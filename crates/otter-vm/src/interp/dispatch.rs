@@ -2488,77 +2488,17 @@ impl Interpreter {
                     )?;
                     continue;
                 }
-                Op::Sub => {
+                Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
+                    let operation = otter_bytecode::scalar_semantics::numeric_binary_semantics(op)
+                        .expect("numeric dispatch group has shared semantics")
+                        .operation;
+                    self.run_numeric_binary_regs(
                         stack,
                         context,
                         top_idx,
-                        dst,
-                        lhs,
-                        rhs,
-                        number::sub,
-                        bigint_sub_op,
-                        feedback,
-                    )?;
-                    continue;
-                }
-                Op::Mul => {
-                    let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
-                        stack,
-                        context,
-                        top_idx,
-                        dst,
-                        lhs,
-                        rhs,
-                        number::mul,
-                        bigint_mul_op,
-                        feedback,
-                    )?;
-                    continue;
-                }
-                Op::Div => {
-                    let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
-                        stack,
-                        context,
-                        top_idx,
-                        dst,
-                        lhs,
-                        rhs,
-                        number::div,
-                        bigint::ops::div,
-                        feedback,
-                    )?;
-                    continue;
-                }
-                Op::Rem => {
-                    let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
-                        stack,
-                        context,
-                        top_idx,
-                        dst,
-                        lhs,
-                        rhs,
-                        number::rem,
-                        bigint::ops::rem,
-                        feedback,
-                    )?;
-                    continue;
-                }
-                Op::Pow => {
-                    let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
-                        stack,
-                        context,
-                        top_idx,
-                        dst,
-                        lhs,
-                        rhs,
-                        number::pow,
-                        bigint::ops::pow,
+                        [dst, lhs, rhs],
+                        operation,
                         feedback,
                     )?;
                     continue;

@@ -29,6 +29,7 @@
 use otter_bytecode::opcode_schema::{
     BindingSemantics, GlobalDeclarationSemantics, RegisterAccess, opcode_schema, register_access_at,
 };
+use otter_bytecode::scalar_semantics::{NumericBinaryOp, numeric_binary_semantics};
 use otter_bytecode::{Op, Operand};
 use otter_vm::{
     JitCompileSnapshot, Value,
@@ -55,14 +56,7 @@ use crate::entry::{
 /// Numeric binary operators lowered to the shared int32/double template plus
 /// the common VM numeric completion. `+` has its own operation
 /// ([`TemplateOp::AddGeneric`]) because its non-numeric semantics are additive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArithKind {
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    Pow,
-}
+pub(crate) type ArithKind = NumericBinaryOp;
 
 /// Comparison operators lowered to the shared int32/double template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -955,13 +949,9 @@ impl TemplatePlan {
                         dst: operands.dst,
                         lhs: operands.lhs,
                         rhs: operands.rhs,
-                        kind: match lowered.op {
-                            Op::Sub => ArithKind::Sub,
-                            Op::Mul => ArithKind::Mul,
-                            Op::Div => ArithKind::Div,
-                            Op::Rem => ArithKind::Rem,
-                            _ => ArithKind::Pow,
-                        },
+                        kind: numeric_binary_semantics(lowered.op)
+                            .expect("numeric bytecode group has shared semantics")
+                            .operation,
                     }
                 }
                 Op::MakeFunction | Op::MakeClosure if meta.make_self => {
@@ -1830,6 +1820,7 @@ fn fusable_arith(op: &TemplateOp) -> Option<(FusedArithKind, u16, u16, u16)> {
             ArithKind::Mul => Some((FusedArithKind::Mul, dst, lhs, rhs)),
             ArithKind::Div => Some((FusedArithKind::Div, dst, lhs, rhs)),
             ArithKind::Rem | ArithKind::Pow => None,
+            ArithKind::Add => None,
         },
         TemplateOp::AddGeneric { dst, lhs, rhs, .. } => Some((FusedArithKind::Add, dst, lhs, rhs)),
         _ => None,

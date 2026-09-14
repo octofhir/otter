@@ -267,9 +267,7 @@ use otter_bytecode::ArgumentsObjectKind;
 use otter_bytecode::{BytecodeModule, Op};
 use smallvec::SmallVec;
 
-use arithmetic_dispatch::{
-    bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
-};
+use arithmetic_dispatch::{bigint_and_op, bigint_or_op, bigint_sub_op, bigint_xor_op};
 pub(crate) use error_ops::{native_to_vm_error, native_to_vm_error_with_stack, symbol_to_vm_error};
 pub use executable::code_block_cfg::{
     ActiveCatchRegionError, ActiveCatchRegions, CodeBlockControlFlowView, CodeBlockExceptionRegion,

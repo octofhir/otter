@@ -225,6 +225,11 @@ fn emit_inline_numeric_binary(
                 "inline numeric method remainder/pow",
             ));
         }
+        ArithKind::Add => {
+            return Err(Unsupported::OperandShape(
+                "inline numeric addition has its own operation",
+            ));
+        }
     }
     emit_box_double(ops, 2, 13);
     emit_store_inline_slot(ops, 13, dst);

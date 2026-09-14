@@ -214,7 +214,14 @@ pub(super) fn compile(
     let mut numeric_slow_paths = Vec::new();
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let bail = ops.new_dynamic_label();
+    let type_mismatch_exit = ops.new_dynamic_label();
+    let identity_guard_exit = ops.new_dynamic_label();
+    let allocation_miss_exit = ops.new_dynamic_label();
+    let unsupported_exit = ops.new_dynamic_label();
+    let runtime_transition_exit = ops.new_dynamic_label();
+    // Runtime-transition helpers share this local name; representation,
+    // identity, allocation, and unsupported sites select dedicated labels.
+    let bail = runtime_transition_exit;
     let returned = ops.new_dynamic_label();
     let committed_throw = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
@@ -296,7 +303,7 @@ pub(super) fn compile(
                 let tgt = labels[&target];
                 emit_load_reg(&mut ops, 9, condition)?;
                 if !canonical_boolean_branch {
-                    emit_truthiness_bool(&mut ops, &mut relocations, bail);
+                    emit_truthiness_bool(&mut ops, &mut relocations, type_mismatch_exit);
                 }
                 dynasm!(ops ; .arch aarch64 ; cmp x9, VALUE_TRUE_IMM);
                 if back_edge {
@@ -340,7 +347,7 @@ pub(super) fn compile(
             }
             TemplateOp::Truthiness { dst, src, negate } => {
                 emit_load_reg(&mut ops, 9, src)?;
-                emit_truthiness_bool(&mut ops, &mut relocations, bail);
+                emit_truthiness_bool(&mut ops, &mut relocations, type_mismatch_exit);
                 if negate {
                     // VALUE_TRUE and VALUE_FALSE differ exactly in bit 0.
                     dynasm!(ops ; .arch aarch64 ; eor x9, x9, #1);
@@ -388,7 +395,7 @@ pub(super) fn compile(
                     lhs,
                     rhs,
                     kind,
-                    bail,
+                    type_mismatch_exit,
                     &mut numeric_slow_paths,
                 )?;
             }
@@ -407,7 +414,7 @@ pub(super) fn compile(
                     lhs,
                     rhs,
                     negate,
-                    bail,
+                    type_mismatch_exit,
                     threw,
                     fatal,
                 )?;
@@ -462,7 +469,7 @@ pub(super) fn compile(
                     emit_load_u64(&mut ops, 12, VALUE_HOLE);
                     // A derived-ctor `this`-before-`super` hole resolves in the
                     // interpreter.
-                    dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
+                    dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>runtime_transition_exit);
                 }
                 emit_store_reg(&mut ops, 9, dst)?;
             }
@@ -482,7 +489,7 @@ pub(super) fn compile(
                 );
                 dynasm!(ops ; .arch aarch64 ; blr x16);
                 emit_load_u64(&mut ops, 16, VALUE_HOLE);
-                dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>bail);
+                dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>runtime_transition_exit);
                 emit_store_reg(&mut ops, 0, dst)?;
             }
             TemplateOp::MakeFunction { dst, constant } => {
@@ -610,7 +617,7 @@ pub(super) fn compile(
                     code_map.as_mut(),
                     instr.pc,
                     [dst, method, receiver, this_value],
-                    bail,
+                    identity_guard_exit,
                     threw,
                     committed_throw,
                     fatal,
@@ -780,7 +787,7 @@ pub(super) fn compile(
                     &argument_registers,
                     instr.pc,
                     byte_pc,
-                    bail,
+                    identity_guard_exit,
                     threw,
                     committed_throw,
                     fatal,
@@ -818,7 +825,7 @@ pub(super) fn compile(
                         &argument_registers,
                         instr.pc,
                         byte_pc,
-                        bail,
+                        identity_guard_exit,
                         threw,
                         committed_throw,
                         fatal,
@@ -863,7 +870,7 @@ pub(super) fn compile(
                     super_construct,
                     instr.pc,
                     byte_pc,
-                    bail,
+                    identity_guard_exit,
                     threw,
                     committed_throw,
                     fatal,
@@ -892,7 +899,7 @@ pub(super) fn compile(
                     byte_pc,
                     arg0,
                     arg1,
-                    bail,
+                    identity_guard_exit,
                     threw,
                     committed_throw,
                     fatal,
@@ -1274,7 +1281,7 @@ pub(super) fn compile(
                     dst,
                     length,
                     safepoint,
-                    bail,
+                    allocation_miss_exit,
                 )?;
             }
             TemplateOp::VariadicOp {
@@ -1420,7 +1427,7 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch aarch64 ; b =>returned);
             }
             TemplateOp::UnsupportedBail => {
-                dynasm!(ops ; .arch aarch64 ; b =>bail);
+                dynasm!(ops ; .arch aarch64 ; b =>unsupported_exit);
             }
         }
         if let Some(code_map) = code_map.as_mut() {
@@ -1443,7 +1450,7 @@ pub(super) fn compile(
     // its source operation's inline fast path.
     if !coercion_slow_paths.is_empty() || !numeric_slow_paths.is_empty() {
         let slow_paths_start = ops.offset().0;
-        dynasm!(ops ; .arch aarch64 ; b =>bail);
+        dynasm!(ops ; .arch aarch64 ; b =>unsupported_exit);
         emit_numeric_slow_paths(
             &mut ops,
             &mut relocations,
@@ -1485,16 +1492,39 @@ pub(super) fn compile(
         ));
     }
 
-    // Shared exact-side-exit epilogue. The payload repeats the frame PC so the
+    // Typed exact-side-exit epilogues. Each payload repeats the frame PC so the
     // VM can assert that machine result and published state are identical.
     let bail_start = ops.offset().0;
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>bail
-        ; ldr w0, [x21, NATIVE_FRAME_PC_OFFSET]
-        ; movz x1, abi::NativeResultStatus::SideExit as u32
+    emit_side_exit_epilogue(
+        &mut ops,
+        type_mismatch_exit,
+        abi::ExitReason::TypeMismatch,
+        abi::ExitAction::Recompile,
     );
-    emit_epilogue(&mut ops);
+    emit_side_exit_epilogue(
+        &mut ops,
+        identity_guard_exit,
+        abi::ExitReason::IdentityGuard,
+        abi::ExitAction::Recompile,
+    );
+    emit_side_exit_epilogue(
+        &mut ops,
+        allocation_miss_exit,
+        abi::ExitReason::AllocationMiss,
+        abi::ExitAction::Resume,
+    );
+    emit_side_exit_epilogue(
+        &mut ops,
+        unsupported_exit,
+        abi::ExitReason::UnsupportedOperation,
+        abi::ExitAction::Recompile,
+    );
+    emit_side_exit_epilogue(
+        &mut ops,
+        runtime_transition_exit,
+        abi::ExitReason::RuntimeTransition,
+        abi::ExitAction::Resume,
+    );
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "bailEpilogue",
@@ -1753,6 +1783,27 @@ fn emit_epilogue(ops: &mut Assembler) {
         ; ldp x29, x30, [sp], #48
         ; ret
     );
+}
+
+fn emit_side_exit_epilogue(
+    ops: &mut Assembler,
+    label: DynamicLabel,
+    reason: abi::ExitReason,
+    action: abi::ExitAction,
+) {
+    let kind = abi::SideExit::new(0, reason, action).to_bits();
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>label
+        ; ldr w0, [x21, NATIVE_FRAME_PC_OFFSET]
+    );
+    emit_load_u64(ops, 16, kind);
+    dynasm!(ops
+        ; .arch aarch64
+        ; orr x0, x0, x16
+        ; movz x1, abi::NativeResultStatus::SideExit as u32
+    );
+    emit_epilogue(ops);
 }
 
 /// Publish the canonical instruction-index PC into the active native frame.

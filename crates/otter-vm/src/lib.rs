@@ -1246,15 +1246,10 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
-    /// Logical PCs each function's optimized code has deoptimized at. The
-    /// optimizing tier reads this back so a pass that speculates about where
-    /// execution reaches does not repeat a speculation that already failed.
-    jit_optimized_bail_pcs: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
-    /// Deoptimizations the current optimizing generation has taken, per exit
-    /// site. One site bailing repeatedly is a wrong speculation in a loop —
-    /// only that pattern discards the generation; occasional bails spread
-    /// across sites never accumulate on one key.
-    jit_optimized_bail_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// Typed optimizing exit evidence keyed by function, PC, and reason.
+    /// The same record owns the requested policy and current-generation count.
+    jit_optimized_exit_profiles:
+        std::collections::BTreeMap<(u32, u32, native_abi::ExitReason), jit::JitExitProfile>,
     /// How many times each function's optimizing code has been discarded for
     /// a bail loop. Past the cap the installed body is the best this
     /// feedback produces and stays; the speculation-failure record remains.

@@ -46,7 +46,7 @@ use std::fmt::Write as _;
 use otter_vm::{
     JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactIdentity,
     JitArtifactMetadata, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
-    deopt::{DeoptLocation, DeoptRepr, DeoptTable},
+    deopt::{DeoptLocation, DeoptRepr, DeoptRuntime},
     native_abi::{SafepointRecord, TaggedLocationKind},
 };
 use serde::Serialize;
@@ -537,7 +537,7 @@ pub(crate) fn build_bundle(
     tier_input: String,
     code_map: CodeMapCapture,
     relocations: RelocationCapture,
-    deopt_table: Option<&DeoptTable>,
+    deopt_runtime: Option<&DeoptRuntime>,
     safepoints: &[SafepointRecord],
 ) -> Box<JitArtifactBundle> {
     let rendered_relocations = relocations
@@ -563,7 +563,7 @@ pub(crate) fn build_bundle(
         code.entry_offset(),
         &code_map,
         &rendered_relocations.validated,
-        deopt_table,
+        deopt_runtime.map(|runtime| &runtime.table),
         safepoints,
     );
     let mut files = vec![
@@ -595,10 +595,10 @@ pub(crate) fn build_bundle(
         JitArtifactFileName::Assembly,
         rendered_assembly,
     ));
-    if let Some(table) = deopt_table {
+    if let Some(runtime) = deopt_runtime {
         files.push(JitArtifactFile::text(
             JitArtifactFileName::Deopt,
-            render_deopt(table),
+            render_deopt(runtime),
         ));
     }
     Box::new(
@@ -687,7 +687,7 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
     rendered
 }
 
-fn render_deopt(table: &DeoptTable) -> String {
+fn render_deopt(runtime: &DeoptRuntime) -> String {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Slot {
@@ -717,23 +717,33 @@ fn render_deopt(table: &DeoptTable) -> String {
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct Exit {
+    struct State {
         id: u32,
         frames: Vec<otter_vm::deopt::DeoptFrame<Slot>>,
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
+    struct Exit {
+        id: u32,
+        frame_state_id: u32,
+        reason: otter_vm::native_abi::ExitReason,
+        action: otter_vm::native_abi::ExitAction,
+        resume_pcs: Vec<u32>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
     struct Document {
+        frame_states: Vec<State>,
         exits: Vec<Exit>,
     }
 
-    let exits = table
-        .entries()
-        .iter()
-        .enumerate()
-        .map(|(id, state)| Exit {
-            id: u32::try_from(id).unwrap_or(u32::MAX),
+    let frame_states = runtime
+        .table
+        .indexed_entries()
+        .map(|(id, state)| State {
+            id,
             frames: state
                 .frames
                 .iter()
@@ -754,8 +764,23 @@ fn render_deopt(table: &DeoptTable) -> String {
                 .collect(),
         })
         .collect();
-    let mut rendered =
-        serde_json::to_string_pretty(&Document { exits }).expect("deopt DTO always serializes");
+    let exits = runtime
+        .exits
+        .iter()
+        .enumerate()
+        .map(|(id, exit)| Exit {
+            id: u32::try_from(id).unwrap_or(u32::MAX),
+            frame_state_id: exit.state,
+            reason: exit.reason,
+            action: exit.action,
+            resume_pcs: exit.resume_pcs.to_vec(),
+        })
+        .collect();
+    let mut rendered = serde_json::to_string_pretty(&Document {
+        frame_states,
+        exits,
+    })
+    .expect("deopt DTO always serializes");
     rendered.push('\n');
     rendered
 }
@@ -765,8 +790,8 @@ mod tests {
     #[test]
     fn deopt_artifact_preserves_inline_entry_recipes() {
         use otter_vm::deopt::{
-            DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
-            FrameState,
+            DeoptExitDescriptor, DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr,
+            DeoptRuntime, DeoptSlot, DeoptTable, FrameState,
         };
         let slot = DeoptSlot {
             location: DeoptLocation::Register(3),
@@ -801,8 +826,19 @@ mod tests {
                 },
             ]),
         }]);
-        let json: serde_json::Value = serde_json::from_str(&super::render_deopt(&table)).unwrap();
-        let frames = &json["exits"][0]["frames"];
+        let runtime = DeoptRuntime {
+            table,
+            exits: vec![DeoptExitDescriptor {
+                state: 0,
+                reason: otter_vm::native_abi::ExitReason::ShapeGuard,
+                action: otter_vm::native_abi::ExitAction::Recompile,
+                resume_pcs: vec![16, 8].into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
+            gpr_budget: 16,
+        };
+        let json: serde_json::Value = serde_json::from_str(&super::render_deopt(&runtime)).unwrap();
+        let frames = &json["frameStates"][0]["frames"];
         assert!(frames[0]["entry"].is_null());
         assert_eq!(frames[1]["entry"]["returnRegister"], 0);
         assert_eq!(frames[1]["entry"]["this"]["locationValue"], "3");
@@ -813,6 +849,10 @@ mod tests {
             frames[1]["entry"]["newTarget"]["locationValue"],
             format!("0x{:016x}", otter_vm::Value::function(99).to_bits())
         );
+        assert_eq!(json["exits"][0]["frameStateId"], 0);
+        assert_eq!(json["exits"][0]["reason"], "shapeGuard");
+        assert_eq!(json["exits"][0]["action"], "recompile");
+        assert_eq!(json["exits"][0]["resumePcs"], serde_json::json!([16, 8]));
     }
 
     use otter_bytecode::{Op, Operand};

@@ -124,11 +124,7 @@ pub(super) fn select_block(
                 MachineOperand::location_input(values.cell),
                 MachineOperand::register_output(values.cold_payload),
                 MachineOperand::register_output(values.status),
-                MachineOperand::tagged_root(receiver),
             ]);
-            if let Some(value) = stored {
-                operands.push(MachineOperand::tagged_root(value));
-            }
             let mut call =
                 MachineInstruction::plain(MachineOpcode::Call(descriptor_index as u32), operands);
             call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
@@ -150,7 +146,6 @@ pub(super) fn select_block(
                 &mut call,
             );
             attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
-            attach_safepoint_roots(representations, &mut call);
             instructions.push(call);
             let mut branch = MachineInstruction::plain(
                 MachineOpcode::BranchNativeStatus,

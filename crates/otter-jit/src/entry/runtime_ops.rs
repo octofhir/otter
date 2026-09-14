@@ -30,8 +30,8 @@ use otter_vm::{VmError, native_abi::NativeResultStatus};
 use super::JitCtx;
 
 mod calls;
-mod inline_frames;
 mod forward_arguments;
+mod inline_frames;
 mod literals;
 mod reentry;
 mod vm_ops;

@@ -108,7 +108,7 @@ pub(super) fn is_valid(
         return false;
     };
     if descriptor(target_spec, target, byte_pc, *representation).as_ref() != Some(call)
-        || instruction.deopt.is_none()
+        || instruction.exits.is_empty()
         || instruction.safepoint.is_some()
     {
         return false;

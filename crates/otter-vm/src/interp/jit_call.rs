@@ -37,7 +37,7 @@
 use super::jit_compile::TemplateCompileOutcome;
 use crate::*;
 use crate::{
-    native_abi::{NativeFrame, NativeResultDomain, NativeResultPair, NativeResultStatus},
+    native_abi::{NativeFrame, NativeResultDomain, NativeResultPair, NativeResultStatus, SideExit},
     rooting::RootScopeExt,
 };
 
@@ -98,8 +98,9 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
         target: jit_debug::JitDebugTarget,
-        pc: u32,
+        exit: SideExit,
     ) {
+        let pc = exit.logical_pc();
         self.record_jit_debug_event(|| {
             let owner = context.for_function(fid).ok();
             let context = owner.as_deref().unwrap_or(context);
@@ -121,6 +122,8 @@ impl Interpreter {
                 tier,
                 target,
                 resume_pc: pc,
+                exit_reason: exit.reason(),
+                exit_action: exit.action(),
                 op_debug,
                 operands_debug,
             }
@@ -147,7 +150,8 @@ impl Interpreter {
                 )
             };
         match outcome {
-            jit::JitExecOutcome::Bailed(pc) => {
+            jit::JitExecOutcome::Bailed(exit) => {
+                let pc = exit.logical_pc();
                 stack[top_idx].pc = pc;
                 let fid = stack[top_idx].function_id;
                 self.record_jit_bail(
@@ -159,13 +163,13 @@ impl Interpreter {
                         jit_debug::JitDebugTier::Template
                     },
                     jit_debug::JitDebugTarget::Entry,
-                    pc,
+                    exit,
                 );
                 // `run_optimized_frame` owns optimizing-bail accounting because
                 // callers such as the iterator fast path consume its outcome
                 // directly. Do not count the same exit again at this dispatch
                 // wrapper.
-                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, exit) {
                     self.note_jit_entry_bail(fid);
                 }
                 Ok(None)
@@ -286,8 +290,8 @@ impl Interpreter {
                 .jit_runtime_stats
                 .optimized_osr_entries
                 .saturating_add(1);
-            if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
-                self.note_jit_optimized_bail(fid, resume_pc);
+            if let jit::JitExecOutcome::Bailed(exit) = outcome {
+                self.note_jit_optimized_bail(fid, exit);
             }
             (outcome, true)
         } else {
@@ -311,7 +315,8 @@ impl Interpreter {
             (outcome, false)
         };
         match outcome {
-            jit::JitExecOutcome::Bailed(pc) => {
+            jit::JitExecOutcome::Bailed(exit) => {
+                let pc = exit.logical_pc();
                 // Compiled body hit a guard or unsupported opcode. Resume the
                 // interpreter at the exact bail PC (committed side effects are
                 // preserved). Disable this loop header only when the miss was in
@@ -328,10 +333,10 @@ impl Interpreter {
                         jit_debug::JitDebugTier::Template
                     },
                     jit_debug::JitDebugTarget::Osr { pc: osr_pc },
-                    pc,
+                    exit,
                 );
                 stack[top_idx].pc = pc;
-                if self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                if self.reoptimize_arith_overflow_bail(context, fid, exit) {
                     return Ok(None);
                 }
                 if Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc) {
@@ -425,19 +430,25 @@ impl Interpreter {
         osr_pc <= bail_pc && bail_pc <= loop_latch
     }
 
-    /// Treat the first compiled `Add` / `Sub` / `Mul` bail at a logical PC as an
-    /// int32-result overflow and recompile that function with the site widened
-    /// to float arithmetic. The interpreter feedback only records operand
-    /// representations, so an accumulator can keep looking int32-only while its
-    /// result has grown past the int32 range. Widening once avoids permanently
-    /// disabling an otherwise valid hot loop; a second bail at the same site is
-    /// left to the normal deopt/disable path.
+    /// Recompile after the first typed integer-overflow or negative-zero exit
+    /// from an `Add` / `Sub` / `Mul` site, widening that site's feedback to
+    /// float arithmetic. Other exit reasons at the same PC cannot trigger this
+    /// policy. Widening once avoids permanently disabling an otherwise valid
+    /// hot loop; a repeated exit follows the normal deopt/disable path.
     pub(crate) fn reoptimize_arith_overflow_bail(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
-        bail_pc: u32,
+        exit: SideExit,
     ) -> bool {
+        if !matches!(
+            exit.reason(),
+            crate::native_abi::ExitReason::Int32Overflow
+                | crate::native_abi::ExitReason::NegativeZero
+        ) {
+            return false;
+        }
+        let bail_pc = exit.logical_pc();
         let Some(function) = context.exec_function(fid) else {
             return false;
         };
@@ -529,33 +540,42 @@ impl Interpreter {
     /// when its feedback epoch advances — the same "stop speculating until the
     /// profile actually changes" rule V8 spells `DisableOptimization` and JSC
     /// spells `jettison` plus an exit-site check.
-    pub(crate) fn note_jit_optimized_bail(&mut self, fid: u32, resume_pc: u32) {
+    pub(crate) fn note_jit_optimized_bail(&mut self, fid: u32, exit: native_abi::SideExit) {
+        let resume_pc = exit.logical_pc();
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
-        self.jit_optimized_bail_pcs
-            .entry(fid)
-            .or_default()
-            .insert(resume_pc);
+        let profile = self
+            .jit_optimized_exit_profiles
+            .entry((fid, resume_pc, exit.reason()))
+            .or_insert(jit::JitExitProfile {
+                action: exit.action(),
+                count: 0,
+            });
+        profile.action = profile.action.max(exit.action());
+        profile.count = profile.count.saturating_add(1);
+        let action = profile.action;
+        let count = profile.count;
+        if action == native_abi::ExitAction::Resume {
+            return;
+        }
         let reopts = self
             .jit_optimized_reopt_counts
             .get(&fid)
             .copied()
             .unwrap_or(0);
-        if reopts >= MAX_OPTIMIZED_REOPTIMIZATIONS {
+        if action == native_abi::ExitAction::Invalidate || reopts >= MAX_OPTIMIZED_REOPTIMIZATIONS {
             self.abandon_optimized_generation(fid);
             return;
         }
-        let bails = self
-            .jit_optimized_bail_counts
-            .entry((fid, resume_pc))
-            .or_insert(0);
-        *bails = bails.saturating_add(1);
-        if *bails < OPTIMIZED_SITE_BAIL_REOPT_THRESHOLD {
+        if count < OPTIMIZED_SITE_BAIL_REOPT_THRESHOLD {
             return;
         }
         self.jit_optimized_reopt_counts.insert(fid, reopts + 1);
-        self.jit_optimized_bail_counts
-            .retain(|&(counted_fid, _), _| counted_fid != fid);
+        for (&(profile_fid, _, _), profile) in &mut self.jit_optimized_exit_profiles {
+            if profile_fid == fid {
+                profile.count = 0;
+            }
+        }
         let dependents = match self.jit_optimized_code.get(&fid) {
             Some(Some(code)) => self
                 .jit_code_registry
@@ -619,8 +639,11 @@ impl Interpreter {
             self.jit_entry_bail_counts.remove(&fid);
             self.jit_optimized_declined_epoch.remove(&fid);
         }
-        self.jit_optimized_bail_counts
-            .retain(|&(counted_fid, _), _| !affected.contains(&counted_fid));
+        for (&(profile_fid, _, _), profile) in &mut self.jit_optimized_exit_profiles {
+            if affected.contains(&profile_fid) {
+                profile.count = 0;
+            }
+        }
         self.jit_template_entry_retry_remaining
             .retain(|fid, _| !affected.contains(fid));
         self.jit_template_osr_fids
@@ -702,7 +725,8 @@ impl Interpreter {
                 )
             };
         match outcome {
-            jit::JitExecOutcome::Bailed(pc) => {
+            jit::JitExecOutcome::Bailed(exit) => {
+                let pc = exit.logical_pc();
                 stack[top_idx].pc = pc;
                 let fid = stack[top_idx].function_id;
                 self.record_jit_bail(
@@ -714,11 +738,11 @@ impl Interpreter {
                         jit_debug::JitDebugTier::Template
                     },
                     jit_debug::JitDebugTarget::SyncEntry,
-                    pc,
+                    exit,
                 );
                 // The optimizing entry helper already recorded this exit; this
                 // synchronous wrapper only owns template-entry accounting.
-                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, exit) {
                     self.note_jit_entry_bail(fid);
                 }
                 Ok(None)
@@ -787,8 +811,8 @@ impl Interpreter {
             self.jit_runtime_stats.optimized_entries.saturating_add(1);
         let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
-        if let jit::JitExecOutcome::Bailed(resume_pc) = outcome {
-            self.note_jit_optimized_bail(fid, resume_pc);
+        if let jit::JitExecOutcome::Bailed(exit) = outcome {
+            self.note_jit_optimized_bail(fid, exit);
         }
         Some(outcome)
     }
@@ -1418,10 +1442,13 @@ mod tests {
             _activation: jit::VmRuntimeActivation,
             logical_pc: u32,
         ) -> Option<jit::JitExecOutcome> {
-            self.osr_entries
-                .binary_search(&logical_pc)
-                .ok()
-                .map(|_| jit::JitExecOutcome::Bailed(logical_pc))
+            self.osr_entries.binary_search(&logical_pc).ok().map(|_| {
+                jit::JitExecOutcome::Bailed(native_abi::SideExit::new(
+                    logical_pc,
+                    native_abi::ExitReason::UnsupportedOperation,
+                    native_abi::ExitAction::Recompile,
+                ))
+            })
         }
     }
 
@@ -1583,7 +1610,7 @@ mod tests {
         for &osr_pc in &osr_entries {
             assert!(matches!(
                 first.osr_entry(activation, osr_pc),
-                Some(jit::JitExecOutcome::Bailed(pc)) if pc == osr_pc
+                Some(jit::JitExecOutcome::Bailed(exit)) if exit.logical_pc() == osr_pc
             ));
         }
     }
@@ -1773,7 +1800,11 @@ mod tests {
     #[test]
     fn compiled_side_exit_is_unchanged_across_collection() {
         let mut vm = Interpreter::new();
-        let result = NativeResultPair::side_exit(37);
+        let result = NativeResultPair::side_exit(crate::native_abi::SideExit::new(
+            37,
+            crate::native_abi::ExitReason::TypeMismatch,
+            crate::native_abi::ExitAction::Recompile,
+        ));
         let returned = vm.with_rooted_compiled_result(result, |vm| {
             vm.collect_minor_tracing_runtime_roots();
         });

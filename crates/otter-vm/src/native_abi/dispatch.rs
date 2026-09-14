@@ -3,19 +3,22 @@
 //! # Contents
 //! - [`NativeResultPair`] is the sole two-register result carrier.
 //! - [`NativeResultStatus`] is the sole machine-observed status alphabet.
+//! - [`SideExit`], [`ExitReason`], and [`ExitAction`] are the typed pre-effect
+//!   exit payload shared by every compiled tier.
 //! - [`NativeResultDomain`] validates the status subset and payload semantics
 //!   owned by each native boundary.
 //!
 //! # Invariants
-//! - The pair is always exactly `x0 = payload_bits`, `x1 = status`; there is no
-//!   packed auxiliary payload and no second result layout.
+//! - The pair is always exactly `x0 = payload_bits`, `x1 = status`; typed side
+//!   exits pack PC/reason/action into that one payload rather than introducing
+//!   another result carrier.
 //! - JavaScript exceptions never unwind through native frames. Compiled,
 //!   structured-exception, and committed domains carry a pure boxed exception
 //!   in `x0`; the probe domain reports a pending exception with canonical zero
 //!   payload instead.
 //! - A compiled or structured-exception [`NativeResultStatus::SideExit`]
-//!   payload is the exact instruction-index PC of an uncommitted instruction.
-//!   A probe-domain side exit is a guard miss and has canonical zero payload.
+//!   payload is one valid [`SideExit`]. A probe-domain side exit is a guard miss
+//!   and has canonical zero payload.
 //! - Every Rust consumer validates the externally known domain before reading
 //!   status-specific payload semantics. Unknown words and statuses outside the
 //!   selected domain are rejected, never silently rewritten as `Fatal`.
@@ -23,6 +26,150 @@
 //!
 //! # See also
 //! - [`super::runtime_stubs`] for descriptor-side result-domain ownership.
+
+/// Why generated execution left before committing its source operation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExitReason {
+    /// A value did not satisfy a proven representation or semantic type.
+    TypeMismatch = 1,
+    /// Checked Int32 arithmetic overflowed.
+    Int32Overflow = 2,
+    /// An Int32 result would erase an observable negative zero.
+    NegativeZero = 3,
+    /// An indexed access could not prove an exact ECMAScript array index.
+    InvalidElementIndex = 4,
+    /// A callable, receiver, or constructor identity proof failed.
+    IdentityGuard = 5,
+    /// An object/prototype shape proof failed.
+    ShapeGuard = 6,
+    /// A length or storage-bounds proof failed.
+    BoundsGuard = 7,
+    /// Interrupt or work-budget polling requested interpreter control.
+    Interrupt = 8,
+    /// A pre-effect generated allocation probe missed.
+    AllocationMiss = 9,
+    /// The baseline tier reached an operation it deliberately did not emit.
+    UnsupportedOperation = 10,
+    /// A VM transition selected interpreter continuation without a failed speculation.
+    RuntimeTransition = 11,
+}
+
+impl ExitReason {
+    const fn decode(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::TypeMismatch),
+            2 => Some(Self::Int32Overflow),
+            3 => Some(Self::NegativeZero),
+            4 => Some(Self::InvalidElementIndex),
+            5 => Some(Self::IdentityGuard),
+            6 => Some(Self::ShapeGuard),
+            7 => Some(Self::BoundsGuard),
+            8 => Some(Self::Interrupt),
+            9 => Some(Self::AllocationMiss),
+            10 => Some(Self::UnsupportedOperation),
+            11 => Some(Self::RuntimeTransition),
+            _ => None,
+        }
+    }
+}
+
+/// Cold policy requested by one typed side-exit site.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExitAction {
+    /// Resume without changing compilation policy.
+    Resume = 0,
+    /// Feed the reason/site profile into a later optimizing compilation.
+    Recompile = 1,
+    /// Invalidate the owning generation immediately.
+    Invalidate = 2,
+}
+
+impl ExitAction {
+    const fn decode(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Resume),
+            1 => Some(Self::Recompile),
+            2 => Some(Self::Invalidate),
+            _ => None,
+        }
+    }
+}
+
+/// Exact typed payload returned with [`NativeResultStatus::SideExit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SideExit {
+    logical_pc: u32,
+    reason: ExitReason,
+    action: ExitAction,
+}
+
+impl SideExit {
+    const REASON_SHIFT: u32 = 32;
+    const ACTION_SHIFT: u32 = 40;
+    const USED_MASK: u64 =
+        u32::MAX as u64 | (u8::MAX as u64) << Self::REASON_SHIFT | 0x3 << Self::ACTION_SHIFT;
+
+    /// Construct one pre-effect exit contract.
+    #[must_use]
+    pub const fn new(logical_pc: u32, reason: ExitReason, action: ExitAction) -> Self {
+        Self {
+            logical_pc,
+            reason,
+            action,
+        }
+    }
+
+    /// Exact interpreter instruction-index PC.
+    #[must_use]
+    pub const fn logical_pc(self) -> u32 {
+        self.logical_pc
+    }
+
+    /// Stable reason identity used by exit profiling.
+    #[must_use]
+    pub const fn reason(self) -> ExitReason {
+        self.reason
+    }
+
+    /// Policy action requested by the generated site.
+    #[must_use]
+    pub const fn action(self) -> ExitAction {
+        self.action
+    }
+
+    /// Encode into the one native result payload word.
+    #[must_use]
+    pub const fn to_bits(self) -> u64 {
+        self.logical_pc as u64
+            | (self.reason as u64) << Self::REASON_SHIFT
+            | (self.action as u64) << Self::ACTION_SHIFT
+    }
+
+    /// Decode one exact payload, rejecting spare bits and unknown enum values.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits & !Self::USED_MASK != 0 {
+            return None;
+        }
+        let reason = match ExitReason::decode((bits >> Self::REASON_SHIFT) as u8) {
+            Some(reason) => reason,
+            None => return None,
+        };
+        let action = match ExitAction::decode((bits >> Self::ACTION_SHIFT) as u8 & 0x3) {
+            Some(action) => action,
+            None => return None,
+        };
+        Some(Self {
+            logical_pc: bits as u32,
+            reason,
+            action,
+        })
+    }
+}
 
 /// The one machine-observed native result status alphabet.
 ///
@@ -97,12 +244,12 @@ impl NativeResultPair {
 
     /// Encode a pre-effect side exit.
     ///
-    /// Compiled and structured-exception domains pass an exact logical PC;
-    /// probes pass zero for a guard miss. Domain validation enforces both.
+    /// Compiled and structured-exception domains pass one typed exit contract.
+    /// Probe misses use [`Self::miss`] and its canonical zero payload.
     #[must_use]
-    pub const fn side_exit(payload_bits: u64) -> Self {
+    pub const fn side_exit(exit: SideExit) -> Self {
         Self {
-            payload_bits,
+            payload_bits: exit.to_bits(),
             status: NativeResultStatus::SideExit as u64,
         }
     }
@@ -133,7 +280,10 @@ impl NativeResultPair {
     /// Report a probe miss with no committed source effect.
     #[must_use]
     pub const fn miss() -> Self {
-        Self::side_exit(0)
+        Self {
+            payload_bits: 0,
+            status: NativeResultStatus::SideExit as u64,
+        }
     }
 
     /// Keep generated fallthrough after a committed structured transition.
@@ -184,7 +334,7 @@ impl NativeResultPair {
             NativeResultDomain::None => false,
             NativeResultDomain::Compiled => match status {
                 NativeResultStatus::Success | NativeResultStatus::Throw => true,
-                NativeResultStatus::SideExit => self.payload_bits <= u32::MAX as u64,
+                NativeResultStatus::SideExit => SideExit::from_bits(self.payload_bits).is_some(),
                 NativeResultStatus::Fatal => {
                     self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
                 }
@@ -192,7 +342,7 @@ impl NativeResultPair {
             },
             NativeResultDomain::ExceptionTransition => match status {
                 NativeResultStatus::Success | NativeResultStatus::Throw => true,
-                NativeResultStatus::SideExit => self.payload_bits <= u32::MAX as u64,
+                NativeResultStatus::SideExit => SideExit::from_bits(self.payload_bits).is_some(),
                 NativeResultStatus::Continue => self.payload_bits == 0,
                 NativeResultStatus::Fatal => {
                     self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
@@ -234,13 +384,18 @@ impl NativeResultPair {
         crate::Value::from_abi_bits(self.payload_bits)
     }
 
-    /// Decode a validated compiled/exception side-exit payload as a logical PC.
+    /// Decode a validated compiled/exception side-exit payload.
+    #[must_use]
+    pub const fn side_exit_payload(self) -> Option<SideExit> {
+        SideExit::from_bits(self.payload_bits)
+    }
+
+    /// Decode a validated side exit's logical PC.
     #[must_use]
     pub const fn logical_pc(self) -> Option<u32> {
-        if self.payload_bits <= u32::MAX as u64 {
-            Some(self.payload_bits as u32)
-        } else {
-            None
+        match self.side_exit_payload() {
+            Some(exit) => Some(exit.logical_pc()),
+            None => None,
         }
     }
 }
@@ -268,12 +423,14 @@ mod tests {
             assert_eq!(success.payload_value(), value);
         }
 
-        let side_exit = NativeResultPair::side_exit(17);
+        let contract = SideExit::new(17, ExitReason::TypeMismatch, ExitAction::Recompile);
+        let side_exit = NativeResultPair::side_exit(contract);
         assert_eq!(
             side_exit.validate(NativeResultDomain::Compiled),
             Some(NativeResultStatus::SideExit)
         );
         assert_eq!(side_exit.logical_pc(), Some(17));
+        assert_eq!(side_exit.side_exit_payload(), Some(contract));
         assert_eq!(
             side_exit.validate(NativeResultDomain::ExceptionTransition),
             Some(NativeResultStatus::SideExit)
@@ -285,6 +442,46 @@ mod tests {
         assert_eq!(
             miss.validate(NativeResultDomain::Probe),
             Some(NativeResultStatus::SideExit)
+        );
+    }
+
+    #[test]
+    fn typed_side_exit_round_trips_every_reason_and_action() {
+        let reasons = [
+            ExitReason::TypeMismatch,
+            ExitReason::Int32Overflow,
+            ExitReason::NegativeZero,
+            ExitReason::InvalidElementIndex,
+            ExitReason::IdentityGuard,
+            ExitReason::ShapeGuard,
+            ExitReason::BoundsGuard,
+            ExitReason::Interrupt,
+            ExitReason::AllocationMiss,
+            ExitReason::UnsupportedOperation,
+            ExitReason::RuntimeTransition,
+        ];
+        let actions = [
+            ExitAction::Resume,
+            ExitAction::Recompile,
+            ExitAction::Invalidate,
+        ];
+        for reason in reasons {
+            for action in actions {
+                let exit = SideExit::new(u32::MAX, reason, action);
+                assert_eq!(SideExit::from_bits(exit.to_bits()), Some(exit));
+            }
+        }
+
+        assert_eq!(SideExit::from_bits(1), None, "reason zero is invalid");
+        assert_eq!(
+            SideExit::from_bits(1 | (u64::from(ExitReason::TypeMismatch as u8) << 32) | (3 << 40)),
+            None,
+            "action three is reserved"
+        );
+        assert_eq!(
+            SideExit::from_bits(1 | (0xff << 32)),
+            None,
+            "unknown reasons are invalid"
         );
     }
 
@@ -344,7 +541,10 @@ mod tests {
             payload_bits: 0,
             status: 1 << 8,
         };
-        let wide_pc = NativeResultPair::side_exit(u64::from(u32::MAX) + 1);
+        let malformed_exit = NativeResultPair {
+            payload_bits: 1_u64 << 63,
+            status: NativeResultStatus::SideExit as u64,
+        };
         for domain in [
             NativeResultDomain::Compiled,
             NativeResultDomain::ExceptionTransition,
@@ -354,7 +554,7 @@ mod tests {
             assert_eq!(unknown.validate(domain), None);
             assert_eq!(widened_status.validate(domain), None);
         }
-        assert_eq!(wide_pc.validate(NativeResultDomain::Compiled), None);
-        assert_eq!(wide_pc.validate(NativeResultDomain::Probe), None);
+        assert_eq!(malformed_exit.validate(NativeResultDomain::Compiled), None);
+        assert_eq!(malformed_exit.validate(NativeResultDomain::Probe), None);
     }
 }

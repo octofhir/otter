@@ -1594,7 +1594,7 @@ impl Interpreter {
         result
     }
 
-    /// Bake the logical PCs at which earlier optimized generations of `fid`
+    /// Bake the typed reasons at which earlier optimized generations of `fid`
     /// exited, and widen the baked feedback of those instructions.
     ///
     /// The exit profile is evidence the operand observations cannot carry: an
@@ -1603,12 +1603,18 @@ impl Interpreter {
     /// caller splicing this body inline — does not emit the speculation that
     /// already exited.
     fn bake_optimized_exit_profile(&self, snapshot: &mut jit::JitCompileSnapshot, fid: u32) {
-        snapshot.optimized_bail_pcs = self
-            .jit_optimized_bail_pcs
-            .get(&fid)
-            .cloned()
-            .unwrap_or_default();
-        for pc in snapshot.optimized_bail_pcs.clone() {
+        snapshot.optimized_exit_reasons = self
+            .jit_optimized_exit_profiles
+            .keys()
+            .filter_map(|&(profile_fid, pc, reason)| (profile_fid == fid).then_some((pc, reason)))
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut exits, (pc, reason)| {
+                    exits.entry(pc).or_default().insert(reason);
+                    exits
+                },
+            );
+        for &pc in snapshot.optimized_exit_reasons.keys() {
             if let Some(instruction) = snapshot.instructions.get_mut(pc as usize) {
                 instruction.note_optimized_exit();
             }

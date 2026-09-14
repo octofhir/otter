@@ -83,7 +83,6 @@ pub(crate) struct GeneratedDeoptState {
     pub(crate) tier: NativeFrameKind,
     pub(crate) entries: u64,
     pub(crate) deopts: u64,
-    pub(crate) consecutive_deopts: u32,
     pub(crate) linked: bool,
 }
 
@@ -572,7 +571,7 @@ impl JitCodeRegistry {
                 .get(&function_id)
                 .expect("every generation retains its permanent function cell");
             let registered = self.codes.get(&code_object_id);
-            let (entries, returns, deopts, throws, streak) = cell.generated_feedback();
+            let (entries, returns, deopts, throws) = cell.generated_feedback();
             generations.push(JitCodeGenerationSnapshot {
                 code_object_id,
                 function_id,
@@ -591,7 +590,6 @@ impl JitCodeRegistry {
                 generated_returns: returns,
                 generated_deopts: deopts,
                 generated_throws: throws,
-                generated_bail_streak: streak,
                 dependencies: registered.map(|registered| {
                     let mut dependencies = registered.dependencies.to_vec();
                     dependencies.sort_unstable_by_key(|dependency| {
@@ -615,7 +613,7 @@ impl JitCodeRegistry {
     pub(crate) fn take_generated_feedback(&mut self) -> Vec<GeneratedCallFeedback> {
         let mut feedback = Vec::new();
         for (&code_object_id, cell) in &self.entry_cells {
-            let (entries, returns, deopts, throws, _) = cell.generated_feedback();
+            let (entries, returns, deopts, throws) = cell.generated_feedback();
             let seen = self
                 .generated_feedback_seen
                 .entry(code_object_id)
@@ -650,7 +648,7 @@ impl JitCodeRegistry {
     /// Current generated-call health for one exact generation.
     pub(crate) fn generated_deopt_state(&self, code_object_id: u64) -> Option<GeneratedDeoptState> {
         let cell = self.entry_cells.get(&code_object_id)?;
-        let (entries, _, deopts, _, consecutive_deopts) = cell.generated_feedback();
+        let (entries, _, deopts, _) = cell.generated_feedback();
         let tier = if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
             NativeFrameKind::Baseline
         } else {
@@ -661,7 +659,6 @@ impl JitCodeRegistry {
             tier,
             entries,
             deopts,
-            consecutive_deopts,
             linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
         })
     }

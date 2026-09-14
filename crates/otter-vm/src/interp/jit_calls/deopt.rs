@@ -46,7 +46,7 @@
 
 use crate::{
     ActivationStack, ActiveFrameRef, ExecutionContext, Frame, Interpreter, Value, VmError, jit,
-    native_abi::{NativeFrame, NativeFrameFlags},
+    native_abi::{NativeFrame, NativeFrameFlags, SideExit},
 };
 
 impl Interpreter {
@@ -67,6 +67,7 @@ impl Interpreter {
         callee_code_object_id: u64,
         caller_code_object_id: u64,
         call_kind: jit::JitDirectCallKind,
+        exit: SideExit,
     ) -> Result<Value, VmError> {
         if !native
             .header
@@ -83,6 +84,7 @@ impl Interpreter {
             callee_code_object_id,
             call_kind,
             native,
+            exit,
         )?;
         self.jit_deopt_resume_stack_call(context, stack, native, call_kind)
     }
@@ -205,6 +207,7 @@ impl Interpreter {
         native: &mut NativeFrame,
         materialized_index: Option<usize>,
         frames: &[crate::deopt::DeoptFrame<Value>],
+        exit: SideExit,
     ) -> Result<Value, VmError> {
         // The chain runs to completion here rather than reporting a bail, so
         // this is the only place the exit can charge the optimizing tier's
@@ -274,17 +277,24 @@ impl Interpreter {
                     .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
             })
             .transpose()?;
-        self.note_jit_optimized_bail(outermost.function_id, resume_pcs[0]);
+        self.note_jit_optimized_bail(outermost.function_id, exit);
         // The speculation that exited lives in the innermost spliced body; its
         // own exit profile must learn the PC so the next bake of that body,
         // inline or standalone, widens the site.
         if let Some(innermost) = frames.last()
             && frames.len() > 1
         {
-            self.jit_optimized_bail_pcs
-                .entry(innermost.function_id)
-                .or_default()
-                .insert(*resume_pcs.last().ok_or(VmError::InvalidOperand)?);
+            self.jit_optimized_exit_profiles
+                .entry((
+                    innermost.function_id,
+                    *resume_pcs.last().ok_or(VmError::InvalidOperand)?,
+                    exit.reason(),
+                ))
+                .and_modify(|profile| profile.action = profile.action.max(exit.action()))
+                .or_insert(crate::jit::JitExitProfile {
+                    action: exit.action(),
+                    count: 0,
+                });
         }
         let handler_plans = frames
             .iter()
@@ -550,6 +560,11 @@ mod tests {
                         &mut native,
                         None,
                         &frames,
+                        SideExit::new(
+                            1,
+                            crate::native_abi::ExitReason::UnsupportedOperation,
+                            crate::native_abi::ExitAction::Recompile,
+                        ),
                     )
                 })
                 .expect("both nested catches resume");
@@ -641,6 +656,11 @@ mod tests {
                         &mut native,
                         None,
                         &frames,
+                        SideExit::new(
+                            0,
+                            crate::native_abi::ExitReason::UnsupportedOperation,
+                            crate::native_abi::ExitAction::Recompile,
+                        ),
                     )
                     .unwrap();
                 assert_eq!(

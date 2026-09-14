@@ -124,6 +124,7 @@ impl Interpreter {
         callee_code_object_id: u64,
         call_kind: JitDirectCallKind,
         callee: &NativeFrame,
+        exit: crate::native_abi::SideExit,
     ) -> Result<(), VmError> {
         if caller_code_object_id == 0
             || callee_code_object_id == 0
@@ -152,7 +153,7 @@ impl Interpreter {
         };
         if state.function_id != callee.header.function_id
             || state.tier != callee.header.kind
-            || state.consecutive_deopts == 0
+            || state.deopts == 0
         {
             return Err(VmError::InvalidOperand);
         }
@@ -173,7 +174,8 @@ impl Interpreter {
             callee_code_object_id,
             callee_tier: tier,
             callee_resume_pc,
-            consecutive_deopts: state.consecutive_deopts,
+            exit_reason: exit.reason(),
+            exit_action: exit.action(),
         });
 
         // An optimizing generation that exits is a round trip on every entry
@@ -181,7 +183,7 @@ impl Interpreter {
         // an entry like any other, so it charges the same bounded
         // reoptimization budget the interpreter's entry paths do.
         if state.tier == NativeFrameKind::Optimizing {
-            self.note_jit_optimized_bail(callee_function_id, callee_resume_pc);
+            self.note_jit_optimized_bail(callee_function_id, exit);
             return Ok(());
         }
 
@@ -196,10 +198,6 @@ impl Interpreter {
             if generated_call_generation_is_unhealthy(state.entries, state.deopts) {
                 self.reopt_or_pin_jit_function(callee_function_id);
             } else {
-                self.jit_entry_bail_counts.insert(
-                    callee_function_id,
-                    state.consecutive_deopts.saturating_sub(1),
-                );
                 self.note_jit_entry_bail(callee_function_id);
             }
         }

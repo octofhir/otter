@@ -32,7 +32,7 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
                 || target == otter_vm::native_abi::STUB_JIT_BINDING_VALUE
                 || target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY))
             || instruction.safepoint.is_none()
-            || instruction.deopt.is_some() != direct
+            || !instruction.exits.is_empty() != direct
             || frames.len() < 2
             || frames[0].entry.is_some()
             || !frames[0].slots.is_empty()

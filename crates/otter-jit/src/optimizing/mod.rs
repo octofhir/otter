@@ -189,11 +189,9 @@ impl JitFunctionCode for OptimizedCode {
             ],
         )
         .saturating_add(self.deopt.retained_bytes())
-        .saturating_add(
-            self.safepoint_records.iter().fold(0u64, |bytes, record| {
-                bytes.saturating_add(record.inline_retained_bytes())
-            }),
-        )
+        .saturating_add(self.safepoint_records.iter().fold(0u64, |bytes, record| {
+            bytes.saturating_add(record.inline_retained_bytes())
+        }))
     }
 
     fn native_frame_kind(&self) -> otter_vm::native_abi::NativeFrameKind {

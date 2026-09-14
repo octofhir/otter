@@ -4369,7 +4369,7 @@ mod tests {
                     instruction
                 ));
                 let mut invalid = instruction.clone();
-                invalid.deopt = None;
+                invalid.exits = Box::default();
                 assert!(!native_leaf::is_valid(
                     &TargetSpec::aarch64(),
                     descriptor,
@@ -5947,7 +5947,7 @@ mod tests {
                 )
             })
             .expect("generated proof");
-        assert!(probe.safepoint.is_none() && probe.deopt.is_none());
+        assert!(probe.safepoint.is_none() && probe.exits.is_empty());
         assert!(sequence.instructions().iter().any(|instruction| matches!(
             instruction.opcode,
             crate::machine::MachineOpcode::Call(_)

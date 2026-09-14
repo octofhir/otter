@@ -4284,10 +4284,10 @@ impl Interpreter {
                 window_rollback.commit();
                 Ok(value)
             }
-            crate::jit::JitExecOutcome::Bailed(pc) => {
+            crate::jit::JitExecOutcome::Bailed(exit) => {
                 // Finish the partially-run frame in the interpreter. A bailout
                 // consumes the recyclable frame; the next element rebuilds it.
-                stack[top_idx].pc = pc;
+                stack[top_idx].pc = exit.logical_pc();
                 let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
                 self.release_frames_above(stack, entry_floor);
                 result

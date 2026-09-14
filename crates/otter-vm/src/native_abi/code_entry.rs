@@ -103,8 +103,9 @@ pub struct CodeEntryCell {
     pub generated_stack_frame_bytes: u32,
     /// Explicit leases that may outlive a native-activation retirement epoch.
     pub active_count: AtomicU32,
-    /// Consecutive generated native bails since the last return/throw.
-    pub generated_bail_streak: Cell<u32>,
+    /// Keeps the copied frame header naturally aligned for target pair loads.
+    /// This is layout padding, not feedback or compatibility state.
+    _native_frame_alignment: u32,
     /// Ready-to-copy frame header for stack-owned generated calls.
     ///
     /// Function identity, register shape, tier, and safepoint capability are
@@ -164,7 +165,7 @@ impl CodeEntryCell {
             flags,
             generated_stack_frame_bytes,
             active_count: AtomicU32::new(0),
-            generated_bail_streak: Cell::new(0),
+            _native_frame_alignment: 0,
             native_frame_header: VmFrameHeader {
                 function_id,
                 pc: 0,
@@ -234,18 +235,12 @@ impl CodeEntryCell {
 
     /// Cumulative generated-call feedback for this exact code generation.
     #[must_use]
-    pub fn generated_feedback(&self) -> (u64, u64, u64, u64, u32) {
+    pub fn generated_feedback(&self) -> (u64, u64, u64, u64) {
         let entries = self.generated_entries.get();
         let deopts = self.generated_deopts.get();
         let throws = self.generated_throws.get();
         let returns = entries.saturating_sub(deopts.saturating_add(throws));
-        (
-            entries,
-            returns,
-            deopts,
-            throws,
-            self.generated_bail_streak.get(),
-        )
+        (entries, returns, deopts, throws)
     }
 }
 
@@ -290,7 +285,7 @@ const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
 const _: [(); 16] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
 const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes)];
 const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
-const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, generated_bail_streak)];
+const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, _native_frame_alignment)];
 const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
 const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
 const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];

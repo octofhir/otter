@@ -108,7 +108,10 @@ mod tests {
     use otter_vm::{
         JitCompileSnapshot, JitFunctionCode,
         jit::JitTestInstruction,
-        native_abi::{NativeResultDomain, NativeResultPair, NativeResultStatus},
+        native_abi::{
+            ExitAction, ExitReason, NativeResultDomain, NativeResultPair, NativeResultStatus,
+            SideExit,
+        },
     };
 
     const STRIDE: u32 = 4;
@@ -210,7 +213,11 @@ mod tests {
         if ctx.error.is_null() || unsafe { (*ctx.error).take() }.is_none() {
             return NativeResultPair::fatal_internal();
         }
-        NativeResultPair::side_exit(u64::from(pc))
+        NativeResultPair::side_exit(SideExit::new(
+            pc,
+            ExitReason::RuntimeTransition,
+            ExitAction::Resume,
+        ))
     }
 
     fn compile(view: &JitCompileSnapshot) -> Result<TemplateCode, super::Unsupported> {

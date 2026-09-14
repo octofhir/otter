@@ -303,14 +303,14 @@ pub struct JitCompileSnapshot {
     /// prototype the hop reaches and guarding the holder shape fixes the slot,
     /// so generated code runs the hop without the site's cache cell.
     pub property_prototype_loads: rustc_hash::FxHashMap<u32, Vec<JitInlinePropertyHop>>,
-    /// Logical PCs an earlier optimized generation of this function
-    /// deoptimized at. Moving a settled access out of a loop makes its guard
-    /// run on paths that would not have reached it, so a pass that would place
-    /// one at a PC already known to deoptimize leaves the loop alone instead.
-    /// The baked per-instruction feedback of every listed PC is already
-    /// widened past the exited speculation
+    /// Typed reasons observed at each logical PC in earlier optimized
+    /// generations. The reason identity remains available to later policy and
+    /// lowering instead of collapsing distinct failures into a PC-only bit.
+    /// The baked per-instruction feedback of every listed PC is already widened
+    /// past the exited speculation
     /// ([`JitInstructionMetadata::note_optimized_exit`]).
-    pub optimized_bail_pcs: std::collections::BTreeSet<u32>,
+    pub optimized_exit_reasons:
+        std::collections::BTreeMap<u32, std::collections::BTreeSet<crate::native_abi::ExitReason>>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
     /// layout never reaches the emitter, so a second element-bearing family
@@ -1484,7 +1484,7 @@ impl JitCompileSnapshot {
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
             property_prototype_loads: rustc_hash::FxHashMap::default(),
-            optimized_bail_pcs: std::collections::BTreeSet::new(),
+            optimized_exit_reasons: std::collections::BTreeMap::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }
@@ -1882,12 +1882,21 @@ pub enum JitExecOutcome {
     /// A typed guard (or an unsupported opcode emitted as a bail) was hit; the
     /// VM resumes the interpreter at the carried byte-PC — the exact
     /// instruction, so committed side effects are preserved.
-    Bailed(u32),
+    Bailed(crate::native_abi::SideExit),
     /// A generated callee propagated one pure JavaScript exception value.
     Throw(crate::Value),
     /// A structural engine failure escaped generated code. The exception
     /// payload channel is never used for this outcome.
     Fatal(crate::run_control::VmError),
+}
+
+/// Per-site optimizing exit evidence and current-generation pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JitExitProfile {
+    /// Cold policy carried by the generated exit.
+    pub action: crate::native_abi::ExitAction,
+    /// Exits observed in the current optimizing generation.
+    pub count: u32,
 }
 
 /// Type-erased compiled-code handle owned by the JIT implementation.
@@ -2085,8 +2094,6 @@ pub struct JitCodeGenerationSnapshot {
     pub generated_deopts: u64,
     /// Generated entries that propagated a throw.
     pub generated_throws: u64,
-    /// Consecutive generated deopts since the last return or throw.
-    pub generated_bail_streak: u32,
     /// Exact validity dependencies while executable metadata remains
     /// registered; `None` denotes a retired tombstone.
     pub dependencies: Option<Vec<CodeDependency>>,

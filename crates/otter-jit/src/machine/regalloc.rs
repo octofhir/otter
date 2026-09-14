@@ -24,7 +24,7 @@ use regalloc2::{
 };
 
 use super::{
-    ControlFlow, DeoptId, InstructionSequence, MachineInstructionId, MachineOperand, MachineValue,
+    ControlFlow, InstructionSequence, MachineInstructionId, MachineOperand, MachineValue,
     OperandConstraint, OperandPurpose, OperandRole, OperandTiming, PhysicalRegister, SafepointId,
     TargetSpec, VerificationError,
 };
@@ -65,8 +65,8 @@ pub struct AllocatedMetadata {
     pub instruction: MachineInstructionId,
     /// Safepoint identity for a root.
     pub safepoint: Option<SafepointId>,
-    /// Deopt identity for a reconstruction value.
-    pub deopt: Option<DeoptId>,
+    /// Logical frame-state identity for reconstruction metadata.
+    pub frame_state: Option<otter_vm::native_abi::FrameStateId>,
     /// Virtual value whose bits occupy the location.
     pub value: MachineValue,
     /// Root/deopt kind.
@@ -308,8 +308,8 @@ pub(super) fn allocate(
                     )
                     .then_some(instruction.safepoint)
                     .flatten(),
-                    deopt: (operand.purpose == OperandPurpose::Deopt)
-                        .then_some(instruction.deopt)
+                    frame_state: (operand.purpose == OperandPurpose::FrameState)
+                        .then_some(instruction.frame_state)
                         .flatten(),
                     value: operand.value,
                     purpose: operand.purpose,
@@ -452,9 +452,10 @@ mod tests {
     use super::*;
     use crate::machine::{
         CallDescriptor, CallEffects, CallTarget, ControlFlow, DeoptId, ExceptionalEdge,
-        FrameLayoutError, InstructionSequence, MachineBlock, MachineBlockData, MachineInstruction,
-        MachineOpcode, MachineOperand, MachineRepresentation, OperandConstraint, OperandPurpose,
-        OperandRole, OperandTiming, SafepointId, SafepointKind, TargetClobberSet,
+        FrameLayoutError, InstructionSequence, MachineBlock, MachineBlockData, MachineFrameSlot,
+        MachineFrameState, MachineInstruction, MachineOpcode, MachineOperand,
+        MachineRepresentation, OperandConstraint, OperandPurpose, OperandRole, OperandTiming,
+        SafepointId, SafepointKind, TargetClobberSet,
     };
 
     fn sequence(target: &TargetSpec) -> InstructionSequence {
@@ -482,6 +483,7 @@ mod tests {
             ],
         );
         call.safepoint = Some(SafepointId(0));
+        call.frame_state = Some(0);
         call.clobbers = target.clobbers(TargetClobberSet::ScalarCall).to_vec();
         let call_clobbers = call.clobbers.clone();
         let mut add = MachineInstruction::plain(
@@ -490,17 +492,17 @@ mod tests {
                 MachineOperand::register_input(tagged),
                 MachineOperand::register_input(integer),
                 MachineOperand::register_output(result),
-                MachineOperand::deopt(tagged),
-                MachineOperand::deopt(integer),
+                MachineOperand::frame_value(tagged),
+                MachineOperand::frame_value(integer),
             ],
         );
-        add.deopt = Some(DeoptId(0));
+        add.set_test_exit(DeoptId(0), 0);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
             vec![MachineOperand::register_input(result)],
         );
         ret.control = ControlFlow::Return;
-        InstructionSequence::new(
+        InstructionSequence::new_with_frame_states(
             target,
             MachineBlock(0),
             vec![
@@ -516,6 +518,18 @@ mod tests {
                 clobbers: call_clobbers,
                 exceptional: ExceptionalEdge::None,
                 safepoint: SafepointKind::Gc,
+            }],
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 0,
+                    entry: None,
+                    slots: Box::new([
+                        MachineFrameSlot::Value(tagged),
+                        MachineFrameSlot::Value(integer),
+                    ]),
+                }]),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -537,8 +551,8 @@ mod tests {
             let allocated = sequence.allocate(&target).expect("allocation succeeds");
             assert_eq!(allocated.metadata().len(), 3);
             assert_eq!(allocated.metadata()[0].safepoint, Some(SafepointId(0)));
-            assert_eq!(allocated.metadata()[1].deopt, Some(DeoptId(0)));
-            assert_eq!(allocated.metadata()[2].deopt, Some(DeoptId(0)));
+            assert_eq!(allocated.metadata()[1].frame_state, Some(0));
+            assert_eq!(allocated.metadata()[2].frame_state, Some(0));
             assert_ne!(
                 allocated.metadata()[1].location,
                 allocated.metadata()[2].location
@@ -590,7 +604,7 @@ mod tests {
 
     #[test]
     fn metadata_must_be_a_late_use_at_a_matching_exit() {
-        let mut invalid = MachineOperand::deopt(MachineValue(0));
+        let mut invalid = MachineOperand::frame_value(MachineValue(0));
         invalid.timing = OperandTiming::Early;
         invalid.role = OperandRole::Definition;
         invalid.purpose = OperandPurpose::TaggedRoot;

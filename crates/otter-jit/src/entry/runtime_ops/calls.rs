@@ -91,7 +91,7 @@ pub(crate) extern "C" fn jit_deopt_stack_call_stub(
     callee_code_object_id: u64,
     caller_code_object_id: u64,
     call_kind: u64,
-    callee_bail_pc: u64,
+    callee_side_exit: u64,
 ) -> NativeResultPair {
     // SAFETY: generated linkage keeps both context and stack frame live and
     // published until this function returns.
@@ -99,7 +99,10 @@ pub(crate) extern "C" fn jit_deopt_stack_call_stub(
     let Some(callee_frame) = (unsafe { callee_frame.as_mut() }) else {
         return compiled_fatal(ctx, VmError::InvalidOperand);
     };
-    if callee_bail_pc != u64::from(callee_frame.header.pc) {
+    let Some(callee_side_exit) = otter_vm::native_abi::SideExit::from_bits(callee_side_exit) else {
+        return compiled_fatal(ctx, VmError::InvalidOperand);
+    };
+    if callee_side_exit.logical_pc() != callee_frame.header.pc {
         return compiled_fatal(ctx, VmError::InvalidOperand);
     }
     let (Ok(caller_function_id), Ok(caller_call_pc)) = (
@@ -132,6 +135,7 @@ pub(crate) extern "C" fn jit_deopt_stack_call_stub(
         callee_code_object_id,
         caller_code_object_id,
         call_kind,
+        callee_side_exit,
     ) {
         Ok(value) => NativeResultPair::success(value),
         Err(err) => compiled_error(ctx, err),

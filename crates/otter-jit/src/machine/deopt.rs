@@ -9,8 +9,13 @@
 //! - Value slots resolve only through late deopt operands retained by regalloc2.
 //! - Integer, floating-point, and spill namespaces are unified deterministically.
 //! - Caller/callee registers, this, closure and new.target use allocator locations.
-//! - Every output frame is register-count wide and every deopt id is dense.
+//! - Every output frame is register-count wide; logical frame-state and emitted
+//!   physical-exit ids are independently dense, and several reason-specific
+//!   exits may share one logical state.
 //! - Target emitters consume the same locations; no pre-allocation fallback exists.
+//!
+//! # See also
+//! - [`super::safepoint`] — root maps derived from the same logical states.
 
 use otter_vm::{
     Value,
@@ -18,11 +23,12 @@ use otter_vm::{
         DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
         DeoptVerifyError, DeoptVerifyLimits, FrameState,
     },
+    native_abi::FrameStateId,
 };
 
 use super::{
     AllocatedLocation, AllocatedSequence, DeoptId, FrameLayoutError, InstructionSequence,
-    MachineFrameLayout, MachineRepresentation, MachineValue,
+    MachineFrameLayout, MachineInstructionId, MachineRepresentation, MachineValue,
 };
 
 /// One interpreter register at a Machine IR exit.
@@ -37,8 +43,8 @@ pub enum MachineFrameSlot {
 /// Exact outermost-first frame chain for one Machine IR deopt exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineFrameState {
-    /// Dense exit identity attached to the owning instruction.
-    pub id: DeoptId,
+    /// Dense logical identity shared by safepoints and exits.
+    pub id: FrameStateId,
     /// VM-owned frame schema with allocator inputs instead of concrete recipes.
     pub frames: Box<[DeoptFrame<MachineFrameSlot>]>,
 }
@@ -47,12 +53,14 @@ pub struct MachineFrameState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineDeoptError {
     /// Frame states are not dense in deopt-id order.
-    NonDenseId {
+    NonDenseFrameStateId {
         /// Dense id required at this table position.
         expected: u32,
         /// Id supplied by the frame state.
         actual: u32,
     },
+    /// More than one physical exit recipe refers to one logical state.
+    AmbiguousExitState(FrameStateId),
     /// A state references a missing Machine IR value.
     InvalidValue(MachineValue),
     /// No late allocator location exists for a state value at this exit.
@@ -84,21 +92,48 @@ pub fn lower_deopt_table(
     fp_budget: u16,
     states: &[MachineFrameState],
 ) -> Result<DeoptTable, MachineDeoptError> {
-    let mut lowered = Vec::with_capacity(states.len());
+    let mut exits_by_state = std::collections::BTreeMap::new();
+    for (instruction_index, instruction) in sequence.instructions().iter().enumerate() {
+        if instruction.exits.is_empty() {
+            continue;
+        }
+        let state = instruction
+            .frame_state
+            .ok_or(MachineDeoptError::AmbiguousExitState(FrameStateId::MAX))?;
+        if exits_by_state
+            .insert(state, MachineInstructionId(instruction_index as u32))
+            .is_some()
+        {
+            return Err(MachineDeoptError::AmbiguousExitState(state));
+        }
+    }
+    let mut lowered = vec![None; states.len()];
     for (expected, state) in states.iter().enumerate() {
         let expected = expected as u32;
-        if state.id.0 != expected {
-            return Err(MachineDeoptError::NonDenseId {
+        if state.id != expected {
+            return Err(MachineDeoptError::NonDenseFrameStateId {
                 expected,
-                actual: state.id.0,
+                actual: state.id,
             });
         }
+        let Some(&instruction) = exits_by_state.get(&state.id) else {
+            continue;
+        };
         let frames = state
             .frames
             .iter()
             .map(|frame| {
-                let lower =
-                    |slot| lower_slot(sequence, allocation, layout, gpr_budget, state.id, slot);
+                let lower = |slot| {
+                    lower_slot(
+                        sequence,
+                        allocation,
+                        layout,
+                        gpr_budget,
+                        state.id,
+                        instruction,
+                        slot,
+                    )
+                };
                 Ok(DeoptFrame {
                     function_id: frame.function_id,
                     byte_pc: frame.byte_pc,
@@ -122,9 +157,9 @@ pub fn lower_deopt_table(
                 })
             })
             .collect::<Result<_, MachineDeoptError>>()?;
-        lowered.push(FrameState { frames });
+        lowered[state.id as usize] = Some(FrameState { frames });
     }
-    let table = DeoptTable::from_states(lowered);
+    let table = DeoptTable::from_indexed_states(lowered);
     let max_stack_offset = if allocation.spill_slots() == 0 {
         0
     } else {
@@ -157,7 +192,8 @@ fn lower_slot(
     allocation: &AllocatedSequence,
     layout: MachineFrameLayout,
     gpr_budget: u16,
-    deopt: DeoptId,
+    frame_state: FrameStateId,
+    instruction: MachineInstructionId,
     slot: MachineFrameSlot,
 ) -> Result<DeoptSlot, MachineDeoptError> {
     let MachineFrameSlot::Value(value) = slot else {
@@ -191,9 +227,16 @@ fn lower_slot(
     let location = allocation
         .metadata()
         .iter()
-        .find(|metadata| metadata.deopt == Some(deopt) && metadata.value == value)
+        .find(|metadata| {
+            metadata.instruction == instruction
+                && metadata.frame_state == Some(frame_state)
+                && metadata.value == value
+        })
         .map(|metadata| metadata.location)
-        .ok_or(MachineDeoptError::MissingLocation(deopt, value))?;
+        .ok_or(MachineDeoptError::MissingLocation(
+            sequence.instructions()[instruction.0 as usize].exits[0].id,
+            value,
+        ))?;
     let location = match location {
         AllocatedLocation::Register(register) if register.is_integer() => {
             let register = u16::from(register.encoding());
@@ -228,7 +271,7 @@ pub fn undefined_slot() -> MachineFrameSlot {
 
 #[cfg(test)]
 mod tests {
-    use otter_vm::deopt::{DeoptExitId, DeoptLocation, DeoptRepr};
+    use otter_vm::deopt::{DeoptLocation, DeoptRepr};
 
     use super::*;
     use crate::machine::{
@@ -238,6 +281,7 @@ mod tests {
 
     fn allocated_exit(
         target: &TargetSpec,
+        frames: Box<[DeoptFrame<MachineFrameSlot>]>,
     ) -> (InstructionSequence, AllocatedSequence, MachineFrameLayout) {
         let integer = MachineValue(0);
         let float = MachineValue(1);
@@ -255,20 +299,21 @@ mod tests {
                     MachineOpcode::Return,
                     vec![
                         MachineOperand::register_input(integer),
-                        MachineOperand::deopt(integer),
-                        MachineOperand::deopt(float),
+                        MachineOperand::frame_value(integer),
+                        MachineOperand::frame_value(float),
                     ],
                 );
-                exit.deopt = Some(DeoptId(0));
+                exit.set_test_exit(DeoptId(0), 0);
                 exit.control = ControlFlow::Return;
                 exit
             },
         ];
-        let sequence = InstructionSequence::new(
+        let sequence = InstructionSequence::new_with_frame_states(
             target,
             MachineBlock(0),
             vec![MachineRepresentation::Int32, MachineRepresentation::Float64],
             Vec::new(),
+            vec![MachineFrameState { id: 0, frames }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
                 end: MachineInstructionId(3),
@@ -313,7 +358,7 @@ mod tests {
             },
         ]);
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
-            let (sequence, allocation, layout) = allocated_exit(&target);
+            let (sequence, allocation, layout) = allocated_exit(&target, frames.clone());
             let (gpr_budget, fp_budget) = target.deopt_register_budgets();
             let table = lower_deopt_table(
                 &sequence,
@@ -321,13 +366,10 @@ mod tests {
                 layout,
                 gpr_budget,
                 fp_budget,
-                &[MachineFrameState {
-                    id: DeoptId(0),
-                    frames: frames.clone(),
-                }],
+                sequence.frame_states(),
             )
             .unwrap();
-            let state = table.lookup(DeoptExitId(0)).unwrap();
+            let state = table.lookup(0).unwrap();
             assert_eq!(state.frames.len(), 2);
             let caller = state.outermost();
             let callee = state.innermost();
@@ -346,7 +388,21 @@ mod tests {
     #[test]
     fn lowers_exact_allocator_locations_and_literal_slots() {
         let target = TargetSpec::aarch64();
-        let (sequence, allocation, layout) = allocated_exit(&target);
+        let state = MachineFrameState {
+            id: 0,
+            frames: Box::new([DeoptFrame {
+                function_id: 71,
+                byte_pc: 24,
+                entry: None,
+                slots: vec![
+                    MachineFrameSlot::Value(MachineValue(0)),
+                    MachineFrameSlot::Value(MachineValue(1)),
+                    undefined_slot(),
+                ]
+                .into_boxed_slice(),
+            }]),
+        };
+        let (sequence, allocation, layout) = allocated_exit(&target, state.frames.clone());
         let (gpr_budget, fp_budget) = target.deopt_register_budgets();
         let table = lower_deopt_table(
             &sequence,
@@ -354,27 +410,11 @@ mod tests {
             layout,
             gpr_budget,
             fp_budget,
-            &[MachineFrameState {
-                id: DeoptId(0),
-                frames: Box::new([DeoptFrame {
-                    function_id: 71,
-                    byte_pc: 24,
-                    entry: None,
-                    slots: vec![
-                        MachineFrameSlot::Value(MachineValue(0)),
-                        MachineFrameSlot::Value(MachineValue(1)),
-                        undefined_slot(),
-                    ]
-                    .into_boxed_slice(),
-                }]),
-            }],
+            sequence.frame_states(),
         )
         .expect("allocator-driven deopt table");
 
-        let frame = table
-            .lookup(DeoptExitId(0))
-            .expect("dense exit")
-            .outermost();
+        let frame = table.lookup(0).expect("dense exit").outermost();
         assert_eq!(frame.function_id, 71);
         assert_eq!(frame.byte_pc, 24);
         assert_eq!(frame.slots[0].repr, DeoptRepr::Int32);

@@ -634,6 +634,10 @@ pub enum JitDebugEvent {
         target: JitDebugTarget,
         /// Logical PC at which interpreter execution resumes.
         resume_pc: u32,
+        /// Typed cause carried by the side exit.
+        exit_reason: crate::native_abi::ExitReason,
+        /// Policy requested by the side exit.
+        exit_action: crate::native_abi::ExitAction,
         /// Human-readable opcode name, when the PC resolves.
         op_debug: Option<String>,
         /// Human-readable operand rendering, when the PC resolves.
@@ -657,8 +661,10 @@ pub enum JitDebugEvent {
         callee_tier: JitDebugTier,
         /// Exact logical PC at which the callee resumes in the interpreter.
         callee_resume_pc: u32,
-        /// Consecutive generated deopts observed by this exact generation.
-        consecutive_deopts: u32,
+        /// Typed reason carried by the callee's side exit.
+        exit_reason: crate::native_abi::ExitReason,
+        /// Policy requested by the callee's side exit.
+        exit_action: crate::native_abi::ExitAction,
     },
     /// One interpreter frame was materialized from an inline deopt record.
     InlineDeoptFrame {

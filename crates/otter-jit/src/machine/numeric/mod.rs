@@ -112,12 +112,12 @@ mod semantics;
 
 use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
-    deopt::{DeoptExitDescriptor, DeoptExitId, DeoptRuntime},
+    deopt::{DeoptExitDescriptor, DeoptRuntime},
     native_abi::{
-        STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL,
-        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CONSTRUCT_VALUE,
-        STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
+        ExitAction, ExitReason, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
+        STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL,
+        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
         STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
         STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
@@ -128,6 +128,7 @@ use self::hir::{
     NumericBindingTarget, NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
     NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFrameStatePurpose,
     NumericFunction, NumericNode, NumericPackedDoubleViewCachePlan, NumericTerminator, NumericType,
+    NumericValue,
 };
 use self::semantics::CommittedValueOperation;
 #[cfg(test)]
@@ -135,9 +136,9 @@ use super::is_explicit_committed_runtime_call;
 use super::{
     CallDescriptor, CallEffects, CallTarget, ColdCallKind, ControlFlow, DeoptId,
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
-    InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineInstruction,
-    MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput, MachineOsrType,
-    MachineRepresentation, MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
+    InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineExit,
+    MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand, MachineOsrInput,
+    MachineOsrType, MachineRepresentation, MachineValue, PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
     PackedDoubleViewCacheClearReason, PhysicalRegister, SafepointId, SafepointKind,
     TargetCapability, TargetClobberSet, TargetSpec, binding_guard_clobbers, binding_hit_clobbers,
     binding_write_barrier_clobbers, lower_deopt_table, lower_safepoints,
@@ -271,17 +272,26 @@ pub(crate) fn try_compile(
         frame,
         gpr_budget,
         fp_budget,
-        &machine_frame_states(&hir),
+        sequence.frame_states(),
     )
     .map_err(|_| Unsupported::OperandShape("scalar Machine IR deopt lowering"))?;
-    let mut exits = Vec::new();
-    for (index, state) in hir
-        .frame_states
+    let exit_count = sequence
+        .instructions()
         .iter()
-        .filter(|state| frame_state_requires_deopt(&hir, state))
-        .enumerate()
-    {
-        let resume_pcs = state
+        .flat_map(|instruction| instruction.exits.iter())
+        .map(|exit| exit.id.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut exits = vec![None; exit_count];
+    for instruction in sequence.instructions() {
+        let Some(state_id) = instruction.frame_state else {
+            continue;
+        };
+        let state = sequence
+            .frame_states()
+            .get(state_id as usize)
+            .ok_or(Unsupported::OperandShape("scalar logical frame state"))?;
+        let resume_pcs: Box<[u32]> = state
             .frames
             .iter()
             .map(|frame| {
@@ -289,11 +299,25 @@ pub(crate) fn try_compile(
                     .ok_or(Unsupported::OperandShape("scalar deopt source function/PC"))
             })
             .collect::<Result<_, _>>()?;
-        exits.push(DeoptExitDescriptor {
-            state: DeoptExitId(index as u32),
-            resume_pcs,
-        });
+        for exit in &instruction.exits {
+            let descriptor = DeoptExitDescriptor {
+                state: state_id,
+                reason: exit.reason,
+                action: exit.action,
+                resume_pcs: resume_pcs.clone(),
+            };
+            let slot = exits
+                .get_mut(exit.id.0 as usize)
+                .ok_or(Unsupported::OperandShape("scalar exit identity"))?;
+            if slot.replace(descriptor).is_some() {
+                return Err(Unsupported::OperandShape("duplicate scalar exit identity"));
+            }
+        }
     }
+    let exits = exits
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(Unsupported::OperandShape("sparse scalar exit identities"))?;
     let deopt_runtime = Box::new(DeoptRuntime {
         table: deopt_table,
         exits: exits.into_boxed_slice(),
@@ -398,7 +422,7 @@ pub(crate) fn try_compile(
             tier_input,
             code_map,
             relocations,
-            Some(&deopt_runtime.table),
+            Some(&deopt_runtime),
             &safepoints,
         )
     });
@@ -514,12 +538,14 @@ fn select_with_packed_double_view_caches(
         .enumerate()
         .map(|(index, state)| (state.point, index))
         .collect::<BTreeMap<_, _>>();
-    let deopt_state_ids = hir
+    let mut next_exit_id = 0_u32;
+    let exit_specs = hir
         .frame_states
         .iter()
-        .filter(|state| frame_state_requires_deopt(hir, state))
-        .enumerate()
-        .map(|(index, state)| (state.point, DeoptId(index as u32)))
+        .filter_map(|state| {
+            let exits = frame_state_exits(hir, state, &mut next_exit_id);
+            (!exits.is_empty()).then_some((state.point, exits))
+        })
         .collect::<BTreeMap<_, _>>();
     for selected in &selection_cfg.order {
         let first = MachineInstructionId(instructions.len() as u32);
@@ -618,7 +644,7 @@ fn select_with_packed_double_view_caches(
                 edge,
                 successor,
             } => {
-                if is_exceptional_hir_edge(hir, predecessor, edge) {
+                if let Some(source) = exceptional_hir_edge_source(hir, predecessor, edge) {
                     let descriptor_index = intern_call_descriptor(
                         &mut call_descriptors,
                         caught_throw_acknowledgement_descriptor(target_spec),
@@ -628,15 +654,19 @@ fn select_with_packed_double_view_caches(
                         Vec::new(),
                     );
                     acknowledgement.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    acknowledgement.frame_state = Some(
+                        u32::try_from(frame_state_indices[&NumericFramePoint::Node(source)])
+                            .expect("bounded scalar frame-state count"),
+                    );
                     instructions.push(acknowledgement);
                 }
                 if successor <= predecessor {
                     let point = NumericFramePoint::Backedge { predecessor, edge };
                     let state_index = frame_state_indices[&point];
-                    let deopt = deopt_state_ids[&point];
+                    let exits = exit_specs[&point].clone();
                     let mut poll =
                         MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
-                    attach_frame_state(hir, &values, state_index, deopt, &mut poll);
+                    attach_frame_state(hir, &values, state_index, exits, &mut poll);
                     poll.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                     instructions.push(poll);
                 }
@@ -1287,7 +1317,6 @@ fn select_with_packed_double_view_caches(
                         .map(MachineOperand::location_input)
                         .collect::<Vec<_>>();
                     operands.push(MachineOperand::register_output(result));
-                    append_unique_tagged_roots(&mut operands, inputs);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -1374,7 +1403,6 @@ fn select_with_packed_double_view_caches(
                         .map(MachineOperand::location_input)
                         .collect::<Vec<_>>();
                     operands.push(MachineOperand::register_output(result));
-                    append_unique_tagged_roots(&mut operands, inputs);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -1467,19 +1495,11 @@ fn select_with_packed_double_view_caches(
                     let receiver = machine_value(&values, receiver);
                     match access {
                         NumericElementAccess::Tagged => {
-                            let mut operands = vec![
+                            let operands = vec![
                                 MachineOperand::location_input(receiver),
                                 MachineOperand::location_input(index),
                                 MachineOperand::register_output(result),
                             ];
-                            append_unique_tagged_roots(
-                                &mut operands,
-                                [receiver].into_iter().chain(
-                                    (representations[index.0 as usize]
-                                        == MachineRepresentation::Tagged)
-                                        .then_some(index),
-                                ),
-                            );
                             let mut load = MachineInstruction::plain(
                                 MachineOpcode::ElementLoad(byte_pc),
                                 operands,
@@ -1556,19 +1576,11 @@ fn select_with_packed_double_view_caches(
                     let receiver = machine_value(&values, receiver);
                     match access {
                         NumericElementAccess::Tagged => {
-                            let mut operands = vec![
+                            let operands = vec![
                                 MachineOperand::location_input(receiver),
                                 MachineOperand::location_input(index),
                                 MachineOperand::location_input(value),
                             ];
-                            append_unique_tagged_roots(
-                                &mut operands,
-                                [receiver, value].into_iter().chain(
-                                    (representations[index.0 as usize]
-                                        == MachineRepresentation::Tagged)
-                                        .then_some(index),
-                                ),
-                            );
                             let mut store = MachineInstruction::plain(
                                 MachineOpcode::ElementStore(byte_pc),
                                 operands,
@@ -1622,12 +1634,11 @@ fn select_with_packed_double_view_caches(
                             2,
                         ),
                     );
-                    let mut operands = vec![
+                    let operands = vec![
                         MachineOperand::register_input(receiver),
                         MachineOperand::register_input(index),
                         MachineOperand::register_output(result),
                     ];
-                    append_unique_tagged_roots(&mut operands, [receiver, index]);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -1674,12 +1685,11 @@ fn select_with_packed_double_view_caches(
                             3,
                         ),
                     );
-                    let mut operands = vec![
+                    let operands = vec![
                         MachineOperand::register_input(receiver),
                         MachineOperand::register_input(index),
                         MachineOperand::register_input(value),
                     ];
-                    append_unique_tagged_roots(&mut operands, [receiver, index, value]);
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -2277,25 +2287,17 @@ fn select_with_packed_double_view_caches(
                     .ok_or(super::VerificationError::InvalidValue(result))?;
                     let descriptor_index =
                         intern_call_descriptor(&mut call_descriptors, descriptor);
-                    let mut call_roots = BTreeSet::new();
-                    call_roots.insert(source_value);
-                    call_roots.extend(arguments.iter().copied());
                     let mut operands = Vec::with_capacity(arguments.len() + 2);
                     operands.push(MachineOperand::register_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::register_input));
                     operands.push(MachineOperand::register_output(result));
-                    // The construct receiver's tagged root must sit at
-                    // `result_index + 1`: the arm64 construct forms resolve
-                    // the receiver root positionally there and publish the
-                    // fresh allocation into that root's save slot before the
-                    // argument-spine copy re-reads every argument from its
-                    // canonical save slot. Emitting the receiver from the
-                    // sorted root set instead would alias an argument's slot
-                    // and clobber it with the receiver.
+                    // A freshly allocated construct receiver is not part of
+                    // the pre-call interpreter state. Keep that one explicit
+                    // runtime root; ordinary arguments and frame values are
+                    // derived after the complete CFG is known.
                     if let Some(receiver) = construct_receiver {
-                        operands.push(MachineOperand::tagged_root(receiver));
+                        operands.push(MachineOperand::runtime_root(receiver));
                     }
-                    operands.extend(call_roots.into_iter().map(MachineOperand::tagged_root));
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -2396,7 +2398,7 @@ fn select_with_packed_double_view_caches(
                         hir,
                         &values,
                         state_index,
-                        deopt_state_ids[&frame_point],
+                        exit_specs[&frame_point].clone(),
                         &mut instruction,
                     ),
                     None => {
@@ -2419,7 +2421,6 @@ fn select_with_packed_double_view_caches(
                     &mut instruction,
                 );
             }
-            attach_safepoint_roots(&representations, &mut instruction);
             instructions.push(instruction);
         }
 
@@ -2529,6 +2530,7 @@ fn select_with_packed_double_view_caches(
         selection_cfg.originals[0],
         representations,
         call_descriptors,
+        machine_frame_states(hir),
         blocks,
         instructions,
         u8::try_from(packed_double_view_caches.caches.len())
@@ -2665,7 +2667,6 @@ fn select_binding_cold_block(
         .collect::<Vec<_>>();
     operands.push(MachineOperand::register_output(values.cold_payload));
     operands.push(MachineOperand::register_output(values.status));
-    append_unique_tagged_roots(&mut operands, inputs);
     let mut call =
         MachineInstruction::plain(MachineOpcode::Call(descriptor_index as u32), operands);
     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
@@ -2683,7 +2684,6 @@ fn select_binding_cold_block(
         &mut call,
     );
     attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
-    attach_safepoint_roots(representations, &mut call);
     instructions.push(call);
     let mut branch = MachineInstruction::plain(
         MachineOpcode::BranchNativeStatus,
@@ -3188,59 +3188,6 @@ fn class_super_constructor_descriptor(target_spec: &TargetSpec) -> CallDescripto
     }
 }
 
-fn append_unique_tagged_roots(
-    operands: &mut Vec<MachineOperand>,
-    values: impl IntoIterator<Item = MachineValue>,
-) {
-    let mut roots = operands
-        .iter()
-        .filter(|operand| operand.purpose == super::OperandPurpose::TaggedRoot)
-        .map(|operand| operand.value)
-        .collect::<BTreeSet<_>>();
-    for value in values {
-        if roots.insert(value) {
-            operands.push(MachineOperand::tagged_root(value));
-        }
-    }
-}
-
-fn attach_safepoint_roots(
-    representations: &[MachineRepresentation],
-    instruction: &mut MachineInstruction,
-) {
-    if instruction.safepoint.is_none() {
-        return;
-    }
-    let mut roots = instruction
-        .operands
-        .iter()
-        .filter(|operand| operand.purpose == super::OperandPurpose::TaggedRoot)
-        .map(|operand| operand.value)
-        .collect::<BTreeSet<_>>();
-    let deopt_roots = instruction
-        .operands
-        .iter()
-        .filter(|operand| operand.purpose == super::OperandPurpose::Deopt)
-        .filter(|operand| {
-            representations[operand.value.0 as usize] == MachineRepresentation::Tagged
-        })
-        .map(|operand| operand.value)
-        .collect::<BTreeSet<_>>();
-    roots.extend(deopt_roots);
-    let existing = instruction
-        .operands
-        .iter()
-        .filter(|operand| operand.purpose == super::OperandPurpose::TaggedRoot)
-        .map(|operand| operand.value)
-        .collect::<BTreeSet<_>>();
-    instruction.operands.extend(
-        roots
-            .difference(&existing)
-            .copied()
-            .map(MachineOperand::tagged_root),
-    );
-}
-
 fn leaf_boolean_call_descriptor(
     target_spec: &TargetSpec,
     target: otter_vm::native_abi::RuntimeStubDescriptor,
@@ -3291,7 +3238,7 @@ fn attach_frame_state(
     hir: &NumericFunction,
     values: &[MachineValue],
     state_index: usize,
-    deopt: DeoptId,
+    exits: Box<[MachineExit]>,
     instruction: &mut MachineInstruction,
 ) {
     let state = &hir.frame_states[state_index];
@@ -3303,10 +3250,11 @@ fn attach_frame_state(
         if values_at_exit.insert(*value) {
             instruction
                 .operands
-                .push(MachineOperand::deopt(machine_value(values, *value)));
+                .push(MachineOperand::frame_value(machine_value(values, *value)));
         }
     }
-    instruction.deopt = Some(deopt);
+    instruction.frame_state = Some(state_index as u32);
+    instruction.exits = exits;
 }
 
 fn attach_frame_state_tagged_roots(
@@ -3315,27 +3263,71 @@ fn attach_frame_state_tagged_roots(
     state_index: usize,
     instruction: &mut MachineInstruction,
 ) {
-    let state = &hir.frame_states[state_index];
-    append_unique_tagged_roots(
-        &mut instruction.operands,
-        state.frame_slots().filter_map(|slot| {
-            let hir::NumericFrameSlot::Value(value) = *slot else {
-                return None;
-            };
-            (hir.nodes[value.0].value_type() == NumericType::Tagged)
-                .then_some(machine_value(values, value))
-        }),
-    );
+    let _ = (hir, values);
+    instruction.frame_state = Some(state_index as u32);
 }
 
-fn frame_state_requires_deopt(hir: &NumericFunction, state: &hir::NumericFrameState) -> bool {
-    match state.point {
-        NumericFramePoint::Backedge { .. } => true,
-        NumericFramePoint::Node(node) => matches!(
-            hir.nodes[node.0].frame_state_purpose(),
-            Some(NumericFrameStatePurpose::ExactDeopt | NumericFrameStatePurpose::RuntimeMetadata)
-        ),
-    }
+fn frame_state_exits(
+    hir: &NumericFunction,
+    state: &hir::NumericFrameState,
+    next_exit_id: &mut u32,
+) -> Box<[MachineExit]> {
+    let specs: &[(ExitReason, ExitAction)] = match state.point {
+        NumericFramePoint::Backedge { .. } => &[(ExitReason::Interrupt, ExitAction::Resume)],
+        NumericFramePoint::Node(node) => match hir.nodes[node.0] {
+            NumericNode::IntegerMul(..) | NumericNode::IntegerNeg(..) => &[
+                (ExitReason::Int32Overflow, ExitAction::Recompile),
+                (ExitReason::NegativeZero, ExitAction::Recompile),
+            ],
+            NumericNode::IntegerAdd(..)
+            | NumericNode::IntegerSub(..)
+            | NumericNode::IntegerAddImmediate(..)
+            | NumericNode::IntegerSubImmediate(..) => {
+                &[(ExitReason::Int32Overflow, ExitAction::Recompile)]
+            }
+            NumericNode::CheckedFloat64ToElementIndex { .. } => {
+                &[(ExitReason::InvalidElementIndex, ExitAction::Recompile)]
+            }
+            NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. } => {
+                &[(ExitReason::BoundsGuard, ExitAction::Recompile)]
+            }
+            NumericNode::InlineConstructGuard { .. }
+            | NumericNode::InlineCallGuard { .. }
+            | NumericNode::InlineMethodGuard { .. }
+            | NumericNode::DirectCall { .. }
+            | NumericNode::ColdCallExit { .. }
+            | NumericNode::NativeLeaf { .. } => {
+                &[(ExitReason::IdentityGuard, ExitAction::Recompile)]
+            }
+            NumericNode::ConstructReceiver { .. } | NumericNode::ArrayConstruct { .. } => {
+                &[(ExitReason::AllocationMiss, ExitAction::Resume)]
+            }
+            NumericNode::ConstructorFieldStore { .. } => {
+                &[(ExitReason::ShapeGuard, ExitAction::Recompile)]
+            }
+            NumericNode::GenericElementLoad { .. } | NumericNode::GenericElementStore { .. } => {
+                &[(ExitReason::RuntimeTransition, ExitAction::Resume)]
+            }
+            NumericNode::TaggedToNumber(..)
+            | NumericNode::TaggedToInt32(..)
+            | NumericNode::ClassSuperConstructor(..)
+            | NumericNode::TaggedToBoolean(..)
+            | NumericNode::TaggedStrictEqual(..)
+            | NumericNode::TaggedNullishEqual { .. }
+            | NumericNode::TaggedStringConcat(..) => {
+                &[(ExitReason::TypeMismatch, ExitAction::Recompile)]
+            }
+            _ => &[],
+        },
+    };
+    specs
+        .iter()
+        .map(|&(reason, action)| {
+            let id = DeoptId(*next_exit_id);
+            *next_exit_id = next_exit_id.saturating_add(1);
+            MachineExit { id, reason, action }
+        })
+        .collect()
 }
 
 fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> {
@@ -3349,10 +3341,9 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
     }
     hir.frame_states
         .iter()
-        .filter(|state| frame_state_requires_deopt(hir, state))
         .enumerate()
         .map(|(index, state)| super::MachineFrameState {
-            id: DeoptId(index as u32),
+            id: index as u32,
             frames: state
                 .frames
                 .iter()
@@ -3553,7 +3544,15 @@ fn binding_site(
 }
 
 fn is_exceptional_hir_edge(hir: &NumericFunction, predecessor: usize, edge: usize) -> bool {
-    hir.blocks[predecessor].nodes.iter().any(|value| {
+    exceptional_hir_edge_source(hir, predecessor, edge).is_some()
+}
+
+fn exceptional_hir_edge_source(
+    hir: &NumericFunction,
+    predecessor: usize,
+    edge: usize,
+) -> Option<NumericValue> {
+    hir.blocks[predecessor].nodes.iter().copied().find(|value| {
         let exceptional_edge = match hir.nodes[value.0] {
             NumericNode::PropertyLoad {
                 exceptional_edge, ..
@@ -3817,7 +3816,7 @@ mod tests {
             &machine_frame_states(&hir),
         )
         .unwrap();
-        let frames = &table.entries()[0].frames;
+        let frames = &table.entries().next().unwrap().frames;
         assert_eq!(frames.len(), 2);
         let entry = frames[1].entry.as_ref().unwrap();
         assert_eq!(entry.this, frames[0].slots[0]);
@@ -3830,12 +3829,8 @@ mod tests {
             0,
             &mut root_carrier,
         );
-        assert!(
-            root_carrier
-                .operands
-                .contains(&MachineOperand::tagged_root(MachineValue(1))),
-            "the closure is live only through the nested activation entry"
-        );
+        assert_eq!(root_carrier.frame_state, Some(0));
+        assert!(root_carrier.operands.is_empty());
     }
 
     use otter_bytecode::opcode_schema::{
@@ -4244,7 +4239,7 @@ mod tests {
                 .enumerate()
                 .find(|(_, instruction)| matches!(instruction.opcode, MachineOpcode::Call(_)))
                 .expect("literal call");
-            assert!(call.deopt.is_none());
+            assert!(call.exits.is_empty());
             assert_eq!(
                 call.operands
                     .iter()
@@ -7300,7 +7295,7 @@ mod tests {
             assert!(candidate.guard.is_some());
         }
         assert_eq!(call.safepoint, Some(SafepointId(0)));
-        assert_eq!(call.deopt, Some(DeoptId(0)));
+        assert_eq!(call.deopt_id(), Some(DeoptId(0)));
         assert_eq!(
             call.operands
                 .iter()
@@ -7444,7 +7439,7 @@ mod tests {
             "the two ABI padding values must remain separate SSA definitions"
         );
         assert_eq!(call.safepoint, Some(SafepointId(0)));
-        assert!(call.deopt.is_some());
+        assert!(call.deopt_id().is_some());
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::BoxInt32
                 && instruction.operands[1].value == call.operands[0].value
@@ -7497,7 +7492,7 @@ mod tests {
                         .map(|probe| (index, probe))
                 })
                 .expect("generated binding probe");
-            assert!(probe.safepoint.is_none() && probe.deopt.is_none());
+            assert!(probe.safepoint.is_none() && probe.exits.is_empty());
             let cold = sequence.blocks()[probe_block].successors[1].0 as usize;
             assert_eq!(
                 super::super::derived_this::cold_byte_pc(&sequence, cold),
@@ -7607,7 +7602,7 @@ mod tests {
                         if sequence.call_descriptors()[index as usize] == *descriptor)
                 })
                 .expect("committed call");
-            assert_eq!(call.deopt, None);
+            assert_eq!(call.deopt_id(), None);
             assert_eq!(call.safepoint, Some(SafepointId(0)));
             let roots = call
                 .operands
@@ -7655,7 +7650,7 @@ mod tests {
         assert!(descriptor.clobbers.is_empty());
         assert!(call.clobbers.is_empty());
         assert_eq!(call.safepoint, None);
-        assert_eq!(call.deopt, Some(DeoptId(0)));
+        assert_eq!(call.deopt_id(), Some(DeoptId(0)));
         assert!(call.operands.iter().all(|operand| {
             !matches!(
                 operand.purpose,
@@ -7763,7 +7758,7 @@ mod tests {
             .expect("cold call");
 
         let mut missing_deopt = valid.clone();
-        missing_deopt.instructions[call_id].deopt = None;
+        missing_deopt.instructions[call_id].exits = Box::default();
         assert_eq!(
             missing_deopt.verify(&TargetSpec::aarch64()),
             Err(crate::machine::VerificationError::InvalidCallTarget(
@@ -7797,7 +7792,7 @@ mod tests {
         assert!(
             guards
                 .iter()
-                .all(|guard| guard.deopt.is_none() && guard.safepoint.is_none())
+                .all(|guard| guard.exits.is_empty() && guard.safepoint.is_none())
         );
         assert!(guards.iter().any(|guard| matches!(
             guard.opcode,
@@ -7870,7 +7865,7 @@ mod tests {
         assert_eq!(committed_calls.len(), 2);
         for (call, descriptor) in committed_calls {
             assert!(call.safepoint.is_some());
-            assert_eq!(call.deopt, None);
+            assert_eq!(call.deopt_id(), None);
             assert_eq!(
                 descriptor.results,
                 [
@@ -7910,7 +7905,7 @@ mod tests {
         assert!(
             write_hits
                 .iter()
-                .all(|instruction| instruction.deopt.is_none() && instruction.safepoint.is_none())
+                .all(|instruction| instruction.exits.is_empty() && instruction.safepoint.is_none())
         );
         assert_eq!(
             sequence
@@ -7958,7 +7953,7 @@ mod tests {
         let frame = arm64::frame_layout(&allocation, safepoints.root_slot_count())
             .expect("binding-to-deopt frame");
         let states = machine_frame_states(&hir);
-        assert!(states.len() < hir.frame_states.len());
+        assert_eq!(states.len(), hir.frame_states.len());
         lower_deopt_table(
             &sequence,
             &allocation,
@@ -8027,7 +8022,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(calls.len(), 1, "{:?}", schema.op);
             assert!(calls[0].safepoint.is_some(), "{:?}", schema.op);
-            assert_eq!(calls[0].deopt, None, "{:?}", schema.op);
+            assert_eq!(calls[0].deopt_id(), None, "{:?}", schema.op);
             assert_eq!(
                 sequence
                     .instructions()
@@ -8133,7 +8128,7 @@ mod tests {
             load.clobbers,
             string_constant_cell_load_clobbers(&TargetSpec::aarch64())
         );
-        assert_eq!(load.deopt, None);
+        assert_eq!(load.deopt_id(), None);
         assert_eq!(load.safepoint, None);
         assert_eq!(sequence.representations()[0], MachineRepresentation::Tagged);
         assert!(sequence.normalized().contains("StringConstantCellLoad"));
@@ -8264,7 +8259,7 @@ mod tests {
                 [
                     MachineOperand::register_input(MachineValue(0)),
                     MachineOperand::register_output(MachineValue(1)),
-                    MachineOperand::deopt(MachineValue(0)),
+                    MachineOperand::frame_value(MachineValue(0)),
                 ]
             );
             assert_eq!(
@@ -8279,7 +8274,7 @@ mod tests {
                 compare.clobbers,
                 TargetSpec::aarch64().clobbers(TargetClobberSet::StatusScratch)
             );
-            assert_eq!(compare.deopt, Some(DeoptId(0)));
+            assert_eq!(compare.deopt_id(), Some(DeoptId(0)));
             assert_eq!(compare.safepoint, None);
             assert!(sequence.instructions().iter().any(|instruction| {
                 instruction.opcode == MachineOpcode::BoxBoolean
@@ -8338,7 +8333,7 @@ mod tests {
         let mut output_in_preop_state = valid.clone();
         output_in_preop_state.instructions[compare_id]
             .operands
-            .push(MachineOperand::deopt(MachineValue(1)));
+            .push(MachineOperand::frame_value(MachineValue(1)));
         assert_eq!(
             output_in_preop_state.verify(&TargetSpec::aarch64()),
             expected
@@ -8347,11 +8342,11 @@ mod tests {
         let mut duplicate_deopt = valid.clone();
         duplicate_deopt.instructions[compare_id]
             .operands
-            .push(MachineOperand::deopt(MachineValue(0)));
+            .push(MachineOperand::frame_value(MachineValue(0)));
         assert_eq!(duplicate_deopt.verify(&TargetSpec::aarch64()), expected);
 
         let mut missing_deopt = valid.clone();
-        missing_deopt.instructions[compare_id].deopt = None;
+        missing_deopt.instructions[compare_id].exits = Box::default();
         assert_eq!(missing_deopt.verify(&TargetSpec::aarch64()), expected);
 
         let mut spurious_safepoint = valid.clone();
@@ -8395,7 +8390,7 @@ mod tests {
             load.clobbers,
             property_load_clobbers(&TargetSpec::aarch64())
         );
-        assert!(load.deopt.is_none());
+        assert!(load.exits.is_empty());
         assert!(load.safepoint.is_none());
         assert_eq!(load.operands.len(), 4);
         let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
@@ -8403,7 +8398,7 @@ mod tests {
             _ => false,
         }).expect("explicit named-load cold call");
         assert!(cold.safepoint.is_some());
-        assert!(cold.deopt.is_none());
+        assert!(cold.exits.is_empty());
         assert_eq!(
             cold.operands[0],
             MachineOperand::location_input(load_receiver)
@@ -8453,14 +8448,14 @@ mod tests {
             store.clobbers,
             property_store_clobbers(&TargetSpec::aarch64(), true)
         );
-        assert!(store.deopt.is_none() && store.safepoint.is_none());
+        assert!(store.exits.is_empty() && store.safepoint.is_none());
         assert_eq!(store.operands.len(), 4);
         let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
             MachineOpcode::Call(index) => matches!(sequence.call_descriptors()[index as usize].target,
                 CallTarget::CommittedRuntime { target, .. } if target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
             _ => false,
         }).expect("explicit named-store cold call");
-        assert!(cold.safepoint.is_some() && cold.deopt.is_none());
+        assert!(cold.safepoint.is_some() && cold.exits.is_empty());
         assert!(
             cold.operands
                 .contains(&MachineOperand::tagged_root(store_receiver))
@@ -8699,12 +8694,12 @@ mod tests {
             &machine_frame_states(&hir),
         )
         .unwrap();
-        assert!(table.lookup(DeoptExitId(0)).is_none());
+        assert!(table.lookup(0).is_none());
         assert!(
             sequence
                 .instructions()
                 .iter()
-                .all(|instruction| instruction.deopt.is_none())
+                .all(|instruction| instruction.exits.is_empty())
         );
     }
 
@@ -8727,7 +8722,7 @@ mod tests {
         );
         assert_eq!(load.clobbers, element_clobbers(&TargetSpec::aarch64()));
         assert_eq!(load.safepoint, Some(SafepointId(0)));
-        assert_eq!(load.deopt, Some(DeoptId(0)));
+        assert_eq!(load.deopt_id(), Some(DeoptId(0)));
         let load_roots = load
             .operands
             .iter()
@@ -8748,7 +8743,7 @@ mod tests {
                 MachineOperand::register_output(MachineValue(3)),
             ]
         );
-        assert_eq!(number_decode.deopt, Some(DeoptId(1)));
+        assert_eq!(number_decode.deopt_id(), Some(DeoptId(1)));
 
         let int32_decode = sequence
             .instructions()
@@ -8762,7 +8757,7 @@ mod tests {
                 MachineOperand::register_reuse_output(MachineValue(4), 0),
             ]
         );
-        assert_eq!(int32_decode.deopt, Some(DeoptId(2)));
+        assert_eq!(int32_decode.deopt_id(), Some(DeoptId(2)));
 
         let store = sequence
             .instructions()
@@ -8784,7 +8779,7 @@ mod tests {
         );
         assert_eq!(store.clobbers, element_clobbers(&TargetSpec::aarch64()));
         assert_eq!(store.safepoint, Some(SafepointId(1)));
-        assert_eq!(store.deopt, Some(DeoptId(3)));
+        assert_eq!(store.deopt_id(), Some(DeoptId(3)));
         let store_roots = store
             .operands
             .iter()
@@ -8848,7 +8843,7 @@ mod tests {
         assert_eq!(load.operands[1].constraint, OperandConstraint::Register);
         assert_eq!(load.operands[2].constraint, OperandConstraint::Register);
         assert!(load.safepoint.is_some());
-        assert!(load.deopt.is_some());
+        assert!(load.deopt_id().is_some());
 
         let (store, store_descriptor) = calls[1];
         assert_eq!(
@@ -8859,7 +8854,7 @@ mod tests {
         assert_eq!(store_descriptor.safepoint, SafepointKind::Gc);
         assert_eq!(store_descriptor.exceptional, ExceptionalEdge::Propagate);
         assert!(store.safepoint.is_some());
-        assert!(store.deopt.is_some());
+        assert!(store.deopt_id().is_some());
         for (instruction, argument_count) in [(load, 2_usize), (store, 3_usize)] {
             let roots = instruction
                 .operands
@@ -9053,7 +9048,7 @@ mod tests {
                 conversion.clobbers,
                 TargetSpec::aarch64().clobbers(TargetClobberSet::FloatElementIndex)
             );
-            assert!(conversion.deopt.is_some());
+            assert!(conversion.deopt_id().is_some());
         }
 
         let load = sequence
@@ -9155,7 +9150,7 @@ mod tests {
         conversion_without_semantic_input.instructions[conversion_id]
             .operands
             .retain(|operand| {
-                !(operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(1))
+                !(operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(1))
             });
         assert_eq!(
             conversion_without_semantic_input.verify(&TargetSpec::aarch64()),
@@ -9181,7 +9176,7 @@ mod tests {
         load_without_semantic_index.instructions[load_id]
             .operands
             .retain(|operand| {
-                !(operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(1))
+                !(operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(1))
             });
         assert_eq!(
             load_without_semantic_index.verify(&TargetSpec::aarch64()),
@@ -9207,7 +9202,7 @@ mod tests {
         store_without_semantic_value.instructions[store_id]
             .operands
             .retain(|operand| {
-                !(operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(3))
+                !(operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(3))
             });
         assert_eq!(
             store_without_semantic_value.verify(&TargetSpec::aarch64()),
@@ -9246,7 +9241,7 @@ mod tests {
                 MachineRepresentation::Tagged
             );
             assert!(instruction.operands.iter().any(|operand| {
-                operand.purpose == OperandPurpose::Deopt && operand.value == MachineValue(1)
+                operand.purpose == OperandPurpose::FrameState && operand.value == MachineValue(1)
             }));
         }
         assert!(sequence.instructions().iter().all(|instruction| {
@@ -9315,7 +9310,7 @@ mod tests {
             &machine_frame_states(&hir),
         )
         .expect("Number-index element deopt table");
-        for exit in [DeoptExitId(0), DeoptExitId(3)] {
+        for exit in [0, 3] {
             assert_eq!(
                 table
                     .lookup(exit)
@@ -9479,7 +9474,7 @@ mod tests {
             )
             .expect("element Boolean deopt table");
             let slot = table
-                .lookup(DeoptExitId(3))
+                .lookup(3)
                 .expect("element-store exit")
                 .outermost()
                 .slots[2];
@@ -9811,11 +9806,11 @@ mod tests {
             call.operands[2].constraint,
             OperandConstraint::Fixed(target.integer_result())
         );
-        assert!(call.deopt.is_some());
+        assert!(call.deopt_id().is_some());
         assert_eq!(
             call.operands
                 .iter()
-                .filter(|operand| operand.purpose == OperandPurpose::Deopt)
+                .filter(|operand| operand.purpose == OperandPurpose::FrameState)
                 .count(),
             3
         );
@@ -9958,7 +9953,7 @@ mod tests {
         for (operand, register) in call.operands[..3].iter().zip(expected_registers) {
             assert_eq!(operand.constraint, OperandConstraint::Fixed(register));
         }
-        assert!(call.deopt.is_some());
+        assert!(call.deopt_id().is_some());
         let allocation = sequence
             .allocate(&target)
             .expect("tagged strict equality allocation");
@@ -10087,7 +10082,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].1.safepoint, Some(SafepointId(0)));
         assert_eq!(calls[1].1.safepoint, Some(SafepointId(1)));
-        assert!(calls.iter().all(|(_, call)| call.deopt.is_some()));
+        assert!(calls.iter().all(|(_, call)| call.deopt_id().is_some()));
         assert!(calls.iter().all(|(_, call)| {
             call.operands
                 .iter()
@@ -10114,8 +10109,24 @@ mod tests {
         let code = compile_output(&view, None).code;
         assert!(!code.metadata().parameter_prefix_entry);
         assert_eq!(JitFunctionCode::safepoint_count(&code), 2);
-        assert_eq!(code.deopt_table().entries()[0].outermost().byte_pc, 0);
-        assert_eq!(code.deopt_table().entries()[1].outermost().byte_pc, 8);
+        assert_eq!(
+            code.deopt_table()
+                .entries()
+                .next()
+                .unwrap()
+                .outermost()
+                .byte_pc,
+            0
+        );
+        assert_eq!(
+            code.deopt_table()
+                .entries()
+                .nth(1)
+                .unwrap()
+                .outermost()
+                .byte_pc,
+            8
+        );
     }
 
     #[test]
@@ -10434,7 +10445,7 @@ mod tests {
         let hir = NumericFunction::build(&view).expect("mixed numeric loop HIR");
         let sequence = select(&hir).expect("mixed numeric loop Machine IR");
         assert!(sequence.instructions().iter().any(|instruction| {
-            instruction.opcode == MachineOpcode::Int32ToFloat64 && instruction.deopt.is_none()
+            instruction.opcode == MachineOpcode::Int32ToFloat64 && instruction.exits.is_empty()
         }));
     }
 
@@ -10549,14 +10560,14 @@ mod tests {
         assert_eq!(instructions[0].opcode, MachineOpcode::BackedgePoll);
         assert_eq!(instructions[1].opcode, MachineOpcode::BoxInt32);
         assert_eq!(instructions[2].opcode, MachineOpcode::Jump);
-        assert_eq!(instructions[0].deopt, Some(DeoptId(0)));
+        assert_eq!(instructions[0].deopt_id(), Some(DeoptId(0)));
         assert_eq!(
             instructions[0]
                 .operands
                 .iter()
                 .map(|operand| (operand.value, operand.purpose))
                 .collect::<Vec<_>>(),
-            [(MachineValue(2), OperandPurpose::Deopt)]
+            [(MachineValue(2), OperandPurpose::FrameState)]
         );
         assert_eq!(instructions[1].operands[0].value, MachineValue(2));
         let converted = instructions[1].operands[1].value;
@@ -10817,7 +10828,7 @@ mod tests {
             .iter()
             .find(|instruction| instruction.opcode == MachineOpcode::BackedgePoll)
             .expect("backedge poll instruction");
-        assert_eq!(poll.deopt, Some(DeoptId(2)));
+        assert_eq!(poll.deopt_id(), Some(DeoptId(2)));
         assert_eq!(poll.operands.len(), 2);
         assert!(sequence.blocks().iter().any(|block| {
             block.parameters.len() >= 2
@@ -10832,7 +10843,7 @@ mod tests {
             allocation
                 .metadata()
                 .iter()
-                .filter(|metadata| metadata.deopt == Some(DeoptId(2)))
+                .filter(|metadata| metadata.frame_state == Some(2))
                 .all(|metadata| match metadata.location {
                     AllocatedLocation::Stack(_) => true,
                     AllocatedLocation::Register(register) => {
@@ -10842,7 +10853,7 @@ mod tests {
             "poll operands must survive the leaf call outside caller-saved registers"
         );
         assert!(allocation.metadata().iter().any(|metadata| {
-            metadata.deopt == Some(DeoptId(2))
+            metadata.frame_state == Some(2)
                 && matches!(metadata.location, AllocatedLocation::Register(register)
                     if register.is_integer() && (20..=28).contains(&register.encoding()))
         }));
@@ -10857,12 +10868,38 @@ mod tests {
         )
         .expect("branch-phi allocator-driven FrameState");
         assert_eq!(deopt_table.len(), 3);
-        assert_eq!(deopt_table.entries()[0].outermost().slots.len(), 12);
-        assert_eq!(deopt_table.entries()[1].outermost().slots.len(), 12);
-        assert_eq!(deopt_table.entries()[2].outermost().slots.len(), 12);
+        assert_eq!(
+            deopt_table
+                .entries()
+                .next()
+                .unwrap()
+                .outermost()
+                .slots
+                .len(),
+            12
+        );
+        assert_eq!(
+            deopt_table
+                .entries()
+                .nth(1)
+                .unwrap()
+                .outermost()
+                .slots
+                .len(),
+            12
+        );
+        assert_eq!(
+            deopt_table
+                .entries()
+                .nth(2)
+                .unwrap()
+                .outermost()
+                .slots
+                .len(),
+            12
+        );
         let live_slot_counts = deopt_table
             .entries()
-            .iter()
             .map(|state| {
                 state
                     .outermost()
@@ -11372,7 +11409,7 @@ mod tests {
             .allocate(&TargetSpec::aarch64())
             .expect("typed leaf overflow allocation");
         assert!(allocation.metadata().iter().any(|metadata| {
-            metadata.deopt.is_some()
+            metadata.frame_state.is_some()
                 && matches!(metadata.location, AllocatedLocation::Register(register)
                     if (register.is_integer() && (20..=28).contains(&register.encoding()))
                         || (register.is_float() && (8..=15).contains(&register.encoding())))

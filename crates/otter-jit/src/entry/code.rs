@@ -172,13 +172,15 @@ pub(crate) unsafe fn enter_compiled(
             Some(NativeResultStatus::Success) if error.is_none() => {
                 JitExecOutcome::Returned(ret.payload_value())
             }
-            Some(NativeResultStatus::SideExit) if error.is_none() => match ret.logical_pc() {
-                Some(pc) if pc == native_frame.header.pc => {
-                    debug_assert_eq!(pc, native_frame.header.pc);
-                    JitExecOutcome::Bailed(pc)
+            Some(NativeResultStatus::SideExit) if error.is_none() => {
+                match ret.side_exit_payload() {
+                    Some(exit) if exit.logical_pc() == native_frame.header.pc => {
+                        debug_assert_eq!(exit.logical_pc(), native_frame.header.pc);
+                        JitExecOutcome::Bailed(exit)
+                    }
+                    Some(_) | None => JitExecOutcome::Fatal(VmError::InvalidOperand),
                 }
-                Some(_) | None => JitExecOutcome::Fatal(VmError::InvalidOperand),
-            },
+            }
             Some(NativeResultStatus::Throw) if error.is_none() => {
                 JitExecOutcome::Throw(ret.payload_value())
             }

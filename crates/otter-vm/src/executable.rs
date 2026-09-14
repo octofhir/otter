@@ -447,7 +447,7 @@ impl CodeBlock {
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
             property_prototype_loads: rustc_hash::FxHashMap::default(),
-            optimized_bail_pcs: std::collections::BTreeSet::new(),
+            optimized_exit_reasons: std::collections::BTreeMap::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

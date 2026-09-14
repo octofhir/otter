@@ -162,14 +162,16 @@ pub fn lower_safepoints(
             .filter(|metadata| metadata.instruction == instruction_id)
         {
             match metadata.purpose {
-                OperandPurpose::TaggedRoot => {}
+                OperandPurpose::TaggedRoot | OperandPurpose::RuntimeRoot => {}
                 OperandPurpose::CellRoot => {
                     return Err(MachineSafepointError::UnsupportedRoot(
                         instruction_id,
                         metadata.value,
                     ));
                 }
-                OperandPurpose::Deopt | OperandPurpose::Input | OperandPurpose::Output => continue,
+                OperandPurpose::FrameState | OperandPurpose::Input | OperandPurpose::Output => {
+                    continue;
+                }
             }
             if metadata.safepoint != Some(id) {
                 return Err(MachineSafepointError::RootSafepointMismatch(
@@ -194,7 +196,7 @@ pub fn lower_safepoints(
         let site_root_count = u16::try_from(roots.len())
             .map_err(|_| MachineSafepointError::RootSlotOverflow(instruction_id))?;
         root_slot_count = root_slot_count.max(site_root_count);
-        let frame_state = instruction.deopt.map_or(NO_FRAME_STATE, |deopt| deopt.0);
+        let frame_state = instruction.frame_state.unwrap_or(NO_FRAME_STATE);
         records.push(SafepointRecord {
             inline_frames: Box::default(),
             inline_frames_published: false,

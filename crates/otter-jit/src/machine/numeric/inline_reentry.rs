@@ -1,7 +1,7 @@
 //! Inline activation recipes from cold SSA inputs to code-owned safepoint homes.
 //!
 //! # Contents
-//! - Cold-only boxing and explicit tagged-root operands before allocation.
+//! - Cold-only boxing and logical inline-frame recipes before allocation.
 //! - Post-allocation safepoint recipes using the shared VM frame schema.
 //!
 //! # Invariants
@@ -53,7 +53,7 @@ pub(super) fn select_frames(
             },
         })
         .collect();
-    append_unique_tagged_roots(&mut call.operands, boxed.into_values());
+    drop(boxed);
 }
 
 pub(super) fn prepare_safepoints(

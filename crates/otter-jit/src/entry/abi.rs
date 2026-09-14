@@ -289,8 +289,6 @@ pub(crate) const CODE_ENTRY_GENERATED_DEOPTS_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_deopts) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_THROWS_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_throws) as u32;
-pub(crate) const CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET: u32 =
-    std::mem::offset_of!(CodeEntryCell, generated_bail_streak) as u32;
 pub(crate) const CODE_ENTRY_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, code_object_id) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET: u32 =

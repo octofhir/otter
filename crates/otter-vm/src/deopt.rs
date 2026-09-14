@@ -1,10 +1,9 @@
 //! Exact-PC deopt frame-state and safepoint stack-map ABI.
 //!
-//! This module defines the two records that let a moving collector and an
-//! optimizing tier coexist. The optimizing tier *populates* them when it
-//! compiles a function; this module only fixes their shape and the
-//! reconstitution rules, so the contract is final before any code bakes
-//! against it.
+//! This module defines the logical frame states, typed physical exits, and
+//! concrete stack maps that let a moving collector and an optimizing tier
+//! coexist. The optimizing tier populates them when it compiles a function;
+//! this module fixes their VM-owned shape and reconstitution rules.
 //!
 //! # Contents
 //! - [`FrameState`], [`DeoptSlot`], and [`DeoptTable`] — exact-PC frame
@@ -13,8 +12,8 @@
 //! - [`StackMap`], [`Safepoint`], and [`SafepointTable`] — compiled-frame GC
 //!   root metadata.
 //!
-//! 1. **Frame-state table** ([`DeoptTable`]) — densely indexed by generated
-//!    exit identity. For each exit it records an outermost-first chain of
+//! 1. **Frame-state table** ([`DeoptTable`]) — indexed by logical
+//!    [`FrameStateId`]. For each reconstructable state it records an outermost-first chain of
 //!    interpreter frames, each at its exact byte-PC, and for every virtual
 //!    register says where the value lives ([`DeoptLocation`]) and how to turn
 //!    its raw bits back into a full tagged [`Value`] ([`DeoptRepr`]).
@@ -35,9 +34,10 @@
 //!
 //! # Invariants
 //!
-//! - A [`DeoptTable`] is dense in [`DeoptExitId`] order. A
-//!   [`SafepointTable`] is sorted by byte-PC and uses exact-match lookup. An
-//!   out-of-range exit or an absent safepoint returns `None`.
+//! - A [`DeoptTable`] retains the dense logical [`FrameStateId`] namespace;
+//!   entries used only for GC may have no reconstruction recipe. Physical
+//!   [`DeoptExitDescriptor`] records separately name that state plus a typed
+//!   reason and action. An absent state or safepoint returns `None`.
 //! - A [`FrameState`] carries one [`DeoptSlot`] per interpreter virtual
 //!   register the frame defines, in register-index order, matching the windowed
 //!   register numbering the frame ABI fixes. Its frames are ordered outermost
@@ -51,6 +51,7 @@
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
 use crate::Value;
+use crate::native_abi::{ExitAction, ExitReason, FrameStateId};
 
 /// Declared bounds used to verify one compiled function's deopt metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,54 +386,70 @@ impl DeoptFrame {
     }
 }
 
-/// Dense identity of one deopt exit in one compiled function.
+/// Dense identity of one physical exit site in one compiled function.
 ///
-/// An exit is the unit of deoptimization, so it is what the table is keyed by.
-/// An interpreter PC cannot key it: a body may guard the same instruction more
-/// than once, and once callee bodies are inlined every exit inside a callee
-/// projects onto its caller's one call instruction.
+/// Several physical exits may share a logical [`FrameStateId`] while retaining
+/// distinct reasons and actions. An interpreter PC cannot identify the site: a
+/// body may guard the same instruction more than once, and inlined callee exits
+/// can project onto one caller instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeoptExitId(pub u32);
 
-/// Per-compiled-function deopt table, indexed by [`DeoptExitId`].
+/// Per-compiled-function deopt table, indexed by logical [`FrameStateId`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeoptTable {
-    entries: Vec<FrameState>,
+    entries: Vec<Option<FrameState>>,
 }
 
 impl DeoptTable {
-    /// Build a table from frame states in exit order; the id of each is its
-    /// index.
+    /// Build a table from dense logical frame states; each id is its index.
     #[must_use]
     pub fn from_states(states: Vec<FrameState>) -> Self {
+        Self {
+            entries: states.into_iter().map(Some).collect(),
+        }
+    }
+
+    /// Build a table in logical frame-state id order. `None` retains an id
+    /// used only for GC root derivation and therefore has no deopt recipe.
+    #[must_use]
+    pub fn from_indexed_states(states: Vec<Option<FrameState>>) -> Self {
         Self { entries: states }
     }
 
-    /// The frame chain for `exit`, or `None` when the id names no exit.
+    /// The frame chain for `state`, or `None` when the id has no recipe.
     #[must_use]
-    pub fn lookup(&self, exit: DeoptExitId) -> Option<&FrameState> {
-        self.entries.get(exit.0 as usize)
+    pub fn lookup(&self, state: FrameStateId) -> Option<&FrameState> {
+        self.entries.get(state as usize)?.as_ref()
     }
 
-    /// All exits in id order.
-    #[must_use]
-    pub fn entries(&self) -> &[FrameState] {
-        &self.entries
+    /// All reconstructable states in logical-id order.
+    pub fn entries(&self) -> impl Iterator<Item = &FrameState> {
+        self.entries.iter().flatten()
     }
 
-    /// Number of recorded deopt points.
+    /// Present concrete states with their stable logical ids.
+    pub fn indexed_entries(&self) -> impl Iterator<Item = (FrameStateId, &FrameState)> {
+        self.entries.iter().enumerate().filter_map(|(id, state)| {
+            state
+                .as_ref()
+                .map(|state| (u32::try_from(id).unwrap_or(u32::MAX), state))
+        })
+    }
+
+    /// Number of reconstructable logical states.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.iter().flatten().count()
     }
 
     /// Whether the table records no deopt points.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.iter().all(Option::is_none)
     }
 
-    /// Verify every exit's frame chain and declared bounds.
+    /// Verify every reconstructable state's frame chain and declared bounds.
     pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
         if limits.min_stack_slot_offset > limits.max_stack_slot_offset {
             return Err(DeoptVerifyError::InvalidStackSlotRange {
@@ -440,7 +457,7 @@ impl DeoptTable {
                 max: limits.max_stack_slot_offset,
             });
         }
-        for state in &self.entries {
+        for state in self.entries.iter().flatten() {
             state.verify(limits)?;
         }
         Ok(())
@@ -451,7 +468,11 @@ impl DeoptTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeoptExitDescriptor {
     /// The frame state this site rebuilds, an index into the owning table.
-    pub state: DeoptExitId,
+    pub state: FrameStateId,
+    /// Typed cause used by exit profiling and diagnostics.
+    pub reason: ExitReason,
+    /// Cold policy requested by this exact generated site.
+    pub action: ExitAction,
     /// Logical (canonical instruction-index) resume PC per frame of the state,
     /// outermost first. The state stores byte PCs, which the interpreter's
     /// frames do not speak; this is the same sequence in their namespace.
@@ -470,7 +491,7 @@ pub struct DeoptExitDescriptor {
 /// property-IC cells.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeoptRuntime {
-    /// Frame states indexed by [`DeoptExitId`].
+    /// Frame states indexed by logical [`FrameStateId`].
     pub table: DeoptTable,
     /// Per-exit-site descriptors, indexed by the site index generated code
     /// passes to the writeback stub.
@@ -823,10 +844,10 @@ mod tests {
         table.verify(verify_limits()).unwrap();
         assert_eq!(table.len(), 2);
         assert_eq!(
-            table.lookup(DeoptExitId(1)).unwrap().innermost().slots[0].location,
+            table.lookup(1).unwrap().innermost().slots[0].location,
             slot.location
         );
-        assert!(table.lookup(DeoptExitId(2)).is_none());
+        assert!(table.lookup(2).is_none());
     }
 
     #[test]

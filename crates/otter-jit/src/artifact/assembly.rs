@@ -154,7 +154,7 @@ fn render_deopt_summary(output: &mut String, table: Option<&DeoptTable>) {
         return;
     };
     writeln!(output, "; deopt-exits={}", table.len()).expect("writing to String cannot fail");
-    for (exit_id, state) in table.entries().iter().enumerate() {
+    for (state_id, state) in table.indexed_entries() {
         let slot_count = state
             .frames
             .iter()
@@ -163,7 +163,7 @@ fn render_deopt_summary(output: &mut String, table: Option<&DeoptTable>) {
         if let Some(frame) = state.frames.last() {
             writeln!(
                 output,
-                "; deopt exit={exit_id} frames={} innermost-function={} innermost-byte-pc={} slots={slot_count}",
+                "; frame-state={state_id} frames={} innermost-function={} innermost-byte-pc={} slots={slot_count}",
                 state.frames.len(),
                 frame.function_id,
                 frame.byte_pc,
@@ -172,7 +172,7 @@ fn render_deopt_summary(output: &mut String, table: Option<&DeoptTable>) {
         } else {
             writeln!(
                 output,
-                "; deopt exit={exit_id} frames=0 innermost=unavailable slots=0"
+                "; frame-state={state_id} frames=0 innermost=unavailable slots=0"
             )
             .expect("writing to String cannot fail");
         }
@@ -364,7 +364,7 @@ fn render_region_annotation(
     }
     if let Some(exit_id) = region.deopt_exit_id {
         write!(output, " deopt-exit={exit_id}").expect("writing to String cannot fail");
-        if let Some(state) = deopt_table.and_then(|table| table.entries().get(exit_id as usize)) {
+        if let Some(state) = deopt_table.and_then(|table| table.lookup(exit_id)) {
             let slots = state
                 .frames
                 .iter()
@@ -786,7 +786,7 @@ mod tests {
         assert!(first.contains("; tier=template"));
         assert!(first.contains("pc=2"));
         assert!(first.contains("tier-op=\"Move { dst: 1, src: 0 }\""));
-        assert!(first.contains("deopt exit=0 frames=1"));
+        assert!(first.contains("frame-state=0 frames=1"));
         assert!(first.contains("deopt-exit=0 deopt-frames=1 deopt-slots=1"));
         assert!(first.contains("safepoint id=3 native-offset=unavailable"));
         assert!(first.contains("tagged=frameSlot:1"));

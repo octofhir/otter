@@ -108,14 +108,15 @@ use otter_vm::{
     JitCompileSnapshot, JitElementAccess, UPVALUE_CELL_TYPE_TAG, Value,
     deopt::DeoptRuntime,
     native_abi::{
-        NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor, RuntimeStubResultAbi,
-        RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE, STUB_JIT_CALL_METHOD_VALUE,
-        STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT,
-        STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+        ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
+        RuntimeStubResultAbi, RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC,
+        STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE,
+        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROPERTY,
+        STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF,
+        STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF, STUB_STRICT_EQ_LEAF,
+        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
     },
 };
 
@@ -124,8 +125,8 @@ use super::super::{
     CallTarget, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBindingTarget, MachineFrameLayout, MachineInstructionId,
     MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation, MachineSafepointSite,
-    MachineSafepointTable, MachineValue, PackedDoubleViewCacheId, binding_target_matches_semantics,
-    is_explicit_committed_runtime_call,
+    MachineSafepointTable, MachineValue, OperandPurpose, PackedDoubleViewCacheId,
+    binding_target_matches_semantics, is_explicit_committed_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -553,7 +554,7 @@ fn emit_committed_element_value_call(
             "scalar committed element value call",
         ));
     }
-    let deopt = instruction.deopt.ok_or(Unsupported::OperandShape(
+    let deopt = instruction.deopt_id().ok_or(Unsupported::OperandShape(
         "scalar committed element frame state",
     ))?;
     let exit = deopt_runtime
@@ -567,7 +568,7 @@ fn emit_committed_element_value_call(
     ))?;
     let byte_pc = deopt_runtime
         .table
-        .lookup(otter_vm::deopt::DeoptExitId(deopt.0))
+        .lookup(exit.state)
         .map(|state| state.innermost().byte_pc)
         .ok_or(Unsupported::OperandShape(
             "scalar committed element byte PC",
@@ -748,7 +749,7 @@ fn emit_committed_runtime_call(
         || target.result_domain != NativeResultDomain::Committed
         || descriptor.arguments.len() != semantic_arity
         || descriptor.results != [MachineRepresentation::Tagged]
-        || instruction.deopt.is_some()
+        || !instruction.exits.is_empty()
     {
         return Err(Unsupported::OperandShape(
             "scalar committed runtime contract",
@@ -926,7 +927,7 @@ fn emit_committed_pair_call(
         || target.result_abi != RuntimeStubResultAbi::NativePair
         || target.result_domain != NativeResultDomain::Committed
         || descriptor.arguments.len() != semantic_arity
-        || instruction.deopt.is_some()
+        || !instruction.exits.is_empty()
     {
         return Err(Unsupported::OperandShape(
             "scalar committed pair runtime contract",
@@ -1580,7 +1581,7 @@ pub(super) fn emit(
             }
             MachineOpcode::InlineMethodGuard { ref guard } => {
                 let start = ops.offset().0;
-                let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 emit_method_guard_from_tagged_register(
                     &mut ops,
@@ -1601,7 +1602,7 @@ pub(super) fn emit(
                 this_mode,
             } => {
                 let start = ops.offset().0;
-                let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
                 crate::arm64::inline_guard::emit_inline_this(
@@ -1616,7 +1617,7 @@ pub(super) fn emit(
                 structural_regions.push(("machineInlineCallGuard", None, start, ops.offset().0));
             }
             MachineOpcode::InlineConstructGuard { function_id } => {
-                let miss = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 let callable = ops.new_dynamic_label();
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 crate::template::arm64::values::emit_cell_test(
@@ -1672,8 +1673,8 @@ pub(super) fn emit(
                 emit_store_allocated_tagged(&mut ops, frame, locations[2], 0, 0)?;
             }
             MachineOpcode::DecodeNumber => {
-                let miss = if instruction.deopt.is_some() {
-                    instruction_deopt_label(instruction.deopt, &deopt_labels)?
+                let miss = if !instruction.exits.is_empty() {
+                    instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?
                 } else {
                     bail
                 };
@@ -1692,8 +1693,8 @@ pub(super) fn emit(
                         "numeric Int32 decode reuse allocation",
                     ));
                 }
-                let miss = if instruction.deopt.is_some() {
-                    instruction_deopt_label(instruction.deopt, &deopt_labels)?
+                let miss = if !instruction.exits.is_empty() {
+                    instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?
                 } else {
                     bail
                 };
@@ -1750,7 +1751,7 @@ pub(super) fn emit(
             MachineOpcode::CheckedFloat64ToElementIndex(_) => {
                 let source = float_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 // `fcvtzu` saturates non-finite, negative, fractional, and
                 // out-of-range values away from an exact round trip. Positive
                 // zero and negative zero compare equal, which is the ordinary
@@ -1828,7 +1829,7 @@ pub(super) fn emit(
                 let left = integer_register(locations[0])?;
                 let right = integer_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
-                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 if instruction.opcode == MachineOpcode::IntegerAdd {
                     dynasm!(ops
                         ; .arch aarch64
@@ -1847,7 +1848,14 @@ pub(super) fn emit(
                 let left = integer_register(locations[0])?;
                 let right = integer_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
-                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let overflow = instruction_deopt_label(
+                    instruction.exit_id(ExitReason::Int32Overflow),
+                    &deopt_labels,
+                )?;
+                let negative_zero = instruction_deopt_label(
+                    instruction.exit_id(ExitReason::NegativeZero),
+                    &deopt_labels,
+                )?;
                 let nonzero = ops.new_dynamic_label();
                 // A test-bit branch reaches only 32 KiB, so the negative-zero
                 // exit goes through a local skip and an unconditional branch
@@ -1857,11 +1865,11 @@ pub(super) fn emit(
                     ; smull x16, W(left), W(right)
                     ; sxtw x17, w16
                     ; cmp x16, x17
-                    ; b.ne =>exit
+                    ; b.ne =>overflow
                     ; cbnz w16, =>nonzero
                     ; eor w17, W(left), W(right)
                     ; tbz w17, #31, =>nonzero
-                    ; b =>exit
+                    ; b =>negative_zero
                     ; =>nonzero
                     ; mov W(destination), w16
                 );
@@ -1869,12 +1877,19 @@ pub(super) fn emit(
             MachineOpcode::IntegerNeg => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let overflow = instruction_deopt_label(
+                    instruction.exit_id(ExitReason::Int32Overflow),
+                    &deopt_labels,
+                )?;
+                let negative_zero = instruction_deopt_label(
+                    instruction.exit_id(ExitReason::NegativeZero),
+                    &deopt_labels,
+                )?;
                 dynasm!(ops
                     ; .arch aarch64
                     ; negs w16, W(source)
-                    ; b.vs =>exit
-                    ; cbz W(source), =>exit
+                    ; b.vs =>overflow
+                    ; cbz W(source), =>negative_zero
                     ; mov W(destination), w16
                 );
             }
@@ -1882,7 +1897,7 @@ pub(super) fn emit(
             | MachineOpcode::IntegerSubImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 emit_load_u64(&mut ops, 16, immediate as u32 as u64);
                 if matches!(instruction.opcode, MachineOpcode::IntegerAddImmediate(_)) {
                     dynasm!(ops
@@ -2064,7 +2079,7 @@ pub(super) fn emit(
             MachineOpcode::TaggedNullishEqual { byte_pc, equal } => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 let nullish = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
@@ -2108,7 +2123,7 @@ pub(super) fn emit(
                 ));
             }
             MachineOpcode::BackedgePoll => {
-                let exit = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 emit_backedge_poll(
                     &mut ops,
                     &mut relocations,
@@ -2382,7 +2397,7 @@ pub(super) fn emit(
                     dense_index_form(sequence, index_value).ok_or(Unsupported::OperandShape(
                         "scalar packed-double element load index representation",
                     ))?;
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 let start = ops.offset().0;
                 emit_packed_double_element_address(
                     &mut ops,
@@ -2428,7 +2443,7 @@ pub(super) fn emit(
                     dense_index_form(sequence, index_value).ok_or(Unsupported::OperandShape(
                         "scalar packed-double element store index representation",
                     ))?;
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 let start = ops.offset().0;
                 emit_packed_double_element_address(
                     &mut ops,
@@ -2651,7 +2666,7 @@ pub(super) fn emit(
                 byte_pc,
                 ref transition,
             } => {
-                let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                 let start = ops.offset().0;
                 // x9-x16 are emitter scratch registers, and regalloc may also
                 // place the field value in x9. Preserve the early-use value
@@ -2859,7 +2874,7 @@ pub(super) fn emit(
                         .site(id)
                         .filter(|site| instruction.safepoint == Some(site.id))
                         .ok_or(Unsupported::OperandShape("scalar direct call safepoint"))?;
-                    let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                     let direct_done = ops.new_dynamic_label();
                     let direct_threw = ops.new_dynamic_label();
                     let direct_bail = ops.new_dynamic_label();
@@ -2938,6 +2953,16 @@ pub(super) fn emit(
                         DirectCallArgumentMode::Fixed => DirectCallArguments::Fixed(&arguments),
                         DirectCallArgumentMode::Spread => DirectCallArguments::Spread(1),
                     };
+                    let construct_receiver = instruction
+                        .operands
+                        .iter()
+                        .position(|operand| operand.purpose == OperandPurpose::RuntimeRoot)
+                        .map(|index| {
+                            u16::try_from(index).map_err(|_| {
+                                Unsupported::OperandShape("scalar construct receiver root")
+                            })
+                        })
+                        .transpose()?;
                     for (candidate_index, candidate) in candidates.iter().enumerate() {
                         let candidate_start = ops.offset().0;
                         let next_method_candidate = (*kind == DirectCallKind::Method
@@ -3002,18 +3027,18 @@ pub(super) fn emit(
                             }
                             DirectCallKind::Construct => DirectCallForm::Construct {
                                 callable: 0,
-                                receiver: u16::try_from(result_index + 1).map_err(|_| {
-                                    Unsupported::OperandShape("scalar construct receiver root")
-                                })?,
+                                receiver: construct_receiver.ok_or(Unsupported::OperandShape(
+                                    "scalar construct receiver root",
+                                ))?,
                             },
                             DirectCallKind::DerivedConstruct => {
                                 DirectCallForm::DerivedConstruct { callable: 0 }
                             }
                             DirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
                                 callable: 0,
-                                receiver: u16::try_from(result_index + 1).map_err(|_| {
-                                    Unsupported::OperandShape("scalar super receiver root")
-                                })?,
+                                receiver: construct_receiver.ok_or(Unsupported::OperandShape(
+                                    "scalar super receiver root",
+                                ))?,
                             },
                             DirectCallKind::DerivedSuperConstruct => {
                                 DirectCallForm::DerivedSuperConstruct { callable: 0 }
@@ -3328,7 +3353,7 @@ pub(super) fn emit(
                     dynasm!(ops ; .arch aarch64 ; =>direct_done);
                 } else {
                     if let CallTarget::NativeLeaf { target, byte_pc } = &descriptor.target {
-                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                         let start = ops.offset().0;
                         let int32 = descriptor.results == [MachineRepresentation::Int32];
                         if int32 {
@@ -3378,7 +3403,7 @@ pub(super) fn emit(
                         continue;
                     }
                     if let CallTarget::ColdCallExit { byte_pc, .. } = &descriptor.target {
-                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                         let start = ops.offset().0;
                         dynasm!(ops ; .arch aarch64 ; b =>deopt);
                         structural_regions.push((
@@ -3600,7 +3625,7 @@ pub(super) fn emit(
                         if locations.len() < 2 {
                             return Err(Unsupported::OperandShape("scalar class-super load call"));
                         }
-                        let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                        let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                         let start = ops.offset().0;
                         emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
                         dynasm!(ops
@@ -3706,15 +3731,12 @@ pub(super) fn emit(
                     if integer_register(locations[result_index])? != 0 {
                         return Err(Unsupported::OperandShape("scalar runtime call result"));
                     }
-                    let deopt = instruction_deopt_label(instruction.deopt, &deopt_labels)?;
+                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
                     let array_construct_region = if target == STUB_ARRAY_CONSTRUCT_ALLOC {
                         let byte_pc = instruction
-                            .deopt
-                            .and_then(|deopt| {
-                                deopt_runtime
-                                    .table
-                                    .lookup(otter_vm::deopt::DeoptExitId(deopt.0))
-                            })
+                            .deopt_id()
+                            .and_then(|deopt| deopt_runtime.exits.get(deopt.0 as usize))
+                            .and_then(|exit| deopt_runtime.table.lookup(exit.state))
                             .map(|state| state.innermost().byte_pc)
                             .ok_or(Unsupported::OperandShape(
                                 "scalar ArrayConstruct deopt state",
@@ -3793,13 +3815,14 @@ pub(super) fn emit(
 
     dynasm!(ops ; .arch aarch64 ; =>bail);
     emit_materialize_vm_window(&mut ops, vm_register_count);
+    let entry_bail = SideExit::new(0, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits();
     dynasm!(ops
         ; .arch aarch64
         ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
         ; str wzr, [x17, NATIVE_FRAME_PC_OFFSET]
-        ; mov w0, wzr
-        ; movz x1, NativeResultStatus::SideExit as u32
     );
+    emit_load_u64(&mut ops, 0, entry_bail);
+    dynasm!(ops ; .arch aarch64 ; movz x1, NativeResultStatus::SideExit as u32);
     emit_epilogue(&mut ops, frame, saved);
 
     let compiled_pair_exit = ops.new_dynamic_label();
@@ -3957,8 +3980,15 @@ pub(super) fn emit(
             ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
             ; str w16, [x17, NATIVE_FRAME_PC_OFFSET]
             ; mov w0, w16
-            ; movz x1, NativeResultStatus::SideExit as u32
         );
+        let osr_bail = SideExit::new(
+            site.logical_pc,
+            ExitReason::TypeMismatch,
+            ExitAction::Recompile,
+        )
+        .to_bits();
+        emit_load_u64(&mut ops, 0, osr_bail);
+        dynasm!(ops ; .arch aarch64 ; movz x1, NativeResultStatus::SideExit as u32);
         emit_epilogue(&mut ops, frame, saved);
         let end = ops.offset().0;
         if osr_entries.insert(site.logical_pc, offset).is_some() {
@@ -4927,27 +4957,23 @@ mod tests {
         machine::{
             AllocatedLocation, CallDescriptor, CallEffects, CallTarget, ControlFlow,
             ExceptionalEdge, InstructionSequence, MachineBindingTarget, MachineBlock,
-            MachineBlockData, MachineInstruction, MachineInstructionId, MachineOpcode,
-            MachineOperand, MachineRepresentation, MachineValue, PhysicalRegister, SafepointId,
-            SafepointKind, TargetClobberSet, TargetSpec, lower_safepoints,
+            MachineBlockData, MachineFrameSlot, MachineFrameState, MachineInstruction,
+            MachineInstructionId, MachineOpcode, MachineOperand, MachineRepresentation,
+            MachineValue, PhysicalRegister, SafepointId, SafepointKind, TargetClobberSet,
+            TargetSpec, lower_safepoints,
         },
     };
     use otter_bytecode::opcode_schema::{BindingMissing, BindingRead, BindingSemantics};
     use otter_vm::{JitCompileSnapshot, deopt::DeoptRuntime};
 
     fn committed_runtime_sequence(semantic_arity: u8) -> InstructionSequence {
-        let unrelated_root = (semantic_arity == 0).then_some(MachineValue(0));
         let inputs = (0..u32::from(semantic_arity))
             .map(MachineValue)
             .collect::<Vec<_>>();
-        let result = MachineValue(if semantic_arity == 0 {
-            1
-        } else {
-            u32::from(semantic_arity)
-        });
-        let mut instructions = unrelated_root
-            .into_iter()
-            .chain(inputs.iter().copied())
+        let result = MachineValue(u32::from(semantic_arity));
+        let mut instructions = inputs
+            .iter()
+            .copied()
             .enumerate()
             .map(|(index, value)| {
                 MachineInstruction::plain(
@@ -4963,12 +4989,12 @@ mod tests {
             .collect::<Vec<_>>();
         operands.push(MachineOperand::register_output(result));
         operands.extend(inputs.iter().copied().map(MachineOperand::tagged_root));
-        operands.extend(unrelated_root.map(MachineOperand::tagged_root));
         let mut call = MachineInstruction::plain(MachineOpcode::Call(0), operands);
         call.clobbers = TargetSpec::aarch64()
             .clobbers(TargetClobberSet::ScalarCall)
             .to_vec();
         call.safepoint = Some(SafepointId(0));
+        call.frame_state = Some(0);
         instructions.push(call);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
@@ -4981,7 +5007,7 @@ mod tests {
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT);
-        InstructionSequence::new(
+        InstructionSequence::new_with_frame_states(
             &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; result.0 as usize + 1],
@@ -5000,6 +5026,19 @@ mod tests {
                     .to_vec(),
                 exceptional: ExceptionalEdge::Propagate,
                 safepoint: SafepointKind::Gc,
+            }],
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 29,
+                    entry: None,
+                    slots: inputs
+                        .iter()
+                        .copied()
+                        .map(MachineFrameSlot::Value)
+                        .collect(),
+                }]),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -5026,6 +5065,7 @@ mod tests {
                 MachineOperand::tagged_root(source),
             ],
         );
+        call.frame_state = Some(0);
         call.clobbers = TargetSpec::aarch64()
             .clobbers(TargetClobberSet::ScalarCall)
             .to_vec();
@@ -5041,6 +5081,7 @@ mod tests {
         acknowledge.clobbers = TargetSpec::aarch64()
             .clobbers(TargetClobberSet::ScalarCall)
             .to_vec();
+        acknowledge.frame_state = Some(0);
         let mut exceptional_edge = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
         exceptional_edge.control = ControlFlow::Branch;
         let mut alternative_edge = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
@@ -5063,7 +5104,7 @@ mod tests {
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT);
 
-        InstructionSequence::new(
+        InstructionSequence::new_with_frame_states(
             &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![
@@ -5103,6 +5144,15 @@ mod tests {
                     safepoint: SafepointKind::None,
                 },
             ],
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 37,
+                    entry: None,
+                    slots: Box::new([MachineFrameSlot::Value(source)]),
+                }]),
+            }],
             vec![
                 MachineBlockData {
                     first: MachineInstructionId(0),
@@ -5251,7 +5301,7 @@ mod tests {
                     .expect("committed-runtime safepoint site")
                     .roots
                     .len(),
-                usize::from(semantic_arity.max(1))
+                usize::from(semantic_arity)
             );
             let frame = frame_layout(&allocation, safepoints.root_slot_count())
                 .expect("committed-runtime frame");

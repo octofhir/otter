@@ -73,7 +73,6 @@ where
         ; =>callee_threw
     );
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
-    emit_reset_generated_bail_streak(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>invalid_callee_result);
     emit_fatal_pair(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
@@ -153,20 +152,18 @@ where
         record("directConstructResultThrow", cold_start, ops.offset().0);
         dynasm!(ops ; .arch aarch64 ; =>ready);
     }
-    emit_reset_generated_bail_streak(ops);
     dynasm!(ops
         ; .arch aarch64
         ; b =>result_ready
         ; =>callee_bailed
         ; mov x7, x0
         ; ldr w14, [sp, NATIVE_FRAME_PC_OFFSET]
-        ; cmp x0, x14
+        ; cmp w7, w14
         ; b.eq >callee_bail_pc_valid
     );
     emit_fatal_pair(ops);
     dynasm!(ops ; .arch aarch64 ; b =>result_ready ; callee_bail_pc_valid:);
     emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_DEOPTS_OFFSET);
-    emit_increment_feedback_u32(ops, CODE_ENTRY_GENERATED_BAIL_STREAK_OFFSET);
     let invalid_deopt_result = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64

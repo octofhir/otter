@@ -38,10 +38,14 @@ use otter_bytecode::Op;
 use otter_vm::{
     JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, Value, VmError,
     native_abi::{
-        ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome, NativeResultPair,
-        NativeResultStatus, ValueLoadRuntimeOp,
+        ClassRuntimeOp, CommittedValueError, ExitAction, ExitReason, IteratorRuntimeOutcome,
+        NativeResultPair, NativeResultStatus, SideExit, ValueLoadRuntimeOp,
     },
 };
+
+const fn runtime_side_exit(pc: u32) -> SideExit {
+    SideExit::new(pc, ExitReason::RuntimeTransition, ExitAction::Resume)
+}
 
 use super::super::JitCtx;
 use super::decode_register;
@@ -129,7 +133,7 @@ fn route_throw_value(ctx: &mut JitCtx, exception: Value) -> NativeResultPair {
                 return compiled_fatal(ctx, VmError::InvalidOperand);
             };
             native_frame.header.pc = pc;
-            NativeResultPair::side_exit(u64::from(pc))
+            NativeResultPair::side_exit(runtime_side_exit(pc))
         }
         Ok(None) => NativeResultPair::throw_value(exception),
         Err(error) => compiled_error(ctx, error),
@@ -329,7 +333,7 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
         native_frame.header.pc = exit.resume_pcs[0];
         let resume_pc = exit.resume_pcs[0];
         debug_assert_eq!(native_frame.header.pc, resume_pc);
-        return NativeResultPair::side_exit(u64::from(resume_pc));
+        return NativeResultPair::side_exit(SideExit::new(resume_pc, exit.reason, exit.action));
     }
 
     // Decode the one shared frame schema. Root entry bindings remain owned by
@@ -379,6 +383,7 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
         native,
         materialized_index,
         &frames,
+        SideExit::new(exit.resume_pcs[0], exit.reason, exit.action),
     ) {
         Ok(value) => NativeResultPair::success(value),
         Err(error) => compiled_error(ctx, error),
@@ -428,7 +433,7 @@ pub(crate) extern "C" fn jit_exception_op_stub(
         Ok(Some(mut runtime)) => runtime.exception_op(opcode as u8, arg0, arg1, arg2),
         Ok(None) => {
             return match ctx.active_frame() {
-                Ok(frame) => NativeResultPair::side_exit(u64::from(frame.pc())),
+                Ok(frame) => NativeResultPair::side_exit(runtime_side_exit(frame.pc())),
                 Err(error) => compiled_fatal(ctx, error),
             };
         }
@@ -436,7 +441,7 @@ pub(crate) extern "C" fn jit_exception_op_stub(
     };
     match outcome {
         Ok(JitExceptionOutcome::Continue) => NativeResultPair::continue_generated(),
-        Ok(JitExceptionOutcome::Resume(pc)) => NativeResultPair::side_exit(u64::from(pc)),
+        Ok(JitExceptionOutcome::Resume(pc)) => NativeResultPair::side_exit(runtime_side_exit(pc)),
         Ok(JitExceptionOutcome::Return(value)) => NativeResultPair::success(value),
         Ok(JitExceptionOutcome::Throw(exception)) => NativeResultPair::throw_value(exception),
         Err(error) => match ctx
@@ -1614,7 +1619,7 @@ mod tests {
                 result.validate(NativeResultDomain::ExceptionTransition),
                 Some(otter_vm::native_abi::NativeResultStatus::SideExit)
             );
-            assert_eq!(result.payload_bits(), 37);
+            assert_eq!(result.logical_pc(), Some(37));
             assert!(error.is_none());
         });
     }
@@ -1622,8 +1627,8 @@ mod tests {
     #[test]
     fn stack_owned_machine_deopt_writes_window_and_returns_exact_bail() {
         use otter_vm::deopt::{
-            DeoptExitDescriptor, DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptRuntime,
-            DeoptSlot, DeoptTable, FrameState,
+            DeoptExitDescriptor, DeoptFrame, DeoptLocation, DeoptRepr, DeoptRuntime, DeoptSlot,
+            DeoptTable, FrameState,
         };
 
         with_frameless_ctx(|ctx, error| {
@@ -1643,7 +1648,9 @@ mod tests {
                     .into_boxed_slice(),
                 }]),
                 exits: vec![DeoptExitDescriptor {
-                    state: DeoptExitId(0),
+                    state: 0,
+                    reason: otter_vm::native_abi::ExitReason::UnsupportedOperation,
+                    action: otter_vm::native_abi::ExitAction::Recompile,
                     resume_pcs: vec![37].into_boxed_slice(),
                 }]
                 .into_boxed_slice(),

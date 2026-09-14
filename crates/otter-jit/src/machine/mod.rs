@@ -30,16 +30,15 @@
 //!   branch or return instruction.
 //! - Metadata values are ordinary late uses. Calls therefore cannot leave a
 //!   live GC/deopt value in a clobbered register.
-//! - Every tagged SSA value live across a GC safepoint appears exactly once as
-//!   `TaggedRoot`. Compiler selection derives missing roots from the completed
-//!   Machine CFG before allocation, then verification proves the same liveness
-//!   independently of deoptimization metadata or the lowering path that
-//!   selected the call.
+//! - Every call, allocation, and side exit names one logical frame state.
+//!   Compiler completion derives the exact `TaggedRoot` set from completed CFG
+//!   liveness plus that state's tagged reconstruction recipes. Verification
+//!   rejects missing and surplus roots before allocation.
 //! - Named loads expose a no-call probe and a committed cold/status CFG.
 //!   Only the cold call roots tagged state; its raw IC pointer must come from
 //!   a property probe. Local catches consume the pure exception payload.
-//!   Inlined property/global-read cold sites carry boxed frame operands as explicit tagged roots;
-//!   the source-owned recipes publish descendants without copying the caller.
+//!   Inlined property/global-read cold sites publish descendants through the
+//!   same state-owned recipes without copying the caller.
 //! - Inline method guards own their source's receiver/prototype/slot program,
 //!   produce the current callable, and exact-deopt before any lookup effects.
 //! - Direct methods own one complete dense one-to-four-candidate chain; plain
@@ -53,9 +52,8 @@
 //!   one exceptional edge; binding and named-load descriptors expose the physical
 //!   tagged payload plus descriptor-domain status to explicit Machine control.
 //!   Neither form can report a guard miss or request deoptimization/replay.
-//!   Trailing `TaggedRoot` metadata contains every true input plus the complete
-//!   live tagged state and may therefore be a strict superset of semantic
-//!   operands.
+//!   Trailing `TaggedRoot` metadata is derived from the state and completed CFG;
+//!   selection does not maintain an independent ordinary-root list.
 //! - The schema-owned binding family expands before allocation into an explicit
 //!   guard, generated hit, committed `NativeResultPair` cold call, three-way
 //!   Success/Throw/Fatal branch, and join. Guard-produced owner/storage
@@ -108,6 +106,7 @@ pub use target::{
     TargetSpec,
 };
 
+use otter_vm::native_abi::{ExitAction, ExitReason, FrameStateId};
 use std::fmt::Write as _;
 
 /// Dense identity of a target-selected virtual value.
@@ -269,15 +268,20 @@ pub enum OperandPurpose {
     Output,
     /// Tagged GC root at the instruction's safepoint.
     TaggedRoot,
+    /// Runtime-only tagged root absent from interpreter frame state.
+    RuntimeRoot,
     /// Cell GC root at the instruction's safepoint.
     CellRoot,
-    /// Value required by deoptimization reconstruction.
-    Deopt,
+    /// Value required by the instruction's logical frame state.
+    FrameState,
 }
 
 impl OperandPurpose {
     const fn is_metadata(self) -> bool {
-        matches!(self, Self::TaggedRoot | Self::CellRoot | Self::Deopt)
+        matches!(
+            self,
+            Self::TaggedRoot | Self::RuntimeRoot | Self::CellRoot | Self::FrameState
+        )
     }
 }
 
@@ -382,6 +386,18 @@ impl MachineOperand {
         }
     }
 
+    /// Keep a runtime-only tagged temporary live through a safepoint.
+    #[must_use]
+    pub const fn runtime_root(value: MachineValue) -> Self {
+        Self {
+            value,
+            constraint: OperandConstraint::Any,
+            role: OperandRole::Use,
+            timing: OperandTiming::Late,
+            purpose: OperandPurpose::RuntimeRoot,
+        }
+    }
+
     /// Keep a cell GC root live through a safepoint instruction.
     #[must_use]
     pub const fn cell_root(value: MachineValue) -> Self {
@@ -394,15 +410,15 @@ impl MachineOperand {
         }
     }
 
-    /// Keep a value available for deoptimization at this instruction.
+    /// Keep a value available for the instruction's logical frame state.
     #[must_use]
-    pub const fn deopt(value: MachineValue) -> Self {
+    pub const fn frame_value(value: MachineValue) -> Self {
         Self {
             value,
             constraint: OperandConstraint::Any,
             role: OperandRole::Use,
             timing: OperandTiming::Late,
-            purpose: OperandPurpose::Deopt,
+            purpose: OperandPurpose::FrameState,
         }
     }
 }
@@ -1028,8 +1044,11 @@ pub struct MachineInstruction {
     pub clobbers: Vec<PhysicalRegister>,
     /// Safepoint described by metadata operands, when present.
     pub safepoint: Option<SafepointId>,
-    /// Deopt exit described by metadata operands, when present.
-    pub deopt: Option<DeoptId>,
+    /// Logical interpreter state shared by root and deopt lowering.
+    pub frame_state: Option<FrameStateId>,
+    /// Exact generated exits and their policies. Multiple entries distinguish
+    /// different failed proofs that share one logical frame state.
+    pub exits: Box<[MachineExit]>,
     /// Boxed inline activation recipes at committed cold reentry. The first
     /// frame names the suspended caller and has no copied register window.
     pub inline_frames: Box<[otter_vm::deopt::DeoptFrame<Option<MachineValue>>]>,
@@ -1046,11 +1065,48 @@ impl MachineInstruction {
             operands,
             clobbers: Vec::new(),
             safepoint: None,
-            deopt: None,
+            frame_state: None,
+            exits: Box::default(),
             inline_frames: Box::default(),
             control: ControlFlow::None,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn set_test_exit(&mut self, exit: DeoptId, state: FrameStateId) {
+        self.frame_state = Some(state);
+        self.exits = Box::new([MachineExit {
+            id: exit,
+            reason: ExitReason::UnsupportedOperation,
+            action: ExitAction::Recompile,
+        }]);
+    }
+
+    /// The sole exit id for operations with one failed proof.
+    #[must_use]
+    pub fn deopt_id(&self) -> Option<DeoptId> {
+        (self.exits.len() == 1).then(|| self.exits[0].id)
+    }
+
+    /// Exit id for one exact failed proof.
+    #[must_use]
+    pub fn exit_id(&self, reason: ExitReason) -> Option<DeoptId> {
+        self.exits
+            .iter()
+            .find(|exit| exit.reason == reason)
+            .map(|exit| exit.id)
+    }
+}
+
+/// One typed pre-effect exit attached to a Machine instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineExit {
+    /// Dense emitted exit-site identity.
+    pub id: DeoptId,
+    /// Stable reason used by exit profiling.
+    pub reason: ExitReason,
+    /// Cold policy requested by this site.
+    pub action: ExitAction,
 }
 
 /// One contiguous target-selected basic block.
@@ -1076,6 +1132,7 @@ pub struct InstructionSequence {
     pub(super) entry: MachineBlock,
     representations: Vec<MachineRepresentation>,
     call_descriptors: Vec<CallDescriptor>,
+    frame_states: Vec<MachineFrameState>,
     blocks: Vec<MachineBlockData>,
     instructions: Vec<MachineInstruction>,
     packed_double_view_cache_count: u8,
@@ -1124,6 +1181,26 @@ pub enum VerificationError {
     MissingLiveTaggedRoot(MachineInstructionId, MachineValue),
     /// One tagged value appears more than once in a safepoint root set.
     DuplicateTaggedRoot(MachineInstructionId, MachineValue),
+    /// A tagged root is neither live nor named by the logical frame state.
+    UnexpectedTaggedRoot(MachineInstructionId, MachineValue),
+    /// Logical frame-state storage is not dense in id order.
+    NonDenseFrameStateId {
+        /// Required id at this storage position.
+        expected: FrameStateId,
+        /// Stored id.
+        actual: FrameStateId,
+    },
+    /// An instruction references no valid logical frame state.
+    InvalidFrameState(MachineInstructionId, Option<FrameStateId>),
+    /// One instruction repeats a typed exit reason.
+    DuplicateExitReason(MachineInstructionId, ExitReason),
+    /// Exit identities are not dense after whole-sequence selection.
+    NonDenseExitId {
+        /// Required id at this sorted exit position.
+        expected: u32,
+        /// Stored id.
+        actual: u32,
+    },
     /// Safepoint metadata appears without a safepoint identity.
     RootWithoutSafepoint(MachineInstructionId),
     /// Deopt metadata appears without a deopt identity.
@@ -1181,6 +1258,28 @@ impl InstructionSequence {
         )
     }
 
+    /// Construct and verify a sequence with explicit logical frame states.
+    pub fn new_with_frame_states(
+        target: &TargetSpec,
+        entry: MachineBlock,
+        representations: Vec<MachineRepresentation>,
+        call_descriptors: Vec<CallDescriptor>,
+        frame_states: Vec<MachineFrameState>,
+        blocks: Vec<MachineBlockData>,
+        instructions: Vec<MachineInstruction>,
+    ) -> Result<Self, VerificationError> {
+        Self::new_with_frame_states_and_packed_double_view_caches(
+            target,
+            entry,
+            representations,
+            call_descriptors,
+            frame_states,
+            blocks,
+            instructions,
+            0,
+        )
+    }
+
     /// Construct and verify a sequence with bounded raw packed-double caches.
     pub fn new_with_packed_double_view_caches(
         target: &TargetSpec,
@@ -1195,6 +1294,31 @@ impl InstructionSequence {
             entry,
             representations,
             call_descriptors,
+            frame_states: Vec::new(),
+            blocks,
+            instructions,
+            packed_double_view_cache_count,
+        };
+        sequence.verify(target)?;
+        Ok(sequence)
+    }
+
+    /// Construct and verify a sequence with logical states and bounded raw caches.
+    pub fn new_with_frame_states_and_packed_double_view_caches(
+        target: &TargetSpec,
+        entry: MachineBlock,
+        representations: Vec<MachineRepresentation>,
+        call_descriptors: Vec<CallDescriptor>,
+        frame_states: Vec<MachineFrameState>,
+        blocks: Vec<MachineBlockData>,
+        instructions: Vec<MachineInstruction>,
+        packed_double_view_cache_count: u8,
+    ) -> Result<Self, VerificationError> {
+        let sequence = Self {
+            entry,
+            representations,
+            call_descriptors,
+            frame_states,
             blocks,
             instructions,
             packed_double_view_cache_count,
@@ -1215,6 +1339,7 @@ impl InstructionSequence {
         entry: MachineBlock,
         representations: Vec<MachineRepresentation>,
         call_descriptors: Vec<CallDescriptor>,
+        frame_states: Vec<MachineFrameState>,
         blocks: Vec<MachineBlockData>,
         instructions: Vec<MachineInstruction>,
         packed_double_view_cache_count: u8,
@@ -1223,12 +1348,13 @@ impl InstructionSequence {
             entry,
             representations,
             call_descriptors,
+            frame_states,
             blocks,
             instructions,
             packed_double_view_cache_count,
         };
-        sequence.verify_structure(target)?;
         sequence.complete_gc_root_liveness();
+        sequence.verify_structure(target)?;
         sequence.verify_gc_root_liveness()?;
         Ok(sequence)
     }
@@ -1248,6 +1374,12 @@ impl InstructionSequence {
     #[must_use]
     pub fn call_descriptors(&self) -> &[CallDescriptor] {
         &self.call_descriptors
+    }
+
+    /// Logical frame states shared by root and deopt lowering.
+    #[must_use]
+    pub fn frame_states(&self) -> &[MachineFrameState] {
+        &self.frame_states
     }
 
     /// Dense blocks indexed by [`MachineBlock`].
@@ -1296,12 +1428,13 @@ impl InstructionSequence {
                 let instruction = &self.instructions[instruction_index as usize];
                 writeln!(
                     output,
-                    "  i{instruction_index} {:?} {:?} clobbers={:?} sp={:?} deopt={:?}",
+                    "  i{instruction_index} {:?} {:?} clobbers={:?} sp={:?} state={:?} exits={:?}",
                     instruction.opcode,
                     instruction.operands,
                     instruction.clobbers,
                     instruction.safepoint,
-                    instruction.deopt
+                    instruction.frame_state,
+                    instruction.exits
                 )
                 .expect("writing to String cannot fail");
                 if !instruction.inline_frames.is_empty() {
@@ -1347,7 +1480,7 @@ impl InstructionSequence {
                     | MachineOpcode::Int32ToFloat64
                     | MachineOpcode::Uint32ToFloat64
             ) || (definition.opcode == MachineOpcode::DecodeNumber
-                && definition.deopt.is_some());
+                && !definition.exits.is_empty());
             if !unwrap {
                 break;
             }
@@ -1456,7 +1589,7 @@ impl InstructionSequence {
             if operand.role == OperandRole::Use
                 && matches!(
                     operand.purpose,
-                    OperandPurpose::Input | OperandPurpose::Deopt
+                    OperandPurpose::Input | OperandPurpose::FrameState
                 )
             {
                 live[operand.value.0 as usize] = true;
@@ -1509,7 +1642,7 @@ impl InstructionSequence {
                 if instruction.safepoint.is_none() {
                     continue;
                 }
-                let live_tagged = self
+                let mut live_tagged = self
                     .representations
                     .iter()
                     .zip(&live)
@@ -1518,8 +1651,43 @@ impl InstructionSequence {
                         (representation == MachineRepresentation::Tagged && is_live)
                             .then_some(MachineValue(value as u32))
                     })
-                    .collect();
-                safepoints.push((id, live_tagged));
+                    .collect::<std::collections::BTreeSet<_>>();
+                if let Some(state_id) = instruction.frame_state
+                    && let Some(state) = self.frame_states.get(state_id as usize)
+                {
+                    for frame in &state.frames {
+                        let slots = frame
+                            .entry
+                            .iter()
+                            .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
+                            .chain(frame.slots.iter());
+                        for slot in slots {
+                            let MachineFrameSlot::Value(value) = *slot else {
+                                continue;
+                            };
+                            if self.representations.get(value.0 as usize)
+                                == Some(&MachineRepresentation::Tagged)
+                            {
+                                live_tagged.insert(value);
+                            }
+                        }
+                    }
+                }
+                for frame in &instruction.inline_frames {
+                    let slots = frame
+                        .entry
+                        .iter()
+                        .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
+                        .chain(frame.slots.iter());
+                    for &value in slots.flatten() {
+                        if self.representations.get(value.0 as usize)
+                            == Some(&MachineRepresentation::Tagged)
+                        {
+                            live_tagged.insert(value);
+                        }
+                    }
+                }
+                safepoints.push((id, live_tagged.into_iter().collect()));
             }
         }
         safepoints
@@ -1557,9 +1725,17 @@ impl InstructionSequence {
                     return Err(VerificationError::DuplicateTaggedRoot(id, root.value));
                 }
             }
-            for value in live_tagged {
+            for &value in &live_tagged {
                 if !roots.contains(&value) {
                     return Err(VerificationError::MissingLiveTaggedRoot(id, value));
+                }
+            }
+            let expected = live_tagged
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            for value in roots {
+                if !expected.contains(&value) {
+                    return Err(VerificationError::UnexpectedTaggedRoot(id, value));
                 }
             }
         }
@@ -1574,6 +1750,29 @@ impl InstructionSequence {
         }
         if self.entry.0 as usize >= self.blocks.len() {
             return Err(VerificationError::InvalidEntry);
+        }
+        for (expected, state) in self.frame_states.iter().enumerate() {
+            let expected = expected as FrameStateId;
+            if state.id != expected {
+                return Err(VerificationError::NonDenseFrameStateId {
+                    expected,
+                    actual: state.id,
+                });
+            }
+            for frame in &state.frames {
+                let slots = frame
+                    .entry
+                    .iter()
+                    .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
+                    .chain(frame.slots.iter());
+                for slot in slots {
+                    if let MachineFrameSlot::Value(value) = *slot
+                        && value.0 as usize >= self.representations.len()
+                    {
+                        return Err(VerificationError::InvalidValue(value));
+                    }
+                }
+            }
         }
         let mut expected_first = 0u32;
         let mut safepoints = std::collections::BTreeSet::new();
@@ -1767,10 +1966,35 @@ impl InstructionSequence {
                 {
                     return Err(VerificationError::DuplicateSafepoint(safepoint));
                 }
-                if let Some(deopt) = instruction.deopt
-                    && !deopts.insert(deopt)
-                {
-                    return Err(VerificationError::DuplicateDeopt(deopt));
+                let state_valid = instruction
+                    .frame_state
+                    .is_some_and(|state| self.frame_states.get(state as usize).is_some());
+                let owns_state = instruction.safepoint.is_some()
+                    || !instruction.exits.is_empty()
+                    || instruction
+                        .operands
+                        .iter()
+                        .any(|operand| operand.purpose == OperandPurpose::FrameState);
+                if owns_state && !state_valid {
+                    return Err(VerificationError::InvalidFrameState(
+                        id,
+                        instruction.frame_state,
+                    ));
+                }
+                if instruction.frame_state.is_some() && !state_valid {
+                    return Err(VerificationError::InvalidFrameState(
+                        id,
+                        instruction.frame_state,
+                    ));
+                }
+                let mut exit_reasons = std::collections::BTreeSet::new();
+                for exit in &instruction.exits {
+                    if !exit_reasons.insert(exit.reason) {
+                        return Err(VerificationError::DuplicateExitReason(id, exit.reason));
+                    }
+                    if !deopts.insert(exit.id) {
+                        return Err(VerificationError::DuplicateDeopt(exit.id));
+                    }
                 }
                 let mut clobbers = std::collections::BTreeSet::new();
                 for &clobber in &instruction.clobbers {
@@ -1796,7 +2020,7 @@ impl InstructionSequence {
                         || target.cell_addr % std::mem::align_of::<otter_vm::Value>() != 0
                         || instruction.clobbers
                             != target_spec.clobbers(TargetClobberSet::StringConstantLoad)
-                        || instruction.deopt.is_some()
+                        || !instruction.exits.is_empty()
                         || instruction.safepoint.is_some()
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -1843,7 +2067,7 @@ impl InstructionSequence {
                                             }
                                 })
                             || instruction.clobbers != target_spec.clobbers(clobbers)
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -1865,7 +2089,7 @@ impl InstructionSequence {
                         };
                         if late
                             .iter()
-                            .any(|operand| *operand != MachineOperand::deopt(operand.value))
+                            .any(|operand| *operand != MachineOperand::frame_value(operand.value))
                             || *input != MachineOperand::register_input(input.value)
                             || *output != MachineOperand::register_output(output.value)
                             || [input, output].iter().any(|operand| {
@@ -1873,7 +2097,7 @@ impl InstructionSequence {
                                     != MachineRepresentation::Tagged
                             })
                             || instruction.clobbers != target_spec.clobbers(clobbers)
-                            || instruction.deopt.is_none()
+                            || instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -1912,7 +2136,7 @@ impl InstructionSequence {
                                 );
                         if !valid
                             || !instruction.clobbers.is_empty()
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2018,7 +2242,7 @@ impl InstructionSequence {
                             || !raw_addresses_are_hit_local
                             || !writable
                             || instruction.clobbers != binding_guard_clobbers(target_spec)
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2062,7 +2286,7 @@ impl InstructionSequence {
                             || !valid_output
                             || !binding_target_matches_semantics(*semantics, *target)
                             || instruction.clobbers != binding_hit_clobbers(target_spec)
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2079,7 +2303,7 @@ impl InstructionSequence {
                             || self.representations[value.value.0 as usize]
                                 != MachineRepresentation::Tagged
                             || instruction.clobbers != binding_write_barrier_clobbers(target_spec)
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2088,7 +2312,7 @@ impl InstructionSequence {
                     MachineOpcode::BindingJoin { .. } => {
                         if !instruction.operands.is_empty()
                             || !instruction.clobbers.is_empty()
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2122,7 +2346,7 @@ impl InstructionSequence {
                             || self.representations[status.value.0 as usize]
                                 != MachineRepresentation::NativeStatus
                             || !committed_pair_status
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                             || instruction.clobbers
                                 != target_spec.clobbers(TargetClobberSet::StatusScratch)
@@ -2138,7 +2362,7 @@ impl InstructionSequence {
                             || self.representations[exception.value.0 as usize]
                                 != MachineRepresentation::Tagged
                             || !instruction.clobbers.is_empty()
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2147,7 +2371,7 @@ impl InstructionSequence {
                     MachineOpcode::Fatal
                         if !instruction.operands.is_empty()
                             || !instruction.clobbers.is_empty()
-                            || instruction.deopt.is_some()
+                            || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some() =>
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2169,14 +2393,14 @@ impl InstructionSequence {
                             == MachineRepresentation::Boolean;
                     let mut deopt_values = std::collections::BTreeSet::new();
                     let metadata_is_exact_deopt = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::deopt(operand.value)
+                        *operand == MachineOperand::frame_value(operand.value)
                             && operand.value != output.value
                             && deopt_values.insert(operand.value)
                     });
                     if !ordinary_signature
                         || !metadata_is_exact_deopt
                         || !deopt_values.contains(&input.value)
-                        || instruction.deopt.is_none()
+                        || instruction.exits.is_empty()
                         || instruction.safepoint.is_some()
                         || instruction.clobbers
                             != target_spec.clobbers(TargetClobberSet::StatusScratch)
@@ -2224,7 +2448,7 @@ impl InstructionSequence {
                     };
                     let metadata_shape = metadata.iter().all(|operand| {
                         *operand == MachineOperand::tagged_root(operand.value)
-                            || *operand == MachineOperand::deopt(operand.value)
+                            || *operand == MachineOperand::frame_value(operand.value)
                     });
                     let root_values = metadata
                         .iter()
@@ -2245,11 +2469,11 @@ impl InstructionSequence {
                     let mut deopt_values = std::collections::BTreeSet::new();
                     let deopts_are_unique = metadata
                         .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::Deopt)
+                        .filter(|operand| operand.purpose == OperandPurpose::FrameState)
                         .all(|operand| deopt_values.insert(operand.value));
                     let deopt_tagged_values_are_rooted = metadata
                         .iter()
-                        .filter(|operand| operand.purpose == OperandPurpose::Deopt)
+                        .filter(|operand| operand.purpose == OperandPurpose::FrameState)
                         .filter(|operand| {
                             self.representations[operand.value.0 as usize]
                                 == MachineRepresentation::Tagged
@@ -2270,7 +2494,7 @@ impl InstructionSequence {
                         || !deopt_tagged_values_are_rooted
                         || !required_roots
                         || instruction.clobbers != target_spec.clobbers(TargetClobberSet::Element)
-                        || instruction.deopt.is_none()
+                        || instruction.exits.is_empty()
                         || instruction.safepoint.is_none()
                         || instruction.control != ControlFlow::None
                     {
@@ -2296,7 +2520,7 @@ impl InstructionSequence {
                         })
                         || instruction.clobbers
                             != target_spec.clobbers(TargetClobberSet::PropertyLoad)
-                        || instruction.deopt.is_some()
+                        || !instruction.exits.is_empty()
                         || instruction.safepoint.is_some()
                         || instruction.control != ControlFlow::None
                     {
@@ -2321,7 +2545,7 @@ impl InstructionSequence {
                             || self.representations[operand.value.0 as usize] != *repr
                     }) || instruction.clobbers
                         != target_spec.clobbers(TargetClobberSet::PropertyStore)
-                        || instruction.deopt.is_some()
+                        || !instruction.exits.is_empty()
                         || instruction.safepoint.is_some()
                         || instruction.control != ControlFlow::None
                     {
@@ -2334,7 +2558,7 @@ impl InstructionSequence {
                 ) && (!instruction.operands.is_empty()
                     || !instruction.clobbers.is_empty()
                     || instruction.safepoint.is_some()
-                    || instruction.deopt.is_some()
+                    || !instruction.exits.is_empty()
                     || instruction.control != ControlFlow::None)
                 {
                     return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2357,14 +2581,14 @@ impl InstructionSequence {
                             == MachineRepresentation::Uint32;
                     let mut deopt_values = std::collections::BTreeSet::new();
                     let metadata_is_exact_deopt = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::deopt(operand.value)
+                        *operand == MachineOperand::frame_value(operand.value)
                             && operand.value != output.value
                             && deopt_values.insert(operand.value)
                     });
                     if !ordinary_signature
                         || !metadata_is_exact_deopt
                         || !deopt_values.contains(&input.value)
-                        || instruction.deopt.is_none()
+                        || instruction.exits.is_empty()
                         || instruction.safepoint.is_some()
                         || instruction.clobbers
                             != target_spec.clobbers(TargetClobberSet::FloatElementIndex)
@@ -2427,7 +2651,7 @@ impl InstructionSequence {
                     .then_some(payload.value);
                     let mut deopt_values = std::collections::BTreeSet::new();
                     let metadata_is_exact_deopt = metadata.iter().all(|operand| {
-                        *operand == MachineOperand::deopt(operand.value)
+                        *operand == MachineOperand::frame_value(operand.value)
                             && Some(operand.value) != output
                             && deopt_values.insert(operand.value)
                     });
@@ -2445,7 +2669,7 @@ impl InstructionSequence {
                             instruction.opcode,
                             MachineOpcode::PackedDoubleElementStore { .. }
                         ) && !deopt_values.contains(&semantic_payload))
-                        || instruction.deopt.is_none()
+                        || instruction.exits.is_empty()
                         || instruction.safepoint.is_some()
                         || instruction.clobbers != expected_clobbers
                     {
@@ -2476,7 +2700,7 @@ impl InstructionSequence {
                             == Some(&MachineRepresentation::Boolean)
                         && instruction.clobbers.is_empty()
                         && instruction.safepoint.is_none()
-                        && instruction.deopt.is_none()
+                        && instruction.exits.is_empty()
                         && instruction.control == ControlFlow::None
                         && derived_this::probe_cfg_is_valid(
                             self,
@@ -2512,7 +2736,7 @@ impl InstructionSequence {
                                 && descriptor.safepoint == SafepointKind::None
                                 && instruction.operands.is_empty()
                                 && instruction.safepoint.is_none()
-                                && instruction.deopt.is_none()
+                                && instruction.exits.is_empty()
                         }
                         CallTarget::RuntimeStub(_) => true,
                         CallTarget::LiteralAllocation { target, .. } => {
@@ -2536,7 +2760,7 @@ impl InstructionSequence {
                                 && descriptor.exceptional == ExceptionalEdge::None
                                 && descriptor.safepoint == SafepointKind::Gc
                                 && instruction.safepoint.is_some()
-                                && instruction.deopt.is_none()
+                                && instruction.exits.is_empty()
                         }
                         CallTarget::NativeLeaf { .. } => {
                             native_leaf::is_valid(target_spec, descriptor, instruction)
@@ -2597,7 +2821,7 @@ impl InstructionSequence {
                                 && descriptor.clobbers
                                     == target_spec.clobbers(TargetClobberSet::ScalarCall)
                                 && descriptor.safepoint == SafepointKind::Gc
-                                && instruction.deopt.is_none()
+                                && instruction.exits.is_empty()
                                 && inputs.len() == semantic_arity
                                 && (!named_property || self.instructions[..id.0 as usize].iter().any(|producer|
                                     (if named_store { matches!(producer.opcode, MachineOpcode::PropertyStore { .. }) } else { matches!(producer.opcode, MachineOpcode::PropertyLoad { .. }) })
@@ -2659,11 +2883,17 @@ impl InstructionSequence {
                                 && descriptor.effects == CallEffects::PURE
                                 && descriptor.clobbers.is_empty()
                                 && descriptor.safepoint == SafepointKind::None
-                                && instruction.deopt.is_some()
+                                && !instruction.exits.is_empty()
                         }
                     };
                     if !valid_target {
                         return Err(VerificationError::InvalidCallTarget(id));
+                    }
+                    if !state_valid {
+                        return Err(VerificationError::InvalidFrameState(
+                            id,
+                            instruction.frame_state,
+                        ));
                     }
                     let inputs = instruction
                         .operands
@@ -2725,7 +2955,7 @@ impl InstructionSequence {
                         return Err(VerificationError::InvalidMetadataOperand(id, operand.value));
                     }
                     match operand.purpose {
-                        OperandPurpose::TaggedRoot
+                        OperandPurpose::TaggedRoot | OperandPurpose::RuntimeRoot
                             if representation != MachineRepresentation::Tagged =>
                         {
                             return Err(VerificationError::InvalidRootRepresentation(
@@ -2741,12 +2971,14 @@ impl InstructionSequence {
                                 operand.value,
                             ));
                         }
-                        OperandPurpose::TaggedRoot | OperandPurpose::CellRoot
+                        OperandPurpose::TaggedRoot
+                        | OperandPurpose::RuntimeRoot
+                        | OperandPurpose::CellRoot
                             if instruction.safepoint.is_none() =>
                         {
                             return Err(VerificationError::RootWithoutSafepoint(id));
                         }
-                        OperandPurpose::Deopt if instruction.deopt.is_none() => {
+                        OperandPurpose::FrameState if instruction.exits.is_empty() => {
                             return Err(VerificationError::DeoptWithoutExit(id));
                         }
                         _ => {}
@@ -2758,6 +2990,14 @@ impl InstructionSequence {
             return Err(VerificationError::NonContiguousBlocks(MachineBlock(
                 self.blocks.len() as u32,
             )));
+        }
+        for (expected, exit) in deopts.into_iter().enumerate() {
+            if exit.0 != expected as u32 {
+                return Err(VerificationError::NonDenseExitId {
+                    expected: expected as u32,
+                    actual: exit.0,
+                });
+            }
         }
         Ok(())
     }
@@ -2772,6 +3012,30 @@ impl InstructionSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selectors_do_not_maintain_independent_tagged_root_lists() {
+        for (name, source) in [
+            ("numeric/mod.rs", include_str!("numeric/mod.rs")),
+            ("numeric/arm64.rs", include_str!("numeric/arm64.rs")),
+            (
+                "numeric/property_cfg.rs",
+                include_str!("numeric/property_cfg.rs"),
+            ),
+            (
+                "numeric/inline_reentry.rs",
+                include_str!("numeric/inline_reentry.rs"),
+            ),
+        ] {
+            let production = source
+                .rsplit_once("#[cfg(test)]\nmod tests")
+                .map_or(source, |(production, _)| production);
+            assert!(
+                !production.contains("MachineOperand::tagged_root"),
+                "{name} must leave ordinary root derivation to InstructionSequence completion"
+            );
+        }
+    }
 
     fn committed_runtime_sequence(semantic_arity: u8) -> InstructionSequence {
         assert!(semantic_arity <= 2);
@@ -2801,6 +3065,9 @@ mod tests {
             .clobbers(TargetClobberSet::ScalarCall)
             .to_vec();
         call.safepoint = Some(SafepointId(0));
+        call.frame_state = Some(0);
+        call.frame_state = Some(0);
+        call.frame_state = Some(0);
         instructions.push(call);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
@@ -2814,7 +3081,7 @@ mod tests {
             .union(CallEffects::REENTRANT);
         let instruction_count = instructions.len() as u32;
 
-        InstructionSequence::new(
+        InstructionSequence::new_with_frame_states(
             &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; usize::from(semantic_arity) + 1],
@@ -2833,6 +3100,19 @@ mod tests {
                     .to_vec(),
                 exceptional: ExceptionalEdge::Propagate,
                 safepoint: SafepointKind::Gc,
+            }],
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 41,
+                    entry: None,
+                    slots: inputs
+                        .iter()
+                        .copied()
+                        .map(MachineFrameSlot::Value)
+                        .collect(),
+                }]),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -2941,17 +3221,27 @@ mod tests {
             .clobbers(TargetClobberSet::ScalarCall)
             .to_vec();
         call.safepoint = Some(SafepointId(0));
+        call.frame_state = Some(0);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
             vec![MachineOperand::register_input(unrelated)],
         );
         ret.control = ControlFlow::Return;
         let descriptor = committed_runtime_sequence(0).call_descriptors[0].clone();
-        let sequence = InstructionSequence::new(
+        let sequence = InstructionSequence::new_with_frame_states(
             &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; 2],
             vec![descriptor],
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 41,
+                    entry: None,
+                    slots: Box::new([MachineFrameSlot::Value(unrelated)]),
+                }]),
+            }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
                 end: MachineInstructionId(3),
@@ -3023,6 +3313,7 @@ mod tests {
             .clobbers(TargetClobberSet::ScalarCall)
             .to_vec();
         call.safepoint = Some(SafepointId(0));
+        call.frame_state = Some(0);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
             vec![MachineOperand::register_input(unrelated)],
@@ -3034,6 +3325,15 @@ mod tests {
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; 2],
             vec![committed_runtime_sequence(0).call_descriptors[0].clone()],
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 41,
+                    entry: None,
+                    slots: Box::new([MachineFrameSlot::Value(unrelated)]),
+                }]),
+            }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
                 end: MachineInstructionId(3),
@@ -3118,7 +3418,7 @@ mod tests {
         );
 
         let mut local_replay = committed_runtime_sequence(2);
-        local_replay.instructions[call_id.0 as usize].deopt = Some(DeoptId(0));
+        local_replay.instructions[call_id.0 as usize].set_test_exit(DeoptId(0), 0);
         assert_eq!(
             local_replay.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
@@ -3206,51 +3506,64 @@ mod tests {
                 MachineOperand::location_input(receiver),
                 MachineOperand::location_input(index),
                 MachineOperand::register_output(result),
-                MachineOperand::deopt(receiver),
-                MachineOperand::deopt(index),
+                MachineOperand::frame_value(receiver),
+                MachineOperand::frame_value(index),
             ],
         );
         load.clobbers = TargetSpec::aarch64()
             .clobbers(TargetClobberSet::Element)
             .to_vec();
-        load.deopt = Some(DeoptId(0));
+        load.set_test_exit(DeoptId(0), 0);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
             vec![MachineOperand::register_input(result)],
         );
         ret.control = ControlFlow::Return;
-        let mut sequence = InstructionSequence::new_with_packed_double_view_caches(
-            &TargetSpec::aarch64(),
-            MachineBlock(0),
-            vec![
-                MachineRepresentation::Tagged,
-                MachineRepresentation::Uint32,
-                MachineRepresentation::Float64,
-            ],
-            Vec::new(),
-            vec![MachineBlockData {
-                first: MachineInstructionId(0),
-                end: MachineInstructionId(4),
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                successor_arguments: Vec::new(),
-            }],
-            vec![
-                MachineInstruction::plain(
-                    MachineOpcode::EntryValue(0),
-                    vec![MachineOperand::register_output(receiver)],
-                ),
-                MachineInstruction::plain(
-                    MachineOpcode::IntegerConstant(0),
-                    vec![MachineOperand::register_output(index)],
-                ),
-                load,
-                ret,
-            ],
-            1,
-        )
-        .expect("cached packed load");
+        let mut sequence =
+            InstructionSequence::new_with_frame_states_and_packed_double_view_caches(
+                &TargetSpec::aarch64(),
+                MachineBlock(0),
+                vec![
+                    MachineRepresentation::Tagged,
+                    MachineRepresentation::Uint32,
+                    MachineRepresentation::Float64,
+                ],
+                Vec::new(),
+                vec![MachineFrameState {
+                    id: 0,
+                    frames: Box::new([otter_vm::deopt::DeoptFrame {
+                        function_id: 0,
+                        byte_pc: 24,
+                        entry: None,
+                        slots: Box::new([
+                            MachineFrameSlot::Value(receiver),
+                            MachineFrameSlot::Value(index),
+                        ]),
+                    }]),
+                }],
+                vec![MachineBlockData {
+                    first: MachineInstructionId(0),
+                    end: MachineInstructionId(4),
+                    predecessors: Vec::new(),
+                    successors: Vec::new(),
+                    parameters: Vec::new(),
+                    successor_arguments: Vec::new(),
+                }],
+                vec![
+                    MachineInstruction::plain(
+                        MachineOpcode::EntryValue(0),
+                        vec![MachineOperand::register_output(receiver)],
+                    ),
+                    MachineInstruction::plain(
+                        MachineOpcode::IntegerConstant(0),
+                        vec![MachineOperand::register_output(index)],
+                    ),
+                    load,
+                    ret,
+                ],
+                1,
+            )
+            .expect("cached packed load");
         sequence.instructions[2].opcode = MachineOpcode::PackedDoubleElementLoad {
             byte_pc: 24,
             cache: PackedDoubleViewCacheId::new(1),
@@ -3270,17 +3583,26 @@ mod tests {
     ) -> InstructionSequence {
         let input = MachineValue(0);
         let result = MachineValue(1);
-        checked.deopt = Some(DeoptId(0));
+        checked.set_test_exit(DeoptId(0), 0);
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
             vec![MachineOperand::register_input(result)],
         );
         ret.control = ControlFlow::Return;
-        InstructionSequence::new(
+        InstructionSequence::new_with_frame_states(
             &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged, result_representation],
             Vec::new(),
+            vec![MachineFrameState {
+                id: 0,
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 0,
+                    byte_pc: 0,
+                    entry: None,
+                    slots: Box::new([MachineFrameSlot::Value(input)]),
+                }]),
+            }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
                 end: MachineInstructionId(3),
@@ -3313,7 +3635,7 @@ mod tests {
             vec![
                 MachineOperand::register_input(input),
                 MachineOperand::register_output(result),
-                MachineOperand::deopt(input),
+                MachineOperand::frame_value(input),
             ],
         );
         compare.clobbers = TargetSpec::aarch64()

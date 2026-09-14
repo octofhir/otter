@@ -2,13 +2,14 @@
 //!
 //! # Contents
 //! - Property, element and global load/store completions.
-//! - Inline-cache cell fills and the write barrier.
+//! - CodeBlock feedback installation and the write barrier.
 //!
 //! # Invariants
 //! - Every entry completes the whole observable operation, so a miss never
 //!   leaves a half-performed effect for the interpreter to finish.
-//! - Validated store IC hits commit directly; canonical `[[Set]]` resolution
-//!   runs only on a miss. Allocation failure is fatal to the current probe.
+//! - Validated CodeBlock CacheIR hits commit directly; canonical `[[Set]]`
+//!   resolution runs only on a miss. New programs affect later immutable
+//!   compile snapshots, never an already-published code object.
 //! - Named-property operands live in the shared handle arena. Scope exit
 //!   restores its depth, and every post-allocation read resolves the live slot.
 //!
@@ -18,9 +19,9 @@
 
 use crate::activation_stack::ActivationStack;
 use crate::{
-    ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, JsObject, Value, VmError,
-    VmPropertyKey, cache_ir, object, property_atom::AtomizedPropertyKey,
-    property_ic::PropertyIcKind, read_register, rooting::RootScopeExt, value_kind_name,
+    ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError, VmPropertyKey,
+    cache_ir, object, property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind,
+    read_register, rooting::RootScopeExt, value_kind_name,
 };
 use otter_bytecode::Op;
 
@@ -78,8 +79,7 @@ impl Interpreter {
     /// instruction, property name, and feedback site. The shared handle arena
     /// roots the receiver across IC setup, moving collection and synchronous
     /// accessor/proxy reentry. The result is returned without another GC-capable
-    /// operation, alongside an optional WhiskerIC program; no outcome requests
-    /// replay.
+    /// operation; no outcome requests replay.
     pub fn jit_runtime_load_property_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -87,7 +87,7 @@ impl Interpreter {
         function_id: u32,
         instruction_pc: u32,
         mut receiver: Value,
-    ) -> Result<(Value, Option<crate::jit::JitPropertyIcWay>), VmError> {
+    ) -> Result<Value, VmError> {
         let (atomized_key, slot) =
             named_property_site(context, function_id, instruction_pc, Op::LoadProperty)?;
         self.record_jit_runtime_property_stub();
@@ -99,7 +99,7 @@ impl Interpreter {
         // only serve cache-representable ordinary-object loads.
         let Some(obj) = receiver.as_object() else {
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
-            return Ok((result, None));
+            return Ok(result);
         };
         if slot.is_megamorphic() {
             // A saturated site still reads one slot per receiver class. The
@@ -108,10 +108,10 @@ impl Interpreter {
             if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
                 slot.record_hit();
                 let result = resolved.value;
-                return Ok((result, None));
+                return Ok(result);
             }
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
-            return Ok((result, None));
+            return Ok(result);
         }
         if let Some(value) = slot.probe_load(obj, &self.gc_heap, atomized_key) {
             slot.record_hit();
@@ -119,9 +119,8 @@ impl Interpreter {
             // allocation may legally alias `dst` with `obj_reg` (common in an
             // optimizing OSR transition). Reading the receiver after the write
             // would then inspect the loaded property value as an object.
-            let fill = self.whisker_load_cell_fill(slot, obj, atomized_key);
             let result = value;
-            return Ok((result, fill));
+            return Ok(result);
         }
         if slot.entry_count() > 0 {
             slot.record_guard_miss();
@@ -145,18 +144,13 @@ impl Interpreter {
                 );
                 slot.install(ic);
             }
-            let current_obj = self
-                .escape_scoped(receiver_root)
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?;
-            let fill = self.whisker_load_cell_fill(slot, current_obj, atomized_key);
             let result = resolved.value;
-            return Ok((result, fill));
+            return Ok(result);
         }
         // Not cache-representable (accessor, deep prototype, absent):
         // complete the load in place through the full cascade.
         let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
-        Ok((result, None))
+        Ok(result)
     }
 
     /// Complete the exact published `StoreProperty` over boxed receiver/value
@@ -165,7 +159,7 @@ impl Interpreter {
     /// Instruction metadata is decoded from `function_id` and logical PC.
     /// Both operands remain rooted across shape work, moving collection, and
     /// setter/proxy reentry. Success means the store committed exactly once and
-    /// optionally returns an inline WhiskerIC program.
+    /// and updates only the CodeBlock-owned CacheIR feedback.
     pub fn jit_runtime_store_property_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -174,7 +168,7 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
-    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+    ) -> Result<(), VmError> {
         if self.jit_debug_request().events_enabled() {
             self.complete_named_store::<true>(
                 stack,
@@ -206,7 +200,7 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
-    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+    ) -> Result<(), VmError> {
         let (atomized_key, slot) =
             named_property_site(context, function_id, instruction_pc, Op::StoreProperty)?;
         self.record_jit_runtime_property_stub();
@@ -228,7 +222,7 @@ impl Interpreter {
                     value,
                     strict,
                 )?;
-                return Ok(None);
+                return Ok(());
             };
             if !object::supports_fast_property_ic(obj, &self.gc_heap) {
                 path = Path::UnsupportedReceiver;
@@ -240,7 +234,7 @@ impl Interpreter {
                     value,
                     strict,
                 )?;
-                return Ok(None);
+                return Ok(());
             }
             let entries_len = slot.entry_count();
             // An installed stub's guards are the authority for its own outcome
@@ -254,12 +248,8 @@ impl Interpreter {
                     .escape_scoped(receiver_root)
                     .as_object()
                     .ok_or(VmError::InvalidOperand)?;
-                return Ok(self.whisker_store_cell_fill(
-                    slot,
-                    current_obj,
-                    &self.gc_heap,
-                    atomized_key,
-                ));
+                let _ = current_obj;
+                return Ok(());
             }
             if entries_len > 0 {
                 slot.record_guard_miss();
@@ -284,7 +274,7 @@ impl Interpreter {
                     value,
                     strict,
                 )?;
-                return Ok(None);
+                return Ok(());
             }
             // Canonical resolution above proved an ordinary data assignment. Only
             // now may the cache install a writable existing slot or capture the
@@ -305,12 +295,7 @@ impl Interpreter {
                 {
                     path = Path::InstallExisting;
                     slot.install(ic);
-                    return Ok(self.whisker_store_cell_fill(
-                        slot,
-                        current_obj,
-                        &self.gc_heap,
-                        atomized_key,
-                    ));
+                    return Ok(());
                 }
 
                 // Shape interning and slab preparation may collect. The helper
@@ -324,16 +309,7 @@ impl Interpreter {
                     &value,
                 )? {
                     slot.install(cache_ir::CacheStub::store_transition(transition));
-                    let current_obj = self
-                        .escape_scoped(receiver_root)
-                        .as_object()
-                        .ok_or(VmError::InvalidOperand)?;
-                    return Ok(self.whisker_store_cell_fill(
-                        slot,
-                        current_obj,
-                        &self.gc_heap,
-                        atomized_key,
-                    ));
+                    return Ok(());
                 }
             }
 
@@ -351,7 +327,7 @@ impl Interpreter {
                     format!("Cannot assign to property '{}'", atomized_key.name()),
                 )?;
             }
-            Ok(None)
+            Ok(())
         })();
         if CAPTURE {
             self.jit_debug.record_property_store(
@@ -359,22 +335,11 @@ impl Interpreter {
                 instruction_pc,
                 path,
                 result.is_err(),
-                matches!(result, Ok(Some(_))),
+                matches!(path, Path::InstallExisting | Path::InstallTransition),
                 || atomized_key.name().to_owned(),
             );
         }
         result
-    }
-
-    /// This load site's cache program lowered for inline execution, or `None`
-    /// to leave the access on the stub.
-    pub(crate) fn whisker_load_cell_fill(
-        &self,
-        slot: crate::feedback::PropertyFeedbackSlot<'_>,
-        obj: JsObject,
-        atomized_key: AtomizedPropertyKey<'_>,
-    ) -> Option<crate::jit::JitPropertyIcWay> {
-        slot.whisker_fill(obj, &self.gc_heap, atomized_key)
     }
 
     /// Complete one computed `[[Get]]` from boxed values owned by generated
@@ -675,16 +640,6 @@ impl Interpreter {
     /// add-transition program additionally names immutable parent/child shapes
     /// and the complete null/direct-terminal-prototype proof; anything that may
     /// allocate or observe user code stays on the stub.
-    pub(crate) fn whisker_store_cell_fill(
-        &self,
-        slot: crate::feedback::PropertyFeedbackSlot<'_>,
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        atomized_key: AtomizedPropertyKey<'_>,
-    ) -> Option<crate::jit::JitPropertyIcWay> {
-        slot.whisker_fill(obj, heap, atomized_key)
-    }
-
     /// Run the GC write barrier after an inline pointer-valued property store.
     ///
     /// Parent and child are read through the canonical activation. The

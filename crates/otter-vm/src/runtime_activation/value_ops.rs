@@ -524,7 +524,7 @@ impl RuntimeCall<'_> {
         function_id: u32,
         instruction_pc: u32,
         receiver: Value,
-    ) -> Result<(Value, Option<crate::jit::JitPropertyIcWay>), VmError> {
+    ) -> Result<Value, VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
@@ -533,15 +533,14 @@ impl RuntimeCall<'_> {
 
     /// Complete the named-property write identified by its explicit source site.
     ///
-    /// Success means the complete store committed exactly once and returns an
-    /// optional inline-cache program for the compiler-owned cell.
+    /// Success means the complete store committed exactly once.
     pub fn store_property_value(
         &mut self,
         function_id: u32,
         instruction_pc: u32,
         receiver: Value,
         value: Value,
-    ) -> Result<Option<crate::jit::JitPropertyIcWay>, VmError> {
+    ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = unsafe { self.context.as_ref() };
@@ -896,35 +895,28 @@ mod tests {
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .expect("stack-owned runtime call");
-        let (y, _) = call
+        let y = call
             .load_property_value(0, call.pc(), receiver)
             .expect("pc 1 selects y");
         assert_eq!(y.as_i32(), Some(22));
 
-        let (x, _) = call
+        let x = call
             .load_property_value(0, 0, receiver)
             .expect("pc 0 selects x");
         assert_eq!(x.as_i32(), Some(11));
         assert_eq!(call.pc(), 1, "source lookup must not mutate the caller PC");
-        let (_, fill) = call
-            .load_property_value(0, 0, receiver)
-            .expect("warmed x load");
-        assert!(fill.is_some(), "warmed own-data load should seed the cell");
+        call.load_property_value(0, 0, receiver)
+            .expect("warmed x load updates CodeBlock CacheIR");
 
         call.set_pc(2);
         call.store_property_value(0, call.pc(), receiver, Value::number_i32(33))
             .expect("pc 2 selects x store");
-        assert!(
-            call.store_property_value(0, call.pc(), receiver, Value::number_i32(33))
-                .expect("warmed x store")
-                .is_some(),
-            "ordinary existing-slot store should seed the cell"
-        );
+        call.store_property_value(0, call.pc(), receiver, Value::number_i32(33))
+            .expect("warmed x store updates CodeBlock CacheIR");
         call.set_pc(0);
         assert_eq!(
             call.load_property_value(0, call.pc(), receiver)
                 .expect("updated x")
-                .0
                 .as_i32(),
             Some(33)
         );
@@ -1115,24 +1107,10 @@ mod tests {
                 RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
             }
             .expect("stack-owned runtime call");
-            let first_way = call
-                .store_property_value(0, call.pc(), registers[0], Value::number_i32(11))
-                .expect("first canonical transition")
-                .expect("inline transition way");
-            assert!(first_way.is_add_transition());
-            assert_eq!(first_way.receiver_shape, parent_shape);
-            assert_ne!(first_way.transition_shape, 0);
-            assert_eq!(
-                first_way.value_byte,
-                std::mem::size_of::<Value>() as u32,
-                "the transition appends after the shared anchor slot"
-            );
-
-            let second_way = call
-                .store_property_value(0, call.pc(), registers[1], Value::number_i32(22))
-                .expect("installed VM transition replay")
-                .expect("replayed transition way");
-            assert_eq!(second_way, first_way);
+            call.store_property_value(0, call.pc(), registers[0], Value::number_i32(11))
+                .expect("first canonical transition");
+            call.store_property_value(0, call.pc(), registers[1], Value::number_i32(22))
+                .expect("installed VM transition replay");
         }
         assert_eq!(
             crate::object::get_own(
@@ -1258,21 +1236,10 @@ mod tests {
                 RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame))
             }
             .expect("stack-owned transition call");
-            let first_way = call
-                .store_property_value(0, call.pc(), registers[0], registers[2])
+            call.store_property_value(0, call.pc(), registers[0], registers[2])
                 .expect("first canonical Cell store");
-            assert_eq!(
-                first_way, None,
-                "dictionary-shaped Object.prototype has no complete native absence guard"
-            );
-
-            let second_way = call
-                .store_property_value(0, call.pc(), registers[1], registers[3])
+            call.store_property_value(0, call.pc(), registers[1], registers[3])
                 .expect("second canonical Cell store");
-            assert_eq!(
-                second_way, None,
-                "each default-prototype peer remains on the canonical store boundary"
-            );
         }
         vm.jit_pop_native_activation();
 
@@ -1340,13 +1307,6 @@ mod tests {
                 Some(prototype),
             );
         }
-        let prototype_shape = crate::object::shape(
-            prototype.as_object().expect("prototype object"),
-            vm.gc_heap(),
-        )
-        .offset();
-        assert_ne!(prototype_shape, 0);
-
         let mut stack = ActivationStack::new();
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
         let mut registers = [prototype, first, second, Value::undefined()];
@@ -1367,17 +1327,10 @@ mod tests {
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .expect("stack-owned runtime call");
-        let first_way = call
-            .store_property_value(0, call.pc(), registers[1], Value::number_i32(7))
-            .expect("first direct-prototype transition")
-            .expect("direct-prototype transition way");
-        assert!(first_way.is_add_transition());
-        assert_eq!(first_way.holder_shape, prototype_shape);
-        let second_way = call
-            .store_property_value(0, call.pc(), registers[2], Value::number_i32(9))
-            .expect("transition replay")
-            .expect("replayed direct-prototype way");
-        assert_eq!(second_way, first_way);
+        call.store_property_value(0, call.pc(), registers[1], Value::number_i32(7))
+            .expect("first direct-prototype transition");
+        call.store_property_value(0, call.pc(), registers[2], Value::number_i32(9))
+            .expect("transition replay");
     }
 
     #[test]

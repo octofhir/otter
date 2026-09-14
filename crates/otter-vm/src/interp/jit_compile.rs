@@ -221,43 +221,52 @@ impl Interpreter {
             inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
         };
         self.push_reserved_jit_debug_event(event);
-        self.record_settled_property_sites(fid, tier, view);
+        self.record_property_cache_ir_sites(fid, tier, view);
     }
 
-    /// Report the guard chain every settled property site in `view` carries.
+    /// Report every immutable CacheIR program bank in `view`.
     ///
     /// Emitted once per baked snapshot, immediately after the prepare event, so
-    /// a report reads as: this function, this tier, these sites lower without
-    /// their cache cells and these are the ways each one must distinguish.
-    fn record_settled_property_sites(
+    /// a report reads as: this function, this tier, these sites lower to
+    /// first-class guards/effects and these are their entry shapes/fields.
+    fn record_property_cache_ir_sites(
         &mut self,
         fid: u32,
         tier: jit_debug::JitDebugTier,
         view: &jit::JitCompileSnapshot,
     ) {
-        let sites = view
-            .property_loads
-            .iter()
-            .map(|entry| (jit_debug::JitDebugPropertyAccess::Load, entry))
-            .chain(
-                view.property_stores
-                    .iter()
-                    .map(|entry| (jit_debug::JitDebugPropertyAccess::Store, entry)),
-            );
-        for (access, (&byte_pc, chain)) in sites {
+        for (&byte_pc, programs) in &view.property_programs {
             if !self.reserve_jit_debug_event() {
                 return;
             }
-            self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::PropertySiteSettled {
+            let access = if programs.iter().any(|program| {
+                program
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, jit::JitCacheIrOp::StoreField { .. }))
+            }) {
+                jit_debug::JitDebugPropertyAccess::Store
+            } else {
+                jit_debug::JitDebugPropertyAccess::Load
+            };
+            self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::PropertyCacheIrSite {
                 function_id: fid,
                 tier,
                 byte_pc,
                 access,
-                ways: chain
+                programs: programs
                     .iter()
-                    .map(|way| jit_debug::JitDebugPropertyWay {
-                        shape: way.receiver_shape,
-                        value_byte: way.value_byte,
+                    .filter_map(|program| {
+                        let shape = program.ops.iter().find_map(|op| match op {
+                            jit::JitCacheIrOp::GuardShape { shape, .. } => Some(*shape),
+                            _ => None,
+                        })?;
+                        let value_byte = program.ops.iter().find_map(|op| match op {
+                            jit::JitCacheIrOp::LoadField { value_byte, .. }
+                            | jit::JitCacheIrOp::StoreField { value_byte, .. } => Some(*value_byte),
+                            _ => None,
+                        })?;
+                        Some(jit_debug::JitDebugPropertyProgram { shape, value_byte })
                     })
                     .collect(),
             });
@@ -465,7 +474,7 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
-        self.bake_property_loads(&mut snapshot);
+        self.bake_property_cache_ir(&mut snapshot);
         self.bake_constructor_field_transitions(&mut snapshot);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
@@ -665,7 +674,7 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut view);
         self.bake_element_accesses(&mut view);
-        self.bake_property_loads(&mut view);
+        self.bake_property_cache_ir(&mut view);
         self.bake_constructor_field_transitions(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
@@ -747,16 +756,8 @@ impl Interpreter {
         view.cage_base = otter_gc::cage_base() as usize;
     }
 
-    /// Describe every property load and store site whose receiver shape has
-    /// settled.
-    ///
-    /// The site's own-data feedback is the declaration: a shape handle and a
-    /// slot. Generated code then compares against that shape as an immediate
-    /// and reads a fixed slab offset, so the settled site never loads its
-    /// cache cell or walks the cell's ways. A receiver that stops matching
-    /// misses to the same window transition, which re-patches the cell.
-    pub(crate) fn bake_property_loads(&mut self, view: &mut jit::JitCompileSnapshot) {
-        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
+    /// Snapshot complete CodeBlock-owned CacheIR programs for native lowering.
+    pub(crate) fn bake_property_cache_ir(&mut self, view: &mut jit::JitCompileSnapshot) {
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -786,32 +787,15 @@ impl Interpreter {
             else {
                 continue;
             };
-            let Some(slots) = slot.settled_property_slots() else {
-                continue;
-            };
-            let slot_count = slots.len();
-            // Every installed program must lower, or the chain would silently
-            // drop a shape the site really sees and send it to the transition.
-            let chain: Vec<_> = slots
-                .into_iter()
-                .filter_map(|(shape_id, shape_offset, slot)| {
-                    let live = self.shape_runtime.handle_for_id(shape_id)?;
-                    (live.offset() == shape_offset).then_some(jit::JitInlinePropertyLoad {
-                        receiver_shape: shape_offset,
-                        value_byte: u32::from(slot) * SLOT_BYTES,
-                    })
-                })
-                .collect();
-            if chain.len() != slot_count || chain.is_empty() {
-                continue;
-            }
-            if op == Op::LoadProperty {
-                view.property_loads.insert(byte_pc, chain);
-            } else {
-                view.property_stores.insert(byte_pc, chain);
+            if let Some(programs) = slot.jit_programs(|shape_id| {
+                self.shape_runtime
+                    .handle_for_id(shape_id)
+                    .map(|shape| shape.offset())
+                    .filter(|&offset| offset != 0)
+            }) {
+                view.property_programs.insert(byte_pc, programs);
             }
         }
-        self.bake_prototype_loads(view);
     }
 
     /// Publish exact constructor field transitions learned during rooted
@@ -854,55 +838,6 @@ impl Interpreter {
                     ))
                 })
                 .collect();
-        }
-    }
-
-    /// Describe every load site whose programs all reach their slot through the
-    /// receiver's prototype.
-    ///
-    /// The receiver's shape decides which prototype the hop lands on and the
-    /// holder's shape decides where the slot is, so both are compile-time
-    /// constants and the site needs no cache cell. A shape that has since moved
-    /// on drops its way, and a site that loses every way keeps its cell.
-    fn bake_prototype_loads(&mut self, view: &mut jit::JitCompileSnapshot) {
-        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
-        let sites: Vec<_> = view
-            .instructions
-            .iter()
-            .filter(|instr| instr.op(&view.code_block) == Op::LoadProperty)
-            .filter(|instr| !instr.load_array_length)
-            .map(|instr| (instr.byte_pc, instr.instruction_pc(&view.code_block)))
-            .collect();
-        for (byte_pc, instruction_pc) in sites {
-            if view.property_loads.contains_key(&byte_pc) {
-                continue;
-            }
-            let Some(slot) = view.code_block.property_feedback_at(
-                instruction_pc as usize,
-                crate::property_ic::PropertyIcKind::Load,
-            ) else {
-                continue;
-            };
-            let Some(slots) = slot.settled_prototype_slots() else {
-                continue;
-            };
-            let chain: Vec<_> = slots
-                .into_iter()
-                .filter_map(|(receiver_id, holder_id, holder_offset, slot)| {
-                    let receiver = self.shape_runtime.handle_for_id(receiver_id)?;
-                    let holder = self.shape_runtime.handle_for_id(holder_id)?;
-                    (holder.offset() == holder_offset && receiver.offset() != 0).then_some(
-                        jit::JitInlinePropertyHop {
-                            receiver_shape: receiver.offset(),
-                            holder_shape: holder_offset,
-                            value_byte: u32::from(slot) * SLOT_BYTES,
-                        },
-                    )
-                })
-                .collect();
-            if !chain.is_empty() {
-                view.property_prototype_loads.insert(byte_pc, chain);
-            }
         }
     }
 
@@ -1595,7 +1530,7 @@ impl Interpreter {
             self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
             self.bake_guarded_method_calls(&mut body);
             self.bake_element_accesses(&mut body);
-            self.bake_property_loads(&mut body);
+            self.bake_property_cache_ir(&mut body);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
         })();

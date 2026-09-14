@@ -325,7 +325,7 @@ impl CodeBlock {
             element_accesses: rustc_hash::FxHashMap::default(),
             string_layout: crate::jit::JitStringLayout::default(),
             // `#[repr(C)]` constant: offset from the decompressed object
-            // pointer to its shape handle, for the WhiskerIC load-cell guard.
+            // pointer to its shape handle for native CacheIR guards.
             object_shape_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
             object_dictionary_shape_id_byte: otter_gc::header::HEADER_SIZE as u32
@@ -498,11 +498,9 @@ impl CodeBlock {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
-            property_loads: rustc_hash::FxHashMap::default(),
-            property_stores: rustc_hash::FxHashMap::default(),
+            property_programs: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
-            property_prototype_loads: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }

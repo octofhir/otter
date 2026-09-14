@@ -729,7 +729,7 @@ pub(super) struct NumericBlock {
 pub(super) struct NumericFunction {
     pub(super) function_id: u32,
     pub(super) nodes: Vec<NumericNode>,
-    pub(super) property_sites: BTreeMap<NumericValue, super::super::MachinePropertySite>,
+    pub(super) property_sites: BTreeMap<NumericValue, super::super::MachineCacheIrSite>,
     pub(super) constructor_field_sites:
         BTreeMap<NumericValue, (u32, otter_vm::jit::JitConstructorFieldTransition)>,
     pub(super) blocks: Vec<NumericBlock>,
@@ -1360,7 +1360,7 @@ impl NumericFunction {
                             _ => return None,
                         };
                         Some(
-                            super::super::MachinePropertySite::capture(view, byte_pc, op)
+                            super::super::MachineCacheIrSite::capture(view, byte_pc, op)
                                 .map(|site| (NumericValue(index), site)),
                         )
                     })
@@ -7028,10 +7028,9 @@ mod tests {
     #[test]
     fn ordinary_properties_build_without_settled_metadata_and_keep_exact_states() {
         let view = property_view();
-        assert!(view.property_loads.is_empty());
-        assert!(view.property_stores.is_empty());
+        assert!(view.property_programs.is_empty());
 
-        let hir = NumericFunction::build(&view).expect("property HIR without settled metadata");
+        let hir = NumericFunction::build(&view).expect("property HIR without CacheIR metadata");
         let receiver = hir
             .nodes
             .iter()

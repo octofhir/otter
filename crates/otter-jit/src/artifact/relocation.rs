@@ -44,7 +44,7 @@ const ITEM_DIRECT_BRANCH: u8 = 2;
 
 const TARGET_RUNTIME_STUB: u8 = 1;
 const TARGET_GC_CAGE_BASE: u8 = 2;
-const TARGET_PROPERTY_IC_CELL: u8 = 3;
+const TARGET_PROPERTY_SOURCE_CELL: u8 = 3;
 const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 4;
 const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
 const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
@@ -52,10 +52,10 @@ const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
 const TARGET_STRING_CONSTANT_CELL: u8 = 12;
 
-/// Whether a property inline-cache cell serves a load or a store site.
+/// Whether a property source-identity cell serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum PropertyIcAccess {
+pub(crate) enum PropertySourceAccess {
     Load,
     Store,
 }
@@ -119,8 +119,8 @@ pub(crate) enum RelocationTarget {
         function_id: u32,
         byte_pc: u32,
     },
-    PropertyIcCell {
-        access: PropertyIcAccess,
+    PropertySourceCell {
+        access: PropertySourceAccess,
         ordinal: u32,
     },
     TemplateOperandSlice {
@@ -1013,11 +1013,11 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *function_id);
             put_u32(output, *byte_pc);
         }
-        RelocationTarget::PropertyIcCell { access, ordinal } => {
-            output.push(TARGET_PROPERTY_IC_CELL);
+        RelocationTarget::PropertySourceCell { access, ordinal } => {
+            output.push(TARGET_PROPERTY_SOURCE_CELL);
             output.push(match access {
-                PropertyIcAccess::Load => 0,
-                PropertyIcAccess::Store => 1,
+                PropertySourceAccess::Load => 0,
+                PropertySourceAccess::Store => 1,
             });
             put_u32(output, *ordinal);
         }
@@ -1411,8 +1411,8 @@ mod tests {
                 signature: "poll1",
             },
             RelocationTarget::GcCageBase,
-            RelocationTarget::PropertyIcCell {
-                access: PropertyIcAccess::Load,
+            RelocationTarget::PropertySourceCell {
+                access: PropertySourceAccess::Load,
                 ordinal: 2,
             },
             RelocationTarget::TemplateOperandSlice {

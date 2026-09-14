@@ -134,7 +134,7 @@ use crate::{
         DirectCallArguments, DirectCallForm, DirectCallSite, GENERATED_POLL_BATCH,
         emit_direct_call_with_access, emit_method_guard_from_tagged_register,
     },
-    artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget},
+    artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
@@ -145,18 +145,17 @@ use crate::{
         MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
         NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET,
-        TransitionTable, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
+        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
+        PropertySourceCell, THREAD_OFFSET, TransitionTable, VALUE_HOLE, VALUE_NULL,
+        VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
         VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, element_access_for, emit_dense_element_view, emit_element_address,
-        emit_element_address_from_dense_view, emit_element_read, emit_element_write,
-        emit_exotic_length_fast, emit_property_ic_load, emit_property_ic_store_guard,
-        emit_property_transition_shape_barrier, emit_settled_property_load,
-        emit_settled_property_store_guard,
+        DenseIndexForm, element_access_for, emit_check_shape_identity, emit_dense_element_view,
+        emit_element_address, emit_element_address_from_dense_view, emit_element_read,
+        emit_element_write, emit_exotic_length_fast, emit_load_header, emit_load_object_header,
+        emit_shape_state_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_initialize_inline_values_ptr,
@@ -1353,8 +1352,8 @@ pub(super) fn emit(
     call_method_value_entry: u64,
     call_with_this_value_entry: u64,
     construct_value_entry: u64,
-    load_ic_cells: &mut [WhiskerIcCell],
-    store_ic_cells: &mut [WhiskerIcCell],
+    load_ic_cells: &mut [PropertySourceCell],
+    store_ic_cells: &mut [PropertySourceCell],
     vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
@@ -2158,221 +2157,401 @@ pub(super) fn emit(
                 integer_register(locations[0])?,
                 integer_register(locations[1])?,
             ),
-            MachineOpcode::PropertyLoad {
-                site: ref property,
-                exotic_length,
+            MachineOpcode::BooleanConstant(value) => {
+                emit_load_u64(&mut ops, 9, u64::from(value));
+                emit_store_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+            }
+            MachineOpcode::BooleanOr => {
+                let left = integer_register(locations[0])?;
+                let right = integer_register(locations[1])?;
+                let output = integer_register(locations[2])?;
+                dynasm!(ops ; .arch aarch64 ; orr W(output), W(left), W(right));
+            }
+            MachineOpcode::TaggedSelect => {
+                let condition = integer_register(locations[0])?;
+                let if_true = integer_register(locations[1])?;
+                let if_false = integer_register(locations[2])?;
+                let output = integer_register(locations[3])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp W(condition), wzr
+                    ; csel X(output), X(if_true), X(if_false), ne
+                );
+            }
+            MachineOpcode::PropertySource {
+                function_id,
+                logical_pc,
+                byte_pc: _,
+                store,
             } => {
-                let byte_pc = property.byte_pc;
-                let logical_pc = property.logical_pc;
-                let cell_ordinal = u32::try_from(next_load_ic)
-                    .map_err(|_| Unsupported::OperandShape("scalar property load IC ordinal"))?;
-                let cell = load_ic_cells
-                    .get_mut(next_load_ic)
-                    .ok_or(Unsupported::OperandShape("scalar property load IC cell"))?;
-                cell.set_source(property.function_id, logical_pc);
-                let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
-                next_load_ic += 1;
-                let start = ops.offset().0;
+                let (cell, ordinal, access) =
+                    if store {
+                        let ordinal = u32::try_from(next_store_ic).map_err(|_| {
+                            Unsupported::OperandShape("scalar property store source ordinal")
+                        })?;
+                        let cell = store_ic_cells.get_mut(next_store_ic).ok_or(
+                            Unsupported::OperandShape("scalar property store source cell"),
+                        )?;
+                        next_store_ic += 1;
+                        (cell, ordinal, PropertySourceAccess::Store)
+                    } else {
+                        let ordinal = u32::try_from(next_load_ic).map_err(|_| {
+                            Unsupported::OperandShape("scalar property load source ordinal")
+                        })?;
+                        let cell = load_ic_cells.get_mut(next_load_ic).ok_or(
+                            Unsupported::OperandShape("scalar property load source cell"),
+                        )?;
+                        next_load_ic += 1;
+                        (cell, ordinal, PropertySourceAccess::Load)
+                    };
+                cell.set_source(function_id, logical_pc);
+                let cell_addr = std::ptr::from_mut::<PropertySourceCell>(cell) as usize;
                 emit_load_symbolic_u64(
                     &mut ops,
                     &mut relocations,
                     9,
                     cell_addr as u64,
-                    RelocationTarget::PropertyIcCell {
-                        access: PropertyIcAccess::Load,
-                        ordinal: cell_ordinal,
-                    },
+                    RelocationTarget::PropertySourceCell { access, ordinal },
                 );
-                emit_store_allocated_tagged(&mut ops, frame, locations[3], 9, 0)?;
-                let completed = ops.new_dynamic_label();
+                emit_store_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+            }
+            MachineOpcode::CacheIrGuardShape { byte_pc, shape } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                let probe_cell = ops.new_dynamic_label();
-                let runtime = ops.new_dynamic_label();
-
-                // Dense-array and primitive-string `.length` values do not
-                // live in an ordinary own-property slab, so no settled shape
-                // chain can describe them. Try that shared exotic program
-                // first. A non-exotic receiver then reloads the same late
-                // allocator location for the ordinary settled proof below.
-                if view.cage_base != 0 && exotic_length {
-                    let have_length = ops.new_dynamic_label();
-                    let not_length = ops.new_dynamic_label();
-                    emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                    emit_exotic_length_fast(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        have_length,
-                        not_length,
-                    );
-                    dynasm!(ops ; .arch aarch64 ; =>have_length);
-                    emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; b =>done
-                        ; =>not_length
-                    );
-                }
-
-                if view.cage_base != 0 && !property.program.is_empty() {
-                    let chain = &property.program;
-                    emit_settled_property_load(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        chain,
-                        |ops, target| {
-                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
-                        },
-                        probe_cell,
-                    )?;
-                    emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>done);
-                }
-
-                // A baked program is only the first way. Its miss walks the
-                // code-owned dynamic cell so a newly observed shape becomes a
-                // generated hit after one canonical runtime completion.
-                dynasm!(ops ; .arch aarch64 ; =>probe_cell);
-                if view.cage_base != 0 {
-                    emit_property_ic_load(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        None,
-                        |ops, target| {
-                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
-                        },
-                        cell_addr,
-                        cell_ordinal,
-                        runtime,
-                    )?;
-                    emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>done);
-                }
-
-                // Miss returns ordinary SSA control to the committed cold block.
-                dynasm!(ops ; .arch aarch64 ; =>runtime);
-                emit_load_u64(&mut ops, 9, VALUE_UNDEFINED);
-                emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                emit_load_u64(&mut ops, 9, 0);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
-                dynasm!(ops ; .arch aarch64 ; b =>completed ; =>done);
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                emit_shape_state_guard(&mut ops, view, 13, miss);
+                emit_check_shape_identity(&mut ops, view, 13, shape, miss);
                 emit_load_u64(&mut ops, 9, 1);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
-                dynasm!(ops ; .arch aarch64 ; =>completed);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
                 structural_regions.push((
-                    "machinePropertyLoad",
+                    "machineCacheIrGuardShape",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::PropertyStore {
-                site: ref property,
-                value_is_non_cell,
+            MachineOpcode::CacheIrGuardAtomSlot {
+                byte_pc,
+                atom: _,
+                value_byte: _,
+                writable: _,
             } => {
-                let byte_pc = property.byte_pc;
-                let logical_pc = property.logical_pc;
-
-                let cell_ordinal = u32::try_from(next_store_ic)
-                    .map_err(|_| Unsupported::OperandShape("scalar property store IC ordinal"))?;
-                let cell = store_ic_cells
-                    .get_mut(next_store_ic)
-                    .ok_or(Unsupported::OperandShape("scalar property store IC cell"))?;
-                cell.set_source(property.function_id, logical_pc);
-                let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
-                next_store_ic += 1;
                 let start = ops.offset().0;
-                emit_load_symbolic_u64(
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_header(
                     &mut ops,
                     &mut relocations,
-                    9,
-                    cell_addr as u64,
-                    RelocationTarget::PropertyIcCell {
-                        access: PropertyIcAccess::Store,
-                        ordinal: cell_ordinal,
-                    },
-                );
-                emit_store_allocated_tagged(&mut ops, frame, locations[3], 9, 0)?;
-                let probe_cell = ops.new_dynamic_label();
-                let commit = ops.new_dynamic_label();
-                let runtime = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                if view.cage_base != 0 && !property.program.is_empty() {
-                    let chain = &property.program;
-                    emit_settled_property_store_guard(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        chain,
-                        |ops, target| {
-                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
-                        },
-                        probe_cell,
-                    )?;
-                    dynasm!(ops ; .arch aarch64 ; mov w16, wzr ; b =>commit);
-                }
-
-                dynasm!(ops ; .arch aarch64 ; =>probe_cell);
-                if view.cage_base != 0 {
-                    emit_property_ic_store_guard(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        None,
-                        |ops, target| {
-                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
-                        },
-                        cell_addr,
-                        cell_ordinal,
-                        runtime,
-                    )?;
-                    dynasm!(ops ; .arch aarch64 ; b =>commit);
-                } else {
-                    dynasm!(ops ; .arch aarch64 ; b =>runtime);
-                }
-
-                // Both settled and dynamic-cell guards leave the same parent,
-                // slab, and slot registers. Nothing after this label may miss.
-                dynasm!(ops ; .arch aarch64 ; =>commit);
-                // x16 carries the add-transition child shape. A large stack
-                // operand may use x16 as address scratch, so save the token
-                // around value materialization and account for the SP bias.
-                dynasm!(ops ; .arch aarch64 ; str x16, [sp, #-16]!);
-                emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 16)?;
-                dynasm!(ops ; .arch aarch64 ; ldr x16, [sp], #16);
-                if value_is_non_cell {
-                    dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
-                    emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
-                } else {
-                    let primitive = ops.new_dynamic_label();
-                    let committed = ops.new_dynamic_label();
-                    emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, primitive);
-                    dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
-                    emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
-                    emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 9, 19);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; b =>committed
-                        ; =>primitive
-                        ; str x9, [x13, x17]
-                    );
-                    emit_property_transition_shape_barrier(&mut ops, &mut relocations, view, 19);
-                    dynasm!(ops ; .arch aarch64 ; =>committed);
-                }
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
                 emit_load_u64(&mut ops, 9, 1);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
-                dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                 emit_load_u64(&mut ops, 9, 0);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
                 structural_regions.push((
-                    "machinePropertyStore",
+                    "machineCacheIrGuardAtomSlot",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
                 ));
+            }
+            MachineOpcode::CacheIrLoadPrototype { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
+                emit_load_u64(&mut ops, 11, 0);
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr w10, [x13, view.jit_proto_byte]
+                    ; cbz w10, =>miss
+                );
+                emit_load_u64(&mut ops, 11, 1);
+                dynasm!(ops ; .arch aarch64 ; =>miss ; =>done);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 10, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 11, 0)?;
+                structural_regions.push((
+                    "machineCacheIrLoadPrototype",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrGuardPrototypeNull { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                dynasm!(ops ; .arch aarch64 ; ldr w10, [x13, view.jit_proto_byte] ; cbnz w10, =>miss);
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                structural_regions.push((
+                    "machineCacheIrGuardPrototypeNull",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrLoadField {
+                byte_pc,
+                value_byte,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 10, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w10, =>miss);
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                crate::template::arm64::ic_probe::emit_load_field(
+                    &mut ops, view, 13, value_byte, miss,
+                );
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, VALUE_UNDEFINED);
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 10, 0)?;
+                structural_regions.push((
+                    "machineCacheIrLoadField",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrStoreField {
+                byte_pc,
+                value_byte,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_u64(&mut ops, 12, 0);
+                emit_load_u64(&mut ops, 10, 0);
+                emit_load_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    12,
+                    miss,
+                )?;
+                dynasm!(ops ; .arch aarch64 ; mov x13, x12);
+                emit_slab_base(&mut ops, view, 13, 14);
+                dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                emit_load_u64(&mut ops, 17, u64::from(value_byte));
+                dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; =>miss ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 12, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[4], 10, 0)?;
+                structural_regions.push((
+                    "machineCacheIrStoreField",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrGuardExtensible {
+                byte_pc,
+                value_byte,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let inline_storage = ops.new_dynamic_label();
+                let storage_fits = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                emit_load_u64(&mut ops, 17, u64::from(value_byte));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; tst w17, #7
+                    ; b.ne =>miss
+                    ; ldr w16, [x13, view.object_slab_handle_byte]
+                    ; cbz w16, =>inline_storage
+                );
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    15,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x15, x15, x16
+                    ; ldr w14, [x15, view.object_slab_capacity_byte]
+                    ; lsr w16, w17, #3
+                    ; cmp w16, w14
+                    ; b.hs =>miss
+                    ; b =>storage_fits
+                    ; =>inline_storage
+                    ; lsr w16, w17, #3
+                    ; cmp w16, view.object_inline_slot_cap
+                    ; b.hs =>miss
+                    ; =>storage_fits
+                    ; ldrb w16, [x13, view.object_extensible_byte]
+                    ; cbz w16, =>miss
+                    ; ldrh w16, [x13, view.object_slab_len_byte]
+                    ; lsr w15, w17, #3
+                    ; cmp w16, w15
+                    ; b.ne =>miss
+                );
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                structural_regions.push((
+                    "machineCacheIrGuardExtensible",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrPublishShape {
+                byte_pc,
+                shape,
+                new_len,
+                initialize_inline,
+            } => {
+                let start = ops.offset().0;
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>done);
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 13, 0)?;
+                if initialize_inline {
+                    emit_initialize_inline_values_ptr(&mut ops, view, 13, 16);
+                }
+                emit_load_u64(&mut ops, 14, u64::from(new_len));
+                emit_load_u64(&mut ops, 15, u64::from(shape));
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; strh w14, [x13, view.object_slab_len_byte]
+                    ; str w15, [x13, view.object_shape_byte]
+                    ; =>done
+                );
+                structural_regions.push((
+                    "machineCacheIrPublishShape",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrWriteBarrier {
+                byte_pc,
+                value_is_non_cell,
+            } => {
+                let start = ops.offset().0;
+                if !value_is_non_cell {
+                    let done = ops.new_dynamic_label();
+                    emit_load_allocated_integer(&mut ops, frame, locations[2], 10, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; cbz w10, =>done);
+                    emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                    emit_cell_test(&mut ops, 9, 11, CellTest::IsNotCell, done);
+                    emit_load_allocated_integer(&mut ops, frame, locations[0], 12, 0)?;
+                    emit_write_barrier_with_context(&mut ops, &mut relocations, view, 12, 9, 19);
+                    dynasm!(ops ; .arch aarch64 ; =>done);
+                }
+                structural_regions.push((
+                    "machineCacheIrWriteBarrier",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::ExoticLength { byte_pc } => {
+                let start = ops.offset().0;
+                let have = ops.new_dynamic_label();
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                emit_exotic_length_fast(&mut ops, &mut relocations, view, have, miss);
+                dynasm!(ops ; .arch aarch64 ; =>have);
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, VALUE_UNDEFINED);
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 10, 0)?;
+                structural_regions.push((
+                    "machineExoticLength",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrJoin { store, .. } => {
+                if store {
+                    emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                    emit_store_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                } else {
+                    emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                    emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
+                    emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                    emit_store_allocated_integer(&mut ops, frame, locations[3], 9, 0)?;
+                }
             }
             MachineOpcode::PackedDoubleElementLoad { byte_pc, cache } => {
                 let access =
@@ -4348,6 +4527,16 @@ fn emit_store_allocated_tagged(
         }
     }
     Ok(())
+}
+
+fn emit_store_allocated_integer(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    frame: MachineFrameLayout,
+    location: AllocatedLocation,
+    source: u8,
+    sp_bias: u32,
+) -> Result<(), Unsupported> {
+    emit_store_allocated_tagged(ops, frame, location, source, sp_bias)
 }
 
 /// Expand a parameter-prefix frame before shared VM machinery can observe it.

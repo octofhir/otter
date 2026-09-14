@@ -201,13 +201,16 @@ pub(super) fn compile(
     });
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let code_block_id = view.code_block.id;
-    // Self-patching property IC cells: allocated address-stable before any
-    // pointer is baked, consumed strictly in emission order, owned by the
-    // finalized code object.
+    // Identity-only property source cells are address-stable before their
+    // pointers are baked, consumed strictly in emission order, and owned by
+    // the finalized code object. Semantic proof data lives only in the
+    // immutable CacheIR snapshot.
     let mut load_ic_cells =
-        vec![crate::entry::WhiskerIcCell::default(); plan.load_property_count].into_boxed_slice();
+        vec![crate::entry::PropertySourceCell::default(); plan.load_property_count]
+            .into_boxed_slice();
     let mut store_ic_cells =
-        vec![crate::entry::WhiskerIcCell::default(); plan.store_property_count].into_boxed_slice();
+        vec![crate::entry::PropertySourceCell::default(); plan.store_property_count]
+            .into_boxed_slice();
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let mut coercion_slow_paths = Vec::new();
@@ -720,7 +723,7 @@ pub(super) fn compile(
                 let cell = &mut load_ic_cells[next_load_ic];
                 next_load_ic += 1;
                 cell.set_source(view.code_block.id, instr.pc);
-                let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
+                let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
                 properties::emit_load_property(
                     &mut ops,
                     &mut relocations,
@@ -733,7 +736,9 @@ pub(super) fn compile(
                     array_length,
                     cell_addr,
                     cell_ordinal,
-                    view.property_loads.get(&instr.byte_pc).map(Vec::as_slice),
+                    view.property_programs
+                        .get(&instr.byte_pc)
+                        .map(Vec::as_slice),
                     committed_throw,
                     fatal,
                 )?;
@@ -749,7 +754,7 @@ pub(super) fn compile(
                 let cell = &mut store_ic_cells[next_store_ic];
                 next_store_ic += 1;
                 cell.set_source(view.code_block.id, instr.pc);
-                let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
+                let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
                 properties::emit_store_property(
                     &mut ops,
                     &mut relocations,
@@ -761,7 +766,9 @@ pub(super) fn compile(
                     site,
                     cell_addr,
                     cell_ordinal,
-                    view.property_stores.get(&instr.byte_pc).map(Vec::as_slice),
+                    view.property_programs
+                        .get(&instr.byte_pc)
+                        .map(Vec::as_slice),
                     committed_throw,
                     fatal,
                 )?;

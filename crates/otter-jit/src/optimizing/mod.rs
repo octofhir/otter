@@ -86,9 +86,9 @@ pub struct OptimizedCode {
     /// Per-`LoadProperty`-site inline caches. Their addresses are baked into
     /// the emitted probes and self-patched by the miss transition, so the
     /// allocation must live exactly as long as the code.
-    _load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+    _load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Per-`StoreProperty`-site inline caches, same ownership contract.
-    _store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+    _store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
@@ -102,8 +102,8 @@ impl OptimizedCode {
         safepoint_records: Box<[SafepointRecord]>,
         osr_entries: BTreeMap<u32, usize>,
         dependencies: Box<[CodeDependency]>,
-        load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
-        store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+        load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
+        store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         metadata: OptimizedMetadata,
     ) -> Self {
         let code_metadata = CodeObjectMetadata {
@@ -183,8 +183,8 @@ impl JitFunctionCode for OptimizedCode {
             &[
                 std::mem::size_of_val::<[SafepointRecord]>(&self.safepoint_records),
                 std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
-                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self._load_ic_cells),
-                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self._store_ic_cells),
+                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self._load_ic_cells),
+                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self._store_ic_cells),
                 self.osr_entries.len() * std::mem::size_of::<(u32, usize)>(),
             ],
         )

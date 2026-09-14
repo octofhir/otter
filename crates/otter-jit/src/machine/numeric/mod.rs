@@ -230,17 +230,27 @@ pub(crate) fn try_compile(
     let load_property_sites = sequence
         .instructions()
         .iter()
-        .filter(|instruction| matches!(instruction.opcode, MachineOpcode::PropertyLoad { .. }))
+        .filter(|instruction| {
+            matches!(
+                instruction.opcode,
+                MachineOpcode::PropertySource { store: false, .. }
+            )
+        })
         .count();
     let store_property_sites = sequence
         .instructions()
         .iter()
-        .filter(|instruction| matches!(instruction.opcode, MachineOpcode::PropertyStore { .. }))
+        .filter(|instruction| {
+            matches!(
+                instruction.opcode,
+                MachineOpcode::PropertySource { store: true, .. }
+            )
+        })
         .count();
     let mut load_ic_cells =
-        vec![crate::entry::WhiskerIcCell::default(); load_property_sites].into_boxed_slice();
+        vec![crate::entry::PropertySourceCell::default(); load_property_sites].into_boxed_slice();
     let mut store_ic_cells =
-        vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
+        vec![crate::entry::PropertySourceCell::default(); store_property_sites].into_boxed_slice();
     let allocation = sequence
         .allocate(target_spec)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
@@ -824,42 +834,32 @@ fn select_with_packed_double_view_caches(
                 });
                 property_inputs.insert(block_index, (receiver, stored));
                 let outputs = property_values[&block_index];
-                let property = Box::new(
-                    owned_property_site(hir, node_value, byte_pc)
-                        .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?
-                        .clone(),
-                );
-                let mut operands = vec![MachineOperand::location_input(receiver)];
-                if let Some(value) = stored {
-                    operands.push(MachineOperand::location_input(value));
-                } else {
-                    operands.push(MachineOperand::register_output(outputs.payload));
-                }
-                operands.extend([
-                    MachineOperand::register_output(outputs.hit),
-                    MachineOperand::register_output(outputs.cell),
-                ]);
                 let non_cell = stored_type.is_some_and(property_store_value_is_non_cell);
-                let mut probe = MachineInstruction::plain(
-                    if stored.is_some() {
-                        MachineOpcode::PropertyStore {
-                            site: property,
-                            value_is_non_cell: non_cell,
-                        }
-                    } else {
-                        MachineOpcode::PropertyLoad {
-                            site: property,
-                            exotic_length,
-                        }
-                    },
-                    operands,
-                );
-                probe.clobbers = if stored.is_some() {
-                    property_store_clobbers(target_spec, non_cell)
-                } else {
-                    property_load_clobbers(target_spec)
-                };
-                instructions.push(probe);
+                let property = owned_property_site(hir, node_value, byte_pc)
+                    .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?;
+                let property_start = instructions.len();
+                select_cache_ir_property_programs(
+                    target_spec,
+                    property,
+                    receiver,
+                    stored,
+                    non_cell,
+                    exotic_length,
+                    outputs,
+                    &mut representations,
+                    &mut instructions,
+                )?;
+                let frame_state = u32::try_from(
+                    *frame_state_indices
+                        .get(&NumericFramePoint::Node(node_value))
+                        .ok_or(super::VerificationError::OpcodeSignatureMismatch(first))?,
+                )
+                .map_err(|_| super::VerificationError::OpcodeSignatureMismatch(first))?;
+                for instruction in &mut instructions[property_start..] {
+                    if instruction.opcode.cache_ir_effects().is_some() {
+                        instruction.frame_state = Some(frame_state);
+                    }
+                }
                 let mut branch = MachineInstruction::plain(
                     MachineOpcode::BranchIf(true),
                     vec![MachineOperand::register_input(outputs.hit)],
@@ -2902,7 +2902,7 @@ fn owned_property_site(
     hir: &NumericFunction,
     node: hir::NumericValue,
     byte_pc: u32,
-) -> Option<&super::MachinePropertySite> {
+) -> Option<&super::MachineCacheIrSite> {
     let site = hir.property_sites.get(&node)?;
     let frame = hir
         .frame_states
@@ -2934,6 +2934,391 @@ const fn property_store_value_is_non_cell(value_type: NumericType) -> bool {
         value_type,
         NumericType::Int32 | NumericType::Uint32 | NumericType::Number | NumericType::Boolean
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_cache_ir_property_programs(
+    target_spec: &TargetSpec,
+    source: &super::MachineCacheIrSite,
+    receiver: MachineValue,
+    stored: Option<MachineValue>,
+    value_is_non_cell: bool,
+    exotic_length: bool,
+    outputs: property_cfg::Values,
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> Result<(), super::VerificationError> {
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::PropertySource {
+            function_id: source.function_id,
+            logical_pc: source.logical_pc,
+            byte_pc: source.byte_pc,
+            store: stored.is_some(),
+        },
+        vec![MachineOperand::register_output(outputs.cell)],
+    ));
+
+    let false_value = push_value(representations, MachineRepresentation::Boolean);
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::BooleanConstant(false),
+        vec![MachineOperand::register_output(false_value)],
+    ));
+    let undefined = push_value(representations, MachineRepresentation::Tagged);
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+        vec![MachineOperand::register_output(undefined)],
+    ));
+    let mut accumulated_hit = false_value;
+    let mut accumulated_payload = undefined;
+
+    if stored.is_none() && exotic_length {
+        let payload = push_value(representations, MachineRepresentation::Tagged);
+        let hit = push_value(representations, MachineRepresentation::Boolean);
+        let mut operation = MachineInstruction::plain(
+            MachineOpcode::ExoticLength {
+                byte_pc: source.byte_pc,
+            },
+            vec![
+                MachineOperand::location_input(receiver),
+                MachineOperand::register_output(payload),
+                MachineOperand::register_output(hit),
+            ],
+        );
+        operation.clobbers = property_load_clobbers(target_spec);
+        instructions.push(operation);
+        accumulated_payload = append_tagged_select(
+            hit,
+            payload,
+            accumulated_payload,
+            representations,
+            instructions,
+        );
+        accumulated_hit = append_boolean_or(accumulated_hit, hit, representations, instructions);
+    }
+
+    for program in source.program.iter() {
+        let active = push_value(representations, MachineRepresentation::Boolean);
+        instructions.push(MachineInstruction::plain(
+            MachineOpcode::BooleanConstant(true),
+            vec![MachineOperand::register_output(active)],
+        ));
+        let mut active = active;
+        let mut objects = [Some(receiver), None];
+        let mut terminal = false;
+        let mut committed_store = None;
+        for op in program.ops.iter() {
+            match *op {
+                otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::CacheIrGuardShape {
+                            byte_pc: source.byte_pc,
+                            shape,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    guard.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(guard);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::GuardAtomSlot {
+                    object,
+                    atom,
+                    value_byte,
+                    writable,
+                } => {
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::CacheIrGuardAtomSlot {
+                            byte_pc: source.byte_pc,
+                            atom,
+                            value_byte,
+                            writable,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    guard.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(guard);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::LoadPrototype { object, result } => {
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let prototype = push_value(representations, MachineRepresentation::Tagged);
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::CacheIrLoadPrototype {
+                            byte_pc: source.byte_pc,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(prototype),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    load.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(load);
+                    let destination = objects.get_mut(result as usize).ok_or(
+                        super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
+                            instructions.len() as u32,
+                        )),
+                    )?;
+                    *destination = Some(prototype);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::CacheIrGuardPrototypeNull {
+                            byte_pc: source.byte_pc,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    guard.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(guard);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::LoadField { object, value_byte } => {
+                    if stored.is_some() || terminal {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    }
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let payload = push_value(representations, MachineRepresentation::Tagged);
+                    let hit = push_value(representations, MachineRepresentation::Boolean);
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::CacheIrLoadField {
+                            byte_pc: source.byte_pc,
+                            value_byte,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(payload),
+                            MachineOperand::register_output(hit),
+                        ],
+                    );
+                    load.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(load);
+                    accumulated_payload = append_tagged_select(
+                        hit,
+                        payload,
+                        accumulated_payload,
+                        representations,
+                        instructions,
+                    );
+                    accumulated_hit =
+                        append_boolean_or(accumulated_hit, hit, representations, instructions);
+                    terminal = true;
+                }
+                otter_vm::JitCacheIrOp::StoreField { object, value_byte } => {
+                    let Some(value) = stored else {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    };
+                    if terminal {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    }
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let owner = push_value(representations, MachineRepresentation::Int64);
+                    let hit = push_value(representations, MachineRepresentation::Boolean);
+                    let mut store = MachineInstruction::plain(
+                        MachineOpcode::CacheIrStoreField {
+                            byte_pc: source.byte_pc,
+                            value_byte,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::location_input(value),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(owner),
+                            MachineOperand::register_output(hit),
+                        ],
+                    );
+                    store.clobbers = property_store_clobbers(target_spec, value_is_non_cell);
+                    instructions.push(store);
+                    let mut barrier = MachineInstruction::plain(
+                        MachineOpcode::CacheIrWriteBarrier {
+                            byte_pc: source.byte_pc,
+                            value_is_non_cell,
+                        },
+                        vec![
+                            MachineOperand::location_input(owner),
+                            MachineOperand::location_input(value),
+                            MachineOperand::register_input(hit),
+                        ],
+                    );
+                    barrier.clobbers = property_store_clobbers(target_spec, value_is_non_cell);
+                    instructions.push(barrier);
+                    accumulated_hit =
+                        append_boolean_or(accumulated_hit, hit, representations, instructions);
+                    terminal = true;
+                    committed_store = Some((object, owner, hit));
+                }
+                otter_vm::JitCacheIrOp::GuardExtensible { object, value_byte } => {
+                    if terminal {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    }
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::CacheIrGuardExtensible {
+                            byte_pc: source.byte_pc,
+                            value_byte,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    guard.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(guard);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::PublishShape {
+                    object,
+                    shape,
+                    new_len,
+                    initialize_inline,
+                } => {
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let Some((stored_object, owner, hit)) = committed_store.take() else {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    };
+                    if stored_object != object || !terminal {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    }
+                    let mut publish = MachineInstruction::plain(
+                        MachineOpcode::CacheIrPublishShape {
+                            byte_pc: source.byte_pc,
+                            shape,
+                            new_len,
+                            initialize_inline,
+                        },
+                        vec![
+                            MachineOperand::location_input(owner),
+                            MachineOperand::register_input(hit),
+                        ],
+                    );
+                    publish.clobbers = property_store_clobbers(target_spec, false);
+                    instructions.push(publish);
+                    let shape_value = push_value(representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::TaggedConstant(u64::from(shape)),
+                        vec![MachineOperand::register_output(shape_value)],
+                    ));
+                    let mut barrier = MachineInstruction::plain(
+                        MachineOpcode::CacheIrWriteBarrier {
+                            byte_pc: source.byte_pc,
+                            value_is_non_cell: false,
+                        },
+                        vec![
+                            MachineOperand::location_input(owner),
+                            MachineOperand::location_input(shape_value),
+                            MachineOperand::register_input(hit),
+                        ],
+                    );
+                    barrier.clobbers = property_store_clobbers(target_spec, false);
+                    instructions.push(barrier);
+                }
+            }
+        }
+        if !terminal {
+            return Err(cache_ir_signature_error(instructions.len()));
+        }
+    }
+
+    let join_operands = if stored.is_none() {
+        vec![
+            MachineOperand::register_input(accumulated_payload),
+            MachineOperand::register_input(accumulated_hit),
+            MachineOperand::register_output(outputs.payload),
+            MachineOperand::register_output(outputs.hit),
+        ]
+    } else {
+        vec![
+            MachineOperand::register_input(accumulated_hit),
+            MachineOperand::register_output(outputs.hit),
+        ]
+    };
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::CacheIrJoin {
+            byte_pc: source.byte_pc,
+            store: stored.is_some(),
+        },
+        join_operands,
+    ));
+    Ok(())
+}
+
+fn cache_ir_signature_error(instruction_count: usize) -> super::VerificationError {
+    super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
+        instruction_count as u32,
+    ))
+}
+
+fn cache_ir_object(
+    objects: &[Option<MachineValue>; 2],
+    object: u8,
+    instruction_count: usize,
+) -> Result<MachineValue, super::VerificationError> {
+    objects
+        .get(object as usize)
+        .copied()
+        .flatten()
+        .ok_or_else(|| cache_ir_signature_error(instruction_count))
+}
+
+fn append_boolean_or(
+    left: MachineValue,
+    right: MachineValue,
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> MachineValue {
+    let result = push_value(representations, MachineRepresentation::Boolean);
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::BooleanOr,
+        vec![
+            MachineOperand::register_input(left),
+            MachineOperand::register_input(right),
+            MachineOperand::register_output(result),
+        ],
+    ));
+    result
+}
+
+fn append_tagged_select(
+    condition: MachineValue,
+    if_true: MachineValue,
+    if_false: MachineValue,
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> MachineValue {
+    let result = push_value(representations, MachineRepresentation::Tagged);
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::TaggedSelect,
+        vec![
+            MachineOperand::register_input(condition),
+            MachineOperand::register_input(if_true),
+            MachineOperand::register_input(if_false),
+            MachineOperand::register_output(result),
+        ],
+    ));
+    result
 }
 
 fn string_constant_cell_load_clobbers(target_spec: &TargetSpec) -> Vec<PhysicalRegister> {
@@ -3838,8 +4223,9 @@ mod tests {
     };
     use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
     use otter_vm::{
-        JitArtifactFileName, JitArtifactIdentity, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
-        JitDirectCallThisMode, JitDirectCallee, JitFunctionCode, JitInlinePropertyLoad, Value,
+        JitArtifactFileName, JitArtifactIdentity, JitCacheIrOp, JitCacheIrProgram,
+        JitCompileSnapshot, JitDebugTarget, JitDebugTier, JitDirectCallThisMode, JitDirectCallee,
+        JitFunctionCode, Value,
         jit::{BindingHitProof, JitDirectCallPlan, JitMethodGuard, JitTestInstruction},
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
         native_abi::{
@@ -6745,20 +7131,46 @@ mod tests {
             property_sites: [
                 (
                     value(2),
-                    super::super::MachinePropertySite {
+                    super::super::MachineCacheIrSite {
                         function_id: 94,
                         logical_pc: 0,
                         byte_pc: 24,
-                        program: Box::default(),
+                        program: vec![JitCacheIrProgram {
+                            ops: vec![
+                                JitCacheIrOp::GuardShape {
+                                    object: 0,
+                                    shape: 7,
+                                },
+                                JitCacheIrOp::LoadField {
+                                    object: 0,
+                                    value_byte: 8,
+                                },
+                            ]
+                            .into_boxed_slice(),
+                        }]
+                        .into_boxed_slice(),
                     },
                 ),
                 (
                     value(3),
-                    super::super::MachinePropertySite {
+                    super::super::MachineCacheIrSite {
                         function_id: 94,
                         logical_pc: 1,
                         byte_pc: 40,
-                        program: Box::default(),
+                        program: vec![JitCacheIrProgram {
+                            ops: vec![
+                                JitCacheIrOp::GuardShape {
+                                    object: 0,
+                                    shape: 7,
+                                },
+                                JitCacheIrOp::StoreField {
+                                    object: 0,
+                                    value_byte: 8,
+                                },
+                            ]
+                            .into_boxed_slice(),
+                        }]
+                        .into_boxed_slice(),
                     },
                 ),
             ]
@@ -6852,6 +7264,37 @@ mod tests {
             register_count: 3,
             arithmetic_op_count: 0,
         }
+    }
+
+    fn property_transition_selection_hir() -> NumericFunction {
+        let mut hir = property_selection_hir();
+        let site = hir::NumericValue(3);
+        hir.property_sites.get_mut(&site).unwrap().program = vec![JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 7,
+                },
+                JitCacheIrOp::GuardPrototypeNull { object: 0 },
+                JitCacheIrOp::GuardExtensible {
+                    object: 0,
+                    value_byte: 8,
+                },
+                JitCacheIrOp::StoreField {
+                    object: 0,
+                    value_byte: 8,
+                },
+                JitCacheIrOp::PublishShape {
+                    object: 0,
+                    shape: 11,
+                    new_len: 2,
+                    initialize_inline: false,
+                },
+            ]
+            .into_boxed_slice(),
+        }]
+        .into_boxed_slice();
+        hir
     }
 
     fn binding_selection_hir() -> NumericFunction {
@@ -7219,11 +7662,20 @@ mod tests {
         // Frozen object-body offsets asserted by the shared slab-base emitter.
         view.object_slab_handle_byte = 24;
         view.object_inline_values_byte = 64;
-        view.property_stores.insert(
+        view.property_programs.insert(
             store_byte_pc,
-            vec![JitInlinePropertyLoad {
-                receiver_shape: 7,
-                value_byte: 16,
+            vec![JitCacheIrProgram {
+                ops: vec![
+                    JitCacheIrOp::GuardShape {
+                        object: 0,
+                        shape: 7,
+                    },
+                    JitCacheIrOp::StoreField {
+                        object: 0,
+                        value_byte: 16,
+                    },
+                ]
+                .into_boxed_slice(),
             }],
         );
         view
@@ -8362,124 +8814,53 @@ mod tests {
     fn selects_properties_with_explicit_completion_and_cold_roots() {
         let hir = property_selection_hir();
         let sequence = select(&hir).expect("property Machine IR");
-
-        let load = sequence
+        let sources = sequence
             .instructions()
             .iter()
-            .find(|instruction| {
-                instruction.opcode
-                    == MachineOpcode::PropertyLoad {
-                        site: Box::new(hir.property_sites[&hir::NumericValue(2)].clone()),
-                        exotic_length: false,
-                    }
+            .filter(|instruction| {
+                matches!(instruction.opcode, MachineOpcode::PropertySource { .. })
             })
-            .expect("selected property load");
-        let load_receiver = load.operands[0].value;
-        assert_eq!(
-            &load.operands[..2],
-            &[
-                MachineOperand::location_input(load_receiver),
-                MachineOperand::register_output(load.operands[1].value),
-            ]
-        );
-        assert_eq!(
-            sequence.representations()[load_receiver.0 as usize],
-            MachineRepresentation::Tagged
-        );
-        assert_eq!(
-            load.clobbers,
-            property_load_clobbers(&TargetSpec::aarch64())
-        );
-        assert!(load.exits.is_empty());
-        assert!(load.safepoint.is_none());
-        assert_eq!(load.operands.len(), 4);
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().all(|source| source.operands.len() == 1));
+        let load_source = sources
+            .iter()
+            .find(|source| {
+                matches!(
+                    source.opcode,
+                    MachineOpcode::PropertySource { store: false, .. }
+                )
+            })
+            .unwrap();
+        let load_cell = load_source.operands[0].value;
         let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
             MachineOpcode::Call(index) => matches!(sequence.call_descriptors()[index as usize].target, CallTarget::CommittedRuntime { target, .. } if target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
             _ => false,
         }).expect("explicit named-load cold call");
         assert!(cold.safepoint.is_some());
         assert!(cold.exits.is_empty());
-        assert_eq!(
-            cold.operands[0],
-            MachineOperand::location_input(load_receiver)
-        );
-        assert_eq!(
-            cold.operands[1],
-            MachineOperand::location_input(load.operands[3].value)
-        );
-        assert!(
-            cold.operands
-                .contains(&MachineOperand::tagged_root(load_receiver))
-        );
-        assert!(sequence.instructions().iter().any(|instruction| {
-            instruction.opcode == MachineOpcode::BoxInt32
-                && instruction.operands.last().map(|operand| operand.value) == Some(load_receiver)
-        }));
-
-        let store = sequence
-            .instructions()
+        assert_eq!(cold.operands[1], MachineOperand::location_input(load_cell));
+        let store_source = sources
             .iter()
-            .find(|instruction| {
-                instruction.opcode
-                    == MachineOpcode::PropertyStore {
-                        site: Box::new(hir.property_sites[&hir::NumericValue(3)].clone()),
-                        value_is_non_cell: true,
-                    }
+            .find(|source| {
+                matches!(
+                    source.opcode,
+                    MachineOpcode::PropertySource { store: true, .. }
+                )
             })
-            .expect("selected property store");
-        let store_receiver = store.operands[0].value;
-        let store_value = store.operands[1].value;
-        assert_eq!(
-            &store.operands[..2],
-            &[
-                MachineOperand::location_input(store_receiver),
-                MachineOperand::location_input(store_value),
-            ]
-        );
-        assert_eq!(
-            sequence.representations()[store_receiver.0 as usize],
-            MachineRepresentation::Tagged
-        );
-        assert_eq!(
-            sequence.representations()[store_value.0 as usize],
-            MachineRepresentation::Tagged
-        );
-        assert_eq!(
-            store.clobbers,
-            property_store_clobbers(&TargetSpec::aarch64(), true)
-        );
-        assert!(store.exits.is_empty() && store.safepoint.is_none());
-        assert_eq!(store.operands.len(), 4);
+            .unwrap();
+        let store_cell = store_source.operands[0].value;
         let cold = sequence.instructions().iter().find(|instruction| match instruction.opcode {
             MachineOpcode::Call(index) => matches!(sequence.call_descriptors()[index as usize].target,
                 CallTarget::CommittedRuntime { target, .. } if target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
             _ => false,
         }).expect("explicit named-store cold call");
         assert!(cold.safepoint.is_some() && cold.exits.is_empty());
-        assert!(
-            cold.operands
-                .contains(&MachineOperand::tagged_root(store_receiver))
-        );
-        assert!(
-            cold.operands
-                .contains(&MachineOperand::tagged_root(store_value))
-        );
-        assert_eq!(
-            cold.operands[2],
-            MachineOperand::location_input(store.operands[3].value)
-        );
-        assert!(sequence.instructions().iter().any(|instruction| {
-            instruction.opcode == MachineOpcode::BoxInt32
-                && instruction.operands.last().map(|operand| operand.value) == Some(store_receiver)
-        }));
-        assert!(sequence.instructions().iter().any(|instruction| {
-            instruction.opcode == MachineOpcode::BoxBoolean
-                && instruction.operands.last().map(|operand| operand.value) == Some(store_value)
-        }));
-
+        assert_eq!(cold.operands[2], MachineOperand::location_input(store_cell));
         let normalized = sequence.normalized();
-        assert!(normalized.contains("PropertyLoad { site: MachinePropertySite { function_id: 94, logical_pc: 0, byte_pc: 24, program: [] }, exotic_length: false }"));
-        assert!(normalized.contains("PropertyStore { site: MachinePropertySite { function_id: 94, logical_pc: 1, byte_pc: 40, program: [] }, value_is_non_cell: true }"));
+        assert!(normalized.contains("PropertySource"));
+        assert!(normalized.contains("CacheIrJoin"));
+        assert!(!normalized.contains("MachinePropertySite"));
         sequence
             .allocate(&TargetSpec::aarch64())
             .expect("property late-location allocation");
@@ -8504,29 +8885,62 @@ mod tests {
             .instructions()
             .iter()
             .find(|instruction| {
-                instruction.opcode
-                    == MachineOpcode::PropertyStore {
-                        site: Box::new(hir.property_sites[&hir::NumericValue(3)].clone()),
+                matches!(
+                    instruction.opcode,
+                    MachineOpcode::CacheIrWriteBarrier {
                         value_is_non_cell: false,
+                        ..
                     }
+                )
             })
             .expect("tagged property store");
-
-        assert_eq!(
-            sequence.representations()[store.operands[1].value.0 as usize],
-            MachineRepresentation::Tagged
-        );
         assert_eq!(
             store.clobbers,
             TargetSpec::aarch64()
                 .clobbers(TargetClobberSet::ScalarCall)
                 .to_vec()
         );
-        assert!(sequence.instructions().iter().all(|instruction| {
-            instruction.opcode != MachineOpcode::BoxBoolean
-                || instruction.operands.last().map(|operand| operand.value)
-                    != Some(store.operands[1].value)
-        }));
+    }
+
+    #[test]
+    fn property_transition_selects_guards_store_publication_and_barriers_in_order() {
+        let sequence = select(&property_transition_selection_hir())
+            .expect("add-transition CacheIR Machine IR");
+        let opcodes = sequence
+            .instructions()
+            .iter()
+            .map(|instruction| &instruction.opcode)
+            .collect::<Vec<_>>();
+        let position = |predicate: fn(&MachineOpcode) -> bool| {
+            opcodes
+                .iter()
+                .position(|opcode| predicate(opcode))
+                .expect("transition opcode")
+        };
+        let guard_shape =
+            position(|opcode| matches!(opcode, MachineOpcode::CacheIrGuardShape { .. }));
+        let guard_prototype =
+            position(|opcode| matches!(opcode, MachineOpcode::CacheIrGuardPrototypeNull { .. }));
+        let guard_extensible =
+            position(|opcode| matches!(opcode, MachineOpcode::CacheIrGuardExtensible { .. }));
+        let store = position(|opcode| matches!(opcode, MachineOpcode::CacheIrStoreField { .. }));
+        let publish =
+            position(|opcode| matches!(opcode, MachineOpcode::CacheIrPublishShape { .. }));
+        assert!(guard_shape < guard_prototype);
+        assert!(guard_prototype < guard_extensible);
+        assert!(guard_extensible < store);
+        assert!(store < publish);
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| matches!(opcode, MachineOpcode::CacheIrWriteBarrier { .. }))
+                .count(),
+            2,
+            "value and child-shape edges each need an explicit barrier"
+        );
+        sequence
+            .allocate(&TargetSpec::aarch64())
+            .expect("transition allocation");
     }
 
     #[test]
@@ -8558,17 +8972,16 @@ mod tests {
         let non_cell = compile_relocations(true, "storeInt32");
         assert_eq!(
             non_cell.matches("\"name\": \"write_barrier\"").count(),
-            1,
-            "a proven non-cell store keeps only the possible transition-shape barrier: \
+            0,
+            "a proven non-cell existing-field store needs no barrier: \
              {non_cell}"
         );
 
         let tagged = compile_relocations(false, "storeTagged");
         assert_eq!(
             tagged.matches("\"name\": \"write_barrier\"").count(),
-            3,
-            "a tagged store emits the possible transition-shape barrier on both tag arms and \
-             the conditional value barrier on the cell arm: {tagged}"
+            1,
+            "a tagged existing-field store emits one conditional value barrier: {tagged}"
         );
     }
 
@@ -8620,44 +9033,27 @@ mod tests {
     fn property_programs_survive_equal_source_ids_in_distinct_snapshots() {
         let mut first = property_store_emission_view(true);
         let mut second = first.clone();
-        first.property_stores.insert(
-            8,
-            vec![otter_vm::JitInlinePropertyLoad {
-                receiver_shape: 101,
-                value_byte: 8,
-            }],
-        );
-        second.property_stores.insert(
-            8,
-            vec![otter_vm::JitInlinePropertyLoad {
-                receiver_shape: 202,
-                value_byte: 16,
-            }],
-        );
+        for (view, shape, value_byte) in [(&mut first, 101, 8), (&mut second, 202, 16)] {
+            view.property_programs.insert(
+                8,
+                vec![JitCacheIrProgram {
+                    ops: vec![
+                        JitCacheIrOp::GuardShape { object: 0, shape },
+                        JitCacheIrOp::StoreField {
+                            object: 0,
+                            value_byte,
+                        },
+                    ]
+                    .into_boxed_slice(),
+                }],
+            );
+        }
         let first_hir = NumericFunction::build(&first).unwrap();
         let second_hir = NumericFunction::build(&second).unwrap();
-        first.property_stores.clear();
-        second.property_stores.clear();
         for (hir, expected_shape, expected_slot) in [(&first_hir, 101, 8), (&second_hir, 202, 16)] {
             let sequence = select(hir).unwrap();
-            let site = sequence
-                .instructions()
-                .iter()
-                .find_map(|instruction| match &instruction.opcode {
-                    MachineOpcode::PropertyStore { site, .. } => Some(site),
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(site.function_id, first.code_block.id);
-            assert_eq!(site.byte_pc, 8);
-            assert_eq!(site.logical_pc, 1);
-            assert_eq!(
-                site.program.as_ref(),
-                &[otter_vm::JitInlinePropertyLoad {
-                    receiver_shape: expected_shape,
-                    value_byte: expected_slot
-                }]
-            );
+            assert!(sequence.instructions().iter().any(|instruction| matches!(instruction.opcode, MachineOpcode::CacheIrGuardShape { shape, .. } if shape == expected_shape)));
+            assert!(sequence.instructions().iter().any(|instruction| matches!(instruction.opcode, MachineOpcode::CacheIrStoreField { value_byte, .. } if value_byte == expected_slot)));
         }
     }
 
@@ -8671,11 +9067,7 @@ mod tests {
 
         let sequence = select(&hir).expect("exotic length Machine IR");
         assert!(sequence.instructions().iter().any(|instruction| {
-            instruction.opcode
-                == MachineOpcode::PropertyLoad {
-                    site: Box::new(hir.property_sites[&hir::NumericValue(2)].clone()),
-                    exotic_length: true,
-                }
+            matches!(instruction.opcode, MachineOpcode::ExoticLength { .. })
         }));
     }
 

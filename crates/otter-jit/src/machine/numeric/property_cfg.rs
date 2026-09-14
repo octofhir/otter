@@ -12,7 +12,7 @@
 //!
 //! # See also
 //! - `super::SelectionCfg` assigns block identities before allocation.
-//! - `super::super::MachinePropertySite` owns source proofs and IC identity.
+//! - `super::super::MachineCacheIrSite` owns source identity and CacheIR.
 
 use super::*;
 

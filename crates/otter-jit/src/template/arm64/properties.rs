@@ -1,7 +1,7 @@
 //! AArch64 named-property IC probes for the template compiler.
 //!
 //! # Contents
-//! - Inline guarded own-data loads/stores through self-patching WhiskerIC
+//! - Inline guarded own-data loads/stores from immutable CacheIR snapshots
 //!   cells, with the Array exotic `length` fast path.
 //! - Fixed-value misses that resolve full load/`[[Set]]` semantics and
 //!   self-patch cacheable sites.
@@ -36,10 +36,10 @@ use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
     emit_store_reg, emit_write_barrier,
 };
-use crate::artifact::relocation::{PropertyIcAccess, RelocationCapture, RelocationTarget};
+use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget};
 use crate::entry::{Unsupported, reg_offset};
 
-/// Emit `dst = obj.name` with the inline WhiskerIC probe.
+/// Emit `dst = obj.name` from transpiled CacheIR and one committed cold edge.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_load_property(
     ops: &mut Assembler,
@@ -53,7 +53,7 @@ pub(super) fn emit_load_property(
     array_length: bool,
     cell_addr: usize,
     cell_ordinal: u32,
-    settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
+    programs: Option<&[otter_vm::JitCacheIrProgram]>,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -88,7 +88,7 @@ pub(super) fn emit_load_property(
             ops,
             relocations,
             view,
-            settled,
+            programs,
             |ops, register| {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
                 Ok(())
@@ -118,8 +118,8 @@ pub(super) fn emit_load_property(
         relocations,
         2,
         cell_addr as u64,
-        RelocationTarget::PropertyIcCell {
-            access: PropertyIcAccess::Load,
+        RelocationTarget::PropertySourceCell {
+            access: PropertySourceAccess::Load,
             ordinal: cell_ordinal,
         },
     );
@@ -145,7 +145,7 @@ pub(super) fn emit_load_property(
     Ok(())
 }
 
-/// Emit `obj.name = value` with the inline WhiskerIC probe.
+/// Emit `obj.name = value` from transpiled CacheIR and one committed cold edge.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_store_property(
     ops: &mut Assembler,
@@ -158,7 +158,7 @@ pub(super) fn emit_store_property(
     _site: u64,
     cell_addr: usize,
     cell_ordinal: u32,
-    settled: Option<&[otter_vm::JitInlinePropertyLoad]>,
+    programs: Option<&[otter_vm::JitCacheIrProgram]>,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -175,7 +175,7 @@ pub(super) fn emit_store_property(
             ops,
             relocations,
             view,
-            settled,
+            programs,
             |ops, register| {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
                 Ok(())
@@ -217,8 +217,8 @@ pub(super) fn emit_store_property(
         relocations,
         3,
         cell_addr as u64,
-        RelocationTarget::PropertyIcCell {
-            access: PropertyIcAccess::Store,
+        RelocationTarget::PropertySourceCell {
+            access: PropertySourceAccess::Store,
             ordinal: cell_ordinal,
         },
     );

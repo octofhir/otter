@@ -64,18 +64,18 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
                     .instructions
                     .iter()
                     .find_map(|probe| match &probe.opcode {
-                        MachineOpcode::PropertyLoad { site, .. }
-                        | MachineOpcode::PropertyStore { site, .. }
-                            if probe.operands[3].value == cell =>
-                        {
-                            Some(site)
+                        MachineOpcode::PropertySource {
+                            function_id,
+                            byte_pc,
+                            store: source_store,
+                            ..
+                        } if *source_store == store && probe.operands[0].value == cell => {
+                            Some((*function_id, *byte_pc))
                         }
                         _ => None,
                     })
                     .ok_or_else(invalid)?;
-                if (current.function_id, current.byte_pc)
-                    != (property.function_id, property.byte_pc)
-                {
+                if (current.function_id, current.byte_pc) != property {
                     return Err(invalid());
                 }
             }

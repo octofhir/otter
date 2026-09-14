@@ -46,10 +46,10 @@ pub struct TemplateCode {
     /// Stable backing store for the self-patching `LoadProperty` IC cells;
     /// emitted code holds raw addresses into this slice.
     #[allow(dead_code)]
-    load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+    load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Stable backing store for the self-patching `StoreProperty` IC cells.
     #[allow(dead_code)]
-    store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+    store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Code-object-owned allocating safepoints, sorted by id.
     safepoint_records: Box<[SafepointRecord]>,
     /// Loop-header logical PC → assembler offset of its OSR-entry trampoline.
@@ -69,8 +69,8 @@ impl TemplateCode {
         dependencies: Box<[CodeDependency]>,
         register_operands: Box<[u16]>,
         index_operands: Box<[u32]>,
-        load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
-        store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+        load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
+        store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         safepoint_records: Box<[SafepointRecord]>,
         osr_entries: std::collections::BTreeMap<u32, usize>,
         osr_only: bool,
@@ -143,8 +143,8 @@ impl JitFunctionCode for TemplateCode {
             &[
                 std::mem::size_of_val::<[u16]>(&self.register_operands),
                 std::mem::size_of_val::<[u32]>(&self.index_operands),
-                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self.load_ic_cells),
-                std::mem::size_of_val::<[crate::entry::WhiskerIcCell]>(&self.store_ic_cells),
+                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self.load_ic_cells),
+                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self.store_ic_cells),
                 std::mem::size_of_val::<[SafepointRecord]>(&self.safepoint_records),
                 std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
                 self.osr_entries.len() * std::mem::size_of::<(u32, usize)>(),

@@ -12,8 +12,7 @@
 //! - [`CacheOp`] — the guard/load opcodes.
 //! - [`CacheStub`] — an op sequence plus its referenced shape ids and hits.
 //! - executor entry points: [`CacheStub::run_load`] and
-//!   [`CacheStub::run_store`], plus [`CacheStub::lower_jit_way`] for the exact
-//!   allocation-free native subset.
+//!   [`CacheStub::run_store`], plus complete immutable JIT snapshots.
 //!
 //! # Invariants
 //! - Store misses are allocation-free; failure while growing a matched
@@ -95,6 +94,142 @@ pub(crate) struct CacheStub {
 }
 
 impl CacheStub {
+    /// Copy this complete program into the owned, target-neutral JIT DTO.
+    ///
+    /// `resolve_shape` is the VM's compile-boundary validation: it maps an
+    /// interned semantic shape id to its current stable compressed token. If
+    /// any referenced fact cannot be validated, or any CacheIR op has no
+    /// native representation yet, the whole program is rejected.
+    pub(crate) fn snapshot_for_jit(
+        &self,
+        mut resolve_shape: impl FnMut(ShapeId) -> Option<u32>,
+    ) -> Option<crate::jit::JitCacheIrProgram> {
+        use crate::jit::JitCacheIrOp;
+
+        let mut ops = Vec::with_capacity(self.ops.len().saturating_add(1));
+        for op in &self.ops {
+            match *op {
+                CacheOp::GuardShapeId { obj, shape } => {
+                    let expected = *self.shape_ids.get(shape as usize)?;
+                    let shape = resolve_shape(expected)?;
+                    if shape == 0 {
+                        return None;
+                    }
+                    ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
+                }
+                CacheOp::LoadPrototype { obj, dst } => {
+                    ops.push(JitCacheIrOp::LoadPrototype {
+                        object: obj,
+                        result: dst,
+                    });
+                }
+                CacheOp::LoadDataSlotResult { obj, hit } => {
+                    let hit = *self.hits.get(hit as usize)?;
+                    let shape = resolve_shape(hit.shape_id)?;
+                    if shape == 0 {
+                        return None;
+                    }
+                    ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
+                    ops.push(JitCacheIrOp::GuardAtomSlot {
+                        object: obj,
+                        atom: hit.atom_id.raw(),
+                        value_byte: slot_value_byte(hit.slot),
+                        writable: false,
+                    });
+                    ops.push(JitCacheIrOp::LoadField {
+                        object: obj,
+                        value_byte: slot_value_byte(hit.slot),
+                    });
+                }
+                CacheOp::StoreDataSlot { obj, hit } => {
+                    let hit = *self.hits.get(hit as usize)?;
+                    let shape = resolve_shape(hit.shape_id)?;
+                    if shape == 0 {
+                        return None;
+                    }
+                    ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
+                    ops.push(JitCacheIrOp::GuardAtomSlot {
+                        object: obj,
+                        atom: hit.atom_id.raw(),
+                        value_byte: slot_value_byte(hit.slot),
+                        writable: true,
+                    });
+                    ops.push(JitCacheIrOp::StoreField {
+                        object: obj,
+                        value_byte: slot_value_byte(hit.slot),
+                    });
+                }
+                CacheOp::StoreAddTransition { transition } => {
+                    let transition = self.transitions.get(transition as usize)?;
+                    let from_shape = resolve_shape(transition.from_shape_id)?;
+                    let to_shape = resolve_shape(transition.to_shape_id)?;
+                    if from_shape == 0 || to_shape == 0 {
+                        return None;
+                    }
+                    ops.push(JitCacheIrOp::GuardShape {
+                        object: 0,
+                        shape: from_shape,
+                    });
+                    match &transition.kind {
+                        object::StorePropertyTransitionKind::OwnAdd => {
+                            ops.push(JitCacheIrOp::GuardPrototypeNull { object: 0 });
+                        }
+                        object::StorePropertyTransitionKind::PrototypeChainMissing { chain } => {
+                            let mut object = 0;
+                            for expected in chain {
+                                let shape = resolve_shape(*expected)?;
+                                if shape == 0 {
+                                    return None;
+                                }
+                                ops.push(JitCacheIrOp::LoadPrototype { object, result: 1 });
+                                ops.push(JitCacheIrOp::GuardShape { object: 1, shape });
+                                object = 1;
+                            }
+                            ops.push(JitCacheIrOp::GuardPrototypeNull { object });
+                        }
+                        object::StorePropertyTransitionKind::DirectPrototypeWritableData {
+                            prototype_hit,
+                        } => {
+                            let shape = resolve_shape(prototype_hit.shape_id)?;
+                            if shape == 0 {
+                                return None;
+                            }
+                            ops.push(JitCacheIrOp::LoadPrototype {
+                                object: 0,
+                                result: 1,
+                            });
+                            ops.push(JitCacheIrOp::GuardShape { object: 1, shape });
+                            ops.push(JitCacheIrOp::GuardAtomSlot {
+                                object: 1,
+                                atom: prototype_hit.atom_id.raw(),
+                                value_byte: slot_value_byte(prototype_hit.slot),
+                                writable: true,
+                            });
+                        }
+                    }
+                    let value_byte = slot_value_byte(transition.slot);
+                    ops.push(JitCacheIrOp::GuardExtensible {
+                        object: 0,
+                        value_byte,
+                    });
+                    ops.push(JitCacheIrOp::StoreField {
+                        object: 0,
+                        value_byte,
+                    });
+                    ops.push(JitCacheIrOp::PublishShape {
+                        object: 0,
+                        shape: to_shape,
+                        new_len: transition.slot.checked_add(1)?,
+                        initialize_inline: transition.slot == 0,
+                    });
+                }
+            }
+        }
+        (!ops.is_empty()).then(|| crate::jit::JitCacheIrProgram {
+            ops: ops.into_boxed_slice(),
+        })
+    }
+
     /// Own-data load: receiver owns the slot.
     #[must_use]
     pub(crate) fn load_own_data(hit: AtomOwnPropertyHit) -> Self {
@@ -329,159 +464,11 @@ impl CacheStub {
         }
     }
 
-    /// The receiver shape and own slot this program resolves, with no live
-    /// receiver.
-    ///
-    /// A stub whose whole program is an own-data terminal already names both:
-    /// the hit carries the shape handle it was installed under and the slot it
-    /// found. That is exactly what a compile-time guard needs, so a site's
-    /// installed programs lower to the guard chain generated code runs without
-    /// replaying them against an object.
-    ///
-    /// `None` for any program that reaches its slot some other way — a
-    /// prototype hop, a key guard, a transition — which keeps that site on the
-    /// runtime cache cell.
-    #[must_use]
-    pub(crate) fn settled_own_slot(&self) -> Option<(ShapeId, u32, u16)> {
-        let hit = match (self.ops.as_slice(), self.hits.as_slice()) {
-            ([CacheOp::LoadDataSlotResult { obj: 0, hit: 0 }], [hit])
-            | ([CacheOp::StoreDataSlot { obj: 0, hit: 0 }], [hit]) => *hit,
-            _ => return None,
-        };
-        let shape_offset = hit.shape.offset();
-        (shape_offset != 0).then_some((hit.shape_id, shape_offset, hit.slot))
-    }
-
-    /// The receiver shape, holder shape and slot a settled prototype-hop load
-    /// resolves to, when this program is exactly that.
-    ///
-    /// The hop is the one program whose slot lives on an object the site does
-    /// not name: guarding the receiver's shape fixes which prototype it reaches,
-    /// and guarding the holder's shape fixes the slot inside it. Both are
-    /// compile-time constants, so generated code runs the same two compares and
-    /// one hop the stub does, without the cell.
-    #[must_use]
-    pub(crate) fn settled_prototype_slot(&self) -> Option<(ShapeId, ShapeId, u32, u16)> {
-        let (
-            [
-                CacheOp::GuardShapeId { obj: 0, shape: 0 },
-                CacheOp::LoadPrototype { obj: 0, dst: 1 },
-                CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
-            ],
-            [receiver_shape_id],
-            [hit],
-        ) = (
-            self.ops.as_slice(),
-            self.shape_ids.as_slice(),
-            self.hits.as_slice(),
-        )
-        else {
-            return None;
-        };
-        let holder_offset = hit.shape.offset();
-        (holder_offset != 0).then_some((*receiver_shape_id, hit.shape_id, holder_offset, hit.slot))
-    }
-
     /// Visit GC roots in stub data — the target shapes of replayed transitions.
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         for transition in &self.transitions {
             transition.trace_roots(visitor);
         }
-    }
-
-    /// Lower this stub to the guarded sequence generated code executes inline.
-    ///
-    /// This walks the op program rather than matching whole stub shapes, so a
-    /// new op composition becomes inline-capable the moment its ops are
-    /// individually lowerable — no new recognizer, no new emitter case.
-    ///
-    /// `recv` is the live receiver the site just saw. Existing-slot programs
-    /// guard its current shape. An add-transition program sees the receiver
-    /// after the first committed append, revalidates that child shape and its
-    /// complete prototype proof, then publishes the immutable parent/child
-    /// pair generated code needs for the next fresh receiver. A stale or
-    /// allocation-capable program lowers to `None`.
-    #[must_use]
-    pub(crate) fn lower_jit_way(
-        &self,
-        recv: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<crate::jit::JitPropertyIcWay> {
-        let receiver_shape = object::shape(recv, heap).offset();
-        if receiver_shape == 0 {
-            return None;
-        }
-
-        let mut holder = recv;
-        let mut holder_shape = 0;
-        for op in &self.ops {
-            match *op {
-                CacheOp::GuardShapeId { obj: 0, shape } => {
-                    if object::shape_id(recv, heap) != self.shape_ids[shape as usize] {
-                        return None;
-                    }
-                }
-                CacheOp::LoadPrototype { obj: 0, dst: 1 } => {
-                    let proto = object::prototype(recv, heap)?;
-                    if !object::supports_fast_property_ic(proto, heap) {
-                        return None;
-                    }
-                    let shape = object::shape(proto, heap).offset();
-                    if shape == 0 {
-                        return None;
-                    }
-                    holder = proto;
-                    holder_shape = shape;
-                }
-                CacheOp::LoadDataSlotResult { hit, .. } => {
-                    let hit = self.hits[hit as usize];
-                    if hit.atom_id != key.atom().id()
-                        || hit.shape.offset() != object::shape(holder, heap).offset()
-                        || object::load_own_data_slot_atom(holder, heap, key, hit).is_none()
-                    {
-                        return None;
-                    }
-                    return Some(crate::jit::JitPropertyIcWay {
-                        receiver_shape,
-                        holder_shape,
-                        value_byte: slot_value_byte(hit.slot),
-                        transition_shape: 0,
-                        chain_shape: 0,
-                        prototype_guard: crate::jit::JitPropertyIcPrototypeGuard::Missing,
-                    });
-                }
-                CacheOp::StoreDataSlot { obj: 0, hit } => {
-                    let hit = self.hits[hit as usize];
-                    if hit.shape.offset() != receiver_shape {
-                        return None;
-                    }
-                    return Some(crate::jit::JitPropertyIcWay {
-                        receiver_shape,
-                        holder_shape,
-                        value_byte: slot_value_byte(hit.slot),
-                        transition_shape: 0,
-                        chain_shape: 0,
-                        prototype_guard: crate::jit::JitPropertyIcPrototypeGuard::Missing,
-                    });
-                }
-                CacheOp::StoreAddTransition { transition } => {
-                    let transition: object::LowerableStoreTransition =
-                        self.transitions[transition as usize].lowerable_add(recv, heap, key)?;
-                    return Some(crate::jit::JitPropertyIcWay {
-                        receiver_shape: transition.from_shape.offset(),
-                        holder_shape: transition.prototype_shape.offset(),
-                        value_byte: slot_value_byte(transition.slot),
-                        transition_shape: transition.to_shape.offset(),
-                        chain_shape: transition.prototype_chain_shape.offset(),
-                        prototype_guard: transition.prototype_guard,
-                    });
-                }
-                // Ops with no inline lowering yet keep the site on the stub.
-                _ => return None,
-            }
-        }
-        None
     }
 }
 

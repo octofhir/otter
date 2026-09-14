@@ -141,8 +141,7 @@ but do not sample live execution. JIT-aware sampling, Chrome/Perfetto async
 traces, and timeout ring-buffer dumps remain roadmap work.
 
 New debug/profiling features must stay default-off and use standard output
-formats where possible. The active implementation order lives in the
-repository root `OTTER_PLAN.md`.
+formats where possible.
 
 Documentation for stable contributor workflows belongs in this book.
 Historical task and ADR files are not part of the living contributor docs.

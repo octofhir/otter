@@ -22,7 +22,6 @@
 //! # See also
 //! - [`crate::active_frame`] for tier-neutral semantic frame access.
 //! - [`crate::jit`] for the compiler service boundary.
-//! - `OTTER_PLAN.md` for engine verification gates.
 
 mod code_entry;
 mod dispatch;

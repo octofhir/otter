@@ -318,8 +318,9 @@ impl TargetSpec {
             },
             clobbers: [
                 scalar_call.clone(),
-                std::iter::once(integer(9))
-                    .chain((11..=16).map(integer))
+                (9..=16)
+                    .map(integer)
+                    .chain([float(30), float(31)])
                     .collect(),
                 (9..=16).map(integer).collect(),
                 scalar_call,
@@ -529,6 +530,17 @@ mod tests {
         let clobbers = target.clobbers(TargetClobberSet::ConstructReceiver);
         assert!(clobbers.contains(&PhysicalRegister::integer(0)));
         assert!(clobbers.contains(&PhysicalRegister::integer(1)));
+    }
+
+    #[test]
+    fn element_number_canonicalization_declares_every_scratch() {
+        let target = TargetSpec::aarch64();
+        let clobbers = target.clobbers(TargetClobberSet::Element);
+        for register in 9..=16 {
+            assert!(clobbers.contains(&PhysicalRegister::integer(register)));
+        }
+        assert!(clobbers.contains(&PhysicalRegister::float(30)));
+        assert!(clobbers.contains(&PhysicalRegister::float(31)));
     }
 
     #[test]

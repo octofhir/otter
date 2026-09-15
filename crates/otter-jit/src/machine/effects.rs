@@ -46,12 +46,10 @@ pub enum MachineAliasClass {
     Allocation,
     /// Remembered-set and incremental-marking metadata.
     GcBarrier,
-    /// Untraced loop-local raw view cache words.
-    RawViewCache,
 }
 
 impl MachineAliasClass {
-    pub(super) const COUNT: usize = 11;
+    pub(super) const COUNT: usize = 10;
 
     const fn bit(self) -> u16 {
         1 << self as u8
@@ -67,8 +65,8 @@ impl MachineAliasSet {
     pub const NONE: Self = Self(0);
     /// Every currently declared alias class.
     pub const ALL: Self = Self((1 << MachineAliasClass::COUNT) - 1);
-    /// All JavaScript heap state, excluding optimizer-private raw cache words.
-    pub const HEAP: Self = Self(Self::ALL.0 & !MachineAliasClass::RawViewCache.bit());
+    /// All JavaScript heap state.
+    pub const HEAP: Self = Self::ALL;
 
     /// Construct a singleton alias set.
     #[must_use]
@@ -172,18 +170,6 @@ impl MachineEffects {
         }
     }
 
-    const fn reentrant_boundary() -> Self {
-        Self {
-            reads: MachineAliasSet::ALL,
-            writes: MachineAliasSet::ALL,
-            allocates: false,
-            throws: false,
-            safepoint: true,
-            reentrant: true,
-            commoning: MachineCommoning::Never,
-        }
-    }
-
     /// A boundary invalidates all dependency epochs even when its alias set is
     /// empty, because success cannot prove that arbitrary runtime state stayed
     /// unchanged.
@@ -204,7 +190,6 @@ const BINDING: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::Binding
 const CONSTANT_CELL: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::ConstantCell);
 const ALLOCATION: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::Allocation);
 const GC_BARRIER: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::GcBarrier);
-const RAW_VIEW_CACHE: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::RawViewCache);
 
 impl MachineOpcode {
     /// Return the opcode-local effect row. Descriptor-backed call effects are
@@ -308,14 +293,10 @@ impl MachineOpcode {
             Self::BindingWriteBarrier => MachineEffects::write(GC_BARRIER),
             Self::StringConstantCellLoad { .. } => MachineEffects::read(CONSTANT_CELL, Value),
 
-            Self::ElementView { .. } => {
-                MachineEffects::read(SHAPE.union(ELEMENT_METADATA).union(RAW_VIEW_CACHE), Guard)
-            }
+            Self::ElementView { .. } => MachineEffects::read(SHAPE.union(ELEMENT_METADATA), Guard),
             Self::ElementValueLoad { .. } => MachineEffects::read(ELEMENT_FIELD, Value),
             Self::ElementValueGuard { .. } => MachineEffects::read(ELEMENT_FIELD, Guard),
             Self::ElementValueStore { .. } => MachineEffects::write(ELEMENT_FIELD),
-            Self::ClearPackedDoubleViewCaches(_) => MachineEffects::write(RAW_VIEW_CACHE),
-
             Self::PropertySource { .. } => MachineEffects::NEVER,
             Self::CacheIrGuardShape { .. } => MachineEffects::read(SHAPE, Guard),
             Self::CacheIrGuardAtomSlot { .. } | Self::CacheIrGuardExtensible { .. } => {
@@ -333,12 +314,19 @@ impl MachineOpcode {
                 MachineEffects::read(SHAPE.union(ELEMENT_METADATA).union(PROPERTY_FIELD), Value)
             }
 
-            Self::BackedgePoll => MachineEffects::reentrant_boundary(),
+            // The batched slow edge is a LeafNoAlloc budget/interrupt check.
+            // It may stop execution, but a successful return cannot collect,
+            // reenter JavaScript, or mutate JavaScript heap state.
+            Self::BackedgePoll => MachineEffects {
+                throws: true,
+                ..MachineEffects::NEVER
+            },
             Self::OsrEntry { .. } => MachineEffects {
                 writes: MachineAliasSet::ALL,
                 ..MachineEffects::NEVER
             },
             Self::Call(_)
+            | Self::LoopPreheader
             | Self::Jump
             | Self::BranchIf(_)
             | Self::BranchNativeStatus
@@ -406,7 +394,6 @@ mod tests {
         assert!(!SHAPE.intersects(PROPERTY_FIELD));
         assert!(!PROPERTY_FIELD.intersects(ELEMENT_FIELD));
         assert!(MachineAliasSet::HEAP.intersects(CONSTANT_CELL));
-        assert!(!MachineAliasSet::HEAP.intersects(RAW_VIEW_CACHE));
     }
 
     #[test]
@@ -442,9 +429,17 @@ mod tests {
             assert!(!effects.writes.is_empty(), "{opcode:?}");
             assert_eq!(effects.commoning, MachineCommoning::Never, "{opcode:?}");
         }
+    }
 
+    #[test]
+    fn backedge_poll_is_a_throwing_leaf_without_heap_invalidation() {
         let poll = MachineOpcode::BackedgePoll.effects();
-        assert!(poll.safepoint && poll.reentrant);
-        assert_eq!(poll.writes, MachineAliasSet::ALL);
+        assert!(poll.throws);
+        assert!(!poll.allocates);
+        assert!(!poll.safepoint);
+        assert!(!poll.reentrant);
+        assert!(poll.reads.is_empty());
+        assert!(poll.writes.is_empty());
+        assert_eq!(poll.commoning, MachineCommoning::Never);
     }
 }

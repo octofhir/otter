@@ -1,30 +1,25 @@
-//! Machine IR loop-scoped packed-double view-cache coverage.
+//! Machine IR packed-double loop-preheader and LICM coverage.
 //!
 //! # Contents
 //! - A Navier-shaped kernel with two inner loops, four invariant Array
 //!   receivers, and ten packed-double element sites.
 //! - Whole-function entry and loop-OSR compilation through the production tier
 //!   policy.
-//! - Fresh replacement arrays after a full collection and a later generated
-//!   entry into the same code object.
+//! - Fresh replacement arrays after a full collection and a later generated entry.
 //!
 //! # Invariants
-//! - Ten decomposed packed-double sites share exactly four loop-scoped raw views:
-//!   one per receiver and natural loop.
-//! - Function entry, OSR entry, and every external inner-loop entry start from
-//!   cleared raw base words; a cache survives only a generated backedge.
-//! - Cached words are untraced base/length data, never GC roots. A later call
-//!   after moving collection must prove and publish each fresh Array view.
+//! - Every external inner-loop edge owns an explicit loop preheader, including OSR.
+//! - Element views are ordinary per-access proof/load nodes. No untraced raw
+//!   base or length survives a backedge, safepoint, collection, or reentry.
+//! - LICM carries scalar invariants through explicit loop-header SSA values.
 //! - Supported packed-double inputs execute without entering the committed
 //!   element sibling or taking an optimizing deoptimization.
 //!
 //! # See also
-//! - `otter_jit::machine::numeric` owns cache planning, Machine selection, raw
-//!   frame layout, and AArch64 emission.
+//! - `otter_jit::machine::licm` owns effect-aware invariant motion.
+//! - `otter_jit::machine::numeric` owns loop-entry selection and emission.
 
 #![cfg(target_arch = "aarch64")]
-
-use std::collections::{BTreeMap, BTreeSet};
 
 use otter_runtime::{
     JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTarget,
@@ -210,7 +205,7 @@ fn target_matches(actual: JitDebugTarget, expect_osr: bool) -> bool {
     }
 }
 
-fn machine_cache_bundle<'artifacts>(
+fn machine_loop_bundle<'artifacts>(
     artifacts: &'artifacts JitArtifactBatch,
     module: &str,
     expect_osr: bool,
@@ -230,8 +225,8 @@ fn machine_cache_bundle<'artifacts>(
                         file.contents().starts_with(MACHINE_IR_HEADER)
                             && file
                                 .contents()
-                                .windows(b"machine-ir packed-double-view-caches=4".len())
-                                .any(|window| window == b"machine-ir packed-double-view-caches=4")
+                                .windows(b"machine-ir explicit-loop-preheaders".len())
+                                .any(|window| window == b"machine-ir explicit-loop-preheaders")
                     })
         })
         .unwrap_or_else(|| {
@@ -254,34 +249,28 @@ fn machine_cache_bundle<'artifacts>(
                     )
                 })
                 .collect::<Vec<_>>();
-            panic!("missing exact packed-cache Machine bundle: {manifests:?}")
+            panic!("missing exact packed-loop Machine bundle: {manifests:?}")
         })
 }
 
-fn cache_id(line: &str) -> usize {
-    line.split_once("cache: Some(PackedDoubleViewCacheId(")
-        .and_then(|(_, suffix)| suffix.split_once(')'))
-        .and_then(|(id, _)| id.parse().ok())
-        .unwrap_or_else(|| panic!("packed-double site lacks a valid cache identity: {line}"))
-}
-
-fn assert_machine_cache_artifact(artifacts: &JitArtifactBatch, module: &str, expect_osr: bool) {
-    let bundle = machine_cache_bundle(artifacts, module, expect_osr);
+fn assert_machine_loop_artifact(artifacts: &JitArtifactBatch, module: &str, expect_osr: bool) {
+    let bundle = machine_loop_bundle(artifacts, module, expect_osr);
     let optimized_ir = std::str::from_utf8(
         bundle
             .file(JitArtifactFileName::OptimizedIr)
-            .expect("packed-cache optimized IR")
+            .expect("packed-loop optimized IR")
             .contents(),
     )
-    .expect("UTF-8 packed-cache optimized IR");
+    .expect("UTF-8 packed-loop optimized IR");
     assert_eq!(
         optimized_ir
             .lines()
-            .filter(|line| *line == "machine-ir packed-double-view-caches=4")
+            .filter(|line| *line == "machine-ir explicit-loop-preheaders")
             .count(),
         1,
-        "the Machine frame must own exactly four two-word views: {optimized_ir}"
+        "the Machine graph must publish its explicit loop contract: {optimized_ir}"
     );
+    assert!(optimized_ir.contains("; licm-hoisted="));
 
     let view_lines = optimized_ir
         .lines()
@@ -295,49 +284,24 @@ fn assert_machine_cache_artifact(artifacts: &JitArtifactBatch, module: &str, exp
     assert_eq!(optimized_ir.matches(" ElementValueLoad {").count(), 8);
     assert_eq!(optimized_ir.matches(" ElementValueGuard {").count(), 2);
     assert_eq!(optimized_ir.matches(" ElementValueStore {").count(), 2);
-    assert!(
-        view_lines
-            .iter()
-            .all(|line| line.contains("cache: Some(PackedDoubleViewCacheId(")),
-        "every packed site must use a persistent loop view: {optimized_ir}"
-    );
-    let mut sites_per_cache = BTreeMap::<usize, usize>::new();
-    for line in &view_lines {
-        *sites_per_cache.entry(cache_id(line)).or_default() += 1;
-    }
     assert_eq!(
-        sites_per_cache.keys().copied().collect::<BTreeSet<_>>(),
-        BTreeSet::from([0, 1, 2, 3]),
-        "the two natural loops must own four dense cache identities: {optimized_ir}"
+        optimized_ir.matches(" LoopPreheader ").count(),
+        2,
+        "each external inner-loop entry must be explicit: {optimized_ir}"
     );
-    let mut group_sizes = sites_per_cache.values().copied().collect::<Vec<_>>();
-    group_sizes.sort_unstable();
-    assert_eq!(
-        group_sizes,
-        [1, 1, 4, 4],
-        "each input shares four loads and each output owns one store: {optimized_ir}"
-    );
-
-    let clear_count = optimized_ir
-        .lines()
-        .filter(|line| line.contains("ClearPackedDoubleViewCaches(LoopEntry)"))
-        .count();
-    assert_eq!(
-        clear_count, 2,
-        "each external inner-loop entry must clear persistent raw bases: {optimized_ir}"
-    );
+    assert!(!optimized_ir.contains("PackedDoubleViewCache"));
+    assert!(!optimized_ir.contains("ClearPackedDoubleViewCaches"));
 
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"]
         .as_array()
-        .expect("packed-cache code-map regions");
+        .expect("packed-loop code-map regions");
     for (kind, expected_count) in [
         ("machineElementView", 10),
         ("machineElementAddress", 10),
         ("machineElementValueLoad", 8),
         ("machineElementValueGuard", 2),
         ("machineElementValueStore", 2),
-        ("machinePackedDoubleViewCacheClear", 2),
     ] {
         let matching = regions
             .iter()
@@ -359,19 +323,19 @@ fn assert_machine_cache_artifact(artifacts: &JitArtifactBatch, module: &str, exp
     let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
     let relocations = relocations["relocations"]
         .as_array()
-        .expect("packed-cache relocations");
+        .expect("packed-loop relocations");
     assert_eq!(
         relocations
             .iter()
             .filter(|relocation| relocation["target"]["kind"] == "gcCageBase")
             .count(),
         view_lines.len(),
-        "each receiver-view proof owns one cage relocation while the hot path shares four published views"
+        "each receiver-view proof reloads its current GC-relative view"
     );
 }
 
 fn run_fresh_after_gc(runtime: &mut Runtime, module: &str) {
-    runtime.force_gc().expect("packed-cache full GC");
+    runtime.force_gc().expect("packed-loop full GC");
     let before = runtime.execution_stats();
     let actual = completion(runtime, FRESH_PROBE, module);
     let delta = CounterDelta::between(before, runtime.execution_stats());
@@ -382,19 +346,19 @@ fn run_fresh_after_gc(runtime: &mut Runtime, module: &str) {
     );
     assert_eq!(
         delta.optimized_deopts, 0,
-        "entry/loop clears must prevent stale raw views after GC: {delta:?}"
+        "per-access views must remain fresh after GC: {delta:?}"
     );
 }
 
 #[test]
-fn packed_double_views_share_by_loop_receiver_and_refresh_after_gc() {
+fn packed_double_loop_preheaders_refresh_views_after_gc() {
     let mut runtime = runtime();
     let setup_source = format!("{KERNEL}\n{ENTRY_SETUP}");
     let setup = runtime
         .run_script(SourceInput::from_javascript(setup_source), ENTRY_MODULE)
-        .expect("packed-cache entry setup");
-    assert_machine_cache_artifact(
-        setup.jit_artifacts().expect("packed-cache entry artifacts"),
+        .expect("packed-loop entry setup");
+    assert_machine_loop_artifact(
+        setup.jit_artifacts().expect("packed-loop entry artifacts"),
         ENTRY_MODULE,
         false,
     );
@@ -404,13 +368,13 @@ fn packed_double_views_share_by_loop_receiver_and_refresh_after_gc() {
 }
 
 #[test]
-fn packed_double_views_start_cleared_at_osr_and_later_entry() {
+fn packed_double_loop_preheaders_cover_osr_and_later_entry() {
     let mut runtime = runtime();
     let setup_source = format!("{KERNEL}\n{OSR_SETUP}");
     let before = runtime.execution_stats();
     let setup = runtime
         .run_script(SourceInput::from_javascript(setup_source), OSR_MODULE)
-        .expect("packed-cache OSR setup");
+        .expect("packed-loop OSR setup");
     let delta = CounterDelta::between(before, runtime.execution_stats());
     assert_eq!(setup.completion_string(), OSR_EXPECTED);
     assert!(
@@ -423,10 +387,10 @@ fn packed_double_views_start_cleared_at_osr_and_later_entry() {
     );
     assert_eq!(
         delta.optimized_deopts, 0,
-        "OSR entry and later external loop entries must begin cleared: {delta:?}"
+        "OSR and later external entries must execute explicit preheaders: {delta:?}"
     );
-    assert_machine_cache_artifact(
-        setup.jit_artifacts().expect("packed-cache OSR artifacts"),
+    assert_machine_loop_artifact(
+        setup.jit_artifacts().expect("packed-loop OSR artifacts"),
         OSR_MODULE,
         true,
     );

@@ -37,11 +37,10 @@
 //!   deoptimizes and replays the operation. The generated hit cannot allocate,
 //!   reenter, or pay a call-clobber allocation boundary.
 //!   Packed-double accesses retain their exact pre-effect deopt boundary.
-//!   Reducible non-reentrant packed-double loops may retain an untraced raw
-//!   base/length pair in the Machine frame across backedges. Entry, OSR, and
-//!   external loop-entry paths clear every pair before it can be observed.
-//!   An unsupported or unprepared element access clears those raw caches,
-//!   publishes exact moving roots, and calls the fixed boxed-value VM boundary.
+//!   Every access derives its current base/length after the explicit loop
+//!   preheader; no untraced interior pointer survives a backedge or safepoint.
+//!   An unsupported or unprepared element access publishes exact moving roots
+//!   and calls the fixed boxed-value VM boundary.
 //!   The operation either completes once or propagates its parked exception;
 //!   no post-call status may deopt and replay it.
 //! - Settled ordinary named properties consume the VM's complete monomorphic
@@ -125,7 +124,7 @@ use super::super::{
     InstructionSequence, MachineBindingTarget, MachineCallGuard, MachineFrameLayout,
     MachineInstructionId, MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation,
     MachineSafepointSite, MachineSafepointTable, MachineValue, OperandPurpose,
-    PackedDoubleViewCacheId, binding_target_matches_semantics, is_explicit_committed_runtime_call,
+    binding_target_matches_semantics, is_explicit_committed_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -329,43 +328,6 @@ pub(super) fn frame_layout(
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
 }
 
-fn packed_double_view_cache_offsets(
-    frame: MachineFrameLayout,
-    cache: PackedDoubleViewCacheId,
-) -> Result<(u32, u32), Unsupported> {
-    let base_slot = u16::try_from(cache.raw_word())
-        .map_err(|_| Unsupported::OperandShape("packed-double view-cache base slot"))?;
-    let length_slot = base_slot.checked_add(1).ok_or(Unsupported::OperandShape(
-        "packed-double view-cache length slot",
-    ))?;
-    Ok((
-        raw_offset(frame, base_slot)?,
-        raw_offset(frame, length_slot)?,
-    ))
-}
-
-fn emit_clear_packed_double_view_caches(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    frame: MachineFrameLayout,
-    cache_count: u8,
-) -> Result<(), Unsupported> {
-    for index in 0..usize::from(cache_count) {
-        let cache = PackedDoubleViewCacheId::new(index).ok_or(Unsupported::OperandShape(
-            "packed-double view-cache identity",
-        ))?;
-        let (base_offset, _) = packed_double_view_cache_offsets(frame, cache)?;
-        // Clear instructions own no clobber. AArch64's scaled unsigned STR
-        // reaches every bounded normal frame we admit without a scratch.
-        if base_offset > 32_760 || !base_offset.is_multiple_of(8) {
-            return Err(Unsupported::OperandShape(
-                "packed-double view-cache clear offset",
-            ));
-        }
-        dynasm!(ops ; .arch aarch64 ; str xzr, [sp, base_offset]);
-    }
-    Ok(())
-}
-
 fn emit_landing_pad_transfer(
     ops: &mut dynasmrt::aarch64::Assembler,
     frame: MachineFrameLayout,
@@ -484,7 +446,6 @@ fn emit_committed_runtime_call(
     // record linked until either the result is committed locally or a pure
     // exception has been handed to the propagation router. No status from
     // either entry can request deoptimization or replay.
-    emit_clear_packed_double_view_caches(ops, frame, sequence.packed_double_view_cache_count())?;
     emit_save_safepoint_roots(ops, frame, site)?;
     emit_publish_machine_roots(ops, frame, site)?;
     if literal {
@@ -588,7 +549,7 @@ fn emit_committed_pair_call(
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
-    sequence: &InstructionSequence,
+    _sequence: &InstructionSequence,
     frame: MachineFrameLayout,
     instruction: &super::super::MachineInstruction,
     id: MachineInstructionId,
@@ -669,7 +630,6 @@ fn emit_committed_pair_call(
             "scalar committed pair runtime safepoint",
         ))?;
 
-    emit_clear_packed_double_view_caches(ops, frame, sequence.packed_double_view_cache_count())?;
     emit_save_safepoint_roots(ops, frame, site)?;
     emit_publish_machine_roots(ops, frame, site)?;
     emit_load_u64(ops, 1, VALUE_UNDEFINED);
@@ -1090,11 +1050,6 @@ pub(super) fn emit(
         .any(|instruction| instruction.opcode == MachineOpcode::BackedgePoll);
 
     emit_prologue(&mut ops, frame, saved);
-    emit_clear_packed_double_view_caches(
-        &mut ops,
-        frame,
-        sequence.packed_double_view_cache_count(),
-    )?;
     if has_backedge_poll {
         dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
     }
@@ -1843,6 +1798,7 @@ pub(super) fn emit(
                     fatal,
                 );
             }
+            MachineOpcode::LoopPreheader => {}
             MachineOpcode::BoxNumber => emit_box_number(
                 &mut ops,
                 float_register(locations[0])?,
@@ -2268,41 +2224,21 @@ pub(super) fn emit(
                     emit_store_allocated_integer(&mut ops, frame, locations[3], 17, 0)?;
                 }
             }
-            MachineOpcode::ElementView { byte_pc, cache } => {
+            MachineOpcode::ElementView { byte_pc } => {
                 let access = element_access_for(view, byte_pc)
                     .copied()
                     .ok_or(Unsupported::OperandShape("scalar element view access"))?;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
-                if let Some(cache) = cache {
-                    let (base_offset, length_offset) =
-                        packed_double_view_cache_offsets(frame, cache)?;
-                    let uncached = ops.new_dynamic_label();
-                    dynasm!(ops ; .arch aarch64 ; ldr x16, [sp, base_offset] ; cbz x16, =>uncached ; ldr x14, [sp, length_offset] ; b >have_view ; =>uncached);
-                    emit_element_view(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        &access,
-                        |ops, target| {
-                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
-                        },
-                        miss,
-                    )?;
-                    dynasm!(ops ; .arch aarch64 ; str x14, [sp, length_offset] ; str x16, [sp, base_offset] ; have_view:);
-                } else {
-                    emit_element_view(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        &access,
-                        |ops, target| {
-                            emit_load_allocated_tagged(ops, frame, locations[0], target, 0)
-                        },
-                        miss,
-                    )?;
-                }
+                emit_element_view(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    &access,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    miss,
+                )?;
                 emit_store_allocated_integer(&mut ops, frame, locations[1], 16, 0)?;
                 emit_store_allocated_integer(&mut ops, frame, locations[2], 14, 0)?;
                 emit_load_u64(&mut ops, 9, 1);
@@ -2438,20 +2374,6 @@ pub(super) fn emit(
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
             }
-            MachineOpcode::ClearPackedDoubleViewCaches(_) => {
-                let start = ops.offset().0;
-                emit_clear_packed_double_view_caches(
-                    &mut ops,
-                    frame,
-                    sequence.packed_double_view_cache_count(),
-                )?;
-                structural_regions.push((
-                    "machinePackedDoubleViewCacheClear",
-                    None,
-                    start,
-                    ops.offset().0,
-                ));
-            }
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;
                 dynasm!(ops
@@ -2536,15 +2458,6 @@ pub(super) fn emit(
                     let direct_threw = ops.new_dynamic_label();
                     let direct_bail = ops.new_dynamic_label();
                     let final_method_guard_miss = ops.new_dynamic_label();
-                    // Any generated JavaScript call can reenter and collect.
-                    // Raw packed-double view caches are neither roots nor
-                    // stable across that boundary, so invalidate them before
-                    // the root record changes SP.
-                    emit_clear_packed_double_view_caches(
-                        &mut ops,
-                        frame,
-                        sequence.packed_double_view_cache_count(),
-                    )?;
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
                     let packet = super::value_packet_frame(sequence)?;
@@ -3525,11 +3438,6 @@ pub(super) fn emit(
         let offset = ops.offset().0;
         let representation_bail = ops.new_dynamic_label();
         emit_prologue(&mut ops, frame, saved);
-        emit_clear_packed_double_view_caches(
-            &mut ops,
-            frame,
-            sequence.packed_double_view_cache_count(),
-        )?;
         if has_backedge_poll {
             dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
         }
@@ -4443,7 +4351,7 @@ fn root_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported>
 fn raw_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported> {
     frame
         .raw_offset(slot)
-        .map_err(|_| Unsupported::OperandShape("scalar Machine IR raw-cache offset"))
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR raw-scratch offset"))
 }
 
 fn emit_sp_address_x9(ops: &mut dynasmrt::aarch64::Assembler, offset: u32) {

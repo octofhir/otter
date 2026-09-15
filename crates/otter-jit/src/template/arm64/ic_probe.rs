@@ -66,13 +66,14 @@ use otter_vm::runtime_stubs::{
 };
 
 use super::values::{
-    CellTest, emit_box_int32, emit_cell_test, emit_load_reg, emit_load_symbol_u64, emit_load_u64,
+    CellTest, emit_box_int32, emit_box_number_with_scratch, emit_cell_test, emit_load_reg,
+    emit_load_symbol_u64, emit_load_u64,
 };
 use crate::artifact::relocation::{GuardedHeapComponent, RelocationCapture, RelocationTarget};
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
-    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16,
-    NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16,
+    OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
     VM_THREAD_GC_HEAP_OFFSET,
 };
 
@@ -994,7 +995,8 @@ where
 ///
 /// A boxed hole is an absent property — the prototype chain answers a read, and
 /// a prototype setter may observe a write — so it is a guard failure. A scalar
-/// element has no such state and always produces a value. Clobbers `x11`.
+/// element has no such state and always produces a value. Clobbers `x10`–`x12`,
+/// `x14`, `x15`, `d30`, and `d31`.
 pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
     match element {
         JitElementRepr::Boxed => {
@@ -1013,25 +1015,12 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
             emit_box_int32(ops, 9, 11);
         }
         JitElementRepr::Float64 => {
-            // The same box `emit_box_double` produces, computed without an FP
-            // register: neither tier reserves an FP scratch here, and the
-            // optimizing tier's are allocated. A double is a NaN exactly when
-            // its sign-cleared bits exceed the all-ones exponent, so the
-            // canonicalization is one masked compare; the encode offset then
-            // moves the bits into the number space.
-            let ready = ops.new_dynamic_label();
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr x9, [x16]
-                ; and x11, x9, #0x7fff_ffff_ffff_ffff
-                ; movz x12, 0x7ff0, lsl #48
-                ; cmp x11, x12
-                ; b.ls =>ready
-                ; movz x9, CANONICAL_NAN_HI16, lsl #48
-                ; =>ready
-                ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
-                ; add x9, x9, x11
-            );
+            // Match `NumberValue::from_f64`: exact int32 values use the Smi
+            // representation, while -0, fractions, infinities and values
+            // outside int32 remain doubles. This is required before a later
+            // representation guard observes the loaded value.
+            dynasm!(ops ; .arch aarch64 ; ldr d31, [x16]);
+            emit_box_number_with_scratch(ops, 31, 9, 30);
         }
     }
 }

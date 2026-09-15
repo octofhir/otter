@@ -11,8 +11,8 @@
 //!   typed plain/method/forwarded calls and frameless scalar/property-inline guards.
 //! - Forwarding carries method, callee, receiver and mapped register values as
 //!   explicit SSA operands; captured aliases remain live activation cells.
-//! - [`NumericPackedDoubleViewCachePlan`] — bounded natural-loop sharing of
-//!   raw packed-array base/length proofs.
+//! - [`NumericLoopEntryPlan`] — explicit external-entry splits for reducible
+//!   natural loops, including OSR entry.
 //!
 //! # Invariants
 //! - Constructor receiver probes and base-result selection are explicit SSA nodes;
@@ -101,10 +101,10 @@
 //!   a forward predecessor; backedge arguments are attached after all blocks
 //!   are lowered. Headers inside an active exception region remain ordinary
 //!   Machine blocks but never publish OSR entry metadata.
-//! - Packed-double view caches are planned only for reducible innermost loops
-//!   without allocation, JavaScript reentry, or incompatible stores. A cached
-//!   receiver is defined outside the loop or passes through an exact identity
-//!   header phi; every external entry edge is recorded for mandatory clearing.
+//! - Reducible innermost packed-double loops without allocation, JavaScript
+//!   reentry, or incompatible stores expose explicit external-entry blocks.
+//!   The receiver is defined outside the loop or passes through an exact
+//!   identity header phi; ordinary entry and OSR share the same preheader.
 //! - HIR preserves source CFG edges; selection splits critical edges before
 //!   allocator move placement.
 //! - Unprotected static-native calls consume the shared VM leaf declaration,
@@ -120,7 +120,6 @@ use otter_bytecode::scalar_semantics::{NumericBinaryOp, numeric_binary_semantics
 use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, JitElementBase, JitElementRepr, JitInstructionMetadata};
 
-use super::super::{MAX_PACKED_DOUBLE_VIEW_CACHES, PackedDoubleViewCacheId};
 use super::semantics::{
     CommittedValueOperation, InstructionSemantics, classify_snapshot,
     packed_double_element_access_is_exact,
@@ -710,36 +709,10 @@ pub(super) struct NumericFunction {
     pub(super) arithmetic_op_count: usize,
 }
 
-/// One proven loop-scoped packed-double view shared by element sites.
-#[derive(Debug, Clone)]
-pub(super) struct NumericPackedDoubleViewCache {
-    /// Dense bounded identity used to address two raw frame words.
-    pub(super) id: PackedDoubleViewCacheId,
-    /// Reducible natural-loop header whose backedges may retain the view.
-    pub(super) loop_header: usize,
-    /// Canonical receiver value before any identity loop phi.
-    pub(super) receiver_root: NumericValue,
-    /// Outside-to-header edges that must clear this cache before entry.
-    pub(super) entry_edges: BTreeSet<(usize, usize)>,
-    /// Complete immutable VM layout proof shared by every grouped site.
-    pub(super) access: otter_vm::JitElementAccess,
-}
-
-/// Conservative target-neutral packed-double view-cache plan.
+/// Natural-loop external edges that require a dedicated Machine preheader.
 #[derive(Debug, Clone, Default)]
-pub(super) struct NumericPackedDoubleViewCachePlan {
-    /// Cache descriptors in deterministic dense-id order.
-    pub(super) caches: Vec<NumericPackedDoubleViewCache>,
-    /// Element HIR value to its shared cache identity.
-    pub(super) sites: BTreeMap<NumericValue, PackedDoubleViewCacheId>,
-}
-
-impl NumericPackedDoubleViewCachePlan {
-    /// Cache identity assigned to one packed-double load or store.
-    #[must_use]
-    pub(super) fn cache_for(&self, site: NumericValue) -> Option<PackedDoubleViewCacheId> {
-        self.sites.get(&site).copied()
-    }
+pub(super) struct NumericLoopEntryPlan {
+    pub(super) entry_edges: BTreeSet<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -810,97 +783,44 @@ impl NumericFunction {
         ))
     }
 
-    /// Plan bounded raw view caches for safe packed-double loop sites.
-    ///
-    /// This analysis deliberately runs after HIR construction, when receiver
-    /// identity phis and the complete CFG are explicit. Failure to prove one
-    /// site merely leaves that site on its ordinary per-access guard path.
-    pub(super) fn plan_packed_double_view_caches(
-        &self,
-        view: &JitCompileSnapshot,
-    ) -> NumericPackedDoubleViewCachePlan {
+    /// Plan explicit external-entry blocks for reducible inner loops with an
+    /// invariant packed-double receiver and no in-loop reentry/invalidation.
+    pub(super) fn plan_loop_entries(&self) -> NumericLoopEntryPlan {
         let Some(loops) = innermost_reducible_natural_loops(&self.blocks) else {
-            return NumericPackedDoubleViewCachePlan::default();
+            return NumericLoopEntryPlan::default();
         };
         let Some(node_blocks) = numeric_node_blocks(self) else {
-            return NumericPackedDoubleViewCachePlan::default();
+            return NumericLoopEntryPlan::default();
         };
-        let mut plan = NumericPackedDoubleViewCachePlan::default();
-
-        for natural_loop in loops {
-            if !packed_double_cache_loop_is_safe(self, &natural_loop) {
+        let mut plan = NumericLoopEntryPlan::default();
+        for natural_loop in &loops {
+            if !loop_is_versionable(self, natural_loop) {
                 continue;
             }
-            for &block_index in &natural_loop.blocks {
-                let Some(block) = self.blocks.get(block_index) else {
-                    continue;
-                };
-                for &site in &block.nodes {
-                    let Some((receiver, byte_pc)) =
-                        self.nodes.get(site.0).and_then(|node| match *node {
-                            NumericNode::ElementLoad {
-                                receiver,
-                                byte_pc,
-                                access: Some(NumericElementAccess::PackedDouble),
-                                ..
-                            }
-                            | NumericNode::ElementStore {
-                                receiver,
-                                byte_pc,
-                                access: Some(NumericElementAccess::PackedDouble),
-                                ..
-                            } => Some((receiver, byte_pc)),
-                            _ => None,
-                        })
-                    else {
-                        continue;
+            let has_invariant_packed_receiver = natural_loop.blocks.iter().any(|&block| {
+                self.blocks[block].nodes.iter().copied().any(|site| {
+                    let receiver = match self.nodes[site.0] {
+                        NumericNode::ElementLoad {
+                            receiver,
+                            access: Some(NumericElementAccess::PackedDouble),
+                            ..
+                        }
+                        | NumericNode::ElementStore {
+                            receiver,
+                            access: Some(NumericElementAccess::PackedDouble),
+                            ..
+                        } => receiver,
+                        _ => return false,
                     };
-                    let Some(access) = view.element_accesses.get(&byte_pc).copied() else {
-                        continue;
-                    };
-                    if !packed_double_element_access_is_exact(&access) {
-                        continue;
-                    }
-                    let Some(receiver_root) = canonical_loop_invariant_receiver(
-                        self,
-                        &natural_loop,
-                        &node_blocks,
-                        receiver,
-                    ) else {
-                        continue;
-                    };
-
-                    let cache_id = plan
-                        .caches
-                        .iter()
-                        .find(|cache| {
-                            cache.loop_header == natural_loop.header
-                                && cache.receiver_root == receiver_root
-                                && same_element_access(&cache.access, &access)
-                        })
-                        .map(|cache| cache.id)
-                        .or_else(|| {
-                            let id = PackedDoubleViewCacheId::new(plan.caches.len())?;
-                            plan.caches.push(NumericPackedDoubleViewCache {
-                                id,
-                                loop_header: natural_loop.header,
-                                receiver_root,
-                                entry_edges: packed_double_cache_entry_edges(
-                                    &self.blocks,
-                                    &natural_loop,
-                                ),
-                                access,
-                            });
-                            Some(id)
-                        });
-                    if let Some(cache_id) = cache_id {
-                        plan.sites.insert(site, cache_id);
-                    }
-                }
+                    canonical_loop_invariant_receiver(self, natural_loop, &node_blocks, receiver)
+                        .is_some()
+                })
+            });
+            if has_invariant_packed_receiver {
+                plan.entry_edges
+                    .extend(natural_loop_entry_edges(&self.blocks, natural_loop));
             }
         }
-
-        debug_assert!(plan.caches.len() <= MAX_PACKED_DOUBLE_VIEW_CACHES);
         plan
     }
 
@@ -1463,10 +1383,7 @@ fn numeric_dominators(blocks: &[NumericBlock]) -> Option<Vec<BTreeSet<usize>>> {
     }
 }
 
-fn packed_double_cache_loop_is_safe(
-    function: &NumericFunction,
-    natural_loop: &NumericNaturalLoop,
-) -> bool {
+fn loop_is_versionable(function: &NumericFunction, natural_loop: &NumericNaturalLoop) -> bool {
     natural_loop.blocks.iter().all(|&block_index| {
         function.blocks.get(block_index).is_some_and(|block| {
             block.nodes.iter().all(|&node| {
@@ -1494,7 +1411,7 @@ fn packed_double_cache_loop_is_safe(
     })
 }
 
-fn packed_double_cache_entry_edges(
+fn natural_loop_entry_edges(
     blocks: &[NumericBlock],
     natural_loop: &NumericNaturalLoop,
 ) -> BTreeSet<(usize, usize)> {
@@ -1565,18 +1482,6 @@ fn value_is_defined_outside_loop(
     node_blocks
         .get(value.0)
         .is_some_and(|block| block.is_some_and(|block| !natural_loop.blocks.contains(&block)))
-}
-
-fn same_element_access(
-    left: &otter_vm::JitElementAccess,
-    right: &otter_vm::JitElementAccess,
-) -> bool {
-    left.type_tag == right.type_tag
-        && left.guards == right.guards
-        && left.length_byte == right.length_byte
-        && left.length_width == right.length_width
-        && left.base == right.base
-        && left.element == right.element
 }
 
 fn infer_parameter_types(
@@ -4273,10 +4178,10 @@ mod tests {
                         .contains(&NumericFrameSlot::Value(leaf)),
                     "result is not defined on a miss"
                 );
-                let sequence = super::super::select_with_packed_double_view_caches(
+                let sequence = super::super::select_with_loop_entries(
                     &TargetSpec::aarch64(),
                     &hir,
-                    &NumericPackedDoubleViewCachePlan::default(),
+                    &hir.plan_loop_entries(),
                 )
                 .expect("verified native leaf Machine IR");
                 sequence
@@ -4430,193 +4335,6 @@ mod tests {
             *access = JitElementAccess::packed_double_array();
         }
         view
-    }
-
-    fn packed_double_loop_view() -> JitCompileSnapshot {
-        let instructions = vec![
-            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
-            (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(2)]),
-            (
-                Op::LessThan,
-                vec![
-                    Operand::Register(3),
-                    Operand::Register(1),
-                    Operand::Register(2),
-                ],
-            ),
-            (
-                Op::JumpIfFalse,
-                vec![Operand::Imm32(4), Operand::Register(3)],
-            ),
-            (
-                Op::LoadElement,
-                vec![
-                    Operand::Register(3),
-                    Operand::Register(0),
-                    Operand::Register(1),
-                ],
-            ),
-            (
-                Op::StoreElement,
-                vec![
-                    Operand::Register(0),
-                    Operand::Register(1),
-                    Operand::Register(3),
-                ],
-            ),
-            (
-                Op::AddImm,
-                vec![
-                    Operand::Register(1),
-                    Operand::Register(1),
-                    Operand::Imm32(1),
-                ],
-            ),
-            (Op::Jump, vec![Operand::Imm32(-6)]),
-            (Op::ReturnValue, vec![Operand::Register(0)]),
-        ];
-        let mut view = JitCompileSnapshot::without_feedback(
-            151,
-            1,
-            4,
-            instructions
-                .into_iter()
-                .enumerate()
-                .map(|(pc, (op, operands))| {
-                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
-                })
-                .collect(),
-        );
-        view.seed_arith_feedback_for_test(2, ArithFeedback::from_bits(ARITH_INT32));
-        view.seed_arith_feedback_for_test(6, ArithFeedback::from_bits(ARITH_INT32));
-        view.cage_base = 0x1000;
-        for byte_pc in [32, 40] {
-            view.element_accesses
-                .insert(byte_pc, JitElementAccess::packed_double_array());
-        }
-        view
-    }
-
-    fn packed_double_cache_function(
-        varying_receiver: bool,
-        unsafe_loop: bool,
-    ) -> (
-        NumericFunction,
-        JitCompileSnapshot,
-        NumericValue,
-        NumericValue,
-    ) {
-        let value = NumericValue;
-        let mut nodes = vec![
-            NumericNode::Parameter {
-                register: 0,
-                value_type: NumericType::Tagged,
-            },
-            NumericNode::BlockParameter(NumericType::Tagged),
-            NumericNode::IntegerConstant(0),
-            NumericNode::ElementLoad {
-                receiver: value(1),
-                index: value(2),
-                byte_pc: 24,
-                access: Some(NumericElementAccess::PackedDouble),
-                exceptional_edge: None,
-            },
-            NumericNode::ElementStore {
-                receiver: value(1),
-                index: value(2),
-                value: value(3),
-                byte_pc: 32,
-                access: Some(NumericElementAccess::PackedDouble),
-                exceptional_edge: None,
-            },
-            NumericNode::BooleanConstant(true),
-        ];
-        let mut loop_nodes = vec![value(2), value(3), value(4)];
-        if unsafe_loop {
-            nodes.push(NumericNode::ArrayConstruct {
-                length: value(2),
-                byte_pc: 40,
-            });
-            loop_nodes.push(value(6));
-        }
-        let backedge_receiver = if varying_receiver { value(2) } else { value(1) };
-        let function = NumericFunction {
-            property_sites: BTreeMap::new(),
-            constructor_field_sites: BTreeMap::new(),
-            function_id: 150,
-            nodes,
-            blocks: vec![
-                NumericBlock {
-                    logical_pc: 0,
-                    osr_entry_allowed: true,
-                    predecessors: Vec::new(),
-                    successors: vec![1],
-                    parameters: Vec::new(),
-                    parameter_registers: Vec::new(),
-                    successor_arguments: vec![vec![value(0)]],
-                    nodes: vec![value(0)],
-                    terminator: NumericTerminator::Jump,
-                },
-                NumericBlock {
-                    logical_pc: 1,
-                    osr_entry_allowed: true,
-                    predecessors: vec![0, 2],
-                    successors: vec![2, 3],
-                    parameters: vec![value(1)],
-                    parameter_registers: vec![0],
-                    successor_arguments: vec![Vec::new(), Vec::new()],
-                    nodes: vec![value(1), value(5)],
-                    terminator: NumericTerminator::Branch {
-                        condition: value(5),
-                        when_true: true,
-                    },
-                },
-                NumericBlock {
-                    logical_pc: 2,
-                    osr_entry_allowed: true,
-                    predecessors: vec![1],
-                    successors: vec![1],
-                    parameters: Vec::new(),
-                    parameter_registers: Vec::new(),
-                    successor_arguments: vec![vec![backedge_receiver]],
-                    nodes: loop_nodes,
-                    terminator: NumericTerminator::Jump,
-                },
-                NumericBlock {
-                    logical_pc: 3,
-                    osr_entry_allowed: true,
-                    predecessors: vec![1],
-                    successors: Vec::new(),
-                    parameters: Vec::new(),
-                    parameter_registers: Vec::new(),
-                    successor_arguments: Vec::new(),
-                    nodes: Vec::new(),
-                    terminator: NumericTerminator::Return(value(0)),
-                },
-            ],
-            frame_states: Vec::new(),
-            direct_call_targets: Vec::new(),
-            operand_values: Vec::new(),
-            parameter_count: 1,
-            register_count: 6,
-            arithmetic_op_count: 0,
-        };
-        let mut view = JitCompileSnapshot::without_feedback(
-            150,
-            1,
-            1,
-            vec![JitTestInstruction::new(
-                Op::ReturnValue,
-                0,
-                0,
-                vec![Operand::Register(0)],
-            )],
-        );
-        view.element_accesses
-            .insert(24, JitElementAccess::packed_double_array());
-        view.element_accesses
-            .insert(32, JitElementAccess::packed_double_array());
-        (function, view, value(3), value(4))
     }
 
     fn global_load_view() -> JitCompileSnapshot {
@@ -6542,84 +6260,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_double_view_cache_groups_identity_phi_sites_and_records_entries() {
-        let (function, view, load, store) = packed_double_cache_function(false, false);
-        let plan = function.plan_packed_double_view_caches(&view);
-        assert_eq!(plan.caches.len(), 1);
-        let cache = &plan.caches[0];
-        assert_eq!(cache.id.index(), 0);
-        assert_eq!(cache.loop_header, 1);
-        assert_eq!(cache.receiver_root, NumericValue(0));
-        assert_eq!(cache.entry_edges, BTreeSet::from([(0, 0)]));
-        assert!(cache.access.is_packed_double_array());
-        assert_eq!(plan.cache_for(load), Some(cache.id));
-        assert_eq!(plan.cache_for(store), Some(cache.id));
-    }
-
-    #[test]
-    fn built_hir_plans_one_cache_for_a_real_packed_double_loop() {
-        let view = packed_double_loop_view();
-        let function = NumericFunction::build(&view).expect("packed-double loop HIR");
-        let plan = function.plan_packed_double_view_caches(&view);
-        assert_eq!(plan.caches.len(), 1);
-        let cache = &plan.caches[0];
-        assert!(!cache.entry_edges.is_empty());
-        assert!(matches!(
-            function.nodes[cache.receiver_root.0],
-            NumericNode::Parameter {
-                register: 0,
-                value_type: NumericType::Tagged
-            }
-        ));
-        let sites = function
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| match node {
-                NumericNode::ElementLoad {
-                    byte_pc: 32,
-                    access: Some(NumericElementAccess::PackedDouble),
-                    ..
-                }
-                | NumericNode::ElementStore {
-                    byte_pc: 40,
-                    access: Some(NumericElementAccess::PackedDouble),
-                    ..
-                } => Some(NumericValue(index)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sites.len(), 2);
-        assert!(
-            sites
-                .into_iter()
-                .all(|site| plan.cache_for(site) == Some(cache.id))
-        );
-    }
-
-    #[test]
-    fn packed_double_view_cache_rejects_varying_receivers_and_reentrant_loops() {
-        let (varying, view, _, _) = packed_double_cache_function(true, false);
-        assert!(
-            varying
-                .plan_packed_double_view_caches(&view)
-                .caches
-                .is_empty(),
-            "a changing header phi must not retain a raw view"
-        );
-
-        let (unsafe_function, view, _, _) = packed_double_cache_function(false, true);
-        assert!(
-            unsafe_function
-                .plan_packed_double_view_caches(&view)
-                .caches
-                .is_empty(),
-            "an allocating loop must clear rather than retain raw addresses"
-        );
-    }
-
-    #[test]
-    fn packed_double_view_cache_plans_only_innermost_natural_loops() {
+    fn loop_entry_plan_splits_only_innermost_natural_loops() {
         let block = |predecessors: Vec<usize>, successors: Vec<usize>| NumericBlock {
             logical_pc: 0,
             osr_entry_allowed: true,

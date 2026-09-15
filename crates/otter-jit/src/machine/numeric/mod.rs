@@ -131,7 +131,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use self::hir::{
     NumericBindingTarget, NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
     NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFrameStatePurpose,
-    NumericFunction, NumericNode, NumericPackedDoubleViewCachePlan, NumericTerminator, NumericType,
+    NumericFunction, NumericLoopEntryPlan, NumericNode, NumericTerminator, NumericType,
     NumericValue,
 };
 use self::semantics::CommittedValueOperation;
@@ -142,8 +142,7 @@ use super::{
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineCallGuard,
     MachineExit, MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand,
-    MachineOsrInput, MachineOsrType, MachineRepresentation, MachineValue,
-    PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS, PackedDoubleViewCacheClearReason, PhysicalRegister,
+    MachineOsrInput, MachineOsrType, MachineRepresentation, MachineValue, PhysicalRegister,
     SafepointId, SafepointKind, TargetCapability, TargetClobberSet, TargetSpec,
     binding_guard_clobbers, binding_hit_clobbers, binding_write_barrier_clobbers,
     lower_deopt_table, lower_safepoints,
@@ -157,8 +156,8 @@ use crate::{
 
 /// Frame-wide untraced packet shared by calls and literal allocation.
 ///
-/// Packed-double caches own the raw prefix. The packet starts immediately
-/// after that prefix and is sized for the widest selected span descriptor.
+/// The packet begins at the untraced area and is sized for the widest selected
+/// span descriptor.
 /// Each descriptor owns its semantic operands; literal spans have no receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ValuePacketFrame {
@@ -179,13 +178,7 @@ struct BindingSelectedValues {
 pub(super) fn value_packet_frame(
     sequence: &InstructionSequence,
 ) -> Result<ValuePacketFrame, Unsupported> {
-    let cache_words = u16::try_from(PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS)
-        .map_err(|_| Unsupported::OperandShape("scalar raw-cache word count"))?;
-    let raw_start = u16::from(sequence.packed_double_view_cache_count())
-        .checked_mul(cache_words)
-        .ok_or(Unsupported::OperandShape(
-            "scalar packed-double view-cache frame",
-        ))?;
+    let raw_start = 0;
     let raw_words = sequence
         .call_descriptors()
         .iter()
@@ -228,10 +221,9 @@ pub(crate) fn try_compile(
         }
     })?;
     let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
-    let packed_double_view_caches = hir.plan_packed_double_view_caches(view);
-    let sequence =
-        select_with_packed_double_view_caches(target_spec, &hir, &packed_double_view_caches)
-            .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
+    let loop_entries = hir.plan_loop_entries();
+    let sequence = select_with_loop_entries(target_spec, &hir, &loop_entries)
+        .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
     let (sequence, optimization_stats) = sequence
         .optimize(target_spec)
         .map_err(|_error| Unsupported::OperandShape("scalar Machine IR optimization"))?;
@@ -396,7 +388,7 @@ pub(crate) fn try_compile(
 
     let artifact = artifact_request.map(|request| {
         let mut tier_input = format!(
-            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n; gvn-eliminated={} guards={} loads={}\n",
+            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n; gvn-eliminated={} guards={} loads={}\n; licm-hoisted={} versioned-loops={}\n",
             hir.parameter_count,
             hir.register_count,
             hir.blocks.len(),
@@ -404,6 +396,8 @@ pub(crate) fn try_compile(
             optimization_stats.eliminated_instructions,
             optimization_stats.eliminated_guards,
             optimization_stats.eliminated_loads,
+            optimization_stats.hoisted_instructions,
+            optimization_stats.versioned_loops,
         );
         tier_input.push_str(&sequence.normalized());
         tier_input.push_str(&allocation.normalized());
@@ -475,10 +469,10 @@ pub(crate) fn try_compile(
     })
 }
 
-fn select_with_packed_double_view_caches(
+fn select_with_loop_entries(
     target_spec: &TargetSpec,
     hir: &NumericFunction,
-    packed_double_view_caches: &NumericPackedDoubleViewCachePlan,
+    loop_entries: &NumericLoopEntryPlan,
 ) -> Result<InstructionSequence, super::VerificationError> {
     let mut representations = hir
         .nodes
@@ -510,7 +504,7 @@ fn select_with_packed_double_view_caches(
         });
     }
 
-    let selection_cfg = SelectionCfg::build(hir, packed_double_view_caches);
+    let selection_cfg = SelectionCfg::build(hir, loop_entries);
     let mut binding_values = BTreeMap::new();
     for (&block, selected) in &selection_cfg.bindings {
         let (node, target, _) = binding_site(hir, block)
@@ -709,15 +703,9 @@ fn select_with_packed_double_view_caches(
                     poll.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                     instructions.push(poll);
                 }
-                if packed_double_view_caches
-                    .caches
-                    .iter()
-                    .any(|cache| cache.entry_edges.contains(&(predecessor, edge)))
-                {
+                if loop_entries.entry_edges.contains(&(predecessor, edge)) {
                     instructions.push(MachineInstruction::plain(
-                        MachineOpcode::ClearPackedDoubleViewCaches(
-                            PackedDoubleViewCacheClearReason::LoopEntry,
-                        ),
+                        MachineOpcode::LoopPreheader,
                         Vec::new(),
                     ));
                 }
@@ -1096,7 +1084,6 @@ fn select_with_packed_double_view_caches(
                     target_spec,
                     byte_pc,
                     access,
-                    packed_double_view_caches.cache_for(node_value),
                     inputs,
                     element_values[&block_index],
                     &mut representations,
@@ -2486,7 +2473,7 @@ fn select_with_packed_double_view_caches(
         &mut blocks,
         &mut instructions,
     );
-    InstructionSequence::new_selected_with_packed_double_view_caches(
+    InstructionSequence::new_selected(
         target_spec,
         selection_cfg.originals[0],
         representations,
@@ -2494,8 +2481,6 @@ fn select_with_packed_double_view_caches(
         machine_frame_states(hir),
         blocks,
         instructions,
-        u8::try_from(packed_double_view_caches.caches.len())
-            .map_err(|_| super::VerificationError::InvalidEntry)?,
     )
 }
 
@@ -2834,11 +2819,7 @@ fn select_binding_join_block(
 
 #[cfg(test)]
 fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::VerificationError> {
-    select_with_packed_double_view_caches(
-        &TargetSpec::aarch64(),
-        hir,
-        &NumericPackedDoubleViewCachePlan::default(),
-    )
+    select_with_loop_entries(&TargetSpec::aarch64(), hir, &hir.plan_loop_entries())
 }
 
 fn intern_leaf_boolean_call_descriptor(
@@ -3724,10 +3705,7 @@ struct SelectionCfg {
 }
 
 impl SelectionCfg {
-    fn build(
-        hir: &NumericFunction,
-        packed_double_view_caches: &NumericPackedDoubleViewCachePlan,
-    ) -> Self {
+    fn build(hir: &NumericFunction, loop_entries: &NumericLoopEntryPlan) -> Self {
         let mut order = Vec::with_capacity(hir.blocks.len());
         let mut originals = vec![MachineBlock(u32::MAX); hir.blocks.len()];
         let mut split_edges = BTreeMap::new();
@@ -3740,10 +3718,7 @@ impl SelectionCfg {
                     || successor <= predecessor
                     || is_exceptional_hir_edge(hir, predecessor, edge)
                     || edge_requires_representation_conversion(hir, predecessor, edge, successor)
-                    || packed_double_view_caches
-                        .caches
-                        .iter()
-                        .any(|cache| cache.entry_edges.contains(&(predecessor, edge)))
+                    || loop_entries.entry_edges.contains(&(predecessor, edge))
                 {
                     let block = MachineBlock(order.len() as u32);
                     split_edges.insert((predecessor, edge), block);
@@ -4158,12 +4133,9 @@ mod tests {
             direct_call_targets: vec![],
             operand_values: vec![],
         };
-        let sequence = select_with_packed_double_view_caches(
-            &TargetSpec::aarch64(),
-            &hir,
-            &Default::default(),
-        )
-        .unwrap();
+        let sequence =
+            select_with_loop_entries(&TargetSpec::aarch64(), &hir, &hir.plan_loop_entries())
+                .unwrap();
         let allocation = sequence.allocate(&TargetSpec::aarch64()).unwrap();
         let layout = crate::machine::MachineFrameLayout::new(&allocation, 0, 16, 16).unwrap();
         let table = lower_deopt_table(
@@ -7561,7 +7533,7 @@ mod tests {
     #[test]
     fn selects_wide_generic_methods_with_deduplicated_alias_roots_and_raw_packet() {
         for argument_count in [5_u32, 8, 300] {
-            let mut sequence = select(&generic_wide_method_call_selection_hir(argument_count))
+            let sequence = select(&generic_wide_method_call_selection_hir(argument_count))
                 .expect("wide generic method Machine IR");
             let call = sequence
                 .instructions()
@@ -7617,9 +7589,8 @@ mod tests {
                 );
             }
 
-            sequence.packed_double_view_cache_count = 3;
             let packet = value_packet_frame(&sequence).expect("method packet frame");
-            assert_eq!(packet.raw_start, 6);
+            assert_eq!(packet.raw_start, 0);
             assert_eq!(packet.raw_words, argument_count as u16 + 1);
         }
     }

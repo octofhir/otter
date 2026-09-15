@@ -408,11 +408,9 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   `machineBindingGuard`, `machineBindingHit`, `machineBindingCold`, and
   `machineBindingJoin`. A failed TDZ, const, epoch, shape, slab, accessor,
   Proxy, or unresolved proof enters the single committed boxed-value sibling;
-  it never deoptimizes and replays the binding operation. In a completely generated,
-    non-reentrant outermost loop, `loopInvariantGlobalObjectLoadCache` marks a
-    native-stack slot that retains the live property address after the first
-    proof. It never caches the loaded value; entry, OSR, and every cold path
-    clear the raw address before collection or JavaScript reentry.
+  it never deoptimizes and replays the binding operation. Loop accesses retain
+  explicit guards and live loads; no global-object raw address is cached across
+  a backedge, collection, or JavaScript reentry.
   - Scalar Machine IR represents `x == null`, `x != null`, and their
     `undefined`-literal counterparts with `machineTaggedNullishEqual`. Null,
     undefined, and non-cell primitives complete without reentry. Every
@@ -442,19 +440,17 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     numeric consumers decode it independently. Fractions, negatives, NaN,
     values beyond Uint32, holes, detached/resized views, and unprepared sites
     enter the one committed boxed-value `[[Get]]` / `[[Set]]` sibling. That
-    sibling clears raw view caches, publishes precise moving roots, and exposes
+    sibling publishes precise moving roots and exposes
     Success/Throw/Fatal control before register allocation. A store occurs only
     after every miss-capable proof and is never replayed. Local catches consume
     the pure exception SSA edge directly.
-    Reducible non-reentrant loops may group invariant packed-double receivers
-    into bounded native-stack view caches. `optimized-ir.txt` reports
-    `packed-double-view-caches=<N>` and annotates each `ElementView` with its
-    cache id; `machinePackedDoubleViewCacheClear` marks an external loop-entry
-    reset. Each cache owns an untraced raw base/length pair, proves the complete
-    receiver/layout program lazily on first use, and retains the pair only over
-    generated backedges. Function entry, every OSR trampoline, and every
-    external edge into the selected loop start with an empty cache. No loaded
-    value or GC reference is cached.
+    Reducible non-reentrant loops expose `LoopPreheader` on every selected
+    external entry, including OSR. `optimized-ir.txt` reports
+    `licm-hoisted=<N> versioned-loops=<N>` and starts its normalized graph with
+    `machine-ir explicit-loop-preheaders`. Hoisted scalar values are explicit
+    loop-header SSA arguments. Packed element base/length addresses are derived
+    per access and never retained across a generated backedge, collection, or
+    JavaScript reentry.
     Named-property regions transpile immutable CacheIR snapshots into explicit
     `machineCacheIr*` guards, prototype loads, field accesses, publication, and
     barrier operations. A code-owned `propertySourceCell` carries only

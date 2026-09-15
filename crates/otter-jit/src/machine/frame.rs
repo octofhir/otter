@@ -6,10 +6,10 @@
 //! - [`FrameLayoutError`] — checked arithmetic and invalid-alignment failures.
 //!
 //! # Invariants
-//! - Every spill, root, and raw-cache slot is one eight-byte machine word.
+//! - Every spill, root, and untraced runtime-scratch slot is one eight-byte word.
 //! - Allocator spills precede the reusable tagged-root save area, which in
-//!   turn precedes untraced raw-cache words.
-//! - Raw-cache words never enter safepoint or deoptimization root metadata.
+//!   turn precedes untraced runtime-scratch words.
+//! - Untraced scratch words never enter safepoint or deoptimization root metadata.
 //! - The total native reservation includes target-owned fixed bytes and is
 //!   aligned to the target ABI requirement.
 //! - Spill offsets are relative to the post-prologue stack pointer and never
@@ -34,7 +34,7 @@ pub enum FrameLayoutError {
     FrameSizeOverflow,
     /// Requested spill slot is outside the allocator-owned range.
     InvalidSpillSlot(u32),
-    /// Requested raw-cache slot is outside the target-owned range.
+    /// Requested untraced scratch slot is outside the target-owned range.
     InvalidRawSlot(u16),
 }
 
@@ -70,7 +70,7 @@ impl MachineFrameLayout {
         Self::new_with_raw_slots(allocation, root_slots, 0, fixed_bytes, stack_alignment)
     }
 
-    /// Build an aligned frame with an additional untraced raw-cache area.
+    /// Build an aligned frame with an additional untraced runtime-scratch area.
     pub fn new_with_raw_slots(
         allocation: &AllocatedSequence,
         root_slots: u16,
@@ -142,7 +142,7 @@ impl MachineFrameLayout {
         self.root_slots
     }
 
-    /// Number of untraced target-owned raw-cache words.
+    /// Number of untraced target-owned runtime-scratch words.
     #[must_use]
     pub const fn raw_slots(self) -> u16 {
         self.raw_slots
@@ -168,7 +168,7 @@ impl MachineFrameLayout {
             .ok_or(FrameLayoutError::FrameSizeOverflow)
     }
 
-    /// Byte offset of one untraced raw-cache word from the post-prologue SP.
+    /// Byte offset of one untraced scratch word from the post-prologue SP.
     pub fn raw_offset(self, slot: u16) -> Result<u32, FrameLayoutError> {
         if slot >= self.raw_slots {
             return Err(FrameLayoutError::InvalidRawSlot(slot));
@@ -271,7 +271,7 @@ mod tests {
         ));
 
         let raw = MachineFrameLayout::new_with_raw_slots(&allocation, 3, 4, 16, 16)
-            .expect("valid raw-cache frame");
+            .expect("valid raw-scratch frame");
         assert_eq!(raw.raw_slots(), 4);
         assert_eq!(raw.raw_offset(0), Ok(raw.root_offset(2).unwrap() + 8));
         assert_eq!(raw.raw_offset(3), Ok(raw.raw_offset(0).unwrap() + 24));

@@ -41,7 +41,6 @@ const ALIASES: [MachineAliasClass; MachineAliasClass::COUNT] = [
     MachineAliasClass::ConstantCell,
     MachineAliasClass::Allocation,
     MachineAliasClass::GcBarrier,
-    MachineAliasClass::RawViewCache,
 ];
 
 /// Deterministic result counters published in optimized artifacts and tests.
@@ -50,6 +49,8 @@ pub(crate) struct MachineOptimizationStats {
     pub(crate) eliminated_instructions: u32,
     pub(crate) eliminated_guards: u32,
     pub(crate) eliminated_loads: u32,
+    pub(crate) hoisted_instructions: u32,
+    pub(crate) versioned_loops: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

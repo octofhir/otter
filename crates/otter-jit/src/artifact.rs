@@ -698,21 +698,31 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
     }
 
     fn render_slot(slot: &otter_vm::deopt::DeoptSlot) -> Slot {
-        let (location_kind, location_value) = match slot.location {
-            DeoptLocation::Register(register) => ("register", register.to_string()),
-            DeoptLocation::StackSlot(offset) => ("stackSlot", offset.to_string()),
-            DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
-        };
-        Slot {
-            location_kind,
-            location_value,
-            representation: match slot.repr {
-                DeoptRepr::Tagged => "tagged",
-                DeoptRepr::Int32 => "int32",
-                DeoptRepr::Boolean => "boolean",
-                DeoptRepr::Uint32 => "uint32",
-                DeoptRepr::Float64 => "float64",
+        match slot.location {
+            DeoptLocation::VirtualObject(object) => Slot {
+                location_kind: "virtualObject",
+                location_value: object.0.to_string(),
+                representation: "tagged",
             },
+            location => {
+                let (location_kind, location_value) = match location {
+                    DeoptLocation::Register(register) => ("register", register.to_string()),
+                    DeoptLocation::StackSlot(offset) => ("stackSlot", offset.to_string()),
+                    DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
+                    DeoptLocation::VirtualObject(_) => unreachable!(),
+                };
+                Slot {
+                    location_kind,
+                    location_value,
+                    representation: match slot.repr {
+                        DeoptRepr::Tagged => "tagged",
+                        DeoptRepr::Int32 => "int32",
+                        DeoptRepr::Boolean => "boolean",
+                        DeoptRepr::Uint32 => "uint32",
+                        DeoptRepr::Float64 => "float64",
+                    },
+                }
+            }
         }
     }
 
@@ -721,6 +731,7 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
     struct State {
         id: u32,
         frames: Vec<otter_vm::deopt::DeoptFrame<Slot>>,
+        virtual_objects: Vec<otter_vm::deopt::VirtualObject<Slot>>,
     }
 
     #[derive(Serialize)]
@@ -763,6 +774,15 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
                     slots: frame.slots.iter().map(render_slot).collect(),
                 })
                 .collect(),
+            virtual_objects: state
+                .virtual_objects
+                .iter()
+                .map(|object| otter_vm::deopt::VirtualObject {
+                    id: object.id,
+                    kind: object.kind,
+                    fields: object.fields.iter().map(render_slot).collect(),
+                })
+                .collect(),
         })
         .collect();
     let exits = runtime
@@ -792,7 +812,8 @@ mod tests {
     fn deopt_artifact_preserves_inline_entry_recipes() {
         use otter_vm::deopt::{
             DeoptExitDescriptor, DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr,
-            DeoptRuntime, DeoptSlot, DeoptTable, FrameState,
+            DeoptRuntime, DeoptSlot, DeoptTable, FrameState, VirtualObject, VirtualObjectId,
+            VirtualObjectKind,
         };
         let slot = DeoptSlot {
             location: DeoptLocation::Register(3),
@@ -823,9 +844,14 @@ mod tests {
                             repr: DeoptRepr::Tagged,
                         },
                     }),
-                    slots: Box::new([slot]),
+                    slots: Box::new([DeoptSlot::virtual_object(VirtualObjectId(0))]),
                 },
             ]),
+            virtual_objects: Box::new([VirtualObject {
+                id: VirtualObjectId(0),
+                kind: VirtualObjectKind::FixedArray,
+                fields: Box::new([slot]),
+            }]),
         }]);
         let runtime = DeoptRuntime {
             table,
@@ -846,6 +872,11 @@ mod tests {
         assert_eq!(frames[1]["entry"]["closure"]["locationKind"], "stackSlot");
         assert_eq!(frames[1]["entry"]["closure"]["locationValue"], "32");
         assert_eq!(frames[1]["entry"]["newTarget"]["locationKind"], "literal");
+        assert_eq!(frames[1]["slots"][0]["locationKind"], "virtualObject");
+        assert_eq!(
+            json["frameStates"][0]["virtualObjects"][0]["kind"],
+            "fixedArray"
+        );
         assert_eq!(
             frames[1]["entry"]["newTarget"]["locationValue"],
             format!("0x{:016x}", otter_vm::Value::function(99).to_bits())

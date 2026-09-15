@@ -7,6 +7,7 @@
 //! # Contents
 //! - Object literal allocation.
 //! - Array literal allocation from variadic register operands.
+//! - Dense virtual-object graph materialization for optimizing deopt.
 //! - Array push helper used by spread/rest lowering.
 //! - WeakRef and FinalizationRegistry allocation.
 //!
@@ -18,6 +19,9 @@
 //! - Runtime-rooted helpers install a direct temporary root provider only when
 //!   the caller has not already published one; external visitors trace only
 //!   caller-local values and never allocate a runtime-root snapshot.
+//! - Virtual-object dependencies and scalar fields stay in one handle scope
+//!   and are re-read after every allocation, so moving collection cannot stale
+//!   an earlier identity or a later recipe input.
 //!
 //! # See also
 //! - [`crate::array`]
@@ -814,6 +818,67 @@ impl Interpreter {
     {
         let array = self.alloc_runtime_rooted_array_from_values(elements, &[], &[])?;
         Ok(Value::array(array))
+    }
+
+    /// Materialize a verified dense virtual-object graph while one handle
+    /// scope keeps every earlier allocation current across moving collection.
+    pub(crate) fn materialize_virtual_objects(
+        &mut self,
+        recipes: &[crate::deopt::VirtualObject<crate::deopt::VirtualMaterializationValue>],
+    ) -> Result<Vec<Value>, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let field_roots = recipes
+                .iter()
+                .map(|recipe| {
+                    recipe
+                        .fields
+                        .iter()
+                        .map(|field| match *field {
+                            crate::deopt::VirtualMaterializationValue::Value(value) => {
+                                Some(interp.scoped_value(scope, value))
+                            }
+                            crate::deopt::VirtualMaterializationValue::VirtualObject(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut roots = Vec::with_capacity(recipes.len());
+            for (recipe, scalar_fields) in recipes.iter().zip(&field_roots) {
+                if recipe.id.0 as usize != roots.len() {
+                    return Err(VmError::InvalidOperand);
+                }
+                let fields = recipe
+                    .fields
+                    .iter()
+                    .zip(scalar_fields)
+                    .map(|(field, scalar)| match *field {
+                        crate::deopt::VirtualMaterializationValue::Value(_) => scalar
+                            .map(|root| interp.handle_arena.get(root.index()))
+                            .ok_or(VmError::InvalidOperand),
+                        crate::deopt::VirtualMaterializationValue::VirtualObject(object) => roots
+                            .get(object.0 as usize)
+                            .map(|root: &crate::Local<'_>| interp.handle_arena.get(root.index()))
+                            .ok_or(VmError::InvalidOperand),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value = match recipe.kind {
+                    crate::deopt::VirtualObjectKind::PlainObject if fields.is_empty() => {
+                        interp.allocate_object_literal_value()?
+                    }
+                    crate::deopt::VirtualObjectKind::FixedArray => {
+                        interp.allocate_array_literal_value(fields)?
+                    }
+                    crate::deopt::VirtualObjectKind::PlainObject => {
+                        return Err(VmError::InvalidOperand);
+                    }
+                };
+                roots.push(interp.scoped_value(scope, value));
+            }
+            Ok(roots
+                .iter()
+                .map(|root| interp.handle_arena.get(root.index()))
+                .collect())
+        })
     }
 
     pub(crate) fn run_load_regexp_reg(

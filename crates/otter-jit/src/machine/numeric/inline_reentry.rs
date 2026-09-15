@@ -22,10 +22,21 @@ pub(super) fn select_frames(
     representations: &mut Vec<MachineRepresentation>,
     instructions: &mut Vec<MachineInstruction>,
     call: &mut MachineInstruction,
-) {
-    let frames = &hir.frame_states[state_index].frames;
+) -> Result<(), super::super::VerificationError> {
+    let state = &hir.frame_states[state_index];
+    let frames = &state.frames;
     if frames.len() <= 1 {
-        return;
+        return Ok(());
+    }
+    if !state.virtual_objects.is_empty()
+        || state
+            .frame_slots()
+            .any(|slot| matches!(slot, hir::NumericFrameSlot::VirtualObject(_)))
+    {
+        return Err(super::super::VerificationError::InvalidFrameState(
+            MachineInstructionId(instructions.len() as u32),
+            None,
+        ));
     }
     let mut boxed = BTreeMap::new();
     let mut slot = |source: &hir::NumericFrameSlot| match source {
@@ -33,6 +44,7 @@ pub(super) fn select_frames(
         hir::NumericFrameSlot::Value(value) => Some(*boxed.entry(*value).or_insert_with(|| {
             tagged_call_argument(hir, values, representations, instructions, *value)
         })),
+        hir::NumericFrameSlot::VirtualObject(_) => unreachable!("validated above"),
     };
     call.inline_frames = frames
         .iter()
@@ -54,6 +66,7 @@ pub(super) fn select_frames(
         })
         .collect();
     drop(boxed);
+    Ok(())
 }
 
 pub(super) fn prepare_safepoints(

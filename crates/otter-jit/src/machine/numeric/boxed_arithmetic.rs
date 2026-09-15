@@ -332,6 +332,7 @@ mod tests {
                         ])
                         .into(),
                     }]),
+                    virtual_objects: Box::default(),
                 })
                 .collect(),
             direct_call_targets: vec![],

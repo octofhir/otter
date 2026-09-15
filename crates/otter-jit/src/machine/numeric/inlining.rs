@@ -389,6 +389,7 @@ fn splice_one(
                         extra_states.push(NumericFrameState {
                             point: NumericFramePoint::Node(decoded),
                             frames: entry_frames.clone().into(),
+                            virtual_objects: Box::default(),
                         });
                         decoded
                     }
@@ -493,6 +494,7 @@ fn splice_one(
         extra_states.push(NumericFrameState {
             point: NumericFramePoint::Node(map(node)),
             frames: frames.into(),
+            virtual_objects: Box::default(),
         });
     }
     let added_blocks = body.blocks.len() + 1 + usize::from(construct);

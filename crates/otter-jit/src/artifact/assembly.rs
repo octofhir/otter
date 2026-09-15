@@ -753,6 +753,7 @@ mod tests {
                 .into_boxed_slice(),
             }]
             .into_boxed_slice(),
+            virtual_objects: Box::default(),
         }]);
         let safepoints = [SafepointRecord {
             inline_frames: Box::default(),

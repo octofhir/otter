@@ -363,6 +363,13 @@ fn rebuild(sequence: &mut InstructionSequence, eliminated: &[bool], replacements
     }
 
     for state in &mut sequence.frame_states {
+        for object in &mut state.virtual_objects {
+            for slot in &mut object.fields {
+                if let MachineFrameSlot::Value(value) = slot {
+                    *value = resolve(replacements, *value);
+                }
+            }
+        }
         for frame in &mut state.frames {
             for slot in frame
                 .entry

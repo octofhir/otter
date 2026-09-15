@@ -183,6 +183,20 @@ Empty spans use no packet storage, and literal allocation cannot deopt/replay
 after entering the canonical boundary. Source register indices and
 array-operand metadata addresses do not cross this ABI.
 
+The optimizing Machine pipeline runs bounded partial escape analysis after
+body splicing and before target selection. A fixed array with exact local
+element reads can remain virtual across dominated, non-reentrant CFG regions;
+the pass replaces those reads with the original scalar SSA values and removes
+the literal allocation. Unknown uses, stores, holes, calls, captures, inline
+frame chains, OSR transport, and any live GC safepoint conservatively keep the
+ordinary allocation. `optimized-ir.txt` reports `pea-virtualized`,
+`pea-eliminated`, `pea-loads`, and `pea-materialized`. Every surviving deopt
+uses the same VM-owned `FrameState`: `deopt.json` includes dense
+`virtualObjects` recipes and `virtualObject` slot locations. Runtime reentry
+materializes the complete dependency graph once under one GC handle scope,
+then publishes the resulting identity into the interpreter window. Target
+selection and emission neither infer escape state nor own a second recipe.
+
 Runtime and engine-benchmark snapshots expose exact receiver-allocation
 attribution. `jit-receiver-alloc-attempts` equals generated successes plus
 guard and space misses. Every guard/space miss owns one

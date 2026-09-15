@@ -270,7 +270,7 @@ pub(super) fn select_block(
                 representations,
                 instructions,
                 &mut call,
-            );
+            )?;
             attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
             instructions.push(call);
             let mut branch = MachineInstruction::plain(

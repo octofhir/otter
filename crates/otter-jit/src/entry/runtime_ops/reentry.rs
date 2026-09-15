@@ -256,11 +256,17 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
                 unsafe { *(address as *const u64) }
             }
             DeoptLocation::Literal(raw) => raw,
+            DeoptLocation::VirtualObject(_) => {
+                unreachable!("virtual objects are decoded from FrameState recipes")
+            }
         }
+    };
+    let decode_physical = |slot: otter_vm::deopt::DeoptSlot| {
+        slot.reconstitute(slot_raw).ok_or(VmError::InvalidOperand)
     };
     let write_frame = |frame: &DeoptFrame, window: *mut otter_vm::Value| {
         for (register, slot) in frame.slots.iter().enumerate() {
-            let value = slot.repr.reconstitute(slot_raw(slot.location));
+            let value = decode_physical(*slot).unwrap_or_else(|_| otter_vm::Value::undefined());
             // SAFETY: the window spans exactly the frame's declared registers
             // and stays rooted for the writeback.
             unsafe {
@@ -323,13 +329,62 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
         if let Err(error) = rebuild_result {
             return compiled_fatal(ctx, error);
         }
-        write_frame(state.outermost(), window as *mut otter_vm::Value);
         // SAFETY: runtime-capable JIT contexts publish this native frame for
         // the full compiled entry dynamic extent.
         let Some(native_frame) = (unsafe { ctx.native_frame.as_mut() }) else {
             return compiled_fatal(ctx, VmError::InvalidOperand);
         };
         native_frame.header.register_count = register_count;
+        write_frame(state.outermost(), window as *mut otter_vm::Value);
+        let recipes = match state
+            .virtual_objects
+            .iter()
+            .map(|object| {
+                Ok(otter_vm::deopt::VirtualObject {
+                    id: object.id,
+                    kind: object.kind,
+                    fields: object
+                        .fields
+                        .iter()
+                        .map(|slot| match slot.location {
+                            DeoptLocation::VirtualObject(dependency) => {
+                                Ok(otter_vm::deopt::VirtualMaterializationValue::VirtualObject(
+                                    dependency,
+                                ))
+                            }
+                            _ => decode_physical(*slot)
+                                .map(otter_vm::deopt::VirtualMaterializationValue::Value),
+                        })
+                        .collect::<Result<_, VmError>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>, VmError>>()
+        {
+            Ok(recipes) => recipes,
+            Err(error) => return compiled_fatal(ctx, error),
+        };
+        let materialized = if recipes.is_empty() {
+            Vec::new()
+        } else {
+            match ctx
+                .runtime_call()
+                .and_then(|mut runtime| runtime.materialize_virtual_objects(&recipes))
+            {
+                Ok(values) => values,
+                Err(error) => return compiled_error(ctx, error),
+            }
+        };
+        for (register, slot) in state.outermost().slots.iter().enumerate() {
+            let DeoptLocation::VirtualObject(object) = slot.location else {
+                continue;
+            };
+            let Some(&value) = materialized.get(object.0 as usize) else {
+                return compiled_fatal(ctx, VmError::InvalidOperand);
+            };
+            // SAFETY: the validated published window is full-width and no
+            // allocation occurs after the materializer returns.
+            unsafe { (window as *mut otter_vm::Value).add(register).write(value) };
+        }
         native_frame.header.pc = exit.resume_pcs[0];
         let resume_pc = exit.resume_pcs[0];
         debug_assert_eq!(native_frame.header.pc, resume_pc);
@@ -338,22 +393,38 @@ pub(crate) extern "C" fn jit_deopt_writeback_stub(
 
     // Decode the one shared frame schema. Root entry bindings remain owned by
     // the published native activation; descendants carry explicit operands.
-    let decode = |slot: otter_vm::deopt::DeoptSlot| slot.repr.reconstitute(slot_raw(slot.location));
-    let frames = state
+    let decode = |slot: otter_vm::deopt::DeoptSlot| decode_physical(slot);
+    let frames = match state
         .frames
         .iter()
-        .map(|frame| otter_vm::deopt::DeoptFrame {
-            function_id: frame.function_id,
-            byte_pc: frame.byte_pc,
-            entry: frame.entry.map(|entry| otter_vm::deopt::DeoptFrameEntry {
-                return_register: entry.return_register,
-                this: decode(entry.this),
-                closure: decode(entry.closure),
-                new_target: decode(entry.new_target),
-            }),
-            slots: frame.slots.iter().copied().map(decode).collect(),
+        .map(|frame| {
+            Ok(otter_vm::deopt::DeoptFrame {
+                function_id: frame.function_id,
+                byte_pc: frame.byte_pc,
+                entry: frame
+                    .entry
+                    .map(|entry| {
+                        Ok::<_, VmError>(otter_vm::deopt::DeoptFrameEntry {
+                            return_register: entry.return_register,
+                            this: decode(entry.this)?,
+                            closure: decode(entry.closure)?,
+                            new_target: decode(entry.new_target)?,
+                        })
+                    })
+                    .transpose()?,
+                slots: frame
+                    .slots
+                    .iter()
+                    .copied()
+                    .map(decode)
+                    .collect::<Result<_, _>>()?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, VmError>>()
+    {
+        Ok(frames) => frames,
+        Err(error) => return compiled_fatal(ctx, error),
+    };
 
     // SAFETY: the live `JitCtx` reentry contract.
     let materialized_index = match unsafe { ctx.native_frame.as_ref() } {
@@ -1646,6 +1717,7 @@ mod tests {
                         .into_boxed_slice(),
                     }]
                     .into_boxed_slice(),
+                    virtual_objects: Box::default(),
                 }]),
                 exits: vec![DeoptExitDescriptor {
                     state: 0,

@@ -4514,6 +4514,7 @@ mod tests {
                         .map(MachineFrameSlot::Value)
                         .collect(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -4627,6 +4628,7 @@ mod tests {
                     entry: None,
                     slots: Box::new([MachineFrameSlot::Value(source)]),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![
                 MachineBlockData {

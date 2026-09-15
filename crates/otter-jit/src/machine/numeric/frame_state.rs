@@ -24,25 +24,34 @@ use std::collections::BTreeSet;
 pub(super) enum NumericFrameSlot {
     Value(NumericValue),
     Undefined,
+    VirtualObject(otter_vm::deopt::VirtualObjectId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericFrameState {
     pub(super) point: NumericFramePoint,
     pub(super) frames: Box<[otter_vm::deopt::DeoptFrame<NumericFrameSlot>]>,
+    pub(super) virtual_objects: Box<[otter_vm::deopt::VirtualObject<NumericFrameSlot>]>,
 }
 
 impl NumericFrameState {
     /// All semantic frame operands, including activation-only bindings.
     pub(super) fn frame_slots(&self) -> impl Iterator<Item = &NumericFrameSlot> {
-        self.frames.iter().flat_map(|frame| {
-            frame.slots.iter().chain(
-                frame
-                    .entry
+        self.frames
+            .iter()
+            .flat_map(|frame| {
+                frame.slots.iter().chain(
+                    frame
+                        .entry
+                        .iter()
+                        .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target]),
+                )
+            })
+            .chain(
+                self.virtual_objects
                     .iter()
-                    .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target]),
+                    .flat_map(|object| object.fields.iter()),
             )
-        })
     }
 }
 

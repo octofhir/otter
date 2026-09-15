@@ -3333,6 +3333,7 @@ mod tests {
                         .map(MachineFrameSlot::Value)
                         .collect(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -3446,6 +3447,7 @@ mod tests {
                     entry: None,
                     slots: Box::new([MachineFrameSlot::Value(unrelated)]),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -3538,6 +3540,7 @@ mod tests {
                     entry: None,
                     slots: Box::new([MachineFrameSlot::Value(unrelated)]),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
@@ -3661,6 +3664,7 @@ mod tests {
                     entry: None,
                     slots: Box::new([MachineFrameSlot::Value(input)]),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),

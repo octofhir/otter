@@ -218,15 +218,29 @@ pub(crate) fn emit_box_double(ops: &mut Assembler, src_d: u8, dst_x: u8) {
 /// Reads `src_d`; writes `dst_x`. Clobbers `d0`, `x14`, `x15`. `src_d` must
 /// not be `d0`.
 pub(crate) fn emit_box_number(ops: &mut Assembler, src_d: u8, dst_x: u8) {
-    debug_assert_ne!(src_d, 0, "d0 is this helper's scratch register");
+    emit_box_number_with_scratch(ops, src_d, dst_x, 0);
+}
+
+/// Box a canonical Number with a caller-selected non-allocatable FP scratch.
+///
+/// This is the same representation contract as [`emit_box_number`]. The
+/// separate scratch parameter lets a Machine operation keep every declared
+/// floating-point clobber outside its allocatable register file.
+pub(crate) fn emit_box_number_with_scratch(
+    ops: &mut Assembler,
+    src_d: u8,
+    dst_x: u8,
+    scratch_d: u8,
+) {
+    debug_assert_ne!(src_d, scratch_d, "source cannot alias FP scratch");
     let double_path = ops.new_dynamic_label();
     let box_int = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; fcvtzs w14, D(src_d)              // trunc toward zero, saturating
-        ; scvtf d0, w14                     // back to f64
-        ; fcmp D(src_d), d0
+        ; scvtf D(scratch_d), w14           // back to f64
+        ; fcmp D(src_d), D(scratch_d)
         ; b.ne =>double_path                // non-integral / out of range / NaN
         // Integral and in range. Exclude -0: it truncates to 0 but must box as
         // a double so `1 / -0 === -Infinity` is preserved.

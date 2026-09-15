@@ -86,6 +86,7 @@ mod effects;
 mod frame;
 mod gvn;
 mod inline_frames;
+mod licm;
 mod native_leaf;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod numeric;
@@ -120,63 +121,6 @@ use std::fmt::Write as _;
 /// Dense identity of a target-selected virtual value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MachineValue(pub u32);
-
-/// Maximum number of loop-scoped packed-double view caches in one body.
-///
-/// Each cache owns two untraced native-stack words, so the bound also caps
-/// persistent raw frame growth at 512 bytes on 64-bit targets.
-pub const MAX_PACKED_DOUBLE_VIEW_CACHES: usize = 32;
-
-/// Number of untraced native-stack words owned by one packed-double view
-/// cache: the non-null element base followed by the live dense length.
-pub const PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS: usize = 2;
-
-/// Dense identity of one loop-scoped packed-double element-view cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PackedDoubleViewCacheId(u8);
-
-impl PackedDoubleViewCacheId {
-    /// Construct a bounded cache identity.
-    #[must_use]
-    pub const fn new(index: usize) -> Option<Self> {
-        if index < MAX_PACKED_DOUBLE_VIEW_CACHES {
-            Some(Self(index as u8))
-        } else {
-            None
-        }
-    }
-
-    /// Zero-based cache index.
-    #[must_use]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    /// First raw frame word owned by this cache.
-    #[must_use]
-    pub const fn raw_word(self) -> usize {
-        self.index() * PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS
-    }
-}
-
-/// Boundary that invalidates every persistent packed-double view cache.
-///
-/// The target emitter consumes this semantic reason when placing zeroing
-/// operations. Cached words contain raw host addresses rather than GC roots
-/// and may survive only across a generated loop backedge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackedDoubleViewCacheClearReason {
-    /// Ordinary function activation before any generated instruction.
-    FunctionEntry,
-    /// Interpreter-to-native loop-header entry.
-    OsrEntry,
-    /// Non-backedge control entering the owning natural-loop header.
-    LoopEntry,
-    /// Generated control leaves through a cold or exact-deoptimization path.
-    ColdExit,
-    /// Generated control may allocate, collect, or invoke JavaScript.
-    Reentry,
-}
 
 /// Dense identity of a machine basic block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -981,8 +925,6 @@ pub enum MachineOpcode {
     ElementView {
         /// Source bytecode offset selecting immutable layout metadata.
         byte_pc: u32,
-        /// Optional loop-scoped raw view cache.
-        cache: Option<PackedDoubleViewCacheId>,
     },
     /// Prove an exact integer index is in bounds and derive one raw address
     /// from a prior view. This operation has no heap effect.
@@ -1009,8 +951,6 @@ pub enum MachineOpcode {
     },
     /// Require a composed Boolean proof. Failure is an exact pre-effect exit.
     GuardCondition,
-    /// Clear every persistent packed-double view word at one semantic boundary.
-    ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason),
     /// Materialize a Boolean constant for explicit guard composition.
     BooleanConstant(bool),
     /// Combine two canonical Boolean guard results.
@@ -1129,6 +1069,9 @@ pub enum MachineOpcode {
     },
     /// Loop backedge poll with an exact interpreter reconstruction state.
     BackedgePoll,
+    /// Explicit external entry into a natural loop. Ordinary entry and OSR
+    /// share this target before any loop-invariant proof is consumed.
+    LoopPreheader,
     /// Unconditional control transfer.
     Jump,
     /// Conditional control transfer; branch when the integer condition equals
@@ -1259,15 +1202,11 @@ pub struct InstructionSequence {
     frame_states: Vec<MachineFrameState>,
     blocks: Vec<MachineBlockData>,
     instructions: Vec<MachineInstruction>,
-    packed_double_view_cache_count: u8,
 }
 
 /// Structural failure in a target-selected instruction sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
-    /// The sequence requests more persistent raw view caches than the frame
-    /// contract permits.
-    TooManyPackedDoubleViewCaches(u8),
     /// Entry block does not exist.
     InvalidEntry,
     /// A block owns an empty or invalid instruction range.
@@ -1295,8 +1234,6 @@ pub enum VerificationError {
     /// A selected opcode's ordinary operands or effect metadata violate its
     /// target-neutral signature.
     OpcodeSignatureMismatch(MachineInstructionId),
-    /// A packed-double operation references a cache outside this sequence.
-    InvalidPackedDoubleViewCache(MachineInstructionId, PackedDoubleViewCacheId),
     /// Metadata operands must be late uses.
     InvalidMetadataOperand(MachineInstructionId, MachineValue),
     /// Root metadata does not match the value representation.
@@ -1371,15 +1308,16 @@ impl InstructionSequence {
         blocks: Vec<MachineBlockData>,
         instructions: Vec<MachineInstruction>,
     ) -> Result<Self, VerificationError> {
-        Self::new_with_packed_double_view_caches(
-            target,
+        let sequence = Self {
             entry,
             representations,
             call_descriptors,
+            frame_states: Vec::new(),
             blocks,
             instructions,
-            0,
-        )
+        };
+        sequence.verify(target)?;
+        Ok(sequence)
     }
 
     /// Construct and verify a sequence with explicit logical frame states.
@@ -1392,52 +1330,6 @@ impl InstructionSequence {
         blocks: Vec<MachineBlockData>,
         instructions: Vec<MachineInstruction>,
     ) -> Result<Self, VerificationError> {
-        Self::new_with_frame_states_and_packed_double_view_caches(
-            target,
-            entry,
-            representations,
-            call_descriptors,
-            frame_states,
-            blocks,
-            instructions,
-            0,
-        )
-    }
-
-    /// Construct and verify a sequence with bounded raw packed-double caches.
-    pub fn new_with_packed_double_view_caches(
-        target: &TargetSpec,
-        entry: MachineBlock,
-        representations: Vec<MachineRepresentation>,
-        call_descriptors: Vec<CallDescriptor>,
-        blocks: Vec<MachineBlockData>,
-        instructions: Vec<MachineInstruction>,
-        packed_double_view_cache_count: u8,
-    ) -> Result<Self, VerificationError> {
-        let sequence = Self {
-            entry,
-            representations,
-            call_descriptors,
-            frame_states: Vec::new(),
-            blocks,
-            instructions,
-            packed_double_view_cache_count,
-        };
-        sequence.verify(target)?;
-        Ok(sequence)
-    }
-
-    /// Construct and verify a sequence with logical states and bounded raw caches.
-    pub fn new_with_frame_states_and_packed_double_view_caches(
-        target: &TargetSpec,
-        entry: MachineBlock,
-        representations: Vec<MachineRepresentation>,
-        call_descriptors: Vec<CallDescriptor>,
-        frame_states: Vec<MachineFrameState>,
-        blocks: Vec<MachineBlockData>,
-        instructions: Vec<MachineInstruction>,
-        packed_double_view_cache_count: u8,
-    ) -> Result<Self, VerificationError> {
         let sequence = Self {
             entry,
             representations,
@@ -1445,7 +1337,6 @@ impl InstructionSequence {
             frame_states,
             blocks,
             instructions,
-            packed_double_view_cache_count,
         };
         sequence.verify(target)?;
         Ok(sequence)
@@ -1458,7 +1349,7 @@ impl InstructionSequence {
     /// therefore the sole authority for adding missing late root uses. Public
     /// construction still requires callers to provide exact root metadata and
     /// is verified without repair.
-    pub(super) fn new_selected_with_packed_double_view_caches(
+    pub(super) fn new_selected(
         target: &TargetSpec,
         entry: MachineBlock,
         representations: Vec<MachineRepresentation>,
@@ -1466,7 +1357,6 @@ impl InstructionSequence {
         frame_states: Vec<MachineFrameState>,
         blocks: Vec<MachineBlockData>,
         instructions: Vec<MachineInstruction>,
-        packed_double_view_cache_count: u8,
     ) -> Result<Self, VerificationError> {
         let mut sequence = Self {
             entry,
@@ -1475,7 +1365,6 @@ impl InstructionSequence {
             frame_states,
             blocks,
             instructions,
-            packed_double_view_cache_count,
         };
         sequence.complete_gc_root_liveness();
         sequence.verify_structure(target)?;
@@ -1488,13 +1377,27 @@ impl InstructionSequence {
         regalloc::allocate(self, target)
     }
 
-    /// Run the sole effect-aware Machine value-numbering pass and reverify the
-    /// rewritten graph before register allocation.
+    /// Run effect-aware GVN and LICM, then reverify the rewritten graph before
+    /// register allocation.
     pub(crate) fn optimize(
         self,
         target: &TargetSpec,
     ) -> Result<(Self, gvn::MachineOptimizationStats), VerificationError> {
-        gvn::optimize(self, target)
+        let (sequence, mut stats) = gvn::optimize(self, target)?;
+        let (sequence, licm) = licm::optimize(sequence, target)?;
+        let (sequence, exposed) = gvn::optimize(sequence, target)?;
+        stats.eliminated_instructions = stats
+            .eliminated_instructions
+            .saturating_add(exposed.eliminated_instructions);
+        stats.eliminated_guards = stats
+            .eliminated_guards
+            .saturating_add(exposed.eliminated_guards);
+        stats.eliminated_loads = stats
+            .eliminated_loads
+            .saturating_add(exposed.eliminated_loads);
+        stats.hoisted_instructions = licm.hoisted_instructions;
+        stats.versioned_loops = licm.versioned_loops;
+        Ok((sequence, stats))
     }
 
     /// Dense machine representations indexed by [`MachineValue`].
@@ -1527,19 +1430,10 @@ impl InstructionSequence {
         &self.instructions
     }
 
-    /// Number of two-word raw packed-double view caches owned by the frame.
-    #[must_use]
-    pub const fn packed_double_view_cache_count(&self) -> u8 {
-        self.packed_double_view_cache_count
-    }
-
     /// Deterministic machine instruction and source-recipe dump.
     #[must_use]
     pub fn normalized(&self) -> String {
-        let mut output = format!(
-            "machine-ir packed-double-view-caches={}\n",
-            self.packed_double_view_cache_count
-        );
+        let mut output = String::from("machine-ir explicit-loop-preheaders\n");
         for (index, representation) in self.representations.iter().enumerate() {
             writeln!(output, "v{index}:{representation:?}").expect("writing to String cannot fail");
         }
@@ -1825,11 +1719,6 @@ impl InstructionSequence {
     }
 
     fn verify_structure(&self, target_spec: &TargetSpec) -> Result<(), VerificationError> {
-        if usize::from(self.packed_double_view_cache_count) > MAX_PACKED_DOUBLE_VIEW_CACHES {
-            return Err(VerificationError::TooManyPackedDoubleViewCaches(
-                self.packed_double_view_cache_count,
-            ));
-        }
         if self.entry.0 as usize >= self.blocks.len() {
             return Err(VerificationError::InvalidEntry);
         }
@@ -2809,6 +2698,16 @@ impl InstructionSequence {
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
+                    MachineOpcode::LoopPreheader
+                        if !instruction.operands.is_empty()
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                            || instruction.frame_state.is_some()
+                            || instruction.control != ControlFlow::None =>
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
                     _ => {}
                 }
                 if matches!(instruction.opcode, MachineOpcode::TaggedNullishEqual { .. }) {
@@ -2840,24 +2739,6 @@ impl InstructionSequence {
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
-                }
-                if matches!(
-                    instruction.opcode,
-                    MachineOpcode::ClearPackedDoubleViewCaches(..)
-                ) && (!instruction.operands.is_empty()
-                    || !instruction.clobbers.is_empty()
-                    || instruction.safepoint.is_some()
-                    || !instruction.exits.is_empty()
-                    || instruction.control != ControlFlow::None)
-                {
-                    return Err(VerificationError::OpcodeSignatureMismatch(id));
-                }
-                if let MachineOpcode::ElementView {
-                    cache: Some(cache), ..
-                } = instruction.opcode
-                    && cache.index() >= usize::from(self.packed_double_view_cache_count)
-                {
-                    return Err(VerificationError::InvalidPackedDoubleViewCache(id, cache));
                 }
                 if matches!(instruction.opcode, MachineOpcode::ElementView { .. }) {
                     let [receiver, base, length, hit] = instruction.operands.as_slice() else {
@@ -3467,21 +3348,6 @@ mod tests {
     }
 
     #[test]
-    fn packed_double_view_cache_ids_bound_raw_frame_words() {
-        let first = PackedDoubleViewCacheId::new(0).expect("first cache");
-        let last = PackedDoubleViewCacheId::new(MAX_PACKED_DOUBLE_VIEW_CACHES - 1)
-            .expect("last bounded cache");
-        assert_eq!(first.raw_word(), 0);
-        assert_eq!(last.index(), 31);
-        assert_eq!(last.raw_word(), 62);
-        assert!(PackedDoubleViewCacheId::new(MAX_PACKED_DOUBLE_VIEW_CACHES).is_none());
-        assert_eq!(
-            MAX_PACKED_DOUBLE_VIEW_CACHES * PACKED_DOUBLE_VIEW_CACHE_RAW_WORDS,
-            64
-        );
-    }
-
-    #[test]
     fn verifier_rejects_direct_method_without_receiver_argument() {
         let result = MachineValue(0);
         let descriptor = CallDescriptor {
@@ -3659,7 +3525,7 @@ mod tests {
         );
         ret.control = ControlFlow::Return;
 
-        let sequence = InstructionSequence::new_selected_with_packed_double_view_caches(
+        let sequence = InstructionSequence::new_selected(
             &TargetSpec::aarch64(),
             MachineBlock(0),
             vec![MachineRepresentation::Tagged; 2],
@@ -3689,7 +3555,6 @@ mod tests {
                 call,
                 ret,
             ],
-            0,
         )
         .expect("completed selection roots");
 
@@ -3768,147 +3633,6 @@ mod tests {
         assert_eq!(
             no_throw_edge.verify(&TargetSpec::aarch64()),
             Err(VerificationError::InvalidCallTarget(call_id))
-        );
-    }
-
-    #[test]
-    fn verifier_bounds_packed_double_view_caches_and_clear_signature() {
-        let input = MachineValue(0);
-        let mut clear = MachineInstruction::plain(
-            MachineOpcode::ClearPackedDoubleViewCaches(PackedDoubleViewCacheClearReason::LoopEntry),
-            Vec::new(),
-        );
-        let mut ret = MachineInstruction::plain(
-            MachineOpcode::Return,
-            vec![MachineOperand::register_input(input)],
-        );
-        ret.control = ControlFlow::Return;
-        let mut sequence = InstructionSequence::new_with_packed_double_view_caches(
-            &TargetSpec::aarch64(),
-            MachineBlock(0),
-            vec![MachineRepresentation::Tagged],
-            Vec::new(),
-            vec![MachineBlockData {
-                first: MachineInstructionId(0),
-                end: MachineInstructionId(3),
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                parameters: Vec::new(),
-                successor_arguments: Vec::new(),
-            }],
-            vec![
-                MachineInstruction::plain(
-                    MachineOpcode::EntryValue(0),
-                    vec![MachineOperand::register_output(input)],
-                ),
-                clear.clone(),
-                ret,
-            ],
-            1,
-        )
-        .expect("one-cache sequence");
-        assert!(
-            sequence
-                .normalized()
-                .starts_with("machine-ir packed-double-view-caches=1\n")
-        );
-
-        sequence.packed_double_view_cache_count = 33;
-        assert_eq!(
-            sequence.verify(&TargetSpec::aarch64()),
-            Err(VerificationError::TooManyPackedDoubleViewCaches(33))
-        );
-        sequence.packed_double_view_cache_count = 1;
-        clear
-            .clobbers
-            .push(TargetSpec::aarch64().clobbers(TargetClobberSet::Element)[0]);
-        sequence.instructions[1] = clear;
-        assert_eq!(
-            sequence.verify(&TargetSpec::aarch64()),
-            Err(VerificationError::OpcodeSignatureMismatch(
-                MachineInstructionId(1)
-            ))
-        );
-    }
-
-    #[test]
-    fn verifier_rejects_packed_double_cache_outside_sequence() {
-        let receiver = MachineValue(0);
-        let base = MachineValue(1);
-        let length = MachineValue(2);
-        let hit = MachineValue(3);
-        let mut load = MachineInstruction::plain(
-            MachineOpcode::ElementView {
-                byte_pc: 24,
-                cache: PackedDoubleViewCacheId::new(0),
-            },
-            vec![
-                MachineOperand::location_input(receiver),
-                MachineOperand::register_output(base),
-                MachineOperand::register_output(length),
-                MachineOperand::register_output(hit),
-            ],
-        );
-        load.clobbers = TargetSpec::aarch64()
-            .clobbers(TargetClobberSet::Element)
-            .to_vec();
-        let mut ret = MachineInstruction::plain(
-            MachineOpcode::Return,
-            vec![MachineOperand::register_input(receiver)],
-        );
-        ret.control = ControlFlow::Return;
-        let mut sequence =
-            InstructionSequence::new_with_frame_states_and_packed_double_view_caches(
-                &TargetSpec::aarch64(),
-                MachineBlock(0),
-                vec![
-                    MachineRepresentation::Tagged,
-                    MachineRepresentation::Int64,
-                    MachineRepresentation::Int64,
-                    MachineRepresentation::Boolean,
-                ],
-                Vec::new(),
-                vec![MachineFrameState {
-                    id: 0,
-                    frames: Box::new([otter_vm::deopt::DeoptFrame {
-                        function_id: 0,
-                        byte_pc: 24,
-                        entry: None,
-                        slots: Box::new([
-                            MachineFrameSlot::Value(receiver),
-                            MachineFrameSlot::Value(receiver),
-                        ]),
-                    }]),
-                }],
-                vec![MachineBlockData {
-                    first: MachineInstructionId(0),
-                    end: MachineInstructionId(3),
-                    predecessors: Vec::new(),
-                    successors: Vec::new(),
-                    parameters: Vec::new(),
-                    successor_arguments: Vec::new(),
-                }],
-                vec![
-                    MachineInstruction::plain(
-                        MachineOpcode::EntryValue(0),
-                        vec![MachineOperand::register_output(receiver)],
-                    ),
-                    load,
-                    ret,
-                ],
-                1,
-            )
-            .expect("cached packed load");
-        sequence.instructions[1].opcode = MachineOpcode::ElementView {
-            byte_pc: 24,
-            cache: PackedDoubleViewCacheId::new(1),
-        };
-        assert_eq!(
-            sequence.verify(&TargetSpec::aarch64()),
-            Err(VerificationError::InvalidPackedDoubleViewCache(
-                MachineInstructionId(1),
-                PackedDoubleViewCacheId::new(1).expect("bounded id")
-            ))
         );
     }
 

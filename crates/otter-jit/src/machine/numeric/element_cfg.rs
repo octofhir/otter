@@ -12,7 +12,6 @@
 //! - A committed cold operation is never deoptimized and replayed.
 
 use super::*;
-use crate::machine::PackedDoubleViewCacheId;
 
 #[derive(Clone, Copy)]
 pub(super) struct Blocks {
@@ -87,7 +86,6 @@ pub(super) fn select_probe(
     target_spec: &TargetSpec,
     byte_pc: u32,
     access: Option<NumericElementAccess>,
-    cache: Option<PackedDoubleViewCacheId>,
     inputs: Inputs,
     values: Values,
     _representations: &mut Vec<MachineRepresentation>,
@@ -109,7 +107,7 @@ pub(super) fn select_probe(
         return Ok(());
     };
     let mut view = MachineInstruction::plain(
-        MachineOpcode::ElementView { byte_pc, cache },
+        MachineOpcode::ElementView { byte_pc },
         vec![
             MachineOperand::location_input(inputs.receiver),
             MachineOperand::register_output(values.base),

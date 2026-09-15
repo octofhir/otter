@@ -1,24 +1,16 @@
-//! Regression coverage for activation-local loop method-guard caches.
+//! Regression coverage for loop proof invalidation without raw guard caches.
 //!
 //! # Contents
-//! - Multiple invariant Map and Math receivers in one natural loop.
+//! - Multiple invariant Map and Math receivers in natural loops.
 //! - Changing primitive-string receivers sharing one pinned prototype method.
 //! - Global-lexical, dense-element, and exotic-length reads in a cached loop.
-//! - Global-object slot caching that makes a builtin namespace receiver
-//!   activation-invariant after one epoch/shape proof.
-//! - Element/property slow reads that mutate a cached method during reentry.
-//! - Interpreter parity and artifact proof for every cached intrinsic site.
+//! - Element/property slow reads that mutate methods and globals during reentry.
+//! - Interpreter parity and artifact proof that retired raw caches stay absent.
 //!
 //! # Invariants
-//! - Entry and OSR activations start with empty caches.
-//! - A changing exotic receiver is validated on every iteration; only its
-//!   pinned prototype method identity is reused.
-//! - Any generated intrinsic miss clears every raw cached receiver before the
-//!   canonical transition may allocate, collect, or re-enter JavaScript.
-//! - Any element/property/global probe miss applies the same invalidation
-//!   before its canonical lookup transition.
-//! - A cached global retains only a raw live-slot address; reentry clears it
-//!   together with method headers before moving GC or observable mutation.
+//! - A changing exotic receiver is validated at the explicit operation.
+//! - Reentry and mutation remain visible to later method/global reads.
+//! - Machine artifacts contain no loop-local raw-address cache regions.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -190,10 +182,7 @@ JSON.stringify([
 ]);
 "#;
 
-fn run(
-    selection: JitSelection,
-    artifacts: bool,
-) -> (String, u64, usize, usize, usize, usize, usize) {
+fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) {
     let builder = Runtime::builder().jit_selection(selection);
     let mut runtime = if artifacts {
         builder
@@ -202,69 +191,57 @@ fn run(
     } else {
         builder.build()
     }
-    .expect("loop guard-cache runtime");
+    .expect("loop proof runtime");
     let completion = runtime
         .run_script(
             SourceInput::from_javascript(LOOP_GUARD_MATRIX),
             "optimizing-loop-method-guard-cache.js",
         )
-        .expect("loop guard-cache matrix");
-    let cache_region_counts = completion.jit_artifacts().map_or_else(Vec::new, |batch| {
-        batch
-            .bundles()
-            .iter()
-            .filter_map(|bundle| bundle.file(otter_runtime::JitArtifactFileName::CodeMap))
-            .map(|file| {
+        .expect("loop proof matrix");
+    let (legacy_regions, machine_bundles) = completion.jit_artifacts().map_or((0, 0), |batch| {
+        let mut legacy_regions = 0;
+        let mut machine_bundles = 0;
+        for bundle in batch.bundles() {
+            if let Some(file) = bundle.file(otter_runtime::JitArtifactFileName::CodeMap) {
                 let map: serde_json::Value =
                     serde_json::from_slice(file.contents()).expect("valid code-map JSON");
-                map["regions"].as_array().map_or((0, 0), |regions| {
-                    let methods = regions
+                legacy_regions += map["regions"].as_array().map_or(0, |regions| {
+                    regions
                         .iter()
-                        .filter(|region| region["kind"] == "loopInvariantMethodGuardCache")
-                        .count();
-                    let globals = regions
-                        .iter()
-                        .filter(|region| region["kind"] == "loopInvariantGlobalObjectLoadCache")
-                        .count();
-                    (methods, globals)
-                })
-            })
-            .collect()
+                        .filter(|region| {
+                            matches!(
+                                region["kind"].as_str(),
+                                Some("loopInvariantMethodGuardCache")
+                                    | Some("loopInvariantGlobalObjectLoadCache")
+                                    | Some("machinePackedDoubleViewCacheClear")
+                            )
+                        })
+                        .count()
+                });
+            }
+            if let Some(file) = bundle.file(otter_runtime::JitArtifactFileName::OptimizedIr) {
+                let ir = std::str::from_utf8(file.contents()).expect("UTF-8 Machine IR");
+                if ir.starts_with("; backend=otter-machine-ir scalar-function\n") {
+                    machine_bundles += 1;
+                    assert!(ir.contains("; licm-hoisted="));
+                    assert!(ir.contains("machine-ir explicit-loop-preheaders"));
+                }
+            }
+        }
+        (legacy_regions, machine_bundles)
     });
     (
         completion.completion_string().to_owned(),
         runtime.execution_stats().jit_optimized_entries,
-        cache_region_counts
-            .iter()
-            .map(|counts| counts.0)
-            .max()
-            .unwrap_or(0),
-        cache_region_counts
-            .iter()
-            .filter(|counts| counts.0 > 0)
-            .count(),
-        cache_region_counts
-            .iter()
-            .map(|counts| counts.1)
-            .max()
-            .unwrap_or(0),
-        cache_region_counts
-            .iter()
-            .filter(|counts| counts.1 > 0)
-            .count(),
-        cache_region_counts
-            .iter()
-            .filter(|counts| counts.1 > 0)
-            .map(|counts| counts.0)
-            .max()
-            .unwrap_or(0),
+        legacy_regions,
+        machine_bundles,
     )
 }
 
 #[test]
-fn loop_method_guard_caches_preserve_semantics() {
-    let (oracle, _, _, _, _, _, _) = run(JitSelection::InterpreterOnly, false);
-    let (compiled, optimized_entries, _, _, _, _, _) = run(JitSelection::ProductionTiered, false);
+fn loop_proof_invalidation_preserves_semantics() {
+    let (oracle, _, _, _) = run(JitSelection::InterpreterOnly, false);
+    let (compiled, optimized_entries, _, _) = run(JitSelection::ProductionTiered, false);
     assert_eq!(compiled, oracle);
     assert_eq!(oracle, "[125696,8,352,1,420,420,2816,272,684,64]");
     #[cfg(target_arch = "aarch64")]
@@ -273,36 +250,14 @@ fn loop_method_guard_caches_preserve_semantics() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn artifacts_expose_every_loop_method_guard_cache() {
-    let (
-        compiled,
-        optimized_entries,
-        cache_regions,
-        cache_bundles,
-        global_cache_regions,
-        global_cache_bundles,
-        global_receiver_method_regions,
-    ) = run(JitSelection::ProductionTiered, true);
+fn artifacts_expose_licm_and_no_retired_raw_caches() {
+    let (compiled, optimized_entries, legacy_regions, machine_bundles) =
+        run(JitSelection::ProductionTiered, true);
     assert_eq!(compiled, "[125696,8,352,1,420,420,2816,272,684,64]");
     assert!(optimized_entries > 0, "fixture must enter optimizing code");
-    assert_eq!(
-        cache_regions, 5,
-        "Map.set/get, charCodeAt, indexOf, and Math.abs each need one cache"
-    );
+    assert_eq!(legacy_regions, 0, "retired cache regions must stay absent");
     assert!(
-        cache_bundles >= 3,
-        "the mixed fast loop and both reentrant read loops must each cache a method guard"
-    );
-    assert_eq!(
-        global_cache_regions, 2,
-        "both global Math reads need activation-local live-slot caches"
-    );
-    assert!(
-        global_cache_bundles >= 1,
-        "the global Math loop must publish its live-slot cache"
-    );
-    assert!(
-        global_receiver_method_regions >= 2,
-        "cached Math values must unlock both namespace method guards"
+        machine_bundles > 0,
+        "fixture must publish Machine artifacts"
     );
 }

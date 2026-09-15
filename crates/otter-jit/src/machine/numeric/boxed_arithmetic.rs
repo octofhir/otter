@@ -16,7 +16,7 @@
 //!
 //! # See also
 //! - `hir` — authoritative node types and pre-operation frame states.
-//! - `super::select_with_packed_double_view_caches` — allocation and boxing.
+//! - `super::select_with_loop_entries` — allocation and boxing.
 
 use super::hir::{
     NumericDirectCallArguments, NumericElementAccess, NumericFramePoint, NumericFunction,

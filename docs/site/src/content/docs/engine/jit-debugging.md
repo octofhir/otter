@@ -225,13 +225,11 @@ once, with precise moving roots and explicit Success/Throw/Fatal CFG. Both
 operators preserve the original thrown value and local catch landing; a miss
 never deoptimizes and replays coercion. Observed numeric feedback retains the
 ordinary specialized numeric comparison.
-For a completely generated, non-reentrant outermost loop, a
-`loopInvariantGlobalObjectLoadCache` code-map region identifies the first
-proof plus its activation-local fast reuse. The native-stack slot retains the
-live property address, not the loaded `Value`, so a same-slot value update is
-read live. Entry and OSR initialize the slot to empty. Every intrinsic or
-generated read miss clears all raw global and method caches before generic
-lookup, allocation, moving GC, or JavaScript reentry.
+Loop global-object reads retain explicit epoch, shape, descriptor, and slot
+proofs plus a live field load. No native-stack property address survives a
+backedge, allocation, moving collection, or JavaScript reentry. Effect-aware
+LICM moves such a proof only when the complete loop has invariant inputs and no
+overlapping write or invalidating boundary.
 
 Every `LoadString` site exposes a `stringConstantCell` relocation keyed by
 function id and byte PC. The process address is redacted. The cell is rooted,
@@ -425,15 +423,12 @@ Success/Throw/Fatal successors; there is no post-call deopt that could replay a
 proxy trap, getter, setter, or key coercion. A local catch receives the pure
 exception SSA value from that CFG.
 When a reducible non-reentrant loop has an invariant packed-double receiver,
-the normalized header reports `packed-double-view-caches=<N>` and `ElementView`
-nodes name `cache: Some(...)`. The first access proves the complete receiver
-and physical layout, then stores only an untraced raw base/length pair in the
-native frame. Later backedge iterations retain that pair while still checking
-the current index and bounds. `machinePackedDoubleViewCacheClear` regions mark
-external loop-entry resets; ordinary entry and every OSR trampoline also begin
-empty. Calls, allocations, tagged stores, and other representation-changing
-effects make a loop ineligible, and no loaded `Value` or GC reference enters a
-view-cache slot.
+each selected external edge exposes a `LoopPreheader`, including OSR. The
+optimized header reports `licm-hoisted=<N> versioned-loops=<N>` and the
+normalized graph begins with `machine-ir explicit-loop-preheaders`. Scalar
+invariants move through explicit loop-header SSA arguments. Every `ElementView`
+still derives its current raw base and live length at the access, so no interior
+pointer survives a backedge, safepoint, collection, or reentry.
 Fixed TypedArray views over resizable ArrayBuffers also compare the complete
 baked view extent with the backing store's live byte length. A shrink branches
 to the committed cold sibling before reading or writing, even when the index
@@ -489,27 +484,21 @@ and resumes the canonical generic method path. The structural region therefore
 proves a faster hit topology, not permission to skip replacement, accessor,
 proxy, coercion, or exception semantics.
 
-### Optimizing loop method-guard caches
+### Optimizing loop proofs and LICM
 
-An optimizing bundle may contain one `loopInvariantMethodGuardCache` region
-per cached method site. The region names the original `bytePc` and spans the
-activation-local cache probe plus the first exact identity proof. A function
-may publish several such regions for one outermost natural loop. Inner loops
-are never selected in isolation because an enclosing iteration could change a
-receiver before re-entry; their sites appear only when the complete enclosing
-outermost loop satisfies the cache contract.
+Optimizing artifacts report `licm-hoisted` and `versioned-loops` before the
+normalized Machine graph. The pass discovers reducible natural loops from
+dominance, moves only instructions with invariant inputs, and consults the one
+Machine effect table for aliasing writes, safepoints, allocation, throws, and
+reentry. Hoisted values become explicit loop-header SSA arguments, so register
+allocation and OSR observe the same lifetime.
 
-Invariant receivers cache their validated body header. Varying exotic Map or
-string receivers cache only the pinned prototype method identity and still
-validate the current body on every iteration. Normal entry and every OSR
-trampoline initialize independent empty caches. Generated intrinsic misses
-and generated element, property, or global-read probe misses clear all sites
-before the generic path can allocate, collect, or re-enter JavaScript, so the
-presence of this region never means a cold transition may retain a raw
-receiver pointer. Element and global reads may coexist with the cache only
-when compile-time feedback prepared a generated hit path; an always-slow read
-keeps the loop uncached. Property reads use their generated exotic-length or
-immutable CacheIR program and apply the same invalidation on its semantic miss.
+Method, global-object, property, and element accesses keep their ordinary
+explicit guards and live loads when a loop contains an invalidating boundary.
+There are no activation-local method/global raw-address caches or cache-clear
+pseudo-operations. Packed-double loops selected for structural preheaders emit
+`LoopPreheader` on every external edge, including OSR, while each element access
+derives its current base and length locally.
 
 ### Template leaf-inline regions
 

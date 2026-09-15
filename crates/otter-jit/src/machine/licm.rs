@@ -110,8 +110,18 @@ fn invariant_instructions(
                     .chain(frame.slots.iter())
                     .filter_map(|slot| match slot {
                         super::MachineFrameSlot::Value(value) => Some(*value),
-                        super::MachineFrameSlot::TaggedLiteral(_) => None,
+                        super::MachineFrameSlot::TaggedLiteral(_)
+                        | super::MachineFrameSlot::VirtualObject(_) => None,
                     })
+            })
+        }))
+        .chain(sequence.frame_states.iter().flat_map(|state| {
+            state.virtual_objects.iter().flat_map(|object| {
+                object.fields.iter().filter_map(|slot| match slot {
+                    super::MachineFrameSlot::Value(value) => Some(*value),
+                    super::MachineFrameSlot::TaggedLiteral(_)
+                    | super::MachineFrameSlot::VirtualObject(_) => None,
+                })
             })
         }))
         .collect::<BTreeSet<_>>();

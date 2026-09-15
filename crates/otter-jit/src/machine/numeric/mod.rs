@@ -6,6 +6,7 @@
 //!   reentrant calls, and catch landing pads.
 //! - `frame_state` — source-owned activation chains and complete SSA liveness.
 //! - `inlining` — guarded scalar callee CFG splicing before selection/allocation.
+//! - `partial_escape` — bounded virtual objects and scalar replacement before selection.
 //! - `property_cfg` — explicit named-property probe/cold/status/landing/join blocks.
 //! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
@@ -111,6 +112,7 @@ mod frame_state;
 mod hir;
 mod inline_reentry;
 mod inlining;
+mod partial_escape;
 mod property_cfg;
 mod semantics;
 
@@ -221,6 +223,7 @@ pub(crate) fn try_compile(
         }
     })?;
     let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
+    let partial_escape = partial_escape::optimize(&mut hir);
     let loop_entries = hir.plan_loop_entries();
     let sequence = select_with_loop_entries(target_spec, &hir, &loop_entries)
         .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
@@ -388,7 +391,7 @@ pub(crate) fn try_compile(
 
     let artifact = artifact_request.map(|request| {
         let mut tier_input = format!(
-            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n; gvn-eliminated={} guards={} loads={}\n; licm-hoisted={} versioned-loops={}\n",
+            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n; gvn-eliminated={} guards={} loads={}\n; licm-hoisted={} versioned-loops={}\n; pea-virtualized={} pea-eliminated={} pea-loads={} pea-materialized={}\n",
             hir.parameter_count,
             hir.register_count,
             hir.blocks.len(),
@@ -398,6 +401,10 @@ pub(crate) fn try_compile(
             optimization_stats.eliminated_loads,
             optimization_stats.hoisted_instructions,
             optimization_stats.versioned_loops,
+            partial_escape.virtualized_allocations,
+            partial_escape.eliminated_allocations,
+            partial_escape.scalar_replaced_loads,
+            partial_escape.materialization_recipes,
         );
         tier_input.push_str(&sequence.normalized());
         tier_input.push_str(&allocation.normalized());
@@ -2367,7 +2374,7 @@ fn select_with_loop_entries(
                     &mut representations,
                     &mut instructions,
                     &mut instruction,
-                );
+                )?;
             }
             instructions.push(instruction);
         }
@@ -2628,7 +2635,7 @@ fn select_binding_cold_block(
         representations,
         instructions,
         &mut call,
-    );
+    )?;
     attach_frame_state_tagged_roots(hir, machine_values, state_index, &mut call);
     instructions.push(call);
     let mut branch = MachineInstruction::plain(
@@ -3628,6 +3635,9 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
                 super::MachineFrameSlot::Value(MachineValue(value.0 as u32))
             }
             hir::NumericFrameSlot::Undefined => super::undefined_slot(),
+            hir::NumericFrameSlot::VirtualObject(object) => {
+                super::MachineFrameSlot::VirtualObject(*object)
+            }
         }
     }
     hir.frame_states
@@ -3651,6 +3661,15 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
                             closure: slot(&entry.closure),
                         }),
                     slots: frame.slots.iter().map(slot).collect(),
+                })
+                .collect(),
+            virtual_objects: state
+                .virtual_objects
+                .iter()
+                .map(|object| otter_vm::deopt::VirtualObject {
+                    id: object.id,
+                    kind: object.kind,
+                    fields: object.fields.iter().map(slot).collect(),
                 })
                 .collect(),
         })
@@ -4129,6 +4148,7 @@ mod tests {
                         slots: Box::new([NumericFrameSlot::Value(value(0))]),
                     },
                 ]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: vec![],
             operand_values: vec![],
@@ -4332,6 +4352,7 @@ mod tests {
                     entry: None,
                     slots: (vec![hir::NumericFrameSlot::Value(value(2))]).into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -4406,6 +4427,7 @@ mod tests {
                     ])
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: vec![NumericDirectCallTarget {
                 kind: NumericDirectCallKind::Method,
@@ -4479,6 +4501,7 @@ mod tests {
                     ])
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: vec![NumericDirectCallTarget {
                 kind: NumericDirectCallKind::Method,
@@ -4537,6 +4560,7 @@ mod tests {
                     ])
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -4661,6 +4685,7 @@ mod tests {
                     ])
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -4766,6 +4791,7 @@ mod tests {
                     ])
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -6862,6 +6888,7 @@ mod tests {
                     ]
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -6988,6 +7015,7 @@ mod tests {
                         ])
                         .into(),
                     }]),
+                    virtual_objects: Box::default(),
                 },
                 hir::NumericFrameState {
                     point: NumericFramePoint::Node(value(3)),
@@ -7002,6 +7030,7 @@ mod tests {
                         ])
                         .into(),
                     }]),
+                    virtual_objects: Box::default(),
                 },
             ]
             .into(),
@@ -7358,6 +7387,7 @@ mod tests {
                     ])
                     .into(),
                 }]),
+                virtual_objects: Box::default(),
             }],
             direct_call_targets: Vec::new(),
             operand_values: Vec::new(),
@@ -10826,6 +10856,7 @@ mod tests {
         let uint_value = match poll_state.frames[0].slots[0] {
             hir::NumericFrameSlot::Value(value) => value,
             hir::NumericFrameSlot::Undefined => panic!("uint32 loop value is live"),
+            hir::NumericFrameSlot::VirtualObject(_) => panic!("uint32 loop value is scalar"),
         };
         assert_eq!(hir.nodes[uint_value.0].value_type(), NumericType::Uint32);
 
@@ -11352,6 +11383,7 @@ mod tests {
                         entry: None,
                         slots: (Vec::new()).into(),
                     }]),
+                    virtual_objects: Box::default(),
                 },
                 hir::NumericFrameState {
                     point: NumericFramePoint::Backedge {
@@ -11364,6 +11396,7 @@ mod tests {
                         entry: None,
                         slots: (Vec::new()).into(),
                     }]),
+                    virtual_objects: Box::default(),
                 },
             ],
             direct_call_targets: Vec::new(),

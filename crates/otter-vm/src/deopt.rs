@@ -6,8 +6,8 @@
 //! this module fixes their VM-owned shape and reconstitution rules.
 //!
 //! # Contents
-//! - [`FrameState`], [`DeoptSlot`], and [`DeoptTable`] — exact-PC frame
-//!   reconstruction metadata.
+//! - [`FrameState`], [`DeoptSlot`], [`VirtualObject`], and [`DeoptTable`] —
+//!   exact-PC frame reconstruction and scalar-replacement metadata.
 //! - [`DeoptVerifyLimits`] and [`DeoptVerifyError`] — pure schema verification.
 //! - [`StackMap`], [`Safepoint`], and [`SafepointTable`] — compiled-frame GC
 //!   root metadata.
@@ -47,6 +47,9 @@
 //!   preserves this, closure and new.target with register-slot location bounds.
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
+//! - Virtual objects are part of the same authoritative frame state. Dense ids
+//!   and backward-only object references make materialization order explicit,
+//!   acyclic, and independent of target emission.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
@@ -132,6 +135,40 @@ pub enum DeoptVerifyError {
         /// Destination outside the caller register window.
         register: u16,
     },
+    /// Virtual-object identities are not dense in materialization order.
+    NonDenseVirtualObjectId {
+        /// Dense identity required at this position.
+        expected: u32,
+        /// Identity stored by the object recipe.
+        actual: u32,
+    },
+    /// A frame slot names no virtual object in its owning frame state.
+    InvalidVirtualObjectReference {
+        /// Invalid virtual-object identity.
+        object: u32,
+        /// Number of recipes in the owning state.
+        object_count: usize,
+    },
+    /// A virtual field refers to itself or a later recipe, creating a cycle or
+    /// an undefined materialization dependency.
+    InvalidVirtualObjectDependency {
+        /// Recipe being verified.
+        object: u32,
+        /// Invalid dependency identity.
+        dependency: u32,
+    },
+    /// A virtual-object reference carried a non-tagged representation.
+    InvalidVirtualObjectRepresentation {
+        /// Referenced virtual-object identity.
+        object: u32,
+    },
+    /// A virtual-object recipe cannot represent fields for its allocation kind.
+    InvalidVirtualObjectFieldCount {
+        /// Recipe identity.
+        object: u32,
+        /// Unsupported field count.
+        fields: usize,
+    },
 }
 
 impl std::fmt::Display for DeoptVerifyError {
@@ -187,16 +224,83 @@ pub enum DeoptLocation {
     /// A compile-time raw literal rematerialized only when this exit runs.
     /// [`DeoptSlot::repr`] defines how the bits become a tagged VM value.
     Literal(u64),
+    /// A scalar-replaced object materialized from the owning frame state.
+    VirtualObject(VirtualObjectId),
 }
 
-/// One interpreter virtual register at a deopt point: where it lives and how to
-/// turn it back into a tagged [`Value`].
+/// Dense identity of one scalar-replaced object in a [`FrameState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct VirtualObjectId(pub u32);
+
+/// Allocation semantics retained for one scalar-replaced object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VirtualObjectKind {
+    /// Ordinary extensible object with `%Object.prototype%` and no own fields.
+    PlainObject,
+    /// Dense fixed-length ordinary Array. Fields are elements in index order.
+    FixedArray,
+}
+
+/// One virtual allocation embedded in the authoritative frame state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualObject<Slot> {
+    /// Dense materialization identity and order.
+    pub id: VirtualObjectId,
+    /// Exact canonical allocation semantics.
+    pub kind: VirtualObjectKind,
+    /// Scalar-replaced fields/elements. Object references must point backward.
+    pub fields: Box<[Slot]>,
+}
+
+/// Decoded input to the VM-owned virtual-object materializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualMaterializationValue {
+    /// Already reconstructed scalar or tagged field.
+    Value(Value),
+    /// Reference to an earlier object in the same dense recipe list.
+    VirtualObject(VirtualObjectId),
+}
+
+/// One interpreter register or virtual field at a deopt point.
+///
+/// A [`DeoptLocation::VirtualObject`] names a recipe in the same
+/// [`FrameState`]; no separate materialization table or emitter-owned state
+/// exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeoptSlot {
-    /// Where the value lives in the optimized frame.
+    /// Where the value lives or which virtual recipe materializes it.
     pub location: DeoptLocation,
-    /// How to reconstitute the boxed `Value` from the raw bits at `location`.
+    /// How to reconstitute a physical value from its raw bits. Virtual
+    /// references always carry `Tagged`.
     pub repr: DeoptRepr,
+}
+
+impl DeoptSlot {
+    /// Construct one physical deopt recipe.
+    #[must_use]
+    pub const fn physical(location: DeoptLocation, repr: DeoptRepr) -> Self {
+        Self { location, repr }
+    }
+
+    /// Construct one state-local virtual-object reference.
+    #[must_use]
+    pub const fn virtual_object(object: VirtualObjectId) -> Self {
+        Self {
+            location: DeoptLocation::VirtualObject(object),
+            repr: DeoptRepr::Tagged,
+        }
+    }
+
+    /// Decode a physical recipe. Virtual objects require state materialization.
+    #[must_use]
+    pub fn reconstitute(self, raw: impl FnOnce(DeoptLocation) -> u64) -> Option<Value> {
+        if matches!(self.location, DeoptLocation::VirtualObject(_)) {
+            return None;
+        }
+        Some(self.repr.reconstitute(raw(self.location)))
+    }
 }
 
 /// How a spliced callee frame was entered, everything its rebuilt activation
@@ -254,6 +358,8 @@ pub struct DeoptFrame<Slot = DeoptSlot> {
 pub struct FrameState<Slot = DeoptSlot> {
     /// Frames to rebuild, outermost first and innermost last. Never empty.
     pub frames: Box<[DeoptFrame<Slot>]>,
+    /// Dense scalar-replaced allocations materialized in id order.
+    pub virtual_objects: Box<[VirtualObject<Slot>]>,
 }
 
 impl<Slot> FrameState<Slot> {
@@ -308,7 +414,39 @@ impl FrameState {
                     register: entry.return_register,
                 });
             }
-            frame.verify(limits)?;
+            frame.verify_with_virtuals(limits, self.virtual_objects.len())?;
+        }
+        for (expected, object) in self.virtual_objects.iter().enumerate() {
+            let expected = expected as u32;
+            if object.id.0 != expected {
+                return Err(DeoptVerifyError::NonDenseVirtualObjectId {
+                    expected,
+                    actual: object.id.0,
+                });
+            }
+            if object.kind == VirtualObjectKind::PlainObject && !object.fields.is_empty() {
+                return Err(DeoptVerifyError::InvalidVirtualObjectFieldCount {
+                    object: object.id.0,
+                    fields: object.fields.len(),
+                });
+            }
+            for field in &object.fields {
+                verify_slot(
+                    field,
+                    limits,
+                    self.innermost().byte_pc,
+                    usize::MAX,
+                    self.virtual_objects.len(),
+                )?;
+                if let DeoptLocation::VirtualObject(dependency) = field.location
+                    && dependency.0 >= object.id.0
+                {
+                    return Err(DeoptVerifyError::InvalidVirtualObjectDependency {
+                        object: object.id.0,
+                        dependency: dependency.0,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -324,6 +462,14 @@ impl DeoptFrame {
     /// [`DeoptRepr`] is a closed Rust enum, so every safely constructed value
     /// is intrinsically one of the supported representations.
     pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
+        self.verify_with_virtuals(limits, 0)
+    }
+
+    fn verify_with_virtuals(
+        &self,
+        limits: DeoptVerifyLimits,
+        virtual_object_count: usize,
+    ) -> Result<(), DeoptVerifyError> {
         if self.slots.len() > limits.max_frame_slots {
             return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
                 byte_pc: self.byte_pc,
@@ -339,10 +485,38 @@ impl DeoptFrame {
             .iter()
             .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target]);
         for (slot_index, slot) in self.slots.iter().chain(entry_slots).enumerate() {
-            match slot.location {
+            verify_slot(slot, limits, self.byte_pc, slot_index, virtual_object_count)?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_slot(
+    slot: &DeoptSlot,
+    limits: DeoptVerifyLimits,
+    byte_pc: u32,
+    slot_index: usize,
+    virtual_object_count: usize,
+) -> Result<(), DeoptVerifyError> {
+    match slot.location {
+        DeoptLocation::VirtualObject(object) => {
+            if slot.repr != DeoptRepr::Tagged {
+                return Err(DeoptVerifyError::InvalidVirtualObjectRepresentation {
+                    object: object.0,
+                });
+            }
+            if object.0 as usize >= virtual_object_count {
+                return Err(DeoptVerifyError::InvalidVirtualObjectReference {
+                    object: object.0,
+                    object_count: virtual_object_count,
+                });
+            }
+        }
+        location => {
+            match location {
                 DeoptLocation::Register(register) if register >= limits.machine_register_count => {
                     return Err(DeoptVerifyError::MachineRegisterOutOfRange {
-                        byte_pc: self.byte_pc,
+                        byte_pc,
                         slot: slot_index,
                         register,
                         register_count: limits.machine_register_count,
@@ -353,7 +527,7 @@ impl DeoptFrame {
                         || offset > limits.max_stack_slot_offset =>
                 {
                     return Err(DeoptVerifyError::StackSlotOutOfRange {
-                        byte_pc: self.byte_pc,
+                        byte_pc,
                         slot: slot_index,
                         offset,
                         min: limits.min_stack_slot_offset,
@@ -364,7 +538,7 @@ impl DeoptFrame {
                     if offset % std::mem::size_of::<u64>() as i32 != 0 =>
                 {
                     return Err(DeoptVerifyError::StackSlotMisaligned {
-                        byte_pc: self.byte_pc,
+                        byte_pc,
                         slot: slot_index,
                         offset,
                     });
@@ -372,8 +546,8 @@ impl DeoptFrame {
                 DeoptLocation::Register(_)
                 | DeoptLocation::StackSlot(_)
                 | DeoptLocation::Literal(_) => {}
+                DeoptLocation::VirtualObject(_) => unreachable!(),
             }
-
             match slot.repr {
                 DeoptRepr::Tagged
                 | DeoptRepr::Int32
@@ -382,8 +556,8 @@ impl DeoptFrame {
                 | DeoptRepr::Float64 => {}
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// Dense identity of one physical exit site in one compiled function.
@@ -514,9 +688,16 @@ impl DeoptRuntime {
         for state in self.table.entries() {
             total =
                 total.saturating_add(std::mem::size_of_val::<[DeoptFrame]>(&state.frames) as u64);
+            total = total.saturating_add(std::mem::size_of_val::<[VirtualObject<DeoptSlot>]>(
+                &state.virtual_objects,
+            ) as u64);
             for frame in &state.frames {
                 total =
                     total.saturating_add(std::mem::size_of_val::<[DeoptSlot]>(&frame.slots) as u64);
+            }
+            for object in &state.virtual_objects {
+                total = total
+                    .saturating_add(std::mem::size_of_val::<[DeoptSlot]>(&object.fields) as u64);
             }
         }
         total
@@ -705,6 +886,7 @@ mod tests {
                 entry: None,
                 slots: slots.into(),
             }]),
+            virtual_objects: Box::default(),
         }
     }
 
@@ -736,6 +918,7 @@ mod tests {
         };
         let valid = FrameState {
             frames: Box::new([outer, inner]),
+            virtual_objects: Box::default(),
         };
         assert_eq!(valid.verify(verify_limits()), Ok(()));
         for binding in 0..3 {
@@ -806,6 +989,7 @@ mod tests {
                     slots: vec![shared].into(),
                 },
             ]),
+            virtual_objects: Box::default(),
         };
 
         assert_eq!(chained.verify(verify_limits()), Ok(()));
@@ -822,6 +1006,7 @@ mod tests {
     fn a_frame_chain_may_not_be_empty() {
         let empty = FrameState {
             frames: Box::new([]),
+            virtual_objects: Box::default(),
         };
         assert_eq!(
             empty.verify(verify_limits()),
@@ -904,6 +1089,37 @@ mod tests {
             ],
         );
         assert_eq!(repeated_literal.verify(verify_limits()), Ok(()));
+    }
+
+    #[test]
+    fn frame_state_verifies_dense_nested_virtual_objects() {
+        let physical = DeoptSlot::physical(
+            DeoptLocation::Literal(Value::number_i32(7).to_bits()),
+            DeoptRepr::Tagged,
+        );
+        let mut state = single_frame(20, vec![DeoptSlot::virtual_object(VirtualObjectId(1))]);
+        state.virtual_objects = Box::new([
+            VirtualObject {
+                id: VirtualObjectId(0),
+                kind: VirtualObjectKind::FixedArray,
+                fields: Box::new([physical]),
+            },
+            VirtualObject {
+                id: VirtualObjectId(1),
+                kind: VirtualObjectKind::FixedArray,
+                fields: Box::new([DeoptSlot::virtual_object(VirtualObjectId(0))]),
+            },
+        ]);
+        assert_eq!(state.verify(verify_limits()), Ok(()));
+
+        state.virtual_objects[0].fields = Box::new([DeoptSlot::virtual_object(VirtualObjectId(1))]);
+        assert_eq!(
+            state.verify(verify_limits()),
+            Err(DeoptVerifyError::InvalidVirtualObjectDependency {
+                object: 0,
+                dependency: 1,
+            })
+        );
     }
 
     #[test]

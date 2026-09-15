@@ -3,6 +3,7 @@
 //! # Contents
 //! - Register-index operations for Template and fixed-value operations for SSA.
 //! - Canonical literal allocation from owned values, without VM destinations.
+//! - VM-owned virtual-object materialization from authoritative deopt recipes.
 //!
 //! # Invariants
 //! Register-index methods own a short [`crate::ActiveFrameMut`] scope
@@ -11,11 +12,14 @@
 //! property operations receive their source function/PC explicitly. The
 //! JIT supplies decoded inputs and receives semantic results; no borrowed
 //! frame/window representation crosses the VM service boundary.
+//! A virtual graph is materialized once under one VM handle scope; the JIT
+//! receives only the completed identities it must publish into frame slots.
 
 use smallvec::SmallVec;
 
 use crate::{
     CommittedValueError, NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, Value, VmError,
+    deopt::{VirtualMaterializationValue, VirtualObject},
 };
 
 use super::{RuntimeCall, RuntimeFrameIdentity};
@@ -395,6 +399,17 @@ impl RuntimeCall<'_> {
         // generated code before the next allocating operation.
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.allocate_object_literal_value()
+    }
+
+    /// Materialize one verified dense virtual-object graph under a single GC
+    /// handle scope. Every earlier object remains rooted and is re-read after
+    /// each potentially moving allocation.
+    pub fn materialize_virtual_objects(
+        &mut self,
+        recipes: &[VirtualObject<VirtualMaterializationValue>],
+    ) -> Result<Vec<Value>, VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        vm.materialize_virtual_objects(recipes)
     }
 
     /// Store a captured binding with its TDZ check.
@@ -1120,6 +1135,77 @@ mod tests {
             )
             .and_then(Value::as_i32),
             Some(22)
+        );
+    }
+
+    #[test]
+    fn virtual_materialization_roots_nested_objects_across_allocations() {
+        use crate::deopt::{
+            VirtualMaterializationValue, VirtualObject, VirtualObjectId, VirtualObjectKind,
+        };
+
+        let context = element_context();
+        let mut vm = Interpreter::new();
+        let scalar_object = vm
+            .allocate_array_literal_value([Value::number_i32(99)])
+            .expect("scalar array field");
+        let mut stack = ActivationStack::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut registers = [Value::undefined(); 3];
+        registers[0] = scalar_object;
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 0,
+                pc: 1,
+                register_count: 3,
+                kind: NativeFrameKind::Optimizing,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        frame.set_stack_registers();
+        let recipes = [
+            VirtualObject {
+                id: VirtualObjectId(0),
+                kind: VirtualObjectKind::FixedArray,
+                fields: Box::new([VirtualMaterializationValue::Value(Value::number_i32(7))]),
+            },
+            VirtualObject {
+                id: VirtualObjectId(1),
+                kind: VirtualObjectKind::FixedArray,
+                fields: Box::new([
+                    VirtualMaterializationValue::VirtualObject(VirtualObjectId(0)),
+                    VirtualMaterializationValue::Value(scalar_object),
+                ]),
+            },
+        ];
+
+        let mut call =
+            unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
+                .expect("stack-owned runtime call");
+        let objects = call
+            .materialize_virtual_objects(&recipes)
+            .expect("nested virtual graph");
+        assert_eq!(objects.len(), 2);
+        assert_eq!(
+            call.load_element_value(objects[1], Value::number_i32(0))
+                .expect("parent element"),
+            objects[0]
+        );
+        let scalar_field = call
+            .load_element_value(objects[1], Value::number_i32(1))
+            .expect("rooted scalar field");
+        assert_eq!(
+            call.load_element_value(scalar_field, Value::number_i32(0))
+                .expect("rooted scalar field contents"),
+            Value::number_i32(99)
+        );
+        assert_eq!(
+            call.load_element_value(objects[0], Value::number_i32(0))
+                .expect("child element"),
+            Value::number_i32(7)
         );
     }
 

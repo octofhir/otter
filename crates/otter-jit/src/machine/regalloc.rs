@@ -538,6 +538,7 @@ mod tests {
                         MachineFrameSlot::Value(integer),
                     ]),
                 }]),
+                virtual_objects: Box::default(),
             }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),

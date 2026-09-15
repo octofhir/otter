@@ -1227,6 +1227,7 @@ impl NumericFunction {
                             .collect::<Vec<_>>())
                         .into(),
                     }]),
+                    virtual_objects: Box::default(),
                 });
             }
         }
@@ -3753,6 +3754,7 @@ fn push_frame_state(
                 .collect::<Vec<_>>())
             .into(),
         }]),
+        virtual_objects: Box::default(),
     });
 }
 

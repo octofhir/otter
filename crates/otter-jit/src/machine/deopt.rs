@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`MachineFrameState`] — one exact chain of interpreter-register snapshots.
-//! - [`MachineFrameSlot`] — allocated value or compile-time literal recipe.
+//! - [`MachineFrameSlot`] — allocated, literal, or virtual-object recipe.
 //! - [`lower_deopt_table`] — conversion into the VM's one current [`DeoptTable`].
 //!
 //! # Invariants
@@ -38,6 +38,8 @@ pub enum MachineFrameSlot {
     Value(MachineValue),
     /// Full tagged literal rematerialized only on the cold exit.
     TaggedLiteral(u64),
+    /// Scalar-replaced object owned by the same authoritative frame state.
+    VirtualObject(otter_vm::deopt::VirtualObjectId),
 }
 
 /// Exact outermost-first frame chain for one Machine IR deopt exit.
@@ -47,6 +49,8 @@ pub struct MachineFrameState {
     pub id: FrameStateId,
     /// VM-owned frame schema with allocator inputs instead of concrete recipes.
     pub frames: Box<[DeoptFrame<MachineFrameSlot>]>,
+    /// Dense target-independent materialization recipes.
+    pub virtual_objects: Box<[otter_vm::deopt::VirtualObject<MachineFrameSlot>]>,
 }
 
 /// Failure to lower allocator locations into VM deopt metadata.
@@ -157,7 +161,36 @@ pub fn lower_deopt_table(
                 })
             })
             .collect::<Result<_, MachineDeoptError>>()?;
-        lowered[state.id as usize] = Some(FrameState { frames });
+        let virtual_objects = state
+            .virtual_objects
+            .iter()
+            .map(|object| {
+                Ok(otter_vm::deopt::VirtualObject {
+                    id: object.id,
+                    kind: object.kind,
+                    fields: object
+                        .fields
+                        .iter()
+                        .copied()
+                        .map(|slot| {
+                            lower_slot(
+                                sequence,
+                                allocation,
+                                layout,
+                                gpr_budget,
+                                state.id,
+                                instruction,
+                                slot,
+                            )
+                        })
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect::<Result<_, MachineDeoptError>>()?;
+        lowered[state.id as usize] = Some(FrameState {
+            frames,
+            virtual_objects,
+        });
     }
     let table = DeoptTable::from_indexed_states(lowered);
     let max_stack_offset = if allocation.spill_slots() == 0 {
@@ -196,14 +229,17 @@ fn lower_slot(
     instruction: MachineInstructionId,
     slot: MachineFrameSlot,
 ) -> Result<DeoptSlot, MachineDeoptError> {
-    let MachineFrameSlot::Value(value) = slot else {
-        let MachineFrameSlot::TaggedLiteral(bits) = slot else {
-            unreachable!("MachineFrameSlot has two variants")
-        };
-        return Ok(DeoptSlot {
-            location: DeoptLocation::Literal(bits),
-            repr: DeoptRepr::Tagged,
-        });
+    let value = match slot {
+        MachineFrameSlot::Value(value) => value,
+        MachineFrameSlot::TaggedLiteral(bits) => {
+            return Ok(DeoptSlot::physical(
+                DeoptLocation::Literal(bits),
+                DeoptRepr::Tagged,
+            ));
+        }
+        MachineFrameSlot::VirtualObject(object) => {
+            return Ok(DeoptSlot::virtual_object(object));
+        }
     };
     let representation = *sequence
         .representations()
@@ -260,7 +296,7 @@ fn lower_slot(
             .map_err(|_| MachineDeoptError::RegisterOutOfRange)?,
         ),
     };
-    Ok(DeoptSlot { location, repr })
+    Ok(DeoptSlot::physical(location, repr))
 }
 
 /// Canonical literal used for dead or uninitialized VM registers.
@@ -313,7 +349,11 @@ mod tests {
             MachineBlock(0),
             vec![MachineRepresentation::Int32, MachineRepresentation::Float64],
             Vec::new(),
-            vec![MachineFrameState { id: 0, frames }],
+            vec![MachineFrameState {
+                id: 0,
+                frames,
+                virtual_objects: Box::default(),
+            }],
             vec![MachineBlockData {
                 first: MachineInstructionId(0),
                 end: MachineInstructionId(3),
@@ -401,6 +441,7 @@ mod tests {
                 ]
                 .into_boxed_slice(),
             }]),
+            virtual_objects: Box::default(),
         };
         let (sequence, allocation, layout) = allocated_exit(&target, state.frames.clone());
         let (gpr_budget, fp_budget) = target.deopt_register_budgets();

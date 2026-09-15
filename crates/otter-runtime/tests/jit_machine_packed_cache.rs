@@ -74,13 +74,24 @@ function makePackedViewCacheInputs() {
 
 const ENTRY_SETUP: &str = r#"
 globalThis.__packedCacheWarm = makePackedViewCacheInputs();
-for (let warm = 0; warm < 5000; warm = warm + 1) {
+// Seed every packed site while keeping each loop below its OSR threshold.
+for (let warm = 0; warm < 8; warm = warm + 1) {
   machinePackedViewCacheKernel(
     __packedCacheWarm[0],
     __packedCacheWarm[1],
     __packedCacheWarm[2],
     __packedCacheWarm[3],
     1
+  );
+}
+// Drive whole-function entry compilation without adding loop backedges.
+for (let warm = 0; warm < 5000; warm = warm + 1) {
+  machinePackedViewCacheKernel(
+    __packedCacheWarm[0],
+    __packedCacheWarm[1],
+    __packedCacheWarm[2],
+    __packedCacheWarm[3],
+    0
   );
 }
 "#;

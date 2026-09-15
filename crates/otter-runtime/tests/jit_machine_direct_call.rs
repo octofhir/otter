@@ -648,26 +648,35 @@ class Returner extends Base {
   }
 }
 
-// Promote the derived body before generated callers begin selecting it. The
-// generated-entry counters are reconciled at the outer activation boundary,
-// independently of the constructor-linkage contract exercised below.
+// Promote the base dependency before the derived body, then promote the
+// derived body before generated callers begin selecting it. The generated-entry
+// counters are reconciled at the outer activation boundary, independently of
+// the constructor-linkage contract exercised below.
+for (let i = 0; i < 5000; i++) {
+  new Base(i);
+}
 for (let i = 0; i < 5000; i++) {
   new Derived(i);
 }
 baseRuns = 0;
 
 function constructDerived(Ctor, value) {
-  return new Ctor(value);
+  const adjusted = value + 1;
+  const restored = adjusted - 1;
+  return new Ctor(restored);
 }
 
 function constructReturner(Ctor, value) {
   return new Ctor(value);
 }
 
-for (let i = 0; i < 5000; i++) {
-  constructDerived(Derived, i);
-  constructReturner(Returner, { warm: i });
+function warmConstructWrappers(rounds) {
+  for (let i = 0; i < rounds; i++) {
+    constructDerived(Derived, i);
+    constructReturner(Returner, { warm: i });
+  }
 }
+warmConstructWrappers(5000);
 
 const result = constructDerived(Derived, 42);
 const override = { marker: "override" };
@@ -1006,7 +1015,8 @@ fn assert_machine_derived_construct(result: &RunResult) {
     assert_machine_direct_call(result);
     assert!(
         result.used_machine_derived_construct,
-        "fixture must publish a typed Machine IR derived construct target"
+        "fixture must publish a typed Machine IR derived construct target; diagnostics={:?}",
+        result.compile_diagnostics
     );
     assert!(
         result.used_machine_super_construct,

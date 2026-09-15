@@ -23,6 +23,8 @@
 //!   safepoint/deoptimization locations.
 //! - [`MachineFrameLayout`] — aligned post-allocation spill-frame contract.
 //! - [`MachineSafepointTable`] — allocator roots and VM spill-slot records.
+//! - [`MachineEffects`] — the exhaustive alias, reentry, allocation, throw,
+//!   safepoint, and commoning contract consumed by graph optimization.
 //!
 //! # Invariants
 //! - Virtual values are dense and have one machine representation.
@@ -70,6 +72,9 @@
 //!   cell completes as not nullish in generated code.
 //! - Target register files enumerate physical registers explicitly. There is
 //!   no synthetic constant register budget.
+//! - GVN equivalence includes representation, canonical inputs, dependency
+//!   epoch, alias class, and the dominating memory version. No committed call,
+//!   allocation, barrier, throwing operation, or control node is commoned.
 //!
 //! # See also
 //! - [`crate::optimizing`] — the production Machine compilation entry.
@@ -77,7 +82,9 @@
 mod committed_probe;
 mod deopt;
 mod derived_this;
+mod effects;
 mod frame;
+mod gvn;
 mod inline_frames;
 mod native_leaf;
 #[cfg(target_arch = "aarch64")]
@@ -91,6 +98,7 @@ mod truthiness;
 pub use deopt::{
     MachineDeoptError, MachineFrameSlot, MachineFrameState, lower_deopt_table, undefined_slot,
 };
+pub use effects::{MachineAliasClass, MachineAliasSet, MachineCommoning, MachineEffects};
 pub use frame::{FrameLayoutError, MachineFrameLayout};
 pub use property::MachineCacheIrSite;
 pub use regalloc::{
@@ -468,57 +476,11 @@ impl CallEffects {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
-}
 
-/// Heap dependency class carried by an explicit CacheIR Machine operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MachineAliasClass {
-    /// Hidden-class and fast-object state.
-    Shape,
-    /// Atom-to-slot descriptor state selected by an immutable hidden class.
-    PropertyMetadata,
-    /// An object's direct prototype link.
-    Prototype,
-    /// String-keyed value-slab contents.
-    PropertyField,
-    /// Remembered-set and incremental-marking metadata.
-    GcBarrier,
-}
-
-/// Optimizer-visible effects of one explicit CacheIR Machine operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MachineCacheIrEffects {
-    /// Alias class read by the operation, if any.
-    pub reads: Option<MachineAliasClass>,
-    /// Alias class written by the operation, if any.
-    pub writes: Option<MachineAliasClass>,
-    /// Whether the operation may allocate.
-    pub allocates: bool,
-    /// Whether the operation may throw.
-    pub throws: bool,
-    /// Whether the operation is a safepoint.
-    pub safepoint: bool,
-}
-
-impl MachineCacheIrEffects {
-    const fn read(alias: MachineAliasClass) -> Self {
-        Self {
-            reads: Some(alias),
-            writes: None,
-            allocates: false,
-            throws: false,
-            safepoint: false,
-        }
-    }
-
-    const fn write(alias: MachineAliasClass) -> Self {
-        Self {
-            reads: None,
-            writes: Some(alias),
-            allocates: false,
-            throws: false,
-            safepoint: false,
-        }
+    /// Whether every bit in `other` is present.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
     }
 }
 
@@ -1184,32 +1146,6 @@ pub enum MachineOpcode {
     Return,
 }
 
-impl MachineOpcode {
-    /// Return the complete optimizer-visible effect declaration for an
-    /// explicit CacheIR operation. Non-CacheIR operations return `None` and
-    /// retain their existing family-specific contracts.
-    #[must_use]
-    pub const fn cache_ir_effects(&self) -> Option<MachineCacheIrEffects> {
-        use MachineAliasClass::{GcBarrier, PropertyField, PropertyMetadata, Prototype, Shape};
-        match self {
-            Self::CacheIrGuardShape { .. } => Some(MachineCacheIrEffects::read(Shape)),
-            Self::CacheIrGuardAtomSlot { .. } => {
-                Some(MachineCacheIrEffects::read(PropertyMetadata))
-            }
-            Self::CacheIrLoadPrototype { .. } => Some(MachineCacheIrEffects::read(Prototype)),
-            Self::CacheIrGuardPrototypeNull { .. } => Some(MachineCacheIrEffects::read(Prototype)),
-            Self::CacheIrLoadField { .. } => Some(MachineCacheIrEffects::read(PropertyField)),
-            Self::CacheIrStoreField { .. } => Some(MachineCacheIrEffects::write(PropertyField)),
-            Self::CacheIrGuardExtensible { .. } => {
-                Some(MachineCacheIrEffects::read(PropertyMetadata))
-            }
-            Self::CacheIrPublishShape { .. } => Some(MachineCacheIrEffects::write(Shape)),
-            Self::CacheIrWriteBarrier { .. } => Some(MachineCacheIrEffects::write(GcBarrier)),
-            _ => None,
-        }
-    }
-}
-
 /// Control-flow role of a selected instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlow {
@@ -1550,6 +1486,15 @@ impl InstructionSequence {
     /// Allocate through regalloc2's Ion allocator and finalize exact metadata.
     pub fn allocate(&self, target: &TargetSpec) -> Result<AllocatedSequence, AllocationError> {
         regalloc::allocate(self, target)
+    }
+
+    /// Run the sole effect-aware Machine value-numbering pass and reverify the
+    /// rewritten graph before register allocation.
+    pub(crate) fn optimize(
+        self,
+        target: &TargetSpec,
+    ) -> Result<(Self, gvn::MachineOptimizationStats), VerificationError> {
+        gvn::optimize(self, target)
     }
 
     /// Dense machine representations indexed by [`MachineValue`].
@@ -3406,91 +3351,6 @@ impl InstructionSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_cache_ir_opcode_declares_one_explicit_alias_effect() {
-        use MachineAliasClass::{GcBarrier, PropertyField, PropertyMetadata, Prototype, Shape};
-        let rows = [
-            (
-                MachineOpcode::CacheIrGuardShape {
-                    byte_pc: 0,
-                    shape: 1,
-                },
-                Some(Shape),
-                None,
-            ),
-            (
-                MachineOpcode::CacheIrGuardAtomSlot {
-                    byte_pc: 0,
-                    atom: 1,
-                    value_byte: 0,
-                    writable: false,
-                },
-                Some(PropertyMetadata),
-                None,
-            ),
-            (
-                MachineOpcode::CacheIrLoadPrototype { byte_pc: 0 },
-                Some(Prototype),
-                None,
-            ),
-            (
-                MachineOpcode::CacheIrGuardPrototypeNull { byte_pc: 0 },
-                Some(Prototype),
-                None,
-            ),
-            (
-                MachineOpcode::CacheIrLoadField {
-                    byte_pc: 0,
-                    value_byte: 0,
-                },
-                Some(PropertyField),
-                None,
-            ),
-            (
-                MachineOpcode::CacheIrStoreField {
-                    byte_pc: 0,
-                    value_byte: 0,
-                },
-                None,
-                Some(PropertyField),
-            ),
-            (
-                MachineOpcode::CacheIrGuardExtensible {
-                    byte_pc: 0,
-                    value_byte: 0,
-                },
-                Some(PropertyMetadata),
-                None,
-            ),
-            (
-                MachineOpcode::CacheIrPublishShape {
-                    byte_pc: 0,
-                    shape: 1,
-                    new_len: 1,
-                    initialize_inline: true,
-                },
-                None,
-                Some(Shape),
-            ),
-            (
-                MachineOpcode::CacheIrWriteBarrier {
-                    byte_pc: 0,
-                    value_is_non_cell: false,
-                },
-                None,
-                Some(GcBarrier),
-            ),
-        ];
-        for (opcode, reads, writes) in rows {
-            let effects = opcode.cache_ir_effects().expect("CacheIR effect row");
-            assert_eq!(effects.reads, reads, "{opcode:?}");
-            assert_eq!(effects.writes, writes, "{opcode:?}");
-            assert!(!effects.allocates, "{opcode:?}");
-            assert!(!effects.throws, "{opcode:?}");
-            assert!(!effects.safepoint, "{opcode:?}");
-        }
-    }
 
     #[test]
     fn selectors_do_not_maintain_independent_tagged_root_lists() {

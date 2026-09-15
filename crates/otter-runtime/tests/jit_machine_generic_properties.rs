@@ -52,7 +52,7 @@ const MIXED_FUNCTION: &str = "machineGenericPropertyBoundary";
 const CATCH_MODULE: &str = "jit-machine-generic-properties-catch-setup.js";
 const CATCH_FUNCTION: &str = "machineGenericPropertyCaught";
 
-const LIVE_PAYLOAD_SETUP: &str = r#"
+const LIVE_PAYLOAD_WARM: &str = r#"
 globalThis.__machineCacheIrLiveObject = { a: 1, b: 2, c: 0 };
 function machineCacheIrLivePayload(target) {
   target.c = target.a + target.b;
@@ -63,6 +63,15 @@ for (let warm = 0; warm < 4010; warm++) {
   livePayloadWarm += "machineCacheIrLivePayload(__machineCacheIrLiveObject);";
 }
 eval(livePayloadWarm);
+"#;
+
+const LIVE_PAYLOAD_SETTLE: &str = r#"
+for (let probeWarm = 0; probeWarm < 1000; probeWarm++) {
+  machineCacheIrLivePayload(__machineCacheIrLiveObject);
+}
+"#;
+
+const LIVE_PAYLOAD_PROBE: &str = r#"
 JSON.stringify([
   __machineCacheIrLiveObject.c,
   machineCacheIrLivePayload(__machineCacheIrLiveObject)
@@ -771,10 +780,22 @@ fn assert_exact_runtime_pair(delta: CounterDelta, operation: &str) {
 #[test]
 fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
     let mut runtime = runtime(false);
+    runtime
+        .run_script(
+            SourceInput::from_javascript(LIVE_PAYLOAD_WARM),
+            "jit-machine-cache-ir-live-payload-warm.js",
+        )
+        .expect("warm live-payload Machine body");
+    runtime
+        .run_script(
+            SourceInput::from_javascript(LIVE_PAYLOAD_SETTLE),
+            "jit-machine-cache-ir-live-payload-settle.js",
+        )
+        .expect("settle live-payload Machine generation");
     let (result, delta) = run_with_delta(
         &mut runtime,
-        LIVE_PAYLOAD_SETUP,
-        "jit-machine-cache-ir-live-payload.js",
+        LIVE_PAYLOAD_PROBE,
+        "jit-machine-cache-ir-live-payload-probe.js",
     );
     assert_eq!(result, "[3,4]");
     assert!(

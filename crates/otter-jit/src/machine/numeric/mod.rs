@@ -16,6 +16,8 @@
 //! - Static-native leaves share VM declarations and exact pre-call deopt state;
 //!   fixed ABI operands and call clobbers remain visible before allocation.
 //! - [`try_compile`] — the sole production optimizing-tier entry.
+//! - Effect-aware Machine GVN runs after complete selection and before
+//!   allocation, then rederives roots and verifies the rewritten graph.
 //!
 //! # See also
 //! - [`crate::machine::TargetSpec`] — immutable target input to selection and allocation.
@@ -230,6 +232,9 @@ pub(crate) fn try_compile(
     let sequence =
         select_with_packed_double_view_caches(target_spec, &hir, &packed_double_view_caches)
             .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
+    let (sequence, optimization_stats) = sequence
+        .optimize(target_spec)
+        .map_err(|_error| Unsupported::OperandShape("scalar Machine IR optimization"))?;
     let load_property_sites = sequence
         .instructions()
         .iter()
@@ -391,11 +396,14 @@ pub(crate) fn try_compile(
 
     let artifact = artifact_request.map(|request| {
         let mut tier_input = format!(
-            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n",
+            "; backend=otter-machine-ir scalar-function\n; parameters={} registers={} blocks={} arithmetic-ops={}\n; gvn-eliminated={} guards={} loads={}\n",
             hir.parameter_count,
             hir.register_count,
             hir.blocks.len(),
-            hir.arithmetic_op_count
+            hir.arithmetic_op_count,
+            optimization_stats.eliminated_instructions,
+            optimization_stats.eliminated_guards,
+            optimization_stats.eliminated_loads,
         );
         tier_input.push_str(&sequence.normalized());
         tier_input.push_str(&allocation.normalized());
@@ -976,7 +984,8 @@ fn select_with_packed_double_view_caches(
                 )
                 .map_err(|_| super::VerificationError::OpcodeSignatureMismatch(first))?;
                 for instruction in &mut instructions[property_start..] {
-                    if instruction.opcode.cache_ir_effects().is_some() {
+                    let effects = instruction.opcode.effects();
+                    if !effects.reads.is_empty() || !effects.writes.is_empty() {
                         instruction.frame_state = Some(frame_state);
                     }
                 }

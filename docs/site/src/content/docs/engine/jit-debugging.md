@@ -371,6 +371,16 @@ and exact regalloc2 output; its `code-map.json` owns one
 VM keeps the Template code object instead of invoking a second optimizing IR,
 allocator, or emitter.
 
+The next header line reports `gvn-eliminated`, `guards`, and `loads`. The one
+Machine optimizer computes dominators and reuses a value or successful guard
+only when its opcode, representations, canonical inputs, dependency epoch,
+alias classes, and dominating memory versions agree. Stores invalidate their
+declared aliases; allocation, moving-GC safepoints, reentry, and throws begin a
+new dependency epoch. Committed calls, allocations, barriers, and throwing
+operations are never commoned. Removed instructions are absent from both the
+normalized Machine listing and `code-map.json`; frame-state recipes and GC
+roots are rewritten and verified before register allocation.
+
 Scalar Machine bundles express indexed access through `machineElementView`,
 `machineElementAddress`, `machineElementValueLoad`,
 `machineElementValueGuard`, and `machineElementValueStore`. Each region carries

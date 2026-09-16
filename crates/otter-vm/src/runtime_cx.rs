@@ -1540,6 +1540,14 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp
     }
 
+    /// Charge completed RegExp matcher work through the shared runtime ledger.
+    pub(crate) fn charge_regex_backtrack_steps(&mut self, steps: u64) -> Result<(), NativeError> {
+        self.cx
+            .interp
+            .charge_regex_backtrack_steps(steps)
+            .map_err(|error| native_function::vm_to_native_error(self.cx.interp, error, "RegExp"))
+    }
+
     /// Reborrow the current interpreter and exact rooted activation stack for
     /// an internal high-level operation that can synchronously re-enter JS.
     pub(crate) fn with_turn_parts<R>(

@@ -668,70 +668,74 @@ impl Interpreter {
         args: &[Value],
         excluded: &[Value],
     ) -> Result<Value, VmError> {
-        let target_input = args.first().cloned().unwrap_or(Value::undefined());
-        // §20.1.2.1 step 2 — `ToObject(target)`. The spec returns the
-        // resulting object as `target`, so Array / RegExp / Map / etc.
-        // exotics pass straight through; only Null / Undefined throw
-        // and only primitives go through the wrapper-boxing path.
-        let target_value: Value = if is_property_bearing_object(&target_input) {
-            target_input
-        } else if target_input.is_nullish() {
-            return Err(
-                self.err_type(("Object.assign called on null or undefined".to_string()).into())
-            );
-        } else {
-            self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[args])?
-        };
-        // Cache the object form when applicable so the existing
-        // `ordinary_set_with_callable_setter` fast path keeps working
-        // unchanged for plain-object targets. Exotic targets fall
-        // through the value-level `[[Set]]` helper below.
-        let target_object: Option<crate::object::JsObject> = target_value.as_object();
-        for src in args.iter().skip(1) {
-            if src.is_nullish() {
-                continue;
-            }
-            if let Some(s) = src.as_string(&self.gc_heap) {
-                // §22.1.4 — String exotic exposes its code units
-                // as own indexed properties plus a `length`. The
-                // latter is read-only on the wrapper, so we copy
-                // only the indexed slots.
-                let lossy = s.to_lossy_string(&self.gc_heap);
-                for (idx, ch) in lossy.chars().enumerate() {
-                    let mut buf = [0u16; 2];
-                    let units = ch.encode_utf16(&mut buf);
-                    let unit_string =
-                        crate::string::JsString::from_utf16_units(units, self.gc_heap_mut())
-                            .map_err(|_| VmError::TypeMismatch)?;
-                    assign_set_string(
-                        self,
+        self.with_handle_scope(|interp, scope| {
+            let target_input = args.first().cloned().unwrap_or(Value::undefined());
+            // §20.1.2.1 step 2 — `ToObject(target)`. The spec returns the
+            // resulting object as `target`, so Array / RegExp / Map / etc.
+            // exotics pass straight through; only Null / Undefined throw
+            // and only primitives go through the wrapper-boxing path.
+            let target_value: Value = if is_property_bearing_object(&target_input) {
+                target_input
+            } else if target_input.is_nullish() {
+                return Err(interp
+                    .err_type(("Object.assign called on null or undefined".to_string()).into()));
+            } else {
+                interp.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[args])?
+            };
+            // Copying a source can allocate or reenter JavaScript. Keep the
+            // target in one canonical handle for the whole operation and
+            // re-read it before every write and before returning it. Returning
+            // the pre-collection local here used to publish a forwarded object
+            // into the caller's destination register under GC stress.
+            let target = interp.scoped_value(scope, target_value);
+            for src in args.iter().skip(1) {
+                if src.is_nullish() {
+                    continue;
+                }
+                if let Some(s) = src.as_string(&interp.gc_heap) {
+                    // §22.1.4 — String exotic exposes its code units
+                    // as own indexed properties plus a `length`. The
+                    // latter is read-only on the wrapper, so we copy
+                    // only the indexed slots.
+                    let lossy = s.to_lossy_string(&interp.gc_heap);
+                    for (idx, ch) in lossy.chars().enumerate() {
+                        let mut buf = [0u16; 2];
+                        let units = ch.encode_utf16(&mut buf);
+                        let unit_string =
+                            crate::string::JsString::from_utf16_units(units, interp.gc_heap_mut())
+                                .map_err(|_| VmError::TypeMismatch)?;
+                        let target_value = interp.escape_scoped(target);
+                        assign_set_string(
+                            interp,
+                            stack,
+                            context,
+                            &target_value,
+                            target_value.as_object(),
+                            &idx.to_string(),
+                            Value::string(unit_string),
+                        )?;
+                    }
+                } else if assign_source_uses_own_property_keys(src) {
+                    let target_value = interp.escape_scoped(target);
+                    assign_copy_source_keys(
+                        interp,
                         stack,
                         context,
                         &target_value,
-                        target_object,
-                        &idx.to_string(),
-                        Value::string(unit_string),
+                        target_value.as_object(),
+                        src,
+                        excluded,
                     )?;
+                } else {
+                    // Primitive Boolean / Number / Symbol / BigInt
+                    // wrappers have no enumerable own properties in
+                    // this VM slice, so ToObject(source) contributes
+                    // an empty key list.
+                    continue;
                 }
-            } else if assign_source_uses_own_property_keys(src) {
-                assign_copy_source_keys(
-                    self,
-                    stack,
-                    context,
-                    &target_value,
-                    target_object,
-                    src,
-                    excluded,
-                )?;
-            } else {
-                // Primitive Boolean / Number / Symbol / BigInt
-                // wrappers have no enumerable own properties in
-                // this VM slice, so ToObject(source) contributes
-                // an empty key list.
-                continue;
             }
-        }
-        Ok(target_value)
+            Ok(interp.escape_scoped(target))
+        })
     }
 
     pub(crate) fn object_static_call_stack_rooted(
@@ -1851,7 +1855,6 @@ fn assign_copy_source_keys(
     excluded: &[Value],
 ) -> Result<(), VmError> {
     let _ = target_object;
-    let keys = interp.own_property_keys_value(stack, context, source)?;
     // Proxy traps and accessors reenter JavaScript below, and every
     // reentry can collect: park the source, target, excluded keys, and
     // the whole ownKeys list in the handle arena and re-read them per
@@ -1862,6 +1865,17 @@ fn assign_copy_source_keys(
     for candidate in excluded {
         interp.json_root_push(*candidate);
     }
+    // `[[OwnPropertyKeys]]` allocates strings even for an ordinary object.
+    // Park every carried value before entering it: the stack frame is traced,
+    // but these copied Rust locals are not rewritten by a moving collection.
+    let source = interp.json_root_get(base);
+    let keys = match interp.own_property_keys_value(stack, context, &source) {
+        Ok(keys) => keys,
+        Err(error) => {
+            interp.json_root_pop_to(base);
+            return Err(error);
+        }
+    };
     let keys_base = interp.json_root_push(Value::undefined()) + 1;
     for key in &keys {
         interp.json_root_push(*key);

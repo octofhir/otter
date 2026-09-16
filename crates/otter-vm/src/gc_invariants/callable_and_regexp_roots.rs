@@ -5,6 +5,7 @@ use smallvec::smallvec;
 use crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG;
 use crate::object::OBJECT_BODY_TYPE_TAG;
 use crate::regexp::REGEXP_BODY_TYPE_TAG;
+use crate::rooting::RootScopeExt;
 use crate::test_support::native_function_captures;
 use crate::{
     BOUND_FUNCTION_BODY_TYPE_TAG, BoundFunction, Interpreter, Value, native_value_with_captures,
@@ -17,30 +18,39 @@ fn live_bytes(interp: &mut Interpreter, tag: u8) -> usize {
 #[test]
 fn bound_function_roots_target_this_and_args_when_rooted() {
     let mut interp = Interpreter::new();
-
-    let target = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("target");
-    let bound_this = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this");
-    let arg = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("arg");
-    let bound = BoundFunction::new(
-        interp.gc_heap_mut(),
-        Value::object(target),
-        Value::object(bound_this),
-        smallvec![Value::object(arg)],
-    )
-    .expect("bound function");
-
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut global = *interp.global_this();
+    let mut target = Value::undefined();
+    let mut bound_this = Value::undefined();
+    let mut arg = Value::undefined();
+    let mut bound = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: all slots precede the scope and remain stationary through the
+    // complete allocation and forced-collection sequence.
+    unsafe {
+        roots.add_object(&mut global);
+        roots.add_value(&mut target);
+        roots.add_value(&mut bound_this);
+        roots.add_value(&mut arg);
+        roots.add_value(&mut bound);
+    }
+    target =
+        Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("target"));
+    bound_this =
+        Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this"));
+    arg = Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("arg"));
+    bound = Value::bound_function(
+        BoundFunction::new(interp.gc_heap_mut(), target, bound_this, smallvec![arg])
+            .expect("bound function"),
+    );
+
     crate::object::set(
         &mut global,
         interp.gc_heap_mut(),
         "__gc_bound_function",
-        Value::bound_function(bound),
+        bound,
     );
 
-    let _ = target;
-    let _ = bound_this;
-    let _ = arg;
-    let _ = bound;
     interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global, interp.gc_heap(), "__gc_bound_function")
@@ -57,16 +67,28 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
 #[test]
 fn native_function_captures_root_gc_values_when_rooted() {
     let mut interp = Interpreter::new();
-
-    let captured = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("capture");
-    let native = native_value_with_captures(
+    let _runtime_roots = interp.scope_runtime_roots_guard();
+    let mut global = *interp.global_this();
+    let mut captured = Value::undefined();
+    let mut native = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: all slots precede the scope and remain stationary through the
+    // complete allocation and forced-collection sequence.
+    unsafe {
+        roots.add_object(&mut global);
+        roots.add_value(&mut captured);
+        roots.add_value(&mut native);
+    }
+    captured = Value::object(
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("capture"),
+    );
+    native = native_value_with_captures(
         interp.gc_heap_mut(),
         "capture-root",
-        smallvec![Value::object(captured)],
+        smallvec![captured],
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
-    let mut global = *interp.global_this();
     crate::object::set(
         &mut global,
         interp.gc_heap_mut(),
@@ -74,7 +96,6 @@ fn native_function_captures_root_gc_values_when_rooted() {
         native,
     );
 
-    let _ = captured;
     interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global, interp.gc_heap(), "__gc_native_function")
@@ -114,6 +135,8 @@ fn regexp_body_survives_force_gc_when_rooted() {
     let haystack: Vec<u16> = "abbbc".encode_utf16().collect();
     let m = re
         .find_from_utf16(interp.gc_heap(), &haystack, 0)
+        .result
+        .expect("within matcher budget")
         .into_iter()
         .next()
         .expect("match after force_gc");

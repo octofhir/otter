@@ -3,8 +3,7 @@
 //! views
 //! variants in a single GC body type.
 //!
-//! Replaces the earlier chunked-storage scaffold: every string lives
-//! in exactly one [`JsStringBody`] on the GC heap. Short flat strings keep
+//! Every string lives in exactly one [`JsStringBody`] on the GC heap. Short flat strings keep
 //! their bytes/code units inside the body; longer strings use `Vec<u16>` /
 //! `Vec<u8>` side storage. Cons / sliced variants reference children through
 //! [`JsStringHandle`] so the collector can trace them transitively.
@@ -20,9 +19,9 @@
 //! # Invariants
 //! - String bytes/code units live on the GC heap (Vec inside body).
 //!   No `Rc` / `Arc` / `Box` / `Cell` / `RefCell` inside the body.
-//! - Bodies are allocated in old-space. `JsString` is a copied handle
-//!   wrapper used heavily by native builtins; keeping string bodies
-//!   non-moving preserves those local handles across GC.
+//! - Ordinary bodies start in the moving young generation. Every handle
+//!   held across an allocation is exposed through a traced slot or scoped VM
+//!   handle; only explicitly stable cells may rely on old-space placement.
 //! - `len` is precomputed at construction and is O(1) heap-free at
 //!   the body level (callers read it via `heap.read_payload`).
 //! - A body length is always exact in `u32`. Concatenation rejects a sum beyond
@@ -345,7 +344,7 @@ pub fn alloc_flat_string_body_with_roots(
     if units.len() <= INLINE_FLAT_CAP {
         let mut inline = [0u16; INLINE_FLAT_CAP];
         inline[..units.len()].copy_from_slice(units);
-        return heap.alloc_old_with_roots(
+        return heap.alloc_with_roots(
             JsStringBody {
                 id,
                 len,
@@ -357,9 +356,8 @@ pub fn alloc_flat_string_body_with_roots(
         );
     }
     // The code units live in the same cell as the body, so they are part of
-    // the GC allocation and need no separate cap reservation. Old space,
-    // like every other string body: see the module invariant.
-    let handle = heap.alloc_variable_with_roots(
+    // the GC allocation and need no separate cap reservation.
+    let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
             id,
             len,
@@ -392,7 +390,7 @@ pub fn alloc_latin1_string_body_with_roots(
     if bytes.len() <= INLINE_LATIN1_CAP {
         let mut inline = [0u8; INLINE_LATIN1_CAP];
         inline[..bytes.len()].copy_from_slice(bytes);
-        return heap.alloc_old_with_roots(
+        return heap.alloc_with_roots(
             JsStringBody {
                 id,
                 len,
@@ -403,9 +401,8 @@ pub fn alloc_latin1_string_body_with_roots(
             external_visit,
         );
     }
-    // Same as the flat path: the bytes are inside the GC allocation, and
-    // the body is old-space like every other string body.
-    let handle = heap.alloc_variable_with_roots(
+    // Same as the flat path: the bytes are inside the GC allocation.
+    let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
             id,
             len,
@@ -539,7 +536,7 @@ pub fn concat_string_bodies(
     // right)` because FNV-1a is a streaming hash.
     let combined_hash = fnv_combine(left_hash, right_hash, right_len as usize);
 
-    Ok(heap.alloc_old_with_roots(
+    Ok(heap.alloc_with_roots(
         JsStringBody {
             id: JsStringId::new(0),
             len: new_len,
@@ -610,7 +607,7 @@ pub fn slice_string_body(
                     FlatContent::Wide(units) => hash_utf16(units),
                 }
             });
-            heap.alloc_old_with_roots(
+            heap.alloc_with_roots(
                 JsStringBody {
                     id: JsStringId::new(0),
                     len: length,
@@ -639,7 +636,7 @@ pub fn slice_string_body(
                     FlatContent::Wide(units) => hash_utf16(units),
                 }
             });
-            heap.alloc_old_with_roots(
+            heap.alloc_with_roots(
                 JsStringBody {
                     id: JsStringId::new(0),
                     len: length,
@@ -1474,6 +1471,150 @@ mod tests {
 
     fn empty_roots(_v: &mut dyn FnMut(*mut RawGc)) {}
 
+    fn is_young(handle: JsStringHandle) -> bool {
+        // SAFETY: each tested handle names a live body in its owning heap.
+        unsafe { (*handle.as_header_ptr()).is_young() }
+    }
+
+    #[test]
+    fn ordinary_string_representations_start_in_young_space() {
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = empty_roots;
+        let inline =
+            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &[0x1234], &mut roots)
+                .expect("inline flat");
+        assert!(is_young(inline));
+
+        let sequential_units = vec![0x1234; INLINE_FLAT_CAP + 1];
+        let sequential = alloc_flat_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            &sequential_units,
+            &mut roots,
+        )
+        .expect("sequential flat");
+        assert!(is_young(sequential));
+
+        let latin1 = alloc_latin1_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            b"latin1",
+            &mut roots,
+        )
+        .expect("inline latin1");
+        assert!(is_young(latin1));
+
+        let sequential_bytes = vec![b'x'; INLINE_LATIN1_CAP + 1];
+        let sequential_latin1 = alloc_latin1_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            &sequential_bytes,
+            &mut roots,
+        )
+        .expect("sequential latin1");
+        assert!(is_young(sequential_latin1));
+    }
+
+    #[test]
+    fn rooted_string_representations_survive_a_minor_collection() {
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = empty_roots;
+        let mut inline_wide = JsStringHandle::null();
+        let mut sequential_wide = JsStringHandle::null();
+        let mut inline_latin1 = JsStringHandle::null();
+        let mut sequential_latin1 = JsStringHandle::null();
+        let mut cons_left = JsStringHandle::null();
+        let mut cons_right = JsStringHandle::null();
+        let mut cons = JsStringHandle::null();
+        let mut sliced = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: every slot precedes the scope and remains stationary until
+        // after the explicit scavenge and all representation checks.
+        unsafe {
+            for slot in [
+                &mut inline_wide,
+                &mut sequential_wide,
+                &mut inline_latin1,
+                &mut sequential_latin1,
+                &mut cons_left,
+                &mut cons_right,
+                &mut cons,
+                &mut sliced,
+            ] {
+                scope.add_raw_slot((slot as *mut JsStringHandle).cast::<RawGc>());
+            }
+        }
+
+        inline_wide =
+            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &[0x1234], &mut roots)
+                .expect("inline wide");
+        let wide_units = vec![0x2345; INLINE_FLAT_CAP + 1];
+        sequential_wide = alloc_flat_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            &wide_units,
+            &mut roots,
+        )
+        .expect("sequential wide");
+        inline_latin1 = alloc_latin1_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            b"latin1",
+            &mut roots,
+        )
+        .expect("inline latin1");
+        let latin1_bytes = vec![b'x'; INLINE_LATIN1_CAP + 1];
+        sequential_latin1 = alloc_latin1_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            &latin1_bytes,
+            &mut roots,
+        )
+        .expect("sequential latin1");
+        cons_left = alloc_latin1_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            b"abcdefghijklmnop",
+            &mut roots,
+        )
+        .expect("cons left");
+        cons_right = alloc_latin1_string_body_with_roots(
+            &mut heap,
+            JsStringId::new(0),
+            b"qrstuvwxyz012345",
+            &mut roots,
+        )
+        .expect("cons right");
+        cons = concat_string_bodies(&mut heap, cons_left, cons_right, &mut roots).expect("cons");
+        sliced =
+            slice_string_body(&mut heap, sequential_latin1, 5, 10, &mut roots).expect("sliced");
+
+        heap.collect_minor_with_roots(&mut roots)
+            .expect("explicit minor collection");
+
+        assert_eq!(to_utf16_vec(&heap, inline_wide), vec![0x1234]);
+        assert_eq!(to_utf16_vec(&heap, sequential_wide), wide_units);
+        assert_eq!(
+            with_latin1(&heap, inline_latin1, |v| v.to_vec()),
+            Some(b"latin1".to_vec())
+        );
+        assert_eq!(
+            with_latin1(&heap, sequential_latin1, |v| v.to_vec()),
+            Some(latin1_bytes)
+        );
+        assert_eq!(
+            to_utf16_vec(&heap, cons),
+            b"abcdefghijklmnopqrstuvwxyz012345"
+                .iter()
+                .map(|&byte| u16::from(byte))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            with_latin1(&heap, sliced, |v| v.to_vec()),
+            Some(vec![b'x'; 10])
+        );
+    }
+
     #[test]
     fn contiguous_repr_tags_match_generated_code_contract() {
         fn tag(repr: &JsStringBodyRepr) -> u8 {
@@ -1535,23 +1676,33 @@ mod tests {
         // long enough that the concatenation stays an unflattened `Cons` rope.
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
+        let mut left = JsStringHandle::null();
+        let mut right = JsStringHandle::null();
+        let mut cons = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all three slots precede the scope and remain stationary.
+        unsafe {
+            scope.add_raw_slot((&mut left as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut right as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut cons as *mut JsStringHandle).cast::<RawGc>());
+        }
         let left_units: Vec<u16> = std::iter::repeat_n(b'a' as u16, 16).collect();
         let right_units: Vec<u16> = std::iter::repeat_n(b'b' as u16, 16).collect();
-        let left = alloc_flat_string_body_with_roots(
+        left = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &left_units,
             &mut roots,
         )
         .expect("left");
-        let right = alloc_flat_string_body_with_roots(
+        right = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &right_units,
             &mut roots,
         )
         .expect("right");
-        let cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
+        cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
         heap.read_payload(cons, |b| {
             assert_eq!(b.len(), 32);
             assert!(matches!(b.repr, JsStringBodyRepr::Cons { .. }));
@@ -1565,11 +1716,18 @@ mod tests {
     fn sliced_view_round_trips() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
+        let mut flat = JsStringHandle::null();
+        let mut view = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: both slots precede the scope and remain stationary.
+        unsafe {
+            scope.add_raw_slot((&mut flat as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut view as *mut JsStringHandle).cast::<RawGc>());
+        }
         let units: Vec<u16> = b"hello world".iter().map(|&b| b as u16).collect();
-        let flat =
-            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &units, &mut roots)
-                .expect("flat");
-        let view = slice_string_body(&mut heap, flat, 6, 5, &mut roots).expect("slice");
+        flat = alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &units, &mut roots)
+            .expect("flat");
+        view = slice_string_body(&mut heap, flat, 6, 5, &mut roots).expect("slice");
         heap.read_payload(view, |b| {
             assert_eq!(b.len(), 5);
             assert!(matches!(b.repr, JsStringBodyRepr::Sliced { .. }));
@@ -1601,11 +1759,19 @@ mod tests {
     fn latin1_slice_is_a_width_preserving_view() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
+        let mut parent = JsStringHandle::null();
+        let mut view = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: both slots precede the scope and remain stationary.
+        unsafe {
+            scope.add_raw_slot((&mut parent as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut view as *mut JsStringHandle).cast::<RawGc>());
+        }
         let bytes = b"0123456789abcdefghijklmnopqrstuvwxyz";
-        let parent =
+        parent =
             alloc_latin1_string_body_with_roots(&mut heap, JsStringId::new(0), bytes, &mut roots)
                 .expect("latin1 parent");
-        let view = slice_string_body(&mut heap, parent, 10, 10, &mut roots).expect("slice");
+        view = slice_string_body(&mut heap, parent, 10, 10, &mut roots).expect("slice");
         heap.read_payload(view, |body| {
             assert_eq!(body.len(), 10);
             assert_eq!(body.hash(), hash_latin1(b"abcdefghij"));
@@ -1637,15 +1803,25 @@ mod tests {
     fn slicing_a_latin1_slice_collapses_to_its_original_parent() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let parent = alloc_latin1_string_body_with_roots(
+        let mut parent = JsStringHandle::null();
+        let mut outer = JsStringHandle::null();
+        let mut inner = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all three slots precede the scope and remain stationary.
+        unsafe {
+            scope.add_raw_slot((&mut parent as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut outer as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut inner as *mut JsStringHandle).cast::<RawGc>());
+        }
+        parent = alloc_latin1_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             b"0123456789abcdefghijklmnopqrstuvwxyz",
             &mut roots,
         )
         .expect("latin1 parent");
-        let outer = slice_string_body(&mut heap, parent, 10, 20, &mut roots).expect("outer");
-        let inner = slice_string_body(&mut heap, outer, 5, 5, &mut roots).expect("inner");
+        outer = slice_string_body(&mut heap, parent, 10, 20, &mut roots).expect("outer");
+        inner = slice_string_body(&mut heap, outer, 5, 5, &mut roots).expect("inner");
         heap.read_payload(inner, |body| {
             assert!(matches!(
                 body.repr,
@@ -1669,22 +1845,34 @@ mod tests {
     fn flatten_realises_cons_into_flat() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let left = alloc_flat_string_body_with_roots(
+        let mut left = JsStringHandle::null();
+        let mut right = JsStringHandle::null();
+        let mut cons = JsStringHandle::null();
+        let mut flat = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all slots precede the scope and remain stationary.
+        unsafe {
+            scope.add_raw_slot((&mut left as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut right as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut cons as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut flat as *mut JsStringHandle).cast::<RawGc>());
+        }
+        left = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &[b'a' as u16, b'b' as u16],
             &mut roots,
         )
         .expect("left");
-        let right = alloc_flat_string_body_with_roots(
+        right = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &[b'c' as u16],
             &mut roots,
         )
         .expect("right");
-        let cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
-        let flat = flatten_string_body(&mut heap, cons, &mut roots).expect("flat");
+        cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
+        flat = flatten_string_body(&mut heap, cons, &mut roots).expect("flat");
         heap.read_payload(flat, |b| {
             assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));
             assert_eq!(b.len(), 3);
@@ -1695,21 +1883,31 @@ mod tests {
     fn equals_string_bodies_short_circuits() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let a = alloc_flat_string_body_with_roots(
+        let mut a = JsStringHandle::null();
+        let mut b = JsStringHandle::null();
+        let mut c = JsStringHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all slots precede the scope and remain stationary.
+        unsafe {
+            scope.add_raw_slot((&mut a as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut b as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut c as *mut JsStringHandle).cast::<RawGc>());
+        }
+        a = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &[1, 2, 3],
             &mut roots,
         )
         .expect("a");
-        let b = alloc_flat_string_body_with_roots(
+        b = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &[1, 2, 3],
             &mut roots,
         )
         .expect("b");
-        let c = alloc_flat_string_body_with_roots(
+        c = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(0),
             &[1, 2, 4],

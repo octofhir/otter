@@ -529,6 +529,35 @@ impl Interpreter {
         self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &[])
     }
 
+    /// Allocate an ordinary object while forwarding caller-owned mutable
+    /// `Value` slots in place.
+    ///
+    /// Unlike the legacy `&[&Value]` helpers, this boundary makes relocation
+    /// explicit in the type: callers that use a pending value after the
+    /// allocation read the collector-rewritten word from the same slice.
+    pub(crate) fn alloc_stack_rooted_object_with_pending_values(
+        &mut self,
+        stack: &ActivationStack,
+        pending: &mut [Value],
+    ) -> Result<crate::object::JsObject, VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let shape_root = self.shape_root();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in pending.iter_mut() {
+                value.trace_value_slot_mut(visitor);
+            }
+        };
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)
+    }
+
     pub(crate) fn alloc_stack_rooted_object_with_value_roots(
         &mut self,
         stack: &ActivationStack,

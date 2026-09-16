@@ -129,6 +129,15 @@ impl Interpreter {
         self.runtime_budget_stats.record_native_call();
     }
 
+    /// Charge one completed RegExp engine attempt to the current root turn.
+    /// The matcher itself is synchronous, so this checkpoint runs immediately
+    /// after it returns and before any result becomes JavaScript-visible.
+    pub(crate) fn charge_regex_backtrack_steps(&mut self, steps: u64) -> Result<(), VmError> {
+        self.runtime_budget_stats
+            .record_regex_backtrack_steps(steps);
+        self.enforce_runtime_budget_checkpoint()
+    }
+
     pub(crate) fn record_runtime_construct_call(&mut self) {
         self.runtime_budget_stats.record_construct_call();
     }

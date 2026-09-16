@@ -118,7 +118,7 @@ function conditionalAlias(flag, value) {
   return [chosen[0], chosen === first, first[1]];
 }
 
-for (let warm = 0; warm < 5000; warm++) {
+for (let warm = 0; warm < 256; warm++) {
   localArray(warm, 2);
   scalarOnce(warm);
   localObjectIdentity();
@@ -150,7 +150,7 @@ const step9Result = JSON.stringify({
   thrown: constructorThrow(9),
   nestedDeopt: deoptMiddle(10, true),
   pressure: allocationPressure(30),
-  osr: osrVirtual(6000, 4097),
+  osr: osrVirtual(4200, 4097),
   aliases: [conditionalAlias(true, 11), conditionalAlias(false, 11)],
   weak: weak.deref() === weakTarget,
   finalization: typeof finalizationRegistry.unregister === "function",

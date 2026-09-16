@@ -1,5 +1,6 @@
 // Split out of `lib.rs` `mod tests`.
 #![allow(unused_imports)]
+use crate::rooting::RootScopeExt;
 use crate::*;
 use otter_bytecode::{
     Constant, Function, Instruction, Op, Operand, SourceKind as BcSourceKind, SpanEntry,
@@ -1300,6 +1301,7 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
         function_source: None,
     };
     let mut interp = Interpreter::new();
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("String")
         .expect("String.prototype")
@@ -1311,7 +1313,11 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
         "slice",
         Value::number_i32(1),
     );
-    let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+    let mut recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: `recv` precedes the scope and remains stationary through module
+    // linking and frame publication.
+    unsafe { roots.add_value(&mut recv) };
 
     let context = interp
         .link_module(module.clone())
@@ -1342,9 +1348,15 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
 #[test]
 fn call_method_string_char_code_at_builtin_fast_path() {
     let mut interp = Interpreter::new();
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
-    let stack = call_char_code_at(&mut interp, recv).expect("charCodeAt should resolve");
+    let stack = call_char_code_at(&mut interp, recv).unwrap_or_else(|error| {
+        panic!(
+            "charCodeAt should resolve: {error:?}, detail={:?}",
+            interp.error_detail()
+        )
+    });
 
     assert_eq!(stack[0].registers[2], Value::number_i32(98));
 }
@@ -1356,13 +1368,19 @@ fn call_method_string_char_code_at_callable_shadow_falls_back() {
     }
 
     let mut interp = Interpreter::new();
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("String")
         .expect("String.prototype")
         .as_object()
         .expect("String.prototype object");
+    let mut proto_root = Value::object(proto);
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: `proto_root` precedes the scope and remains stationary.
+    unsafe { roots.add_value(&mut proto_root) };
     let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
         .expect("replacement");
+    proto = proto_root.as_object().expect("String.prototype root");
     object::set(&mut proto, interp.gc_heap_mut(), "charCodeAt", replacement);
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
@@ -1374,6 +1392,7 @@ fn call_method_string_char_code_at_callable_shadow_falls_back() {
 #[test]
 fn call_method_string_char_code_at_non_callable_shadows_builtin() {
     let mut interp = Interpreter::new();
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("String")
         .expect("String.prototype")
@@ -1393,7 +1412,10 @@ fn call_method_string_char_code_at_non_callable_shadows_builtin() {
     assert!(matches!(err, VmError::NotCallable));
 }
 
-fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<ActivationStack, VmError> {
+fn call_char_code_at(
+    interp: &mut Interpreter,
+    mut recv: Value,
+) -> Result<ActivationStack, VmError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1406,13 +1428,25 @@ fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<Activation
         module_inits: Vec::new(),
         function_source: None,
     };
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: `recv` precedes the scope and remains stationary through module
+    // linking and frame publication.
+    unsafe { roots.add_value(&mut recv) };
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
+    assert!(
+        recv.as_string(interp.gc_heap()).is_some(),
+        "rooted receiver survives module linking"
+    );
     let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
+    assert!(
+        recv.as_string(interp.gc_heap()).is_some(),
+        "rooted receiver survives frame allocation"
+    );
     frame.registers[0] = recv;
     frame.registers[1] = Value::number_i32(1);
     stack.push(frame);
@@ -1507,13 +1541,19 @@ fn call_method_number_to_string_callable_shadow_falls_back() {
     }
 
     let mut interp = Interpreter::new();
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("Number")
         .expect("Number.prototype")
         .as_object()
         .expect("Number.prototype object");
+    let mut proto_root = Value::object(proto);
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: `proto_root` precedes the scope and remains stationary.
+    unsafe { roots.add_value(&mut proto_root) };
     let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
         .expect("replacement");
+    proto = proto_root.as_object().expect("Number.prototype root");
     object::set(&mut proto, interp.gc_heap_mut(), "toString", replacement);
 
     let stack = call_number_to_string(&mut interp, Value::number_i32(42), None)
@@ -3261,6 +3301,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         function_source: None,
     };
     let mut interp = Interpreter::new();
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let proto = interp
         .constructor_prototype_value("String")
         .expect("String.prototype")
@@ -3269,7 +3310,12 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     let mut obj =
         object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("string wrapper");
     object::set_prototype(obj, interp.gc_heap_mut(), Some(proto));
+    let obj_anchor = interp.push_iteration_anchor(Value::object(obj)) - 1;
     let data = JsString::from_str("abc", interp.gc_heap_mut()).expect("string data");
+    obj = interp
+        .iteration_anchor(obj_anchor)
+        .as_object()
+        .expect("rooted string wrapper");
     object::set_string_data(&mut obj, interp.gc_heap_mut(), data);
     object::set(
         &mut obj,
@@ -3277,9 +3323,17 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         "replace",
         Value::number_i32(1),
     );
-    let search = Value::string(JsString::from_str("a", interp.gc_heap_mut()).expect("search"));
-    let repl =
-        native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
+    let mut search = Value::undefined();
+    let mut repl = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+    // SAFETY: both slots precede the scope and remain stationary through
+    // subsequent allocation, module linking, and frame publication.
+    unsafe {
+        roots.add_value(&mut search);
+        roots.add_value(&mut repl);
+    }
+    search = Value::string(JsString::from_str("a", interp.gc_heap_mut()).expect("search"));
+    repl = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
 
     let context = interp
         .link_module(module.clone())
@@ -3288,7 +3342,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
-    frame.registers[0] = Value::object(obj);
+    frame.registers[0] = interp.iteration_anchor(obj_anchor);
     frame.registers[1] = search;
     frame.registers[2] = repl;
     stack.push(frame);
@@ -3309,6 +3363,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         .expect_err("non-callable own String wrapper replace should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
+    interp.pop_iteration_anchors_to(obj_anchor);
 }
 
 #[test]

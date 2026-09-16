@@ -357,18 +357,17 @@ fn is_ws_code_unit(u: u16) -> bool {
 /// so we can release the iterator's borrow on `text_units` before
 /// allocating replacement strings or building result arrays.
 fn collect_regex_matches(
+    ctx: &mut NativeCtx<'_>,
     re: &JsRegExp,
-    gc_heap: &otter_gc::GcHeap,
     text_units: &[u16],
-) -> Vec<crate::regexp::engine::Match> {
-    let mut out = Vec::new();
-    for m in re.find_from_utf16(gc_heap, text_units, 0) {
-        out.push(m);
-        if !re.flags(gc_heap).global {
-            break;
-        }
+) -> Result<Vec<crate::regexp::engine::Match>, NativeError> {
+    let global = re.flags(ctx.heap()).global;
+    let execution = re.find_from_utf16(ctx.heap(), text_units, 0);
+    let mut out = crate::regexp::finish_execution(ctx, execution)?;
+    if !global {
+        out.truncate(1);
     }
-    out
+    Ok(out)
 }
 
 /// `GetSubstitution`-lite: handles `$$`, `$&`, and `$1`–`$9`.
@@ -719,13 +718,28 @@ fn impl_concat(
     // `arg_to_string` helper (primitives + wrapper objects with
     // `[[StringData]]`); plain objects without an inherited
     // `toString` still reject.
-    let recv = receiver_string(ctx, receiver)?;
-    let mut result = recv;
-    for i in 0..args.len() {
-        let piece = arg_to_string(ctx, args, i as u16)?;
-        result = JsString::concat(result, piece, ctx.heap_mut()).map_err(concat_error)?;
-    }
-    Ok(Value::string(result))
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(*receiver);
+        let receiver_value = scope.raw(receiver);
+        let recv = receiver_string(scope.context(), &receiver_value)?;
+        let mut result = scope.value(Value::string(recv));
+        for i in 0..args.len() {
+            let piece = arg_to_string(scope.context(), args, i as u16)?;
+            let piece = scope.value(Value::string(piece));
+            let result_string = scope
+                .raw(result)
+                .as_string(scope.context().heap())
+                .expect("concatenation accumulator is a string");
+            let piece_string = scope
+                .raw(piece)
+                .as_string(scope.context().heap())
+                .expect("ToString result is a string");
+            let joined = JsString::concat(result_string, piece_string, scope.context().heap_mut())
+                .map_err(concat_error)?;
+            result = scope.value(Value::string(joined));
+        }
+        Ok(scope.finish(result))
+    })
 }
 
 fn impl_repeat(
@@ -2010,16 +2024,20 @@ fn impl_replace(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    if let Some(re) = args.first().and_then(|v| v.as_regexp()) {
+    let recv_units = recv.to_utf16_vec(ctx.heap());
+    if args.first().and_then(|v| v.as_regexp()).is_some() {
         let replacement = arg_to_string(ctx, args, 1)?;
         let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
-        return regex_replace(recv, &re, ctx.heap_mut(), &replacement_units);
+        let re = args
+            .first()
+            .and_then(|value| value.as_regexp())
+            .ok_or_else(|| type_error("String.prototype.replace", "RegExp root was lost"))?;
+        return regex_replace(ctx, &recv_units, &re, &replacement_units);
     }
     let needle = arg_to_string(ctx, args, 0)?;
+    let needle_units = needle.to_utf16_vec(ctx.heap());
     let replacement = arg_to_string(ctx, args, 1)?;
-    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
-    let needle_units = needle.to_utf16_vec(ctx.heap_mut());
-    let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
+    let replacement_units = replacement.to_utf16_vec(ctx.heap());
 
     if needle_units.is_empty() {
         let mut buf = Vec::with_capacity(recv_units.len() + replacement_units.len());
@@ -2032,7 +2050,12 @@ fn impl_replace(
     }
     let pos = match find_substr(&recv_units, &needle_units, 0) {
         Some(p) => p,
-        None => return Ok(Value::string(recv)),
+        None => {
+            return Ok(Value::string(JsString::from_utf16_units(
+                &recv_units,
+                ctx.heap_mut(),
+            )?));
+        }
     };
     let mut buf =
         Vec::with_capacity(recv_units.len() - needle_units.len() + replacement_units.len());
@@ -2051,10 +2074,16 @@ fn impl_replace_all(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
-    if let Some(re) = args.first().and_then(|v| v.as_regexp()) {
+    let recv_units = recv.to_utf16_vec(ctx.heap());
+    if args.first().and_then(|v| v.as_regexp()).is_some() {
         // Spec: `replaceAll` requires the `g` flag for regex args.
-        let heap = ctx.heap();
-        if !re.flags(heap).global {
+        if !args
+            .first()
+            .and_then(|value| value.as_regexp())
+            .expect("checked RegExp argument")
+            .flags(ctx.heap())
+            .global
+        {
             return Err(type_error(
                 "String.prototype",
                 "must be a global regular expression",
@@ -2062,13 +2091,16 @@ fn impl_replace_all(
         }
         let replacement = arg_to_string(ctx, args, 1)?;
         let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
-        return regex_replace(recv, &re, ctx.heap_mut(), &replacement_units);
+        let re = args
+            .first()
+            .and_then(|value| value.as_regexp())
+            .ok_or_else(|| type_error("String.prototype.replaceAll", "RegExp root was lost"))?;
+        return regex_replace(ctx, &recv_units, &re, &replacement_units);
     }
     let needle = arg_to_string(ctx, args, 0)?;
+    let needle_units = needle.to_utf16_vec(ctx.heap());
     let replacement = arg_to_string(ctx, args, 1)?;
-    let recv_units = recv.to_utf16_vec(ctx.heap_mut());
-    let needle_units = needle.to_utf16_vec(ctx.heap_mut());
-    let replacement_units = replacement.to_utf16_vec(ctx.heap_mut());
+    let replacement_units = replacement.to_utf16_vec(ctx.heap());
 
     if needle_units.is_empty() {
         // Spec: insert replacement before each unit and at the end.
@@ -2085,7 +2117,10 @@ fn impl_replace_all(
         )?));
     }
     if recv_units.len() < needle_units.len() {
-        return Ok(Value::string(recv));
+        return Ok(Value::string(JsString::from_utf16_units(
+            &recv_units,
+            ctx.heap_mut(),
+        )?));
     }
     let last_start = recv_units.len() - needle_units.len();
     let mut buf = Vec::with_capacity(recv_units.len());
@@ -2275,26 +2310,31 @@ fn parse_split_limit(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<u32, Nat
 }
 
 fn regex_replace(
-    recv: JsString,
+    ctx: &mut NativeCtx<'_>,
+    recv_units: &[u16],
     re: &JsRegExp,
-    gc_heap: &mut otter_gc::GcHeap,
     replacement_template: &[u16],
 ) -> Result<Value, NativeError> {
-    let recv_units = recv.to_utf16_vec(gc_heap);
-    let matches = collect_regex_matches(re, gc_heap, &recv_units);
+    let matches = collect_regex_matches(ctx, re, recv_units)?;
     if matches.is_empty() {
-        return Ok(Value::string(recv));
+        return Ok(Value::string(JsString::from_utf16_units(
+            recv_units,
+            ctx.heap_mut(),
+        )?));
     }
     let mut buf = Vec::with_capacity(recv_units.len());
     let mut cursor = 0;
     for m in &matches {
         buf.extend_from_slice(&recv_units[cursor..m.range.start]);
-        let rendered = apply_substitution(replacement_template, &recv_units, m);
+        let rendered = apply_substitution(replacement_template, recv_units, m);
         buf.extend_from_slice(&rendered);
         cursor = m.range.end;
     }
     buf.extend_from_slice(&recv_units[cursor..]);
-    Ok(Value::string(JsString::from_utf16_units(&buf, gc_heap)?))
+    Ok(Value::string(JsString::from_utf16_units(
+        &buf,
+        ctx.heap_mut(),
+    )?))
 }
 
 fn regex_split(
@@ -2313,7 +2353,8 @@ fn regex_split(
     let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     let mut out: Vec<Value> = Vec::new();
     let mut cursor: usize = 0;
-    let mut iter = re.find_from_utf16(ctx.heap(), &recv_units, 0).into_iter();
+    let execution = re.find_from_utf16(ctx.heap(), &recv_units, 0);
+    let mut iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
     while (out.len() as u32) < limit {
         let m = match iter.next() {
             Some(m) => m,
@@ -2329,9 +2370,8 @@ fn regex_split(
             // Drop the iterator and resume after the cursor advance.
             drop(iter);
             cursor += 1;
-            iter = re
-                .find_from_utf16(ctx.heap(), &recv_units, cursor)
-                .into_iter();
+            let execution = re.find_from_utf16(ctx.heap(), &recv_units, cursor);
+            iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
             continue;
         }
         let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], ctx.heap_mut())?;
@@ -2994,6 +3034,7 @@ string_prototype_methods!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rooting::RootScopeExt;
     use crate::{Interpreter, NativeCallInfo};
 
     /// Drive a builtin string method with a string receiver. Argument inputs
@@ -3002,14 +3043,22 @@ mod tests {
     /// to keep the existing test cases readable.
     fn call(method: &str, recv: &str, args: &[&str]) -> String {
         let mut interp = Interpreter::new();
-        let recv_v = Value::string(JsString::from_str(recv, interp.gc_heap_mut()).unwrap());
-        let arg_vs: Vec<Value> = args
-            .iter()
-            .map(|s| match s.parse::<i32>() {
+        let mut recv_v = Value::undefined();
+        let mut arg_vs: Vec<Value> = Vec::with_capacity(args.len());
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary through
+        // argument construction and native invocation.
+        unsafe {
+            roots.add_value(&mut recv_v);
+            roots.add_value_vec(&mut arg_vs);
+        }
+        recv_v = Value::string(JsString::from_str(recv, interp.gc_heap_mut()).unwrap());
+        for input in args {
+            arg_vs.push(match input.parse::<i32>() {
                 Ok(n) => Value::number(NumberValue::from_i32(n)),
-                Err(_) => Value::string(JsString::from_str(s, interp.gc_heap_mut()).unwrap()),
-            })
-            .collect();
+                Err(_) => Value::string(JsString::from_str(input, interp.gc_heap_mut()).unwrap()),
+            });
+        }
         let impl_fn = intrinsic_impl(method).unwrap();
         let result =
             NativeCtx::with_host_context(&mut interp, NativeCallInfo::call(recv_v), None, |ctx| {
@@ -3025,8 +3074,17 @@ mod tests {
         interp: &mut Interpreter,
     ) -> Result<Value, NativeError> {
         let impl_fn = intrinsic_impl(method).unwrap();
-        NativeCtx::with_host_context(interp, NativeCallInfo::call(*receiver), None, |ctx| {
-            impl_fn(ctx, receiver, args)
+        let mut receiver_root = *receiver;
+        let mut args_root = args.to_vec();
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary through
+        // the complete native invocation.
+        unsafe {
+            roots.add_value(&mut receiver_root);
+            roots.add_value_vec(&mut args_root);
+        }
+        NativeCtx::with_host_context(interp, NativeCallInfo::call(receiver_root), None, |ctx| {
+            impl_fn(ctx, &receiver_root, &args_root)
         })
     }
 
@@ -3095,14 +3153,22 @@ mod tests {
     }
 
     fn call_v_with_interp(method: &str, recv: &str, args: &[A], interp: &mut Interpreter) -> Value {
-        let recv_v = Value::string(JsString::from_str(recv, interp.gc_heap_mut()).unwrap());
-        let arg_vs: Vec<Value> = args
-            .iter()
-            .map(|a| match a {
+        let mut recv_v = Value::undefined();
+        let mut arg_vs: Vec<Value> = Vec::with_capacity(args.len());
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary through
+        // argument construction and invocation.
+        unsafe {
+            roots.add_value(&mut recv_v);
+            roots.add_value_vec(&mut arg_vs);
+        }
+        recv_v = Value::string(JsString::from_str(recv, interp.gc_heap_mut()).unwrap());
+        for arg in args {
+            arg_vs.push(match arg {
                 A::N(n) => Value::number(NumberValue::from_i32(*n)),
                 A::S(s) => Value::string(JsString::from_str(s, interp.gc_heap_mut()).unwrap()),
-            })
-            .collect();
+            });
+        }
         invoke_raw(method, &recv_v, &arg_vs, interp).unwrap()
     }
 

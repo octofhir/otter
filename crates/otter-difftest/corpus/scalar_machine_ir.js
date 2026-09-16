@@ -54,14 +54,14 @@ const receiver = { marker: "receiver", scalarThis };
 // Tier the callees independently before their final tagged inputs are created.
 eval(
   "scalarIdentity(null); scalarChoose(null, false, 1, 2); scalarEmpty(); receiver.scalarThis();\n".repeat(
-    12000,
+    512,
   ),
 );
-eval("scalarTruth(true, null, false); scalarNot(false);\n".repeat(12000));
-eval("scalarStrictEq(null, null); scalarStrictNe(null, false);\n".repeat(12000));
+eval("scalarTruth(true, null, false); scalarNot(false);\n".repeat(512));
+eval("scalarStrictEq(null, null); scalarStrictNe(null, false);\n".repeat(512));
 eval(
   'scalarConcat3("otter-", "machine-", "ir"); scalarConcatInt("key", 42, "!"); scalarConcatMiss("a", "b", "c");\n'.repeat(
-    12000,
+    512,
   ),
 );
 

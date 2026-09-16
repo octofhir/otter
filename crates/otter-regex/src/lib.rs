@@ -43,5 +43,5 @@ mod unicode;
 
 pub use api::{Match, Matches, NamedGroups, Regex};
 pub use error::{ExecError, RegexError};
-pub use exec::ExecConfig;
+pub use exec::{DEFAULT_STEP_LIMIT, ExecConfig};
 pub use flags::Flags;

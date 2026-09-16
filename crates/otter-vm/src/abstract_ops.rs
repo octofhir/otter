@@ -737,6 +737,7 @@ fn to_numeric_for_compare(value: &Value, heap: &otter_gc::GcHeap) -> Option<Nume
 mod tests {
     use super::*;
     use crate::number::NumberValue;
+    use crate::rooting::RootScopeExt;
     use crate::string::JsString;
 
     fn n(v: f64) -> Value {
@@ -777,9 +778,19 @@ mod tests {
     #[test]
     fn strings_compare_by_content() {
         let mut heap = fresh_heap();
-        let hi1 = s("hi", &mut heap);
-        let hi2 = s("hi", &mut heap);
-        let bye = s("bye", &mut heap);
+        let mut hi1 = Value::undefined();
+        let mut hi2 = Value::undefined();
+        let mut bye = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_value(&mut hi1);
+            roots.add_value(&mut hi2);
+            roots.add_value(&mut bye);
+        }
+        hi1 = s("hi", &mut heap);
+        hi2 = s("hi", &mut heap);
+        bye = s("bye", &mut heap);
         assert!(same_value(&hi1, &hi2, &heap));
         assert!(!same_value(&hi1, &bye, &heap));
     }

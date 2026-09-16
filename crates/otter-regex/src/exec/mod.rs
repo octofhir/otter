@@ -1,8 +1,7 @@
-//! Execution layer: the bounded-backtracking matcher and its per-execution
-//! config.
+//! Execution layer: the bounded-backtracking matcher and its per-search config.
 //!
 //! # Contents
-//! - [`ExecConfig`] — the ReDoS step budget for one match attempt.
+//! - [`ExecConfig`] — the ReDoS step budget for one search.
 //! - [`backtrack`] — the matcher backend; every ECMAScript feature is matched
 //!   here, with a step budget bounding catastrophic backtracking.
 //!
@@ -16,15 +15,24 @@
 
 pub(crate) mod backtrack;
 
-/// Per-execution tuning for a single match attempt.
+/// Default maximum number of explored backtrack points per search.
 ///
-/// The default is unbounded (no ReDoS guard); hosts running untrusted patterns
-/// should set a [`step_limit`](ExecConfig::step_limit).
-#[derive(Debug, Clone, Copy, Default)]
+/// The checked-in adversarial corpus reaches this ceiling while the ordinary
+/// matching suite stays below it. Hosts may lower the bound, but no public
+/// execution path is unbounded.
+pub const DEFAULT_STEP_LIMIT: u64 = 1_000_000;
+
+/// Per-execution tuning for one search, shared across all candidate starts.
+#[derive(Debug, Clone, Copy)]
 pub struct ExecConfig {
-    /// Maximum number of backtrack points one match attempt may explore. `None`
-    /// means unbounded. A budget around `10_000_000` cuts pathological
-    /// backtracking within milliseconds while leaving realistic patterns
-    /// untouched.
-    pub step_limit: Option<u64>,
+    /// Maximum number of backtrack points the complete search may explore.
+    pub step_limit: u64,
+}
+
+impl Default for ExecConfig {
+    fn default() -> Self {
+        Self {
+            step_limit: DEFAULT_STEP_LIMIT,
+        }
+    }
 }

@@ -46,6 +46,7 @@ use crate::native_abi::{
     STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
     TaggedLocationKind, validate_stub_descriptor,
 };
+use crate::rooting::RootScopeExt;
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
 
@@ -2037,19 +2038,6 @@ fn string_concat_alloc_inner(
     let Some(interp) = alloc_interpreter_mut(ctx) else {
         return NativeResultPair::miss();
     };
-    // One-allocation fast path for `<short flat latin1 string> + <int32>` and
-    // its mirror — the common key-building shape (`"k" + n`), skipping the
-    // general path's number-string / cons-rope / flatten allocations. Shared
-    // with the interpreter's `Op::Add` string path.
-    if let Some(fast) = interp.try_concat_string_int32(
-        Value::from_abi_bits(lhs_bits),
-        Value::from_abi_bits(rhs_bits),
-    ) {
-        return match fast {
-            Ok(value) => NativeResultPair::success(value),
-            Err(_) => NativeResultPair::out_of_memory(),
-        };
-    }
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
     let Ok(roots) = (unsafe {
@@ -2069,6 +2057,26 @@ fn string_concat_alloc_inner(
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     (|| {
+        // One-allocation fast path for `<short flat latin1 string> + <int32>`
+        // and its mirror. It must run only after the generated frame slots are
+        // published: the result allocation may scavenge either string operand.
+        let lhs = roots.value(0);
+        let rhs = roots.value(1);
+        if let Some(fast) = interp.try_concat_string_int32(lhs, rhs) {
+            return match fast {
+                Ok(value) => NativeResultPair::success(value),
+                Err(_) => NativeResultPair::out_of_memory(),
+            };
+        }
+        let mut lhs_string_root = Value::undefined();
+        let mut rhs_string_root = Value::undefined();
+        let mut string_roots = otter_gc::RootScope::new(&mut interp.gc_heap);
+        // SAFETY: both slots precede the scope and remain stationary through
+        // coercion, which can allocate, and the final rope allocation.
+        unsafe {
+            string_roots.add_value(&mut lhs_string_root);
+            string_roots.add_value(&mut rhs_string_root);
+        }
         let lhs = roots.value(0);
         let rhs = roots.value(1);
         if lhs.as_string(&interp.gc_heap).is_none() && rhs.as_string(&interp.gc_heap).is_none() {
@@ -2081,6 +2089,10 @@ fn string_concat_alloc_inner(
         }) else {
             return NativeResultPair::miss();
         };
+        lhs_string_root = Value::string(lhs_string);
+        // The left conversion may scavenge. Reload the right ABI operand from
+        // its published safepoint slot before inspecting or converting it.
+        let rhs = roots.value(1);
         let Ok(rhs_string) = (if let Some(string) = rhs.as_string(&interp.gc_heap) {
             Ok(string)
         } else {
@@ -2088,6 +2100,13 @@ fn string_concat_alloc_inner(
         }) else {
             return NativeResultPair::miss();
         };
+        rhs_string_root = Value::string(rhs_string);
+        let lhs_string = lhs_string_root
+            .as_string(&interp.gc_heap)
+            .expect("rooted concat lhs is a string");
+        let rhs_string = rhs_string_root
+            .as_string(&interp.gc_heap)
+            .expect("rooted concat rhs is a string");
         match crate::string::JsString::concat(lhs_string, rhs_string, &mut interp.gc_heap) {
             Ok(result) => NativeResultPair::success(Value::string(result)),
             // The generated caller owns the exact source FrameState. A logical
@@ -2897,6 +2916,31 @@ mod tests {
         let value = probe_value(pair).expect("string");
         let string = value.as_string(interp.gc_heap()).expect("string value");
         assert_eq!(string.to_lossy_string(interp.gc_heap()), "k7");
+
+        slots[1] = Value::boolean(true).to_abi_bits();
+        let pair = STRING_CONCAT_ALLOC
+            .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let string = probe_value(pair)
+            .and_then(|value| value.as_string(interp.gc_heap()))
+            .expect("string value");
+        assert_eq!(string.to_lossy_string(interp.gc_heap()), "ktrue");
+
+        // The left conversion allocates before the generated-stub boundary
+        // reads the right string. The right operand must be reloaded from the
+        // safepoint slot after that scavenge.
+        let lhs_bits = slots[0];
+        slots[0] = Value::boolean(false).to_abi_bits();
+        slots[1] = lhs_bits;
+        let pair = STRING_CONCAT_ALLOC
+            .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
+            .expect("entry");
+        assert_eq!(probe_status(pair), NativeResultStatus::Success);
+        let string = probe_value(pair)
+            .and_then(|value| value.as_string(interp.gc_heap()))
+            .expect("string value");
+        assert_eq!(string.to_lossy_string(interp.gc_heap()), "falsek");
 
         let pair = STRING_CONCAT_ALLOC
             .invoke_raw(

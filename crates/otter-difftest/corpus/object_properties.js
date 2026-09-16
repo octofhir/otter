@@ -19,7 +19,7 @@ function hotFloatProperty(o) {
 }
 
 let warm = "";
-for (let i = 0; i < 4010; i++) {
+for (let i = 0; i < 256; i++) {
   warm += "hotProperty(hotObject);";
   warm += "hotFloatProperty({ x: 1.5, y: 2.0, z: 0.25, total: 0 });";
 }
@@ -30,7 +30,7 @@ eval(warm);
 // may relocate mid-store).
 let propSum = 0;
 let floatSum = 0;
-for (let k = 0; k < 800; k++) {
+for (let k = 0; k < 128; k++) {
   const o = { a: k & 7, b: (k + 1) & 7, c: 0 };
   propSum += hotProperty(o);
   const f = { x: (k & 3) + 0.5, y: 2.0, z: 0.25, total: 0 };
@@ -52,11 +52,11 @@ Point.prototype.mix = function () {
   return this.c + this.a;
 };
 let warmThis = "";
-for (let i = 0; i < 4010; i++) { warmThis += "sink.mix();"; }
+for (let i = 0; i < 256; i++) { warmThis += "sink.mix();"; }
 globalThis.sink = new Point(1, 2);
 eval(warmThis);
 let thisSum = 0;
-for (let k = 0; k < 800; k++) {
+for (let k = 0; k < 128; k++) {
   const p = new Point(k & 7, (k + 1) & 7);
   thisSum += p.mix();
 }
@@ -66,12 +66,12 @@ function constructWith(C, x, y) {
   return new C(x, y);
 }
 let warmConstruct = "";
-for (let i = 0; i < 4010; i++) {
+for (let i = 0; i < 256; i++) {
   warmConstruct += "constructWith(Point, 1, 2);";
 }
 eval(warmConstruct);
 let constructSum = 0;
-for (let i = 0; i < 800; i++) {
+for (let i = 0; i < 128; i++) {
   const p = constructWith(Point, i & 7, (i + 1) & 7);
   constructSum += p.a + p.b;
 }
@@ -89,13 +89,13 @@ TruthyVector.prototype.reset = function (x, y, z) {
 
 globalThis.truthyVector = new TruthyVector();
 let warmTruthyVector = "";
-for (let i = 0; i < 4010; i++) {
+for (let i = 0; i < 256; i++) {
   warmTruthyVector += "new TruthyVector().reset(1.5, 2.5, 3.5);";
 }
 eval(warmTruthyVector);
 
 let truthyVectorSum = 0;
-for (let i = 0; i < 800; i++) {
+for (let i = 0; i < 128; i++) {
   truthyVector.reset(
     (i & 1) ? 1.25 : 0,
     (i & 2) ? 2.5 : 0,

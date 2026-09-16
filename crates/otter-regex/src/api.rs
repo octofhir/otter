@@ -96,6 +96,7 @@ impl Regex {
             next_start: start,
             config,
             done: false,
+            steps_executed: 0,
             scratch: backtrack::Scratch::new(),
         }
     }
@@ -141,8 +142,8 @@ enum Scan<'p> {
 /// Iterator over successive matches of a [`Regex`] in a UTF-16 subject.
 ///
 /// Mirrors the host's existing consumption: it collects `Result<Match,
-/// ExecError>` and stops on the first error (the host then surfaces "no match"
-/// and moves on, per the ReDoS contract).
+/// ExecError>` and stops on the first error. The host preserves that error as
+/// resource exhaustion rather than converting it into a semantic no-match.
 #[derive(Debug)]
 pub struct Matches<'r, 't> {
     regex: &'r Regex,
@@ -150,7 +151,16 @@ pub struct Matches<'r, 't> {
     next_start: usize,
     config: ExecConfig,
     done: bool,
+    steps_executed: u64,
     scratch: backtrack::Scratch,
+}
+
+impl Matches<'_, '_> {
+    /// Number of backtrack points explored by this search so far.
+    #[must_use]
+    pub fn steps_executed(&self) -> u64 {
+        self.steps_executed
+    }
 }
 
 impl Iterator for Matches<'_, '_> {
@@ -235,13 +245,18 @@ impl Iterator for Matches<'_, '_> {
                 self.done = true;
                 return None;
             }
-            match backtrack::attempt(
+            let remaining = self.config.step_limit.saturating_sub(self.steps_executed);
+            let (attempt, steps) = backtrack::attempt(
                 &self.regex.program,
                 &input,
                 pos,
-                self.config,
+                ExecConfig {
+                    step_limit: remaining,
+                },
                 &mut self.scratch,
-            ) {
+            );
+            self.steps_executed = self.steps_executed.saturating_add(steps);
+            match attempt {
                 Err(e) => {
                     self.done = true;
                     return Some(Err(e));

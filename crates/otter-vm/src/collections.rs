@@ -2028,6 +2028,7 @@ where
 mod tests {
     use super::*;
     use crate::number::NumberValue;
+    use crate::rooting::RootScopeExt;
 
     fn n(i: i32) -> Value {
         Value::number(NumberValue::from_i32(i))
@@ -2083,35 +2084,61 @@ mod tests {
         // collide as Map keys (SameValueZero). Regression for the
         // Phase B handle-identity equality bug.
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        let m = alloc_map(&mut heap).unwrap();
-        let a = crate::string::JsString::from_str("hello", &mut heap).unwrap();
-        let b = crate::string::JsString::from_str("hello", &mut heap).unwrap();
-        assert_ne!(a.handle(), b.handle(), "test setup: handles must differ");
+        let mut m = JsMap::null();
+        let mut a = Value::undefined();
+        let mut b = Value::undefined();
+        let mut c = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_raw_slot((&mut m as *mut JsMap).cast::<RawGc>());
+            roots.add_value(&mut a);
+            roots.add_value(&mut b);
+            roots.add_value(&mut c);
+        }
+        m = alloc_map(&mut heap).unwrap();
+        a = Value::string(crate::string::JsString::from_str("hello", &mut heap).unwrap());
+        b = Value::string(crate::string::JsString::from_str("hello", &mut heap).unwrap());
+        assert_ne!(
+            a.as_string(&heap).expect("string a").handle(),
+            b.as_string(&heap).expect("string b").handle(),
+            "test setup: handles must differ"
+        );
 
-        map_set(m, &mut heap, Value::string(a), n(1)).unwrap();
-        assert!(map_has(m, &heap, &Value::string(b)));
-        assert_eq!(map_get(m, &heap, &Value::string(b)), Some(n(1)));
+        map_set(m, &mut heap, a, n(1)).unwrap();
+        assert!(map_has(m, &heap, &b));
+        assert_eq!(map_get(m, &heap, &b), Some(n(1)));
 
         // Update should hit the existing slot, not append.
-        map_set(m, &mut heap, Value::string(b), n(2)).unwrap();
+        map_set(m, &mut heap, b, n(2)).unwrap();
         assert_eq!(map_len(m, &heap), 1);
-        assert_eq!(map_get(m, &heap, &Value::string(a)), Some(n(2)));
+        assert_eq!(map_get(m, &heap, &a), Some(n(2)));
 
         // Mismatched content stays distinct.
-        let c = crate::string::JsString::from_str("world", &mut heap).unwrap();
-        assert!(!map_has(m, &heap, &Value::string(c)));
+        c = Value::string(crate::string::JsString::from_str("world", &mut heap).unwrap());
+        assert!(!map_has(m, &heap, &c));
     }
 
     #[test]
     fn set_string_keys_compare_by_content() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        let s = alloc_set(&mut heap).unwrap();
-        let a = crate::string::JsString::from_str("k", &mut heap).unwrap();
-        let b = crate::string::JsString::from_str("k", &mut heap).unwrap();
-        set_add(s, &mut heap, Value::string(a)).unwrap();
-        set_add(s, &mut heap, Value::string(b)).unwrap();
+        let mut s = JsSet::null();
+        let mut a = Value::undefined();
+        let mut b = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: all slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_raw_slot((&mut s as *mut JsSet).cast::<RawGc>());
+            roots.add_value(&mut a);
+            roots.add_value(&mut b);
+        }
+        s = alloc_set(&mut heap).unwrap();
+        a = Value::string(crate::string::JsString::from_str("k", &mut heap).unwrap());
+        b = Value::string(crate::string::JsString::from_str("k", &mut heap).unwrap());
+        set_add(s, &mut heap, a).unwrap();
+        set_add(s, &mut heap, b).unwrap();
         assert_eq!(set_len(s, &heap), 1);
-        assert!(set_has(s, &heap, &Value::string(b)));
+        assert!(set_has(s, &heap, &b));
     }
 
     #[test]
@@ -2302,8 +2329,16 @@ mod tests {
     #[test]
     fn map_string_keys() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let m = alloc_map(&mut gc_heap).unwrap();
-        let key = Value::string(JsString::from_str("k", &mut gc_heap).unwrap());
+        let mut m = JsMap::null();
+        let mut key = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut gc_heap);
+        // SAFETY: both slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_raw_slot((&mut m as *mut JsMap).cast::<RawGc>());
+            roots.add_value(&mut key);
+        }
+        m = alloc_map(&mut gc_heap).unwrap();
+        key = Value::string(JsString::from_str("k", &mut gc_heap).unwrap());
         map_set(m, &mut gc_heap, key, n(1)).unwrap();
         assert_eq!(map_get(m, &gc_heap, &key), Some(n(1)),);
     }

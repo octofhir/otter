@@ -42,7 +42,13 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 /// [`compile`](engine::compile), [`find`](engine::find)). The dependency edge is
 /// one-way: the VM consumes the engine; the engine never reaches back into it.
 pub(crate) mod engine {
-    pub use otter_regex::{Match, Regex};
+    pub use otter_regex::{ExecError, Match, Regex};
+
+    /// One matcher result plus the exact work charged to the VM ledger.
+    pub(crate) struct Execution<T> {
+        pub(crate) result: Result<T, ExecError>,
+        pub(crate) steps: u64,
+    }
 
     /// Compile a pattern (lossy UTF-8 view) under the engine-relevant flags.
     /// `g`/`y`/`d` are spec state above the matcher and are not passed here.
@@ -67,38 +73,38 @@ pub(crate) mod engine {
         Regex::compile_utf16(pattern_utf16, flags).map_err(|e| format!("{e}"))
     }
 
-    /// Collect every successful match from `start`, dropping a step-budget
-    /// abort as "no further matches" (the ReDoS contract).
-    pub(crate) fn find(re: &Regex, text: &[u16], start: usize, budget: u64) -> Vec<Match> {
-        let config = otter_regex::ExecConfig {
-            step_limit: Some(budget),
+    /// Collect every successful match from `start` with exact work accounting.
+    pub(crate) fn find(re: &Regex, text: &[u16], start: usize) -> Execution<Vec<Match>> {
+        let mut matches =
+            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig::default());
+        let mut found = Vec::new();
+        let result = loop {
+            match matches.next() {
+                Some(Ok(matched)) => found.push(matched),
+                Some(Err(error)) => break Err(error),
+                None => break Ok(found),
+            }
         };
-        re.find_from_utf16_with_config(text, start, config)
-            .map_while(Result::ok)
-            .collect()
+        Execution {
+            result,
+            steps: matches.steps_executed(),
+        }
     }
 
     /// Find only the first match from `start` — the single-match path for
     /// `exec`/`test`. The iterator is lazy, so this computes one match instead
-    /// of the whole remaining set. A step-budget abort yields `None`.
-    pub(crate) fn find_one(re: &Regex, text: &[u16], start: usize, budget: u64) -> Option<Match> {
-        let config = otter_regex::ExecConfig {
-            step_limit: Some(budget),
-        };
-        re.find_from_utf16_with_config(text, start, config)
-            .next()
-            .and_then(Result::ok)
+    /// of the whole remaining set. Budget exhaustion remains an explicit
+    /// resource error for the VM boundary to surface.
+    pub(crate) fn find_one(re: &Regex, text: &[u16], start: usize) -> Execution<Option<Match>> {
+        let mut matches =
+            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig::default());
+        let result = matches.next().transpose();
+        Execution {
+            result,
+            steps: matches.steps_executed(),
+        }
     }
 }
-
-/// ReDoS guard for every matcher execution. Cuts pathological backtracking
-/// patterns (`(a+)+b` against long inputs, nested alternation explosions) at a
-/// fixed step budget. `10_000_000` aborts runaway inputs within a few
-/// milliseconds while leaving realistic patterns untouched.
-///
-/// # See also
-/// - <https://en.wikipedia.org/wiki/ReDoS>
-pub const REGEX_BACKTRACK_BUDGET: u64 = 10_000_000;
 
 /// Per-isolate cache of compiled regex programs.
 ///
@@ -180,6 +186,20 @@ impl RegexCompileCache {
 
 use crate::Value;
 use crate::number::NumberValue;
+
+/// Charge one matcher execution to the runtime ledger and retain finite-engine
+/// exhaustion as the VM's structural resource error.
+pub(crate) fn finish_execution<T>(
+    ctx: &mut crate::NativeCtx<'_>,
+    execution: engine::Execution<T>,
+) -> Result<T, crate::NativeError> {
+    ctx.charge_regex_backtrack_steps(execution.steps)?;
+    execution
+        .result
+        .map_err(|_| crate::NativeError::BudgetExceeded {
+            reason: "regular expression backtrack budget exceeded".to_string(),
+        })
+}
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
 pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
@@ -541,34 +561,29 @@ impl JsRegExp {
     /// advances `lastIndex`, so a `/g` loop calls this once per match; using the
     /// collecting [`Self::find_from_utf16`] there is quadratic (each call would
     /// re-find every remaining match and discard all but the first). Step-limit
-    /// aborts surface as `None`, matching "no match at this position".
-    #[must_use]
-    pub fn find_one_from_utf16(
+    /// aborts remain explicit so the runtime can surface one resource error.
+    pub(crate) fn find_one_from_utf16(
         &self,
         heap: &otter_gc::GcHeap,
         text_units: &[u16],
         start: usize,
-    ) -> Option<engine::Match> {
+    ) -> engine::Execution<Option<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find_one(&body.regex, text_units, start, REGEX_BACKTRACK_BUDGET)
+            engine::find_one(&body.regex, text_units, start)
         })
     }
 
     /// Run the compiled engine from a UTF-16 offset and collect
-    /// owned matches. Bounded by [`REGEX_BACKTRACK_BUDGET`] so
-    /// pathological ReDoS patterns abort with no matches instead of
-    /// stalling the interpreter. Step-limit aborts surface as an
-    /// empty match list — the spec-visible behaviour matches
-    /// "no match at this position" while letting the caller move on.
-    #[must_use]
-    pub fn find_from_utf16(
+    /// owned matches. The standalone engine's finite default bounds the scan;
+    /// the returned work count is charged at the runtime boundary.
+    pub(crate) fn find_from_utf16(
         &self,
         heap: &otter_gc::GcHeap,
         text_units: &[u16],
         start: usize,
-    ) -> Vec<engine::Match> {
+    ) -> engine::Execution<Vec<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find(&body.regex, text_units, start, REGEX_BACKTRACK_BUDGET)
+            engine::find(&body.regex, text_units, start)
         })
     }
 
@@ -795,6 +810,8 @@ mod tests {
         let utf16: Vec<u16> = "abbbcXabbbbc".encode_utf16().collect();
         let m = r
             .find_from_utf16(&heap, &utf16, 0)
+            .result
+            .expect("within matcher budget")
             .into_iter()
             .next()
             .unwrap();

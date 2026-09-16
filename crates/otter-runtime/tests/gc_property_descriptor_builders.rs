@@ -5,6 +5,7 @@
 //! - `Reflect.getOwnPropertyDescriptor` data and accessor results.
 //! - Native-function partial updates and built-in metadata descriptors.
 //! - Proxy observability and exact abrupt propagation during descriptor reads.
+//! - Object-spread descriptor targets surviving own-key string allocation.
 //!
 //! # Invariants
 //! - Proxy trap descriptor objects preserve exactly the optional fields and
@@ -15,6 +16,8 @@
 //!   inherit omitted enumerable/configurable attributes.
 //! - Key coercion precedes the Proxy `getOwnPropertyDescriptor` trap, while an
 //!   invalid target prevents coercion and Proxy abrupt values escape unchanged.
+//! - `CopyDataProperties` parks target and source before `[[OwnPropertyKeys]]`
+//!   materializes moving string keys.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -132,6 +135,30 @@ fn proxy_partial_descriptor_survives_each_field_write() {
         probe(73);
         "#,
         "<gc-partial-property-descriptor>",
+        "true",
+    );
+}
+
+#[test]
+fn object_spread_parks_descriptor_target_before_key_allocation() {
+    assert_interpreter_and_template(
+        r#"
+        const attributes = {
+            writable: true,
+            enumerable: false,
+            configurable: true
+        };
+        const descriptor = {
+            __proto__: null,
+            ...attributes,
+            value: 73
+        };
+        descriptor.writable === true &&
+            descriptor.enumerable === false &&
+            descriptor.configurable === true &&
+            descriptor.value === 73;
+        "#,
+        "<gc-object-spread-descriptor-target>",
         "true",
     );
 }

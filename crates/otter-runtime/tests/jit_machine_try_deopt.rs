@@ -12,8 +12,6 @@
 //!   invents an exception value owned by the interpreter.
 //! - Loop-header OSR inside an active exception region remains disabled.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitDebugTarget, JitDebugTier, JitSelection, Runtime,
     SourceInput,

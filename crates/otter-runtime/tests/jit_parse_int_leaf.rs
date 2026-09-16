@@ -14,8 +14,6 @@
 //! - Generated code names the one shared runtime-stub declaration rather than
 //!   a backend-private parse operation.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDebugTier,
     JitSelection, Runtime, SourceInput,
@@ -24,19 +22,27 @@ use otter_vm::{JitStaticNativeCallLoweringOutcome, JitStaticNativeCallLoweringRe
 
 const SEMANTIC_MATRIX: &str = r#"
 function parseIdentity(value) {
-  return parseInt(value);
+  let result = parseInt(value);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 function parseStringMiss(value) {
-  return parseInt(value);
+  let result = parseInt(value);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 function parseDoubleMiss(value) {
-  return parseInt(value);
+  let result = parseInt(value);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 function parseObjectMiss(value) {
-  return parseInt(value);
+  let result = parseInt(value);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 for (let warm = 0; warm < 5000; warm++) {
@@ -74,7 +80,9 @@ const bootstrapParseInt = parseInt;
 const numberSharesIdentity = Number.parseInt === bootstrapParseInt;
 
 function parseGlobal(value) {
-  return parseInt(value);
+  let result = parseInt(value);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 for (let warm = 0; warm < 5000; warm++) {
@@ -98,11 +106,15 @@ JSON.stringify({
 
 const ARTIFACT_FIXTURE: &str = r#"
 function parseIntLeafHot(value) {
-  return parseInt(value);
+  let result = parseInt(value);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 function parseIntExplicitRadix(value, radix) {
-  return parseInt(value, radix);
+  let result = parseInt(value, radix);
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 for (let warm = 0; warm < 5000; warm++) {
@@ -269,7 +281,8 @@ const absolute = Math.abs;
 const floor = Math.floor;
 const squareRoot = Math.sqrt;
 function leafPressure(value, a, b, c, d, e, f, g, object) {
-  const parsed = parseInt(value);
+  let parsed = parseInt(value);
+  for (let index = 0; index < 16; index++) parsed += 0;
   return parsed + maximum(a | 0, b | 0) + minimum(c | 0, d | 0) + absolute(e | 0)
       + floor(f) + squareRoot(g) + object.offset;
 }

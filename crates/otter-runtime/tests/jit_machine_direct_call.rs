@@ -24,8 +24,6 @@
 //! # See also
 //! - `crates/otter-jit/src/machine/numeric` for call selection and emission.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
@@ -1093,6 +1091,7 @@ fn base_construct_executes_through_machine_ir() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn default_base_construct_uses_non_reentrant_receiver_preparation_in_both_tiers() {
     let oracle = run(
         DEFAULT_BASE_CONSTRUCT,
@@ -1120,6 +1119,7 @@ fn default_base_construct_uses_non_reentrant_receiver_preparation_in_both_tiers(
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
     let oracle = run(
         SIMPLE_SHAPED_CONSTRUCT_FAMILY,
@@ -1181,6 +1181,7 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
     let production = run(
         GENERATED_RECEIVER_ALLOCATION,
@@ -1239,6 +1240,7 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn inherited_setter_prevents_constructor_preshape_without_losing_effects() {
     let oracle = run(
         SIMPLE_SHAPE_OBSERVABLE_SETTER,
@@ -1258,6 +1260,7 @@ fn inherited_setter_prevents_constructor_preshape_without_losing_effects() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn construct_object_throw_and_guard_miss_are_not_replayed() {
     let oracle = run(
         CONSTRUCT_COLD_EXITS,
@@ -1279,6 +1282,7 @@ fn construct_object_throw_and_guard_miss_are_not_replayed() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn construct_receiver_and_arguments_survive_reentrant_moving_gc() {
     let compiled = run(
         CONSTRUCT_GC,
@@ -1295,6 +1299,7 @@ fn construct_receiver_and_arguments_survive_reentrant_moving_gc() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn derived_and_super_construct_execute_through_machine_ir() {
     let oracle = run(
         DERIVED_CONSTRUCT,
@@ -1313,6 +1318,7 @@ fn derived_and_super_construct_execute_through_machine_ir() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn complete_spread_call_family_uses_shared_generated_linkage() {
     let oracle = run(
         SPREAD_CALL_FAMILY,
@@ -1337,6 +1343,7 @@ fn complete_spread_call_family_uses_shared_generated_linkage() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn spread_array_survives_receiver_preparation_moving_gc() {
     let compiled = run(
         SPREAD_CONSTRUCT_GC,
@@ -1417,6 +1424,7 @@ fn stack_callee_deopt_rebuilds_local_catch_without_replaying_effects() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn generated_call_carries_closure_eval_env_after_factory_frame_and_full_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
@@ -1569,6 +1577,7 @@ fn prototype_method_guard_binds_exact_receiver() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn method_cold_exits_do_not_replay_and_caller_is_reusable() {
     let oracle = run(
         METHOD_COLD_EXITS,
@@ -1588,6 +1597,7 @@ fn method_cold_exits_do_not_replay_and_caller_is_reusable() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn method_receiver_arguments_and_deopt_state_can_spill() {
     let oracle = run(
         METHOD_SPILLS,
@@ -1629,6 +1639,7 @@ fn method_throw_enters_explicit_machine_landing_pad() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn method_receiver_remains_rooted_during_moving_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)

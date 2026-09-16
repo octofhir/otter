@@ -157,7 +157,11 @@ impl JitFunctionCode for TemplateCode {
         {
             Some(super::arm64::NATIVE_FRAME_BYTES)
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        {
+            Some(super::x86_64::NATIVE_FRAME_BYTES)
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             None
         }

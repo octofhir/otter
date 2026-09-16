@@ -25,8 +25,6 @@
 //! - `crates/otter-jit/src/machine/numeric` owns property HIR, selection, and
 //!   AArch64 emission.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactBatch, JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
     SourceInput,
@@ -121,6 +119,7 @@ function makeMachineAccessorWarmRecord(value) {
 }
 
 function machineAccessorProperty(record, value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   record.value = value;
   return record.value;
 }
@@ -200,6 +199,7 @@ function makeMachineLengthRecord(length) {
 }
 
 function machinePropertyLength(value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   return value.length;
 }
 
@@ -240,6 +240,7 @@ function makeMachineBarrierParent(value) {
 }
 
 function machinePropertyBarrier(parent, child) {
+  for (let probe = 0; probe < 3; probe++) child = child;
   parent.value = child;
   return parent.value;
 }

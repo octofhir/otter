@@ -13,8 +13,6 @@
 //! - The surviving scalar value is used twice; there is no second lowering or
 //!   emitter-local peephole.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime, SourceInput,
 };

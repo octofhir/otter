@@ -30,7 +30,7 @@ mod method_guard;
 /// `x29` holds the activation-local countdown in optimizing and scalar Machine
 /// IR bodies. Both tiers subtract this exact batch from shared VM fuel when the
 /// countdown expires, keeping accounting and interrupt latency aligned.
-pub(crate) const GENERATED_POLL_BATCH: u32 = 16;
+pub(crate) use crate::GENERATED_POLL_BATCH;
 
 pub(crate) use direct_call::{
     DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,

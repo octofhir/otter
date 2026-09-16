@@ -30,6 +30,8 @@
 //! - [`super::TemplatePlan`] — validated typed operations analyzed here.
 //! - `super::arm64` — current machine-code consumer of this plan.
 
+#![cfg_attr(all(test, target_arch = "x86_64"), allow(dead_code))]
+
 use std::cmp::Reverse;
 
 use otter_vm::{JitInlineCallee, JitInlineMethod};

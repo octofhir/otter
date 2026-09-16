@@ -1,4 +1,4 @@
-//! Address-free AArch64 relocation artifacts and semantic code normalization.
+//! Address-free native relocation artifacts and semantic code normalization.
 //!
 //! # Contents
 //! - [`RelocationCapture`] records typed address materializations while the
@@ -10,7 +10,8 @@
 //!
 //! # Invariants
 //! - Relocation ranges use exact `code.bin` byte offsets and contain one
-//!   contiguous AArch64 `MOVZ` followed by zero to three `MOVK` instructions.
+//!   the target's fixed address-materialization form: AArch64 `MOVZ`/`MOVK`
+//!   sequences or one x86-64 `mov r64, imm64`.
 //! - Captured targets contain semantic identities only. Raw target addresses
 //!   never enter this module's state or either rendered artifact.
 //! - Exact relocation JSON may name an isolate-local target code generation.
@@ -36,10 +37,15 @@ use super::{
 };
 
 const NORMALIZED_MAGIC: &[u8; 8] = b"OTJNCODE";
+#[cfg(not(target_arch = "x86_64"))]
 const NORMALIZED_ARCH_AARCH64: u16 = 1;
+#[cfg(target_arch = "x86_64")]
+const NORMALIZED_ARCH_X86_64: u16 = 2;
 
+#[cfg(not(target_arch = "x86_64"))]
 const ITEM_RAW_INSTRUCTION: u8 = 0;
 const ITEM_RELOCATION: u8 = 1;
+#[cfg(not(target_arch = "x86_64"))]
 const ITEM_DIRECT_BRANCH: u8 = 2;
 
 const TARGET_RUNTIME_STUB: u8 = 1;
@@ -79,6 +85,7 @@ pub(crate) enum TemplateOperandRole {
 /// Address-stable heap component used by a collection fast path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) enum GuardedHeapComponent {
     Prototype,
     PrototypeShape,
@@ -95,6 +102,7 @@ pub(crate) enum GuardedHeapComponent {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) enum RelocationTarget {
     RuntimeStub {
         id: u32,
@@ -206,7 +214,28 @@ impl RelocationCapture {
     ///
     /// Validation is intentionally deferred until finalized code is available:
     /// `render` verifies both the byte range and every encoded instruction.
+    #[cfg(not(target_arch = "x86_64"))]
     pub(crate) fn record_mov_wide(
+        &mut self,
+        start: usize,
+        end: usize,
+        register: u8,
+        target: RelocationTarget,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.records.push(RelocationRecord {
+            start,
+            end,
+            register,
+            target,
+        });
+    }
+
+    /// Records one fixed-width x86-64 `mov r64, imm64` materialization.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn record_x86_imm64(
         &mut self,
         start: usize,
         end: usize,
@@ -226,24 +255,139 @@ impl RelocationCapture {
 
     /// Renders address-free relocation metadata and portable semantic code.
     pub(crate) fn render(&self, code: &[u8]) -> Result<RenderedRelocations, RelocationError> {
-        if !code.len().is_multiple_of(4) {
-            return Err(RelocationError::CodeLengthNotInstructionAligned {
+        #[cfg(target_arch = "x86_64")]
+        {
+            render_x86_64(&self.records, code)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            if !code.len().is_multiple_of(4) {
+                return Err(RelocationError::CodeLengthNotInstructionAligned {
+                    code_len: code.len(),
+                });
+            }
+
+            let validated = ValidatedRelocations {
+                records: validate_relocations(&self.records, code)?,
+            };
+            let logical_items = build_logical_items(&validated.records, code);
+            let normalized_code = render_normalized(&validated.records, &logical_items, code)?;
+            let json = render_json(&validated.records);
+            Ok(RenderedRelocations {
+                json,
+                normalized_code,
+                validated,
+            })
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn render_x86_64(
+    records: &[RelocationRecord],
+    code: &[u8],
+) -> Result<RenderedRelocations, RelocationError> {
+    let mut records = records.to_vec();
+    records.sort_by_key(|record| (record.start, record.end, record.register));
+    let mut previous_start = 0usize;
+    let mut previous_end = 0usize;
+    let mut validated = Vec::with_capacity(records.len());
+    for record in records {
+        if record.start == record.end {
+            return Err(RelocationError::EmptyRange {
+                start: record.start,
+            });
+        }
+        if record.start < previous_end {
+            return Err(RelocationError::OverlappingRanges {
+                previous_start,
+                previous_end,
+                start: record.start,
+                end: record.end,
+            });
+        }
+        if record.end > code.len() || record.start > record.end {
+            return Err(RelocationError::RangeOutOfBounds {
+                start: record.start,
+                end: record.end,
                 code_len: code.len(),
             });
         }
-
-        let validated = ValidatedRelocations {
-            records: validate_relocations(&self.records, code)?,
-        };
-        let logical_items = build_logical_items(&validated.records, code);
-        let normalized_code = render_normalized(&validated.records, &logical_items, code)?;
-        let json = render_json(&validated.records);
-        Ok(RenderedRelocations {
-            json,
-            normalized_code,
-            validated,
-        })
+        if record.register > 15 {
+            return Err(RelocationError::InvalidRegister {
+                start: record.start,
+                register: record.register,
+            });
+        }
+        let bytes = &code[record.start..record.end];
+        let expected_rex = 0x48 | u8::from(record.register >= 8);
+        let expected_opcode = 0xb8 | (record.register & 7);
+        if bytes.len() != 10 || bytes[0] != expected_rex || bytes[1] != expected_opcode {
+            return Err(RelocationError::ExpectedX86Imm64Move {
+                start: record.start,
+                end: record.end,
+                register: record.register,
+            });
+        }
+        previous_start = record.start;
+        previous_end = record.end;
+        validated.push(ValidatedRelocation {
+            start_offset: record.start as u64,
+            end_offset: record.end as u64,
+            register: record.register,
+            width_bits: 64,
+            chunks: Vec::new(),
+            target: record.target,
+        });
     }
+    let json = render_json(&validated);
+    let normalized_code = render_x86_64_normalized(&validated, code)?;
+    Ok(RenderedRelocations {
+        json,
+        normalized_code,
+        validated: ValidatedRelocations { records: validated },
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn render_x86_64_normalized(
+    relocations: &[ValidatedRelocation],
+    code: &[u8],
+) -> Result<Vec<u8>, RelocationError> {
+    let raw_chunks = relocations.len().saturating_add(1);
+    let item_count = relocations.len().checked_add(raw_chunks).ok_or(
+        RelocationError::LogicalItemCountOverflow {
+            count: relocations.len(),
+        },
+    )?;
+    let item_count = u32::try_from(item_count)
+        .map_err(|_| RelocationError::LogicalItemCountOverflow { count: item_count })?;
+    let mut output = Vec::with_capacity(code.len().saturating_add(relocations.len() * 16));
+    output.extend_from_slice(NORMALIZED_MAGIC);
+    put_u16(&mut output, NORMALIZED_ARCH_X86_64);
+    put_u32(&mut output, item_count);
+    let mut offset = 0usize;
+    for relocation in relocations {
+        encode_raw_bytes(&mut output, &code[offset..relocation.start()])?;
+        output.push(ITEM_RELOCATION);
+        output.push(relocation.register);
+        output.push(relocation.width_bits);
+        encode_target(&relocation.target, &mut output)?;
+        offset = relocation.end();
+    }
+    encode_raw_bytes(&mut output, &code[offset..])?;
+    Ok(output)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn encode_raw_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), RelocationError> {
+    const ITEM_RAW_BYTES: u8 = 3;
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| RelocationError::LogicalItemCountOverflow { count: bytes.len() })?;
+    output.push(ITEM_RAW_BYTES);
+    put_u32(output, len);
+    output.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// Rendered files added to an owned JIT artifact bundle.
@@ -256,6 +400,7 @@ pub(crate) struct RenderedRelocations {
 
 /// A relocation range or PC-relative instruction violated portability rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) enum RelocationError {
     CodeLengthNotInstructionAligned {
         code_len: usize,
@@ -291,6 +436,12 @@ pub(crate) enum RelocationError {
     },
     ExpectedMovk {
         offset: usize,
+    },
+    #[cfg(target_arch = "x86_64")]
+    ExpectedX86Imm64Move {
+        start: usize,
+        end: usize,
+        register: u8,
     },
     RegisterMismatch {
         offset: usize,
@@ -398,6 +549,15 @@ impl fmt::Display for RelocationError {
             Self::ExpectedMovk { offset } => {
                 write!(formatter, "expected MOVK at byte offset {offset}")
             }
+            #[cfg(target_arch = "x86_64")]
+            Self::ExpectedX86Imm64Move {
+                start,
+                end,
+                register,
+            } => write!(
+                formatter,
+                "expected x86-64 mov r{register}, imm64 at byte range {start}..{end}"
+            ),
             Self::RegisterMismatch {
                 offset,
                 expected,
@@ -484,6 +644,7 @@ impl std::error::Error for RelocationError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 enum MovWideOperation {
     Movz,
     Movk,
@@ -528,18 +689,21 @@ pub(super) struct ValidatedRelocations {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(target_arch = "x86_64"))]
 enum LogicalItem {
     RawInstruction { offset: usize },
     Relocation { index: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(target_arch = "x86_64"))]
 enum MovWideKind {
     Movz,
     Movk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(target_arch = "x86_64"))]
 struct DecodedMovWide {
     kind: MovWideKind,
     register: u8,
@@ -547,6 +711,7 @@ struct DecodedMovWide {
     shift_bits: u8,
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn validate_relocations(
     records: &[RelocationRecord],
     code: &[u8],
@@ -578,6 +743,7 @@ fn validate_relocations(
         .collect()
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn validate_record_bounds(
     record: &RelocationRecord,
     code_len: usize,
@@ -616,6 +782,7 @@ fn validate_record_bounds(
     Ok(())
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn validate_mov_wide(
     record: RelocationRecord,
     code: &[u8],
@@ -706,6 +873,7 @@ fn validate_mov_wide(
     })
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn decode_mov_wide(instruction: u32) -> Option<DecodedMovWide> {
     let kind = match instruction & 0x7f80_0000 {
         0x5280_0000 => MovWideKind::Movz,
@@ -721,6 +889,7 @@ fn decode_mov_wide(instruction: u32) -> Option<DecodedMovWide> {
     })
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn build_logical_items(relocations: &[ValidatedRelocation], code: &[u8]) -> Vec<LogicalItem> {
     let mut items = Vec::new();
     let mut offset = 0;
@@ -760,6 +929,7 @@ fn render_json(relocations: &[ValidatedRelocation]) -> String {
     rendered
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn render_normalized(
     relocations: &[ValidatedRelocation],
     items: &[LogicalItem],
@@ -811,6 +981,7 @@ fn render_normalized(
     Ok(output)
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn branch_target_ordinal(
     target: i64,
     source_offset: usize,
@@ -855,6 +1026,7 @@ fn branch_target_ordinal(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(target_arch = "x86_64"))]
 pub(super) enum DirectBranchKind {
     B,
     Bl,
@@ -866,11 +1038,13 @@ pub(super) enum DirectBranchKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(target_arch = "x86_64"))]
 pub(super) struct DirectBranch {
     pub(super) kind: DirectBranchKind,
     pub(super) target: i64,
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 impl DirectBranch {
     fn encode_without_target(self, output: &mut Vec<u8>) {
         match self.kind {
@@ -910,6 +1084,7 @@ impl DirectBranch {
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<DirectBranch> {
     if instruction & 0x7c00_0000 == 0x1400_0000 {
         let displacement = sign_extend(instruction & 0x03ff_ffff, 26) << 2;
@@ -968,6 +1143,7 @@ pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<Di
     None
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn unsupported_pc_relative(instruction: u32) -> Option<&'static str> {
     match instruction & 0x9f00_0000 {
         0x1000_0000 => return Some("ADR"),
@@ -1114,6 +1290,7 @@ fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn read_instruction(code: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(
         code[offset..offset + 4]
@@ -1122,6 +1299,7 @@ fn read_instruction(code: &[u8], offset: usize) -> u32 {
     )
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn sign_extend(value: u32, bits: u32) -> i64 {
     let shift = 64 - bits;
     (i64::from(value) << shift) >> shift
@@ -1135,7 +1313,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_arch = "aarch64")]
     const NOP: u32 = 0xd503_201f;
+    #[cfg(target_arch = "aarch64")]
     const RET: u32 = 0xd65f_03c0;
 
     fn runtime_stub() -> RelocationTarget {
@@ -1168,10 +1348,12 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn instructions(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn movz(register: u8, immediate: u16, shift_bits: u8, is_64_bit: bool) -> u32 {
         let base = if is_64_bit { 0xd280_0000 } else { 0x5280_0000 };
         base | (u32::from(shift_bits / 16) << 21)
@@ -1179,6 +1361,7 @@ mod tests {
             | u32::from(register)
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn movk(register: u8, immediate: u16, shift_bits: u8, is_64_bit: bool) -> u32 {
         let base = if is_64_bit { 0xf280_0000 } else { 0x7280_0000 };
         base | (u32::from(shift_bits / 16) << 21)
@@ -1186,15 +1369,18 @@ mod tests {
             | u32::from(register)
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn b(displacement: i32, link: bool) -> u32 {
         let immediate = ((displacement >> 2) as u32) & 0x03ff_ffff;
         (if link { 0x9400_0000 } else { 0x1400_0000 }) | immediate
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn b_cond(displacement: i32, condition: u8) -> u32 {
         0x5400_0000 | ((((displacement >> 2) as u32) & 0x7ffff) << 5) | u32::from(condition)
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn cb(displacement: i32, nonzero: bool, is_64_bit: bool, register: u8) -> u32 {
         0x3400_0000
             | (u32::from(is_64_bit) << 31)
@@ -1203,6 +1389,7 @@ mod tests {
             | u32::from(register)
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn tb(displacement: i32, nonzero: bool, bit: u8, register: u8) -> u32 {
         0x3600_0000
             | (u32::from(bit >> 5) << 31)
@@ -1212,12 +1399,190 @@ mod tests {
             | u32::from(register)
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn render_single(code: &[u8], end: usize, target: RelocationTarget) -> RenderedRelocations {
         let mut capture = RelocationCapture::new(true);
         capture.record_mov_wide(0, end, 16, target);
         capture.render(code).expect("valid relocation")
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn x86_mov(register: u8, immediate: u64) -> Vec<u8> {
+        let mut code = vec![0x48 | u8::from(register >= 8), 0xb8 | (register & 7)];
+        code.extend_from_slice(&immediate.to_le_bytes());
+        code
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn render_x86_single(
+        register: u8,
+        immediate: u64,
+        target: RelocationTarget,
+    ) -> RenderedRelocations {
+        let code = x86_mov(register, immediate);
+        let mut capture = RelocationCapture::new(true);
+        capture.record_x86_imm64(0, code.len(), register, target);
+        capture.render(&code).expect("valid x86-64 relocation")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_imm64_relocations_validate_sort_and_hide_addresses() {
+        let first = x86_mov(3, 0xfeed_face_dead_beef);
+        let second = x86_mov(12, 0x0123_4567_89ab_cdef);
+        let mut code = first.clone();
+        code.push(0x90);
+        let second_start = code.len();
+        code.extend_from_slice(&second);
+
+        let mut capture = RelocationCapture::new(true);
+        capture.record_x86_imm64(second_start, code.len(), 12, RelocationTarget::GcCageBase);
+        capture.record_x86_imm64(0, first.len(), 3, runtime_stub());
+        let rendered = capture.render(&code).unwrap();
+        let document: Value = serde_json::from_str(&rendered.json).unwrap();
+        assert_eq!(document["offsetBasis"], "code.bin");
+        assert_eq!(document["addressEncoding"], "symbolicOnly");
+        assert_eq!(document["relocations"][0]["startOffset"], 0);
+        assert_eq!(
+            document["relocations"][1]["startOffset"],
+            second_start as u64
+        );
+        assert_eq!(
+            document["relocations"][0]["chunks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!rendered.json.contains("18369614221520256751"));
+        assert!(!rendered.json.contains("81985529216486895"));
+        assert_eq!(
+            &rendered.normalized_code[NORMALIZED_MAGIC.len()..NORMALIZED_MAGIC.len() + 2],
+            &NORMALIZED_ARCH_X86_64.to_le_bytes()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_normalization_replaces_process_addresses_with_semantics() {
+        let first = render_x86_single(11, 1, runtime_stub());
+        let second = render_x86_single(11, u64::MAX, runtime_stub());
+        assert_eq!(first.normalized_code, second.normalized_code);
+        assert_ne!(first.json, "");
+
+        let targets = [
+            runtime_stub(),
+            RelocationTarget::GcCageBase,
+            RelocationTarget::PropertySourceCell {
+                access: PropertySourceAccess::Store,
+                ordinal: 7,
+            },
+            direct_call_target(
+                41,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::MethodReceiver,
+            ),
+        ];
+        let normalized: BTreeSet<_> = targets
+            .into_iter()
+            .map(|target| render_x86_single(11, 0x1234, target).normalized_code)
+            .collect();
+        assert_eq!(normalized.len(), 4);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_direct_call_generation_is_exact_but_not_portable_identity() {
+        let first = render_x86_single(
+            11,
+            0x1111,
+            direct_call_target(
+                29,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::SloppyGlobal,
+            ),
+        );
+        let second = render_x86_single(
+            11,
+            0x2222,
+            direct_call_target(
+                30,
+                DirectCallTierArtifact::Optimizing,
+                DirectCallThisModeArtifact::SloppyGlobal,
+            ),
+        );
+        assert_eq!(first.normalized_code, second.normalized_code);
+        assert_ne!(first.json, second.json);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_rejects_malformed_ranges_registers_and_overlaps() {
+        let code = x86_mov(8, 7);
+        let error_for = |start, end, register| {
+            let mut capture = RelocationCapture::new(true);
+            capture.record_x86_imm64(start, end, register, runtime_stub());
+            capture.render(&code).unwrap_err()
+        };
+        assert_eq!(error_for(0, 0, 8), RelocationError::EmptyRange { start: 0 });
+        assert_eq!(
+            error_for(0, 11, 8),
+            RelocationError::RangeOutOfBounds {
+                start: 0,
+                end: 11,
+                code_len: 10,
+            }
+        );
+        assert_eq!(
+            error_for(0, 10, 16),
+            RelocationError::InvalidRegister {
+                start: 0,
+                register: 16,
+            }
+        );
+        assert_eq!(
+            error_for(0, 9, 8),
+            RelocationError::ExpectedX86Imm64Move {
+                start: 0,
+                end: 9,
+                register: 8,
+            }
+        );
+
+        let mut two = x86_mov(3, 1);
+        two.extend_from_slice(&x86_mov(4, 2));
+        let mut capture = RelocationCapture::new(true);
+        capture.record_x86_imm64(0, 10, 3, runtime_stub());
+        capture.record_x86_imm64(9, 19, 4, RelocationTarget::GcCageBase);
+        assert_eq!(
+            capture.render(&two).unwrap_err(),
+            RelocationError::OverlappingRanges {
+                previous_start: 0,
+                previous_end: 10,
+                start: 9,
+                end: 19,
+            }
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_disabled_capture_keeps_raw_code_and_target_header() {
+        let code = [0x90, 0xc3];
+        let mut capture = RelocationCapture::default();
+        capture.record_x86_imm64(0, 2, 0, runtime_stub());
+        assert!(capture.records.is_empty());
+        assert_eq!(capture.records.capacity(), 0);
+        let rendered = capture.render(&code).unwrap();
+        assert!(rendered.normalized_code.starts_with(NORMALIZED_MAGIC));
+        assert_eq!(
+            &rendered.normalized_code[NORMALIZED_MAGIC.len()..NORMALIZED_MAGIC.len() + 2],
+            &NORMALIZED_ARCH_X86_64.to_le_bytes()
+        );
+        assert!(rendered.normalized_code.ends_with(&code));
+    }
+
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn accepts_one_to_four_chunks_and_skipped_zero_chunks() {
         for chunk_count in 1..=4 {
@@ -1259,6 +1624,7 @@ mod tests {
         assert_eq!(shifts, [0, 32, 48]);
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn json_is_sorted_uses_code_bin_offsets_and_hides_address_chunks() {
         let code = instructions(&[movz(3, 0xdead, 0, true), NOP, movz(5, 0xbeef, 0, true)]);
@@ -1281,6 +1647,7 @@ mod tests {
         assert!(!rendered.json.contains("48879"));
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn record_order_does_not_change_artifacts() {
         let code = instructions(&[movz(3, 1, 0, true), NOP, movz(5, 2, 0, true)]);
@@ -1293,6 +1660,7 @@ mod tests {
         assert_eq!(forward.render(&code), reverse.render(&code));
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn disabled_capture_does_not_allocate_or_retain_records() {
         let code = instructions(&[NOP]);
@@ -1358,6 +1726,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn all_direct_branches_use_logical_item_destinations() {
         fn code_with_relocation(chunks: &[u32]) -> (Vec<u8>, usize, usize) {
@@ -1401,6 +1770,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn target_semantics_are_explicit_in_normalized_code() {
         let code = instructions(&[movz(16, 0x1234, 0, true)]);
@@ -1460,6 +1830,7 @@ mod tests {
         assert!(first.normalized_code.starts_with(NORMALIZED_MAGIC));
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn direct_call_exact_generation_is_not_portable_normalized_identity() {
         let code = instructions(&[movz(16, 0x1234, 0, true)]);
@@ -1535,6 +1906,7 @@ mod tests {
         assert_ne!(first.normalized_code, chained.normalized_code);
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn rejects_malformed_ranges_and_mov_wide_sequences() {
         let code = instructions(&[
@@ -1638,6 +2010,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn rejects_overlap_before_decoding_ranges() {
         let code = instructions(&[movz(16, 1, 0, true), movk(16, 2, 16, true)]);
@@ -1655,6 +2028,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn rejects_unsupported_pc_relative_instructions() {
         for (instruction, name) in [
@@ -1675,6 +2049,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn rejects_branches_into_relocation_interiors_and_outside_code() {
         let code = instructions(&[
@@ -1716,6 +2091,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn rejects_non_instruction_sized_code() {
         assert_eq!(

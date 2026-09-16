@@ -4,6 +4,15 @@
 //! `get_prototype_for_op`, non-GC exotic prototype overrides, primitive
 //! wrapper prototypes, sloppy-mode `this` boxing, well-known symbols,
 //! and `install_global_class`.
+//!
+//! # Invariants
+//! - Moving primitive payloads are re-read from a handle after every wrapper
+//!   allocation; raw string, symbol, and bigint handles never cross a GC point.
+//! - Sloppy receiver boxing preserves the caller's stack/runtime root domain.
+//!
+//! # See also
+//! - `crate::allocation_ops` — rooted object allocation helpers.
+//! - `crate::object` — primitive wrapper internal-slot installation.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -650,24 +659,45 @@ impl Interpreter {
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
             object::set_number_data(&mut obj, &mut self.gc_heap, value);
             obj
-        } else if let Some(value) = this_value.as_string(&self.gc_heap) {
-            let proto = self.primitive_wrapper_prototype("String")?;
-            let mut obj =
-                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_string_data(&mut obj, &mut self.gc_heap, value);
-            obj
-        } else if let Some(sym) = this_value.as_symbol(&self.gc_heap) {
-            let proto = self.primitive_wrapper_prototype("Symbol")?;
-            let mut obj =
-                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_symbol_data(&mut obj, &mut self.gc_heap, sym);
-            obj
-        } else if let Some(value) = this_value.as_big_int() {
-            let proto = self.primitive_wrapper_prototype("BigInt")?;
-            let mut obj =
-                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_bigint_data(&mut obj, &mut self.gc_heap, value);
-            obj
+        } else if this_value.as_string(&self.gc_heap).is_some() {
+            self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
+                let rooted = interp.scoped_value(scope, this_value);
+                let proto = interp.primitive_wrapper_prototype("String")?;
+                let mut obj =
+                    interp.alloc_runtime_rooted_object_with_proto(proto, &[], slice_roots)?;
+                let value = interp
+                    .escape_scoped(rooted)
+                    .as_string(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                object::set_string_data(&mut obj, &mut interp.gc_heap, value);
+                Ok(obj)
+            })?
+        } else if this_value.as_symbol(&self.gc_heap).is_some() {
+            self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
+                let rooted = interp.scoped_value(scope, this_value);
+                let proto = interp.primitive_wrapper_prototype("Symbol")?;
+                let mut obj =
+                    interp.alloc_runtime_rooted_object_with_proto(proto, &[], slice_roots)?;
+                let value = interp
+                    .escape_scoped(rooted)
+                    .as_symbol(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                object::set_symbol_data(&mut obj, &mut interp.gc_heap, value);
+                Ok(obj)
+            })?
+        } else if this_value.as_big_int().is_some() {
+            self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
+                let rooted = interp.scoped_value(scope, this_value);
+                let proto = interp.primitive_wrapper_prototype("BigInt")?;
+                let mut obj =
+                    interp.alloc_runtime_rooted_object_with_proto(proto, &[], slice_roots)?;
+                let value = interp
+                    .escape_scoped(rooted)
+                    .as_big_int()
+                    .ok_or(VmError::InvalidOperand)?;
+                object::set_bigint_data(&mut obj, &mut interp.gc_heap, value);
+                Ok(obj)
+            })?
         } else {
             return Ok(this_value);
         };
@@ -700,36 +730,45 @@ impl Interpreter {
             )?;
             object::set_number_data(&mut obj, &mut self.gc_heap, value);
             obj
-        } else if let Some(value) = this_value.as_string(&self.gc_heap) {
-            let proto = self.primitive_wrapper_prototype("String")?;
-            let mut obj = self.alloc_stack_rooted_object_with_proto(
-                stack,
-                proto,
-                &[&this_value],
-                slice_roots,
-            )?;
-            object::set_string_data(&mut obj, &mut self.gc_heap, value);
-            obj
-        } else if let Some(sym) = this_value.as_symbol(&self.gc_heap) {
-            let proto = self.primitive_wrapper_prototype("Symbol")?;
-            let mut obj = self.alloc_stack_rooted_object_with_proto(
-                stack,
-                proto,
-                &[&this_value],
-                slice_roots,
-            )?;
-            object::set_symbol_data(&mut obj, &mut self.gc_heap, sym);
-            obj
-        } else if let Some(value) = this_value.as_big_int() {
-            let proto = self.primitive_wrapper_prototype("BigInt")?;
-            let mut obj = self.alloc_stack_rooted_object_with_proto(
-                stack,
-                proto,
-                &[&this_value],
-                slice_roots,
-            )?;
-            object::set_bigint_data(&mut obj, &mut self.gc_heap, value);
-            obj
+        } else if this_value.as_string(&self.gc_heap).is_some() {
+            self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
+                let rooted = interp.scoped_value(scope, this_value);
+                let proto = interp.primitive_wrapper_prototype("String")?;
+                let mut obj =
+                    interp.alloc_stack_rooted_object_with_proto(stack, proto, &[], slice_roots)?;
+                let value = interp
+                    .escape_scoped(rooted)
+                    .as_string(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                object::set_string_data(&mut obj, &mut interp.gc_heap, value);
+                Ok(obj)
+            })?
+        } else if this_value.as_symbol(&self.gc_heap).is_some() {
+            self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
+                let rooted = interp.scoped_value(scope, this_value);
+                let proto = interp.primitive_wrapper_prototype("Symbol")?;
+                let mut obj =
+                    interp.alloc_stack_rooted_object_with_proto(stack, proto, &[], slice_roots)?;
+                let value = interp
+                    .escape_scoped(rooted)
+                    .as_symbol(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                object::set_symbol_data(&mut obj, &mut interp.gc_heap, value);
+                Ok(obj)
+            })?
+        } else if this_value.as_big_int().is_some() {
+            self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
+                let rooted = interp.scoped_value(scope, this_value);
+                let proto = interp.primitive_wrapper_prototype("BigInt")?;
+                let mut obj =
+                    interp.alloc_stack_rooted_object_with_proto(stack, proto, &[], slice_roots)?;
+                let value = interp
+                    .escape_scoped(rooted)
+                    .as_big_int()
+                    .ok_or(VmError::InvalidOperand)?;
+                object::set_bigint_data(&mut obj, &mut interp.gc_heap, value);
+                Ok(obj)
+            })?
         } else {
             return Ok(this_value);
         };

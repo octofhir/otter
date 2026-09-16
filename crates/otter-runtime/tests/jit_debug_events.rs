@@ -20,7 +20,6 @@
 
 use std::collections::BTreeSet;
 
-#[cfg(target_arch = "aarch64")]
 use otter_runtime::JitDebugCompileOutcome;
 use otter_runtime::{
     JitDebugEvent, JitDebugRequest, JitDebugTarget, JitDebugTier, JitSelection, Otter, Runtime,
@@ -197,7 +196,6 @@ fn template_osr_emits_ordered_compile_events() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
@@ -281,7 +279,6 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn numeric_method_candidate_splices_into_optimizing_backend() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
@@ -360,7 +357,6 @@ engineKernel(128);
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn optimized_method_deopt_preserves_this_overflow_invalidation_and_abrupt_completion() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)

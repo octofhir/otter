@@ -1253,6 +1253,7 @@ pub(crate) fn unpack_register_lanes(packed: u64) -> [u16; PACKED_REGISTER_LANES]
 }
 
 /// Byte offset of register `idx` within the register array.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
     let off = u32::from(idx) * 8;
     if off > 32760 {

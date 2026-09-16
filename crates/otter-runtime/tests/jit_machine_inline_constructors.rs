@@ -9,6 +9,7 @@
 //! - Numeric exits retain the allocated receiver and new.target without replay.
 
 #![cfg(target_arch = "aarch64")]
+
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]
@@ -155,7 +156,8 @@ for(var i=0;i<70000;i++)box(1.25);
                             && ir.contains("AllocateObject {")
                             && ir.contains("PublishObject {")
                     })),
-        "numeric constructor must be spliced"
+        "numeric constructor must be spliced: {:?}",
+        warm.jit_debug_report()
     );
     let result = runtime
         .run_script(

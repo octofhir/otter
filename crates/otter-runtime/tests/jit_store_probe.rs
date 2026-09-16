@@ -14,8 +14,6 @@
 //! # See also
 //! - `otter_vm::property_dispatch::jit_runtime` owns generated store misses.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 const SOURCE: &str = include_str!("../../otter-difftest/corpus/store_probe_invalidation.js");
@@ -142,6 +140,7 @@ fn store_diagnostics_count_paths_without_replaying_effects() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn inherited_writable_data_fills_and_reuses_native_store_way() {
     use otter_runtime::{JitDebugEvent, JitDebugRequest};
 

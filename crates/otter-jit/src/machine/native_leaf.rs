@@ -19,6 +19,8 @@
 
 #[cfg(target_arch = "aarch64")]
 pub(super) mod arm64;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_64;
 
 use super::{
     CallDescriptor, CallEffects, CallTarget, ExceptionalEdge, MachineInstruction,
@@ -27,7 +29,7 @@ use super::{
 };
 use otter_vm::JitStaticNativeCall;
 
-pub(super) fn supports_site(
+pub(crate) fn supports_site(
     view: &otter_vm::JitCompileSnapshot,
     target: JitStaticNativeCall,
     argument_count: usize,
@@ -139,7 +141,6 @@ pub(super) fn is_valid(
     actual.eq(expected)
 }
 
-#[cfg(target_arch = "aarch64")]
 pub(super) fn diagnostics(
     view: &otter_vm::JitCompileSnapshot,
     sequence: &super::InstructionSequence,

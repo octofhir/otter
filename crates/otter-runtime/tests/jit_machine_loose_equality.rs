@@ -14,8 +14,6 @@
 //!   every other cell is decided by its tag in generated code.
 //! - The generated comparison neither allocates nor owns a safepoint.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTier,
     JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
@@ -31,19 +29,36 @@ const FUNCTION_NAMES: [(&str, bool); 4] = [
 
 const SETUP: &str = r#"
 function machineLooseEqNull(value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   return value == null;
 }
 
 function machineLooseNeNull(value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   return value != null;
 }
 
 function machineLooseEqUndefined(value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   return undefined == value;
 }
 
 function machineLooseNeUndefined(value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   return undefined != value;
+}
+
+function machineLooseReuse() {
+  var result;
+  for (var reuse = 0; reuse < 6000; reuse++) {
+    result = [
+      machineLooseEqNull(null),
+      machineLooseNeNull(1),
+      machineLooseEqUndefined(undefined),
+      machineLooseNeUndefined(false)
+    ];
+  }
+  return JSON.stringify(result);
 }
 
 for (let warm = 0; warm < 5000; warm++) {
@@ -212,12 +227,23 @@ fn assert_machine_artifact(bundle: &JitArtifactBundle, equal: bool) {
     );
 
     let deopt = artifact_json(bundle, JitArtifactFileName::Deopt);
+    let frame_state_ids = deopt["exits"]
+        .as_array()
+        .expect("deopt exits")
+        .iter()
+        .filter_map(|exit| exit["frameStateId"].as_u64())
+        .collect::<std::collections::BTreeSet<_>>();
     assert!(
-        deopt["exits"]
+        deopt["frameStates"]
             .as_array()
-            .expect("deopt exits")
+            .expect("deopt frame states")
             .iter()
-            .flat_map(|exit| exit["frames"].as_array().into_iter().flatten())
+            .filter(|state| {
+                state["id"]
+                    .as_u64()
+                    .is_some_and(|id| frame_state_ids.contains(&id))
+            })
+            .flat_map(|state| state["frames"].as_array().into_iter().flatten())
             .any(|frame| frame["bytePc"].as_u64() == Some(byte_pc)),
         "the cell guard must reconstruct the exact comparison PC: {deopt}"
     );
@@ -226,14 +252,15 @@ fn assert_machine_artifact(bundle: &JitArtifactBundle, equal: bool) {
     let relocations = relocations["relocations"]
         .as_array()
         .expect("relocation entries");
-    // Every Machine body links the shared exact-deopt handler and the
-    // abrupt-completion finisher; the comparison itself must add no other
-    // runtime target.
+    // Every Machine body links the shared exact-deopt handler, the
+    // abrupt-completion finisher, and the fixture's tier-driving backedge
+    // poll; the comparison itself must add no other runtime target.
     assert!(
         relocations.iter().all(|relocation| {
             relocation["target"]["kind"] != "runtimeStub"
                 || relocation["target"]["name"] == "jit_deopt_rebuild_frames"
                 || relocation["target"]["name"] == "jit_finish_error"
+                || relocation["target"]["name"] == "jit_backedge_poll"
         }),
         "tagged/nullish emission may call only the shared exact-deopt handler: {relocations:?}"
     );
@@ -346,17 +373,19 @@ fn machine_tagged_nullish_native_functions_exact_deopt_without_coercion_or_repla
         "each function must exact-deopt once before its Boolean destination"
     );
 
+    let retiered = completion(
+        &mut compiled,
+        "machineLooseReuse();",
+        "jit-machine-loose-equality-retier.js",
+    );
+    assert_eq!(retiered, "[true,true,true,true]");
+    let after_retier = compiled.execution_stats();
     let reused = completion(
         &mut compiled,
-        r#"JSON.stringify([
-          machineLooseEqNull(null),
-          machineLooseNeNull(1),
-          machineLooseEqUndefined(undefined),
-          machineLooseNeUndefined(false)
-        ]);"#,
+        "machineLooseReuse();",
         "jit-machine-loose-equality-reuse.js",
     );
-    let (reuse_entries, reuse_deopts) = stats_delta(after_object, compiled.execution_stats());
+    let (reuse_entries, reuse_deopts) = stats_delta(after_retier, compiled.execution_stats());
     assert_eq!(reused, "[true,true,true,true]");
     assert!(reuse_entries >= 4, "all generated bodies remain reusable");
     assert_eq!(reuse_deopts, 0, "primitive reuse stays on the fast path");

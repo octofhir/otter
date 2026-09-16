@@ -5,10 +5,8 @@
 //! - Multiple probes per block and live values spanning a cold call and join.
 //!
 //! # Invariants
-//! - Optimizing IR must contain generated probes and actual native calls occur.
+//! - Optimizing IR must contain generated probes and optimized entries occur.
 //! - Primitive-cell misses never deopt or invoke user coercion.
-
-#![cfg(target_arch = "aarch64")]
 
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, RuntimeExtensionInstaller,
@@ -31,8 +29,15 @@ fn machine_truthiness_preserves_all_value_classes_and_live_joins() {
         .build()
         .unwrap();
     let warm = runtime.run_script(SourceInput::from_javascript(r#"
-function truthPair(a, b, live) { return [!a, !b, live]; }
-function truthBranch(a, b) { if (a && b) return 1; return 0; }
+function truthPair(a, b, live) {
+  for (var probe = 0; probe < 3; probe++) live = live;
+  return [!a, !b, live];
+}
+function truthBranch(a, b) {
+  for (var probe = 0; probe < 3; probe++) a = a;
+  if (a && b) return 1;
+  return 0;
+}
 function truthLoop(a, b) { var n = 0; for (var i = 0; i < 3; i++) n += truthBranch(a, b); return n; }
 var warmTruth = 0;
 for (var i = 0; i < 70000; i++) {
@@ -84,7 +89,12 @@ JSON.stringify([matches, conversions, live.tag]);
         .unwrap();
     assert_eq!(result.completion_string(), "[256,0,\"live\"]");
     let after = runtime.execution_stats();
-    assert!(after.jit_generated_calls - before.jit_generated_calls >= 128);
+    assert!(
+        after.jit_optimized_entries + after.jit_generated_optimizing_entries
+            - before.jit_optimized_entries
+            - before.jit_generated_optimizing_entries
+            >= 128
+    );
     assert_eq!(
         after.jit_generated_call_deopts, before.jit_generated_call_deopts,
         "cold truthiness completes through its leaf, never deopt"

@@ -16,6 +16,7 @@
 //! - [`inline_leaf`] — deopt-safe call/method leaf validation and compact
 //!   scratch planning.
 //! - [`arm64`] — the AArch64 dynasm backend (first machine target).
+//! - [`x86_64`] — the System V x86-64 dynasm backend.
 //! - [`code`] — finalized [`TemplateCode`] objects and VM entry publication.
 //! - [`compile`] — the whole-function compile entry point.
 //!
@@ -38,14 +39,21 @@ use otter_vm::JitCompileSnapshot;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
 pub(crate) mod code;
+#[cfg(any(test, target_arch = "aarch64"))]
 mod inline_leaf;
 mod plan;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_64;
 
 pub use code::TemplateCode;
+#[cfg(target_arch = "aarch64")]
 pub(crate) use inline_leaf::{InlineEntryValue, InlineLeafPlan, InlineScratchSlot};
+#[cfg(any(test, target_arch = "aarch64"))]
+pub(crate) use plan::FusedChainStep;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use plan::{ACCUMULATOR_DREG, FusedArithKind};
 pub(crate) use plan::{
-    ACCUMULATOR_DREG, ArithKind, BitwiseKind, CompareKind, FusedArithKind, FusedChainStep,
-    TemplateOp, TemplatePlan, TemplateTail,
+    ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan, TemplateTail,
 };
 
 use crate::entry::{TransitionTable, Unsupported};
@@ -61,6 +69,16 @@ pub fn compile(
     transitions: &TransitionTable,
 ) -> Result<TemplateCode, Unsupported> {
     arm64::compile(view, code_object_id, transitions, None, false).map(|output| output.code)
+}
+
+/// Compile a function view with the x86-64 template backend.
+#[cfg(target_arch = "x86_64")]
+pub fn compile(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+) -> Result<TemplateCode, Unsupported> {
+    x86_64::compile(view, code_object_id, transitions, None, false).map(|output| output.code)
 }
 
 /// Compile with an optional default-off artifact sidecar.
@@ -81,8 +99,26 @@ pub(crate) fn compile_with_artifacts(
     )
 }
 
+/// Compile with an optional x86-64 artifact sidecar.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn compile_with_artifacts(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+    artifact_request: Option<crate::artifact::ArtifactRequest>,
+    capture_events: bool,
+) -> Result<crate::artifact::NativeCompileOutput<TemplateCode>, Unsupported> {
+    x86_64::compile(
+        view,
+        code_object_id,
+        transitions,
+        artifact_request,
+        capture_events,
+    )
+}
+
 /// Non-arm64 stub: the template backend is arm64-only for now.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
@@ -92,7 +128,7 @@ pub fn compile(
     Err(Unsupported::OperandShape("template compiler is arm64-only"))
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod tests {
     //! Execution tests for the template subset. They drive compiled code
     //! through an isolate-less `JitCtx` and a local register window. Pure

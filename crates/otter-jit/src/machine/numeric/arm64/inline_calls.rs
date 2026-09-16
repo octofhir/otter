@@ -25,20 +25,6 @@ use otter_vm::native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind};
 
 const HEADER_WORDS: usize = std::mem::size_of::<NativeFrame>() / 8;
 
-pub(in crate::machine::numeric) fn frame_words(
-    sequence: &InstructionSequence,
-) -> Result<u16, Unsupported> {
-    let max = sequence.instructions().iter().filter(|instruction| {
-        matches!(instruction.opcode, MachineOpcode::Call(index)
-            if matches!(sequence.call_descriptors()[index as usize].target, CallTarget::Direct { .. }))
-    }).map(|instruction| {
-        if instruction.inline_frames.is_empty() { 0 } else {
-            1 + instruction.inline_frames.iter().skip(1).map(|frame| HEADER_WORDS + frame.slots.len()).sum::<usize>()
-        }
-    }).max().unwrap_or(0);
-    u16::try_from(max).map_err(|_| Unsupported::OperandShape("inline native frame capacity"))
-}
-
 fn offset(frame: MachineFrameLayout, word: u16) -> Result<u32, Unsupported> {
     frame
         .raw_offset(word)

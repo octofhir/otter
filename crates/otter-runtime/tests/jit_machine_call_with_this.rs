@@ -16,8 +16,6 @@
 //! - Each fixture function is compiled by the optimizing tier; explicit
 //!   receivers and unsettled plain calls no longer decline the function.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitDebugCompileOutcome, JitDebugEvent, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
     SourceInput,

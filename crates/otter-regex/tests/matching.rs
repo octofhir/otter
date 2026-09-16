@@ -404,10 +404,20 @@ fn step_budget_aborts_catastrophic_backtracking() {
     let re = Regex::compile_str("(a+)+$", flags).unwrap();
     let units: Vec<u16> = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!".encode_utf16().collect();
     let cfg = ExecConfig {
-        step_limit: Some(100_000),
+        step_limit: 100_000,
     };
     let result = re.find_utf16(&units, 0, cfg).next();
     assert!(matches!(result, Some(Err(_))));
+}
+
+#[test]
+fn default_execution_budget_is_finite() {
+    let regex = Regex::compile_str("(a|aa)+b", Flags::default()).expect("pattern");
+    let subject = "a".repeat(32).encode_utf16().collect::<Vec<_>>();
+    assert!(matches!(
+        regex.find_utf16(&subject, 0, ExecConfig::default()).next(),
+        Some(Err(otter_regex::ExecError::StepLimitExceeded))
+    ));
 }
 
 /// §22.2.2.4 — a lookbehind body matches with direction -1: its alternatives

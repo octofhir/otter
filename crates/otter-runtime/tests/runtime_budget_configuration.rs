@@ -100,6 +100,39 @@ fn one_report_carries_the_cpu_counters_and_the_resource_ledger() {
 }
 
 #[test]
+fn regexp_backtracking_is_charged_to_the_shared_reduction_ledger() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    rt.run_script(
+        SourceInput::from_javascript(r#"/(a+)+$/.test("aaaaaaaaaaaaaaaa!");"#),
+        "<regexp-budget-accounting>",
+    )
+    .expect("bounded regexp ran");
+
+    let stats = rt.budget_report().execution;
+    assert!(stats.regex_backtrack_steps > 0);
+    assert!(stats.reductions_executed >= stats.regex_backtrack_steps);
+}
+
+#[test]
+fn regexp_default_limit_surfaces_the_runtime_resource_error() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    let error = rt
+        .run_script(
+            SourceInput::from_javascript(r#"/(a|aa)+b/.test("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");"#),
+            "<regexp-default-budget>",
+        )
+        .expect_err("catastrophic backtracking must exhaust the finite default");
+
+    match error {
+        OtterError::Runtime { diagnostic } => assert_eq!(diagnostic.code, "BUDGET_EXCEEDED"),
+        other => panic!("expected a budget diagnostic, got {other:?}"),
+    }
+    let stats = rt.budget_report().execution;
+    assert!(stats.regex_backtrack_steps >= 1_000_000);
+    assert!(stats.reductions_executed >= stats.regex_backtrack_steps);
+}
+
+#[test]
 fn telemetry_outlives_a_borrow_of_the_runtime() {
     let mut rt = Runtime::builder().build().expect("runtime");
     let telemetry = rt.budget_telemetry();

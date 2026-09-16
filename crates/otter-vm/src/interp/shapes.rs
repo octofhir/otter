@@ -48,7 +48,7 @@ impl Interpreter {
         parent: object::ShapeHandle,
         key: &str,
         obj: &mut object::JsObject,
-        value: &Value,
+        value: &mut Value,
     ) -> Result<object::ShapeHandle, VmError> {
         // Fast path: a previously seen field-shape transition resolves with no
         // allocation, so it needs no rooting. Building an object whose layout
@@ -70,7 +70,7 @@ impl Interpreter {
             }
             let p = obj as *mut object::JsObject as *mut RawGc;
             visitor(p);
-            value.trace_value_slots(visitor);
+            value.trace_value_slot_mut(visitor);
         };
         self.shape_runtime
             .child_with_roots(
@@ -89,10 +89,9 @@ impl Interpreter {
         parent: object::ShapeHandle,
         key: &str,
         obj: &mut object::JsObject,
-        descriptor: &object::PropertyDescriptor,
+        flags: object::PropertyFlags,
+        is_accessor: bool,
     ) -> Result<object::ShapeHandle, VmError> {
-        let flags = descriptor.flags;
-        let is_accessor = matches!(descriptor.kind, object::DescriptorKind::Accessor { .. });
         if let Some(child) =
             self.shape_runtime
                 .child_if_cached(&self.gc_heap, parent, key, flags, is_accessor)
@@ -106,17 +105,6 @@ impl Interpreter {
             }
             let p = obj as *mut object::JsObject as *mut RawGc;
             visitor(p);
-            match &descriptor.kind {
-                object::DescriptorKind::Data { value } => value.trace_value_slots(visitor),
-                object::DescriptorKind::Accessor { getter, setter } => {
-                    if let Some(getter) = getter {
-                        getter.trace_value_slots(visitor);
-                    }
-                    if let Some(setter) = setter {
-                        setter.trace_value_slots(visitor);
-                    }
-                }
-            }
         };
         self.shape_runtime
             .child_with_roots(
@@ -184,7 +172,7 @@ impl Interpreter {
         &mut self,
         mut obj: object::JsObject,
         key: &str,
-        value: Value,
+        mut value: Value,
     ) -> Result<bool, VmError> {
         let shape = object::shape(obj, &self.gc_heap);
         // Past the fast-property cap, stop extending the transition
@@ -196,7 +184,7 @@ impl Interpreter {
         let should_add_shape =
             self.should_add_property(obj, key) && (old_count as u32) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
-            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
+            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &mut value)?)
         } else {
             None
         };
@@ -225,14 +213,14 @@ impl Interpreter {
         &mut self,
         mut obj: object::JsObject,
         key: &str,
-        value: Value,
+        mut value: Value,
     ) -> Result<(), VmError> {
         let shape = object::shape(obj, &self.gc_heap);
         let old_count = object::shape_property_count(shape, &self.gc_heap) as usize;
         let should_add_shape =
             self.should_add_property(obj, key) && (old_count as u32) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
-            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
+            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &mut value)?)
         } else {
             None
         };
@@ -262,8 +250,10 @@ impl Interpreter {
         if self.should_add_property(*obj_ref, key)
             && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES
         {
+            let flags = completed.flags;
+            let is_accessor = matches!(completed.kind, object::DescriptorKind::Accessor { .. });
             let (next_shape, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
-                this.shape_child_rooting_object_descriptor(shape, key, obj_ref, &completed)
+                this.shape_child_rooting_object_descriptor(shape, key, obj_ref, flags, is_accessor)
             })?;
             return Ok(object::define_own_property_partial_with_shape(
                 obj_ref,

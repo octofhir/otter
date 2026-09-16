@@ -122,7 +122,9 @@ pub(crate) fn exec_once_native(
                 .as_string(scope.context().heap())
                 .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
             let heap = scope.context().heap();
-            let matched = text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
+            let execution =
+                text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
+            let matched = crate::regexp::finish_execution(scope.context(), execution)?;
             let matched = match matched {
                 Some(matched) => matched,
                 None => {
@@ -445,7 +447,8 @@ pub fn native_regexp_symbol_match(
                         scope.context().heap(),
                     )
                 {
-                    let found = re.find_from_utf16(scope.context().heap(), &input_units, 0);
+                    let execution = re.find_from_utf16(scope.context().heap(), &input_units, 0);
+                    let found = crate::regexp::finish_execution(scope.context(), execution)?;
                     if found.is_empty() {
                         return Ok(Value::null());
                     }
@@ -1278,7 +1281,8 @@ pub fn native_regexp_symbol_replace(
                             name,
                             reason: "replace receiver root is not a RegExp".to_string(),
                         })?;
-                    let found = re.find_from_utf16(ctx.heap(), &s_units, 0);
+                    let execution = re.find_from_utf16(ctx.heap(), &s_units, 0);
+                    let found = crate::regexp::finish_execution(ctx, execution)?;
                     let mut accumulated: Vec<u16> = Vec::new();
                     let mut next_source_position: usize = 0;
                     for m in &found {
@@ -2354,6 +2358,7 @@ pub fn escape_regexp_pattern_utf16(units: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rooting::RootScopeExt;
     use crate::{Interpreter, NativeCallInfo};
 
     fn make(pattern: &str, flags: &str, interp: &mut Interpreter) -> Value {
@@ -2420,16 +2425,32 @@ mod tests {
     }
 
     fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {
-        recv.as_regexp().expect("RegExp receiver");
+        let mut recv_root = *recv;
+        let mut args_root = args.to_vec();
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary through
+        // the complete native call.
+        unsafe {
+            roots.add_value(&mut recv_root);
+            roots.add_value_vec(&mut args_root);
+        }
+        recv_root.as_regexp().expect("RegExp receiver");
         let context = empty_context();
-        NativeCtx::with_host_context(interp, NativeCallInfo::call(*recv), Some(&context), |ctx| {
-            let text = string_arg_to_jsstring_for_test(args, 0, ctx).unwrap();
-            match method {
-                "exec" => exec_once_native(recv, text, ctx).unwrap(),
-                "test" => Value::boolean(!exec_once_native(recv, text, ctx).unwrap().is_null()),
-                _ => panic!("unknown regexp test method {method}"),
-            }
-        })
+        NativeCtx::with_host_context(
+            interp,
+            NativeCallInfo::call(recv_root),
+            Some(&context),
+            |ctx| {
+                let text = string_arg_to_jsstring_for_test(&args_root, 0, ctx).unwrap();
+                match method {
+                    "exec" => exec_once_native(&recv_root, text, ctx).unwrap(),
+                    "test" => {
+                        Value::boolean(!exec_once_native(&recv_root, text, ctx).unwrap().is_null())
+                    }
+                    _ => panic!("unknown regexp test method {method}"),
+                }
+            },
+        )
     }
 
     fn string_arg_to_jsstring_for_test(
@@ -2450,8 +2471,16 @@ mod tests {
     #[test]
     fn test_returns_boolean() {
         let mut interp = Interpreter::new();
-        let re = make("ab+c", "", &mut interp);
-        let text = Value::string(JsString::from_str("abbbc", interp.gc_heap_mut()).unwrap());
+        let _runtime_roots = interp.scope_runtime_roots_guard();
+        let mut re = make("ab+c", "", &mut interp);
+        let mut text = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_value(&mut re);
+            roots.add_value(&mut text);
+        }
+        text = Value::string(JsString::from_str("abbbc", interp.gc_heap_mut()).unwrap());
         assert_eq!(
             call("test", &re, &[text], &mut interp),
             Value::boolean(true)
@@ -2463,8 +2492,16 @@ mod tests {
     #[test]
     fn exec_returns_array_or_null() {
         let mut interp = Interpreter::new();
-        let re = make("(a)(b)", "", &mut interp);
-        let text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
+        let _runtime_roots = interp.scope_runtime_roots_guard();
+        let mut re = make("(a)(b)", "", &mut interp);
+        let mut text = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_value(&mut re);
+            roots.add_value(&mut text);
+        }
+        text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
         let r = call("exec", &re, &[text], &mut interp);
         let Some(arr) = r.as_array() else {
             panic!("expected array");
@@ -2496,11 +2533,19 @@ mod tests {
     #[test]
     fn exec_result_arrays_use_native_rooted_allocation() {
         let mut interp = Interpreter::new();
-        let re = make("(?<first>a)(b)", "d", &mut interp);
-        let text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
-        let before = interp.gc_heap().stats().new_allocated_bytes;
+        let _runtime_roots = interp.scope_runtime_roots_guard();
+        let mut re = make("(?<first>a)(b)", "d", &mut interp);
+        let mut text = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary.
+        unsafe {
+            roots.add_value(&mut re);
+            roots.add_value(&mut text);
+        }
+        text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
+        let before = interp.gc_heap_mut().gc_stats().alloc_bytes_total;
         let result = call("exec", &re, std::slice::from_ref(&text), &mut interp);
-        let after = interp.gc_heap().stats().new_allocated_bytes;
+        let after = interp.gc_heap_mut().gc_stats().alloc_bytes_total;
 
         assert!(
             after > before,
@@ -2522,8 +2567,17 @@ mod tests {
     #[test]
     fn exec_global_walks_through_text() {
         let mut interp = Interpreter::new();
-        let re = make("a", "g", &mut interp);
-        let text = Value::string(JsString::from_str("abab", interp.gc_heap_mut()).unwrap());
+        let _runtime_roots = interp.scope_runtime_roots_guard();
+        let mut re = make("a", "g", &mut interp);
+        let mut text = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
+        // SAFETY: both slots precede the scope and remain stationary across
+        // the complete global-exec sequence.
+        unsafe {
+            roots.add_value(&mut re);
+            roots.add_value(&mut text);
+        }
+        text = Value::string(JsString::from_str("abab", interp.gc_heap_mut()).unwrap());
         // First call → match at 0, lastIndex moves to 1.
         let r1 = call("exec", &re, std::slice::from_ref(&text), &mut interp);
         let (Some(arr), Some(rx)) = (r1.as_array(), re.as_regexp()) else {
@@ -2550,12 +2604,18 @@ mod tests {
     #[test]
     fn property_lookups() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = JsRegExp::compile(
+        let mut re = JsRegExp::compile(
             &mut gc_heap,
             &"ab+c".encode_utf16().collect::<Vec<_>>(),
             "gi",
         )
         .unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut gc_heap);
+        // SAFETY: `re` precedes the scope and remains stationary through every
+        // property-result allocation.
+        unsafe {
+            roots.add_raw_slot((&mut re as *mut JsRegExp).cast::<otter_gc::raw::RawGc>());
+        }
         let src = load_property(&re, &mut gc_heap, "source");
         assert_eq!(src.display_string(&gc_heap), "ab+c");
         let flags = load_property(&re, &mut gc_heap, "flags");
@@ -2577,8 +2637,18 @@ mod tests {
     #[test]
     fn last_index_writable() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re =
+        let mut re =
             JsRegExp::compile(&mut gc_heap, &"a".encode_utf16().collect::<Vec<_>>(), "g").unwrap();
+        let mut written = Value::undefined();
+        let mut nope = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut gc_heap);
+        // SAFETY: all slots precede the scope and remain stationary through
+        // property writes, result allocation, and execution coercion.
+        unsafe {
+            roots.add_raw_slot((&mut re as *mut JsRegExp).cast::<otter_gc::raw::RawGc>());
+            roots.add_value(&mut written);
+            roots.add_value(&mut nope);
+        }
         store_property(&re, &mut gc_heap, "lastIndex", Value::number_i32(7));
         assert_eq!(re.last_index(&gc_heap), 7);
         // Numeric execution coercion clamps negative values to 0,
@@ -2591,15 +2661,12 @@ mod tests {
         );
         // String writes are observable, and execution coerces them
         // numerically when needed.
-        let written = JsString::from_str("9", &mut gc_heap).unwrap();
-        store_property(&re, &mut gc_heap, "lastIndex", Value::string(written));
-        assert_eq!(
-            load_property(&re, &mut gc_heap, "lastIndex"),
-            Value::string(written)
-        );
+        written = Value::string(JsString::from_str("9", &mut gc_heap).unwrap());
+        store_property(&re, &mut gc_heap, "lastIndex", written);
+        assert_eq!(load_property(&re, &mut gc_heap, "lastIndex"), written);
         assert_eq!(re.last_index(&gc_heap), 9);
         // Non-lastIndex names are silently ignored.
-        let nope = Value::string(JsString::from_str("nope", &mut gc_heap).unwrap());
+        nope = Value::string(JsString::from_str("nope", &mut gc_heap).unwrap());
         store_property(&re, &mut gc_heap, "source", nope);
     }
 }

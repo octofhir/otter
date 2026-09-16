@@ -82,7 +82,7 @@ pub(crate) fn attempt(
     at: usize,
     config: ExecConfig,
     scratch: &mut Scratch,
-) -> Result<Option<Caps>, ExecError> {
+) -> (Result<Option<Caps>, ExecError>, u64) {
     let mut m = Matcher {
         program,
         input,
@@ -95,19 +95,20 @@ pub(crate) fn attempt(
     let mut stack = core::mem::take(&mut scratch.stack);
     let mut log = core::mem::take(&mut scratch.log);
     let result = m.run(0, at, false, caps, &mut stack, &mut log);
+    let steps = m.steps;
     scratch.stack = stack;
     scratch.log = log;
-    match result? {
-        Some((_, caps)) => Ok(Some(caps)),
-        None => Ok(None),
-    }
+    (
+        result.map(|matched| matched.map(|(_, captures)| captures)),
+        steps,
+    )
 }
 
 struct Matcher<'p, 't> {
     program: &'p Program,
     input: &'p Input<'t>,
     steps: u64,
-    step_limit: Option<u64>,
+    step_limit: u64,
 }
 
 /// A pending alternative on the backtrack stack.
@@ -164,9 +165,7 @@ impl Matcher<'_, '_> {
         // and the lookaround arm can call `&mut self` `eval_look` without a
         // separate decode-then-act dispatch step.
         let prog = self.program;
-        // `u64::MAX` sentinel turns the unbounded case into a never-taken
-        // compare instead of an `Option` test.
-        let limit = self.step_limit.unwrap_or(u64::MAX);
+        let limit = self.step_limit;
 
         while let Some(frame) = stack.pop() {
             // Account one step per backtrack point explored, not per

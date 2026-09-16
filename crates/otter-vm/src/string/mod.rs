@@ -1,7 +1,6 @@
 //! GC-backed JavaScript string handle.
 //!
-//! Phase B of the JsString migration: the public [`JsString`] is now
-//! a 16-byte `Copy` value pairing a 4-byte [`JsStringHandle`]
+//! The public [`JsString`] is a 16-byte `Copy` value pairing a 4-byte [`JsStringHandle`]
 //! (`Gc<JsStringBody>`) with a `u32` cached length and a `u32`
 //! truncated FNV-1a hash. All payload data — flat WTF-16, Latin-1,
 //! cons-rope, sliced views — lives on the GC heap inside
@@ -25,6 +24,8 @@
 //! - Reader methods (`to_utf16_vec`, `to_lossy_string`,
 //!   `char_code_at`, `index_of`, …) require an explicit
 //!   `&otter_gc::GcHeap` parameter; no thread-local heap.
+//! - Ordinary string bodies start in moving young space; callers keep values
+//!   live across allocation through scoped handles or traced slots.
 //! - Concatenation preserves the exact `u32` UTF-16 length contract. A wider
 //!   sum returns [`StringConcatError::StringTooLong`] before allocation.
 //!
@@ -341,8 +342,21 @@ impl JsString {
         if left.is_empty() {
             return Ok(right);
         }
+        let mut left_handle = left.handle;
+        let mut right_handle = right.handle;
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: both handle slots precede the scope and remain stationary
+        // through every flatten/allocation the rope builder may perform.
+        unsafe {
+            scope.add_raw_slot(
+                (&mut left_handle as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>(),
+            );
+            scope.add_raw_slot(
+                (&mut right_handle as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>(),
+            );
+        }
         let mut roots = no_extra_roots;
-        let handle = gc_body::concat_string_bodies(heap, left.handle, right.handle, &mut roots)?;
+        let handle = gc_body::concat_string_bodies(heap, left_handle, right_handle, &mut roots)?;
         let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
         Ok(Self {
             handle,
@@ -357,8 +371,15 @@ impl JsString {
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn slice(self, start: u32, length: u32, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        let mut source = self.handle;
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: `source` precedes the scope and remains stationary through
+        // the slice allocation.
+        unsafe {
+            scope.add_raw_slot((&mut source as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>());
+        }
         let mut roots = no_extra_roots;
-        let handle = gc_body::slice_string_body(heap, self.handle, start, length, &mut roots)?;
+        let handle = gc_body::slice_string_body(heap, source, start, length, &mut roots)?;
         let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
         Ok(Self {
             handle,
@@ -373,8 +394,15 @@ impl JsString {
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn flatten(self, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        let mut source = self.handle;
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: `source` precedes the scope and remains stationary through
+        // the flatten allocation.
+        unsafe {
+            scope.add_raw_slot((&mut source as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>());
+        }
         let mut roots = no_extra_roots;
-        let handle = gc_body::flatten_string_body(heap, self.handle, &mut roots)?;
+        let handle = gc_body::flatten_string_body(heap, source, &mut roots)?;
         Ok(Self {
             handle,
             cached_len: self.cached_len,
@@ -390,8 +418,15 @@ impl JsString {
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn flatten_in_place(self, heap: &mut GcHeap) -> Result<(), OutOfMemory> {
+        let mut source = self.handle;
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: `source` precedes the scope and remains stationary through
+        // cache/body allocation.
+        unsafe {
+            scope.add_raw_slot((&mut source as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>());
+        }
         let mut roots = no_extra_roots;
-        gc_body::flatten_in_place(heap, self.handle, &mut roots)
+        gc_body::flatten_in_place(heap, source, &mut roots)
     }
 
     /// Body handle for the legacy bridge. Phase B: the wrapper *is*
@@ -442,7 +477,14 @@ impl JsString {
     /// # Errors
     /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
     pub fn ensure_utf16_cache(self, heap: &mut GcHeap) -> Result<(), otter_gc::OutOfMemory> {
-        gc_body::ensure_utf16_cache(heap, self.handle, &mut |_| {})
+        let mut source = self.handle;
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: `source` precedes the scope and remains stationary through
+        // widened-cache allocation and publication.
+        unsafe {
+            scope.add_raw_slot((&mut source as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>());
+        }
+        gc_body::ensure_utf16_cache(heap, source, &mut |_| {})
     }
 
     /// Render as a lossy Rust `String` for display / diagnostics.
@@ -874,6 +916,15 @@ impl std::error::Error for Interrupted {}
 mod tests {
     use super::*;
 
+    unsafe fn root_string(scope: &mut otter_gc::RootScope, string: &mut JsString) {
+        // SAFETY: callers keep `string` stationary until `scope` drops.
+        unsafe {
+            scope.add_raw_slot(
+                (&mut string.handle as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>(),
+            );
+        }
+    }
+
     fn h() -> GcHeap {
         GcHeap::new().expect("gc heap")
     }
@@ -950,7 +1001,10 @@ mod tests {
     #[test]
     fn latin1_equals_flat_for_ascii() {
         let mut heap = h();
-        let thin = JsString::from_latin1(b"hello", &mut heap).unwrap();
+        let mut thin = JsString::from_latin1(b"hello", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: `thin` remains stationary through the second allocation.
+        unsafe { root_string(&mut roots, &mut thin) };
         let flat = JsString::from_str("hello", &mut heap).unwrap();
         assert!(thin.equals(flat, &heap));
         assert!(flat.equals(thin, &heap));
@@ -968,8 +1022,13 @@ mod tests {
     #[test]
     fn equality_on_flat() {
         let mut heap = h();
-        let a = JsString::from_str("abc", &mut heap).unwrap();
-        let b = JsString::from_str("abc", &mut heap).unwrap();
+        let mut a = JsString::from_str("abc", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: every registered string remains stationary.
+        unsafe { root_string(&mut roots, &mut a) };
+        let mut b = JsString::from_str("abc", &mut heap).unwrap();
+        // SAFETY: `b` remains stationary through the next allocation.
+        unsafe { root_string(&mut roots, &mut b) };
         let c = JsString::from_str("abd", &mut heap).unwrap();
         assert!(a.equals(b, &heap));
         assert!(!a.equals(c, &heap));
@@ -981,7 +1040,10 @@ mod tests {
         // place; a `Cons` node is built only past it, so the operands here are
         // deliberately long enough to exceed it.
         let mut heap = h();
-        let a = JsString::from_str("aaaaaaaaaaaaaaaa", &mut heap).unwrap();
+        let mut a = JsString::from_str("aaaaaaaaaaaaaaaa", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: `a` remains stationary through the second allocation.
+        unsafe { root_string(&mut roots, &mut a) };
         let b = JsString::from_str("bbbbbbbbbbbbbbbb", &mut heap).unwrap();
         let ab = JsString::concat(a, b, &mut heap).unwrap();
         assert_eq!(ab.len(), 32);
@@ -998,6 +1060,10 @@ mod tests {
     fn concat_rejects_the_32nd_doubling_before_allocation() {
         let mut heap = h();
         let mut rope = JsString::from_str("a", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: `rope` remains stationary and is updated in place by every
+        // loop assignment.
+        unsafe { root_string(&mut roots, &mut rope) };
         for _ in 0..31 {
             rope = JsString::concat(rope, rope, &mut heap).unwrap();
         }
@@ -1018,12 +1084,11 @@ mod tests {
             "length overflow must fail before allocating a rope node"
         );
 
-        let reusable = JsString::concat(
-            JsString::from_str("still", &mut heap).unwrap(),
-            JsString::from_str("-usable", &mut heap).unwrap(),
-            &mut heap,
-        )
-        .unwrap();
+        let mut reusable_left = JsString::from_str("still", &mut heap).unwrap();
+        // SAFETY: the left operand remains stationary through right allocation.
+        unsafe { root_string(&mut roots, &mut reusable_left) };
+        let reusable_right = JsString::from_str("-usable", &mut heap).unwrap();
+        let reusable = JsString::concat(reusable_left, reusable_right, &mut heap).unwrap();
         assert_eq!(reusable.to_lossy_string(&heap), "still-usable");
     }
 
@@ -1032,7 +1097,12 @@ mod tests {
         // Build s += "abcd" 1000 times. Each step is O(1) cons work.
         let mut heap = h();
         let mut s = JsString::empty(&mut heap).unwrap();
-        let piece = JsString::from_str("abcd", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: both loop operands remain stationary while the scope lives.
+        unsafe { root_string(&mut roots, &mut s) };
+        let mut piece = JsString::from_str("abcd", &mut heap).unwrap();
+        // SAFETY: `piece` remains stationary while the scope lives.
+        unsafe { root_string(&mut roots, &mut piece) };
         for _ in 0..1_000 {
             s = JsString::concat(s, piece, &mut heap).unwrap();
         }
@@ -1047,7 +1117,10 @@ mod tests {
         // Flat UTF-16 parent; slicing Latin-1 collapses into a fresh compact
         // body and would not exercise the Sliced-over-Flat path.
         let units = vec![0x0100, b'a' as u16, b'b' as u16, b'c' as u16, b'd' as u16];
-        let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
+        let mut s = JsString::from_utf16_units(&units, &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: `s` remains stationary through slice allocation.
+        unsafe { root_string(&mut roots, &mut s) };
         let sliced = s.slice(1, 3, &mut heap).unwrap();
         assert_eq!(sliced.len(), 3);
         assert_eq!(sliced.to_lossy_string(&heap), "abc");
@@ -1059,9 +1132,14 @@ mod tests {
     #[test]
     fn slice_of_cons_flattens() {
         let mut heap = h();
-        let a = JsString::from_str("ab", &mut heap).unwrap();
+        let mut a = JsString::from_str("ab", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: registered strings remain stationary.
+        unsafe { root_string(&mut roots, &mut a) };
         let b = JsString::from_str("cd", &mut heap).unwrap();
-        let cons = JsString::concat(a, b, &mut heap).unwrap();
+        let mut cons = JsString::concat(a, b, &mut heap).unwrap();
+        // SAFETY: `cons` remains stationary through slice allocation.
+        unsafe { root_string(&mut roots, &mut cons) };
         let sliced = cons.slice(1, 2, &mut heap).unwrap();
         assert_eq!(sliced.to_lossy_string(&heap), "bc");
     }
@@ -1069,7 +1147,10 @@ mod tests {
     #[test]
     fn char_code_at_walks_rope() {
         let mut heap = h();
-        let a = JsString::from_str("ab", &mut heap).unwrap();
+        let mut a = JsString::from_str("ab", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: `a` remains stationary through the second allocation.
+        unsafe { root_string(&mut roots, &mut a) };
         let b = JsString::from_str("cd", &mut heap).unwrap();
         let cons = JsString::concat(a, b, &mut heap).unwrap();
         assert_eq!(cons.char_code_at(0, &heap), Some(b'a' as u16));
@@ -1091,8 +1172,14 @@ mod tests {
     #[test]
     fn flatten_is_iterative_on_deep_rope() {
         let mut heap = h();
-        let leaf = JsString::from_str("ab", &mut heap).unwrap();
+        let mut leaf = JsString::from_str("ab", &mut heap).unwrap();
         let mut acc = leaf;
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: both slots remain stationary and `acc` is updated in place.
+        unsafe {
+            root_string(&mut roots, &mut leaf);
+            root_string(&mut roots, &mut acc);
+        }
         for _ in 0..(MAX_ROPE_DEPTH * 2) {
             acc = JsString::concat(acc, leaf, &mut heap).unwrap();
         }
@@ -1104,7 +1191,11 @@ mod tests {
     #[test]
     fn empty_concat_is_identity() {
         let mut heap = h();
-        let a = JsString::from_str("abc", &mut heap).unwrap();
+        let mut a = JsString::from_str("abc", &mut heap).unwrap();
+        let mut roots = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: `a` remains stationary through empty-string allocation and
+        // both identity checks.
+        unsafe { root_string(&mut roots, &mut a) };
         let empty = JsString::empty(&mut heap).unwrap();
         let r1 = JsString::concat(a, empty, &mut heap).unwrap();
         let r2 = JsString::concat(empty, a, &mut heap).unwrap();

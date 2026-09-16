@@ -470,19 +470,33 @@ mod tests {
     fn child_shapes_keep_gc_string_keys_in_order() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let root = alloc_root_shape_body_with_roots(&mut heap, &mut roots).expect("root");
-        let x = alloc_key(&mut heap, 1, "x");
-        let y = alloc_key(&mut heap, 2, "y");
+        let mut root = ShapeHandle::null();
+        let mut x = JsStringHandle::null();
+        let mut y = JsStringHandle::null();
+        let mut sx = ShapeHandle::null();
+        let mut sxy = ShapeHandle::null();
+        let mut scope = otter_gc::RootScope::new(&mut heap);
+        // SAFETY: every handle slot precedes the scope and remains stationary
+        // through all allocations and the final parent-chain walk.
+        unsafe {
+            scope.add_raw_slot((&mut root as *mut ShapeHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut x as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut y as *mut JsStringHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut sx as *mut ShapeHandle).cast::<RawGc>());
+            scope.add_raw_slot((&mut sxy as *mut ShapeHandle).cast::<RawGc>());
+        }
+        root = alloc_root_shape_body_with_roots(&mut heap, &mut roots).expect("root");
+        x = alloc_key(&mut heap, 1, "x");
+        y = alloc_key(&mut heap, 2, "y");
 
         let flags = PropertyFlags::data_default();
         let atom_x = AtomId::from_global(1);
         let atom_y = AtomId::from_global(2);
-        let sx =
+        sx =
             alloc_child_shape_body_with_roots(&mut heap, root, x, atom_x, flags, false, &mut roots)
                 .expect("sx");
-        let sxy =
-            alloc_child_shape_body_with_roots(&mut heap, sx, y, atom_y, flags, false, &mut roots)
-                .expect("sxy");
+        sxy = alloc_child_shape_body_with_roots(&mut heap, sx, y, atom_y, flags, false, &mut roots)
+            .expect("sxy");
 
         assert_eq!(shape_offset_of_key(&heap, sxy, x), Some(0));
         assert_eq!(shape_offset_of_key(&heap, sxy, y), Some(1));

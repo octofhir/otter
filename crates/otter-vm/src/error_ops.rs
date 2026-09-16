@@ -26,7 +26,6 @@
 
 use crate::activation_stack::ActivationStack;
 use crate::rooting::RootScopeExt;
-use smallvec::SmallVec;
 
 use crate::{
     ActiveFrameMut, ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError, Value,
@@ -145,11 +144,12 @@ impl Interpreter {
             .as_ref()
             .map(|text| JsString::from_str(text, self.gc_heap_mut()).map(Value::string))
             .transpose()?;
-        let mut extra_roots: SmallVec<[&Value; 4]> = smallvec::smallvec![message_value];
-        if let Some(ref message_gc_value) = message_gc_value {
-            extra_roots.push(message_gc_value);
-        }
-        let mut obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra_roots)?;
+        let has_message = message_gc_value.is_some();
+        let mut pending = [
+            *message_value,
+            message_gc_value.unwrap_or_else(Value::undefined),
+        ];
+        let mut obj = self.alloc_stack_rooted_object_with_pending_values(stack, &mut pending)?;
         // Fetch the prototype only after every allocation in this function:
         // the message-string and object allocs above can each trigger a major
         // GC that relocates the (old-gen) error prototype. The class registry
@@ -157,10 +157,18 @@ impl Interpreter {
         // always yields the live pointer — a handle captured earlier would be
         // stale and silently corrupt the new instance's `[[Prototype]]`.
         let proto = self.error_classes.prototype(kind);
+        let mut message_gc_value = pending[1];
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: both locals are declared before `roots` and remain stable
+        // until the scope is dropped below.
+        unsafe {
+            roots.add_object(&mut obj);
+            roots.add_value(&mut message_gc_value);
+        }
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         // §20.5.* — mark the `[[ErrorData]]` internal slot.
         object::set_error_data(&mut obj, &mut self.gc_heap);
-        if let Some(message_gc_value) = message_gc_value {
+        if has_message {
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,
             // [[Configurable]]: true }`. Ordinary `set` would install
@@ -173,6 +181,7 @@ impl Interpreter {
                 object::PropertyDescriptor::data(message_gc_value, true, false, true),
             );
         }
+        drop(roots);
         Ok(obj)
     }
 
@@ -723,6 +732,7 @@ pub(crate) fn native_to_vm_error_with_stack(
         ),
         NativeError::Exit { code } => VmError::Exit { code },
         NativeError::Interrupted => VmError::Interrupted,
+        NativeError::BudgetExceeded { reason } => interp.err_budget(reason.into()),
         NativeError::OutOfMemory {
             name: _,
             requested_bytes,

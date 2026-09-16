@@ -37,4 +37,4 @@ function drive(rounds) {
   }
   return acc + "|" + tail;
 }
-console.log(drive(3000));
+console.log(drive(256));

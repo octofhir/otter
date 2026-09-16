@@ -7,6 +7,8 @@
 //! # Invariants
 //! - A setter along the prototype chain can re-enter JavaScript; the receiver
 //!   is re-read from its rooted slot after any such call.
+//! - Proxy key materialization and trap reentry keep target, value, receiver,
+//!   and symbol keys in one handle scope until invariant checks complete.
 
 use crate::activation_stack::ActivationStack;
 use crate::{
@@ -383,67 +385,120 @@ impl Interpreter {
             self.pop_iteration_anchors_to(base);
             return outcome;
         }
-        if let Some(proxy) = target.as_proxy() {
-            if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform 'set' on a proxy that has been revoked".to_string()).into(),
-                ));
-            }
-            let key_value = self.vm_property_key_to_value(key)?;
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![proxy.target(&self.gc_heap), key_value, value, receiver,];
-            return match self.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
-                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
-                    let ok = result.to_boolean(&self.gc_heap);
-                    if !ok {
-                        return Ok(false);
-                    }
-                    let target_value = proxy.target(&self.gc_heap);
-                    let target_desc = self.ordinary_get_own_property_descriptor_value(
-                        stack,
-                        context,
-                        target_value,
-                        key,
-                        hops + 1,
-                    )?;
-                    if let Some(desc) = target_desc.as_ref()
-                        && !desc.configurable()
-                    {
-                        match &desc.kind {
-                            object::DescriptorKind::Data { value: target_v }
-                                if !desc.writable()
-                                    && !abstract_ops::same_value(
-                                        target_v,
-                                        &value,
-                                        &self.gc_heap,
-                                    ) =>
-                            {
-                                return Err(self.err_type((
-                                        "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                            .to_string()).into()));
-                            }
-                            object::DescriptorKind::Accessor { setter: None, .. } => {
-                                return Err(self.err_type((
-                                        "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                            .to_string()).into()));
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(true)
+        if target.as_proxy().is_some() {
+            return self.with_handle_scope(|interp, scope| {
+                let proxy_root = interp.scoped_value(scope, target);
+                let value_root = interp.scoped_value(scope, value);
+                let receiver_root = interp.scoped_value(scope, receiver);
+                let proxy = interp
+                    .escape_scoped(proxy_root)
+                    .as_proxy()
+                    .expect("proxy branch keeps a proxy target");
+                if proxy.is_revoked(&interp.gc_heap) {
+                    return Err(interp.err_type(
+                        ("Cannot perform 'set' on a proxy that has been revoked".to_string())
+                            .into(),
+                    ));
                 }
-                crate::object_internal_ops::ProxyTrap::NoTrap {
-                    target: fallthrough_target,
-                } => self.ordinary_set_data_value(
-                    stack,
-                    context,
-                    fallthrough_target,
-                    key,
-                    value,
-                    receiver,
-                    hops + 1,
-                ),
-            };
+
+                // ToPropertyKey materialization allocates for named keys. Park
+                // every operand before it so the trap receives relocated
+                // target/value/receiver handles rather than pre-move copies.
+                let key_value = interp.vm_property_key_to_value(key)?;
+                let key_root = interp.scoped_value(scope, key_value);
+                let proxy = interp
+                    .escape_scoped(proxy_root)
+                    .as_proxy()
+                    .expect("rooted proxy remains a proxy");
+                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                    proxy.target(&interp.gc_heap),
+                    interp.escape_scoped(key_root),
+                    interp.escape_scoped(value_root),
+                    interp.escape_scoped(receiver_root),
+                ];
+                match interp.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
+                    crate::object_internal_ops::ProxyTrap::Trapped(result) => {
+                        if !result.to_boolean(&interp.gc_heap) {
+                            return Ok(false);
+                        }
+                        let proxy = interp
+                            .escape_scoped(proxy_root)
+                            .as_proxy()
+                            .expect("rooted proxy remains a proxy after trap reentry");
+                        let live_key = match key {
+                            VmPropertyKey::Symbol(_) => VmPropertyKey::Symbol(
+                                interp
+                                    .escape_scoped(key_root)
+                                    .as_symbol(&interp.gc_heap)
+                                    .expect("rooted symbol key remains a symbol"),
+                            ),
+                            _ => VmPropertyKey::OwnedString(
+                                key.string_name()
+                                    .expect("non-symbol key has string spelling")
+                                    .to_owned(),
+                            ),
+                        };
+                        let target_desc = interp.ordinary_get_own_property_descriptor_value(
+                            stack,
+                            context,
+                            proxy.target(&interp.gc_heap),
+                            &live_key,
+                            hops + 1,
+                        )?;
+                        if let Some(desc) = target_desc.as_ref()
+                            && !desc.configurable()
+                        {
+                            match &desc.kind {
+                                object::DescriptorKind::Data { value: target_v }
+                                    if !desc.writable()
+                                        && !abstract_ops::same_value(
+                                            target_v,
+                                            &interp.escape_scoped(value_root),
+                                            &interp.gc_heap,
+                                        ) =>
+                                {
+                                    return Err(interp.err_type((
+                                            "Proxy set trap reported success but target is non-configurable non-writable with a different value"
+                                                .to_string()).into()));
+                                }
+                                object::DescriptorKind::Accessor { setter: None, .. } => {
+                                    return Err(interp.err_type((
+                                            "Proxy set trap reported success but target is a non-configurable accessor without a setter"
+                                                .to_string()).into()));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(true)
+                    }
+                    crate::object_internal_ops::ProxyTrap::NoTrap {
+                        target: fallthrough_target,
+                    } => {
+                        let live_key = match key {
+                            VmPropertyKey::Symbol(_) => VmPropertyKey::Symbol(
+                                interp
+                                    .escape_scoped(key_root)
+                                    .as_symbol(&interp.gc_heap)
+                                    .expect("rooted symbol key remains a symbol"),
+                            ),
+                            _ => VmPropertyKey::OwnedString(
+                                key.string_name()
+                                    .expect("non-symbol key has string spelling")
+                                    .to_owned(),
+                            ),
+                        };
+                        interp.ordinary_set_data_value(
+                            stack,
+                            context,
+                            fallthrough_target,
+                            &live_key,
+                            interp.escape_scoped(value_root),
+                            interp.escape_scoped(receiver_root),
+                            hops + 1,
+                        )
+                    }
+                }
+            });
         }
         if let Some(arr) = target.as_array() {
             // §10.4.2 arrays inherit OrdinarySet but their receiver

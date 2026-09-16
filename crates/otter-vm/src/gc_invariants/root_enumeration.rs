@@ -598,6 +598,8 @@ fn regexp_root_survives_force_gc() {
     let text: Vec<u16> = "aaab".encode_utf16().collect();
     let first = re
         .find_from_utf16(interp.gc_heap(), &text, 0)
+        .result
+        .expect("within matcher budget")
         .into_iter()
         .next()
         .expect("regexp remains executable after force_gc");

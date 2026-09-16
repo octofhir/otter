@@ -1715,71 +1715,120 @@ impl Interpreter {
         desc_obj: Option<JsObject>,
         descriptor: object::PropertyDescriptor,
     ) -> Result<bool, VmError> {
-        let descriptor = match self.ordinary_function_own_property_descriptor(
-            context,
-            owner,
-            function_id,
-            key,
-        )? {
-            Some(existing) => {
-                let descriptor = if function_metadata::ordinary_function_metadata_key(key).is_some()
-                {
-                    match desc_obj {
-                        Some(desc_obj) => complete_descriptor_defaults_from_object(
-                            desc_obj,
-                            &self.gc_heap,
-                            descriptor,
-                            &existing,
-                        ),
-                        None => descriptor,
-                    }
-                } else {
-                    descriptor
-                };
-                match object::validate_descriptor_update(&existing, &descriptor, &self.gc_heap) {
-                    Some(merged) => merged,
-                    None => return Ok(false),
-                }
-            }
-            None => {
-                let has_virtual_prototype = context.is_some_and(|context| {
-                    key == "prototype"
-                        && context
-                            .for_function(function_id)
-                            .ok()
-                            .is_some_and(|owner| owner.function_has_prototype_property(function_id))
-                        && !self
-                            .function_deleted_metadata
-                            .contains(&(function_id, "prototype"))
-                });
-                if !has_virtual_prototype
-                    && !self.ordinary_function_is_extensible(owner, function_id)
-                {
-                    return Ok(false);
-                }
-                descriptor
-            }
-        };
-        // The bag allocation and the define below can move every carried
-        // value, and a shared reference into a stack local is not a root the
-        // collector can rewrite. The owner closure and the descriptor's
-        // payload values ride iteration-anchor slots and are re-read after
-        // each allocating step.
+        // Even the existing-descriptor lookup can allocate: virtual `name`
+        // and `length` metadata are materialized as ordinary JS values. Park
+        // every incoming cell before that lookup, not merely before the later
+        // expando-bag allocation. Computed-property SetFunctionName reaches
+        // this path with a freshly allocated young string.
         let owner_slot =
             self.push_iteration_anchor(owner.map(Value::closure).unwrap_or(Value::undefined())) - 1;
         let base = owner_slot;
-        let (value_slot, getter_slot, setter_slot) = match &descriptor.kind {
-            object::DescriptorKind::Data { value } => {
-                (Some(self.push_iteration_anchor(*value) - 1), None, None)
-            }
-            object::DescriptorKind::Accessor { getter, setter } => (
-                None,
-                getter.as_ref().map(|g| self.push_iteration_anchor(*g) - 1),
-                setter.as_ref().map(|s| self.push_iteration_anchor(*s) - 1),
-            ),
-        };
-        let flags = descriptor.flags;
+        let desc_obj_slot = desc_obj.map(|obj| self.push_iteration_anchor(Value::object(obj)) - 1);
+        let incoming_flags = descriptor.flags;
+        let (incoming_value_slot, incoming_getter_slot, incoming_setter_slot) =
+            match descriptor.kind {
+                object::DescriptorKind::Data { value } => {
+                    (Some(self.push_iteration_anchor(value) - 1), None, None)
+                }
+                object::DescriptorKind::Accessor { getter, setter } => (
+                    None,
+                    getter.map(|value| self.push_iteration_anchor(value) - 1),
+                    setter.map(|value| self.push_iteration_anchor(value) - 1),
+                ),
+            };
         let outcome = (|this: &mut Self| {
+            let existing = this.ordinary_function_own_property_descriptor(
+                context,
+                this.iteration_anchor(owner_slot).as_closure(&this.gc_heap),
+                function_id,
+                key,
+            )?;
+            // The virtual metadata lookup above may allocate. Only now rebuild
+            // the incoming descriptor from collector-rewritten anchors; a raw
+            // descriptor assembled before the lookup would retain forwarding
+            // pointers for young string/accessor values.
+            let incoming_kind = match (
+                incoming_value_slot,
+                incoming_getter_slot,
+                incoming_setter_slot,
+            ) {
+                (Some(value_slot), _, _) => object::DescriptorKind::Data {
+                    value: this.iteration_anchor(value_slot),
+                },
+                (None, getter_slot, setter_slot) => object::DescriptorKind::Accessor {
+                    getter: getter_slot.map(|slot| this.iteration_anchor(slot)),
+                    setter: setter_slot.map(|slot| this.iteration_anchor(slot)),
+                },
+            };
+            let incoming = object::PropertyDescriptor {
+                kind: incoming_kind,
+                flags: incoming_flags,
+            };
+            let descriptor = match existing {
+                Some(existing) => {
+                    let incoming =
+                        if function_metadata::ordinary_function_metadata_key(key).is_some() {
+                            match desc_obj_slot {
+                                Some(slot) => complete_descriptor_defaults_from_object(
+                                    this.iteration_anchor(slot)
+                                        .as_object()
+                                        .ok_or(VmError::TypeMismatch)?,
+                                    &this.gc_heap,
+                                    incoming,
+                                    &existing,
+                                ),
+                                None => incoming,
+                            }
+                        } else {
+                            incoming
+                        };
+                    match object::validate_descriptor_update(&existing, &incoming, &this.gc_heap) {
+                        Some(merged) => merged,
+                        None => return Ok(false),
+                    }
+                }
+                None => {
+                    // The virtual metadata lookup above may allocate and move
+                    // the closure. Never carry its raw handle across that
+                    // boundary; recover the collector-rewritten owner from
+                    // the anchor before consulting instance state.
+                    let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
+                    let has_virtual_prototype = context.is_some_and(|context| {
+                        key == "prototype"
+                            && context.for_function(function_id).ok().is_some_and(|owner| {
+                                owner.function_has_prototype_property(function_id)
+                            })
+                            && !this
+                                .function_deleted_metadata
+                                .contains(&(function_id, "prototype"))
+                    });
+                    if !has_virtual_prototype
+                        && !this.ordinary_function_is_extensible(owner, function_id)
+                    {
+                        return Ok(false);
+                    }
+                    incoming
+                }
+            };
+            // Validation can replace the incoming descriptor with a merged
+            // one. Root that exact result before allocating the property bag
+            // or any of its side tables.
+            let (value_slot, getter_slot, setter_slot) = match descriptor.kind {
+                object::DescriptorKind::Data { value } => {
+                    (Some(this.push_iteration_anchor(value) - 1), None, None)
+                }
+                object::DescriptorKind::Accessor { getter, setter } => (
+                    None,
+                    getter.map(|value| this.push_iteration_anchor(value) - 1),
+                    setter.map(|value| this.push_iteration_anchor(value) - 1),
+                ),
+            };
+            let flags = descriptor.flags;
+            // Descriptor lookup can allocate even when it returns an existing
+            // virtual `name` or `length`. Re-read the owner immediately before
+            // the bag allocation so the closure→bag edge is installed on the
+            // live body, not on a vacated nursery copy.
+            let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
             let mut bag = this.function_user_bag(stack, owner, function_id, &[])?;
             let kind = match (value_slot, getter_slot, setter_slot) {
                 (Some(value_slot), _, _) => object::DescriptorKind::Data {

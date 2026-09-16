@@ -83,6 +83,8 @@ Initial charging rules:
 - loop backedges and basic-block entries are preferred accounting points
   once compact bytecode has block metadata;
 - allocation charges both reductions and bytes.
+- regular-expression backtrack points charge the same reduction ledger, and
+  every search also has a finite engine-local ceiling.
 
 The dispatch loop must not perform expensive accounting on every opcode if
 that becomes measurable. Use block-level or backedge counters where the
@@ -171,6 +173,7 @@ The runtime must expose cheap aggregate counters suitable for tests and
 production diagnostics:
 
 - reductions executed;
+- regular-expression backtrack steps included in those reductions;
 - forced yields;
 - max contiguous VM turn duration;
 - allocations and allocated bytes;

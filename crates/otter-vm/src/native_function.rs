@@ -1689,6 +1689,14 @@ pub enum NativeError {
     /// catchable by user code.
     #[error("native function interrupted")]
     Interrupted,
+    /// Structural resource exhaustion raised while a native operation was
+    /// executing. This is not a JavaScript throw and must retain the VM's
+    /// `BudgetExceeded` identity across the native boundary.
+    #[error("native function exceeded runtime budget: {reason}")]
+    BudgetExceeded {
+        /// Human-readable resource that exhausted its finite budget.
+        reason: String,
+    },
     /// Heap-limit exhaustion surfaced from inside a native body. Kept
     /// distinct from [`NativeError::TypeError`] so it round-trips to
     /// [`crate::VmError::OutOfMemory`] — a catchable JS `RangeError`
@@ -1797,6 +1805,7 @@ pub fn vm_to_native_error(
             }
         }
         crate::VmError::Interrupted => NativeError::Interrupted,
+        crate::VmError::BudgetExceeded => NativeError::BudgetExceeded { reason: message() },
         // Heap exhaustion must keep its identity across the native
         // boundary: a generic `TypeError` fallback would render OOM as
         // an uncatchable-looking type error and lose the host's
@@ -1814,18 +1823,18 @@ pub fn vm_to_native_error(
         // boundary so a host (e.g. the CommonJS loader) can surface a clean
         // process termination instead of an uncatchable-looking TypeError.
         crate::VmError::Exit { code } => NativeError::Exit { code },
-        // URIError / BudgetExceeded / UnknownIntrinsic / InvalidRegExp are
+        // URIError / UnknownIntrinsic / InvalidRegExp are
         // raised with a message or name detail of their own.
         crate::VmError::URIError => NativeError::URIError {
             name,
             reason: message(),
         },
-        crate::VmError::BudgetExceeded
-        | crate::VmError::UnknownIntrinsic
-        | crate::VmError::InvalidRegExp => NativeError::TypeError {
-            name,
-            reason: message(),
-        },
+        crate::VmError::UnknownIntrinsic | crate::VmError::InvalidRegExp => {
+            NativeError::TypeError {
+                name,
+                reason: message(),
+            }
+        }
         // Everything else raises no detail. The isolate's slot holds one
         // error's detail at a time and is only emptied where an error
         // surfaces, so reading it here would pin whatever was raised last

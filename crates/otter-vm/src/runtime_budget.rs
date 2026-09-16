@@ -129,6 +129,8 @@ pub struct RuntimeBudgetStats {
     pub turns_finished: u64,
     /// Total reduction units charged.
     pub reductions_executed: u64,
+    /// RegExp backtrack points charged into `reductions_executed`.
+    pub regex_backtrack_steps: u64,
     /// `reductions_executed` sampled when the active root turn began. The
     /// turn-local count is the delta against it ([`Self::current_turn_reductions`]),
     /// so the per-instruction charge updates exactly one counter.
@@ -264,6 +266,13 @@ impl RuntimeBudgetStats {
     #[inline]
     pub(crate) fn record_reductions(&mut self, units: u64) {
         self.reductions_executed = self.reductions_executed.wrapping_add(units);
+    }
+
+    /// Charge exact matcher work both to its diagnostic counter and to the
+    /// shared reduction ledger used by the per-turn runtime budget.
+    pub(crate) fn record_regex_backtrack_steps(&mut self, steps: u64) {
+        self.regex_backtrack_steps = self.regex_backtrack_steps.saturating_add(steps);
+        self.record_reductions(steps);
     }
 
     pub(crate) fn record_bytecode_calls(&mut self, calls: u64) {

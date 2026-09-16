@@ -980,6 +980,8 @@ pub struct RuntimeExecutionStats {
     pub property_store_disables: u64,
     /// Runtime reduction units executed.
     pub reductions_executed: u64,
+    /// RegExp backtrack points included in `reductions_executed`.
+    pub regex_backtrack_steps: u64,
     /// Bytecode calls observed by runtime budget stats.
     pub bytecode_calls: u64,
     /// Native calls observed by runtime budget stats.
@@ -4813,6 +4815,7 @@ impl Runtime {
             property_store_installs: ic.store_installs,
             property_store_disables: ic.store_disables,
             reductions_executed: budget.reductions_executed,
+            regex_backtrack_steps: budget.regex_backtrack_steps,
             bytecode_calls: budget.bytecode_calls,
             native_calls: budget.native_calls,
             construct_calls: budget.construct_calls,

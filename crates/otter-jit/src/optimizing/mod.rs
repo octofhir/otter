@@ -2,7 +2,7 @@
 //!
 //! Supported functions lower once through typed scalar HIR, target-neutral
 //! Machine IR, regalloc2, exact safepoint/deoptimization metadata, and the
-//! AArch64 encoder. A function outside that pipeline returns [`Unsupported`];
+//! selected target encoder. A function outside that pipeline returns [`Unsupported`];
 //! optimizing compilation has no second SSA, allocator, emitter, or artifact
 //! fallback. The VM retains the independently compiled template body as its
 //! baseline for such functions.
@@ -279,7 +279,7 @@ impl JitFunctionCode for OptimizedCode {
 
 /// Compile through the Machine optimizing backend, or return [`Unsupported`]
 /// without producing executable code.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
@@ -289,7 +289,7 @@ pub fn compile_optimized(
         .map(|output| output.code)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn compile_optimized_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
@@ -297,7 +297,10 @@ pub(crate) fn compile_optimized_with_artifacts(
     capture_events: bool,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
+    #[cfg(target_arch = "aarch64")]
     let target_spec = crate::machine::TargetSpec::aarch64();
+    #[cfg(target_arch = "x86_64")]
+    let target_spec = crate::machine::TargetSpec::x86_64();
     crate::machine::numeric::try_compile(
         &target_spec,
         view,
@@ -308,19 +311,19 @@ pub(crate) fn compile_optimized_with_artifacts(
     )
 }
 
-/// Non-arm64 stub: the first optimizing backend is arm64-only.
-#[cfg(not(target_arch = "aarch64"))]
+/// Stub for architectures without a native optimizing encoder.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
     let _ = (view, code_object_id);
     Err(Unsupported::OperandShape(
-        "optimizing compiler is arm64-only",
+        "optimizing compiler target is unavailable",
     ))
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) fn compile_optimized_with_transitions(
     view: &JitCompileSnapshot,
     code_object_id: u64,

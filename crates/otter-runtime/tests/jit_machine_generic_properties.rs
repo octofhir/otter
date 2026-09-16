@@ -37,8 +37,6 @@
 //! - `crates/otter-vm/src/runtime_activation/value_ops.rs` owns the fixed value
 //!   boundary used by generated named-property misses.
 
-#![cfg(target_arch = "aarch64")]
-
 use std::collections::BTreeSet;
 
 use otter_runtime::{
@@ -80,16 +78,19 @@ JSON.stringify([
 
 const WARMED_TRANSITION_SETUP: &str = r#"
 function machineSnapshotAddNull(target, value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   target.added = value;
   return value;
 }
 function machineSnapshotAddDefault(target, value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   target.added = value;
   return value;
 }
 globalThis.__snapshotWritablePrototype = Object.create(null);
 __snapshotWritablePrototype.added = 0;
 function machineSnapshotAddInherited(target, value) {
+  for (let probe = 0; probe < 3; probe++) value = value;
   target.added = value;
   return value;
 }

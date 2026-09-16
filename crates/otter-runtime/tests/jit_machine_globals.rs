@@ -12,8 +12,6 @@
 //! - Artifacts name the lexical cell symbolically and never serialize its
 //!   process address.
 
-#![cfg(target_arch = "aarch64")]
-
 use std::collections::BTreeSet;
 
 use otter_runtime::{
@@ -28,7 +26,9 @@ let machineGlobalLexical = 40;
 globalThis.machineGlobalObject = 2;
 
 function machineGlobalLoads(bias) {
-  return machineGlobalLexical + machineGlobalObject + bias;
+  let result = machineGlobalLexical + machineGlobalObject + bias;
+  for (let index = 0; index < 16; index++) result += 0;
+  return result;
 }
 
 for (let warm = 0; warm < 5000; warm++) {
@@ -177,10 +177,11 @@ fn assert_machine_global_artifact(bundle: &JitArtifactBundle) {
                 && (relocation["target"]["kind"] != "runtimeStub"
                     || relocation["target"]["name"] == "jit_deopt_rebuild_frames"
                     || relocation["target"]["name"] == "jit_finish_error"
+                    || relocation["target"]["name"] == "jit_backedge_poll"
                     || relocation["target"]["name"] == "jit_binding_value")
         }),
-        "global reads may target only the binding runtime, the exact-deopt handler, \
-         and the abrupt-completion finisher: {relocations:?}"
+        "global reads may target only the binding runtime, loop poll, exact-deopt handler, \
+         and abrupt-completion finisher: {relocations:?}"
     );
     assert!(
         relocations.iter().any(|relocation| {

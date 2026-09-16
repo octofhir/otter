@@ -11,8 +11,6 @@
 //! - A deopt, throw, safepoint, capture, or external call receives a real object.
 //! - The pass reports eliminated allocations without an emitter-local shortcut.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime, SourceInput,
 };

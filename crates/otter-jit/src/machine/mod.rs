@@ -87,8 +87,8 @@ mod frame;
 mod gvn;
 mod inline_frames;
 mod licm;
-mod native_leaf;
-#[cfg(target_arch = "aarch64")]
+pub(crate) mod native_leaf;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) mod numeric;
 mod property;
 mod regalloc;

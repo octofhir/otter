@@ -592,9 +592,11 @@ pub(crate) struct TemplatePlan {
     pub(crate) register_operands: Box<[u16]>,
     pub(crate) index_operands: Box<[u32]>,
     /// Steps of every [`TemplateOp::FusedNumericChain`], addressed by tail.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) chain_steps: Box<[FusedChainStep]>,
     /// Distinct leaf window registers of every fused chain, addressed by tail;
     /// leaf at tail offset `i` is unboxed into `d(ACCUMULATOR_DREG + 1 + i)`.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) chain_leaves: Box<[u16]>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) load_property_count: usize,
@@ -699,10 +701,12 @@ impl TemplatePlan {
         &self.index_operands[tail.start..tail.start + tail.len]
     }
 
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn chain_step_tail(&self, tail: TemplateTail) -> &[FusedChainStep] {
         &self.chain_steps[tail.start..tail.start + tail.len]
     }
 
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn chain_leaf_tail(&self, tail: TemplateTail) -> &[u16] {
         &self.chain_leaves[tail.start..tail.start + tail.len]
     }

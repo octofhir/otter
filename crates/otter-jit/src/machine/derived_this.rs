@@ -15,6 +15,7 @@ use super::{
 };
 
 /// Recover the cold region's source identity from its explicit predecessor.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(super) fn cold_byte_pc(sequence: &super::InstructionSequence, block: usize) -> Option<u32> {
     let [predecessor] = sequence.blocks().get(block)?.predecessors.as_slice() else {
         return None;

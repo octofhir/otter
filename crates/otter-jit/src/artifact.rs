@@ -8,7 +8,7 @@
 //!   correlation, including template inline subregions, generated direct-call
 //!   targets, and compact scratch layouts.
 //! - [`relocation`] — typed address sites and portable semantic code.
-//! - [`assembly`] — deterministic annotated AArch64 disassembly.
+//! - [`assembly`] — deterministic annotated target disassembly.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
 //!
 //! # Invariants
@@ -35,9 +35,10 @@
 //! - [`otter_vm::jit_artifact`] for the public bundle contract.
 //! - [`crate::template`] and [`crate::optimizing`] for tier-specific capture.
 
-#![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
-
 #[cfg(target_arch = "aarch64")]
+mod assembly;
+#[cfg(target_arch = "x86_64")]
+#[path = "artifact/assembly_x86_64.rs"]
 mod assembly;
 pub(crate) mod relocation;
 
@@ -105,7 +106,9 @@ pub(crate) enum DirectCallTierArtifact {
     Optimizing,
 }
 
+#[cfg(any(test, target_arch = "aarch64"))]
 impl DirectCallTierArtifact {
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Template => "template",
@@ -126,7 +129,9 @@ pub(crate) enum DirectCallKindArtifact {
     DerivedSuperConstruct,
 }
 
+#[cfg(any(test, target_arch = "aarch64"))]
 impl DirectCallKindArtifact {
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Plain => "plain",
@@ -142,13 +147,16 @@ impl DirectCallKindArtifact {
 /// How one generated call materializes its callee parameter prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) enum DirectCallArgumentModeArtifact {
     Fixed,
     Spread,
     Forward,
 }
 
+#[cfg(any(test, target_arch = "aarch64"))]
 impl DirectCallArgumentModeArtifact {
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Fixed => "fixed",
@@ -169,7 +177,9 @@ pub(crate) enum DirectCallThisModeArtifact {
     DerivedConstructor,
 }
 
+#[cfg(any(test, target_arch = "aarch64"))]
 impl DirectCallThisModeArtifact {
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::StrictOrLexical => "strictOrLexical",
@@ -221,6 +231,7 @@ pub(crate) struct MethodGuardArtifact {
 /// One live-in value materialized by an inline scratch setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) enum InlineScratchEntryArtifact {
     Argument {
         argument: u16,
@@ -340,6 +351,7 @@ impl CodeRegion {
         }
     }
 
+    #[cfg(any(test, target_arch = "aarch64"))]
     pub(crate) fn inline_structural(
         kind: &'static str,
         start: usize,
@@ -358,6 +370,7 @@ impl CodeRegion {
     /// `function_id` remains the caller owning this code object. `direct_call`
     /// carries the exact target generation and stack contract separately.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, target_arch = "aarch64"))]
     pub(crate) fn call_structural(
         kind: &'static str,
         start: usize,
@@ -377,6 +390,8 @@ impl CodeRegion {
 
     /// Heap identity guard immediately preceding a generated method call.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, target_arch = "aarch64"))]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn method_call_structural(
         kind: &'static str,
         start: usize,
@@ -427,6 +442,8 @@ impl CodeRegion {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, target_arch = "aarch64"))]
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn inline_instruction(
         start: usize,
         end: usize,
@@ -446,6 +463,7 @@ impl CodeRegion {
         region
     }
 
+    #[cfg(any(test, target_arch = "aarch64"))]
     pub(crate) fn inline_scratch(
         start: usize,
         end: usize,
@@ -557,7 +575,6 @@ pub(crate) fn build_bundle(
         bytecode_bytes: u64::from(view.code_block.bytecode_byte_len()),
         code_bytes: u64::try_from(code.len()).unwrap_or(u64::MAX),
     };
-    #[cfg(target_arch = "aarch64")]
     let rendered_assembly = assembly::render(
         &metadata,
         code.bytes(),
@@ -591,7 +608,6 @@ pub(crate) fn build_bundle(
             render_safepoints(safepoints),
         ),
     ];
-    #[cfg(target_arch = "aarch64")]
     files.push(JitArtifactFile::text(
         JitArtifactFileName::Assembly,
         rendered_assembly,

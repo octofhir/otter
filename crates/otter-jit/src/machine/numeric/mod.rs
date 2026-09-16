@@ -104,7 +104,18 @@
 //!   remains outside local catches until it returns a pure exception value
 //!   instead of a pending VM exception side channel.
 
+#[cfg(target_arch = "aarch64")]
 mod arm64;
+#[cfg(target_arch = "aarch64")]
+use arm64 as backend;
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+#[cfg(target_arch = "x86_64")]
+use x86_64 as backend;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::emit_generated_receiver_allocation as emit_x86_64_generated_receiver_allocation;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::emit_increment_runtime_counter as emit_x86_64_increment_runtime_counter;
 mod boxed_arithmetic;
 mod constructor_effects;
 mod element_cfg;
@@ -156,6 +167,19 @@ use crate::{
     optimizing::{OptimizedCode, OptimizedMetadata},
 };
 
+#[cfg(test)]
+use super::target::{AARCH64_DEOPT_FP_BUDGET, AARCH64_DEOPT_GPR_BUDGET};
+
+#[cfg(test)]
+fn aarch64_test_frame(
+    allocation: &super::AllocatedSequence,
+    root_slots: u16,
+) -> Result<super::MachineFrameLayout, Unsupported> {
+    TargetSpec::aarch64()
+        .frame_layout(allocation, root_slots, 0)
+        .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
+}
+
 /// Frame-wide untraced packet shared by calls and literal allocation.
 ///
 /// The packet begins at the untraced area and is sized for the widest selected
@@ -206,6 +230,32 @@ pub(super) fn value_packet_frame(
         raw_start,
         raw_words,
     })
+}
+
+fn inline_frame_words(sequence: &InstructionSequence) -> Result<u16, Unsupported> {
+    let header_words = std::mem::size_of::<otter_vm::native_abi::NativeFrame>() / 8;
+    let max = sequence
+        .instructions()
+        .iter()
+        .filter(|instruction| {
+            matches!(instruction.opcode, MachineOpcode::Call(index)
+                if matches!(sequence.call_descriptors()[index as usize].target, CallTarget::Direct { .. }))
+        })
+        .map(|instruction| {
+            if instruction.inline_frames.is_empty() {
+                0
+            } else {
+                1 + instruction
+                    .inline_frames
+                    .iter()
+                    .skip(1)
+                    .map(|frame| header_words + frame.slots.len())
+                    .sum::<usize>()
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    u16::try_from(max).map_err(|_| Unsupported::OperandShape("inline native frame capacity"))
 }
 
 pub(crate) fn try_compile(
@@ -266,7 +316,7 @@ pub(crate) fn try_compile(
             .iter()
             .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let method_packet = value_packet_frame(&sequence)?;
-    let inline_frame_words = arm64::inline_calls::frame_words(&sequence)?;
+    let inline_frame_words = inline_frame_words(&sequence)?;
     let frame = target_spec
         .frame_layout(
             &allocation,
@@ -336,7 +386,7 @@ pub(crate) fn try_compile(
         exits: exits.into_boxed_slice(),
         gpr_budget,
     });
-    let emission = arm64::emit(
+    let emission = backend::emit(
         view,
         &sequence,
         &allocation,
@@ -380,7 +430,7 @@ pub(crate) fn try_compile(
         .map_err(|_| Unsupported::OperandShape("scalar machine register count"))?;
     let safepoints = machine_safepoints.records().to_vec().into_boxed_slice();
 
-    let arm64::Emission {
+    let backend::Emission {
         code: emitted_code,
         generated_stack_frame_bytes,
         relocations,
@@ -3433,6 +3483,9 @@ fn committed_value_descriptor(
             otter_vm::native_abi::STUB_JIT_OBJECT_PROTOCOL_VALUE
         }
         CommittedValueOperation::Scalar(_) => otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
+        CommittedValueOperation::GlobalDeclaration(_) => {
+            otter_vm::native_abi::STUB_JIT_GLOBAL_DECLARATION_VALUE
+        }
     };
     CallDescriptor {
         target: CallTarget::CommittedRuntime {
@@ -4208,7 +4261,7 @@ mod tests {
         VerificationError, lower_deopt_table,
     };
 
-    const POLL_BATCH: i32 = crate::arm64::GENERATED_POLL_BATCH as i32;
+    const POLL_BATCH: i32 = crate::GENERATED_POLL_BATCH as i32;
 
     fn compiled_payload_bits(result: NativeResultPair) -> u64 {
         assert_eq!(
@@ -6630,15 +6683,12 @@ mod tests {
         transitions: &TransitionTable,
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
-        try_compile(
-            &TargetSpec::aarch64(),
-            view,
-            7001,
-            transitions,
-            false,
-            artifact_request,
-        )
-        .expect("numeric Machine IR code generation")
+        #[cfg(target_arch = "aarch64")]
+        let target = TargetSpec::aarch64();
+        #[cfg(target_arch = "x86_64")]
+        let target = TargetSpec::x86_64();
+        try_compile(&target, view, 7001, transitions, false, artifact_request)
+            .expect("numeric Machine IR code generation")
     }
 
     fn execute(
@@ -8185,7 +8235,7 @@ mod tests {
             .expect("binding-to-deopt allocation");
         let safepoints =
             lower_safepoints(&sequence, &allocation).expect("binding-to-deopt safepoints");
-        let frame = arm64::frame_layout(&allocation, safepoints.root_slot_count())
+        let frame = aarch64_test_frame(&allocation, safepoints.root_slot_count())
             .expect("binding-to-deopt frame");
         let states = machine_frame_states(&hir);
         assert_eq!(states.len(), hir.frame_states.len());
@@ -8193,8 +8243,8 @@ mod tests {
             &sequence,
             &allocation,
             frame,
-            arm64::GPR_BUDGET,
-            arm64::FP_BUDGET,
+            AARCH64_DEOPT_GPR_BUDGET,
+            AARCH64_DEOPT_FP_BUDGET,
             &states,
         )
         .expect("only exact/runtime-metadata states require allocator deopt locations");
@@ -8859,13 +8909,13 @@ mod tests {
         let hir = property_selection_hir();
         let sequence = select(&hir).expect("property Machine IR");
         let allocation = sequence.allocate(&TargetSpec::aarch64()).unwrap();
-        let layout = arm64::frame_layout(&allocation, 0).unwrap();
+        let layout = aarch64_test_frame(&allocation, 0).unwrap();
         let table = lower_deopt_table(
             &sequence,
             &allocation,
             layout,
-            arm64::GPR_BUDGET,
-            arm64::FP_BUDGET,
+            AARCH64_DEOPT_GPR_BUDGET,
+            AARCH64_DEOPT_FP_BUDGET,
             &machine_frame_states(&hir),
         )
         .unwrap();
@@ -9641,7 +9691,7 @@ mod tests {
                 .any(|root| matches!(root.source, AllocatedLocation::Stack(_))),
             "callee-saved GPR pressure must force at least one GC root to a spill"
         );
-        let frame = arm64::frame_layout(&allocation, safepoints.root_slot_count())
+        let frame = aarch64_test_frame(&allocation, safepoints.root_slot_count())
             .expect("pressure root-save frame");
         assert_eq!(frame.root_slots(), safepoints.root_slot_count());
         assert!(frame.root_offset(0).expect("first root offset") >= allocation.spill_slots() * 8);
@@ -10342,13 +10392,13 @@ mod tests {
                 && matches!(metadata.location, AllocatedLocation::Register(register)
                     if register.is_integer() && (20..=28).contains(&register.encoding()))
         }));
-        let layout = arm64::frame_layout(&allocation, 0).expect("branch-phi frame layout");
+        let layout = aarch64_test_frame(&allocation, 0).expect("branch-phi frame layout");
         let deopt_table = lower_deopt_table(
             &sequence,
             &allocation,
             layout,
-            arm64::GPR_BUDGET,
-            arm64::FP_BUDGET,
+            AARCH64_DEOPT_GPR_BUDGET,
+            AARCH64_DEOPT_FP_BUDGET,
             &machine_frame_states(&hir),
         )
         .expect("branch-phi allocator-driven FrameState");
@@ -10986,13 +11036,13 @@ mod tests {
         let allocation = sequence
             .allocate(&TargetSpec::aarch64())
             .expect("integer-scalar allocation");
-        let frame = arm64::frame_layout(&allocation, 0).expect("integer-scalar frame");
+        let frame = aarch64_test_frame(&allocation, 0).expect("integer-scalar frame");
         lower_deopt_table(
             &sequence,
             &allocation,
             frame,
-            arm64::GPR_BUDGET,
-            arm64::FP_BUDGET,
+            AARCH64_DEOPT_GPR_BUDGET,
+            AARCH64_DEOPT_FP_BUDGET,
             &machine_frame_states(&hir),
         )
         .expect("integer-scalar deopt table");

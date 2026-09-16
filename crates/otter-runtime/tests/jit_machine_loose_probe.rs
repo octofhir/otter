@@ -9,7 +9,6 @@
 //! - Both comparison operators retain HTMLDDA and revoked Proxy semantics.
 //! - A coercive miss completes once through the shared committed boundary.
 
-#![cfg(target_arch = "aarch64")]
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, RuntimeExtensionInstaller,
     SourceInput,
@@ -34,10 +33,23 @@ fn loose_equality_probes_preserve_identity_coercion_and_catch_roots() {
         .run_script(
             SourceInput::from_javascript(
                 r#"
-function pair(a,b,live) { return [a == b, a != b, live]; }
-function unseen(a,b,take) { if (take) return a != b; return false; }
-function equals(a,b,live) { try { return a == b ? live : null; } catch(e) { return e; } }
-function notEquals(a,b,live) { try { return a != b ? live : null; } catch(e) { return e; } }
+function pair(a,b,live) {
+  for (var probe = 0; probe < 3; probe++) live = live;
+  return [a == b, a != b, live];
+}
+function unseen(a,b,take) {
+  for (var probe = 0; probe < 3; probe++) take = take;
+  if (take) return a != b;
+  return false;
+}
+function equals(a,b,live) {
+  for (var probe = 0; probe < 3; probe++) live = live;
+  try { return a == b ? live : null; } catch(e) { return e; }
+}
+function notEquals(a,b,live) {
+  for (var probe = 0; probe < 3; probe++) live = live;
+  try { return a != b ? live : null; } catch(e) { return e; }
+}
 var left = {}, right = {}, live = {tag:'live'}, token = {};
 for (var i = 0; i < 70000; i++) {
   unseen(left,right,false); equals(left,right,live); notEquals(left,left,live); pair(left,right,live);

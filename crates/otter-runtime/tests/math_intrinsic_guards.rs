@@ -127,7 +127,6 @@ fn optimizing_int32_math_matches_interpreter_and_observes_replacement() {
 
     assert_eq!(compiled, oracle);
     assert_eq!(oracle, r#"[[704,2147483648,2,-7],[3956,-2147482648,2,-7]]"#);
-    #[cfg(target_arch = "aarch64")]
     assert!(
         optimized_entries > 0,
         "fixture must enter optimizing code before replacing Math.abs"

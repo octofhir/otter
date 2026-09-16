@@ -8,7 +8,6 @@
 //! - Numeric representation changes retain optimizing execution.
 //! - A failed Number guard never repeats a getter or coercion effect.
 
-#![cfg(target_arch = "aarch64")]
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]
@@ -22,10 +21,10 @@ fn boxed_immediates_accept_numbers_without_repeated_deopts() {
         .run_script(
             SourceInput::from_javascript(
                 r#"
-function plus(o) { return o.x + 1; }
-function minus(o) { return o.x - 1; }
-function power(o) { return Math.pow(10, o.x + 1); }
-function integer(o) { return (o.x + 1) | 0; }
+function plus(o) { for (var probe=0; probe<3; probe++) o=o; return o.x + 1; }
+function minus(o) { for (var probe=0; probe<3; probe++) o=o; return o.x - 1; }
+function power(o) { for (var probe=0; probe<3; probe++) o=o; return Math.pow(10, o.x + 1); }
+function integer(o) { for (var probe=0; probe<3; probe++) o=o; return (o.x + 1) | 0; }
 var box = {x:2};
 for (var i=0; i<70000; i++) { plus(box); minus(box); integer(box); power(box); }
 "#,
@@ -52,7 +51,7 @@ for (var i=0; i<70000; i++) { plus(box); minus(box); integer(box); power(box); }
         );
         assert!(ir.contains("DecodeNumber"), "{name}: {ir}");
         assert!(
-            !ir.contains("IntegerAddImmediate") && !ir.contains("IntegerSubImmediate"),
+            ir.matches("IntegerAddImmediate").count() == 1 && !ir.contains("IntegerSubImmediate"),
             "{name}: {ir}"
         );
     }
@@ -141,7 +140,7 @@ fn multiplication_preserves_signed_zero_in_every_compiled_tier() {
             .run_script(
                 SourceInput::from_javascript(
                     r#"
-function mul(pair) { return pair.left * pair.right; }
+function mul(pair) { for (var probe=0; probe<3; probe++) pair=pair; return pair.left * pair.right; }
 var pair = {left: 3, right: 4};
 for (var i = 0; i < 70000; i++) mul(pair);
 function isProduct(left, right, expected) {

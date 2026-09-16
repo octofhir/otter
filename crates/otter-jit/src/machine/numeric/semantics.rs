@@ -23,7 +23,7 @@
 
 use otter_bytecode::{
     Op,
-    opcode_schema::{ControlFlow, OpcodeEffects, opcode_schema},
+    opcode_schema::{ControlFlow, GlobalDeclarationSemantics, OpcodeEffects, opcode_schema},
 };
 use otter_vm::{
     JitCompileSnapshot,
@@ -59,6 +59,7 @@ const EFFECTS_COMMITTED_RUNTIME: OpcodeEffects = OpcodeEffects {
 pub(super) enum CommittedValueOperation {
     ObjectProtocol(ObjectProtocolValueOp),
     Scalar(ScalarValueOp),
+    GlobalDeclaration(GlobalDeclarationSemantics),
 }
 
 /// Effective semantics of one instruction in an immutable compile snapshot.
@@ -132,12 +133,17 @@ fn classify_instruction(
     // Only observed numeric operands justify numeric speculation. Unseen or
     // coercive sites retain a generated comparison proof with one committed
     // cold sibling, so their first real operands cannot start a deopt loop.
-    let committed_value = committed_value_operation(op, view.derived_constructor).filter(|_| {
-        !matches!(op, Op::LooseEqual | Op::LooseNotEqual) || {
-            let feedback = instruction.arith_feedback();
-            !feedback.is_numeric_only()
-        }
-    });
+    let committed_value = opcode_schema(op)
+        .global_declaration
+        .map(CommittedValueOperation::GlobalDeclaration)
+        .or_else(|| {
+            committed_value_operation(op, view.derived_constructor).filter(|_| {
+                !matches!(op, Op::LooseEqual | Op::LooseNotEqual) || {
+                    let feedback = instruction.arith_feedback();
+                    !feedback.is_numeric_only()
+                }
+            })
+        });
     let effects = if committed_value.is_some() || opcode_schema(op).binding.is_some() {
         EFFECTS_COMMITTED_RUNTIME
     } else {

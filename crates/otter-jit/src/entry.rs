@@ -14,6 +14,8 @@
 //! - [`code`] — [`enter_compiled`], the shared activation-to-entry invocation.
 //! - [`runtime_stub_bindings`] — the complete active JIT-owned transition
 //!   inventory.
+//! - `x86_64_tiering` — generated-entry accounting and hot-callee publication
+//!   shared by the x86 Template and Machine encoders.
 //! - [`TransitionTable`] — hook-lifetime descriptor-id-indexed resolution of
 //!   that inventory for O(1) compile-time address baking.
 //!
@@ -39,11 +41,15 @@ mod code;
 mod lowering;
 mod runtime_ops;
 mod value_abi;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_64_tiering;
 pub(crate) use abi::*;
 pub(crate) use code::enter_compiled;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use lowering::reg_offset;
 pub use lowering::{BackendFailure, Unsupported};
 pub(crate) use lowering::{
-    BaselinePlan, PACKED_REGISTER_LANES, decode_register_list, pack_register_lanes, reg_offset,
+    BaselinePlan, PACKED_REGISTER_LANES, decode_register_list, pack_register_lanes,
     unpack_register_lanes,
 };
 use runtime_ops::*;

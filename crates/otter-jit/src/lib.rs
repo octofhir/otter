@@ -4,7 +4,7 @@
 //! lowers Otter register bytecode directly to native machine code with no
 //! register allocation or deopt. The optimizing tier has one implementation:
 //! typed scalar HIR lowers to target-neutral [`machine`] IR, regalloc2 assigns
-//! physical homes, and the AArch64 encoder consumes that allocation. The
+//! physical homes, and the selected target encoder consumes that allocation. The
 //! dynasm-backed [`CompiledCode`] remains the sole W^X executable-memory owner.
 //!
 //! # Contents
@@ -52,6 +52,12 @@ pub mod machine;
 mod measurement;
 pub mod optimizing;
 mod template;
+
+/// Backedges between shared interrupt/work-budget probes in generated code.
+///
+/// Every native tier and target uses the same batch so cooperative scheduling
+/// does not depend on the selected machine-code encoder.
+pub(crate) const GENERATED_POLL_BATCH: u32 = 16;
 
 pub use code::CompiledCode;
 pub use entry::{BackendFailure, TransitionTable, Unsupported};
@@ -161,7 +167,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                         otter_vm::JitDebugTarget::Osr { pc }
                     }),
             });
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let compiled = template::compile_with_artifacts(
             &request.snapshot,
             request.code_object_id,
@@ -169,7 +175,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             artifact_request,
             capture_events,
         );
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let compiled = {
             let _ = artifact_request;
             template::compile(&request.snapshot, request.code_object_id, &self.transitions).map(
@@ -218,7 +224,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                         otter_vm::JitDebugTarget::Osr { pc }
                     }),
             });
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let compiled = optimizing::compile_optimized_with_artifacts(
             &request.snapshot,
             request.code_object_id,
@@ -226,7 +232,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             request.debug.events_enabled(),
             artifact_request,
         );
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let compiled = {
             let _ = artifact_request;
             optimizing::compile_optimized_with_transitions(
@@ -353,6 +359,88 @@ mod toolchain_tests {
         });
         let box_i32 = |v: i32| -> u64 { (0xfffeu64 << 48) | (v as u32 as u64) };
         let unbox = |v: u64| -> i32 { v as u32 as i32 };
+        // SAFETY: emitted `extern "C" fn(u64) -> u64`; `code` outlives the call.
+        let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
+        assert_eq!(unbox(f(box_i32(10))), 55, "tagged fib(10) == 55");
+        assert_eq!(unbox(f(box_i32(20))), 6765, "tagged fib(20) == 6765");
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_64_toolchain_tests {
+    //! Executed proof that the dynasm-rs x86-64 toolchain and the host's W^X
+    //! mapping policy support Otter's tagged-value calling convention.
+
+    use crate::CompiledCode;
+    use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+
+    fn assemble<F>(emit: F) -> CompiledCode
+    where
+        F: FnOnce(&mut dynasmrt::x64::Assembler) -> dynasmrt::AssemblyOffset,
+    {
+        let mut ops = dynasmrt::x64::Assembler::new().unwrap();
+        let entry = emit(&mut ops);
+        CompiledCode::new(ops.finalize().unwrap(), entry)
+    }
+
+    #[test]
+    fn emits_and_runs_ret_const() {
+        let code = assemble(|ops| {
+            let entry = ops.offset();
+            dynasm!(ops
+                ; .arch x64
+                ; mov eax, 42
+                ; ret
+            );
+            entry
+        });
+        // SAFETY: emitted `extern "C" fn() -> i32`; `code` outlives the call.
+        let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(code.entry_ptr()) };
+        assert_eq!(f(), 42, "x86-64 JIT toolchain must execute on this host");
+    }
+
+    #[test]
+    fn emits_and_runs_tagged_fib() {
+        let code = assemble(|ops| {
+            let entry = ops.offset();
+            dynasm!(ops
+                ; .arch x64
+                ; ->fibt:
+                ; mov rax, rdi
+                ; shr rax, 48
+                ; mov rcx, 0xfffe
+                ; cmp rax, rcx
+                ; jne >slow
+                ; cmp edi, 2
+                ; jl >done
+                ; push rbx
+                ; push r12
+                ; push r13
+                ; mov r12, QWORD (0xfffe_u64 << 48) as i64
+                ; mov ebx, edi
+                ; lea edi, [rbx - 1]
+                ; or rdi, r12
+                ; call ->fibt
+                ; mov r13d, eax
+                ; lea edi, [rbx - 2]
+                ; or rdi, r12
+                ; call ->fibt
+                ; add eax, r13d
+                ; or rax, r12
+                ; pop r13
+                ; pop r12
+                ; pop rbx
+                ; ret
+                ; done:
+                ; mov rax, rdi
+                ; ret
+                ; slow:
+                ; int3
+            );
+            entry
+        });
+        let box_i32 = |value: i32| -> u64 { (0xfffe_u64 << 48) | u64::from(value as u32) };
+        let unbox = |value: u64| -> i32 { value as u32 as i32 };
         // SAFETY: emitted `extern "C" fn(u64) -> u64`; `code` outlives the call.
         let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
         assert_eq!(unbox(f(box_i32(10))), 55, "tagged fib(10) == 55");

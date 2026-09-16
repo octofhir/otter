@@ -12,8 +12,6 @@
 //! - Every tier returns the interpreter's completion.
 //! - Both fixture functions compile on the optimizing tier.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitDebugCompileOutcome, JitDebugEvent, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
     SourceInput,

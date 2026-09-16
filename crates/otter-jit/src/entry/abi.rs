@@ -293,6 +293,7 @@ pub(crate) const CODE_ENTRY_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, code_object_id) as u32;
 pub(crate) const CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes) as u32;
+#[cfg(target_arch = "aarch64")]
 pub(crate) const CODE_ENTRY_FLAGS_OFFSET: u32 = std::mem::offset_of!(CodeEntryCell, flags) as u32;
 pub(crate) const CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, native_frame_header) as u32;
@@ -312,6 +313,7 @@ pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
 pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
+#[cfg(target_arch = "aarch64")]
 pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags))
     as u32;

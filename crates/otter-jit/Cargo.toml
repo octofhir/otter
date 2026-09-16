@@ -38,5 +38,9 @@ dynasmrt = "5"
 yaxpeax-arch = { workspace = true }
 yaxpeax-arm = { workspace = true }
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+yaxpeax-arch = { workspace = true }
+yaxpeax-x86 = { workspace = true }
+
 [dev-dependencies]
 otter-gc = { workspace = true }

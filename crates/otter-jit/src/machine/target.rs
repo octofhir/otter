@@ -260,15 +260,17 @@ struct TargetCallConvention {
     context: PhysicalRegister,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TargetFrameSpec {
     base_fixed_bytes: u32,
     stack_alignment: u32,
+    entry_stack_bias: u32,
     deopt_gpr_budget: u16,
     deopt_fp_budget: u16,
     saved_gpr_first: u8,
     saved_gpr_last: u8,
     saved_gpr_implicit: u8,
+    extra_saved_gprs: Box<[u8]>,
     saved_fp_first: u8,
     saved_fp_last: u8,
 }
@@ -308,11 +310,13 @@ impl TargetSpec {
             frame: TargetFrameSpec {
                 base_fixed_bytes: AARCH64_BASE_FIXED_FRAME_BYTES,
                 stack_alignment: 16,
+                entry_stack_bias: 0,
                 deopt_gpr_budget: AARCH64_DEOPT_GPR_BUDGET,
                 deopt_fp_budget: AARCH64_DEOPT_FP_BUDGET,
                 saved_gpr_first: 20,
                 saved_gpr_last: 28,
                 saved_gpr_implicit: 1,
+                extra_saved_gprs: Box::new([]),
                 saved_fp_first: 8,
                 saved_fp_last: 15,
             },
@@ -365,13 +369,17 @@ impl TargetSpec {
                 context: integer(15),
             },
             frame: TargetFrameSpec {
-                base_fixed_bytes: 32,
+                // `rbp` and the retained `r15` context are always pushed.
+                base_fixed_bytes: 16,
                 stack_alignment: 16,
+                // System V enters after an eight-byte return-address push.
+                entry_stack_bias: 8,
                 deopt_gpr_budget: 16,
                 deopt_fp_budget: 16,
                 saved_gpr_first: 12,
                 saved_gpr_last: 14,
                 saved_gpr_implicit: 0,
+                extra_saved_gprs: Box::new([3]),
                 saved_fp_first: 16,
                 saved_fp_last: 15,
             },
@@ -380,7 +388,7 @@ impl TargetSpec {
             // System V caller-saved set. This is safe input to verifier and
             // regalloc tests, not a claim of implemented x86 lowering.
             clobbers: std::array::from_fn(|_| scalar_call.clone()),
-            capabilities: [false; 4],
+            capabilities: [true; 4],
         }
     }
 
@@ -456,6 +464,7 @@ impl TargetSpec {
         (register.is_integer()
             && (self.frame.saved_gpr_first..=self.frame.saved_gpr_last)
                 .contains(&register.encoding()))
+            || (register.is_integer() && self.frame.extra_saved_gprs.contains(&register.encoding()))
             || (register.is_float()
                 && (self.frame.saved_fp_first..=self.frame.saved_fp_last)
                     .contains(&register.encoding()))
@@ -473,7 +482,11 @@ impl TargetSpec {
         }
         let highest_gpr = allocation
             .used_registers()
-            .filter(|register| register.is_integer() && self.is_callee_saved(*register))
+            .filter(|register| {
+                register.is_integer()
+                    && (self.frame.saved_gpr_first..=self.frame.saved_gpr_last)
+                        .contains(&register.encoding())
+            })
             .map(PhysicalRegister::encoding)
             .max();
         let highest_fp = allocation
@@ -487,17 +500,25 @@ impl TargetSpec {
         let fp_count = highest_fp
             .map(|register| register - self.frame.saved_fp_first + 1)
             .unwrap_or(0);
+        let extra_gpr_count = allocation
+            .used_registers()
+            .filter(|register| {
+                register.is_integer() && self.frame.extra_saved_gprs.contains(&register.encoding())
+            })
+            .count() as u32;
         let fixed_bytes = self.frame.base_fixed_bytes
             + u32::from(gpr_count.saturating_sub(self.frame.saved_gpr_implicit))
                 .saturating_mul(8)
                 .next_multiple_of(16)
+            + extra_gpr_count.saturating_mul(8)
             + u32::from(fp_count).saturating_mul(8).next_multiple_of(16);
-        MachineFrameLayout::new_with_raw_slots(
+        MachineFrameLayout::new_with_target_alignment(
             allocation,
             root_slots,
             raw_slots,
             fixed_bytes,
             self.frame.stack_alignment,
+            self.frame.entry_stack_bias,
         )
     }
 }

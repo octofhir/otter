@@ -25,6 +25,7 @@ pub(crate) const VALUE_NULL: u64 = value_tag::VALUE_NULL;
 /// `false` immediate.
 pub(crate) const VALUE_FALSE: u64 = value_tag::VALUE_FALSE;
 /// Low 32 bits of [`VALUE_FALSE`] for immediate materialization.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const VALUE_FALSE_LOW: u32 = value_tag::VALUE_FALSE as u32;
 /// `true` immediate.
 pub(crate) const VALUE_TRUE: u64 = value_tag::VALUE_TRUE;
@@ -33,6 +34,7 @@ pub(crate) const VALUE_UNDEFINED: u64 = value_tag::VALUE_UNDEFINED;
 /// Internal hole sentinel.
 pub(crate) const VALUE_HOLE: u64 = value_tag::VALUE_HOLE;
 /// Low tag selecting a closure-less function-id immediate.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const FUNCTION_ID_TAG: u64 = value_tag::FUNCTION_ID_TAG;
 
 const _: () = assert!(value_tag::NUMBER_TAG == 0xfffe_0000_0000_0000);

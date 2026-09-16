@@ -78,7 +78,31 @@ impl MachineFrameLayout {
         fixed_bytes: u32,
         stack_alignment: u32,
     ) -> Result<Self, FrameLayoutError> {
+        Self::new_with_target_alignment(
+            allocation,
+            root_slots,
+            raw_slots,
+            fixed_bytes,
+            stack_alignment,
+            0,
+        )
+    }
+
+    /// Build a frame whose entry stack pointer has a target ABI alignment
+    /// bias (eight bytes on System V x86-64 because `call` pushed the return
+    /// address, zero on AArch64).
+    pub(crate) fn new_with_target_alignment(
+        allocation: &AllocatedSequence,
+        root_slots: u16,
+        raw_slots: u16,
+        fixed_bytes: u32,
+        stack_alignment: u32,
+        entry_stack_bias: u32,
+    ) -> Result<Self, FrameLayoutError> {
         if !stack_alignment.is_power_of_two() {
+            return Err(FrameLayoutError::InvalidAlignment);
+        }
+        if entry_stack_bias >= stack_alignment {
             return Err(FrameLayoutError::InvalidAlignment);
         }
         let allocator_spill_bytes = allocation
@@ -102,7 +126,14 @@ impl MachineFrameLayout {
         let unaligned_total = fixed_bytes
             .checked_add(raw_spill_bytes)
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;
-        let frame_bytes = align_up(unaligned_total, stack_alignment)?;
+        let frame_bytes = align_up(
+            unaligned_total
+                .checked_add(entry_stack_bias)
+                .ok_or(FrameLayoutError::FrameSizeOverflow)?,
+            stack_alignment,
+        )?
+        .checked_sub(entry_stack_bias)
+        .ok_or(FrameLayoutError::FrameSizeOverflow)?;
         let spill_area_bytes = frame_bytes
             .checked_sub(fixed_bytes)
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;

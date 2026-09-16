@@ -14,8 +14,6 @@
 //!   applying the captured-owner fallback; it cannot leak into an older eval
 //!   environment.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
 const SETUP: &str = r#"

@@ -9,8 +9,6 @@
 //! - Tests require optimizing artifacts, not merely interpreter-equivalent output.
 //! - Error construction and message effects occur once across native boundaries.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]

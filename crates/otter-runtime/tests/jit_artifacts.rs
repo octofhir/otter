@@ -19,8 +19,6 @@
 //! # See also
 //! - `otter_vm::jit_artifact` for the current manifest and bounded batch.
 
-#![cfg(target_arch = "aarch64")]
-
 use std::collections::BTreeSet;
 
 use otter_runtime::{
@@ -65,7 +63,7 @@ function onceOverflow(limit) {
   }
   return total;
 }
-String(onceOverflow(20));
+String(onceOverflow(96));
 "#;
 
 const OPTIMIZING_MATH: &str = r#"
@@ -122,11 +120,12 @@ fn assert_assembly_is_symbolic(bundle: &JitArtifactBundle) {
     )
     .expect("annotated assembly is UTF-8");
     let mut lines = assembly.lines();
-    assert_eq!(
-        lines.next(),
-        Some("; otter jit aarch64 assembly"),
-        "current assembly header"
-    );
+    let expected_header = match std::env::consts::ARCH {
+        "aarch64" => "; otter jit aarch64 assembly",
+        "x86_64" => "; otter jit x86-64 assembly",
+        architecture => panic!("unsupported JIT artifact architecture {architecture}"),
+    };
+    assert_eq!(lines.next(), Some(expected_header), "assembly header");
     assert_eq!(
         lines.next(),
         Some("; offset-basis=code.bin"),
@@ -325,6 +324,7 @@ fn template_osr_returns_a_current_owned_bundle_without_events() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered);
     let result = runtime
@@ -565,7 +565,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
     let batch = result.jit_artifacts().expect("enabled artifact batch");
     let bundle = first_tier_bundle(batch, JitDebugTier::Optimizing);
 
-    assert_eq!(result.completion_string(), "2147485000");
+    assert_eq!(result.completion_string(), "2147492600");
     assert!(matches!(
         bundle.manifest().entry(),
         JitDebugTarget::Osr { .. }
@@ -659,6 +659,7 @@ fn optimizing_math_artifact_inlines_guarded_int32_abs() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
 fn template_artifacts_type_every_active_non_stub_address_class() {
     let mut runtime = runtime_with_artifacts(JitSelection::Template);
     let result = runtime

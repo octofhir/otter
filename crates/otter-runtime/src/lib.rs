@@ -174,8 +174,7 @@ pub use otter_vm::{
     array, object,
 };
 pub use otter_vm::{
-    JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,
-    RuntimeBudgetTelemetry,
+    JitRuntimeStats, WorkBudget, WorkBudgetExceededAction, WorkBudgetStats, WorkBudgetTelemetry,
 };
 pub use otter_vm::{NativeCtx, NativeError, Value, marshal};
 pub use process::node_platform;
@@ -978,15 +977,21 @@ pub struct RuntimeExecutionStats {
     pub property_store_installs: u64,
     /// `StoreProperty` IC disables / megamorphic transitions.
     pub property_store_disables: u64,
-    /// Runtime reduction units executed.
-    pub reductions_executed: u64,
-    /// RegExp backtrack points included in `reductions_executed`.
+    /// Unified VM work units executed.
+    pub work_units_executed: u64,
+    /// RegExp backtrack points included in `work_units_executed`.
     pub regex_backtrack_steps: u64,
-    /// Bytecode calls observed by runtime budget stats.
+    /// GC work included in `work_units_executed`.
+    pub gc_work_units: u64,
+    /// Cooperative work-slice yields.
+    pub forced_yields: u64,
+    /// Hard work-budget rejections.
+    pub budget_rejections: u64,
+    /// Bytecode calls observed by work-budget stats.
     pub bytecode_calls: u64,
-    /// Native calls observed by runtime budget stats.
+    /// Native calls observed by work-budget stats.
     pub native_calls: u64,
-    /// Construct calls observed by runtime budget stats.
+    /// Construct calls observed by work-budget stats.
     pub construct_calls: u64,
     /// Max frame-stack depth observed.
     pub max_stack_depth_observed: u32,
@@ -1822,16 +1827,16 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
 ///
 /// The runtime meters two halves of the same policy: the shared resource
 /// ledger charges memory, retained bytes, queued work, and worker slots, while
-/// the VM meters per-turn CPU work — reductions, allocation bytes, host-op
-/// enqueues, turn duration, microtask drain length. This carries both, plus
+/// the VM meters bytecode, generated backedges, native calls, GC, RegExp, and
+/// microtasks in one work currency, alongside allocation/host/time pressure. This carries both, plus
 /// the configured limits that produced them, so a caller reads one consistent
 /// picture instead of correlating two surfaces by hand.
 #[derive(Debug, Clone)]
-pub struct RuntimeBudgetReport {
-    /// Per-turn execution policy in force for this isolate.
-    pub limits: RuntimeBudget,
-    /// Counters published at the isolate's most recent root-turn boundary.
-    pub execution: RuntimeBudgetStats,
+pub struct WorkBudgetReport {
+    /// Per-slice execution policy in force for this isolate.
+    pub limits: WorkBudget,
+    /// Counters published at the isolate's most recent slice boundary.
+    pub execution: WorkBudgetStats,
     /// Current, peak, rejection, and limit counters of the shared ledger.
     pub resources: ResourceSnapshot,
 }
@@ -1862,10 +1867,10 @@ pub(crate) struct RuntimeConfig {
     pub(crate) resource_account: ResourceAccount,
     /// Finite per-isolate credits for terminal work and its live origins.
     pub(crate) completion_capacities: completion_admission::CompletionCapacities,
-    /// Per-turn execution budget installed before the isolate's first turn.
+    /// Work-slice budget installed before the isolate's first turn.
     /// Child isolates inherit it through the cloned config, so a worker
     /// cannot execute under a looser CPU policy than its parent.
-    pub(crate) runtime_budget: RuntimeBudget,
+    pub(crate) work_budget: WorkBudget,
     max_heap_bytes: u64,
     timeout: Duration,
     max_stack_depth: u32,
@@ -2173,7 +2178,7 @@ impl Default for RuntimeConfig {
                 host_operations: completion_admission::DEFAULT_HOST_OPERATION_CAPACITY,
                 timers: completion_admission::DEFAULT_TIMER_CAPACITY,
             },
-            runtime_budget: RuntimeBudget::default(),
+            work_budget: WorkBudget::default(),
             max_heap_bytes: DEFAULT_MAX_HEAP_BYTES,
             timeout: DEFAULT_TIMEOUT,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
@@ -2218,8 +2223,8 @@ impl RuntimeConfig {
         self.runtime_host.clone()
     }
 
-    pub(crate) const fn runtime_budget(&self) -> RuntimeBudget {
-        self.runtime_budget
+    pub(crate) const fn work_budget(&self) -> WorkBudget {
+        self.work_budget
     }
 
     pub(crate) const fn completion_capacities(&self) -> completion_admission::CompletionCapacities {
@@ -2304,18 +2309,18 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Set the per-turn execution budget the isolate runs under.
+    /// Set the per-slice work budget the isolate runs under.
     ///
     /// This is the CPU half of the same budget model the resource ledger owns
-    /// for memory and queue depth: reductions, allocation bytes, host-op
-    /// enqueues, turn duration, outstanding external bytes, and microtask
-    /// drain length, enforced cooperatively at VM checkpoints. Configuring it
+    /// for memory and queue depth. Bytecode, generated backedges, native calls,
+    /// GC, RegExp, and microtasks debit one counter; allocation, host-op, time,
+    /// and external-memory limits share its checkpoints. Configuring it
     /// here rather than mutating a built runtime means the policy is in force
     /// before the first turn, on handle threads and workers alike; workers
     /// inherit it and cannot widen it.
     #[must_use]
-    pub fn runtime_budget(mut self, budget: RuntimeBudget) -> Self {
-        self.config.runtime_budget = budget;
+    pub fn work_budget(mut self, budget: WorkBudget) -> Self {
+        self.config.work_budget = budget;
         self
     }
 
@@ -2912,7 +2917,7 @@ impl Runtime {
         interp.set_console_sink(config.console_sink.clone());
         // A restored isolate runs no bootstrap, so its configured per-turn
         // policy is in force from the first instruction it executes.
-        interp.set_runtime_budget(config.runtime_budget);
+        interp.set_work_budget(config.work_budget);
         // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
         // heap state, so a restored isolate wires it fresh.
         interp.set_eval_hook(Some(standard_eval_hook()));
@@ -3250,15 +3255,15 @@ impl Runtime {
         // Bootstrap is over; user allocations go back through the nursery,
         // where most of them die.
         runtime.interp.gc_heap_mut().set_tenure_all(false);
-        // The per-turn execution policy governs the isolate's turns, not its
+        // The work policy governs the isolate's user execution, not its
         // construction: the builtin shims above are host-chosen work of a
-        // fixed size, and metering them against a caller's per-turn limit
+        // fixed size, and metering them against a caller's slice limit
         // would reject the isolate instead of the script it was configured
         // for. The counters start from zero with it, so what an embedder
         // reads is its own workload no matter what bootstrap accounts for.
-        let budget = runtime.config.runtime_budget;
-        runtime.interp.reset_runtime_budget_stats();
-        runtime.interp.set_runtime_budget(budget);
+        let budget = runtime.config.work_budget;
+        runtime.interp.reset_work_budget_stats();
+        runtime.interp.set_work_budget(budget);
         Ok(runtime)
     }
 
@@ -4756,26 +4761,27 @@ impl Runtime {
         self.interp.gc_heap().stats()
     }
 
-    /// Return the VM's observational runtime budget policy.
+    /// Return the VM's work-budget policy.
     #[must_use]
-    pub fn runtime_budget(&self) -> RuntimeBudget {
-        self.interp.runtime_budget()
+    pub fn work_budget(&self) -> WorkBudget {
+        self.interp.work_budget()
     }
 
-    /// Replace the per-turn execution budget of a built runtime.
+    /// Replace the per-slice work budget of a built runtime.
     ///
-    /// [`RuntimeBuilder::runtime_budget`] is the configured form and is in
+    /// [`RuntimeBuilder::work_budget`] is the configured form and is in
     /// force before the first turn; this retunes a live isolate. Observe mode
-    /// records crossings in [`RuntimeBudgetStats`], Reject mode returns a
-    /// budget diagnostic at the next VM checkpoint.
-    pub fn set_runtime_budget(&mut self, budget: RuntimeBudget) {
-        self.interp.set_runtime_budget(budget);
+    /// records crossings in [`WorkBudgetStats`], Reject returns a budget
+    /// diagnostic, and Yield resumes the same turn after a host scheduling
+    /// point.
+    pub fn set_work_budget(&mut self, budget: WorkBudget) {
+        self.interp.set_work_budget(budget);
     }
 
-    /// Snapshot VM runtime budget/resource counters.
+    /// Snapshot VM work-budget/resource counters.
     #[must_use]
-    pub fn runtime_budget_stats(&self) -> RuntimeBudgetStats {
-        self.interp.runtime_budget_stats()
+    pub fn work_budget_stats(&self) -> WorkBudgetStats {
+        self.interp.work_budget_stats()
     }
 
     /// Return the cell this isolate publishes its budget counters to.
@@ -4783,17 +4789,17 @@ impl Runtime {
     /// The cell outlives a borrow of the runtime, so a monitor thread can read
     /// the counters while the isolate keeps running.
     #[must_use]
-    pub fn budget_telemetry(&self) -> RuntimeBudgetTelemetry {
-        self.interp.runtime_budget_telemetry()
+    pub fn budget_telemetry(&self) -> WorkBudgetTelemetry {
+        self.interp.work_budget_telemetry()
     }
 
     /// Read the isolate's CPU policy, its published counters, and the shared
     /// resource ledger as one consistent picture.
     #[must_use]
-    pub fn budget_report(&self) -> RuntimeBudgetReport {
-        RuntimeBudgetReport {
-            limits: self.interp.runtime_budget(),
-            execution: self.interp.runtime_budget_stats(),
+    pub fn budget_report(&self) -> WorkBudgetReport {
+        WorkBudgetReport {
+            limits: self.interp.work_budget(),
+            execution: self.interp.work_budget_stats(),
             resources: self.config.resource_account.snapshot(),
         }
     }
@@ -4801,7 +4807,7 @@ impl Runtime {
     /// Snapshot the compact end-of-run diagnostics used by `OTTER_STATS=1`.
     pub fn execution_stats(&mut self) -> RuntimeExecutionStats {
         let ic = self.interp.property_ic_stats();
-        let budget = self.interp.runtime_budget_stats();
+        let budget = self.interp.work_budget_stats();
         let jit = self.interp.jit_runtime_stats();
         let collection_method_ics = self.interp.jit_collection_method_ic_stats();
         let gc = self.interp.gc_heap_mut().gc_stats().clone();
@@ -4814,8 +4820,11 @@ impl Runtime {
             property_store_misses: ic.store_misses,
             property_store_installs: ic.store_installs,
             property_store_disables: ic.store_disables,
-            reductions_executed: budget.reductions_executed,
+            work_units_executed: budget.work_units_executed,
             regex_backtrack_steps: budget.regex_backtrack_steps,
+            gc_work_units: budget.gc_work_units,
+            forced_yields: budget.forced_yields,
+            budget_rejections: budget.budget_rejections,
             bytecode_calls: budget.bytecode_calls,
             native_calls: budget.native_calls,
             construct_calls: budget.construct_calls,
@@ -4958,9 +4967,9 @@ impl Runtime {
         self.interp.take_jit_artifacts()
     }
 
-    /// Reset VM runtime budget/resource counters.
-    pub fn reset_runtime_budget_stats(&mut self) {
-        self.interp.reset_runtime_budget_stats();
+    /// Reset VM work-budget/resource counters.
+    pub fn reset_work_budget_stats(&mut self) {
+        self.interp.reset_work_budget_stats();
     }
 
     /// Snapshot every property inline-cache site. See
@@ -6880,7 +6889,7 @@ impl Otter {
     /// Read the isolate's CPU policy, its published counters, and the shared
     /// resource ledger as one consistent picture.
     #[must_use]
-    pub fn budget_report(&self) -> RuntimeBudgetReport {
+    pub fn budget_report(&self) -> WorkBudgetReport {
         self.handle.budget_report()
     }
 
@@ -6912,13 +6921,13 @@ impl OtterBuilder {
         self
     }
 
-    /// Set the per-turn execution budget the managed isolate runs under.
+    /// Set the work-slice budget the managed isolate runs under.
     ///
     /// The policy is installed before the isolate's first turn and is readable
     /// with its counters through [`Otter::budget_report`].
     #[must_use]
-    pub fn runtime_budget(mut self, budget: RuntimeBudget) -> Self {
-        self.runtime = self.runtime.runtime_budget(budget);
+    pub fn work_budget(mut self, budget: WorkBudget) -> Self {
+        self.runtime = self.runtime.work_budget(budget);
         self
     }
 

@@ -68,7 +68,7 @@ impl Interpreter {
         // Hoisted once per turn: the budget config does not change mid-turn,
         // so the per-op checkpoint only needs to run when enforcement is on.
         // In the default Observe mode this collapses to a not-taken branch.
-        let enforce_budget = self.runtime_budget.rejects_on_exceedance();
+        let enforce_budget = self.work_budget.enforces_on_exceedance();
         // Like `enforce_budget`, these installation states are fixed for the
         // duration of a dispatch run — a JIT hook, CPU profiler, or step tracer
         // is attached between turns, never mid-loop. Hoisting the `is_some`
@@ -195,8 +195,8 @@ impl Interpreter {
                     let depth32 = u32::try_from(depth)
                         .unwrap_or(u32::MAX)
                         .saturating_add(self.jit_generated_call_depth());
-                    if depth32 > self.runtime_budget_stats.max_stack_depth_observed {
-                        self.runtime_budget_stats.max_stack_depth_observed = depth32;
+                    if depth32 > self.work_budget_stats.max_stack_depth_observed {
+                        self.work_budget_stats.max_stack_depth_observed = depth32;
                     }
                     // Refresh the miss-only fields of the cache.
                     cache_valid = true;
@@ -215,13 +215,11 @@ impl Interpreter {
             } else {
                 None
             };
-            // Per-instruction reduction metering. Reductions accumulate exactly
-            // as before; the max-stack-depth sample moved to the frame-resolution
-            // miss branch (depth changes only across frame transitions), and the
-            // budget checkpoint below stays gated on `enforce_budget` (a not-taken
-            // branch in the default Observe mode).
-            self.runtime_budget_stats
-                .record_reductions(instr.reductions());
+            // Every opcode has a static base work charge. The max-stack-depth
+            // sample lives on the frame-resolution miss branch (depth changes
+            // only across frame transitions), and the checkpoint stays gated
+            // on `enforce_budget` in the default Observe mode.
+            self.work_budget_stats.record_work(instr.reductions());
             // Budget enforcement, CPU sampling, and step tracing are each
             // installed between turns, never mid-loop. Testing their union once
             // keeps the common no-hook instruction at a single not-taken branch
@@ -229,7 +227,7 @@ impl Interpreter {
             // actually present.
             if has_hooks {
                 if enforce_budget {
-                    self.enforce_runtime_budget_checkpoint()?;
+                    self.enforce_work_budget_checkpoint()?;
                 }
                 if has_profiler && let Some(profiler) = self.cpu_profiler.as_mut() {
                     profiler.maybe_sample(context, stack);

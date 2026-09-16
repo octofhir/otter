@@ -192,7 +192,8 @@ pub(crate) unsafe fn enter_compiled(
                 | NativeResultStatus::SideExit
                 | NativeResultStatus::Throw
                 | NativeResultStatus::Continue
-                | NativeResultStatus::OutOfMemory,
+                | NativeResultStatus::OutOfMemory
+                | NativeResultStatus::Yield,
             )
             | None => JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand)),
         }

@@ -64,8 +64,8 @@ use crate::{
     RuntimeModuleLoaderState, RuntimePackageManagerHandle, SourceInput, TimerFireOutcome,
 };
 use otter_vm::{
-    DynamicImportAdmission, DynamicImportLoader, RuntimeBudget, RuntimeBudgetTelemetry,
-    TimerAdmission, TimerScheduler,
+    DynamicImportAdmission, DynamicImportLoader, TimerAdmission, TimerScheduler, WorkBudget,
+    WorkBudgetTelemetry,
 };
 
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
@@ -166,10 +166,10 @@ struct RuntimeHandleInner {
     command_timeout: Duration,
     command_capacity: usize,
     counters: Arc<RuntimeCounters>,
-    /// Per-turn execution policy the isolate was built with, paired with the
+    /// Per-slice work policy the isolate was built with, paired with the
     /// counters it publishes so one reading carries both.
-    budget_limits: RuntimeBudget,
-    budget_telemetry: RuntimeBudgetTelemetry,
+    budget_limits: WorkBudget,
+    budget_telemetry: WorkBudgetTelemetry,
     exit: Arc<IsolateExit>,
     /// Shared fire-order queue every timer wake is handed to. Only the
     /// host-scheduled test path reaches it from this side; the isolate runner
@@ -1524,7 +1524,7 @@ impl RuntimeHandle {
             admitted.config.completion_capacities(),
         );
         let command_timeout = admitted.config.timeout();
-        let budget_limits = admitted.config.runtime_budget();
+        let budget_limits = admitted.config.work_budget();
         let event_loop = match admitted.config.runtime_host() {
             Some(host) => host.event_loop(),
             None => TokioEventLoop::current_or_owned().map_err(|e| OtterError::Internal {
@@ -2135,8 +2135,8 @@ impl RuntimeHandle {
     /// No command crosses the inbox: the counters are published by the isolate
     /// at its own turn boundaries, so a busy or blocked isolate still reports.
     #[must_use]
-    pub fn budget_report(&self) -> crate::RuntimeBudgetReport {
-        crate::RuntimeBudgetReport {
+    pub fn budget_report(&self) -> crate::WorkBudgetReport {
+        crate::WorkBudgetReport {
             limits: self.inner.budget_limits,
             execution: self.inner.budget_telemetry.snapshot(),
             resources: self.inner.resources.snapshot(),
@@ -2494,7 +2494,7 @@ fn run_isolate(
     interrupt_tx: SyncSender<(
         otter_vm::InterruptFlag,
         otter_vm::atomics_wait::WaitAgentHandle,
-        RuntimeBudgetTelemetry,
+        WorkBudgetTelemetry,
     )>,
     inbox: InboxSender,
     event_loop: TokioEventLoop,

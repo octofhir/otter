@@ -22,7 +22,7 @@
 //!
 //! # See also
 //! - [`crate::Interpreter`]
-//! - [`crate::runtime_budget`]
+//! - [`crate::work_budget`]
 //! - [Runtime principles](../../../docs/book/src/engine/runtime-principles.md)
 
 use std::sync::Arc;
@@ -194,7 +194,7 @@ pub enum VmError {
     },
     /// `InterruptFlag` was tripped before the next checkpoint.
     Interrupted,
-    /// A configured runtime budget rejected the current VM turn at
+    /// A configured work budget rejected the current isolate slice at
     /// a checkpoint. Message in [`ErrorDetail::Message`].
     BudgetExceeded,
     /// `CALL_STRING_METHOD` referenced a method name not in

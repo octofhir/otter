@@ -356,8 +356,7 @@ impl Interpreter {
         }
     }
 
-    /// Drain the microtask queue until empty (or
-    /// [`microtask::MAX_DRAIN_ITERS`] is hit).
+    /// Drain the microtask queue until empty.
     ///
     /// Each task is executed by invoking its callee with `this`
     /// and `args` set up at enqueue time. Tasks pushed during the
@@ -392,7 +391,10 @@ impl Interpreter {
         // free or move objects still reachable through them.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
-        self.drain_microtasks_with_default_inner(default_context)
+        self.begin_work_budget_turn();
+        let result = self.drain_microtasks_with_default_inner(default_context);
+        self.finish_work_budget_turn();
+        result
     }
 
     pub(crate) fn drain_microtasks_with_default_inner(
@@ -429,8 +431,6 @@ impl Interpreter {
         default_context: Option<ExecutionContext>,
     ) -> Result<(), RunError> {
         self.record_runtime_microtask_drain_started();
-        let mut iters: u32 = 0;
-        let mut observed_microtask_budget = false;
         loop {
             let Some(batch_len) = self.microtasks.begin_drain() else {
                 return Ok(());
@@ -445,36 +445,14 @@ impl Interpreter {
             // the GC root walk — parked async frames in the queue
             // hold raw register slots a scavenge must rewrite.
             while let Some(task) = self.microtasks.next_in_flight() {
-                if iters >= microtask::MAX_DRAIN_ITERS {
+                self.record_runtime_microtask_executed();
+                if let Err(error) = self.enforce_work_budget_checkpoint() {
                     self.microtasks.end_drain();
                     return Err(RunError {
-                        error: self.err_json(
-                            "MICROTASK_RUNAWAY",
-                            format!(
-                                "microtask drain exceeded {} iterations",
-                                microtask::MAX_DRAIN_ITERS
-                            ),
-                        ),
+                        error,
                         frames: Vec::new(),
                         detail: self.take_error_detail(),
                     });
-                }
-                iters += 1;
-                self.record_runtime_microtask_executed();
-                if !observed_microtask_budget {
-                    observed_microtask_budget =
-                        self.observe_runtime_microtask_budget(u64::from(iters));
-                    if observed_microtask_budget && self.runtime_budget.rejects_on_exceedance() {
-                        self.runtime_budget_stats.record_budget_rejection();
-                        self.microtasks.end_drain();
-                        return Err(RunError {
-                            error: self.err_budget(
-                                ("runtime microtask budget exceeded".to_string()).into(),
-                            ),
-                            frames: Vec::new(),
-                            detail: self.take_error_detail(),
-                        });
-                    }
                 }
                 // Context resolution is uniform for every drain entry point:
                 // the job's own origin context, else the caller's hint, else
@@ -686,7 +664,13 @@ impl Interpreter {
                 };
             }
             let call_info = NativeCallInfo::call(*effective_this);
-            self.record_runtime_native_call();
+            if let Err(error) = self.record_runtime_native_call() {
+                return Err(RunError {
+                    error,
+                    frames: Vec::new(),
+                    detail: self.take_error_detail(),
+                });
+            }
             let raw = {
                 let slice_roots = [effective_args.as_slice()];
                 let roots = crate::runtime_cx::NativeCallRoots::new(&call_info, &[], &slice_roots);
@@ -1164,7 +1148,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         debug_assert!(stack.is_runtime_rooted_by(self));
         self.ensure_method_feedback_context(context);
-        self.begin_runtime_budget_turn();
+        self.begin_work_budget_turn();
         let result = (|| -> Result<Value, VmError> {
             loop {
                 match self.dispatch_loop_inner(context, stack, floor) {
@@ -1228,7 +1212,7 @@ impl Interpreter {
                 }
             }
         })();
-        self.finish_runtime_budget_turn();
+        self.finish_work_budget_turn();
         result
     }
 }

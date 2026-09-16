@@ -207,7 +207,6 @@ pub mod root_census;
 pub mod rooting;
 pub mod run_control;
 mod runtime_activation;
-pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
 /// Compiler-internal machine-callable runtime entrypoints.
@@ -235,6 +234,7 @@ pub mod upvalue_spine;
 pub mod value;
 pub mod value_slab;
 pub mod weak_refs;
+pub mod work_budget;
 
 #[cfg(test)]
 mod gc_invariants;
@@ -317,7 +317,7 @@ pub use js_surface::{
     ConstructorSpec, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec, ObjectBuilder,
     PropertySpec,
 };
-pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
+pub use microtask::{Microtask, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
     native_value, native_value_static, native_value_with_captures,
@@ -484,12 +484,10 @@ pub use upvalue::{
     read_upvalue, store_upvalue,
 };
 
-pub use runtime_budget::{
-    RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats, RuntimeBudgetTelemetry,
-};
 pub use runtime_cx::{NativeCallInfo, NativeCtx, NativeScope};
+pub use work_budget::{WorkBudget, WorkBudgetExceededAction, WorkBudgetStats, WorkBudgetTelemetry};
 
-use runtime_budget::RuntimeHeapSnapshot;
+use work_budget::RuntimeHeapSnapshot;
 
 use otter_gc::raw::RawGc;
 
@@ -1272,19 +1270,18 @@ pub struct Interpreter {
     jit_native_activation_top: usize,
     /// Top of the linked Machine IR allocator-root record chain.
     jit_machine_roots: u64,
-    /// Optional per-turn resource policy. This slice records observations but
-    /// does not yet yield or reject when a limit is exceeded.
-    runtime_budget: RuntimeBudget,
-    /// Aggregate VM resource counters for diagnostics and embedding policy
-    /// work.
-    runtime_budget_stats: RuntimeBudgetStats,
-    /// Cell the counters above are published to at every root-turn boundary,
+    /// Optional per-slice work policy shared by interpreter, JIT, native,
+    /// RegExp, GC, and microtask checkpoints.
+    work_budget: WorkBudget,
+    /// Aggregate VM work/resource counters for diagnostics and embedding.
+    work_budget_stats: WorkBudgetStats,
+    /// Cell the counters above are published to at every slice boundary,
     /// so a holder outside this isolate's thread can read them.
-    runtime_budget_telemetry: RuntimeBudgetTelemetry,
-    /// Nested dispatch loops share one root-turn accounting window.
-    runtime_budget_depth: u32,
-    runtime_budget_turn_started_at: Option<std::time::Instant>,
-    runtime_budget_heap_start: Option<RuntimeHeapSnapshot>,
+    work_budget_telemetry: WorkBudgetTelemetry,
+    /// Nested dispatch loops share one ECMAScript-turn accounting window.
+    work_budget_depth: u32,
+    work_budget_slice_started_at: Option<std::time::Instant>,
+    work_budget_heap_start: Option<RuntimeHeapSnapshot>,
     /// Per-interpreter table of well-known symbol singletons
     /// (ECMA-262 §6.1.5.1). Populated in [`Self::new`]; constant
     /// across an interpreter's lifetime.

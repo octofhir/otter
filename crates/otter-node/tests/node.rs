@@ -1,6 +1,7 @@
 use otter_node::{NodeApiBuilderExt, hosted_modules};
 use otter_runtime::{
-    CapabilitySet, Permission, ResourceAccount, ResourceClass, ResourceLimits, Runtime,
+    CapabilitySet, Permission, ResourceAccount, ResourceClass, ResourceLimits, Runtime, WorkBudget,
+    WorkBudgetExceededAction,
 };
 
 #[test]
@@ -311,9 +312,15 @@ fn node_async_local_storage_survives_every_continuation() {
     let mut runtime = Runtime::builder()
         .capabilities(CapabilitySet::allow_all())
         .with_node_apis()
+        .work_budget(WorkBudget {
+            on_exceeded: WorkBudgetExceededAction::Yield,
+            max_work_units_per_turn: Some(4),
+            ..WorkBudget::default()
+        })
         .build()
         .unwrap();
     runtime.run_module(&main).unwrap();
+    assert!(runtime.work_budget_stats().forced_yields > 0);
 }
 
 /// A domain owns the errors of the work started inside it: a synchronous

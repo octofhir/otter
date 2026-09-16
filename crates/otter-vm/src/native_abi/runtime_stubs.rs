@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - [`RuntimeStubDescriptor`] declares signature, effects, safepoint,
-//!   exception, and result ABI for every dense [`RuntimeStubId`].
+//!   exception, result ABI, and static work charge for every dense
+//!   [`RuntimeStubId`].
 //! - [`RuntimeStubAllocContext`] is the rooted allocation packet passed by
 //!   every allocating entry.
 //! - Typed scalar leaves keep unboxed numeric values in their machine ABI.
@@ -12,6 +13,7 @@
 //! - Leaf stubs cannot allocate, trigger GC, reenter JS, or name a safepoint.
 //! - Allocating and reentrant stubs require a precise safepoint at every call.
 //! - Throwing behavior and result-status encoding are explicit descriptor data.
+//! - Every descriptor has a non-zero static work charge.
 //!
 //! # See also
 //! - [`crate::runtime_stubs`] for semantic entrypoints.
@@ -45,6 +47,16 @@ impl RuntimeStubClass {
     #[must_use]
     pub const fn can_reenter_js(self) -> bool {
         matches!(self, Self::Reentrant)
+    }
+
+    /// Static base charge for crossing this runtime boundary.
+    #[must_use]
+    pub const fn work_units(self) -> u8 {
+        match self {
+            Self::LeafNoAlloc => 2,
+            Self::Alloc => 4,
+            Self::Reentrant => 8,
+        }
     }
 }
 
@@ -268,6 +280,8 @@ pub struct RuntimeStubDescriptor {
     pub signature: RuntimeStubSignature,
     /// Fixed value argument count, or [`VARIADIC_STUB_ARGUMENTS`].
     pub argument_count: u8,
+    /// Static base charge debited on each transition.
+    pub work_units: u8,
     /// Safepoint requirement.
     pub safepoint: RuntimeStubSafepoint,
     /// Exception behavior.
@@ -296,6 +310,7 @@ const fn descriptor(
         class,
         signature,
         argument_count,
+        work_units: class.work_units(),
         safepoint: if class.can_allocate() {
             RuntimeStubSafepoint::Required
         } else {
@@ -1936,6 +1951,9 @@ pub const fn validate_stub_descriptor(
     desc: RuntimeStubDescriptor,
     safepoint_id: SafepointId,
 ) -> bool {
+    if desc.work_units == 0 || desc.work_units != desc.class.work_units() {
+        return false;
+    }
     let alloc_gc = RuntimeStubEffects::MAY_ALLOCATE | RuntimeStubEffects::MAY_TRIGGER_GC;
     let throwing_matches = desc.effects.contains(RuntimeStubEffects::MAY_THROW)
         == matches!(desc.exception, RuntimeStubException::Status);
@@ -2055,8 +2073,8 @@ pub const fn validate_stub_descriptor(
 const _: [(); 16] = [(); std::mem::size_of::<RuntimeStubDescriptor>()];
 const _: [(); 4] = [(); std::mem::align_of::<RuntimeStubDescriptor>()];
 const _: [(); 0] = [(); std::mem::offset_of!(RuntimeStubDescriptor, id)];
-const _: [(); 9] = [(); std::mem::offset_of!(RuntimeStubDescriptor, result_abi)];
-const _: [(); 10] = [(); std::mem::offset_of!(RuntimeStubDescriptor, result_domain)];
+const _: [(); 10] = [(); std::mem::offset_of!(RuntimeStubDescriptor, result_abi)];
+const _: [(); 11] = [(); std::mem::offset_of!(RuntimeStubDescriptor, result_domain)];
 const _: [(); 12] = [(); std::mem::offset_of!(RuntimeStubDescriptor, effects)];
 const _: [(); 24] = [(); std::mem::size_of::<RuntimeStubAllocContext>()];
 const _: [(); 8] = [(); std::mem::offset_of!(RuntimeStubAllocContext, spill_slots)];

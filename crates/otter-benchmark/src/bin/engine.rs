@@ -1123,7 +1123,7 @@ fn run_kernel(
         );
     }
     let jit_before = interpreter.jit_runtime_stats();
-    let budget_before = interpreter.runtime_budget_stats();
+    let budget_before = interpreter.work_budget_stats();
     let property_before = interpreter.property_ic_stats();
     let call_before = context.call_feedback_stats();
     for index in 0..warmup {
@@ -1190,7 +1190,7 @@ fn run_kernel(
         .as_ref()
         .map_or_else(Default::default, JitCompilerProbe::measurement);
     let residency = interpreter.jit_code_residency();
-    let budget_after = interpreter.runtime_budget_stats();
+    let budget_after = interpreter.work_budget_stats();
     let property_after = interpreter.property_ic_stats();
     let call_after = context.call_feedback_stats();
     measurements.diagnostics = vec![
@@ -1252,11 +1252,11 @@ fn run_kernel(
             residency.installed_osr_bodies,
         ),
         (
-            "vm-reductions",
+            "vm-work-units",
             MetricUnit::Count,
             budget_after
-                .reductions_executed
-                .saturating_sub(budget_before.reductions_executed),
+                .work_units_executed
+                .saturating_sub(budget_before.work_units_executed),
         ),
         (
             "vm-bytecode-calls",

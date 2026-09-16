@@ -190,6 +190,9 @@ pub enum NativeResultStatus {
     Continue = 3,
     /// A probe/allocation boundary could not allocate.
     OutOfMemory = 4,
+    /// The owning isolate rotated its cooperative work slice. This is a raw
+    /// backedge-poll status only and is never valid in a boxed result pair.
+    Yield = 5,
     /// Structural engine failure parked in the active runtime context.
     Fatal = 6,
 }
@@ -327,6 +330,7 @@ impl NativeResultPair {
             2 => NativeResultStatus::Throw,
             3 => NativeResultStatus::Continue,
             4 => NativeResultStatus::OutOfMemory,
+            5 => NativeResultStatus::Yield,
             6 => NativeResultStatus::Fatal,
             _ => return None,
         };
@@ -338,7 +342,9 @@ impl NativeResultPair {
                 NativeResultStatus::Fatal => {
                     self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
                 }
-                NativeResultStatus::Continue | NativeResultStatus::OutOfMemory => false,
+                NativeResultStatus::Continue
+                | NativeResultStatus::OutOfMemory
+                | NativeResultStatus::Yield => false,
             },
             NativeResultDomain::ExceptionTransition => match status {
                 NativeResultStatus::Success | NativeResultStatus::Throw => true,
@@ -347,7 +353,7 @@ impl NativeResultPair {
                 NativeResultStatus::Fatal => {
                     self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
                 }
-                NativeResultStatus::OutOfMemory => false,
+                NativeResultStatus::OutOfMemory | NativeResultStatus::Yield => false,
             },
             NativeResultDomain::Committed => match status {
                 NativeResultStatus::Success | NativeResultStatus::Throw => true,
@@ -356,7 +362,8 @@ impl NativeResultPair {
                 }
                 NativeResultStatus::SideExit
                 | NativeResultStatus::Continue
-                | NativeResultStatus::OutOfMemory => false,
+                | NativeResultStatus::OutOfMemory
+                | NativeResultStatus::Yield => false,
             },
             NativeResultDomain::Probe => match status {
                 NativeResultStatus::Success => true,
@@ -366,7 +373,7 @@ impl NativeResultPair {
                 NativeResultStatus::Fatal => {
                     self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
                 }
-                NativeResultStatus::Continue => false,
+                NativeResultStatus::Continue | NativeResultStatus::Yield => false,
             },
         };
         if valid { Some(status) } else { None }
@@ -533,9 +540,13 @@ mod tests {
 
     #[test]
     fn malformed_status_and_payload_words_are_rejected() {
+        let raw_yield = NativeResultPair {
+            payload_bits: 0,
+            status: NativeResultStatus::Yield as u64,
+        };
         let unknown = NativeResultPair {
             payload_bits: 0,
-            status: 5,
+            status: 7,
         };
         let widened_status = NativeResultPair {
             payload_bits: 0,
@@ -551,6 +562,7 @@ mod tests {
             NativeResultDomain::Committed,
             NativeResultDomain::Probe,
         ] {
+            assert_eq!(raw_yield.validate(domain), None);
             assert_eq!(unknown.validate(domain), None);
             assert_eq!(widened_status.validate(domain), None);
         }

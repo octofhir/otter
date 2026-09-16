@@ -2324,21 +2324,21 @@ mod tests {
     }
 
     #[test]
-    fn a_child_isolate_inherits_the_parent_per_turn_budget() {
-        let parent_budget = otter_vm::RuntimeBudget {
-            on_exceeded: otter_vm::RuntimeBudgetExceededAction::Reject,
-            max_reductions_per_turn: Some(64),
-            ..otter_vm::RuntimeBudget::default()
+    fn a_child_isolate_inherits_the_parent_work_budget() {
+        let parent_budget = otter_vm::WorkBudget {
+            on_exceeded: otter_vm::WorkBudgetExceededAction::Yield,
+            max_work_units_per_turn: Some(64),
+            ..otter_vm::WorkBudget::default()
         };
         let config = RuntimeConfig {
-            runtime_budget: parent_budget,
+            work_budget: parent_budget,
             ..RuntimeConfig::default()
         };
         let child = configure_worker_child(config, None, None);
 
         // Capabilities narrow on the way down; the CPU policy does not, so a
-        // worker cannot buy itself a longer turn than its parent runs under.
-        assert_eq!(child.runtime_budget, parent_budget);
+        // worker cannot buy itself a longer slice than its parent runs under.
+        assert_eq!(child.work_budget, parent_budget);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

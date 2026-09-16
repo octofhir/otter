@@ -1378,7 +1378,7 @@ impl CodeBlockInstruction {
             op: source.op,
             operand_count: u8::try_from(operand_count)
                 .expect("executable operand count exceeds u8"),
-            reductions: crate::runtime_budget::opcode_reductions(source.op),
+            reductions: crate::work_budget::opcode_work_units(source.op),
             reserved: 0,
         }
     }

@@ -1157,6 +1157,7 @@ impl Interpreter {
             NativeResultStatus::SideExit
             | NativeResultStatus::Continue
             | NativeResultStatus::OutOfMemory
+            | NativeResultStatus::Yield
             | NativeResultStatus::Fatal => unreachable!("status narrowed above"),
         }
     }
@@ -1953,6 +1954,7 @@ mod tests {
             NativeResultStatus::SideExit
             | NativeResultStatus::Continue
             | NativeResultStatus::OutOfMemory
+            | NativeResultStatus::Yield
             | NativeResultStatus::Fatal => panic!("fixture requires a boxed compiled result"),
         };
 

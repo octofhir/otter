@@ -1683,7 +1683,7 @@ impl Interpreter {
             Some(*new_target),
             used_object_prototype_fallback,
         );
-        self.record_runtime_native_call();
+        self.record_runtime_native_call()?;
         // Same root coverage as the call path (`invoke_native_call_with_roots`):
         // trace the interpreter's full root set (crucially the scope-handle
         // arena, so a native constructor's `Local` handles stay live) and
@@ -2155,7 +2155,7 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
             }
-            self.record_runtime_native_call();
+            self.record_runtime_native_call()?;
             let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
@@ -2176,7 +2176,7 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
             }
-            self.record_runtime_native_call();
+            self.record_runtime_native_call()?;
             let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
@@ -2454,7 +2454,7 @@ impl Interpreter {
                 crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
-            self.record_runtime_native_call();
+            self.record_runtime_native_call()?;
             let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
@@ -2503,7 +2503,7 @@ impl Interpreter {
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
             }
-            self.record_runtime_native_call();
+            self.record_runtime_native_call()?;
             let realm_global = self.native_target_realm_global(&native);
             let result = invoke_native_call_with_roots(
                 self,
@@ -2674,7 +2674,7 @@ impl Interpreter {
             return Ok(false);
         }
 
-        self.record_runtime_construct_call();
+        self.record_runtime_construct_call()?;
         let function_id = current
             .as_function()
             .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()));
@@ -3038,7 +3038,7 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
-        self.record_runtime_construct_call();
+        self.record_runtime_construct_call()?;
         let roots = SyncJsCallRoots::construct(callee, new_target, args);
         let _roots_guard = self
             .gc_heap
@@ -3780,7 +3780,7 @@ impl Interpreter {
                 crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
-            self.record_runtime_native_call();
+            self.record_runtime_native_call()?;
             let realm_global = self.native_target_realm_global(&native);
             let current = roots.current.get();
             let receiver = roots.receiver.get();
@@ -3816,7 +3816,7 @@ impl Interpreter {
                 return self
                     .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
             }
-            self.record_runtime_native_call();
+            self.record_runtime_native_call()?;
             let realm_global = self.native_target_realm_global(native);
             let current = roots.current.get();
             let receiver = roots.receiver.get();
@@ -4484,7 +4484,7 @@ impl Interpreter {
         context: &ExecutionContext,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
-        self.record_runtime_construct_call();
+        self.record_runtime_construct_call()?;
         let mut hops: u32 = 0;
         loop {
             if hops >= self.max_stack_depth {

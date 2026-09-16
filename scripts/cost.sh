@@ -70,7 +70,7 @@ def total(*names):
 # pretend the counters add up to the instruction total.
 axes = {
     "wall_ms": by_name.get("wall-time", 0.0) / 1e6,
-    "reductions": total("vm-reductions"),
+    "work_units": total("vm-work-units"),
     "ic_miss": total(
         "property-ic-load-misses",
         "property-ic-store-misses",
@@ -113,7 +113,7 @@ PY
 for tier in $TIERS; do
   printf '\n=== tier: %s  samples=%s warmup=%s ===\n' "$tier" "$SAMPLES" "$WARMUP"
   printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %10s %10s %11s %6s\n' \
-    kernel retired wall_ms reductions instr/red ic_miss ic_inst ic_disa native alloc_ok alloc_miss prop_stub deopt
+    kernel retired wall_ms work_units instr/work ic_miss ic_inst ic_disa native alloc_ok alloc_miss prop_stub deopt
   for entry in "${KERNELS[@]}"; do
     read -r name expected <<<"$entry"
     if [[ -n "$filter" && "$name" != *"$filter"* ]]; then continue; fi
@@ -143,13 +143,13 @@ for tier in $TIERS; do
       rm -f "$record" "$timing"
       continue
     fi
-    read -r wall reductions ic_miss ic_install ic_disable native alloc_ok alloc_miss prop_stub deopt gc <<<"$axes"
+    read -r wall work_units ic_miss ic_install ic_disable native alloc_ok alloc_miss prop_stub deopt gc <<<"$axes"
 
-    per_reduction=$(python3 -c \
-      "r=${retired:-0}; d=${reductions:-0}; print(f'{r/d:.1f}' if d else '-')")
+    per_work_unit=$(python3 -c \
+      "r=${retired:-0}; d=${work_units:-0}; print(f'{r/d:.1f}' if d else '-')")
 
     printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %10s %10s %11s %6s\n' \
-      "$name" "${retired:-?}" "$wall" "$reductions" "$per_reduction" \
+      "$name" "${retired:-?}" "$wall" "$work_units" "$per_work_unit" \
       "$ic_miss" "$ic_install" "$ic_disable" "$native" "$alloc_ok" "$alloc_miss" \
       "$prop_stub" "$deopt"
 

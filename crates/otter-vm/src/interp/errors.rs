@@ -108,17 +108,6 @@ impl Interpreter {
         )
     }
 
-    /// Raise a `JSON.stringify`/`JSON.parse` error.
-    pub(crate) fn err_json(&self, code: &'static str, message: impl Into<String>) -> VmError {
-        self.raise(
-            run_control::ErrorDetail::Json(run_control::VmJsonError {
-                code,
-                message: message.into(),
-            }),
-            VmError::JsonError,
-        )
-    }
-
     /// Raise a Node-style coded error.
     pub(crate) fn err_coded(
         &self,

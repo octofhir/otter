@@ -2,12 +2,17 @@
 
 use std::time::{Duration, Instant};
 
-use otter_runtime::{OtterError, Runtime, SourceInput};
+use otter_runtime::{OtterError, Runtime, SourceInput, WorkBudget, WorkBudgetExceededAction};
 
 #[test]
 fn infinite_loop_times_out_and_runtime_is_reusable() {
     let mut runtime = Runtime::builder()
         .timeout(Duration::from_millis(25))
+        .work_budget(WorkBudget {
+            on_exceeded: WorkBudgetExceededAction::Yield,
+            max_work_units_per_turn: Some(64),
+            ..WorkBudget::default()
+        })
         .build()
         .expect("runtime");
     let started = Instant::now();

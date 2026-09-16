@@ -4358,7 +4358,7 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
 }
 
 #[test]
-fn runtime_budget_stats_record_reductions_and_budget_observations() {
+fn work_budget_stats_record_work_and_budget_observations() {
     let module = module_with(
         vec![
             Instruction {
@@ -4375,23 +4375,23 @@ fn runtime_budget_stats_record_reductions_and_budget_observations() {
         1,
     );
     let mut interp = Interpreter::new();
-    interp.set_runtime_budget(RuntimeBudget {
-        max_reductions_per_turn: Some(1),
-        ..RuntimeBudget::default()
+    interp.set_work_budget(WorkBudget {
+        max_work_units_per_turn: Some(1),
+        ..WorkBudget::default()
     });
     let context = interp.link_module(module).expect("valid bytecode fixture");
     assert_eq!(interp.run(&context).unwrap(), Value::undefined());
-    let stats = interp.runtime_budget_stats();
+    let stats = interp.work_budget_stats();
     assert_eq!(stats.turns_started, 1);
     assert_eq!(stats.turns_finished, 1);
-    assert!(stats.reductions_executed >= 2);
-    assert!(stats.max_turn_reductions >= 2);
+    assert!(stats.work_units_executed >= 2);
+    assert!(stats.max_turn_work_units >= 2);
     assert_eq!(stats.budget_limit_observations, 1);
     assert_eq!(stats.max_stack_depth_observed, 1);
 }
 
 #[test]
-fn runtime_budget_can_reject_on_reduction_limit() {
+fn work_budget_can_reject_on_work_limit() {
     let module = module_with(
         vec![
             Instruction {
@@ -4408,21 +4408,21 @@ fn runtime_budget_can_reject_on_reduction_limit() {
         1,
     );
     let mut interp = Interpreter::new();
-    interp.set_runtime_budget(RuntimeBudget {
-        on_exceeded: RuntimeBudgetExceededAction::Reject,
-        max_reductions_per_turn: Some(0),
-        ..RuntimeBudget::default()
+    interp.set_work_budget(WorkBudget {
+        on_exceeded: WorkBudgetExceededAction::Reject,
+        max_work_units_per_turn: Some(0),
+        ..WorkBudget::default()
     });
     let context = interp.link_module(module).expect("valid bytecode fixture");
     let err = interp.run(&context).unwrap_err();
     assert!(matches!(err.error, VmError::BudgetExceeded));
-    let stats = interp.runtime_budget_stats();
+    let stats = interp.work_budget_stats();
     assert_eq!(stats.budget_rejections, 1);
     assert_eq!(stats.budget_limit_observations, 1);
 }
 
 #[test]
-fn runtime_budget_stats_record_heap_allocations() {
+fn work_budget_stats_record_heap_allocations() {
     let module = module_with(
         vec![
             Instruction {
@@ -4441,7 +4441,7 @@ fn runtime_budget_stats_record_heap_allocations() {
     let mut interp = Interpreter::new();
     let context = interp.link_module(module).expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_object());
-    let stats = interp.runtime_budget_stats();
+    let stats = interp.work_budget_stats();
     assert!(stats.allocated_objects_observed >= 1);
     assert!(stats.allocated_bytes_observed > 0);
     assert!(stats.max_turn_allocated_bytes > 0);
@@ -4667,20 +4667,20 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
 }
 
 #[test]
-fn runtime_budget_stats_record_host_ops_and_external_bytes() {
+fn work_budget_stats_record_host_ops_and_external_bytes() {
     let mut interp = Interpreter::new();
-    interp.set_runtime_budget(RuntimeBudget {
+    interp.set_work_budget(WorkBudget {
         max_host_ops_per_turn: Some(0),
         max_external_bytes: Some(0),
-        ..RuntimeBudget::default()
+        ..WorkBudget::default()
     });
 
-    interp.begin_runtime_budget_turn();
+    interp.begin_work_budget_turn();
     interp.record_runtime_host_op_enqueued();
     let external = interp.gc_heap_mut().reserve_external(64).unwrap();
-    interp.finish_runtime_budget_turn();
+    interp.finish_work_budget_turn();
 
-    let stats = interp.runtime_budget_stats();
+    let stats = interp.work_budget_stats();
     assert_eq!(stats.host_ops_enqueued, 1);
     assert_eq!(stats.max_turn_host_ops, 1);
     assert!(stats.max_external_bytes_observed >= 64);

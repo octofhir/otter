@@ -1614,7 +1614,8 @@ pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     };
     let result = runtime.backedge_poll();
     match result {
-        Ok(()) => NativeResultStatus::Success as u64,
+        Ok(false) => NativeResultStatus::Success as u64,
+        Ok(true) => NativeResultStatus::Yield as u64,
         Err(err) => {
             park_jit_error(ctx, err);
             NativeResultStatus::Throw as u64

@@ -26,9 +26,9 @@
 //! - **Reentrant `drain_depth`**: nested `drain_microtasks()` calls
 //!   from inside a microtask are no-ops — the outermost drain
 //!   absorbs all pending work.
-//! - **Iteration budget**: a hard cap (`MAX_DRAIN_ITERS`) prevents
-//!   `queueMicrotask(fn) inside fn` from livelocking the host.
-//!   Hitting it surfaces as [`MicrotaskError::Runaway`].
+//! - **Work-budget checkpoint**: each task debits the isolate's unified
+//!   [`crate::WorkBudget`]. Yield mode rotates the owning work slice between
+//!   tasks without allowing a later macrotask to overtake the drain.
 //! - **Exception policy**: foundation propagates the **first**
 //!   error out of the drain. Promise reactions use spec-style rejection
 //!   scheduling when they are queued through the promise machinery.
@@ -36,7 +36,6 @@
 //! # Contents
 //! - [`Microtask`] — task record (callee + this + inline args).
 //! - [`MicrotaskQueue`] — sync deque + drain state.
-//! - [`MicrotaskError`] — drain-time failure modes.
 //!
 //! # See also
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
@@ -48,11 +47,6 @@ use smallvec::SmallVec;
 use crate::Value;
 use crate::execution_context::ExecutionContext;
 use otter_gc::raw::RawGc;
-
-/// Hard cap on tasks drained per single drain call. Past this we
-/// return [`MicrotaskError::Runaway`] so a misbehaving JS program
-/// that recursively schedules microtasks cannot stall the host.
-pub const MAX_DRAIN_ITERS: u32 = 1_000_000;
 
 /// One queued microtask.
 ///
@@ -173,20 +167,6 @@ pub struct MicrotaskCapability {
     pub resolve: Value,
     /// Native callable: `reject(reason)` settles the downstream as rejected.
     pub reject: Value,
-}
-
-/// Failure modes for a drain.
-#[derive(Debug, Clone, thiserror::Error)]
-#[non_exhaustive]
-pub enum MicrotaskError {
-    /// The drain hit [`MAX_DRAIN_ITERS`] before the queue emptied.
-    /// A real program almost never trips this — it indicates a
-    /// `queueMicrotask` recursion bug.
-    #[error("microtask drain exceeded {limit} iterations")]
-    Runaway {
-        /// The cap that was reached.
-        limit: u32,
-    },
 }
 
 /// Sync deque + optional async inbox + drain bookkeeping.

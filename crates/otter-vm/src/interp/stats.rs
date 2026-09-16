@@ -1,116 +1,163 @@
-//! Runtime-budget bookkeeping and JIT runtime counters.
+//! Work-budget bookkeeping and JIT runtime counters.
 //!
 //! # Contents
-//! Runtime budget turn begin/finish/checkpoint, bytecode/native/construct
+//! Work-slice begin/finish/checkpoint, bytecode/native/construct
 //! call tallies, JIT stub and fast-path hit counters, microtask drain
 //! stats, and property-IC capacity management.
+//!
+//! # Invariants
+//! - Every enforcing checkpoint either continues, rejects, or rotates exactly
+//!   one isolate-owned work slice.
+//! - A cooperative yield never exposes a JavaScript completion and never lets
+//!   a later macrotask overtake the current turn.
 #![allow(unused_imports)]
+use crate::work_budget::WorkBudgetCheckpoint;
 use crate::*;
 
 impl Interpreter {
-    /// Return the current per-turn runtime budget policy.
+    /// Return the current per-slice work budget policy.
     #[must_use]
-    pub fn runtime_budget(&self) -> RuntimeBudget {
-        self.runtime_budget
+    pub fn work_budget(&self) -> WorkBudget {
+        self.work_budget
     }
 
-    /// Set the per-turn runtime budget policy.
+    /// Set the per-slice work budget policy.
     ///
-    /// Observe mode records crossings without changing execution. Reject mode
-    /// returns [`VmError::BudgetExceeded`] at interpreter instructions, JIT
-    /// backedge batches, and bounded microtask-drain checkpoints.
-    pub fn set_runtime_budget(&mut self, budget: RuntimeBudget) {
-        self.runtime_budget = budget;
+    /// Observe records crossings, Reject returns [`VmError::BudgetExceeded`],
+    /// and Yield rotates the owning isolate's slice before resuming the same
+    /// ECMAScript turn.
+    pub fn set_work_budget(&mut self, budget: WorkBudget) {
+        self.work_budget = budget;
     }
 
-    /// Return aggregate runtime budget/resource counters.
+    /// Return aggregate work-budget/resource counters.
     #[must_use]
-    pub fn runtime_budget_stats(&self) -> RuntimeBudgetStats {
-        self.runtime_budget_stats
+    pub fn work_budget_stats(&self) -> WorkBudgetStats {
+        self.work_budget_stats
     }
 
     /// Return the shareable cell this isolate publishes its budget counters
     /// to.
     #[must_use]
-    pub fn runtime_budget_telemetry(&self) -> RuntimeBudgetTelemetry {
-        self.runtime_budget_telemetry.clone()
+    pub fn work_budget_telemetry(&self) -> WorkBudgetTelemetry {
+        self.work_budget_telemetry.clone()
     }
 
     /// Publish this isolate's budget counters into `telemetry` from now on.
     ///
     /// The runtime installs one cell per isolate before the first turn, so a
     /// worker never publishes into its parent's counters.
-    pub fn set_runtime_budget_telemetry(&mut self, telemetry: RuntimeBudgetTelemetry) {
-        self.runtime_budget_telemetry = telemetry;
-        self.publish_runtime_budget_telemetry();
+    pub fn set_work_budget_telemetry(&mut self, telemetry: WorkBudgetTelemetry) {
+        self.work_budget_telemetry = telemetry;
+        self.publish_work_budget_telemetry();
     }
 
-    pub(crate) fn publish_runtime_budget_telemetry(&self) {
-        self.runtime_budget_telemetry
-            .publish(self.runtime_budget_stats);
+    pub(crate) fn publish_work_budget_telemetry(&self) {
+        self.work_budget_telemetry.publish(self.work_budget_stats);
     }
 
-    /// Reset aggregate runtime budget/resource counters.
-    pub fn reset_runtime_budget_stats(&mut self) {
-        self.runtime_budget_stats = RuntimeBudgetStats::default();
-        self.runtime_budget_depth = 0;
-        self.runtime_budget_turn_started_at = None;
-        self.runtime_budget_heap_start = None;
-        self.publish_runtime_budget_telemetry();
+    /// Reset aggregate work-budget/resource counters.
+    pub fn reset_work_budget_stats(&mut self) {
+        self.work_budget_stats = WorkBudgetStats::default();
+        self.work_budget_depth = 0;
+        self.work_budget_slice_started_at = None;
+        self.work_budget_heap_start = None;
+        self.publish_work_budget_telemetry();
     }
 
-    pub(crate) fn begin_runtime_budget_turn(&mut self) {
-        if self.runtime_budget_depth == 0 {
-            self.runtime_budget_stats.begin_turn();
-            self.runtime_budget_turn_started_at = Some(std::time::Instant::now());
+    pub(crate) fn begin_work_budget_turn(&mut self) {
+        if self.work_budget_depth == 0 {
+            self.work_budget_stats.begin_turn();
+            self.work_budget_slice_started_at = Some(std::time::Instant::now());
             let heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
-            self.runtime_budget_heap_start = Some(heap);
+            self.work_budget_heap_start = Some(heap);
         }
-        self.runtime_budget_depth = self.runtime_budget_depth.saturating_add(1);
+        self.work_budget_depth = self.work_budget_depth.saturating_add(1);
     }
 
-    pub(crate) fn finish_runtime_budget_turn(&mut self) {
-        self.runtime_budget_depth = self.runtime_budget_depth.saturating_sub(1);
-        if self.runtime_budget_depth == 0
-            && let Some(started_at) = self.runtime_budget_turn_started_at.take()
+    pub(crate) fn finish_work_budget_turn(&mut self) {
+        self.work_budget_depth = self.work_budget_depth.saturating_sub(1);
+        if self.work_budget_depth == 0
+            && let Some(started_at) = self.work_budget_slice_started_at.take()
         {
-            if let Some(start_heap) = self.runtime_budget_heap_start.take() {
+            if let Some(start_heap) = self.work_budget_heap_start.take() {
                 let end_heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
-                self.runtime_budget_stats
+                self.work_budget_stats
                     .record_turn_heap_delta(start_heap, end_heap);
             }
-            self.runtime_budget_stats
-                .finish_turn(started_at.elapsed(), self.runtime_budget);
-            self.publish_runtime_budget_telemetry();
+            self.work_budget_stats
+                .finish_turn(started_at.elapsed(), self.work_budget);
+            self.publish_work_budget_telemetry();
         }
     }
 
-    pub(crate) fn enforce_runtime_budget_checkpoint(&mut self) -> Result<(), VmError> {
-        if !self.runtime_budget.rejects_on_exceedance() {
-            return Ok(());
+    fn poll_work_budget_checkpoint(&mut self) -> Result<WorkBudgetCheckpoint, VmError> {
+        if !self.work_budget.enforces_on_exceedance() {
+            return Ok(WorkBudgetCheckpoint::Continue);
         }
-        let Some(started_at) = self.runtime_budget_turn_started_at else {
-            return Ok(());
+        let Some(started_at) = self.work_budget_slice_started_at else {
+            return Ok(WorkBudgetCheckpoint::Continue);
         };
-        if self.runtime_budget.has_heap_checkpoint_limits()
-            && let Some(start_heap) = self.runtime_budget_heap_start
+        if self.work_budget.needs_heap_checkpoint()
+            && let Some(start_heap) = self.work_budget_heap_start
         {
             let end_heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
-            self.runtime_budget_stats
+            self.work_budget_stats
                 .observe_current_turn_heap_delta(start_heap, end_heap);
         }
         let elapsed_nanos = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        if runtime_budget::budget_exceeded(
-            self.runtime_budget_stats.current_turn_reductions(),
-            self.runtime_budget_stats.current_turn_allocated_bytes,
-            self.runtime_budget_stats.current_turn_host_ops,
+        if work_budget::budget_exceeded(
+            self.work_budget_stats.current_turn_work_units(),
+            self.work_budget_stats.current_turn_allocated_bytes,
+            self.work_budget_stats.current_turn_host_ops,
             elapsed_nanos,
-            self.runtime_budget_stats.current_external_bytes,
-            self.runtime_budget,
+            self.work_budget_stats.current_external_bytes,
+            self.work_budget,
         ) {
-            self.runtime_budget_stats.record_budget_rejection();
-            self.publish_runtime_budget_telemetry();
-            return Err(self.err_budget(("runtime budget exceeded".to_string()).into()));
+            // Outstanding external memory is not reset by rotating a CPU work
+            // slice, so yielding on that limit would livelock forever.
+            if self.work_budget.yields_on_exceedance()
+                && !work_budget::external_budget_exceeded(
+                    self.work_budget_stats.current_external_bytes,
+                    self.work_budget,
+                )
+            {
+                return Ok(WorkBudgetCheckpoint::Yield);
+            }
+            self.work_budget_stats.record_budget_rejection();
+            self.publish_work_budget_telemetry();
+            return Err(self.err_budget(("work budget exceeded".to_string()).into()));
+        }
+        Ok(WorkBudgetCheckpoint::Continue)
+    }
+
+    fn rotate_work_budget_slice(&mut self) {
+        let Some(started_at) = self.work_budget_slice_started_at.take() else {
+            return;
+        };
+        if let Some(start_heap) = self.work_budget_heap_start.take() {
+            let end_heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
+            self.work_budget_stats
+                .record_turn_heap_delta(start_heap, end_heap);
+        }
+        self.work_budget_stats.record_forced_yield();
+        self.work_budget_stats
+            .finish_turn(started_at.elapsed(), self.work_budget);
+        self.publish_work_budget_telemetry();
+
+        // The isolate retains ownership of the current ECMAScript turn. This
+        // gives peer OS threads a scheduling point without letting a later
+        // macrotask on this isolate overtake its microtask checkpoint.
+        std::thread::yield_now();
+
+        self.work_budget_stats.begin_turn();
+        self.work_budget_slice_started_at = Some(std::time::Instant::now());
+        self.work_budget_heap_start = Some(RuntimeHeapSnapshot::from_heap(&mut self.gc_heap));
+    }
+
+    pub(crate) fn enforce_work_budget_checkpoint(&mut self) -> Result<(), VmError> {
+        if self.poll_work_budget_checkpoint()? == WorkBudgetCheckpoint::Yield {
+            self.rotate_work_budget_slice();
         }
         Ok(())
     }
@@ -122,41 +169,42 @@ impl Interpreter {
     /// Reconcile a cold batch of bytecode call entries without one VM
     /// transition per generated call.
     pub(crate) fn record_runtime_bytecode_calls(&mut self, calls: u64) {
-        self.runtime_budget_stats.record_bytecode_calls(calls);
+        self.work_budget_stats.record_bytecode_calls(calls);
     }
 
-    pub(crate) fn record_runtime_native_call(&mut self) {
-        self.runtime_budget_stats.record_native_call();
+    pub(crate) fn record_runtime_native_call(&mut self) -> Result<(), VmError> {
+        self.work_budget_stats.record_native_call();
+        self.enforce_work_budget_checkpoint()
     }
 
     /// Charge one completed RegExp engine attempt to the current root turn.
     /// The matcher itself is synchronous, so this checkpoint runs immediately
     /// after it returns and before any result becomes JavaScript-visible.
     pub(crate) fn charge_regex_backtrack_steps(&mut self, steps: u64) -> Result<(), VmError> {
-        self.runtime_budget_stats
-            .record_regex_backtrack_steps(steps);
-        self.enforce_runtime_budget_checkpoint()
+        self.work_budget_stats.record_regex_backtrack_steps(steps);
+        self.enforce_work_budget_checkpoint()
     }
 
-    pub(crate) fn record_runtime_construct_call(&mut self) {
-        self.runtime_budget_stats.record_construct_call();
+    pub(crate) fn record_runtime_construct_call(&mut self) -> Result<(), VmError> {
+        self.work_budget_stats.record_construct_call();
+        self.enforce_work_budget_checkpoint()
     }
 
     pub(crate) fn record_runtime_host_op_enqueued(&mut self) {
-        self.runtime_budget_stats.record_host_op_enqueued();
+        self.work_budget_stats.record_host_op_enqueued();
     }
 
-    /// Poll interrupts and runtime budget from compiled loop backedges.
+    /// Poll interrupts and the work budget from compiled loop backedges.
     ///
     /// Baseline code reaches this through a leaf VM-native runtime stub. The
     /// interpreter charges every opcode; compiled code has no per-op VM tick, so
-    /// it charges one reduction per backedge and then reuses the same budget
+    /// it charges a bounded backedge batch and then reuses the same budget
     /// checkpoint. This keeps timeout/budget semantics independent of whether a
     /// hot loop has OSR'd into native code.
-    pub fn jit_backedge_poll(
+    pub(crate) fn jit_backedge_poll(
         &mut self,
         context: &crate::execution_context::ExecutionContext,
-    ) -> Result<(), VmError> {
+    ) -> Result<WorkBudgetCheckpoint, VmError> {
         self.record_jit_runtime_stub_class(native_abi::STUB_JIT_BACKEDGE_POLL.class);
         // A compiled loop is the one place a long-running program may spend
         // all its time without an interpreter entry; promote the callee its
@@ -169,12 +217,16 @@ impl Interpreter {
         }
         // Compiled code decremented the fuel counter inline for each back-edge
         // since the last checkpoint and re-entered when it hit zero. Account for
-        // that whole batch of reductions in one step and re-arm the counter, then
+        // that whole batch of work in one step and re-arm the counter, then
         // run the (possibly early-returning) budget checkpoint.
-        self.runtime_budget_stats
-            .record_reductions(Self::JIT_BACKEDGE_POLL_BATCH);
+        self.work_budget_stats
+            .record_work(Self::JIT_BACKEDGE_POLL_BATCH);
         self.jit_backedge_fuel = Self::JIT_BACKEDGE_POLL_BATCH;
-        self.enforce_runtime_budget_checkpoint()
+        let checkpoint = self.poll_work_budget_checkpoint()?;
+        if checkpoint == WorkBudgetCheckpoint::Yield {
+            self.rotate_work_budget_slice();
+        }
+        Ok(checkpoint)
     }
 
     /// Address of the inline back-edge fuel counter, handed to compiled code so
@@ -199,6 +251,8 @@ impl Interpreter {
     }
 
     pub(crate) fn record_jit_runtime_stub_class(&mut self, class: native_abi::RuntimeStubClass) {
+        self.work_budget_stats
+            .record_work(u64::from(class.work_units()));
         self.jit_runtime_stats.runtime_stub_transitions = self
             .jit_runtime_stats
             .runtime_stub_transitions
@@ -248,6 +302,7 @@ impl Interpreter {
             }
             native_abi::NativeResultStatus::Throw
             | native_abi::NativeResultStatus::Continue
+            | native_abi::NativeResultStatus::Yield
             | native_abi::NativeResultStatus::Fatal => {
                 self.jit_runtime_stats.alloc_value_stub_other = self
                     .jit_runtime_stats
@@ -258,23 +313,10 @@ impl Interpreter {
     }
 
     pub(crate) fn record_runtime_microtask_drain_started(&mut self) {
-        self.runtime_budget_stats.record_microtask_drain_started();
+        self.work_budget_stats.record_microtask_drain_started();
     }
 
     pub(crate) fn record_runtime_microtask_executed(&mut self) {
-        self.runtime_budget_stats.record_microtask_executed();
-    }
-
-    pub(crate) fn observe_runtime_microtask_budget(&mut self, microtasks_this_drain: u64) -> bool {
-        if self
-            .runtime_budget
-            .max_microtasks_per_drain
-            .is_some_and(|limit| microtasks_this_drain > limit)
-        {
-            self.runtime_budget_stats.record_budget_limit_observation();
-            true
-        } else {
-            false
-        }
+        self.work_budget_stats.record_microtask_executed();
     }
 }

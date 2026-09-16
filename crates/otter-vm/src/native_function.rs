@@ -1692,7 +1692,7 @@ pub enum NativeError {
     /// Structural resource exhaustion raised while a native operation was
     /// executing. This is not a JavaScript throw and must retain the VM's
     /// `BudgetExceeded` identity across the native boundary.
-    #[error("native function exceeded runtime budget: {reason}")]
+    #[error("native function exceeded work budget: {reason}")]
     BudgetExceeded {
         /// Human-readable resource that exhausted its finite budget.
         reason: String,

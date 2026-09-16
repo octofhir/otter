@@ -1931,7 +1931,16 @@ fn emit_backedge_poll(
         poll_entry,
         abi::STUB_JIT_BACKEDGE_POLL,
     );
-    dynasm!(ops ; .arch aarch64 ; blr x16);
-    transitions::emit_status_word_result(ops, None, threw, fatal);
-    dynasm!(ops ; .arch aarch64 ; =>cont);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, abi::NativeResultStatus::Success as u32
+        ; b.eq =>cont
+        ; cmp x0, abi::NativeResultStatus::Yield as u32
+        ; b.eq =>cont
+        ; cmp x0, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>threw
+        ; b =>fatal
+        ; =>cont
+    );
 }

@@ -15,7 +15,7 @@ code to be polite.
 
 - Minimize allocations on hot paths.
 - Make every expensive resource measurable.
-- Bound each VM turn with explicit budgets.
+- Bound each contiguous isolate work slice with explicit budgets.
 - Keep host resources deny-by-default and budgeted.
 - Preserve isolate ownership: one isolate owns one VM, one runtime state,
   and one GC heap.
@@ -39,22 +39,28 @@ language semantics or actor API.
 
 ## Resource Budgets
 
-Every runtime turn should be able to run under a `RuntimeBudget` policy.
-The exact public API can change, but the policy needs these dimensions:
+Every runtime turn can run under a `WorkBudget` policy. One monotonic work
+counter covers these producers:
 
-- reductions or instruction units;
+- bytecode instructions and generated loop backedges;
+- native/runtime transitions;
+- GC tracing and collection cycles;
+- regular-expression backtrack points;
+- microtask execution;
+
+The policy also observes these resource dimensions:
+
 - allocation bytes and allocation count;
 - external/off-heap bytes;
 - host operation enqueue count;
-- microtask drain count;
-- maximum contiguous turn duration;
+- maximum contiguous slice duration;
 - optional stack depth and recursion limits.
 
 The default policy is observational: it records exceedances for these
 dimensions without changing JavaScript-visible completion. Embedders can opt
 into hard rejection, which returns a structured `BUDGET_EXCEEDED` runtime
-diagnostic at VM checkpoints. Cooperative yield and resumable scheduling remain
-future work.
+diagnostic at VM checkpoints, or cooperative yield, which closes the current
+slice, yields the isolate's OS thread, and resumes the same ECMAScript turn.
 
 Budget exhaustion must not be modeled as an arbitrary internal crash. The
 VM should distinguish:
@@ -65,13 +71,14 @@ VM should distinguish:
 - cooperative yield because the turn spent its budget;
 - hard budget rejection when policy says yielding is not allowed.
 
-The direct CLI can usually continue a yielded turn immediately. Embedded
-runtime handles should be able to reschedule yielded work so other inbox
-messages, timers, or host completions can make progress.
+The yielded turn retains ownership of its isolate and stays ahead of later
+macrotasks, timers, and host completions. This preserves the required
+microtask checkpoint. Peer isolate threads can run at the host scheduling
+point; Otter does not introduce a second event loop.
 
-## Reductions
+## Work Units
 
-Otter should count execution in reduction-like units. A reduction is not
+Otter counts execution in reduction-like work units. A unit is not
 required to map one-to-one to a bytecode instruction; the useful property
 is stable accounting at low overhead.
 
@@ -82,8 +89,8 @@ Initial charging rules:
   loading, and iterator/async machinery charge more;
 - loop backedges and basic-block entries are preferred accounting points
   once compact bytecode has block metadata;
-- allocation charges both reductions and bytes.
-- regular-expression backtrack points charge the same reduction ledger, and
+- allocation charges both work units and bytes;
+- regular-expression backtrack points charge the same work ledger, and
   every search also has a finite engine-local ceiling.
 
 The dispatch loop must not perform expensive accounting on every opcode if
@@ -172,8 +179,9 @@ losing pending timers, host completions, interrupts, or diagnostics.
 The runtime must expose cheap aggregate counters suitable for tests and
 production diagnostics:
 
-- reductions executed;
-- regular-expression backtrack steps included in those reductions;
+- work units executed;
+- regular-expression backtrack steps included in those work units;
+- collector work included in those work units;
 - forced yields;
 - max contiguous VM turn duration;
 - allocations and allocated bytes;
@@ -208,8 +216,8 @@ per-op telemetry.
 
 Runtime-resource work is incomplete until it has tests or benchmarks for:
 
-- CPU-heavy loop under a small reduction budget;
-- recursive microtask chain under a microtask budget;
+- CPU-heavy loop under a small work-unit budget;
+- recursive microtask chain under the same work-unit budget;
 - timer or host completion competing with CPU-heavy JS;
 - allocation-heavy object/array workload under heap budget;
 - large `ArrayBuffer` or string workload under external-memory budget;

@@ -274,12 +274,12 @@ impl Interpreter {
             ],
             jit_native_activation_top: 0,
             jit_machine_roots: 0,
-            runtime_budget: RuntimeBudget::default(),
-            runtime_budget_stats: RuntimeBudgetStats::default(),
-            runtime_budget_telemetry: RuntimeBudgetTelemetry::default(),
-            runtime_budget_depth: 0,
-            runtime_budget_turn_started_at: None,
-            runtime_budget_heap_start: None,
+            work_budget: WorkBudget::default(),
+            work_budget_stats: WorkBudgetStats::default(),
+            work_budget_telemetry: WorkBudgetTelemetry::default(),
+            work_budget_depth: 0,
+            work_budget_slice_started_at: None,
+            work_budget_heap_start: None,
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
             error_classes,
@@ -1382,7 +1382,7 @@ impl Interpreter {
 
     /// Number of compiled back-edges the fuel counter allows between cooperative
     /// budget checkpoints. Large enough to amortize the VM re-entry across a hot
-    /// loop, small enough that a runtime budget is enforced within a bounded
+    /// loop, small enough that a work budget is enforced within a bounded
     /// number of iterations. The interrupt flag is polled inline every back-edge,
     /// so cancellation latency is unaffected by this batch size.
     pub(crate) const JIT_BACKEDGE_POLL_BATCH: u64 = 4096;

@@ -87,9 +87,7 @@ pub enum DiagnosticCode {
     JsonParse,
     /// `JSON.parse` / `stringify` got a non-conforming argument.
     JsonBadArg,
-    /// Microtask queue exceeded the host-set runaway guard.
-    MicrotaskRunaway,
-    /// Runtime budget rejected a VM turn.
+    /// Work budget rejected an isolate slice.
     BudgetExceeded,
 
     // ── Package-manager (otter-pm-* surfaces) ──────────────────
@@ -164,7 +162,6 @@ impl DiagnosticCode {
             JsonDepth => "JSON_DEPTH",
             JsonParse => "JSON_PARSE",
             JsonBadArg => "JSON_BAD_ARG",
-            MicrotaskRunaway => "MICROTASK_RUNAWAY",
             BudgetExceeded => "BUDGET_EXCEEDED",
             PmManifestEmptyName => "PM_MANIFEST_EMPTY_NAME",
             PmManifestEmptyVersion => "PM_MANIFEST_EMPTY_VERSION",
@@ -200,7 +197,7 @@ impl DiagnosticCode {
             CompileUnknown => Cat::Compile,
             TypeMismatch | TypeError | UnknownMethod | Tdz | StackOverflow | NotCallable
             | Uncaught | JsonCyclic | JsonBigint | JsonDepth | JsonParse | JsonBadArg
-            | MicrotaskRunaway | BudgetExceeded => Cat::Runtime,
+            | BudgetExceeded => Cat::Runtime,
             PmManifestEmptyName
             | PmManifestEmptyVersion
             | PmManifestEmptyDependencyName
@@ -252,7 +249,6 @@ impl DiagnosticCode {
             "JSON_DEPTH" => JsonDepth,
             "JSON_PARSE" => JsonParse,
             "JSON_BAD_ARG" => JsonBadArg,
-            "MICROTASK_RUNAWAY" => MicrotaskRunaway,
             "BUDGET_EXCEEDED" => BudgetExceeded,
             "PM_MANIFEST_EMPTY_NAME" => PmManifestEmptyName,
             "PM_MANIFEST_EMPTY_VERSION" => PmManifestEmptyVersion,
@@ -302,7 +298,6 @@ impl DiagnosticCode {
             JsonDepth,
             JsonParse,
             JsonBadArg,
-            MicrotaskRunaway,
             BudgetExceeded,
             PmManifestEmptyName,
             PmManifestEmptyVersion,

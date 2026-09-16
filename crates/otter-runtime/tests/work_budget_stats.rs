@@ -1,17 +1,14 @@
-//! Runtime budget DTOs and VM resource counters are visible through
-//! the direct runtime surface.
-//!
-//! This covers the first observational slice only: configured limits record
-//! exceedance observations without preempting or rejecting execution.
+//! Work-budget DTOs, enforcement modes, and VM resource counters are visible
+//! through the direct runtime surface.
 
-use otter_runtime::{OtterError, Runtime, RuntimeBudget, RuntimeBudgetExceededAction, SourceInput};
+use otter_runtime::{OtterError, Runtime, SourceInput, WorkBudget, WorkBudgetExceededAction};
 
 #[test]
-fn runtime_budget_stats_are_visible_after_script_run() {
+fn work_budget_stats_are_visible_after_script_run() {
     let mut rt = Runtime::builder().build().expect("runtime");
-    rt.set_runtime_budget(RuntimeBudget {
-        max_reductions_per_turn: Some(1),
-        ..RuntimeBudget::default()
+    rt.set_work_budget(WorkBudget {
+        max_work_units_per_turn: Some(1),
+        ..WorkBudget::default()
     });
 
     rt.run_script(
@@ -20,32 +17,32 @@ fn runtime_budget_stats_are_visible_after_script_run() {
     )
     .expect("script ran");
 
-    let stats = rt.runtime_budget_stats();
+    let stats = rt.work_budget_stats();
     assert!(stats.turns_started >= 1);
     assert_eq!(stats.turns_started, stats.turns_finished);
-    assert!(stats.reductions_executed > 1);
+    assert!(stats.work_units_executed > 1);
     assert!(stats.bytecode_calls >= 1);
     assert!(stats.budget_limit_observations >= 1);
 }
 
 #[test]
-fn runtime_budget_stats_can_be_reset() {
+fn work_budget_stats_can_be_reset() {
     let mut rt = Runtime::builder().build().expect("runtime");
     rt.run_script(SourceInput::from_javascript("1 + 1;"), "<budget-reset>")
         .expect("script ran");
-    assert!(rt.runtime_budget_stats().reductions_executed > 0);
+    assert!(rt.work_budget_stats().work_units_executed > 0);
 
-    rt.reset_runtime_budget_stats();
-    assert_eq!(rt.runtime_budget_stats().reductions_executed, 0);
-    assert_eq!(rt.runtime_budget_stats().turns_started, 0);
+    rt.reset_work_budget_stats();
+    assert_eq!(rt.work_budget_stats().work_units_executed, 0);
+    assert_eq!(rt.work_budget_stats().turns_started, 0);
 }
 
 #[test]
-fn runtime_budget_stats_include_microtasks_and_heap_observations() {
+fn work_budget_stats_include_microtasks_and_heap_observations() {
     let mut rt = Runtime::builder().build().expect("runtime");
-    rt.set_runtime_budget(RuntimeBudget {
-        max_microtasks_per_drain: Some(0),
-        ..RuntimeBudget::default()
+    rt.set_work_budget(WorkBudget {
+        max_work_units_per_turn: Some(1),
+        ..WorkBudget::default()
     });
 
     rt.run_script(
@@ -56,7 +53,7 @@ fn runtime_budget_stats_include_microtasks_and_heap_observations() {
     )
     .expect("script ran");
 
-    let stats = rt.runtime_budget_stats();
+    let stats = rt.work_budget_stats();
     assert!(stats.microtask_drains >= 1);
     assert!(stats.microtasks_executed >= 1);
     assert!(stats.allocated_objects_observed >= 1);
@@ -76,18 +73,18 @@ fn execution_result_carries_compact_stats_snapshot() {
         .expect("script ran");
 
     let stats = result.stats();
-    assert!(stats.reductions_executed > 0);
+    assert!(stats.work_units_executed > 0);
     assert!(stats.bytecode_calls >= 1);
     assert!(stats.gc_alloc_bytes_total > 0);
 }
 
 #[test]
-fn runtime_budget_can_reject_script_execution() {
+fn work_budget_can_reject_script_execution() {
     let mut rt = Runtime::builder().build().expect("runtime");
-    rt.set_runtime_budget(RuntimeBudget {
-        on_exceeded: RuntimeBudgetExceededAction::Reject,
-        max_reductions_per_turn: Some(0),
-        ..RuntimeBudget::default()
+    rt.set_work_budget(WorkBudget {
+        on_exceeded: WorkBudgetExceededAction::Reject,
+        max_work_units_per_turn: Some(0),
+        ..WorkBudget::default()
     });
 
     let err = rt
@@ -98,7 +95,7 @@ fn runtime_budget_can_reject_script_execution() {
         OtterError::Runtime { diagnostic } => {
             assert_eq!(diagnostic.code, "BUDGET_EXCEEDED");
         }
-        other => panic!("expected runtime budget error, got {other:?}"),
+        other => panic!("expected work-budget error, got {other:?}"),
     }
-    assert_eq!(rt.runtime_budget_stats().budget_rejections, 1);
+    assert_eq!(rt.work_budget_stats().budget_rejections, 1);
 }

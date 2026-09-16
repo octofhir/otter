@@ -279,6 +279,8 @@ fn emit_backedge_poll(
         ; blr x16
         ; cmp x0, NativeResultStatus::Success as u32
         ; b.eq =>cont
+        ; cmp x0, NativeResultStatus::Yield as u32
+        ; b.eq =>cont
         ; cmp x0, NativeResultStatus::Throw as u32
         ; b.eq =>finish_error
         ; b =>fatal

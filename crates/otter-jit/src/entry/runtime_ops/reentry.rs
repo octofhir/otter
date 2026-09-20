@@ -142,9 +142,10 @@ fn route_throw_value(ctx: &mut JitCtx, exception: Value) -> NativeResultPair {
 
 /// Repair one empty stable generated-call function cell.
 ///
-/// This transition cannot compile, allocate, or reenter JavaScript. It only
-/// asks the isolate registry to republish an already-installed fallback
-/// generation and returns that generation-cell address.
+/// This transition cannot reenter JavaScript. It first asks the isolate
+/// registry to republish an installed fallback and, when dependency
+/// invalidation removed every entry generation, may compile and collect while
+/// rebuilding the hot target from the activation's current execution context.
 pub(crate) extern "C" fn jit_resolve_direct_entry_stub(
     ctx: *mut JitCtx,
     function_entry_addr: u64,
@@ -155,9 +156,12 @@ pub(crate) extern "C" fn jit_resolve_direct_entry_stub(
         return 0;
     };
     // SAFETY: the compiled activation owns exclusive isolate execution for the
-    // dynamic extent of this no-allocation resolver call.
+    // dynamic extent of this non-reentrant resolver call.
     let vm = unsafe { &mut *activation.vm_ptr() };
-    vm.jit_resolve_direct_entry(function_entry_addr)
+    // SAFETY: the activation keeps its linked context alive for the complete
+    // generated entry and compilation retains no borrow after returning.
+    let context = unsafe { &*activation.context_ptr() };
+    vm.jit_resolve_direct_entry(context, function_entry_addr)
 }
 
 /// Route one pure exception value returned by generated code.

@@ -51,6 +51,9 @@
 //!   reused as a discriminator (always `false`).
 //! - Hidden-class ICs may cache only [`ShapeCacheMode::Fast`] objects;
 //!   string-keyed delete moves an object to dictionary-compatible mode.
+//! - Generated shape proofs reject opaque chain links: non-ordinary
+//!   prototypes, String-wrapper virtual keys, and host payloads whose property
+//!   semantics can substitute values outside the ordinary slot table.
 //! - Runtime transaction rollback may force-remove only the own data slot that
 //!   still holds its expected published value; it never invokes an accessor or
 //!   removes a replacement installed by re-entrant code.
@@ -93,6 +96,8 @@ mod key_order;
 mod lookup;
 mod shape_body;
 mod shape_cache;
+#[cfg(test)]
+mod shape_lookup_tests;
 mod shape_runtime;
 mod shape_transition;
 pub mod slot_slab;
@@ -102,6 +107,7 @@ pub use descriptor::{
 };
 pub(crate) use key_order::array_index_property_name;
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
+pub(crate) use shape_body::SHAPE_BODY_ID_OFFSET;
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
@@ -601,6 +607,7 @@ fn slot_lookup(flags: PropertyFlags, kind: &SlotKind, value: Value) -> PropertyL
 /// Shape ids are internal metadata only. They are not serialized and have no
 /// JavaScript-observable meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub(crate) struct ShapeId(u64);
 
 impl ShapeId {
@@ -636,6 +643,7 @@ impl ShapeId {
 /// learn the receiver shape, property atom, and slot offset without changing
 /// object storage or descriptor semantics yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub(crate) struct AtomOwnPropertyHit {
     /// Shape observed on the receiver object.
     pub(crate) shape_id: ShapeId,
@@ -786,10 +794,12 @@ pub struct ObjectBody {
     /// prototype chain: its `[[Prototype]]` is a Proxy or a non-object value
     /// held in [`ExoticSlots::proto_override`] (the flat `jit_proto` mirror
     /// is then null without meaning `null`), or it is a String wrapper whose
-    /// index and `length` keys live outside its shape. Generated
-    /// add-transition guards read this byte for every chain link, so a
-    /// shape match proves the key absent only on objects whose keys the
-    /// shape fully describes. Lives in the padding after
+    /// index and `length` keys live outside its shape, or it owns host data
+    /// that can supply namespace properties or mapped argument values outside
+    /// its ordinary slots. Generated shape guards read this byte for every
+    /// chain link, so a shape match proves ordinary key/slot lookup only on
+    /// objects whose shape fully describes it. Symbol properties and native
+    /// call metadata alone do not make a link opaque. Lives in the padding after
     /// [`Self::slot_attrs_overridden`], so it adds no object size.
     chain_link_opaque: bool,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
@@ -3239,7 +3249,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
-            chain_link_opaque: false,
+            chain_link_opaque: true,
             exotic: slot,
         },
         &mut visit,
@@ -3282,7 +3292,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
-            chain_link_opaque: false,
+            chain_link_opaque: true,
             exotic: slot,
         },
         &mut visit,
@@ -3326,7 +3336,7 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
             jit_proto: otter_gc::Gc::null(),
             extensible: true,
             slot_attrs_overridden: false,
-            chain_link_opaque: false,
+            chain_link_opaque: true,
             exotic: slot,
         },
         &mut visit,
@@ -3419,6 +3429,7 @@ pub(crate) fn install_mapped_arguments(
     }
     let cells: Vec<UpvalueCell> = entries.iter().map(|entry| entry.cell).collect();
     heap.with_payload(obj, |body| {
+        body.chain_link_opaque = true;
         body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
             entries: entries.into_boxed_slice(),
         })));
@@ -3852,17 +3863,22 @@ pub(crate) fn load_own_data_slot_atom(
             body_key_matches(heap, body, offset, key.name()),
             "shape-id hit resolved to a slot whose key differs from the request"
         );
-        // Fast path: an ordinary shaped object (no exotic slots, so no mapped
-        // arguments) whose attributes have not been overridden in place reads a
-        // baked data slot straight from the slab — the matching shape fixes the
-        // slot kind and bounds, so neither the per-slot attributes nor the
-        // property count need consulting.
+        // Use the same ordinary-state proof as generated named loads. Symbol
+        // and native-call sidecars preserve shape-derived slot semantics;
+        // opaque host/mapped/String state and overridden descriptors do not.
+        // A matching fast shape fixes the slot kind and bounds, so neither
+        // per-slot attributes nor the property count need consulting.
         //
         // Accessor-ness is part of the shape, and `hit.is_data` was recorded
         // against this very shape handle, so a matched shape with unoverridden
         // attributes cannot have turned the slot into an accessor. Asserting
         // that keeps the release hit off the shape body entirely.
-        if shaped && hit.is_data && !body.slot_attrs_overridden && body.exotic.is_null() {
+        if shaped
+            && hit.is_data
+            && matches!(body.shape_cache_mode, ShapeCacheMode::Fast)
+            && !body.chain_link_opaque
+            && !body.slot_attrs_overridden
+        {
             debug_assert!(
                 !body.slot_attrs(heap, offset).1,
                 "shape-matched data hit resolved to an accessor slot"
@@ -3890,9 +3906,9 @@ pub(crate) fn load_own_data_slot_atom(
 /// [`load_own_data_slot_atom`] performs is redundant here. Used by the
 /// monomorphic method-call IC, whose cached `hit` was recorded against this same
 /// shape: the hot path is a single offset compare plus a slab read, with no atom
-/// resolution and no stub walk. Only the shaped, non-overridden, non-exotic data
-/// fast path is served; anything else returns `None` so the caller falls back to
-/// full method resolution.
+/// resolution and no stub walk. It shares the generated ordinary-state proof:
+/// fast shape mode, no opaque lookup and no overridden slot attributes. Benign
+/// symbol/native sidecars remain eligible; a miss uses full method resolution.
 pub(crate) fn load_own_data_slot_by_shape(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
@@ -3902,8 +3918,9 @@ pub(crate) fn load_own_data_slot_by_shape(
         if body.shape.is_null()
             || body.shape != hit.shape
             || !hit.is_data
+            || !matches!(body.shape_cache_mode, ShapeCacheMode::Fast)
+            || body.chain_link_opaque
             || body.slot_attrs_overridden
-            || !body.exotic.is_null()
         {
             return None;
         }
@@ -5154,6 +5171,7 @@ pub fn set_prototype_value(
     heap.with_payload(obj, |body| {
         body.jit_proto = jit_proto;
         body.chain_link_opaque = body.string_data().is_some()
+            || body.host_data_ref().is_some()
             || matches!(
                 new_proto,
                 ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)

@@ -491,6 +491,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             signature,
         } => format!("runtimeStub(id={id},name={name:?},signature={signature:?})"),
         RelocationTarget::GcCageBase => "gcCageBase".to_string(),
+        RelocationTarget::PropertyLookupCacheTable => "propertyLookupCacheTable".to_string(),
         RelocationTarget::DeoptRuntimeData => "deoptRuntimeData".to_string(),
         RelocationTarget::GlobalLexicalCell {
             function_id,

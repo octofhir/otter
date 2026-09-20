@@ -10,8 +10,6 @@
 //!   and the generic packet; the caller never side-exits for the new shape.
 //! - Every tier returns the interpreter's completion.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{JitDebugEvent, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 const SOURCE: &str = r#"

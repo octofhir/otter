@@ -47,6 +47,11 @@ path = "src/bin/engine.rs"
 required-features = ["engine"]
 
 [[bin]]
+name = "otter-allocation-probe"
+path = "src/bin/allocation_probe.rs"
+required-features = ["engine"]
+
+[[bin]]
 name = "otter-engine-baseline"
 path = "src/bin/baseline.rs"
 required-features = ["engine"]

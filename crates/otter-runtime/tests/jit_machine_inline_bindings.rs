@@ -7,7 +7,6 @@
 //! - Cold reads commit once in the callee's source activation and return to SSA.
 //! - Code-owned safepoints preserve exact roots and source stacks across GC.
 
-#![cfg(target_arch = "aarch64")]
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]
@@ -47,7 +46,7 @@ for(var i=0;i<70000;i++)caller(1.25,mark);
         .unwrap();
     let ir = String::from_utf8_lossy(ir.contents());
     assert!(
-        ir.contains("InlineCallGuard") && ir.contains("inline-frames="),
+        ir.contains("GuardCallTarget { guard: Plain") && ir.contains("inline-frames="),
         "{ir}"
     );
     assert!(!ir.contains("Direct {"), "leaf call must disappear: {ir}");

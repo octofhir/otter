@@ -13,9 +13,9 @@
 //!
 //! # Invariants
 //! - Construction reads and validates scalar descriptors from the published
-//!   runtime record and current [`NativeFrame`]; the boundary retains only
-//!   `NonNull` identities, never references to either owner container or a
-//!   copied frame record.
+//!   runtime record and current [`NativeFrame`], resolves that function's
+//!   owning chunk, and retains only owned context/`NonNull` service identities,
+//!   never references to either owner container or a copied frame record.
 //! - No method returns the interpreter, materialized stack, native frame,
 //!   register pointer, or an [`ActiveFrameMut`] view. Frame views exist only
 //!   inside one typed method and never survive a VM transition.
@@ -71,14 +71,15 @@ pub(crate) enum RuntimeFrameIdentity {
 
 /// Exclusive, short-lived semantic view of one compiled activation.
 ///
-/// This type deliberately owns only branded raw descriptors to VM services.
-/// JIT stubs can request operations, read/write one checked register, and
-/// inspect scalar frame identity only. In particular, no retained native-frame
-/// or materialized-stack reference aliases the GC's active-frame root walk.
+/// This type owns the current function's immutable execution context plus
+/// branded raw descriptors to mutable VM services. JIT stubs can request
+/// operations, read/write one checked register, and inspect scalar frame
+/// identity only. In particular, no retained native-frame or
+/// materialized-stack reference aliases the GC's active-frame root walk.
 pub struct RuntimeCall<'a> {
     pub(super) vm: NonNull<Interpreter>,
     pub(super) stack: NonNull<ActivationStack>,
-    pub(super) context: NonNull<ExecutionContext>,
+    pub(super) context: ExecutionContext,
     pub(super) frame: NonNull<NativeFrame>,
     identity: RuntimeFrameIdentity,
     _exclusive: PhantomData<&'a mut ()>,
@@ -105,7 +106,7 @@ impl<'a> RuntimeCall<'a> {
         let activation = unsafe { activation.as_ref() };
         let vm = NonNull::new(activation.vm).ok_or(VmError::InvalidOperand)?;
         let stack = NonNull::new(activation.stack).ok_or(VmError::InvalidOperand)?;
-        let context = NonNull::new(activation.context.cast_mut()).ok_or(VmError::InvalidOperand)?;
+        let ambient = unsafe { activation.context.as_ref() }.ok_or(VmError::InvalidOperand)?;
         // Validate both published windows before exposing any semantic method.
         // SAFETY: the entry contract retains the initialized raw descriptor for
         // `'a`; ActiveFrameRef itself stores no native Rust reference.
@@ -152,6 +153,10 @@ impl<'a> RuntimeCall<'a> {
             }
             RuntimeFrameIdentity::Materialized(frame_index)
         };
+        let context = ambient
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = (*context).clone();
         Ok(Self {
             vm,
             stack,
@@ -212,8 +217,10 @@ impl<'a> RuntimeCall<'a> {
         arg2: u64,
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
-        self.with_frame(|frame| vm.jit_runtime_control_op(context, frame, opcode, arg0, arg1, arg2))
+        let context = self.context.clone();
+        self.with_frame(|frame| {
+            vm.jit_runtime_control_op(&context, frame, opcode, arg0, arg1, arg2)
+        })
     }
 
     /// Complete one materialized global-access transition while the native
@@ -231,9 +238,18 @@ impl<'a> RuntimeCall<'a> {
         };
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = self.context.clone();
         self.with_frame(|frame| {
-            vm.jit_runtime_global_op(context, stack, frame_index, frame, opcode, arg0, arg1, arg2)
+            vm.jit_runtime_global_op(
+                &context,
+                stack,
+                frame_index,
+                frame,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            )
         })
     }
 
@@ -253,9 +269,18 @@ impl<'a> RuntimeCall<'a> {
         };
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = self.context.clone();
         self.with_frame(|frame| {
-            vm.jit_runtime_delete_op(context, stack, frame_index, frame, opcode, arg0, arg1, arg2)
+            vm.jit_runtime_delete_op(
+                &context,
+                stack,
+                frame_index,
+                frame,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            )
         })
     }
 
@@ -282,7 +307,7 @@ impl<'a> RuntimeCall<'a> {
         }
 
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let result =
             vm.jit_runtime_eval_op(context, stack, frame_index, packed_registers, flags, site);
 
@@ -364,14 +389,14 @@ mod tests {
         let mut registers = [Value::number_i32(3), Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
-                function_id: 7,
+                function_id: 0,
                 pc: 11,
                 register_count: 2,
                 kind: NativeFrameKind::Baseline,
                 flags: Default::default(),
             },
             registers.as_mut_ptr() as u64,
-            Value::function(7),
+            Value::function(0),
             Value::undefined(),
         );
         frame.set_stack_registers();
@@ -399,14 +424,14 @@ mod tests {
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
-                function_id: 7,
+                function_id: 0,
                 pc: 0,
                 register_count: 1,
                 kind: NativeFrameKind::Baseline,
                 flags: Default::default(),
             },
             registers.as_mut_ptr() as u64,
-            Value::function(7),
+            Value::function(0),
             Value::undefined(),
         );
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
@@ -497,14 +522,14 @@ mod tests {
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
-                function_id: 7,
+                function_id: 0,
                 pc: 0,
                 register_count: 1,
                 kind: NativeFrameKind::Baseline,
                 flags: Default::default(),
             },
             registers.as_mut_ptr() as u64,
-            Value::function(7),
+            Value::function(0),
             Value::undefined(),
         );
         frame.set_stack_registers();
@@ -559,14 +584,14 @@ mod tests {
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
-                function_id: 404,
+                function_id: 0,
                 pc: 37,
                 register_count: 1,
                 kind: NativeFrameKind::Baseline,
                 flags: Default::default(),
             },
             registers.as_mut_ptr() as u64,
-            Value::function(404),
+            Value::function(0),
             Value::undefined(),
         );
         frame.set_stack_registers();

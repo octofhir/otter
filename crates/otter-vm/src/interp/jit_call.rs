@@ -787,14 +787,38 @@ impl Interpreter {
     /// Cold repair for one stable generated-call function cell.
     ///
     /// Publication normally keeps the cell hot and this is never called.
-    /// A zero target enters this single no-allocation resolver, which can
-    /// republish an already-installed fallback generation before the caller
-    /// takes its exact pre-effect side exit.
-    pub fn jit_resolve_direct_entry(&mut self, function_entry_addr: u64) -> u64 {
+    /// A zero target first republishes an installed fallback generation. If
+    /// invalidation removed every generation, the resolver may compile a fresh
+    /// baseline while the caller's native frame remains the authoritative root
+    /// owner. Failure leaves the caller on its exact pre-effect side exit.
+    pub fn jit_resolve_direct_entry(
+        &mut self,
+        context: &ExecutionContext,
+        function_entry_addr: u64,
+    ) -> u64 {
         self.jit_runtime_stats.cold_entry_resolver_misses = self
             .jit_runtime_stats
             .cold_entry_resolver_misses
             .saturating_add(1);
+        let resolved = self
+            .jit_code_registry
+            .resolve_function_entry(function_entry_addr);
+        if resolved != 0 {
+            return resolved;
+        }
+        let Some(fid) = self
+            .jit_code_registry
+            .function_id_for_entry_addr(function_entry_addr)
+        else {
+            return 0;
+        };
+        if matches!(self.jit_code.get(&fid), Some(None)) {
+            return 0;
+        }
+        self.jit_runtime_stats.compile_attempts =
+            self.jit_runtime_stats.compile_attempts.saturating_add(1);
+        let outcome = self.compile_jit_function(context, fid, None);
+        self.retain_template_compile_outcome(fid, outcome);
         self.jit_code_registry
             .resolve_function_entry(function_entry_addr)
     }

@@ -11,6 +11,7 @@
 //! - [`MATH_SPEC`] — static namespace spec used by bootstrap.
 //! - [`load_constant`] — used by `Op::MathLoad`.
 //! - [`call`] — typed numeric dispatch shared by the native wrappers.
+//! - `coercion` — rooted argument conversion across user-defined coercion.
 //! - [`MathError`] — failure modes the dispatcher converts to
 //!   `VmError`.
 //!
@@ -18,6 +19,8 @@
 //! - Extracted methods remain ordinary callable objects. Native leaf codegen is
 //!   selected only after exact bootstrap function identity feedback and keeps
 //!   a pre-effect side exit for every identity or numeric guard miss.
+//! - Pending argument objects stay rooted across user-defined coercion;
+//!   completed conversions contain only non-GC Numbers.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-math-object>
@@ -26,6 +29,10 @@
 use crate::native_function::NativeFastFn;
 use crate::number::{NumberValue, bitwise};
 use crate::{NativeCtx, NativeError, Value};
+
+mod coercion;
+
+use coercion::{coerce_all, coerce_math_args};
 
 /// Foundation `Math` constants per ECMA-262 §21.3.1. Each constant
 /// is a static `f64` so the compiler can fold them at intern time
@@ -153,46 +160,51 @@ pub fn call(
     args: &[Value],
     heap: &otter_gc::GcHeap,
 ) -> Result<Value, MathError> {
-    use otter_bytecode::method_id::MathMethod as M;
+    let args = coercion::arguments_for(method, args);
     let nums = coerce_all(method.name(), args, heap)?;
+    Ok(call_numbers(method, &nums))
+}
+
+fn call_numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberValue]) -> Value {
+    use otter_bytecode::method_id::MathMethod as M;
     let value = match method {
-        M::Abs => impl_abs(&nums),
-        M::Acos => impl_acos(&nums),
-        M::Acosh => impl_acosh(&nums),
-        M::Asin => impl_asin(&nums),
-        M::Asinh => impl_asinh(&nums),
-        M::Atan => impl_atan(&nums),
-        M::Atan2 => impl_atan2(&nums),
-        M::Atanh => impl_atanh(&nums),
-        M::Cbrt => impl_cbrt(&nums),
-        M::Ceil => impl_ceil(&nums),
-        M::Clz32 => impl_clz32(&nums),
-        M::Cos => impl_cos(&nums),
-        M::Cosh => impl_cosh(&nums),
-        M::Exp => impl_exp(&nums),
-        M::Expm1 => impl_expm1(&nums),
-        M::Floor => impl_floor(&nums),
-        M::Fround => impl_fround(&nums),
-        M::Hypot => impl_hypot(&nums),
-        M::Imul => impl_imul(&nums),
-        M::Log => impl_log(&nums),
-        M::Log10 => impl_log10(&nums),
-        M::Log1p => impl_log1p(&nums),
-        M::Log2 => impl_log2(&nums),
-        M::Max => impl_max(&nums),
-        M::Min => impl_min(&nums),
-        M::Pow => impl_pow(&nums),
+        M::Abs => impl_abs(nums),
+        M::Acos => impl_acos(nums),
+        M::Acosh => impl_acosh(nums),
+        M::Asin => impl_asin(nums),
+        M::Asinh => impl_asinh(nums),
+        M::Atan => impl_atan(nums),
+        M::Atan2 => impl_atan2(nums),
+        M::Atanh => impl_atanh(nums),
+        M::Cbrt => impl_cbrt(nums),
+        M::Ceil => impl_ceil(nums),
+        M::Clz32 => impl_clz32(nums),
+        M::Cos => impl_cos(nums),
+        M::Cosh => impl_cosh(nums),
+        M::Exp => impl_exp(nums),
+        M::Expm1 => impl_expm1(nums),
+        M::Floor => impl_floor(nums),
+        M::Fround => impl_fround(nums),
+        M::Hypot => impl_hypot(nums),
+        M::Imul => impl_imul(nums),
+        M::Log => impl_log(nums),
+        M::Log10 => impl_log10(nums),
+        M::Log1p => impl_log1p(nums),
+        M::Log2 => impl_log2(nums),
+        M::Max => impl_max(nums),
+        M::Min => impl_min(nums),
+        M::Pow => impl_pow(nums),
         M::Random => random_number(),
-        M::Round => impl_round(&nums),
-        M::Sign => impl_sign(&nums),
-        M::Sin => impl_sin(&nums),
-        M::Sinh => impl_sinh(&nums),
-        M::Sqrt => impl_sqrt(&nums),
-        M::Tan => impl_tan(&nums),
-        M::Tanh => impl_tanh(&nums),
-        M::Trunc => impl_trunc(&nums),
+        M::Round => impl_round(nums),
+        M::Sign => impl_sign(nums),
+        M::Sin => impl_sin(nums),
+        M::Sinh => impl_sinh(nums),
+        M::Sqrt => impl_sqrt(nums),
+        M::Tan => impl_tan(nums),
+        M::Tanh => impl_tanh(nums),
+        M::Trunc => impl_trunc(nums),
     };
-    Ok(Value::number(value))
+    Value::number(value)
 }
 
 pub(crate) fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFastFn {
@@ -241,76 +253,9 @@ fn native_call(
     method: otter_bytecode::method_id::MathMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    // §21.3.2.{24,25} — `Math.max` / `Math.min` and every other
-    // unary / binary Math method call `ToNumber` on each argument,
-    // which runs `ToPrimitive(arg, "number")` for non-primitives.
-    // Pre-coerce object operands here so `coerce_all` below sees
-    // primitives and the user-installed `@@toPrimitive` / `valueOf`
-    // / `toString` ladder fires per spec.
-    let coerced = coerce_math_args(ctx, args)?;
-    call(method, &coerced, ctx.heap()).map_err(|err| match err {
-        MathError::UnknownMember(member) => NativeError::TypeError {
-            name: method.name(),
-            reason: format!("unknown Math member {member}"),
-        },
-        MathError::BadArgument { reason, .. } => NativeError::TypeError {
-            name: method.name(),
-            reason: reason.to_string(),
-        },
-    })
-}
-
-fn coerce_math_args(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
-    let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    for slot in out.iter_mut() {
-        if needs_to_primitive_for_math(slot) {
-            let exec = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| NativeError::TypeError {
-                    name: "Math",
-                    reason: "missing execution context".to_string(),
-                })?;
-            match ctx.with_turn_parts(|interp, stack| {
-                interp.evaluate_to_primitive(
-                    stack,
-                    &exec,
-                    slot,
-                    crate::abstract_ops::ToPrimitiveHint::Number,
-                )
-            }) {
-                Ok(primitive) => *slot = primitive,
-                // A user-thrown value (e.g. a throwing `valueOf`) must
-                // propagate intact, not be re-wrapped as a TypeError:
-                // `Math.hypot` coerces every argument and surfaces the
-                // original abrupt completion. `vm_to_native_error`
-                // preserves `VmError::Uncaught` as `NativeError::Thrown`.
-                Err(e) => {
-                    return Err(crate::native_function::vm_to_native_error(
-                        ctx.interp_mut(),
-                        e,
-                        "Math",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn needs_to_primitive_for_math(v: &Value) -> bool {
-    v.is_object()
-        || v.is_array()
-        || v.is_function()
-        || v.is_closure()
-        || v.is_native_function()
-        || v.is_bound_function()
-        || v.is_class_constructor()
-        || v.is_proxy()
-        || v.is_regexp()
+    let args = coercion::arguments_for(method, args);
+    let numbers = coerce_math_args(ctx, method.name(), args)?;
+    Ok(call_numbers(method, &numbers))
 }
 
 macro_rules! native_math {
@@ -356,52 +301,6 @@ native_math!(native_sign, Sign);
 native_math!(native_clz32, Clz32);
 native_math!(native_imul, Imul);
 native_math!(native_random, Random);
-
-fn coerce_all(
-    name: &'static str,
-    args: &[Value],
-    heap: &otter_gc::GcHeap,
-) -> Result<Vec<NumberValue>, MathError> {
-    let mut out = Vec::with_capacity(args.len());
-    for (idx, v) in args.iter().enumerate() {
-        let n = if let Some(n) = v.as_number() {
-            n
-        } else if let Some(b) = v.as_boolean() {
-            if b {
-                NumberValue::Smi(1)
-            } else {
-                NumberValue::Smi(0)
-            }
-        } else if v.is_null() {
-            NumberValue::Smi(0)
-        } else if v.is_undefined() {
-            NumberValue::Double(f64::NAN)
-        } else if let Some(s) = v.as_string(heap) {
-            // §7.1.4 ToNumber on String.
-            crate::number::parse::to_number_from_string(&s.to_lossy_string(heap))
-        } else if v.is_big_int() {
-            return Err(MathError::BadArgument {
-                name,
-                index: idx as u16,
-                reason: "cannot convert a BigInt to a number",
-            });
-        } else if v.is_symbol() {
-            return Err(MathError::BadArgument {
-                name,
-                index: idx as u16,
-                reason: "cannot convert a Symbol to a number",
-            });
-        } else {
-            // Non-primitive operands should have been routed through
-            // `Interpreter::math_coerce_args` before reaching this
-            // table. Soft NaN so Math.max / Math.min produce the
-            // §21.3.2.{24,25} step 3 NaN result.
-            NumberValue::Double(f64::NAN)
-        };
-        out.push(n);
-    }
-    Ok(out)
-}
 
 fn impl_abs(args: &[NumberValue]) -> NumberValue {
     let f = first_or_nan(args);
@@ -839,17 +738,7 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 /// §21.3.2.16 `Math.f16round(x)` — round `x` to the nearest IEEE-754
 /// half (binary16) and return it back as a `Number`.
 fn native_f16round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let coerced = coerce_math_args(ctx, args)?;
-    let nums = coerce_all("Math.f16round", &coerced, ctx.heap()).map_err(|err| match err {
-        MathError::BadArgument { reason, .. } => NativeError::TypeError {
-            name: "Math.f16round",
-            reason: reason.to_string(),
-        },
-        MathError::UnknownMember(member) => NativeError::TypeError {
-            name: "Math.f16round",
-            reason: format!("unknown Math member {member}"),
-        },
-    })?;
+    let nums = coerce_math_args(ctx, "Math.f16round", &args[..args.len().min(1)])?;
     let x = first_or_nan(&nums).as_f64();
     let bits = crate::binary::typed_array::f64_to_f16_bits(x);
     let rounded = crate::binary::typed_array::f16_bits_to_f64(bits);

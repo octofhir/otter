@@ -720,6 +720,20 @@ fn is_caught_throw_acknowledgement_target(descriptor: &CallDescriptor) -> bool {
 /// Target-neutral name of a selected machine operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineOpcode {
+    /// Test the current native callable identity under an already-proven method lookup.
+    NativeLeafIdentity {
+        /// Exact bootstrap function identity from the VM declaration.
+        builtin_native_ref: u32,
+        /// Source byte offset for structural attribution.
+        byte_pc: u32,
+    },
+    /// Pure Int32 Math result/hit probe; overflow misses before any result commits.
+    NativeInt32Math {
+        /// Shared VM declaration naming abs, max or min.
+        stub: otter_vm::native_abi::RuntimeStubId,
+        /// Source byte offset for structural attribution.
+        byte_pc: u32,
+    },
     /// Materialize an incoming ABI value.
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
@@ -977,6 +991,14 @@ pub enum MachineOpcode {
         /// Stable compressed hidden-class token.
         shape: u32,
     },
+    /// Prove that an ordinary fast object's shape authorizes named lookup:
+    /// no object-local descriptor overrides or opaque lookup state. Benign
+    /// sidecars, such as symbol properties, remain eligible. A false incoming
+    /// condition keeps the result false without touching the object.
+    CacheIrGuardOrdinaryState {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+    },
     /// Prove that an atom's immutable shape slot is not overridden by
     /// object-local descriptor or exotic state.
     CacheIrGuardAtomSlot {
@@ -1006,6 +1028,14 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Byte offset inside the object's value slab.
         value_byte: u32,
+    },
+    /// Probe the isolate's existing shape/atom table and read a live own or
+    /// direct-prototype data slot. Miss returns undefined/false without effects.
+    PropertyMegamorphicLoad {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Exact interned property key, owned by the source operation.
+        atom: u32,
     },
     /// Commit one existing own-data field store under a complete CacheIR guard
     /// chain. The parent address output is valid only for the immediately
@@ -2115,7 +2145,8 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::CacheIrGuardPrototypeNull { .. }
+                    MachineOpcode::CacheIrGuardOrdinaryState { .. }
+                    | MachineOpcode::CacheIrGuardPrototypeNull { .. }
                     | MachineOpcode::CacheIrGuardExtensible { .. } => {
                         let [object, active, output] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2138,6 +2169,16 @@ impl InstructionSequence {
                             || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::NativeLeafIdentity { .. }
+                    | MachineOpcode::NativeInt32Math { .. } => {
+                        if !native_leaf::method_probe_is_valid(
+                            target_spec,
+                            instruction,
+                            &self.representations,
+                        ) {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
@@ -2233,11 +2274,15 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::ExoticLength { .. } => {
+                    MachineOpcode::ExoticLength { .. }
+                    | MachineOpcode::PropertyMegamorphicLoad { .. } => {
                         let [receiver, payload, hit] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
-                        if *receiver != MachineOperand::location_input(receiver.value)
+                        if matches!(
+                            instruction.opcode,
+                            MachineOpcode::PropertyMegamorphicLoad { atom: u32::MAX, .. }
+                        ) || *receiver != MachineOperand::location_input(receiver.value)
                             || self.representations[receiver.value.0 as usize]
                                 != MachineRepresentation::Tagged
                             || *payload != MachineOperand::register_output(payload.value)

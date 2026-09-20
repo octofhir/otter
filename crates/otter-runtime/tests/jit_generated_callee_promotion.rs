@@ -11,8 +11,6 @@
 //!   the optimizing tier without a single interpreter entry after tier-up.
 //! - Every tier returns the interpreter's completion.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitDebugCompileOutcome, JitDebugEvent, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
     SourceInput,
@@ -20,12 +18,16 @@ use otter_runtime::{
 
 const SOURCE: &str = r#"
 function Node(v) { this.v = v; this.next = null; }
-function nodeSum(acc) { return acc + this.v; }
+function nodeSum(acc) {
+  if (acc < 0) return nodeSum(-acc);
+  return acc + this.v;
+}
 Node.prototype.sum = nodeSum;
 function Holder(node) { this.node = node; this.total = 0; }
 // The loop keeps `step` out of the caller's inline tree, so every call is a
-// real generated entry; `nodeSum` is a plain leaf the callee inlines or
-// calls, and both must promote without an interpreter entry.
+// real generated entry. `nodeSum` retains an unreachable-in-this-fixture
+// recursive edge so it cannot be spliced into `step`; every post-warmup
+// execution must pass through its own entry and contribute tiering feedback.
 function step(h) {
   let t = 0;
   for (let k = 0; k < 2; k++) t = h.node.sum(h.total);

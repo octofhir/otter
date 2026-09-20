@@ -52,6 +52,8 @@ pub mod machine;
 mod measurement;
 pub mod optimizing;
 mod template;
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
 
 /// Backedges between shared interrupt/work-budget probes in generated code.
 ///

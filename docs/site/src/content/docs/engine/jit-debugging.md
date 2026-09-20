@@ -13,6 +13,18 @@ Neither channel writes from the VM or JIT compiler. The engine returns bounded,
 owned data to the outer runtime, and the CLI performs filesystem I/O only when
 the corresponding flag is present.
 
+## Focused iteration
+
+Use `just quick [calls|gc|math|native|properties|all]` for incremental debug
+checks. The default `calls` family runs the two constructor moving-GC tests;
+`gc` checks scavenging, promotion preflight and remembered arrays; `math` checks
+guarded Math methods; `native` checks resolved calls, evaluation order and moving
+argument roots; `properties` checks named-slot proofs and shared-cache loads.
+`all` runs every focused family. An unset `OTTER_GC_STRESS` defaults to 1;
+explicit values and the Cargo target/runner configuration are preserved.
+These checks support iteration. The full gate and required targeted Test262
+comparison remain the closing evidence; cold compilation can dominate a quick run.
+
 ## Capture a run
 
 Build the release CLI, then run the production tier policy:
@@ -273,8 +285,9 @@ arguments, result, call clobbers, and exact pre-call deopt state are represented
 in Machine IR before allocation. These leaves allocate no objects, publish no
 GC roots, and cannot reenter JavaScript. The exact bootstrap `parseInt` with
 one Int32 argument uses `parse_int_i32_leaf`. A different tag or replaced
-callee exits before coercion; an unsupported arity, explicit receiver, or
-local exception handler retains the canonical call. Template uses the same
+callee exits before coercion. Unsupported plain-leaf arities and local exception
+handlers retain the canonical call; the resolved `CallWithThis` Math path below
+uses a separate explicit cold sibling. Template uses the same
 identity guard and declared ABI with its own explicit context register.
 Separate
 plan and lowering events keep feedback selection distinct from emitted machine
@@ -410,6 +423,17 @@ data. Generated add transitions prove their complete prototype contract,
 receiver extensibility, exact append position, and existing storage capacity
 before storing the value and publishing the child shape. Dictionary transitions
 and other allocation-requiring programs remain canonical.
+Megamorphic named loads expose `machineMegamorphicPropertyLoad`. This pure probe
+reads the isolate's existing shared shape/atom table through a symbolic
+`propertyLookupCacheTable` relocation. Own and direct-prototype data hits validate
+the live object state, full key, holder shape and storage bounds, then load the
+current slot. Cache fills and collisions do not replace the compiled body.
+The table has a fixed address for the owning isolate's lifetime and contains
+pinned shape metadata, not moving receivers, prototypes or cached values. The
+non-reentrant probe retains no borrowed slot address across a collection.
+Negative, exotic and deeper-prototype entries use the same rooted cold load; stores
+retain their existing CacheIR or canonical path. Bootstrap dictionary receivers
+are prepared while attaching interpreter feedback before the first OSR snapshot.
 Success or throw commits once; named-property misses do not exact-deopt and
 replay the source operation. Both named loads and stores split their generated
 probe/commit and rooted cold call before register allocation. Cold calls expose
@@ -484,19 +508,29 @@ canonically and cannot remain in a generated deopt loop. An already-attempted
 site without a complete generated plan keeps the whole function on Template
 instead of being mislabeled cold.
 
-### Optimizing frame-free method intrinsics
+### Optimizing frame-free native intrinsics
 
-An optimizing bundle uses `machineMethodIntrinsic` for a generated Map, string,
-or Int32 Math method hit. The region spans the allocated-SSA receiver guard,
-generated body, and direct store into the result's allocated home. A successful
-region does not construct a transition frame, publish a VM PC, or write and
-reload the result through the interpreter register window.
+An optimizing bundle uses `machineMethodIntrinsic` for the generated Int32
+`Math.abs`, `Math.max`, or `Math.min` arithmetic probe. Method sites use shared
+`machineCacheIr*` operations to prove the current receiver, optional prototype
+holder, and slot. Resolved `CallWithThis` sites consume their already-loaded
+callee. Both use `machineNativeLeafIdentity` to prove its builtin identity.
+These are separate Machine operations before register allocation. The hit
+does not construct a transition frame, publish a VM PC, or round-trip its result
+through the interpreter register window.
 
-The miss edge is intentionally outside the region. It clears any activation
-cache, materializes the exact transition frame, publishes the original call PC,
-and resumes the canonical generic method path. The structural region therefore
-proves a faster hit topology, not permission to skip replacement, accessor,
-proxy, coercion, or exception semantics.
+Sites are admitted for `CallMethodValue` and separately evaluated `LoadProperty`
+plus `CallWithThis` with HIR operands already Int32. Explicit calls preserve the
+callee loaded before arguments and guard that value after argument evaluation.
+Identity and overflowing `abs(INT32_MIN)` misses branch to the existing canonical
+method or explicit-call sibling. The latter uses the original callee and receiver
+without repeating lookup. Only the cold sibling owns a safepoint and transition
+frame; its tagged result joins the generated result through SSA. Replacement, accessors,
+proxies, and exceptions execute once without site deopt or replay. Tagged
+operands retain the canonical method call, including coercion; independently
+inferred function parameter guards can still deopt at function entry. Map and
+string method calls currently retain the canonical Machine call boundary
+rather than this arithmetic specialization.
 
 ### Optimizing loop proofs and LICM
 

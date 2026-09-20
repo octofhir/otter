@@ -1,12 +1,9 @@
 //! Per-heap GC counters and per-type allocation breakdown.
 //!
-//! Wired to make leaks observable before they show up as host
-//! OOM. The counters are pure accounting; updating them is on
-//! the slow paths only — the alloc fast path increments a small
-//! handful of u64s, the per-GC reconciliation runs once per
-//! collection. Migration tasks (76+) read these counters to
-//! prove a removed `Rc<RefCell<…>>` cycle actually returns to
-//! baseline.
+//! Allocation totals, collection pauses, and root/remembered-set work make
+//! leaks and excessive collector work observable. Counters do not influence
+//! collection policy. The allocation fast path updates a handful of integers;
+//! collection counters are folded once per collection.
 //!
 //! # Contents
 //!
@@ -28,8 +25,8 @@
 //!
 //! # See also
 //!
-//! - GC architecture plan §1.2 NF6, §7 ("Leak diagnosis").
-//! - Task 74 — GC stats, heap snapshot, retained-size walker.
+//! - [`crate::scavenger`] — per-cycle minor collection accounting.
+//! - [`crate::heap`] — allocation and collection counter publication.
 
 /// Number of distinct `type_tag` slots — matches
 /// [`crate::trace::TraceTable`]. Keep in sync.
@@ -94,6 +91,12 @@ pub struct GcStats {
     pub minor_gc_cycles: u64,
     /// Cumulative minor-GC pause time, in nanoseconds.
     pub minor_pause_ns_total: u64,
+    /// Cumulative root slots visited across minor GCs, excluding heap tracing.
+    pub minor_root_slots_scanned: u64,
+    /// Largest number of root slots visited by one minor GC.
+    pub minor_root_slots_peak: u64,
+    /// Cumulative minor-GC slot updates, including relocation and weak-slot clearing.
+    pub minor_slot_updates: u64,
     /// Cumulative remembered-set entries scanned across all minor GCs.
     pub minor_dirty_cards_scanned: u64,
     /// Cumulative old-space headers strided to re-derive edge owners. Holding
@@ -102,7 +105,8 @@ pub struct GcStats {
     pub minor_old_headers_walked: u64,
     /// Cumulative remembered parents re-traced across all minor GCs.
     pub minor_objects_retraced: u64,
-    /// Cumulative slots visited while re-tracing remembered parents.
+    /// Cumulative slots visited while tracing remembered parents and the
+    /// children of freshly promoted bodies.
     pub minor_slots_scanned: u64,
 }
 
@@ -119,6 +123,9 @@ impl Default for GcStats {
             gc_cycles: 0,
             minor_gc_cycles: 0,
             minor_pause_ns_total: 0,
+            minor_root_slots_scanned: 0,
+            minor_root_slots_peak: 0,
+            minor_slot_updates: 0,
             minor_dirty_cards_scanned: 0,
             minor_old_headers_walked: 0,
             minor_objects_retraced: 0,
@@ -147,6 +154,9 @@ impl std::fmt::Debug for GcStats {
             .field("gc_cycles", &self.gc_cycles)
             .field("minor_gc_cycles", &self.minor_gc_cycles)
             .field("minor_pause_ns_total", &self.minor_pause_ns_total)
+            .field("minor_root_slots_scanned", &self.minor_root_slots_scanned)
+            .field("minor_root_slots_peak", &self.minor_root_slots_peak)
+            .field("minor_slot_updates", &self.minor_slot_updates)
             .field("minor_dirty_cards_scanned", &self.minor_dirty_cards_scanned)
             .field("minor_old_headers_walked", &self.minor_old_headers_walked)
             .field("minor_objects_retraced", &self.minor_objects_retraced)
@@ -191,6 +201,11 @@ impl GcStats {
     pub fn record_minor(&mut self, s: &crate::scavenger::ScavengeStats) {
         self.minor_gc_cycles = self.minor_gc_cycles.wrapping_add(1);
         self.minor_pause_ns_total = self.minor_pause_ns_total.wrapping_add(s.minor_pause_ns);
+        self.minor_root_slots_scanned = self
+            .minor_root_slots_scanned
+            .wrapping_add(s.root_slots_scanned as u64);
+        self.minor_root_slots_peak = self.minor_root_slots_peak.max(s.root_slots_scanned as u64);
+        self.minor_slot_updates = self.minor_slot_updates.wrapping_add(s.slot_updates as u64);
         self.minor_dirty_cards_scanned = self
             .minor_dirty_cards_scanned
             .wrapping_add(s.dirty_cards_scanned as u64);

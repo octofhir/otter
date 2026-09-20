@@ -208,7 +208,7 @@ impl Interpreter {
             .jit_runtime_stats
             .jit_to_rust_call_transitions
             .saturating_add(1);
-        self.record_resolved_bytecode_call_feedback(function, call_pc, function_id, callee);
+        self.record_resolved_call_feedback(function, call_pc, function_id, callee);
         self.run_rooted_call_values(stack, context, callee, receiver, args)
     }
 

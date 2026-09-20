@@ -7,8 +7,15 @@
 //!   concat packet and coercive runtime delegate.
 //! - Monomorphic plain and bounded polymorphic method generated calls through
 //!   the shared entry-cell, frame, deopt, and feedback contracts.
-//! - Generated base-constructor linkage, closure-capture refresh, descriptor
-//!   definitions, and class-value transitions through shared VM descriptors.
+//! - Generated base/super constructor linkage with fixed or spread arguments,
+//!   closure-capture refresh, and receiver-allocation fast paths.
+//! - Iterator lifecycle, descriptor definitions, and class-value transitions
+//!   through shared VM descriptors.
+//! - Actual-argument collection and intrinsic-apply forwarding through the
+//!   shared activation-window descriptors.
+//! - Canonical indexed loads and stores through committed element descriptors.
+//! - Named-property CacheIR hits for existing slots and allocation-free shape
+//!   transitions, including receiver storage and write-barrier proofs.
 //! - Structured try/catch/finally operations through the VM-owned exception
 //!   transition protocol.
 //! - Cooperative interrupt/work-budget polling on every generated backedge.
@@ -25,6 +32,8 @@
 //! - Every generated callee entry uses the shared x86 tier-up mailbox protocol;
 //!   nested callees cannot overwrite an outer pending promotion request.
 //! - Every exact exit publishes the canonical instruction PC before returning.
+//! - Forwarding probes reject sources requiring caller materialization before
+//!   the committed value-span boundary can perform call effects.
 //! - The stack is 16-byte aligned at every generated call boundary.
 //!
 //! # See also
@@ -111,6 +120,7 @@ pub(super) fn compile(
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let type_mismatch = ops.new_dynamic_label();
+    let identity_guard = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
     let runtime_transition = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
@@ -311,6 +321,20 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch x64 ; mov rax, [r14 + NATIVE_FRAME_SELF_OFFSET as i32]);
                 emit_store_reg(&mut ops, 0, dst);
             }
+            TemplateOp::ClassSuperConstructor { dst, class } => {
+                emit_load_reg(&mut ops, 6, class);
+                dynasm!(ops ; .arch x64 ; mov rdi, r15);
+                emit_load_runtime_stub(
+                    &mut ops,
+                    &mut relocations,
+                    transitions.variadic_entry(abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+                    abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
+                );
+                dynasm!(ops ; .arch x64 ; call r11);
+                emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>runtime_transition);
+                emit_store_reg(&mut ops, 0, dst);
+            }
             TemplateOp::MakeFunction { dst, constant } => emit_make_function(
                 &mut ops,
                 &mut relocations,
@@ -327,6 +351,30 @@ pub(super) fn compile(
                 abi::STUB_JIT_NEW_OBJECT,
                 &[],
                 dst,
+                committed_throw,
+                fatal,
+            )?,
+            TemplateOp::CollectArguments { dst } => {
+                emit_collect_arguments(&mut ops, &mut relocations, transitions, dst, threw, fatal)
+            }
+            TemplateOp::CallForwardArguments {
+                dst,
+                method,
+                receiver,
+                this_value,
+            } => emit_forward_call(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                view,
+                code_map.as_mut(),
+                instruction.pc,
+                dst,
+                method,
+                receiver,
+                this_value,
+                identity_guard,
+                threw,
                 committed_throw,
                 fatal,
             )?,
@@ -399,6 +447,86 @@ pub(super) fn compile(
                 threw,
                 fatal,
             ),
+            TemplateOp::ClassOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_class_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::SpreadCallOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                let direct_done = ops.new_dynamic_label();
+                let emitted_direct = if opcode == otter_bytecode::Op::CallSpread as u8 {
+                    let lane = |index: usize| ((arg0 >> (index * 16)) & 0xffff) as u16;
+                    direct_call::emit_spread_plain(
+                        &mut ops,
+                        &mut relocations,
+                        transitions,
+                        view,
+                        lane(0),
+                        lane(1),
+                        lane(2),
+                        lane(3),
+                        instruction.pc,
+                        instruction.byte_pc,
+                        threw,
+                        committed_throw,
+                        fatal,
+                        direct_done,
+                    )?
+                } else if opcode == otter_bytecode::Op::NewSpread as u8
+                    || opcode == otter_bytecode::Op::SuperConstructSpread as u8
+                {
+                    direct_call::emit_spread_construct(
+                        &mut ops,
+                        &mut relocations,
+                        transitions,
+                        view,
+                        code_map.as_mut(),
+                        arg0 as u16,
+                        arg1 as u16,
+                        arg2 as u16,
+                        instruction.pc,
+                        instruction.byte_pc,
+                        opcode == otter_bytecode::Op::SuperConstructSpread as u8,
+                        committed_throw,
+                        fatal,
+                        direct_done,
+                    )?
+                } else {
+                    false
+                };
+                emit_spread_call_op(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    runtime_transition,
+                    threw,
+                    fatal,
+                );
+                if emitted_direct {
+                    dynasm!(ops ; .arch x64 ; =>direct_done);
+                }
+            }
             TemplateOp::ClassValueOp {
                 opcode,
                 arg0,
@@ -461,6 +589,22 @@ pub(super) fn compile(
                     fatal,
                 );
             }
+            TemplateOp::ObjectProtocolValue {
+                operation: _,
+                result,
+                value0,
+                value1,
+            } => emit_committed_value2(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                result,
+                Some(value0),
+                value1,
+                committed_throw,
+                fatal,
+            ),
             TemplateOp::LoadStringConstant { dst } => {
                 let target = view
                     .string_constant_cells
@@ -527,6 +671,20 @@ pub(super) fn compile(
                     fatal,
                 );
             }
+            TemplateOp::LoadElement {
+                dst,
+                receiver,
+                index,
+            } => emit_load_element(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                dst,
+                receiver,
+                index,
+                committed_throw,
+                fatal,
+            ),
             TemplateOp::StoreElement {
                 receiver,
                 index,
@@ -632,6 +790,7 @@ pub(super) fn compile(
                     &arguments,
                     instruction.pc,
                     byte_pc,
+                    threw,
                     committed_throw,
                     fatal,
                     direct_done,
@@ -687,6 +846,7 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     view,
+                    code_map.as_mut(),
                     dst,
                     callee,
                     &arguments,
@@ -734,6 +894,7 @@ pub(super) fn compile(
                     argument_registers,
                     instruction.pc,
                     byte_pc,
+                    threw,
                     committed_throw,
                     fatal,
                     direct_done,
@@ -853,6 +1014,58 @@ pub(super) fn compile(
                 committed_throw,
                 fatal,
             ),
+            TemplateOp::IteratorNext {
+                value_dst,
+                done_dst,
+                iterator,
+            } => emit_iterator_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                otter_bytecode::Op::IteratorNext as u8,
+                u64::from(value_dst),
+                u64::from(done_dst),
+                u64::from(iterator),
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::IteratorClose { iterator } => emit_iterator_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                otter_bytecode::Op::IteratorClose as u8,
+                u64::from(iterator),
+                0,
+                0,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::IteratorCloseStart { iterator } => emit_iterator_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                otter_bytecode::Op::IteratorCloseStart as u8,
+                u64::from(iterator),
+                0,
+                0,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::IteratorCloseEnd { iterator } => emit_iterator_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                otter_bytecode::Op::IteratorCloseEnd as u8,
+                u64::from(iterator),
+                0,
+                0,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
             TemplateOp::JumpViaFinally { target, floor } => exceptions::emit_exception_op(
                 &mut ops,
                 &mut relocations,
@@ -867,6 +1080,30 @@ pub(super) fn compile(
                 fatal,
             ),
             TemplateOp::NoOp => {}
+            TemplateOp::GetIterator { dst, src } => emit_iterator_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                otter_bytecode::Op::GetIterator as u8,
+                u64::from(dst),
+                u64::from(src),
+                0,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::GetAsyncIterator { dst, src } => emit_iterator_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                otter_bytecode::Op::GetAsyncIterator as u8,
+                u64::from(dst),
+                u64::from(src),
+                0,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
             TemplateOp::Return { src } => {
                 emit_load_reg(&mut ops, 0, src);
                 dynasm!(ops ; .arch x64 ; jmp =>returned);
@@ -899,7 +1136,25 @@ pub(super) fn compile(
         ; xor edx, edx
         ; jmp =>pair_exit
         ; =>committed_throw
-        ; mov edx, abi::NativeResultStatus::Throw as i32
+        ; mov rsi, rax
+        ; mov rdi, r15
+    );
+    emit_load_runtime_stub(
+        &mut ops,
+        &mut relocations,
+        transitions.entry(abi::STUB_JIT_ROUTE_THROW),
+        abi::STUB_JIT_ROUTE_THROW,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; cmp edx, abi::NativeResultStatus::SideExit as i32
+        ; je =>pair_exit
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>pair_exit
+        ; cmp edx, abi::NativeResultStatus::Fatal as i32
+        ; je =>pair_exit
+        ; jmp =>fatal
         ; =>pair_exit
     );
     emit_epilogue(&mut ops);
@@ -907,6 +1162,12 @@ pub(super) fn compile(
         &mut ops,
         type_mismatch,
         abi::ExitReason::TypeMismatch,
+        abi::ExitAction::Recompile,
+    );
+    emit_side_exit(
+        &mut ops,
+        identity_guard,
+        abi::ExitReason::IdentityGuard,
         abi::ExitAction::Recompile,
     );
     emit_side_exit(
@@ -1042,20 +1303,27 @@ fn supports(op: TemplateOp) -> bool {
             | TemplateOp::AddGeneric { .. }
             | TemplateOp::LoadThis { .. }
             | TemplateOp::LoadSelfClosure { .. }
+            | TemplateOp::ClassSuperConstructor { .. }
             | TemplateOp::MakeFunction { .. }
             | TemplateOp::NewObject { .. }
+            | TemplateOp::CollectArguments { .. }
+            | TemplateOp::CallForwardArguments { .. }
             | TemplateOp::NewArray { .. }
             | TemplateOp::FreshUpvalue { .. }
             | TemplateOp::DefineDataProperty { .. }
             | TemplateOp::DefineOwnProperty { .. }
             | TemplateOp::ConstructOp { .. }
+            | TemplateOp::ClassOp { .. }
+            | TemplateOp::SpreadCallOp { .. }
             | TemplateOp::ClassValueOp { .. }
             | TemplateOp::MakeClosure { .. }
             | TemplateOp::BindingValue { .. }
             | TemplateOp::GlobalDeclarationValue { .. }
+            | TemplateOp::ObjectProtocolValue { .. }
             | TemplateOp::LoadStringConstant { .. }
             | TemplateOp::LoadProperty { .. }
             | TemplateOp::StoreProperty { .. }
+            | TemplateOp::LoadElement { .. }
             | TemplateOp::StoreElement { .. }
             | TemplateOp::Call { .. }
             | TemplateOp::CallWithThis { .. }
@@ -1069,6 +1337,12 @@ fn supports(op: TemplateOp) -> bool {
             | TemplateOp::EndFinally
             | TemplateOp::PopParkedFinally { .. }
             | TemplateOp::JumpViaFinally { .. }
+            | TemplateOp::IteratorNext { .. }
+            | TemplateOp::IteratorClose { .. }
+            | TemplateOp::IteratorCloseStart { .. }
+            | TemplateOp::IteratorCloseEnd { .. }
+            | TemplateOp::GetIterator { .. }
+            | TemplateOp::GetAsyncIterator { .. }
             | TemplateOp::NoOp
             | TemplateOp::Return { .. }
             | TemplateOp::ReturnUndefined
@@ -1942,6 +2216,129 @@ fn emit_class_value_op(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_class_op(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    opcode: u8,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov esi, i32::from(opcode)
+    );
+    emit_load_u64(ops, 2, arg0);
+    emit_load_u64(ops, 1, arg1);
+    emit_load_u64(ops, 8, arg2);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.variadic_entry(abi::STUB_JIT_CLASS_OP),
+        abi::STUB_JIT_CLASS_OP,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rax, rax
+        ; je >completed
+        ; cmp eax, abi::NativeResultStatus::SideExit as i32
+        ; je =>bail
+        ; cmp eax, abi::NativeResultStatus::Throw as i32
+        ; je =>threw
+        ; jmp =>fatal
+        ; completed:
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_spread_call_op(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    opcode: u8,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov esi, i32::from(opcode)
+    );
+    emit_load_u64(ops, 2, arg0);
+    emit_load_u64(ops, 1, arg1);
+    emit_load_u64(ops, 8, arg2);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.variadic_entry(abi::STUB_JIT_SPREAD_CALL_OP),
+        abi::STUB_JIT_SPREAD_CALL_OP,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rax, rax
+        ; je >completed
+        ; cmp eax, abi::NativeResultStatus::SideExit as i32
+        ; je =>bail
+        ; cmp eax, abi::NativeResultStatus::Throw as i32
+        ; je =>threw
+        ; jmp =>fatal
+        ; completed:
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_iterator_op(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    opcode: u8,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov esi, i32::from(opcode)
+    );
+    emit_load_u64(ops, 2, arg0);
+    emit_load_u64(ops, 1, arg1);
+    emit_load_u64(ops, 8, arg2);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.variadic_entry(abi::STUB_JIT_ITERATOR_OP),
+        abi::STUB_JIT_ITERATOR_OP,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rax, rax
+        ; je >completed
+        ; cmp eax, abi::NativeResultStatus::SideExit as i32
+        ; je =>bail
+        ; cmp eax, abi::NativeResultStatus::Throw as i32
+        ; je =>threw
+        ; jmp =>fatal
+        ; completed:
+    );
+}
+
 fn emit_make_closure(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -2169,7 +2566,7 @@ fn emit_existing_property_load(
                 otter_vm::JitCacheIrOp::LoadPrototype {
                     object: 0,
                     result: 1,
-                } => emit_template_prototype(ops, relocations, view, 10, next),
+                } => emit_template_prototype(ops, relocations, view, 10, false, next),
                 otter_vm::JitCacheIrOp::LoadField { object, value_byte } => {
                     let header = if object == 0 { 10 } else { 8 };
                     emit_template_slab_base(ops, view, header, 11, next);
@@ -2215,35 +2612,85 @@ fn emit_existing_property_store(
             .ops
             .iter()
             .any(|op| matches!(op, otter_vm::JitCacheIrOp::StoreField { .. }))
-            || program.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    otter_vm::JitCacheIrOp::GuardExtensible { .. }
-                        | otter_vm::JitCacheIrOp::PublishShape { .. }
-                        | otter_vm::JitCacheIrOp::LoadField { .. }
-                )
-            })
         {
             continue;
         }
         let next = ops.new_dynamic_label();
         let mut terminal = false;
-        for op in &program.ops {
+        let add_transition = program.ops.iter().any(|op| {
+            matches!(
+                op,
+                otter_vm::JitCacheIrOp::GuardExtensible { .. }
+                    | otter_vm::JitCacheIrOp::PublishShape { .. }
+            )
+        });
+        for (index, op) in program.ops.iter().enumerate() {
             match *op {
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = if object == 0 { 10 } else { 8 };
-                    emit_template_shape_guard(ops, view, header, shape, next);
+                    if add_transition && object == 1 {
+                        emit_template_shape_state_guard(ops, view, header, next);
+                        emit_template_shape_identity_guard(ops, view, header, shape, next);
+                    } else {
+                        emit_template_shape_guard(ops, view, header, shape, next);
+                    }
                 }
-                otter_vm::JitCacheIrOp::GuardAtomSlot { writable: true, .. } => {}
-                otter_vm::JitCacheIrOp::LoadPrototype {
-                    object: 0,
-                    result: 1,
-                } => emit_template_prototype(ops, relocations, view, 10, next),
+                otter_vm::JitCacheIrOp::GuardAtomSlot {
+                    object,
+                    writable: true,
+                    ..
+                } if object <= 1 => {}
+                otter_vm::JitCacheIrOp::LoadPrototype { object, result: 1 } if object <= 1 => {
+                    let header = if object == 0 { 10 } else { 8 };
+                    emit_template_prototype(ops, relocations, view, header, add_transition, next);
+                }
                 otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
                     let header = if object == 0 { 10 } else { 8 };
                     dynasm!(ops
                         ; .arch x64
                         ; cmp DWORD [Rq(header) + view.jit_proto_byte as i32], 0
+                        ; jne =>next
+                    );
+                }
+                otter_vm::JitCacheIrOp::GuardExtensible {
+                    object: 0,
+                    value_byte,
+                } => {
+                    let inline = ops.new_dynamic_label();
+                    let storage_fits = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r11d, value_byte as i32
+                        ; test r11d, 7
+                        ; jnz =>next
+                        ; mov r9d, [r10 + view.object_slab_handle_byte as i32]
+                        ; test r9d, r9d
+                        ; jz =>inline
+                    );
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        8,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add r8, r9
+                        ; mov r9d, [r8 + view.object_slab_capacity_byte as i32]
+                        ; shr r11d, 3
+                        ; cmp r11d, r9d
+                        ; jae =>next
+                        ; jmp =>storage_fits
+                        ; =>inline
+                        ; shr r11d, 3
+                        ; cmp r11d, view.object_inline_slot_cap as i32
+                        ; jae =>next
+                        ; =>storage_fits
+                        ; cmp BYTE [r10 + view.object_extensible_byte as i32], 0
+                        ; je =>next
+                        ; movzx r9d, WORD [r10 + view.object_slab_len_byte as i32]
+                        ; cmp r9d, r11d
                         ; jne =>next
                     );
                 }
@@ -2253,10 +2700,70 @@ fn emit_existing_property_store(
                 } => {
                     emit_template_slab_base(ops, view, 10, 11, next);
                     emit_load_reg(ops, 2, value);
-                    dynasm!(ops ; .arch x64 ; mov [r11 + value_byte as i32], rdx);
+                    terminal = true;
+                    if !matches!(
+                        program.ops.get(index + 1),
+                        Some(otter_vm::JitCacheIrOp::PublishShape { .. })
+                    ) {
+                        dynasm!(ops ; .arch x64 ; mov [r11 + value_byte as i32], rdx);
+                        emit_template_value_barrier(ops, relocations, view, 10, 2);
+                        dynasm!(ops ; .arch x64 ; jmp =>done);
+                    }
+                }
+                otter_vm::JitCacheIrOp::PublishShape {
+                    object: 0,
+                    shape,
+                    new_len,
+                    initialize_inline,
+                } if terminal => {
+                    let Some(otter_vm::JitCacheIrOp::StoreField {
+                        object: 0,
+                        value_byte,
+                    }) = index
+                        .checked_sub(1)
+                        .and_then(|index| program.ops.get(index))
+                        .copied()
+                    else {
+                        terminal = false;
+                        break;
+                    };
+                    if initialize_inline {
+                        let initialized = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp DWORD [r10 + view.object_slab_handle_byte as i32], 0
+                            ; jne =>initialized
+                            ; lea r8, [r10 + view.object_inline_values_byte as i32]
+                            ; mov [r10 + view.object_values_ptr_byte as i32], r8
+                            ; =>initialized
+                        );
+                    }
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov WORD [r10 + view.object_slab_len_byte as i32], new_len as i16
+                        ; mov DWORD [r10 + view.object_shape_byte as i32], shape as i32
+                        ; mov [r11 + value_byte as i32], rdx
+                        ; sub rsp, 16
+                        ; mov [rsp], r10
+                        ; mov [rsp + 8], rdx
+                    );
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        8,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    dynasm!(ops ; .arch x64 ; add r8, shape as i32);
+                    emit_template_value_barrier(ops, relocations, view, 10, 8);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r10, [rsp]
+                        ; mov rdx, [rsp + 8]
+                        ; add rsp, 16
+                    );
                     emit_template_value_barrier(ops, relocations, view, 10, 2);
                     dynasm!(ops ; .arch x64 ; jmp =>done);
-                    terminal = true;
                 }
                 _ => {
                     terminal = false;
@@ -2328,6 +2835,31 @@ fn emit_template_shape_guard(
     miss: DynamicLabel,
 ) {
     emit_template_fast_state_guard(ops, view, header, miss);
+    emit_template_shape_identity_guard(ops, view, header, shape, miss);
+}
+
+fn emit_template_shape_state_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; cmp BYTE [Rq(header) + view.object_shape_cache_mode_byte as i32], view.object_shape_cache_fast as i8
+        ; jne =>miss
+        ; cmp BYTE [Rq(header) + view.object_chain_link_opaque_byte as i32], 0
+        ; jne =>miss
+    );
+}
+
+fn emit_template_shape_identity_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    shape: u32,
+    miss: DynamicLabel,
+) {
     dynasm!(ops
         ; .arch x64
         ; cmp DWORD [Rq(header) + view.object_shape_byte as i32], shape as i32
@@ -2340,6 +2872,7 @@ fn emit_template_prototype(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
+    chain_link: bool,
     miss: DynamicLabel,
 ) {
     dynasm!(ops
@@ -2361,7 +2894,11 @@ fn emit_template_prototype(
         ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
         ; jne =>miss
     );
-    emit_template_fast_state_guard(ops, view, 8, miss);
+    if chain_link {
+        emit_template_shape_state_guard(ops, view, 8, miss);
+    } else {
+        emit_template_fast_state_guard(ops, view, 8, miss);
+    }
 }
 
 fn emit_template_slab_base(
@@ -2426,6 +2963,161 @@ fn emit_status_word_result(ops: &mut Assembler, threw: DynamicLabel, fatal: Dyna
         ; jmp =>fatal
         ; completed:
     );
+}
+
+fn emit_collect_arguments(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    dst: u16,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov esi, i32::from(dst)
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.variadic_entry(abi::STUB_JIT_COLLECT_ARGUMENTS),
+        abi::STUB_JIT_COLLECT_ARGUMENTS,
+    );
+    dynasm!(ops ; .arch x64 ; call r11);
+    emit_status_word_result(ops, threw, fatal);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_forward_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &JitCompileSnapshot,
+    mut code_map: Option<&mut CodeMapCapture>,
+    logical_pc: u32,
+    dst: u16,
+    method: u16,
+    callee: u16,
+    receiver: u16,
+    identity_guard: DynamicLabel,
+    finish_error: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let byte_pc = view
+        .instructions
+        .get(logical_pc as usize)
+        .ok_or(Unsupported::OperandShape("x86-64 forward instruction PC"))?
+        .byte_pc;
+    let canonical = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let native_start = ops.offset().0;
+    crate::x86_64::emit_runtime_forward(
+        ops,
+        relocations,
+        view,
+        transitions,
+        [dst, method, callee, receiver],
+        logical_pc,
+        byte_pc,
+        code_map.as_deref_mut(),
+        canonical,
+        finish_error,
+        throw_value,
+        fatal,
+        done,
+        |ops, source, target, _| {
+            emit_load_reg(ops, target, source);
+            Ok(())
+        },
+        |ops, destination, source, _| {
+            emit_store_reg(ops, source, destination);
+            Ok(())
+        },
+        |ops| {
+            dynasm!(ops
+                ; .arch x64
+                ; mov r14, [r15 + NATIVE_FRAME_OFFSET as i32]
+                ; mov r13, [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
+            );
+            Ok(())
+        },
+        |ops, register, _| {
+            emit_load_reg(ops, 11, register);
+            Ok(())
+        },
+    )?;
+    if let Some(map) = code_map {
+        let targets: Vec<_> = view
+            .direct_callees
+            .get(&byte_pc)
+            .into_iter()
+            .flatten()
+            .collect();
+        for (index, target) in targets.iter().enumerate() {
+            if let Ok(artifact) =
+                direct_call::forward_artifact(target, index as u32, targets.len() as u32)
+            {
+                map.record(CodeRegion::call_structural(
+                    "runtimeForwardCallCandidate",
+                    native_start,
+                    ops.offset().0,
+                    view.code_block.id,
+                    logical_pc,
+                    byte_pc,
+                    artifact,
+                ));
+            }
+        }
+    }
+    dynasm!(ops ; .arch x64 ; =>canonical);
+    emit_load_reg(ops, 6, method);
+    dynasm!(ops ; .arch x64 ; mov rdi, r15);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.entry(abi::STUB_JIT_FORWARD_SOURCE_READY),
+        abi::STUB_JIT_FORWARD_SOURCE_READY,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rax, rax
+        ; jz =>identity_guard
+    );
+
+    let mut words = vec![
+        PacketWord::Register(method),
+        PacketWord::Register(callee),
+        PacketWord::Register(receiver),
+    ];
+    words.extend(
+        view.code_block
+            .forwarded_argument_bindings()
+            .filter_map(|(_, storage)| match storage {
+                otter_bytecode::ArgumentBindingStorage::Register { reg } => {
+                    Some(PacketWord::Register(reg))
+                }
+                otter_bytecode::ArgumentBindingStorage::Upvalue { .. } => None,
+            }),
+    );
+    if words.len() > 510 {
+        dynasm!(ops ; .arch x64 ; jmp =>identity_guard);
+        return Ok(());
+    }
+    emit_value_packet_transition(
+        ops,
+        relocations,
+        transitions,
+        abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
+        &words,
+        dst,
+        throw_value,
+        fatal,
+    )?;
+    dynasm!(ops ; .arch x64 ; =>done);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2577,6 +3269,38 @@ fn emit_value_packet_transition(
     );
     emit_store_reg(ops, 0, dst);
     Ok(())
+}
+
+fn emit_load_element(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    dst: u16,
+    receiver: u16,
+    index: u16,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) {
+    emit_load_reg(ops, 6, receiver);
+    emit_load_reg(ops, 2, index);
+    dynasm!(ops ; .arch x64 ; mov rdi, r15);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.entry(abi::STUB_JIT_LOAD_ELEMENT),
+        abi::STUB_JIT_LOAD_ELEMENT,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rdx, rdx
+        ; je >done
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>fatal
+        ; done:
+    );
+    emit_store_reg(ops, 0, dst);
 }
 
 fn emit_store_element(

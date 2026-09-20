@@ -23,6 +23,8 @@
 //!   the full parent chain.
 //! - Shape bodies have no interior mutability; all transition/cache mutation
 //!   belongs to interpreter-owned side tables.
+//! - The C layout exposes only the immutable identity word to generated
+//!   shared-cache probes; shape handles remain pinned in old space.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
@@ -50,6 +52,7 @@ pub type ShapeHandle = otter_gc::Gc<ShapeBody>;
 
 /// Immutable hidden-class layout node.
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct ShapeBody {
     /// VM-local identity used by property inline-cache guards.
     id: ShapeId,
@@ -76,6 +79,9 @@ pub struct ShapeBody {
     /// than a data property. Meaningless for the root.
     own_is_accessor: bool,
 }
+
+/// Identity word read by generated probes of the shared property lookup table.
+pub(crate) const SHAPE_BODY_ID_OFFSET: usize = std::mem::offset_of!(ShapeBody, id);
 
 impl ShapeBody {
     #[must_use]

@@ -370,7 +370,7 @@ impl CodeRegion {
     /// `function_id` remains the caller owning this code object. `direct_call`
     /// carries the exact target generation and stack contract separately.
     #[allow(clippy::too_many_arguments)]
-    #[cfg(any(test, target_arch = "aarch64"))]
+    #[cfg(any(test, target_arch = "aarch64", target_arch = "x86_64"))]
     pub(crate) fn call_structural(
         kind: &'static str,
         start: usize,

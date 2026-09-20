@@ -327,7 +327,7 @@ impl RuntimeCall<'_> {
     pub(super) fn published_opcode(&self) -> Result<Op, VmError> {
         let function_id = self.function_id();
         let instruction_pc = self.pc();
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -344,7 +344,7 @@ impl RuntimeCall<'_> {
     pub(super) fn published_const_index(&self, operand: u8) -> Result<u32, VmError> {
         let function_id = self.function_id();
         let instruction_pc = self.pc();
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -366,7 +366,7 @@ impl RuntimeCall<'_> {
     pub(super) fn published_imm32(&self, operand: u8) -> Result<i32, VmError> {
         let function_id = self.function_id();
         let instruction_pc = self.pc();
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -395,7 +395,7 @@ impl RuntimeCall<'_> {
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         vm.object_protocol_value(
             unsafe { &mut *self.stack.as_ptr() },
-            unsafe { self.context.as_ref() },
+            &self.context,
             operation,
             value0,
             value1,
@@ -422,7 +422,7 @@ impl RuntimeCall<'_> {
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
             if vm.pending_uncaught_frames.is_none() {
                 vm.pending_uncaught_frames = Some(vm.snapshot_active_frames(
-                    unsafe { self.context.as_ref() },
+                    &self.context,
                     unsafe { self.stack.as_ref() },
                     usize::MAX,
                 ));
@@ -433,7 +433,7 @@ impl RuntimeCall<'_> {
             operation,
             ScalarValueOp::NewError | ScalarValueOp::NewBuiltinError
         ) {
-            let context = unsafe { self.context.as_ref() };
+            let context = &self.context;
             let kind = if operation == ScalarValueOp::NewError {
                 crate::ErrorKind::Error
             } else {
@@ -461,7 +461,7 @@ impl RuntimeCall<'_> {
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         vm.scalar_value(
             unsafe { &mut *self.stack.as_ptr() },
-            unsafe { self.context.as_ref() },
+            &self.context,
             operation,
             value0,
             value1,
@@ -490,7 +490,7 @@ impl RuntimeCall<'_> {
             return Ok(exception);
         }
         let exception = vm.vm_error_to_throwable_with_stack_roots(
-            Some(unsafe { self.context.as_ref() }),
+            Some(&self.context),
             unsafe { self.stack.as_ref() },
             &err,
         );

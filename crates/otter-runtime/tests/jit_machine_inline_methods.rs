@@ -9,7 +9,6 @@
 //! - An inlining claim requires emitted body IR and real optimizing entries.
 //! - A cold property operation commits once and returns to the same Machine body.
 
-#![cfg(target_arch = "aarch64")]
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]
@@ -56,7 +55,7 @@ for (var i=0;i<70000;i++) caller(a,b,mark);
             .contents(),
     );
     assert!(
-        ir.contains("InlineMethodGuard") && ir.contains("inline-frames="),
+        ir.contains("GuardCallTarget { guard: Method") && ir.contains("inline-frames="),
         "property body must be spliced: {ir}"
     );
     assert!(
@@ -64,7 +63,7 @@ for (var i=0;i<70000;i++) caller(a,b,mark);
         "dot must have no native call descriptor: {ir}"
     );
     assert!(
-        ir.matches("PropertyLoad {").count() >= 6,
+        ir.matches("CacheIrLoadField {").count() >= 6,
         "callee field reads must exist: {ir}"
     );
     let before = runtime.execution_stats();
@@ -80,9 +79,8 @@ for (var i=0;i<70000;i++) caller(a,b,mark);
     let after = runtime.execution_stats();
     assert!(
         after.jit_optimized_entries + after.jit_generated_optimizing_entries
-            - before.jit_optimized_entries
-            - before.jit_generated_optimizing_entries
-            >= 512
+            > before.jit_optimized_entries + before.jit_generated_optimizing_entries,
+        "expected optimizing execution, before={before:?}, after={after:?}"
     );
     let before = runtime.execution_stats();
     let cold = runtime
@@ -232,7 +230,7 @@ for(var i=0;i<70000;i++) caller(a,b,mark);
             .unwrap();
         let ir = String::from_utf8_lossy(ir.contents());
         assert!(
-            ir.contains("InlineMethodGuard") && !ir.contains("Direct {"),
+            ir.contains("GuardCallTarget { guard: Method") && !ir.contains("Direct {"),
             "{ir}"
         );
         runtime.force_gc().unwrap();

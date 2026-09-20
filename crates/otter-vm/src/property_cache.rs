@@ -1,21 +1,14 @@
 //! Isolate-wide `(receiver shape, property atom)` property cache.
 //!
-//! A per-site inline cache answers a property read only while that site stays
-//! monomorphic or narrowly polymorphic. Past that the site goes megamorphic and
-//! every execution re-enters the full `[[Get]]` ladder — even though the same
-//! handful of `(shape, name)` pairs keep coming back, and even though a
-//! *different* site already resolved that exact pair. A dispatch loop over
-//! sibling classes (DeltaBlue's constraint list, Richards' task queue) spends
-//! its time there.
-//!
-//! This is the shared answer, direct-mapped on `(ShapeId, AtomId)` the way
-//! SpiderMonkey's megamorphic cache is: one probe replaces the ladder, whatever
-//! site asks. It caches only what the cache stubs already prove sound — a plain
-//! data slot on the receiver or on its direct prototype — so a hit runs the
-//! same shape/atom/attribute validation an installed stub runs.
+//! One direct-mapped table shares resolved own/direct-prototype data slots
+//! across property sites. Runtime loads consult it when a per-site program
+//! misses; generated megamorphic loads probe the same entries before entering
+//! their committed cold sibling. Every hit validates the live receiver and
+//! holder, then reads the current value rather than caching a JavaScript value.
 //!
 //! # Contents
 //! - [`PropertyLookupCache`] — the direct-mapped table.
+//! - [`jit`] — the same table's owned layout description for generated loads.
 //!
 //! # Invariants
 //! - A shape's own-key set never changes, so an entry keyed by receiver shape
@@ -25,9 +18,16 @@
 //!   shape on every hit, exactly like [`crate::cache_ir::CacheStub`]'s
 //!   direct-prototype program. Receiver-shape identity proves the receiver has
 //!   no own slot shadowing it.
-//! - Entries are recorded only for shaped, fast-IC-compatible receivers.
-//!   Dictionary-mode identities are never inserted.
+//! - Positive resolutions require fast-IC-compatible receivers. Entries are
+//!   keyed only by nonnull receiver shapes, never dictionary-mode identities.
+//! - A positive entry's atom and data-slot metadata come from one resolution
+//!   of that exact key. The receiver shape proves own-key presence/absence;
+//!   generated hits also require a nonnull cached holder shape fixing the
+//!   slot's key and descriptor kind, with no live descriptor overrides.
 //! - The table is derived data: dropping any entry is always sound.
+//! - The boxed table never resizes or is replaced during its interpreter's
+//!   lifetime. Generated probes share these exact entries and their layout;
+//!   only the owning VM thread may read or replace an entry.
 //!
 //! # See also
 //! - [`crate::cache_ir`]
@@ -39,11 +39,17 @@ use crate::cache_ir;
 use crate::object::{self, AtomOwnPropertyHit, JsObject, ShapeId};
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
 
+pub(crate) mod jit;
+
 /// Entries in the direct-mapped table. Power of two so the index is a mask.
 const CAPACITY: usize = 1024;
+const HASH_SHAPE_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+const HASH_ATOM_MULTIPLIER: u64 = 0xC2B2_AE3D_27D4_EB4F;
+const HASH_SHIFT: u8 = 32;
 
 /// One resolved `(receiver shape, atom)` answer.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 struct Entry {
     /// Receiver hidden class this answer was resolved under.
     /// [`ShapeId::UNASSIGNED`] marks an empty way.
@@ -102,9 +108,9 @@ impl PropertyLookupCache {
     /// counters, so a plain xor would collide systematically for neighbouring
     /// shapes; multiplying spreads the low bits.
     fn index(receiver_shape: ShapeId, atom: AtomId) -> usize {
-        let mixed = receiver_shape.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ u64::from(atom.raw()).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        ((mixed >> 32) as usize) & (CAPACITY - 1)
+        let mixed = receiver_shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
+            ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
+        ((mixed >> HASH_SHIFT) as usize) & (CAPACITY - 1)
     }
 
     /// The entry recorded for this receiver's class and this name, if any.

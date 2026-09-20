@@ -554,11 +554,32 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         }
         N::NativeLeaf {
             source,
+            target,
             argument_start,
             ..
         } => {
             inputs.push(source);
-            inputs.extend(span_values(function, argument_start, 1));
+            inputs.extend(span_values(
+                function,
+                argument_start,
+                u32::from(target.argument_count),
+            ));
+        }
+        N::NativeCall {
+            receiver,
+            target,
+            argument_start,
+            ..
+        } => {
+            inputs.push(receiver);
+            if let super::hir::NumericNativeCallTarget::Resolved { callee, .. } = target {
+                inputs.push(callee);
+            }
+            inputs.extend(span_values(
+                function,
+                argument_start,
+                u32::from(target.declaration().argument_count),
+            ));
         }
         N::TaggedStrictEqual(left, right)
         | N::TaggedStringConcat(left, right)
@@ -690,6 +711,14 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
             replacement(value);
         }
         N::PropertyLoad { receiver, .. } => replacement(receiver),
+        N::NativeCall {
+            receiver, target, ..
+        } => {
+            replacement(receiver);
+            if let super::hir::NumericNativeCallTarget::Resolved { callee, .. } = target {
+                replacement(callee);
+            }
+        }
         N::PropertyStore {
             receiver, value, ..
         } => {

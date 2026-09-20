@@ -1158,15 +1158,34 @@ mod tests {
 
         let context = ExecutionContext::from_module(module).expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
-
-        assert_eq!(
-            interp.run(&context).expect("first run"),
-            Value::boolean(true)
-        );
-        assert_eq!(
-            interp.run(&context).expect("second run"),
-            Value::boolean(true)
-        );
+        // The trailing load can prepare Object.prototype on its first miss.
+        // Stabilize that shared guard before measuring replay of the same
+        // add-store site; otherwise the second store correctly relearns it.
+        let prototype_shape = {
+            let mut prototype = interp
+                .object_prototype_object_opt()
+                .expect("Object.prototype");
+            interp.migrate_slow_to_fast(&mut prototype);
+            crate::object::shape_id(prototype, interp.gc_heap())
+        };
+        for run in ["first run", "second run"] {
+            assert_eq!(interp.run(&context).expect(run), Value::boolean(true));
+            let prototype = interp
+                .object_prototype_object_opt()
+                .expect("Object.prototype");
+            assert_eq!(
+                crate::object::shape_id(prototype, interp.gc_heap()),
+                prototype_shape
+            );
+            let first_store = context
+                .property_feedback_slot(
+                    context.function_base(),
+                    2,
+                    crate::property_ic::PropertyIcKind::Store,
+                )
+                .expect("initial store site");
+            assert_eq!(first_store.entry_count(), 1, "{run}: initial store bank");
+        }
         let stats = interp.property_ic_stats();
         assert_eq!(stats.store_hits, 1);
         assert_eq!(stats.store_misses, 1);
@@ -1224,16 +1243,53 @@ mod tests {
         ))
         .expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
-
-        assert_eq!(
-            interp.run(&context).expect("first run"),
-            Value::boolean(true)
-        );
-        assert_eq!(
-            interp.run(&context).expect("second run"),
-            Value::boolean(true)
-        );
-
+        // The trailing load can prepare Object.prototype on its first miss.
+        // Stabilize that shared guard before measuring replay of the same
+        // add-store site; otherwise the second store correctly relearns it.
+        let prototype_shape = {
+            let mut prototype = interp
+                .object_prototype_object_opt()
+                .expect("Object.prototype");
+            interp.migrate_slow_to_fast(&mut prototype);
+            crate::object::shape_id(prototype, interp.gc_heap())
+        };
+        for run in ["first run", "second run"] {
+            assert_eq!(interp.run(&context).expect(run), Value::boolean(true));
+            let prototype = interp
+                .object_prototype_object_opt()
+                .expect("Object.prototype");
+            assert_eq!(
+                crate::object::shape_id(prototype, interp.gc_heap()),
+                prototype_shape
+            );
+            let first_store = context
+                .property_feedback_slot(
+                    context.function_base(),
+                    2,
+                    crate::property_ic::PropertyIcKind::Store,
+                )
+                .expect("initial store site");
+            assert_eq!(first_store.entry_count(), 1, "{run}: initial store bank");
+            let deleted_store = context
+                .property_feedback_slot(
+                    context.function_base(),
+                    4,
+                    crate::property_ic::PropertyIcKind::Store,
+                )
+                .expect("post-delete store site");
+            assert_eq!(
+                deleted_store.entry_count(),
+                0,
+                "{run}: post-delete store bank"
+            );
+            assert!(
+                matches!(
+                    deleted_store.state(),
+                    crate::feedback::PropertyFeedbackState::Empty
+                ),
+                "{run}: post-delete store must stay empty"
+            );
+        }
         let stats = interp.property_ic_stats();
         assert_eq!(stats.store_installs, 1);
         assert_eq!(interp.store_property_ic_count(), 1);

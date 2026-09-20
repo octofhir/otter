@@ -258,12 +258,20 @@ cargo run -p otter-cli -- run <file>   # Run a script
 cargo run -p otter-cli -- check <file> # Type check with tsgo
 
 # Quick local loop
-just fmt && just lint && just test
+just quick calls
 ```
 
 Justfile shortcuts available: `just fmt`, `just lint`, `just test`, `just build`, `just release`
 
 Fast iteration tips:
+- For JIT/GC hypotheses, start with the affected test and
+  `just quick [calls|gc|math|native|properties|all]`. The default `calls` family
+  runs the two constructor moving-GC regressions; `gc` covers collector and
+  remembered-array safety, `math` guarded methods, `native` resolved calls and
+  moving argument roots, and `properties` named slots and shared-cache loads.
+  These incremental checks default to stress stride 1 and preserve an explicit
+  stress value and Cargo target. Run the full gate and required targeted
+  Test262 checks once the coherent change is ready, rather than after each edit.
 - Run VM tests: `cargo test -p otter-vm`
 - Run runtime tests: `cargo test -p otter-runtime`
 - Run a single active support crate after porting work there: `cargo test -p otter-modules`, `cargo test -p otter-web`, etc.
@@ -465,6 +473,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Named loads and stores expose their probe, hit edge,
     `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
     Success/Throw/Fatal control and join before register allocation.
+    Megamorphic loads expose `machineMegamorphicPropertyLoad` and a symbolic
+    `propertyLookupCacheTable` relocation to the isolate's existing fixed
+    shape/atom table. Positive own/direct-prototype hits validate live ordinary
+    state, the full key, holder shape and storage bounds before reading the
+    current slot. Entries hold pinned shape metadata, never moving object or
+    value pointers. Negative/deeper entries use the same rooted cold load;
+    stores retain their existing proofs. Table fills do not recompile the body.
     Local catches receive the pure exception payload through SSA landing edges
     without deopt or replay. The probe has no safepoint; only the cold call owns
     moving roots. Its stable untraced IC address must originate in a property
@@ -522,12 +537,17 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     values. A zero-width
     `inlineInstruction` is an intentionally coalesced operation, not missing
     capture.
-  - Optimizing generated Map, string, and Int32 Math method hits expose one
-    `machineMethodIntrinsic` region spanning their allocated-SSA receiver
-    guard, body, and direct result-home store. The hit constructs no transition
-    frame, publishes no VM PC, and never round-trips through the interpreter
-    window. The canonical frame-building generic miss is the cold sibling
-    outside that region.
+  - Optimizing Int32 `Math.abs`, `Math.max`, and `Math.min` method and resolved-call hits expose
+    `machineMethodIntrinsic` for the arithmetic probe and result. Receiver,
+    holder, and slot proofs use the shared `machineCacheIr*` operations;
+    `machineNativeLeafIdentity` checks the live callable. The hit constructs no
+    transition frame and publishes no VM PC. The explicit miss edge enters the
+    canonical method or resolved call with precise roots and joins its tagged
+    result, without deopt or replay. Proven Int32 `CallMethodValue` and separately
+    evaluated `LoadProperty` plus `CallWithThis` share the arithmetic CFG.
+    Explicit calls guard the already-loaded callee after argument evaluation;
+    their cold sibling retains that callee and receiver without another lookup.
+    Map/string method calls currently retain the canonical Machine call boundary.
   - Optimizing plain/method scalar/named-load splices use the same HIR and allocator.
     The caller owns the identity/this guard; named accesses retain the callee's
     source program and cold activation recipes in `optimized-ir.txt`.
@@ -545,19 +565,14 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Bounded nested plain/method bodies share the snapshot tree and remap every
     descendant this/closure, property source and method guard into the caller.
     Source bodies remain bounded; recursive ancestry and residual unsupported
-    calls decline the enclosing splice. Loop-invariant global-object reads and
-    method guards keep their full proofs on the first iteration and use
-    independent native-stack caches on later iterations. A cached global slot
-    makes its loaded builtin namespace receiver activation-invariant; other
-    invariant receivers reuse their validated body header, while varying
-    exotic Map/string receivers revalidate the current body and reuse pinned
-    prototype identity. Any cold intrinsic miss, or generated
-    element/property/global-read probe miss, clears every site before generic
-    reentry or collection. Element and global reads require a prepared
-    generated hit path; always-slow reads keep the loop uncached.
-    Entry and OSR caches are distinct activations and start empty. Inner loops
-    are never selected in isolation; their sites require the complete
-    enclosing outermost loop to satisfy the cache contract.
+    calls decline the enclosing splice. Method, global-object, property, and
+    element accesses retain explicit guards and live loads when a loop contains
+    an invalidating boundary. Effect-aware LICM moves a proof only when its
+    inputs are invariant and no overlapping write, allocation, safepoint, or
+    JavaScript reentry invalidates it. There are no activation-local method or
+    global raw-address caches or cache-clear pseudo-operations. Packed element
+    base and length addresses are derived per access and never retained across
+    a generated backedge, collection, or JavaScript reentry.
   - Fixed-arity ordinary and class base-constructor bodies can splice into the
     caller's SSA. `InlineConstructGuard` proves the live underlying callable;
     `machineConstructReceiver` probes the shared nursery allocator at the call's
@@ -639,7 +654,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Optimizing calls to the exact bootstrap `Math.abs`, `Math.max`, and
     `Math.min` complete directly for proven Int32 operands after the same
     static or method identity guard as the declared leaf call. Extracted static
-    calls use the `nativeInt32MathIntrinsic` code-map region and carry no
+    calls use the `machineNativeInt32MathIntrinsic` code-map region and carry no
     relocation for the replaced Math leaf. The exact bootstrap `parseInt` with
     one Int32 argument uses the same static-native planning boundary and an
     allocation-free `parse_int_i32_leaf`; other tags, arities, explicit radix
@@ -778,6 +793,15 @@ Practical rules when adding/altering APIs:
 - External suite runners and the baseline capture protocol are documented in
   `benchmarks/README.md`. Raw local results belong under the ignored
   `benchmarks/results/` directory.
+- Retained-allocation GC diagnosis uses
+  `cargo build --release -p otter-benchmark --features engine --bin otter-allocation-probe`
+  followed by `target/release/otter-allocation-probe construct production 200000`
+  (`spread`, `interpreter`, and `template` select the other cases). Configure
+  `OTTER_GC_STRESS` separately for each process. The report includes existing
+  GC/JIT timings, root-slot totals/peak, relocation updates, and receiver
+  counters; full-GC time includes its minor collection, so those pause totals
+  must not be added. `emit-kernel construct` or `emit-kernel spread` emits the
+  same 200k workload for the standard engine benchmark; see `benchmarks/README.md`.
 - Clean engine baseline capture:
   `cargo run --locked --release -p otter-benchmark --features engine --bin otter-engine-baseline -- capture`
   - The fixed matrix runs serially and keeps its outer watchdog in the

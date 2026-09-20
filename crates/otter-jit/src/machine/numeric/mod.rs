@@ -8,6 +8,7 @@
 //! - `inlining` — guarded scalar callee CFG splicing before selection/allocation.
 //! - `partial_escape` — bounded virtual objects and scalar replacement before selection.
 //! - `property_cfg` — explicit named-property probe/cold/status/landing/join blocks.
+//! - `native_call_cfg` — shared native probes and committed method/resolved calls.
 //! - `boxed_arithmetic` — use-demand relaxation of tagged immediate arithmetic.
 //! - `arm64` — allocation-driven AArch64 emission.
 //! - Derived-this committed operations split into generated and cold CFG
@@ -123,6 +124,7 @@ mod frame_state;
 mod hir;
 mod inline_reentry;
 mod inlining;
+mod native_call_cfg;
 mod partial_escape;
 mod property_cfg;
 mod semantics;
@@ -144,8 +146,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use self::hir::{
     NumericBindingTarget, NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
     NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFrameStatePurpose,
-    NumericFunction, NumericLoopEntryPlan, NumericNode, NumericTerminator, NumericType,
-    NumericValue,
+    NumericFunction, NumericLoopEntryPlan, NumericNativeCallTarget, NumericNode, NumericTerminator,
+    NumericType, NumericValue,
 };
 use self::semantics::CommittedValueOperation;
 #[cfg(test)]
@@ -587,6 +589,12 @@ fn select_with_loop_entries(
         .keys()
         .map(|&block| (block, property_cfg::Values::new(&mut representations)))
         .collect::<BTreeMap<_, _>>();
+    let native_call_values = selection_cfg
+        .native_calls
+        .keys()
+        .map(|&block| (block, native_call_cfg::Values::new(&mut representations)))
+        .collect::<BTreeMap<_, _>>();
+    let mut native_call_inputs = BTreeMap::new();
     let element_values = selection_cfg
         .elements
         .keys()
@@ -619,6 +627,29 @@ fn select_with_loop_entries(
         let first = MachineInstructionId(instructions.len() as u32);
         let block_index = match *selected {
             SelectedBlock::Original(block_index) => block_index,
+            SelectedBlock::NativeCallHit(block_index)
+            | SelectedBlock::NativeCallCold(block_index)
+            | SelectedBlock::NativeCallJoin(block_index) => {
+                let node = native_call_cfg::site(hir, block_index).ok_or(
+                    super::VerificationError::InvalidBlock(selection_cfg.originals[block_index]),
+                )?;
+                blocks.push(native_call_cfg::select_block(
+                    target_spec,
+                    *selected,
+                    hir,
+                    &selection_cfg,
+                    block_index,
+                    native_call_values[&block_index],
+                    native_call_inputs[&block_index],
+                    &values,
+                    &mut representations,
+                    &mut call_descriptors,
+                    &mut next_safepoint,
+                    &mut instructions,
+                    exit_specs[&NumericFramePoint::Node(node)].clone(),
+                )?);
+                continue;
+            }
             SelectedBlock::PropertyHit(block_index)
             | SelectedBlock::PropertyCold(block_index)
             | SelectedBlock::PropertySuccess(block_index)
@@ -966,6 +997,69 @@ fn select_with_loop_entries(
                     &mut instructions,
                 )?;
                 continue;
+            }
+            if let NumericNode::NativeCall { receiver, .. } = node {
+                if block.nodes.last().copied() != Some(node_value) {
+                    return Err(super::VerificationError::OpcodeSignatureMismatch(first));
+                }
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                native_call_inputs.insert(block_index, receiver);
+                let start = instructions.len();
+                let outputs = native_call_values[&block_index];
+                native_call_cfg::select_probe(
+                    target_spec,
+                    hir,
+                    node_value,
+                    receiver,
+                    outputs,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                )?;
+                let state = frame_state_indices[&NumericFramePoint::Node(node_value)] as u32;
+                for instruction in &mut instructions[start..] {
+                    if !instruction.opcode.effects().reads.is_empty() {
+                        instruction.frame_state = Some(state);
+                    }
+                }
+                let mut branch = MachineInstruction::plain(
+                    MachineOpcode::BranchIf(true),
+                    vec![MachineOperand::register_input(outputs.hit)],
+                );
+                branch.control = ControlFlow::Branch;
+                instructions.push(branch);
+                let selected = selection_cfg.native_calls[&block_index];
+                let mut predecessors = incoming_edges(hir, block_index)
+                    .into_iter()
+                    .map(|(predecessor, edge)| {
+                        selection_cfg
+                            .split_edges
+                            .get(&(predecessor, edge))
+                            .copied()
+                            .unwrap_or_else(|| selection_cfg.normal_exit(predecessor))
+                    })
+                    .collect::<Vec<_>>();
+                predecessors.sort_unstable();
+                blocks.push(MachineBlockData {
+                    first,
+                    end: MachineInstructionId(instructions.len() as u32),
+                    predecessors,
+                    successors: vec![selected.hit, selected.cold],
+                    successor_arguments: vec![vec![], vec![]],
+                    parameters: block
+                        .parameters
+                        .iter()
+                        .map(|&value| machine_value(&values, value))
+                        .collect(),
+                });
+                selected_binding_guard = true;
+                break;
             }
             if matches!(
                 node,
@@ -1788,7 +1882,9 @@ fn select_with_loop_entries(
                         .expect("bounded scalar function safepoint count");
                     call
                 }
-                NumericNode::PropertyLoad { .. } | NumericNode::PropertyStore { .. } => {
+                NumericNode::PropertyLoad { .. }
+                | NumericNode::PropertyStore { .. }
+                | NumericNode::NativeCall { .. } => {
                     unreachable!("property probe is selected before ordinary nodes")
                 }
                 NumericNode::IntegerConstant(value) => MachineInstruction::plain(
@@ -2296,8 +2392,12 @@ fn select_with_loop_entries(
                     let descriptor_index =
                         intern_call_descriptor(&mut call_descriptors, descriptor);
                     let mut operands = Vec::with_capacity(arguments.len() + 2);
-                    operands.push(MachineOperand::register_input(source_value));
-                    operands.extend(arguments.into_iter().map(MachineOperand::register_input));
+                    // Direct linkage consumes every boxed input from its
+                    // canonical safepoint home after root publication. Keep
+                    // the semantic inputs allocator-visible through the call,
+                    // but allow high-arity sites to remain in spill slots.
+                    operands.push(MachineOperand::location_input(source_value));
+                    operands.extend(arguments.into_iter().map(MachineOperand::location_input));
                     operands.push(MachineOperand::register_output(result));
                     // A freshly allocated construct receiver is not part of
                     // the pre-call interpreter state. Keep that one explicit
@@ -2969,6 +3069,28 @@ fn select_cache_ir_property_programs(
     ));
     let mut accumulated_hit = false_value;
     let mut accumulated_payload = undefined;
+
+    if stored.is_none()
+        && let Some(atom) = source.megamorphic_atom
+    {
+        let payload = push_value(representations, MachineRepresentation::Tagged);
+        let hit = push_value(representations, MachineRepresentation::Boolean);
+        let mut probe = MachineInstruction::plain(
+            MachineOpcode::PropertyMegamorphicLoad {
+                byte_pc: source.byte_pc,
+                atom,
+            },
+            vec![
+                MachineOperand::location_input(receiver),
+                MachineOperand::register_output(payload),
+                MachineOperand::register_output(hit),
+            ],
+        );
+        probe.clobbers = property_load_clobbers(target_spec);
+        instructions.push(probe);
+        accumulated_payload = payload;
+        accumulated_hit = hit;
+    }
 
     if stored.is_none() && exotic_length {
         let payload = push_value(representations, MachineRepresentation::Tagged);
@@ -3649,6 +3771,7 @@ fn frame_state_exits(
             | NumericNode::InlineCallGuard { .. }
             | NumericNode::InlineMethodGuard { .. }
             | NumericNode::DirectCall { .. }
+            | NumericNode::NativeCall { .. }
             | NumericNode::ColdCallExit { .. }
             | NumericNode::NativeLeaf { .. } => {
                 &[(ExitReason::IdentityGuard, ExitAction::Recompile)]
@@ -3731,6 +3854,9 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedBlock {
+    NativeCallHit(usize),
+    NativeCallCold(usize),
+    NativeCallJoin(usize),
     Original(usize),
     SplitEdge {
         predecessor: usize,
@@ -3774,6 +3900,7 @@ struct SelectionCfg {
     bindings: BTreeMap<usize, BindingSelectedBlocks>,
     properties: BTreeMap<usize, property_cfg::Blocks>,
     elements: BTreeMap<usize, element_cfg::Blocks>,
+    native_calls: BTreeMap<usize, native_call_cfg::Blocks>,
 }
 
 impl SelectionCfg {
@@ -3784,6 +3911,7 @@ impl SelectionCfg {
         let mut bindings = BTreeMap::new();
         let mut properties = BTreeMap::new();
         let mut elements = BTreeMap::new();
+        let mut native_calls = BTreeMap::new();
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
                 if is_critical_edge(hir, predecessor, successor)
@@ -3803,6 +3931,16 @@ impl SelectionCfg {
             }
             *original = MachineBlock(order.len() as u32);
             order.push(SelectedBlock::Original(successor));
+            if native_call_cfg::site(hir, successor).is_some() {
+                let hit = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::NativeCallHit(successor));
+                let cold = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::NativeCallCold(successor));
+                let join = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::NativeCallJoin(successor));
+                native_calls.insert(successor, native_call_cfg::Blocks { hit, cold, join });
+                continue;
+            }
             if property_cfg::site(hir, successor).is_some() {
                 let hit = MachineBlock(order.len() as u32);
                 order.push(SelectedBlock::PropertyHit(successor));
@@ -3903,10 +4041,14 @@ impl SelectionCfg {
             bindings,
             properties,
             elements,
+            native_calls,
         }
     }
 
     fn normal_exit(&self, block: usize) -> MachineBlock {
+        if let Some(method) = self.native_calls.get(&block) {
+            return method.join;
+        }
         self.properties
             .get(&block)
             .map(|property| property.join)
@@ -6959,6 +7101,7 @@ mod tests {
                         function_id: 94,
                         logical_pc: 0,
                         byte_pc: 24,
+                        megamorphic_atom: None,
                         program: vec![JitCacheIrProgram {
                             ops: vec![
                                 JitCacheIrOp::GuardShape {
@@ -6981,6 +7124,7 @@ mod tests {
                         function_id: 94,
                         logical_pc: 1,
                         byte_pc: 40,
+                        megamorphic_atom: None,
                         program: vec![JitCacheIrProgram {
                             ops: vec![
                                 JitCacheIrOp::GuardShape {

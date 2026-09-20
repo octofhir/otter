@@ -15,8 +15,6 @@
 //!   side exits merely because it materializes `arguments`.
 //! - Every tier returns the interpreter's completion.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{
     JitDebugEvent, JitDebugRequest, JitDirectCallKind, JitDirectCallPlanOutcome, JitSelection,
     Runtime, SourceInput,

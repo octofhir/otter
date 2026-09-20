@@ -255,6 +255,7 @@ impl MachineOpcode {
             | Self::BooleanConstant(_)
             | Self::BooleanOr
             | Self::TaggedSelect
+            | Self::NativeInt32Math { .. }
             | Self::CacheIrJoin { .. } => MachineEffects::PURE_VALUE,
 
             Self::DecodeNumber | Self::DecodeInt32 | Self::GuardCondition => {
@@ -265,6 +266,10 @@ impl MachineOpcode {
                 MachineEffects::read(SHAPE.union(PROTOTYPE).union(PROPERTY_METADATA), Guard)
             }
             Self::ResolveCallThis { .. } => MachineEffects::read(BINDING, Value),
+            // The live callable's kind and native identity are read only after
+            // its active guard. Heap invalidation must also invalidate this
+            // proof; method lookup itself remains an explicit CacheIR load.
+            Self::NativeLeafIdentity { .. } => MachineEffects::read(MachineAliasSet::HEAP, Guard),
             Self::TruthinessProbe
             | Self::LooseEqualityProbe { .. }
             | Self::TaggedNullishEqual { .. } => MachineEffects::read(SHAPE, Guard),
@@ -298,13 +303,22 @@ impl MachineOpcode {
             Self::ElementValueGuard { .. } => MachineEffects::read(ELEMENT_FIELD, Guard),
             Self::ElementValueStore { .. } => MachineEffects::write(ELEMENT_FIELD),
             Self::PropertySource { .. } => MachineEffects::NEVER,
-            Self::CacheIrGuardShape { .. } => MachineEffects::read(SHAPE, Guard),
-            Self::CacheIrGuardAtomSlot { .. } | Self::CacheIrGuardExtensible { .. } => {
-                MachineEffects::read(PROPERTY_METADATA, Guard)
+            Self::CacheIrGuardShape { .. }
+            | Self::CacheIrGuardOrdinaryState { .. }
+            | Self::CacheIrGuardAtomSlot { .. }
+            | Self::CacheIrGuardExtensible { .. } => {
+                MachineEffects::read(SHAPE.union(PROPERTY_METADATA).union(PROTOTYPE), Guard)
             }
             Self::CacheIrLoadPrototype { .. } => MachineEffects::read(PROTOTYPE, Value),
             Self::CacheIrGuardPrototypeNull { .. } => MachineEffects::read(PROTOTYPE, Guard),
             Self::CacheIrLoadField { .. } => MachineEffects::read(PROPERTY_FIELD, Value),
+            Self::PropertyMegamorphicLoad { .. } => MachineEffects::read(
+                SHAPE
+                    .union(PROPERTY_METADATA)
+                    .union(PROPERTY_FIELD)
+                    .union(PROTOTYPE),
+                Value,
+            ),
             Self::CacheIrStoreField { .. } => MachineEffects::write(PROPERTY_FIELD),
             Self::CacheIrPublishShape { .. } => {
                 MachineEffects::write(SHAPE.union(PROPERTY_METADATA))
@@ -398,13 +412,42 @@ mod tests {
 
     #[test]
     fn cache_ir_rows_are_explicit_and_effectful_stores_are_not_commonable() {
-        let guard = MachineOpcode::CacheIrGuardShape {
-            byte_pc: 0,
-            shape: 1,
+        // Both emitters read fast-shape/opaque state; ordinary slot and
+        // extensibility guards also read descriptor/storage metadata.
+        // Prototype changes can change opacity without changing the shape.
+        let ordinary_state_reads = SHAPE.union(PROPERTY_METADATA).union(PROTOTYPE);
+        for opcode in [
+            MachineOpcode::CacheIrGuardShape {
+                byte_pc: 0,
+                shape: 1,
+            },
+            MachineOpcode::CacheIrGuardOrdinaryState { byte_pc: 0 },
+            MachineOpcode::CacheIrGuardAtomSlot {
+                byte_pc: 0,
+                atom: 1,
+                value_byte: 8,
+                writable: false,
+            },
+            MachineOpcode::CacheIrGuardAtomSlot {
+                byte_pc: 0,
+                atom: 1,
+                value_byte: 8,
+                writable: true,
+            },
+            MachineOpcode::CacheIrGuardExtensible {
+                byte_pc: 0,
+                value_byte: 8,
+            },
+        ] {
+            let guard = opcode.effects();
+            assert_eq!(guard.reads, ordinary_state_reads, "{opcode:?}");
+            assert_eq!(guard.commoning, MachineCommoning::Guard, "{opcode:?}");
+            assert!(guard.writes.is_empty(), "{opcode:?}");
+            assert!(!guard.allocates, "{opcode:?}");
+            assert!(!guard.throws, "{opcode:?}");
+            assert!(!guard.safepoint, "{opcode:?}");
+            assert!(!guard.reentrant, "{opcode:?}");
         }
-        .effects();
-        assert_eq!(guard.reads, SHAPE);
-        assert_eq!(guard.commoning, MachineCommoning::Guard);
 
         let load = MachineOpcode::CacheIrLoadField {
             byte_pc: 0,

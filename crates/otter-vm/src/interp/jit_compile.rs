@@ -483,7 +483,7 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
-        self.bake_property_cache_ir(&mut snapshot);
+        self.bake_property_cache_ir(&mut snapshot, context);
         self.bake_constructor_field_transitions(&mut snapshot);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
@@ -698,7 +698,7 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut view);
         self.bake_element_accesses(&mut view);
-        self.bake_property_cache_ir(&mut view);
+        self.bake_property_cache_ir(&mut view, context);
         self.bake_constructor_field_transitions(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
@@ -801,7 +801,12 @@ impl Interpreter {
     }
 
     /// Snapshot complete CodeBlock-owned CacheIR programs for native lowering.
-    pub(crate) fn bake_property_cache_ir(&mut self, view: &mut jit::JitCompileSnapshot) {
+    pub(crate) fn bake_property_cache_ir(
+        &mut self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+    ) {
+        view.property_lookup_cache = Some(self.property_cache.jit_layout());
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -816,10 +821,13 @@ impl Interpreter {
                     instr.byte_pc,
                     instr.instruction_pc(&view.code_block),
                     instr.op(&view.code_block),
+                    (instr.op(&view.code_block) == Op::LoadProperty)
+                        .then(|| instr.const_index(&view.code_block, 2))
+                        .flatten(),
                 )
             })
             .collect();
-        for (byte_pc, instruction_pc, op) in sites {
+        for (byte_pc, instruction_pc, op, load_name_index) in sites {
             let kind = if op == Op::LoadProperty {
                 crate::property_ic::PropertyIcKind::Load
             } else {
@@ -831,6 +839,15 @@ impl Interpreter {
             else {
                 continue;
             };
+            if op == Op::LoadProperty && slot.is_megamorphic() {
+                if let Some(key) = load_name_index.and_then(|name_index| {
+                    context.property_atom_for_function(view.code_block.id, name_index)
+                }) {
+                    view.property_megamorphic_loads
+                        .insert(byte_pc, key.atom().id().raw());
+                }
+                continue;
+            }
             if let Some(programs) = slot.jit_programs(|shape_id| {
                 self.shape_runtime
                     .handle_for_id(shape_id)
@@ -1292,6 +1309,40 @@ impl Interpreter {
         self.invalidate_jit_function(fid);
     }
 
+    /// Replace an executing generated caller immediately after one of its
+    /// runtime-selected call sites gains a target.
+    ///
+    /// The active generation remains leased by the native activation while its
+    /// stable function cell publishes the replacement. This is used by dynamic
+    /// forwarding, whose current body is itself the only path able to keep
+    /// sampling targets after a generated caller invalidates its old snapshot.
+    pub(crate) fn recompile_active_caller_for_feedback(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) {
+        self.invalidate_jit_function(fid);
+        self.jit_runtime_stats.compile_attempts =
+            self.jit_runtime_stats.compile_attempts.saturating_add(1);
+        let outcome = self.compile_jit_function(context, fid, None);
+        self.retain_template_compile_outcome(fid, outcome);
+    }
+
+    /// Resolve or boundedly materialize an entry generation selected by a
+    /// runtime forwarding site.
+    ///
+    /// Canonical forwarding can execute a target entirely below an already
+    /// generated caller, so ordinary function-entry tier checks may never see
+    /// it. Reusing the direct-target planner here lets accumulated canonical
+    /// call hotness publish that target without inventing a second policy.
+    pub(crate) fn ensure_runtime_forward_callee_plan(
+        &mut self,
+        context: &ExecutionContext,
+        function: &CodeBlock,
+    ) -> Option<jit::JitDirectCallPlan> {
+        self.ensure_direct_callee_plan(context, function, EAGER_DIRECT_TARGET_DEPTH, true)
+    }
+
     /// Resolve the stable entry cell for one compiler-native call.
     ///
     /// The registry publishes an optimizing generation only when it advertises
@@ -1320,11 +1371,42 @@ impl Interpreter {
         context: &ExecutionContext,
         function: &CodeBlock,
         eager_depth: u8,
+        runtime_selected: bool,
     ) -> Option<jit::JitDirectCallPlan> {
         if let Some(plan) = self.current_direct_callee_plan(function) {
             return Some(plan);
         }
-        if eager_depth == 0 || self.jit_code.contains_key(&function.id) {
+        if eager_depth == 0 {
+            return None;
+        }
+        let replaces_entry_generation = self
+            .jit_code_registry
+            .has_entry_generation_history(function.id);
+        // A dependency change can unlink the target between two caller
+        // generations while the ordinary Template owner still retains its
+        // invalid `Arc`. Function-entry resolution drops that stale owner on
+        // its first miss, but a generated caller may reach this planner first.
+        // Remove the same non-current owner here so the bounded eager compile
+        // below can publish the replacement before the caller snapshot is
+        // sealed. Cached declines and live OSR-only bodies remain authoritative.
+        let stale_template = self
+            .jit_code
+            .get(&function.id)
+            .and_then(Option::as_ref)
+            .is_some_and(|code| !self.jit_code_registry.is_current_for_entry(code.as_ref()));
+        if stale_template {
+            self.jit_code.remove(&function.id);
+            if self
+                .jit_code_cache
+                .as_ref()
+                .is_some_and(|(cached_fid, _)| *cached_fid == function.id)
+            {
+                self.jit_code_cache = None;
+            }
+            self.jit_entry_osr_only.remove(&function.id);
+            self.jit_template_osr_fids.remove(&function.id);
+        }
+        if self.jit_code.contains_key(&function.id) {
             return None;
         }
         let executions = u64::from(self.jit_call_counts.get(&function.id).copied().unwrap_or(0))
@@ -1333,17 +1415,19 @@ impl Interpreter {
                     .generated_entries_for_function(function.id),
             );
         let resident_code_bytes = self.jit_code_residency().code_bytes;
-        if !self
-            .jit_tier_cost_decision(
-                context,
-                function.id,
-                crate::tier_policy::CostedTier::Template,
-                crate::tier_policy::TierTrigger::DirectCallTarget,
-                executions,
-                0,
-                resident_code_bytes,
-            )
-            .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
+        if !runtime_selected
+            && !replaces_entry_generation
+            && !self
+                .jit_tier_cost_decision(
+                    context,
+                    function.id,
+                    crate::tier_policy::CostedTier::Template,
+                    crate::tier_policy::TierTrigger::DirectCallTarget,
+                    executions,
+                    0,
+                    resident_code_bytes,
+                )
+                .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
         {
             return None;
         }
@@ -1594,7 +1678,7 @@ impl Interpreter {
             self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
             self.bake_guarded_method_calls(&mut body);
             self.bake_element_accesses(&mut body);
-            self.bake_property_cache_ir(&mut body);
+            self.bake_property_cache_ir(&mut body, context);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
         })();
@@ -1759,7 +1843,29 @@ impl Interpreter {
                         continue;
                     }
                 };
-                let Some(callee) = context.exec_function(callee_fid) else {
+                let Ok(callee_context) = context.for_function(callee_fid) else {
+                    self.record_jit_inline_candidate(
+                        fid,
+                        instruction_pc,
+                        tier,
+                        Some(callee_fid),
+                        Some(jit_debug::JitInlineRejectionReason::MissingCallee),
+                    );
+                    self.record_jit_direct_call_plan(
+                        unresolved_call_kind,
+                        fid,
+                        instruction_pc,
+                        tier,
+                        callee_fid,
+                        target_index,
+                        target_count,
+                        jit_debug::JitDirectCallPlanOutcome::Rejected {
+                            reason: jit_debug::JitDirectCallRejectionReason::MissingCallee,
+                        },
+                    );
+                    continue;
+                };
+                let Some(callee) = callee_context.exec_function(callee_fid) else {
                     self.record_jit_inline_candidate(
                         fid,
                         instruction_pc,
@@ -1819,9 +1925,12 @@ impl Interpreter {
                     );
                     continue;
                 }
-                let direct_call_outcome = if let Some(plan) =
-                    self.ensure_direct_callee_plan(context, callee, eager_direct_target_depth)
-                {
+                let direct_call_outcome = if let Some(plan) = self.ensure_direct_callee_plan(
+                    &callee_context,
+                    callee,
+                    eager_direct_target_depth,
+                    false,
+                ) {
                     debug_assert_eq!(plan.function_id, callee_fid);
                     let receiver_allocation = if is_construct && !callee.is_derived_constructor {
                         let new_target_function_id = match op {
@@ -1905,7 +2014,8 @@ impl Interpreter {
                 if inline_ineligible || target_count != 1 {
                     continue;
                 }
-                let Some(body) = self.bake_inline_body(context, callee_fid, tier, budget) else {
+                let Some(body) = self.bake_inline_body(&callee_context, callee_fid, tier, budget)
+                else {
                     self.record_jit_inline_candidate(
                         fid,
                         instruction_pc,
@@ -2116,7 +2226,10 @@ impl Interpreter {
         target_count: u32,
         eager_direct_target_depth: u8,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
-        let method = context
+        let method_context = context
+            .for_function(target.method_fid)
+            .map_err(|_| jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
+        let method = method_context
             .exec_function(target.method_fid)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
         if !method.admits_generated_call(jit::JitDirectCallKind::Method) {
@@ -2126,7 +2239,7 @@ impl Interpreter {
             .bake_method_guard(target)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MethodGuardUnavailable)?;
         let plan = self
-            .ensure_direct_callee_plan(context, method, eager_direct_target_depth)
+            .ensure_direct_callee_plan(&method_context, method, eager_direct_target_depth, false)
             .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
         debug_assert_eq!(plan.function_id, target.method_fid);
         Ok(jit::JitDirectMethod {
@@ -2221,6 +2334,8 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
     ) -> Option<jit::JitInlineMethod> {
+        let method_context = context.for_function(target.method_fid).ok()?;
+        let context = &*method_context;
         let method = context.exec_function(target.method_fid)?;
         if method.is_generator
             || method.is_async

@@ -47,6 +47,7 @@ use rustc_hash::FxHashMap;
 
 /// Isolate-global atom id for a string property key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub(crate) struct AtomId(u32);
 
 impl AtomId {

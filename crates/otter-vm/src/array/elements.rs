@@ -18,6 +18,10 @@
 //!   bitmap; no floating-point payload is reserved as a sentinel.
 //! - Only `Tagged` slabs trace their live prefix. The kind is published only
 //!   after every converted `Value` word has been initialized.
+//! - Full tracing visits the complete tagged prefix. Minor remembered-parent
+//!   tracing visits a conservative dirty interval and retains any slots whose
+//!   targets remain young after relocation. Every write that can introduce or
+//!   move a GC edge updates the interval; generated primitive stores need not.
 //! - Slabs live in old space and never resize. Growth allocates a replacement
 //!   and the owning array republishes its cached base.
 //!
@@ -28,6 +32,9 @@
 use crate::Value;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::SlotVisitor;
+
+#[cfg(test)]
+mod remembered_tests;
 
 /// Reserved GC type tag for ordinary-array element slabs.
 pub(crate) const ELEMENT_SLAB_BODY_TYPE_TAG: u8 = 0x3f;
@@ -80,9 +87,14 @@ pub(crate) struct ElementSlabBody {
     hole_count: u32,
     kind: DenseElementKind,
     reserved: [u8; 3],
+    /// Conservative interval of writes not yet proven free of young edges.
+    /// Empty is represented by `dirty_start >= dirty_end`. Keeping indices,
+    /// rather than slot addresses, also makes copied heap images self-contained.
+    dirty_start: u32,
+    dirty_end: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<ElementSlabBody>() == 16);
+const _: () = assert!(std::mem::size_of::<ElementSlabBody>() == 24);
 const _: () = assert!(std::mem::align_of::<ElementSlabBody>() == 8);
 
 impl ElementSlabBody {
@@ -98,6 +110,8 @@ impl ElementSlabBody {
             hole_count: 0,
             kind,
             reserved: [0; 3],
+            dirty_start: u32::MAX,
+            dirty_end: 0,
         }
     }
 
@@ -136,7 +150,7 @@ impl ElementSlabBody {
     #[must_use]
     pub(crate) fn data_ptr(&self) -> *mut u8 {
         // SAFETY: allocation reserves the trailing storage immediately after
-        // this fixed 16-byte, eight-byte-aligned header.
+        // this fixed, eight-byte-aligned header.
         unsafe { (self as *const Self as *mut u8).add(std::mem::size_of::<Self>()) }
     }
 
@@ -270,6 +284,18 @@ impl ElementSlabBody {
         debug_assert_eq!(self.kind, DenseElementKind::Tagged);
         // SAFETY: `index < capacity`; tagged data words are `Value`.
         unsafe { *self.values_ptr().add(index) = value };
+        self.mark_dirty_range(index, index + 1);
+    }
+
+    /// Mark mutations using element indices, without allocating or retaining
+    /// host pointers. Appends leave only the newly written suffix dirty;
+    /// disjoint writes conservatively include the intervening slots.
+    fn mark_dirty_range(&mut self, start: usize, end: usize) {
+        debug_assert!(end <= self.capacity());
+        if start < end {
+            self.dirty_start = self.dirty_start.min(start as u32);
+            self.dirty_end = self.dirty_end.max(end as u32);
+        }
     }
 
     /// Publish a fully initialized live prefix.
@@ -303,6 +329,11 @@ impl ElementSlabBody {
             }
         }
         self.set_len(len);
+        self.dirty_end = self.dirty_end.min(len as u32);
+        if self.dirty_start >= self.dirty_end {
+            self.dirty_start = u32::MAX;
+            self.dirty_end = 0;
+        }
     }
 
     /// Convert every live numeric word to a tagged Number/hole word, then
@@ -348,11 +379,15 @@ impl ElementSlabBody {
 
     #[must_use]
     pub(crate) fn tagged_slice_mut(&mut self) -> Option<&mut [Value]> {
-        (self.kind == DenseElementKind::Tagged).then(|| {
-            // SAFETY: the complete tagged live prefix is initialized and the
-            // exclusive body borrow rules out another array mutation.
-            unsafe { std::slice::from_raw_parts_mut(self.values_ptr(), self.len()) }
-        })
+        if self.kind != DenseElementKind::Tagged {
+            return None;
+        }
+        // A slice caller can rewrite any slot, including by swapping existing
+        // young edges. Publish the complete interval before exposing it.
+        self.mark_dirty_range(0, self.len());
+        // SAFETY: the complete tagged live prefix is initialized and the
+        // exclusive body borrow rules out another array mutation.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.values_ptr(), self.len()) })
     }
 }
 
@@ -373,6 +408,28 @@ impl otter_gc::SafeTraceable for ElementSlabBody {
     fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {
         // A stack-resident header has no trailing storage. Callers root pending
         // source values explicitly until they have been copied into the slab.
+    }
+
+    fn trace_remembered_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        let start = std::mem::replace(&mut self.dirty_start, u32::MAX).min(self.len);
+        let end = std::mem::replace(&mut self.dirty_end, 0).min(self.len);
+        if self.kind != DenseElementKind::Tagged {
+            return;
+        }
+        for index in start..end {
+            // SAFETY: the interval is clipped to the initialized tagged prefix.
+            let value = unsafe { &mut *self.values_ptr().add(index as usize) };
+            value.trace_value_slot_mut(visitor);
+            // The root walk precedes remembered parents. A child it already
+            // copied to young to-space will stay young on this visit, so its
+            // slot must remain dirty even though this pass rewrote it.
+            if let Some(raw) = value.as_raw_gc()
+                // SAFETY: the visitor has returned a current, live cell offset.
+                && unsafe { (*raw.as_header_ptr()).is_young() }
+            {
+                self.mark_dirty_range(index as usize, index as usize + 1);
+            }
+        }
     }
 }
 

@@ -1,0 +1,13 @@
+target,selection,before_passed,after_passed,total,skipped,newly_passing,regressed,test262_commit
+arm64,built-ins/Math/,327,327,327,0,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+arm64,built-ins/TypedArrayConstructors/internals/GetOwnProperty,22,22,24,2,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+arm64,language/expressions/call,91,91,92,1,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+arm64,language/expressions/new,72,72,73,1,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+arm64,built-ins/Object/,3413,3413,3414,1,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+arm64,language/arguments-object/,263,263,263,0,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+x86_64,built-ins/Math/,327,327,327,0,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+x86_64,built-ins/TypedArrayConstructors/internals/GetOwnProperty,22,22,24,2,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+x86_64,language/expressions/call,91,91,92,1,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+x86_64,language/expressions/new,72,72,73,1,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+x86_64,built-ins/Object/,3413,3413,3414,1,0,0,be13516fb6441b950ba8a3df97eb34062c186972
+x86_64,language/arguments-object/,263,263,263,0,0,0,be13516fb6441b950ba8a3df97eb34062c186972

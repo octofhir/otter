@@ -18,8 +18,9 @@
 //! - Promotion (young → old) happens inside the scavenger when
 //!   `survival_age >= PROMOTE_AFTER_SURVIVALS`. New-space pages
 //!   carry the survival counter; old-space pages do not.
-//! - The active old-space page (head of `pages`) is the only one
-//!   bump-allocated into; older pages are sealed.
+//! - Old allocation reuses swept holes, then available page tails. Promotion
+//!   preflight guarantees capacity before the first forwarding write; existing
+//!   contiguous tail space can satisfy that guarantee without standby pages.
 //!
 //! # See also
 //!
@@ -439,7 +440,23 @@ impl OldSpace {
     /// satisfy the complete request, that vector drops and the old space
     /// stays unchanged. Reserved pages enter [`Self::alloc`]'s rotation only
     /// when neither the free list nor an existing page has room.
-    pub(crate) fn reserve_promotion_pages(&mut self, count: usize) -> Result<(), OutOfMemory> {
+    ///
+    /// `max_promotion_bytes` bounds all bytes that may be promoted, including
+    /// descendants. When the newest page can hold that entire bound, its tail
+    /// already proves capacity: reserving and immediately releasing empty
+    /// pages would only zero memory and call the OS on every tiny scavenge.
+    pub(crate) fn reserve_promotion_pages(
+        &mut self,
+        count: usize,
+        max_promotion_bytes: usize,
+    ) -> Result<(), OutOfMemory> {
+        if self
+            .pages
+            .last()
+            .is_some_and(|page| page.header().bump_remaining() >= max_promotion_bytes)
+        {
+            return Ok(());
+        }
         let reserved = Page::new_many(SpaceKind::Old, count).ok_or(OutOfMemory::CageExhausted)?;
         self.standby.extend(reserved);
         Ok(())
@@ -640,13 +657,49 @@ mod tests {
         let first = old.alloc(64).expect("first alloc");
         let pages_after_first = old.page_count();
         // Reserving standby pages must not enter the bump rotation…
-        old.reserve_promotion_pages(4).expect("reserve");
+        old.reserve_promotion_pages(4, PAGE_PAYLOAD_SIZE * 2)
+            .expect("reserve");
         assert_eq!(old.page_count(), pages_after_first);
         // …so the next allocation keeps filling the same tail page.
         let second = old.alloc(64).expect("second alloc");
         assert_eq!(second, first + 64, "tail page keeps filling");
         old.release_unused_promotion_pages();
         assert_eq!(old.page_count(), pages_after_first);
+    }
+
+    #[test]
+    fn promotion_preflight_uses_existing_tail_without_cage_pages() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        ensure_cage();
+        let mut old = OldSpace::new();
+        let first = old.alloc(64).expect("first alloc");
+        let tail = old
+            .pages()
+            .last()
+            .expect("old page")
+            .header()
+            .bump_remaining();
+        let free_before = crate::compressed::cage_stats()
+            .expect("cage stats")
+            .free_pages;
+
+        old.reserve_promotion_pages(2, tail)
+            .expect("tail covers nursery");
+        assert!(old.standby.is_empty());
+        assert_eq!(
+            crate::compressed::cage_stats()
+                .expect("cage stats")
+                .free_pages,
+            free_before
+        );
+        assert_eq!(old.alloc(tail).expect("promote full bound"), first + 64);
+        assert_eq!(old.page_count(), 1);
+
+        old.reserve_promotion_pages(2, CELL_SIZE)
+            .expect("exhausted tail reserves");
+        assert_eq!(old.standby.len(), 2);
+        old.release_unused_promotion_pages();
+        assert!(old.standby.is_empty());
     }
 
     /// A body larger than one page gets a region spanning as many as it

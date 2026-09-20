@@ -93,6 +93,7 @@
 
 mod forward_call;
 mod loose_equality;
+mod megamorphic_property;
 mod truthiness;
 mod value_span;
 use value_span::emit_value_span_arguments;
@@ -153,7 +154,8 @@ use crate::{
         DenseIndexForm, element_access_for, emit_check_shape_identity,
         emit_element_address_from_dense_view, emit_element_read, emit_element_view,
         emit_element_write_guard, emit_element_write_proven, emit_exotic_length_fast,
-        emit_load_header, emit_load_object_header, emit_shape_state_guard,
+        emit_load_header, emit_load_object_header, emit_ordinary_lookup_state_guard,
+        emit_shape_state_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_initialize_inline_values_ptr,
@@ -1912,18 +1914,14 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::CacheIrGuardAtomSlot {
-                byte_pc,
-                atom: _,
-                value_byte: _,
-                writable: _,
-            } => {
+            MachineOpcode::CacheIrGuardOrdinaryState { byte_pc }
+            | MachineOpcode::CacheIrGuardAtomSlot { byte_pc, .. } => {
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
-                emit_load_header(
+                emit_load_object_header(
                     &mut ops,
                     &mut relocations,
                     view,
@@ -1931,13 +1929,21 @@ pub(super) fn emit(
                     13,
                     miss,
                 )?;
+                emit_ordinary_lookup_state_guard(&mut ops, view, 13, miss);
                 emit_load_u64(&mut ops, 9, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                 emit_load_u64(&mut ops, 9, 0);
                 dynasm!(ops ; .arch aarch64 ; =>done);
                 emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
                 structural_regions.push((
-                    "machineCacheIrGuardAtomSlot",
+                    if matches!(
+                        instruction.opcode,
+                        MachineOpcode::CacheIrGuardOrdinaryState { .. }
+                    ) {
+                        "machineCacheIrGuardOrdinaryState"
+                    } else {
+                        "machineCacheIrGuardAtomSlot"
+                    },
                     Some(byte_pc),
                     start,
                     ops.offset().0,
@@ -1947,9 +1953,9 @@ pub(super) fn emit(
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
                 emit_load_u64(&mut ops, 11, 0);
-                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
                 emit_load_object_header(
                     &mut ops,
@@ -1997,6 +2003,23 @@ pub(super) fn emit(
                 emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
                 structural_regions.push((
                     "machineCacheIrGuardPrototypeNull",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::PropertyMegamorphicLoad { byte_pc, atom } => {
+                let start = ops.offset().0;
+                megamorphic_property::emit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    frame,
+                    locations,
+                    atom,
+                )?;
+                structural_regions.push((
+                    "machineMegamorphicPropertyLoad",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
@@ -2436,6 +2459,60 @@ pub(super) fn emit(
             }
             MachineOpcode::Fatal => {
                 dynasm!(ops ; .arch aarch64 ; b =>fatal);
+            }
+            MachineOpcode::NativeLeafIdentity {
+                builtin_native_ref,
+                byte_pc,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 10, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w10, =>miss);
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                crate::template::arm64::ic_probe::emit_native_leaf_guard(
+                    &mut ops,
+                    view,
+                    builtin_native_ref,
+                    9,
+                    miss,
+                )?;
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 10, 0)?;
+                structural_regions.push((
+                    "machineNativeLeafIdentity",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::NativeInt32Math { stub, byte_pc } => {
+                let argument_count = otter_vm::jit_static_native::jit_leaf_builtin(stub)
+                    .ok_or(Unsupported::OperandShape("Int32 math declaration"))?
+                    .argument_count as usize;
+                if locations.len() != argument_count + 3 {
+                    return Err(Unsupported::OperandShape("Int32 math operands"));
+                }
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[argument_count], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                super::super::native_leaf::arm64::emit_int32(&mut ops, stub, miss)?;
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss ; mov w0, wzr);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[argument_count + 2], 9, 0)?;
+                structural_regions.push((
+                    "machineMethodIntrinsic",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::Call(descriptor_index) => {
                 let descriptor = sequence

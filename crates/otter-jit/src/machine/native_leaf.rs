@@ -4,18 +4,22 @@
 //! - [`descriptor`] derives the call ABI from the VM's shared builtin registry.
 //! - [`is_valid`] checks the complete physical call and exact-deopt contract.
 //! - [`diagnostics`] attributes final lowering only when event capture is enabled.
+//! - Method and resolved-call probes reuse declarations with result/hit values.
 //!
 //! # Invariants
 //! - Bootstrap identity and argument count come from one VM declaration.
 //! - Proven Int32 abs/max/min use equivalent generated operations with Int32
-//!   inputs and result; the abs overflow miss precedes the result definition.
-//! - Leaves cannot allocate, collect, throw, or reenter JavaScript. Identity or
-//!   operand misses deoptimize before the source call has any observable effect.
+//!   inputs and result; abs overflow misses before any observable effect.
+//! - Leaves cannot allocate, collect, throw, or reenter JavaScript. Static
+//!   `Op::Call` leaves retain exact pre-call deoptimization on misses. Method
+//!   and resolved `CallWithThis` probes select their committed cold sibling;
+//!   resolved calls retain the already-loaded callee without repeating lookup.
 //! - The target specification owns the callee, argument, result, and clobber
 //!   registers. Identity-guard scratch never overlaps the arguments.
 //!
 //! # See also
 //! - [`otter_vm::jit_static_native`] — authoritative builtin declarations.
+//! - `super::numeric::native_call_cfg` — shared method/resolved-call CFG.
 
 #[cfg(target_arch = "aarch64")]
 pub(super) mod arm64;
@@ -40,6 +44,7 @@ pub(crate) fn supports_site(
     };
     view.native_ref_byte != 0
         && argument_count == usize::from(declaration.argument_count)
+        && target.argument_count == declaration.argument_count
         && otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)
             .is_some_and(|stub| stub.is_valid())
 }
@@ -52,6 +57,82 @@ pub(super) fn supports_int32(stub: otter_vm::native_abi::RuntimeStubId) -> bool 
         STUB_MATH_MIN_LEAF.id,
     ]
     .contains(&stub)
+}
+
+/// Scratch for the pure method probe, including its fixed Math operands.
+pub(super) fn method_math_clobbers(target_spec: &TargetSpec) -> Vec<super::PhysicalRegister> {
+    let mut clobbers = target_spec
+        .clobbers(TargetClobberSet::PropertyLoad)
+        .to_vec();
+    clobbers.extend_from_slice(target_spec.clobbers(TargetClobberSet::NativeLeafInt32));
+    clobbers.extend((1..=2).filter_map(|index| target_spec.integer_argument(index)));
+    clobbers.sort_unstable();
+    clobbers.dedup();
+    clobbers.retain(|register| *register != target_spec.integer_result());
+    clobbers
+}
+
+/// Verify pure native-method probes before allocation; neither can side-exit.
+pub(super) fn method_probe_is_valid(
+    target_spec: &TargetSpec,
+    instruction: &MachineInstruction,
+    representations: &[MachineRepresentation],
+) -> bool {
+    if !instruction.exits.is_empty() || instruction.safepoint.is_some() {
+        return false;
+    }
+    let representation =
+        |operand: &super::MachineOperand| representations[operand.value.0 as usize];
+    match instruction.opcode {
+        super::MachineOpcode::NativeLeafIdentity { .. } => {
+            let [callee, active, hit] = instruction.operands.as_slice() else {
+                return false;
+            };
+            *callee == super::MachineOperand::location_input(callee.value)
+                && representation(callee) == MachineRepresentation::Tagged
+                && *active == super::MachineOperand::location_input(active.value)
+                && representation(active) == MachineRepresentation::Boolean
+                && *hit == super::MachineOperand::register_output(hit.value)
+                && representation(hit) == MachineRepresentation::Boolean
+                && instruction.clobbers == target_spec.clobbers(TargetClobberSet::PropertyLoad)
+        }
+        super::MachineOpcode::NativeInt32Math { stub, .. } => {
+            let Some(declaration) = otter_vm::jit_static_native::jit_leaf_builtin(stub) else {
+                return false;
+            };
+            let count = usize::from(declaration.argument_count);
+            if !target_spec.supports(TargetCapability::NativeLeaf)
+                || !supports_int32(stub)
+                || instruction.operands.len() != count + 3
+            {
+                return false;
+            }
+            let (arguments, tail) = instruction.operands.split_at(count);
+            let [active, result, hit] = tail else {
+                return false;
+            };
+            arguments.iter().enumerate().all(|(index, operand)| {
+                target_spec
+                    .integer_argument(index + 1)
+                    .is_some_and(|register| {
+                        *operand
+                            == super::MachineOperand::fixed_register_input(operand.value, register)
+                    })
+                    && representation(operand) == MachineRepresentation::Int32
+            }) && *active == super::MachineOperand::location_input(active.value)
+                && representation(active) == MachineRepresentation::Boolean
+                && *result
+                    == super::MachineOperand::fixed_register_output(
+                        result.value,
+                        target_spec.integer_result(),
+                    )
+                && representation(result) == MachineRepresentation::Int32
+                && *hit == super::MachineOperand::register_output(hit.value)
+                && representation(hit) == MachineRepresentation::Boolean
+                && instruction.clobbers == method_math_clobbers(target_spec)
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn descriptor(
@@ -155,6 +236,10 @@ pub(super) fn diagnostics(
         let instruction = view.instructions.iter().find(|instruction| instruction.byte_pc == byte_pc)?;
         let generated = sequence.call_descriptors().iter().any(|descriptor| matches!(
             descriptor.target, CallTarget::NativeLeaf { byte_pc: pc, .. } if pc == byte_pc
+        )) || sequence.instructions().iter().any(|instruction| matches!(
+            instruction.opcode,
+            super::MachineOpcode::NativeInt32Math { byte_pc: pc, stub }
+                if pc == byte_pc && stub == target.leaf_stub_id
         ));
         let count_operand = match instruction.op(&view.code_block) {
             otter_bytecode::Op::Call => 2,
@@ -182,4 +267,175 @@ pub(super) fn diagnostics(
             target: otter_vm::native_abi::runtime_stub_name(target.leaf_stub_id), outcome,
         })
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machine::{MachineOpcode, MachineOperand, MachineValue, SafepointId};
+    use otter_vm::native_abi::{STUB_MATH_ABS_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF};
+
+    fn identity(target: &TargetSpec) -> (MachineInstruction, Vec<MachineRepresentation>) {
+        let mut instruction = MachineInstruction::plain(
+            MachineOpcode::NativeLeafIdentity {
+                builtin_native_ref: 17,
+                byte_pc: 4,
+            },
+            vec![
+                MachineOperand::location_input(MachineValue(0)),
+                MachineOperand::location_input(MachineValue(1)),
+                MachineOperand::register_output(MachineValue(2)),
+            ],
+        );
+        instruction.clobbers = target.clobbers(TargetClobberSet::PropertyLoad).to_vec();
+        (
+            instruction,
+            vec![
+                MachineRepresentation::Tagged,
+                MachineRepresentation::Boolean,
+                MachineRepresentation::Boolean,
+            ],
+        )
+    }
+
+    fn math(
+        target: &TargetSpec,
+        stub: otter_vm::native_abi::RuntimeStubId,
+    ) -> (MachineInstruction, Vec<MachineRepresentation>) {
+        let count = usize::from(
+            otter_vm::jit_static_native::jit_leaf_builtin(stub)
+                .unwrap()
+                .argument_count,
+        );
+        let mut representations = vec![MachineRepresentation::Int32; count];
+        representations.extend([
+            MachineRepresentation::Boolean,
+            MachineRepresentation::Int32,
+            MachineRepresentation::Boolean,
+        ]);
+        let mut operands = (0..count)
+            .map(|index| {
+                MachineOperand::fixed_register_input(
+                    MachineValue(index as u32),
+                    target.integer_argument(index + 1).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        operands.extend([
+            MachineOperand::location_input(MachineValue(count as u32)),
+            MachineOperand::fixed_register_output(
+                MachineValue(count as u32 + 1),
+                target.integer_result(),
+            ),
+            MachineOperand::register_output(MachineValue(count as u32 + 2)),
+        ]);
+        let mut instruction = MachineInstruction::plain(
+            MachineOpcode::NativeInt32Math { stub, byte_pc: 4 },
+            operands,
+        );
+        instruction.clobbers = method_math_clobbers(target);
+        (instruction, representations)
+    }
+
+    #[test]
+    fn method_identity_probe_rejects_wrong_types_outputs_and_safepoints() {
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let (instruction, representations) = identity(&target);
+            assert!(method_probe_is_valid(
+                &target,
+                &instruction,
+                &representations
+            ));
+            let effects = instruction.opcode.effects();
+            assert!(
+                !effects.allocates && !effects.safepoint && !effects.reentrant && !effects.throws
+            );
+            for (index, invalid_type) in [
+                (0, MachineRepresentation::Int32),
+                (1, MachineRepresentation::Tagged),
+                (2, MachineRepresentation::Tagged),
+            ] {
+                let mut wrong = representations.clone();
+                wrong[index] = invalid_type;
+                assert!(!method_probe_is_valid(&target, &instruction, &wrong));
+            }
+            let mut wrong = instruction.clone();
+            wrong.operands[2] = MachineOperand::location_input(MachineValue(2));
+            assert!(!method_probe_is_valid(&target, &wrong, &representations));
+            let mut wrong = instruction.clone();
+            wrong.safepoint = Some(SafepointId(0));
+            assert!(!method_probe_is_valid(&target, &wrong, &representations));
+            let mut wrong = instruction.clone();
+            wrong.exits = Box::new([crate::machine::MachineExit {
+                id: crate::machine::DeoptId(0),
+                reason: otter_vm::native_abi::ExitReason::IdentityGuard,
+                action: otter_vm::native_abi::ExitAction::Recompile,
+            }]);
+            assert!(!method_probe_is_valid(&target, &wrong, &representations));
+            let mut wrong = instruction;
+            wrong.clobbers.pop();
+            assert!(!method_probe_is_valid(&target, &wrong, &representations));
+        }
+    }
+
+    #[test]
+    fn method_math_probes_require_complete_fixed_int32_contract() {
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            for stub in [
+                STUB_MATH_ABS_LEAF.id,
+                STUB_MATH_MAX_LEAF.id,
+                STUB_MATH_MIN_LEAF.id,
+            ] {
+                let (instruction, representations) = math(&target, stub);
+                assert!(method_probe_is_valid(
+                    &target,
+                    &instruction,
+                    &representations
+                ));
+                let effects = instruction.opcode.effects();
+                assert!(effects.reads.is_empty() && effects.writes.is_empty());
+                assert!(
+                    !effects.allocates
+                        && !effects.safepoint
+                        && !effects.reentrant
+                        && !effects.throws
+                );
+                let count = instruction.operands.len() - 3;
+                let mut wrong = instruction.clone();
+                wrong.operands.remove(0);
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction.clone();
+                wrong.operands[0] = MachineOperand::register_input(MachineValue(0));
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction.clone();
+                wrong.operands[count + 1] =
+                    MachineOperand::register_output(MachineValue(count as u32 + 1));
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                for index in 0..representations.len() {
+                    let mut wrong = representations.clone();
+                    wrong[index] = MachineRepresentation::Tagged;
+                    assert!(!method_probe_is_valid(&target, &instruction, &wrong));
+                }
+                let mut wrong = instruction.clone();
+                wrong.safepoint = Some(SafepointId(0));
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction.clone();
+                wrong.exits = Box::new([crate::machine::MachineExit {
+                    id: crate::machine::DeoptId(0),
+                    reason: otter_vm::native_abi::ExitReason::IdentityGuard,
+                    action: otter_vm::native_abi::ExitAction::Recompile,
+                }]);
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction.clone();
+                wrong.clobbers.pop();
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction;
+                wrong.opcode = MachineOpcode::NativeInt32Math {
+                    stub: otter_vm::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF.id,
+                    byte_pc: 4,
+                };
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+            }
+        }
+    }
 }

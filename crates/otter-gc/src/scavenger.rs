@@ -50,6 +50,13 @@
 //! - [`ScavengeStats`] — counters returned by `scavenge`.
 //! - [`scavenge`] — the entry point.
 //!
+//! # Invariants
+//!
+//! - Roots and newly copied bodies receive complete strong-slot walks.
+//! - Remembered old parents may use type-owned mutation ranges, but every
+//!   remaining young edge is retained for the following collection.
+//! - Promotion space is admitted before the first forwarding write.
+//!
 //! # See also
 //!
 //! - [`crate::barrier`] — the generational barrier that feeds the
@@ -83,6 +90,8 @@ pub struct ScavengeStats {
     /// caller around the [`scavenge`] call, not by the scavenge
     /// itself (the pause spans more than the inner work).
     pub minor_pause_ns: u64,
+    /// Root slots visited, excluding remembered-parent and Cheney body slots.
+    pub root_slots_scanned: usize,
     /// Remembered-set entries scanned this scavenge — the count of old/large
     /// parents recorded by the barrier as holding an old→young edge.
     pub dirty_cards_scanned: usize,
@@ -90,10 +99,9 @@ pub struct ScavengeStats {
     /// edge. Holding the parent objects directly keeps this at zero; the
     /// counter exists to prove no per-page header walk remains.
     pub old_headers_walked: usize,
-    /// Remembered parents re-traced whole to evacuate their young children.
+    /// Remembered parents traced to evacuate their young children.
     pub objects_retraced: usize,
-    /// Slots visited while re-tracing remembered parents — the per-object
-    /// slot fan-out of the re-trace.
+    /// Slots visited while tracing remembered parents and freshly promoted bodies.
     pub slots_scanned: usize,
 }
 
@@ -103,9 +111,10 @@ struct ScavCtx {
     old_space: NonNull<OldSpace>,
     trace_table: NonNull<TraceTable>,
     stats: ScavengeStats,
-    /// True only while [`scan_remembered_parents`] is running, so
-    /// [`process_slot`] attributes the slots it visits to the remembered-parent
-    /// re-trace (and not to root / Cheney passes).
+    /// True while remembered parents or freshly promoted bodies are traced.
+    /// Their young children promote immediately, and their slots contribute
+    /// to the remembered/promoted work counter. This policy does not select
+    /// the trace callback: newly promoted bodies always receive a full walk.
     in_dirty_scan: bool,
     /// The live remembered-set store buffer (the heap's
     /// `remembered_parents`). Drained at the start of the scavenge into a
@@ -185,11 +194,14 @@ pub unsafe fn scavenge(
     // when a remembered parent can reach any nursery page) need that 2× bound
     // in old space. Non-promoted pages use to-space first; reserve only their
     // possible overflow beyond the existing to-space page count.
-    let active_pages = new_space
-        .from_pages()
-        .iter()
-        .filter(|page| page.header().allocated_bytes != 0)
-        .count();
+    let (active_pages, max_promotion_bytes) =
+        new_space
+            .from_pages()
+            .iter()
+            .fold((0usize, 0usize), |(pages, bytes), page| {
+                let allocated = page.header().allocated_bytes;
+                (pages + usize::from(allocated != 0), bytes + allocated)
+            });
     let promotion_pages = if remembered_parents.is_empty() {
         new_space
             .from_pages()
@@ -209,7 +221,7 @@ pub unsafe fn scavenge(
     let reserve_count = promotion_pages
         .saturating_mul(2)
         .saturating_add(copy_overflow);
-    old_space.reserve_promotion_pages(reserve_count)?;
+    old_space.reserve_promotion_pages(reserve_count, max_promotion_bytes)?;
 
     // Snapshot the remembered parents recorded by the mutator since the last
     // scavenge, then leave the live buffer empty so `remember_parent` can
@@ -231,6 +243,7 @@ pub unsafe fn scavenge(
 
     // 1) Explicit root slots.
     for &slot in root_slots {
+        ctx.stats.root_slots_scanned += 1;
         // SAFETY: caller guarantees slot is a valid pointer.
         unsafe { process_slot(&mut ctx, slot, None) };
     }
@@ -239,7 +252,10 @@ pub unsafe fn scavenge(
     let ctx_ptr = &mut ctx as *mut ScavCtx;
     external_visit(&mut move |slot: *mut RawGc| {
         // SAFETY: ctx is alive on the surrounding stack frame.
-        unsafe { process_slot(&mut *ctx_ptr, slot, None) };
+        unsafe {
+            (*ctx_ptr).stats.root_slots_scanned += 1;
+            process_slot(&mut *ctx_ptr, slot, None);
+        }
     });
 
     // 3) Re-trace the remembered parents — the old/large objects the
@@ -412,8 +428,8 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
     // SAFETY: slot is dereferenceable per precondition.
     unsafe {
         if ctx.in_dirty_scan {
-            // Every slot reached here while the remembered-parent scan owns the
-            // visitor is a slot of an old parent being re-traced.
+            // Count both remembered-parent scans and the promoted-body closure
+            // whose children use the same immediate-promotion policy.
             ctx.stats.slots_scanned += 1;
         }
         let raw = (*slot).0;
@@ -723,8 +739,8 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
 /// Re-trace the remembered parents — the old/large objects the write
 /// barrier (and the prior scavenge's re-dirty path) recorded as holding an
 /// old→young edge. Each is a root for the young collection: re-tracing it
-/// in full reaches every slot through the refreshed slab base, evacuating
-/// any young child.
+/// reaches every young edge through the current body. Type-owned dirty ranges
+/// may skip clean old edges without retaining raw slot addresses.
 ///
 /// This replaces the card-table dirty-page header walk. The parents are
 /// held directly (object-granular), so there is no O(objects/page)
@@ -759,7 +775,7 @@ unsafe fn scan_remembered_parents(ctx: &mut ScavCtx, snapshot: &[RawGc]) {
             // parents from the buffer, so this is belt-and-suspenders.
             if (*header).size_bytes() != 0 && !(*header).is_swept() {
                 ctx.stats.objects_retraced += 1;
-                trace_one(ctx, header);
+                trace_one(ctx, header, TraceKind::Remembered);
             }
         }
         ctx.in_dirty_scan = false;
@@ -819,7 +835,7 @@ unsafe fn cheney_scan(ctx: &mut ScavCtx) {
                 let header_ptr = cage_base().add(offset as usize) as *mut GcHeader;
                 let was_dirty = ctx.in_dirty_scan;
                 ctx.in_dirty_scan = true;
-                trace_one(ctx, header_ptr);
+                trace_one(ctx, header_ptr, TraceKind::Full);
                 ctx.in_dirty_scan = was_dirty;
             }
 
@@ -847,18 +863,26 @@ unsafe fn scan_range_raw(ctx: &mut ScavCtx, base: *mut u8, from: usize, to: usiz
             if size == 0 {
                 break;
             }
-            trace_one(ctx, header_ptr);
+            trace_one(ctx, header_ptr, TraceKind::Full);
             offset += align_up(size, CELL_SIZE);
         }
     }
 }
 
-/// Trace one header — visitor evacuates any from-space child.
+/// Whether this body came from the old remembered set or the Cheney worklist.
+enum TraceKind {
+    Full,
+    Remembered,
+}
+
+/// Trace one header — visitor evacuates any from-space child. The tracing
+/// scope is independent of the policy that promotes an old body's children:
+/// newly promoted bodies require full tracing even under that policy.
 ///
 /// # Safety
 ///
 /// `header` is a live, valid GcHeader.
-unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader) {
+unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader, kind: TraceKind) {
     // SAFETY: per docstring; trace table guaranteed to register
     // the type tag.
     unsafe {
@@ -867,7 +891,10 @@ unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader) {
         let mut visitor = move |slot: *mut RawGc| {
             process_slot(&mut *ctx_ptr, slot, Some(header));
         };
-        (*table_ptr).trace(header, &mut visitor);
+        match kind {
+            TraceKind::Full => (*table_ptr).trace(header, &mut visitor),
+            TraceKind::Remembered => (*table_ptr).trace_remembered(header, &mut visitor),
+        }
     }
 }
 
@@ -898,6 +925,37 @@ mod tests {
                 }
             }
         }
+
+        unsafe fn trace_remembered_slots(_this: *mut Self, _visitor: &mut SlotVisitor<'_>) {
+            panic!("newly copied or promoted bodies require the full trace callback");
+        }
+    }
+
+    #[test]
+    fn promoted_body_uses_full_trace_to_keep_its_only_child() {
+        use crate::{EmptyRoots, GcHeap, HandleScope, test_support::OpaqueLeaf};
+
+        let mut heap = GcHeap::new().expect("heap");
+        // SAFETY: heap outlives the scope and its handles.
+        let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let child = heap.alloc(OpaqueLeaf { payload: 79 }).expect("child");
+        let parent = heap
+            .alloc(SelfRelativeSlot {
+                cached_slot: std::ptr::null_mut(),
+                child: child.raw(),
+            })
+            .expect("parent");
+        let parent = scope.local(parent);
+        heap.collect_minor(EmptyRoots).expect("copy");
+        heap.collect_minor(EmptyRoots).expect("promote");
+        // SAFETY: the live parent root still owns its registered leaf child.
+        let child =
+            unsafe { heap.read_payload(parent.get(), |body| body.child.cast::<OpaqueLeaf>()) };
+        assert_eq!(heap.read_payload(child, |body| body.payload), 79);
+        // SAFETY: the rooted parent and its traced child are live after promotion.
+        assert!(unsafe { (*parent.get().as_header_ptr()).is_old() });
+        // SAFETY: as above, the leaf remains owned by the rooted parent.
+        assert!(unsafe { (*child.as_header_ptr()).is_old() });
     }
 
     #[test]

@@ -127,7 +127,21 @@ cargo build                              # debug build
 cargo build --release -p otter-cli       # release CLI
 cargo test --all                         # run tests
 cargo run -p otter-cli -- run examples/basic.ts
+just quick                              # two moving-GC constructor regressions
+just quick gc                           # scavenger and remembered-array regressions
+just quick math                         # guarded Math hits and cold-path semantics
+just quick native                       # explicit calls, evaluation order, moving roots
+just quick properties                   # named slots and shared-cache generated loads
 ```
+
+The quick checks use incremental debug builds and default to `OTTER_GC_STRESS=1`
+when it is unset; explicit stress and Cargo target settings are preserved. On
+the measured ARM64 development host, warm command times were 2.18 s for calls,
+1.43 s for GC, 1.95 s for Math, 0.83 s for native calls and 1.00 s for properties.
+These include Cargo startup; cold compilation can dominate the first run.
+The [measurement report](benchmarks/measurements/2026-09-20-gc-jit.md) records
+test counts, rebuild costs and the full validation results.
+Run `just gate` and required targeted Test262 checks before closing engine changes.
 
 ## Benchmarks
 

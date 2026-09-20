@@ -3,7 +3,9 @@
 //! # Contents
 //! - Exact callable and installed-generation guards.
 //! - Stack-owned callee frame and register-window construction.
-//! - Base-receiver allocation/preparation and constructor result selection.
+//! - Exact actual-argument windows for callees that consume `arguments`.
+//! - Base/super receiver allocation and constructor result selection.
+//! - Fixed and compiler-collected spread argument materialization.
 //! - Generated entry, stack deoptimization, and caller restoration.
 //!
 //! # Invariants
@@ -12,6 +14,8 @@
 //! - The caller remains the active VM frame until the callee frame is complete.
 //! - Constructor receiver misses remain pre-effect until the rooted canonical
 //!   preparation sibling commits one receiver.
+//! - Actual arguments immediately follow the complete register window and are
+//!   published through the shared native-frame flag/count contract.
 //! - Every started generated call is removed from the activation stack before
 //!   its success, throw, or fatal result leaves this linkage.
 //!
@@ -39,10 +43,17 @@ use crate::{
 };
 
 const MAX_DIRECT_CALL_FRAME_BYTES: u32 = 4_080;
+const INCOMING_ARGUMENTS_HEADER_WORD: u32 = (abi::NativeFrameFlags::INCOMING_ARGUMENTS as u32)
+    << (8
+        * (std::mem::offset_of!(abi::VmFrameHeader, flags)
+            - std::mem::offset_of!(abi::VmFrameHeader, register_count)));
 
 #[derive(Debug, Clone, Copy)]
 struct StackLayout {
+    upvalue_base: u32,
     register_base: u32,
+    incoming_base: u32,
+    incoming_count: u32,
     result_word: u32,
     status_word: u32,
     caller_frame: u32,
@@ -52,7 +63,7 @@ struct StackLayout {
 }
 
 impl StackLayout {
-    fn for_target(target: &otter_vm::JitDirectCallee) -> Option<Self> {
+    fn for_target(target: &otter_vm::JitDirectCallee, argument_count: usize) -> Option<Self> {
         target
             .plan
             .generated_stack_frame_bytes
@@ -65,12 +76,22 @@ impl StackLayout {
             .checked_add(upvalue_count.checked_mul(4)?)?
             .checked_add(7)?
             & !7;
-        let frame_bytes = register_base
-            .checked_add(u32::from(target.plan.register_count).checked_mul(8)?)?
+        let incoming_count = if target.plan.needs_incoming_arguments {
+            u32::try_from(argument_count).ok()?
+        } else {
+            0
+        };
+        let incoming_base =
+            register_base.checked_add(u32::from(target.plan.register_count).checked_mul(8)?)?;
+        let frame_bytes = incoming_base
+            .checked_add(incoming_count.checked_mul(8)?)?
             .checked_add(15)?
             & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
+            upvalue_base,
             register_base,
+            incoming_base,
+            incoming_count,
             result_word: control,
             status_word: control + 8,
             caller_frame: control + 16,
@@ -86,10 +107,36 @@ enum CallForm<'a> {
     Plain {
         callee: u16,
     },
+    CallWithThis {
+        callee: u16,
+        receiver: u16,
+    },
     Method {
         receiver: u16,
         guard: &'a otter_vm::jit::JitMethodGuard,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CallArguments<'a> {
+    Fixed(&'a [u16]),
+    Spread(u16),
+}
+
+impl CallArguments<'_> {
+    fn fixed_len(self) -> usize {
+        match self {
+            Self::Fixed(arguments) => arguments.len(),
+            Self::Spread(_) => 0,
+        }
+    }
+
+    fn artifact_mode(self) -> DirectCallArgumentModeArtifact {
+        match self {
+            Self::Fixed(_) => DirectCallArgumentModeArtifact::Fixed,
+            Self::Spread(_) => DirectCallArgumentModeArtifact::Spread,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -103,6 +150,7 @@ pub(super) fn emit_plain(
     arguments: &[u16],
     logical_pc: u32,
     byte_pc: u32,
+    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -119,13 +167,14 @@ pub(super) fn emit_plain(
         transitions,
         view,
         dst,
-        arguments,
+        CallArguments::Fixed(arguments),
         logical_pc,
         byte_pc,
         target,
         0,
         1,
         CallForm::Plain { callee },
+        finish_error,
         throw_value,
         fatal,
         done,
@@ -143,6 +192,7 @@ pub(super) fn emit_method(
     arguments: &[u16],
     logical_pc: u32,
     byte_pc: u32,
+    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -158,7 +208,7 @@ pub(super) fn emit_method(
             transitions,
             view,
             dst,
-            arguments,
+            CallArguments::Fixed(arguments),
             logical_pc,
             byte_pc,
             &method.callee,
@@ -168,6 +218,7 @@ pub(super) fn emit_method(
                 receiver,
                 guard: &method.guard,
             },
+            finish_error,
             throw_value,
             fatal,
             done,
@@ -177,11 +228,55 @@ pub(super) fn emit_method(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn emit_spread_plain(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &JitCompileSnapshot,
+    dst: u16,
+    callee: u16,
+    receiver: u16,
+    arguments: u16,
+    logical_pc: u32,
+    byte_pc: u32,
+    finish_error: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+    done: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    let Some(candidates) = view.direct_callees.get(&byte_pc) else {
+        return Ok(false);
+    };
+    let [target] = candidates.as_slice() else {
+        return Ok(false);
+    };
+    emit_candidate(
+        ops,
+        relocations,
+        transitions,
+        view,
+        dst,
+        CallArguments::Spread(arguments),
+        logical_pc,
+        byte_pc,
+        target,
+        0,
+        1,
+        CallForm::CallWithThis { callee, receiver },
+        finish_error,
+        throw_value,
+        fatal,
+        done,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_construct(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
     arguments: &[u16],
@@ -192,22 +287,89 @@ pub(super) fn emit_construct(
     fatal: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    let Some(target) = (!super_construct)
-        .then(|| view.direct_constructs.get(&byte_pc))
-        .flatten()
-    else {
+    emit_construct_with_arguments(
+        ops,
+        relocations,
+        transitions,
+        view,
+        code_map,
+        dst,
+        callee,
+        CallArguments::Fixed(arguments),
+        logical_pc,
+        byte_pc,
+        super_construct,
+        throw_value,
+        fatal,
+        done,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_spread_construct(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &JitCompileSnapshot,
+    code_map: Option<&mut CodeMapCapture>,
+    dst: u16,
+    callee: u16,
+    arguments: u16,
+    logical_pc: u32,
+    byte_pc: u32,
+    super_construct: bool,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+    done: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    emit_construct_with_arguments(
+        ops,
+        relocations,
+        transitions,
+        view,
+        code_map,
+        dst,
+        callee,
+        CallArguments::Spread(arguments),
+        logical_pc,
+        byte_pc,
+        super_construct,
+        throw_value,
+        fatal,
+        done,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_construct_with_arguments(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &JitCompileSnapshot,
+    mut code_map: Option<&mut CodeMapCapture>,
+    dst: u16,
+    callee: u16,
+    arguments: CallArguments<'_>,
+    logical_pc: u32,
+    byte_pc: u32,
+    super_construct: bool,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+    done: DynamicLabel,
+) -> Result<bool, Unsupported> {
+    let Some(target) = view.direct_constructs.get(&byte_pc) else {
         return Ok(false);
     };
     if target.plan.is_derived_constructor
         || target.plan.own_upvalue_count != 0
-        || target.plan.needs_incoming_arguments
+        || (matches!(arguments, CallArguments::Spread(_)) && target.plan.needs_incoming_arguments)
     {
         return Ok(false);
     }
-    let Some(layout) = StackLayout::for_target(target) else {
+    let Some(layout) = StackLayout::for_target(target, arguments.fixed_len()) else {
         return Ok(false);
     };
-    let artifact = construct_artifact(target, layout)?;
+    let artifact = construct_artifact(target, layout, arguments.artifact_mode(), super_construct)?;
     let guard_fail = ops.new_dynamic_label();
     let generation_ready = ops.new_dynamic_label();
     let unpublished_fail = ops.new_dynamic_label();
@@ -278,9 +440,21 @@ pub(super) fn emit_construct(
     );
 
     initialize_frame(ops, target, layout);
+    let prepare_start = ops.offset().0;
+    let fast_prepare_start = prepare_start;
     emit_load_reg(ops, 6, callee);
-    dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+    if super_construct {
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov rdx, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+        );
+    } else {
+        dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+    }
+    let mut receiver_cold_start = None;
     if let Some(allocation) = target.receiver_allocation {
+        let receiver_allocation_start = ops.offset().0;
         let allocation_guard_miss = ops.new_dynamic_label();
         let allocation_space_miss = ops.new_dynamic_label();
         let cold_prepare = ops.new_dynamic_label();
@@ -304,12 +478,32 @@ pub(super) fn emit_construct(
             crate::entry::RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
         );
         dynasm!(ops ; .arch x64 ; =>cold_prepare);
+        if let Some(code_map) = code_map.as_deref_mut() {
+            code_map.record(CodeRegion::call_structural(
+                "directConstructReceiverAllocFast",
+                receiver_allocation_start,
+                ops.offset().0,
+                view.code_block.id,
+                logical_pc,
+                byte_pc,
+                artifact,
+            ));
+        }
+        receiver_cold_start = Some(ops.offset().0);
         emit_load_reg(ops, 6, callee);
+        if super_construct {
+            dynasm!(ops
+                ; .arch x64
+                ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+                ; mov rdx, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+            );
+        } else {
+            dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+        }
     }
     dynasm!(ops
         ; .arch x64
         ; mov rdi, r15
-        ; mov rdx, rsi
         ; mov ecx, target.plan.function_id as i32
         ; mov r8d, if target.receiver_allocation.is_some() { 1 } else { 0 }
     );
@@ -331,11 +525,42 @@ pub(super) fn emit_construct(
         ; jmp =>prepare_fatal
         ; =>observable_prepare
     );
+    if let (Some(code_map), Some(start)) = (code_map.as_deref_mut(), receiver_cold_start) {
+        code_map.record(CodeRegion::call_structural(
+            "directConstructReceiverAllocCold",
+            start,
+            ops.offset().0,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            artifact,
+        ));
+    }
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::call_structural(
+            "directConstructPrepareFast",
+            fast_prepare_start,
+            ops.offset().0,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            artifact,
+        ));
+    }
+    let observable_prepare_start = ops.offset().0;
     emit_load_reg(ops, 6, callee);
+    if super_construct {
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov rdx, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+        );
+    } else {
+        dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+    }
     dynasm!(ops
         ; .arch x64
         ; mov rdi, r15
-        ; mov rdx, rsi
         ; mov ecx, target.plan.function_id as i32
     );
     emit_load_runtime_stub(
@@ -355,25 +580,79 @@ pub(super) fn emit_construct(
         ; =>receiver_ready
         ; mov [rsp + NATIVE_FRAME_THIS_OFFSET as i32], rax
     );
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::call_structural(
+            "directConstructPrepareObservable",
+            observable_prepare_start,
+            ops.offset().0,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            artifact,
+        ));
+    }
 
     emit_load_reg(ops, 9, callee);
-    dynasm!(ops ; .arch x64 ; mov r14, r9);
+    if super_construct {
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov r14, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+        );
+    } else {
+        dynasm!(ops ; .arch x64 ; mov r14, r9);
+    }
     unwrap_constructor(ops, view, target, 9);
     dynasm!(ops
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r14
-        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.len() as i32
+        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
     initialize_inherited_state(ops, view, target);
-    for (index, &argument) in arguments
-        .iter()
-        .take(usize::from(target.plan.param_count))
-        .enumerate()
-    {
-        emit_load_reg(ops, 11, argument);
-        let offset = layout.register_base + u32::try_from(index).unwrap() * 8;
-        dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+    match arguments {
+        CallArguments::Fixed(arguments) => {
+            for (index, &argument) in arguments.iter().enumerate() {
+                emit_load_reg(ops, 11, argument);
+                let index = u32::try_from(index)
+                    .map_err(|_| Unsupported::OperandShape("x86-64 construct argument index"))?;
+                if index < u32::from(target.plan.param_count) {
+                    let offset = layout.register_base + index * 8;
+                    dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+                }
+                if index < layout.incoming_count {
+                    let offset = layout.incoming_base + index * 8;
+                    dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+                }
+            }
+        }
+        CallArguments::Spread(arguments) => {
+            emit_load_reg(ops, 6, arguments);
+            dynasm!(ops
+                ; .arch x64
+                ; mov rdi, r15
+                ; mov rdx, rsp
+                ; mov ecx, target.plan.param_count as i32
+            );
+            emit_load_runtime_stub(
+                ops,
+                relocations,
+                transitions.entry(abi::STUB_JIT_COPY_SPREAD_ARGUMENTS),
+                abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
+            );
+            dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
+        }
+    }
+    if let Some(code_map) = code_map {
+        code_map.record(CodeRegion::call_structural(
+            "directConstructPrepare",
+            prepare_start,
+            ops.offset().0,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            artifact,
+        ));
     }
 
     dynasm!(ops
@@ -499,32 +778,41 @@ fn emit_candidate(
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
     dst: u16,
-    arguments: &[u16],
+    arguments: CallArguments<'_>,
     logical_pc: u32,
     byte_pc: u32,
     target: &otter_vm::JitDirectCallee,
     target_index: u32,
     target_count: u32,
     form: CallForm<'_>,
+    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    if target.plan.own_upvalue_count != 0
-        || target.plan.needs_incoming_arguments
-        || (matches!(form, CallForm::Plain { .. })
-            && !matches!(
-                target.plan.this_mode,
-                otter_vm::JitDirectCallThisMode::StrictOrLexical
-                    | otter_vm::JitDirectCallThisMode::SloppyGlobal
-            ))
+    if (matches!(form, CallForm::Plain { .. } | CallForm::CallWithThis { .. })
+        && !matches!(
+            target.plan.this_mode,
+            otter_vm::JitDirectCallThisMode::StrictOrLexical
+                | otter_vm::JitDirectCallThisMode::SloppyGlobal
+        ))
     {
         return Ok(false);
     }
-    let Some(layout) = StackLayout::for_target(target) else {
+    if matches!(arguments, CallArguments::Spread(_)) && target.plan.needs_incoming_arguments {
+        return Ok(false);
+    }
+    let Some(layout) = StackLayout::for_target(target, arguments.fixed_len()) else {
         return Ok(false);
     };
-    let artifact = artifact(target, layout, form, target_index, target_count)?;
+    let artifact = artifact(
+        target,
+        layout,
+        form,
+        arguments.artifact_mode(),
+        target_index,
+        target_count,
+    )?;
     let guard_fail = ops.new_dynamic_label();
     let generation_ready = ops.new_dynamic_label();
     let unpublished_fail = ops.new_dynamic_label();
@@ -533,6 +821,9 @@ fn emit_candidate(
     let started_fatal = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
     let fallback = ops.new_dynamic_label();
+    let finished = ops.new_dynamic_label();
+    let prepare_pending = ops.new_dynamic_label();
+    let prepare_fatal = ops.new_dynamic_label();
 
     dynasm!(ops
         ; .arch x64
@@ -597,17 +888,76 @@ fn emit_candidate(
     dynasm!(ops
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r11
-        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.len() as i32
+        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
     initialize_inherited_state(ops, view, target);
-    for (index, &argument) in arguments
-        .iter()
-        .take(usize::from(target.plan.param_count))
-        .enumerate()
-    {
-        emit_load_reg(ops, 11, argument);
-        let offset = layout.register_base + u32::try_from(index).unwrap() * 8;
-        dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+    if target.plan.own_upvalue_count != 0 {
+        dynasm!(ops
+            ; .arch x64
+            ; lea r10, [rsp + layout.upvalue_base as i32]
+            ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
+            ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
+        );
+    }
+    match arguments {
+        CallArguments::Fixed(arguments) => {
+            for (index, &argument) in arguments.iter().enumerate() {
+                emit_load_reg(ops, 11, argument);
+                let index = u32::try_from(index)
+                    .map_err(|_| Unsupported::OperandShape("x86-64 call argument index"))?;
+                if index < u32::from(target.plan.param_count) {
+                    let offset = layout.register_base + index * 8;
+                    dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+                }
+                if index < layout.incoming_count {
+                    let offset = layout.incoming_base + index * 8;
+                    dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+                }
+            }
+        }
+        CallArguments::Spread(arguments) => {
+            emit_load_reg(ops, 6, arguments);
+            dynasm!(ops
+                ; .arch x64
+                ; mov rdi, r15
+                ; mov rdx, rsp
+                ; mov ecx, target.plan.param_count as i32
+            );
+            emit_load_runtime_stub(
+                ops,
+                relocations,
+                transitions.entry(abi::STUB_JIT_COPY_SPREAD_ARGUMENTS),
+                abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
+            );
+            dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
+        }
+    }
+    if target.plan.own_upvalue_count != 0 {
+        dynasm!(ops
+            ; .arch x64
+            ; mov rdi, r15
+            ; mov rsi, rsp
+            ; mov edx, target.plan.own_upvalue_count as i32
+            ; mov ecx, target.plan.inherited_upvalue_count as i32
+        );
+        emit_load_runtime_stub(
+            ops,
+            relocations,
+            transitions.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
+            abi::STUB_JIT_INITIALIZE_UPVALUES,
+        );
+        dynasm!(ops
+            ; .arch x64
+            ; call r11
+            ; test rdx, rdx
+            ; je >captures_ready
+            ; cmp edx, abi::NativeResultStatus::SideExit as i32
+            ; je =>unpublished_fail
+            ; cmp edx, abi::NativeResultStatus::Throw as i32
+            ; je =>prepare_pending
+            ; jmp =>prepare_fatal
+            ; captures_ready:
+        );
     }
 
     dynasm!(ops
@@ -708,6 +1058,17 @@ fn emit_candidate(
         ; =>guard_fail
         ; jmp =>fallback
         ; =>fallback
+        ; jmp =>finished
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; =>prepare_pending
+        ; add rsp, layout.frame_bytes as i32
+        ; jmp =>finish_error
+        ; =>prepare_fatal
+        ; add rsp, layout.frame_bytes as i32
+        ; jmp =>fatal
+        ; =>finished
     );
     Ok(true)
 }
@@ -719,9 +1080,16 @@ fn initialize_frame(ops: &mut Assembler, target: &otter_vm::JitDirectCallee, lay
         ; mov rax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32]
         ; mov [rsp], rax
         ; mov eax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32 + 8]
+    );
+    if target.plan.needs_incoming_arguments {
+        dynasm!(ops ; .arch x64 ; or eax, INCOMING_ARGUMENTS_HEADER_WORD as i32);
+    }
+    dynasm!(ops
+        ; .arch x64
         ; mov [rsp + 8], eax
         ; lea rax, [rsp + layout.register_base as i32]
         ; mov [rsp + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], rax
+        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32
     );
     emit_load_u64(ops, 11, VALUE_UNDEFINED);
     for index in 0..u32::from(target.plan.register_count) {
@@ -737,10 +1105,13 @@ fn initialize_receiver(
     target: &otter_vm::JitDirectCallee,
     form: CallForm<'_>,
 ) -> Result<(), Unsupported> {
-    if let CallForm::Method { receiver, .. } = form {
-        emit_load_reg(ops, 12, receiver);
-        dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_THIS_OFFSET as i32], r12);
-        return Ok(());
+    match form {
+        CallForm::Method { receiver, .. } | CallForm::CallWithThis { receiver, .. } => {
+            emit_load_reg(ops, 12, receiver);
+            dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_THIS_OFFSET as i32], r12);
+            return Ok(());
+        }
+        CallForm::Plain { .. } => {}
     }
     match target.plan.this_mode {
         otter_vm::JitDirectCallThisMode::StrictOrLexical => {
@@ -792,7 +1163,7 @@ fn emit_load_and_guard_callable(
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     match form {
-        CallForm::Plain { callee } => {
+        CallForm::Plain { callee } | CallForm::CallWithThis { callee, .. } => {
             emit_load_reg(ops, 9, callee);
             emit_callable_guard(ops, view, target, miss);
         }
@@ -1064,6 +1435,7 @@ fn artifact(
     target: &otter_vm::JitDirectCallee,
     layout: StackLayout,
     form: CallForm<'_>,
+    argument_mode: DirectCallArgumentModeArtifact,
     target_index: u32,
     target_count: u32,
 ) -> Result<DirectCallArtifact, Unsupported> {
@@ -1080,7 +1452,7 @@ fn artifact(
         } else {
             DirectCallKindArtifact::Plain
         },
-        argument_mode: DirectCallArgumentModeArtifact::Fixed,
+        argument_mode,
         target_function_id: target.plan.function_id,
         target_index,
         target_count,
@@ -1127,9 +1499,52 @@ fn artifact(
     })
 }
 
+pub(super) fn forward_artifact(
+    target: &otter_vm::JitDirectCallee,
+    target_index: u32,
+    target_count: u32,
+) -> Result<DirectCallArtifact, Unsupported> {
+    let plan = &target.plan;
+    let callee_native_frame_bytes = plan
+        .generated_stack_frame_bytes
+        .ok_or(Unsupported::OperandShape("x86-64 forward target frame"))?;
+    Ok(DirectCallArtifact {
+        call_kind: DirectCallKindArtifact::Plain,
+        argument_mode: DirectCallArgumentModeArtifact::Forward,
+        target_function_id: plan.function_id,
+        target_index,
+        target_count,
+        target_code_object_id: plan.code_object_id,
+        target_tier: match plan.tier {
+            otter_vm::native_abi::NativeFrameKind::Baseline => DirectCallTierArtifact::Template,
+            otter_vm::native_abi::NativeFrameKind::Optimizing => DirectCallTierArtifact::Optimizing,
+            otter_vm::native_abi::NativeFrameKind::Interpreter => {
+                return Err(Unsupported::OperandShape("x86-64 forward target tier"));
+            }
+        },
+        this_mode: match plan.this_mode {
+            otter_vm::JitDirectCallThisMode::StrictOrLexical => {
+                DirectCallThisModeArtifact::StrictOrLexical
+            }
+            otter_vm::JitDirectCallThisMode::SloppyGlobal => {
+                DirectCallThisModeArtifact::SloppyGlobal
+            }
+            _ => return Err(Unsupported::OperandShape("x86-64 forward receiver mode")),
+        },
+        callee_native_frame_bytes,
+        linkage_bytes: None,
+        reserved_stack_bytes: None,
+        callee_register_count: plan.register_count,
+        own_upvalue_count: plan.own_upvalue_count,
+        inherited_upvalue_count: plan.inherited_upvalue_count,
+    })
+}
+
 fn construct_artifact(
     target: &otter_vm::JitDirectCallee,
     layout: StackLayout,
+    argument_mode: DirectCallArgumentModeArtifact,
+    super_construct: bool,
 ) -> Result<DirectCallArtifact, Unsupported> {
     let callee_native_frame_bytes =
         target
@@ -1139,8 +1554,12 @@ fn construct_artifact(
                 "x86-64 template direct construct target frame",
             ))?;
     Ok(DirectCallArtifact {
-        call_kind: DirectCallKindArtifact::Construct,
-        argument_mode: DirectCallArgumentModeArtifact::Fixed,
+        call_kind: if super_construct {
+            DirectCallKindArtifact::SuperConstruct
+        } else {
+            DirectCallKindArtifact::Construct
+        },
+        argument_mode,
         target_function_id: target.plan.function_id,
         target_index: 0,
         target_count: 1,

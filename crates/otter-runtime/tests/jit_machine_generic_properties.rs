@@ -11,6 +11,8 @@
 //!   an accessor and a writable store becomes non-writable.
 //! - A store followed by two loads keeps the first tagged payload live across
 //!   the second CacheIR probe's Boolean SSA plumbing.
+//! - Adding benign symbol metadata keeps the same named load/store proof live
+//!   without runtime transitions or a replacement native generation.
 //! - A local `try`/`catch` fixture whose throwing getter reaches the Machine
 //!   landing pad through explicit committed status control without deopt.
 //!
@@ -56,23 +58,22 @@ function machineCacheIrLivePayload(target) {
   target.c = target.a + target.b;
   return target.c + target.a;
 }
-let livePayloadWarm = "";
+globalThis.__machineCacheIrLiveArguments = [__machineCacheIrLiveObject];
 for (let warm = 0; warm < 4010; warm++) {
-  livePayloadWarm += "machineCacheIrLivePayload(__machineCacheIrLiveObject);";
+  Reflect.apply(machineCacheIrLivePayload, undefined, __machineCacheIrLiveArguments);
 }
-eval(livePayloadWarm);
 "#;
 
 const LIVE_PAYLOAD_SETTLE: &str = r#"
 for (let probeWarm = 0; probeWarm < 1000; probeWarm++) {
-  machineCacheIrLivePayload(__machineCacheIrLiveObject);
+  Reflect.apply(machineCacheIrLivePayload, undefined, __machineCacheIrLiveArguments);
 }
 "#;
 
 const LIVE_PAYLOAD_PROBE: &str = r#"
 JSON.stringify([
   __machineCacheIrLiveObject.c,
-  machineCacheIrLivePayload(__machineCacheIrLiveObject)
+  Reflect.apply(machineCacheIrLivePayload, undefined, __machineCacheIrLiveArguments)
 ]);
 "#;
 
@@ -780,19 +781,56 @@ fn assert_exact_runtime_pair(delta: CounterDelta, operation: &str) {
 
 #[test]
 fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
-    let mut runtime = runtime(false);
-    runtime
+    let mut runtime = runtime(true);
+    let warm = runtime
         .run_script(
             SourceInput::from_javascript(LIVE_PAYLOAD_WARM),
             "jit-machine-cache-ir-live-payload-warm.js",
         )
         .expect("warm live-payload Machine body");
-    runtime
+    let settle = runtime
         .run_script(
             SourceInput::from_javascript(LIVE_PAYLOAD_SETTLE),
             "jit-machine-cache-ir-live-payload-settle.js",
         )
         .expect("settle live-payload Machine generation");
+    // A direct caller can splice this tiny body and consume its remaining
+    // warmup calls. Reflect.apply keeps the standalone body observable so the
+    // measured probe executes the same Machine property program.
+    let machine = [&warm, &settle]
+        .into_iter()
+        .filter_map(|result| result.jit_artifacts())
+        .flat_map(|batch| batch.bundles())
+        .find(|bundle| {
+            bundle.manifest().function_name() == "machineCacheIrLivePayload"
+                && bundle.manifest().tier() == JitDebugTier::Optimizing
+                && bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "standalone live-payload Machine body required: warm={:?}, settle={:?}",
+                warm.jit_debug_report(),
+                settle.jit_debug_report(),
+            )
+        });
+    let code_map = artifact_json(machine, JitArtifactFileName::CodeMap);
+    let regions = code_map["regions"].as_array().expect("code-map regions");
+    for kind in ["machineCacheIrGuardShape", "machineCacheIrStoreField"] {
+        assert!(
+            regions.iter().any(|region| region["kind"] == kind),
+            "live-payload Machine body must retain {kind}: {code_map}",
+        );
+    }
+    assert!(
+        regions
+            .iter()
+            .filter(|region| region["kind"] == "machineCacheIrLoadField")
+            .count()
+            >= 2,
+        "the tagged result must remain live across another CacheIR load: {code_map}",
+    );
     let (result, delta) = run_with_delta(
         &mut runtime,
         LIVE_PAYLOAD_PROBE,
@@ -806,6 +844,26 @@ fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
     assert_eq!(
         delta.optimized_deopts, 0,
         "Boolean SSA helpers must not clobber a tagged load result: {delta:?}"
+    );
+    completion(
+        &mut runtime,
+        "__machineCacheIrLiveObject[Symbol('metadata')] = { retained: 7 };",
+        "jit-machine-cache-ir-live-payload-symbol.js",
+    );
+    let (result, delta) = run_with_delta(
+        &mut runtime,
+        LIVE_PAYLOAD_PROBE,
+        "jit-machine-cache-ir-live-payload-symbol-probe.js",
+    );
+    assert_eq!(result, "[3,4]");
+    assert_machine_entry_without_deopt(delta, "ordinary named slots with symbol metadata");
+    assert_eq!(
+        delta.runtime_property_stubs, 0,
+        "benign symbol metadata must preserve the generated named loads and store: {delta:?}"
+    );
+    assert_eq!(
+        delta.reentrant_stub_transitions, 0,
+        "the existing named-slot proof must remain allocation-free: {delta:?}"
     );
 }
 

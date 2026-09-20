@@ -10,6 +10,8 @@
 //!   stress mode proves the rooted GC sibling while the fast window is disabled.
 //! - Plain, base, derived, and superclass spread calls sharing that linkage.
 //! - Nested generated calls retaining a tagged value across moving GC.
+//! - Bounded stress probes prove collections and relocations after warmup;
+//!   unstressed tests and the shared production benchmark retain 200k objects.
 //!
 //! # Invariants
 //! - The fixture must execute through the Machine IR backend; semantic equality
@@ -27,6 +29,10 @@
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
+
+#[path = "../../../benchmarks/fixtures/engine/reentrant_allocations.rs"]
+mod reentrant_allocations;
+use reentrant_allocations::AllocationFixture;
 
 fn gc_stress_stride() -> u32 {
     let Ok(value) = std::env::var("OTTER_GC_STRESS") else {
@@ -587,42 +593,6 @@ JSON.stringify([
 ]);
 "#;
 
-const CONSTRUCT_GC: &str = r#"
-let constructGcProbe = false;
-const constructGcPrototype = { marker: "prototype" };
-globalThis.__machineConstructGcSink = [];
-
-function GcBase(marker) {
-  this.marker = marker;
-}
-
-Object.defineProperty(GcBase, "prototype", {
-  configurable: true,
-  get() {
-    if (constructGcProbe) {
-      for (let i = 0; i < 200000; i++) {
-        globalThis.__machineConstructGcSink.push({ i, padding: "construct-gc-" + i });
-      }
-    }
-    return constructGcPrototype;
-  }
-});
-
-function constructGc(Ctor, marker) {
-  return new Ctor(marker);
-}
-
-for (let i = 0; i < 5000; i++) constructGc(GcBase, "warm:" + i);
-constructGcProbe = true;
-const marker = "kept:" + 42;
-const result = constructGc(GcBase, marker);
-JSON.stringify([
-  result.marker,
-  Object.getPrototypeOf(result) === constructGcPrototype,
-  globalThis.__machineConstructGcSink.length
-]);
-"#;
-
 const DERIVED_CONSTRUCT: &str = r#"
 let baseRuns = 0;
 
@@ -774,46 +744,10 @@ JSON.stringify([
 ]);
 "#;
 
-const SPREAD_CONSTRUCT_GC: &str = r#"
-let spreadGcProbe = false;
-const spreadGcPrototype = { marker: "spread-gc-prototype" };
-globalThis.__spreadGcSink = [];
-
-function SpreadGcBase(marker) {
-  this.marker = marker;
-}
-
-Object.defineProperty(SpreadGcBase, "prototype", {
-  configurable: true,
-  get() {
-    if (spreadGcProbe) {
-      for (let i = 0; i < 200000; i++) {
-        globalThis.__spreadGcSink.push({ i, padding: "spread-gc-" + i });
-      }
-    }
-    return spreadGcPrototype;
-  }
-});
-
-function constructSpreadGc(Ctor, args) {
-  return new Ctor(...args);
-}
-
-const warmArgs = ["warm"];
-for (let i = 0; i < 5000; i++) constructSpreadGc(SpreadGcBase, warmArgs);
-spreadGcProbe = true;
-const liveArgs = ["kept:42"];
-const result = constructSpreadGc(SpreadGcBase, liveArgs);
-JSON.stringify([
-  result.marker,
-  Object.getPrototypeOf(result) === spreadGcPrototype,
-  globalThis.__spreadGcSink.length
-]);
-"#;
-
 struct RunResult {
     completion: String,
     stats: RuntimeExecutionStats,
+    stats_before_last_phase: RuntimeExecutionStats,
     used_machine_direct_call: bool,
     used_machine_inline_call: bool,
     used_machine_method_call: bool,
@@ -838,7 +772,11 @@ struct RunResult {
     compile_diagnostics: Vec<String>,
 }
 
-fn run(source: &'static str, name: &'static str, selection: JitSelection) -> RunResult {
+fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
+    run_phases(&[source], name, selection)
+}
+
+fn run_phases(sources: &[&str], name: &str, selection: JitSelection) -> RunResult {
     let artifacts = matches!(selection, JitSelection::ProductionTiered);
     let builder = Runtime::builder().jit_selection(selection);
     let mut runtime = if artifacts {
@@ -849,52 +787,60 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         builder.build()
     }
     .expect("Machine direct-call runtime");
-    let result = runtime
-        .run_script(SourceInput::from_javascript(source), name)
-        .unwrap_or_else(|error| {
-            panic!("Machine direct-call fixture {name} ({selection:?}): {error:?}")
-        });
-    let artifact_has = |needle: &str, machine_only: bool| {
-        result.jit_artifacts().is_some_and(|batch| {
-            batch.bundles().iter().any(|bundle| {
-                (!machine_only
-                    || bundle
-                        .file(JitArtifactFileName::OptimizedIr)
-                        .is_some_and(|file| {
-                            file.contents()
-                                .starts_with(b"; backend=otter-machine-ir scalar-function\n")
-                        }))
-                    && bundle
-                        .file(JitArtifactFileName::Relocations)
-                        .is_some_and(|file| {
-                            std::str::from_utf8(file.contents())
-                                .is_ok_and(|text| text.contains(needle))
-                        })
-            })
-        })
+    let mut results = Vec::with_capacity(sources.len());
+    let mut stats_before_last_phase = runtime.execution_stats();
+    for source in sources {
+        stats_before_last_phase = runtime.execution_stats();
+        results.push(
+            runtime
+                .run_script(SourceInput::from_javascript(*source), name)
+                .unwrap_or_else(|error| {
+                    panic!("Machine direct-call fixture {name} ({selection:?}): {error:?}")
+                }),
+        );
+    }
+    // Setup compiles warmed callers; the allocating probe reuses those native
+    // bodies. Keep both artifact batches as publication evidence.
+    let bundles = || {
+        results
+            .iter()
+            .filter_map(|result| result.jit_artifacts())
+            .flat_map(|batch| batch.bundles())
     };
-    let code_map_has = |needle: &str| {
-        result.jit_artifacts().is_some_and(|batch| {
-            batch.bundles().iter().any(|bundle| {
-                bundle
-                    .file(JitArtifactFileName::CodeMap)
+    let artifact_has = |needle: &str, machine_only: bool| {
+        bundles().any(|bundle| {
+            (!machine_only
+                || bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .is_some_and(|file| {
+                        file.contents()
+                            .starts_with(b"; backend=otter-machine-ir scalar-function\n")
+                    }))
+                && bundle
+                    .file(JitArtifactFileName::Relocations)
                     .is_some_and(|file| {
                         std::str::from_utf8(file.contents()).is_ok_and(|text| text.contains(needle))
                     })
-            })
+        })
+    };
+    let code_map_has = |needle: &str| {
+        bundles().any(|bundle| {
+            bundle
+                .file(JitArtifactFileName::CodeMap)
+                .is_some_and(|file| {
+                    std::str::from_utf8(file.contents()).is_ok_and(|text| text.contains(needle))
+                })
         })
     };
     let optimized_ir_has = |needle: &str| {
-        result.jit_artifacts().is_some_and(|batch| {
-            batch.bundles().iter().any(|bundle| {
-                bundle
-                    .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| {
-                        file.contents().starts_with(MACHINE_IR_HEADER)
-                            && std::str::from_utf8(file.contents())
-                                .is_ok_and(|text| text.contains(needle))
-                    })
-            })
+        bundles().any(|bundle| {
+            bundle
+                .file(JitArtifactFileName::OptimizedIr)
+                .is_some_and(|file| {
+                    file.contents().starts_with(MACHINE_IR_HEADER)
+                        && std::str::from_utf8(file.contents())
+                            .is_ok_and(|text| text.contains(needle))
+                })
         })
     };
     let used_machine_direct_call = artifact_has("directCallEntryCell", true);
@@ -902,28 +848,26 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
     let used_machine_method_call = artifact_has("\"callKind\": \"method\"", true)
         || artifact_has("\"callKind\":\"method\"", true);
     let used_machine_inline_method = optimized_ir_has("GuardCallTarget { guard: Method");
-    let used_machine_method_landing_ack = result.jit_artifacts().is_some_and(|batch| {
-        batch.bundles().iter().any(|bundle| {
-            bundle.manifest().function_name() == "landingCaller"
-                && bundle
-                    .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
-                && bundle
-                    .file(JitArtifactFileName::Relocations)
-                    .is_some_and(|file| {
-                        std::str::from_utf8(file.contents()).is_ok_and(|text| {
-                            text.contains("jit_acknowledge_caught_throw")
-                                && (text.contains("\"callKind\": \"method\"")
-                                    || text.contains("\"callKind\":\"method\""))
-                        })
+    let used_machine_method_landing_ack = bundles().any(|bundle| {
+        bundle.manifest().function_name() == "landingCaller"
+            && bundle
+                .file(JitArtifactFileName::OptimizedIr)
+                .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+            && bundle
+                .file(JitArtifactFileName::Relocations)
+                .is_some_and(|file| {
+                    std::str::from_utf8(file.contents()).is_ok_and(|text| {
+                        text.contains("jit_acknowledge_caught_throw")
+                            && (text.contains("\"callKind\": \"method\"")
+                                || text.contains("\"callKind\":\"method\""))
                     })
-                && bundle
-                    .file(JitArtifactFileName::CodeMap)
-                    .is_some_and(|file| {
-                        std::str::from_utf8(file.contents())
-                            .is_ok_and(|text| text.contains("machineDirectMethodCandidate"))
-                    })
-        })
+                })
+            && bundle
+                .file(JitArtifactFileName::CodeMap)
+                .is_some_and(|file| {
+                    std::str::from_utf8(file.contents())
+                        .is_ok_and(|text| text.contains("machineDirectMethodCandidate"))
+                })
     });
     let used_machine_construct = artifact_has("\"callKind\": \"construct\"", true)
         || artifact_has("\"callKind\":\"construct\"", true);
@@ -950,19 +894,20 @@ fn run(source: &'static str, name: &'static str, selection: JitSelection) -> Run
         code_map_has("machineDerivedThisBindFast") && code_map_has("machineDerivedThisBindCold");
     let used_direct_construct_result_fast = code_map_has("directConstructResultFast");
     let used_direct_construct_result_throw = code_map_has("directConstructResultThrow");
-    let compile_diagnostics = result
-        .jit_debug_report()
-        .map(|report| {
-            report
-                .events()
-                .iter()
-                .map(|event| format!("{event:?}"))
-                .collect()
-        })
-        .unwrap_or_default();
+    let compile_diagnostics = results
+        .iter()
+        .filter_map(|result| result.jit_debug_report())
+        .flat_map(|report| report.events())
+        .map(|event| format!("{event:?}"))
+        .collect();
     RunResult {
-        completion: result.completion_string().to_owned(),
+        completion: results
+            .last()
+            .expect("at least one fixture phase")
+            .completion_string()
+            .to_owned(),
         stats: runtime.execution_stats(),
+        stats_before_last_phase,
         used_machine_direct_call,
         used_machine_inline_call,
         used_machine_method_call,
@@ -992,8 +937,45 @@ fn assert_generated_spread_call(result: &RunResult) {
     assert!(result.stats.jit_generated_calls > 0);
     assert!(
         result.used_machine_spread_arguments,
-        "fixture must publish spread argument materialization on shared direct linkage"
+        "fixture must publish spread argument materialization on shared direct linkage; diagnostics={:?}",
+        result.compile_diagnostics
     );
+}
+
+fn moving_gc_probe_allocations() -> usize {
+    // The shared production kernel retains 200k objects independently of the
+    // correctness test. Stress needs repeated movement during one live native
+    // activation; its collection floor is checked against this bounded work.
+    if gc_stress_stride() == 0 {
+        200_000
+    } else {
+        2_048
+    }
+}
+
+fn assert_allocating_probe(result: &RunResult, fixture: AllocationFixture, allocations: usize) {
+    let before = result.stats_before_last_phase;
+    let minor_cycles = result.stats.gc_minor_cycles - before.gc_minor_cycles;
+    let slot_updates = result.stats.gc_minor_slot_updates - before.gc_minor_slot_updates;
+    let generated_calls = result.stats.jit_generated_calls - before.jit_generated_calls;
+    let stride = gc_stress_stride();
+    let minimum_collections = if stride == 0 {
+        1
+    } else {
+        (allocations as u64 / u64::from(stride)).max(1)
+    };
+    eprintln!(
+        "{} probe: allocations={allocations}, stress_stride={stride}, \
+         minor_cycles={minor_cycles}, minimum_collections={minimum_collections}, \
+         relocation_slot_updates={slot_updates}, generated_calls={generated_calls}",
+        fixture.name(),
+    );
+    assert!(
+        minor_cycles >= minimum_collections,
+        "prototype getter must collect repeatedly while construct roots are published"
+    );
+    assert!(generated_calls > 0, "probe must enter a generated callee");
+    assert!(slot_updates >= 2, "probe must relocate live references");
 }
 
 fn assert_machine_construct(result: &RunResult) {
@@ -1091,7 +1073,6 @@ fn base_construct_executes_through_machine_ir() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn default_base_construct_uses_non_reentrant_receiver_preparation_in_both_tiers() {
     let oracle = run(
         DEFAULT_BASE_CONSTRUCT,
@@ -1112,14 +1093,17 @@ fn default_base_construct_uses_non_reentrant_receiver_preparation_in_both_tiers(
     assert_eq!(oracle.completion, "[42,true,true]");
     assert_eq!(template.completion, oracle.completion);
     assert_eq!(production.completion, oracle.completion);
-    assert!(template.stats.jit_generated_calls > 0);
+    assert!(
+        template.stats.jit_generated_calls > 0,
+        "template must enter generated constructor linkage; diagnostics={:?}",
+        template.compile_diagnostics
+    );
     assert!(template.stats.jit_alloc_stub_transitions > 0);
     assert_machine_construct(&production);
     assert!(production.stats.jit_alloc_stub_transitions > 0);
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
     let oracle = run(
         SIMPLE_SHAPED_CONSTRUCT_FAMILY,
@@ -1140,7 +1124,11 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
     assert_eq!(oracle.completion, r#"[42,42,42,"left,right",true]"#);
     assert_eq!(template.completion, oracle.completion);
     assert_eq!(production.completion, oracle.completion);
-    assert!(template.stats.jit_generated_calls > 0);
+    assert!(
+        template.stats.jit_generated_calls > 0,
+        "template must enter generated constructor linkage; diagnostics={:?}",
+        template.compile_diagnostics
+    );
     assert!(template.stats.property_store_misses < 500);
     assert!(template.stats.jit_alloc_stub_transitions > 0);
     assert_generated_spread_call(&production);
@@ -1181,7 +1169,6 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
     let production = run(
         GENERATED_RECEIVER_ALLOCATION,
@@ -1210,13 +1197,17 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
     assert_eq!(production.stats.jit_receiver_alloc_deopts, 0);
     assert_eq!(production.stats.jit_receiver_alloc_oom, 0);
     if gc_stress_stride() != 0 {
-        // Stress keeps the nursery fast window unavailable: every otherwise
-        // eligible generated attempt must reach the rooted GC allocator.
+        // Stress keeps the nursery fast window unavailable. Every attempt
+        // misses the generated window, and every transition that reaches the
+        // rooted allocation sibling must collect there. Spread preparation
+        // may instead commit through its reentrant construct sibling.
         assert_eq!(production.stats.jit_receiver_alloc_generated, 0);
         assert_eq!(production.stats.jit_receiver_alloc_refills, 0);
         assert_eq!(
             production.stats.jit_receiver_alloc_gc_transitions,
-            production.stats.jit_receiver_alloc_attempts
+            production.stats.jit_receiver_alloc_cold_transitions,
+            "stats={:?}",
+            production.stats
         );
         assert!(
             production.stats.jit_alloc_stub_transitions
@@ -1234,13 +1225,14 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
         );
         assert!(
             production.stats.jit_alloc_stub_transitions
-                < production.stats.jit_receiver_alloc_attempts / 100
+                < production.stats.jit_receiver_alloc_attempts / 100,
+            "stats={:?}",
+            production.stats
         );
     }
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn inherited_setter_prevents_constructor_preshape_without_losing_effects() {
     let oracle = run(
         SIMPLE_SHAPE_OBSERVABLE_SETTER,
@@ -1260,7 +1252,6 @@ fn inherited_setter_prevents_constructor_preshape_without_losing_effects() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn construct_object_throw_and_guard_miss_are_not_replayed() {
     let oracle = run(
         CONSTRUCT_COLD_EXITS,
@@ -1282,24 +1273,26 @@ fn construct_object_throw_and_guard_miss_are_not_replayed() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn construct_receiver_and_arguments_survive_reentrant_moving_gc() {
-    let compiled = run(
-        CONSTRUCT_GC,
+    let fixture = AllocationFixture::Fixed;
+    let allocations = moving_gc_probe_allocations();
+    let compiled = run_phases(
+        &[&fixture.setup(allocations), fixture.probe()],
         "jit-machine-construct-gc.js",
         JitSelection::ProductionTiered,
     );
 
-    assert_eq!(compiled.completion, r#"["kept:42",true,200000]"#);
-    assert_machine_construct(&compiled);
-    assert!(
-        compiled.stats.gc_minor_cycles > 0,
-        "prototype getter must trigger moving GC while construct roots are published"
+    assert_eq!(
+        compiled.completion,
+        AllocationFixture::expected_completion(allocations),
+        "{} fixture",
+        AllocationFixture::Fixed.name(),
     );
+    assert_machine_construct(&compiled);
+    assert_allocating_probe(&compiled, fixture, allocations);
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn derived_and_super_construct_execute_through_machine_ir() {
     let oracle = run(
         DERIVED_CONSTRUCT,
@@ -1318,7 +1311,6 @@ fn derived_and_super_construct_execute_through_machine_ir() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn complete_spread_call_family_uses_shared_generated_linkage() {
     let oracle = run(
         SPREAD_CALL_FAMILY,
@@ -1343,18 +1335,24 @@ fn complete_spread_call_family_uses_shared_generated_linkage() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn spread_array_survives_receiver_preparation_moving_gc() {
-    let compiled = run(
-        SPREAD_CONSTRUCT_GC,
+    let fixture = AllocationFixture::Spread;
+    let allocations = moving_gc_probe_allocations();
+    let compiled = run_phases(
+        &[&fixture.setup(allocations), fixture.probe()],
         "jit-machine-spread-construct-gc.js",
         JitSelection::ProductionTiered,
     );
 
-    assert_eq!(compiled.completion, r#"["kept:42",true,200000]"#);
+    assert_eq!(
+        compiled.completion,
+        AllocationFixture::expected_completion(allocations),
+        "{} fixture",
+        AllocationFixture::Spread.name(),
+    );
     assert_generated_spread_call(&compiled);
     assert!(compiled.used_generated_construct);
-    assert!(compiled.stats.gc_minor_cycles > 0);
+    assert_allocating_probe(&compiled, fixture, allocations);
 }
 
 #[test]
@@ -1424,7 +1422,6 @@ fn stack_callee_deopt_rebuilds_local_catch_without_replaying_effects() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn generated_call_carries_closure_eval_env_after_factory_frame_and_full_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
@@ -1577,7 +1574,6 @@ fn prototype_method_guard_binds_exact_receiver() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn method_cold_exits_do_not_replay_and_caller_is_reusable() {
     let oracle = run(
         METHOD_COLD_EXITS,
@@ -1597,7 +1593,6 @@ fn method_cold_exits_do_not_replay_and_caller_is_reusable() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn method_receiver_arguments_and_deopt_state_can_spill() {
     let oracle = run(
         METHOD_SPILLS,
@@ -1639,7 +1634,6 @@ fn method_throw_enters_explicit_machine_landing_pad() {
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn method_receiver_remains_rooted_during_moving_gc() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)

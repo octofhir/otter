@@ -77,7 +77,7 @@ impl RuntimeCall<'_> {
         // SAFETY: RuntimeCall binds these live service owners. Preparation
         // below only allocates Rust containers; it never collects or reenters.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let stack = unsafe { self.stack.as_ref() };
         let base = vm.jit_native_activation_top;
         if base == 0 || vm.jit_native_activations[base - 1].frame != self.frame.as_ptr() {
@@ -98,7 +98,10 @@ impl RuntimeCall<'_> {
             usize::from(unsafe { self.frame.as_ref() }.header.register_count);
         for recipe in frames.iter_mut() {
             let entry = recipe.entry.as_ref().ok_or(VmError::InvalidOperand)?;
-            let function = context
+            let owner = context
+                .for_function(recipe.function_id)
+                .map_err(|_| VmError::InvalidOperand)?;
+            let function = owner
                 .exec_function(recipe.function_id)
                 .ok_or(VmError::InvalidOperand)?;
             if recipe.slots.len() != usize::from(function.register_count)
@@ -166,10 +169,13 @@ impl RuntimeCall<'_> {
             // stay stationary until the lexical publication is dropped.
             unsafe { vm.jit_push_native_frame(native) }?;
         }
+        let inner_context = context
+            .for_function(frames.last().expect("nonempty inline chain").function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let mut inner = RuntimeCall {
             vm: self.vm,
             stack: self.stack,
-            context: self.context,
+            context: (*inner_context).clone(),
             frame: NonNull::from(natives.last_mut().expect("nonempty inline chain")),
             identity: RuntimeFrameIdentity::StackOwned,
             _exclusive: std::marker::PhantomData,

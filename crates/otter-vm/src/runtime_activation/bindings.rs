@@ -67,7 +67,8 @@ impl RuntimeCall<'_> {
         let function_id = self.function_id();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let context = unsafe { self.context.as_ref() };
+        let context = self.context.clone();
+        let context = &context;
         let stack = unsafe { &mut *self.stack.as_ptr() };
 
         let mut result = Value::undefined();
@@ -335,7 +336,8 @@ impl RuntimeCall<'_> {
         let function_id = self.function_id();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let context = unsafe { self.context.as_ref() };
+        let context = self.context.clone();
+        let context = &context;
 
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);

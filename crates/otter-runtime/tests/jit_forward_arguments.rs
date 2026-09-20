@@ -12,6 +12,7 @@
 //! - Native polymorphic hits, dynamic actual windows, bounded fallback, moving
 //!   roots and exact exceptions after warmup.
 //! - Saturated native dispatch with fresh/inherited captures and semantic misses.
+//! - Runtime-selected callees owned by a sibling linked script chunk.
 //!
 //! # Invariants
 //! - Bodies that only forward `arguments` never materialize the object on
@@ -20,8 +21,6 @@
 //! - A non-intrinsic `apply` observes exactly the object a materialized
 //!   `arguments` binding would have produced, once per activation.
 //! - Every tier returns the interpreter's completion.
-
-#![cfg(target_arch = "aarch64")]
 
 use otter_runtime::{JitDebugEvent, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
@@ -407,6 +406,52 @@ checksum;
 }
 
 #[test]
+fn runtime_forward_resolves_target_from_sibling_chunk() {
+    let forwarder = r#"
+var selected;
+function forward(a, b, c) { return selected.apply(null, arguments); }
+"#;
+    let target = r#"
+function siblingTarget(a, b) { return a + b + arguments[2] + arguments.length; }
+selected = siblingTarget;
+for (var i = 0; i < 6000; i++) forward(i, 2, 3);
+"#;
+    let probe = r#"
+var siblingSum = 0;
+for (var j = 0; j < 256; j++) siblingSum += forward(j, 2, 3);
+siblingSum;
+"#;
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = Runtime::builder()
+            .jit_selection(selection)
+            .build()
+            .expect("runtime");
+        runtime
+            .run_script(SourceInput::from_javascript(forwarder), "forward-owner.js")
+            .expect("install forwarder");
+        runtime
+            .run_script(SourceInput::from_javascript(target), "target-owner.js")
+            .expect("warm sibling target");
+        let before = runtime.execution_stats();
+        let result = runtime
+            .run_script(SourceInput::from_javascript(probe), "sibling-probe.js")
+            .expect("forward into sibling chunk");
+        assert_eq!(result.completion_string(), "34688", "{selection:?}");
+        let after = runtime.execution_stats();
+        let native_calls = after.jit_generated_calls - before.jit_generated_calls;
+        let rooted_calls = after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
+        assert!(
+            native_calls >= 256,
+            "{selection:?}: sibling native calls={native_calls}"
+        );
+        assert!(
+            rooted_calls < 64,
+            "{selection:?}: sibling rooted calls={rooted_calls}"
+        );
+    }
+}
+
+#[test]
 fn saturated_forwarding_preserves_live_arguments_and_reports_distinct_feedback() {
     let source = include_str!("../../otter-difftest/corpus/forward_arguments_saturated.js");
     for selection in [
@@ -520,7 +565,7 @@ fn machine_forwarding_keeps_saturated_native_hits_and_live_bindings() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .expect("runtime");
-    runtime
+    let warm = runtime
         .run_script(
             SourceInput::from_javascript(include_str!(
                 "../../otter-difftest/corpus/forward_arguments_saturated.js"
@@ -544,24 +589,25 @@ machineSum;
         )
         .expect("Machine forwards");
     assert_eq!(result.completion_string(), "128164432");
-    let compiled = result
-        .jit_artifacts()
-        .expect("artifacts")
-        .bundles()
-        .iter()
-        .any(|bundle| {
-            bundle.manifest().function_name() == "forward"
-                && bundle
-                    .file(otter_runtime::JitArtifactFileName::OptimizedIr)
-                    .is_some()
-                && bundle
-                    .file(otter_runtime::JitArtifactFileName::CodeMap)
-                    .is_some_and(|file| {
-                        std::str::from_utf8(file.contents())
-                            .expect("code map")
-                            .contains("machineForwardCall")
-                    })
-        });
+    let compiled = [&warm, &result].into_iter().any(|run| {
+        run.jit_artifacts()
+            .expect("artifacts")
+            .bundles()
+            .iter()
+            .any(|bundle| {
+                bundle.manifest().function_name() == "forward"
+                    && bundle
+                        .file(otter_runtime::JitArtifactFileName::OptimizedIr)
+                        .is_some()
+                    && bundle
+                        .file(otter_runtime::JitArtifactFileName::CodeMap)
+                        .is_some_and(|file| {
+                            std::str::from_utf8(file.contents())
+                                .expect("code map")
+                                .contains("machineForwardCall")
+                        })
+            })
+    });
     assert!(
         compiled,
         "forward must reach Machine: {:?}",

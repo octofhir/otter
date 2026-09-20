@@ -1106,6 +1106,12 @@ pub struct RuntimeExecutionStats {
     pub gc_minor_cycles: u64,
     /// Cumulative minor-GC pause time, in nanoseconds.
     pub gc_minor_pause_ns_total: u64,
+    /// Cumulative root slots visited across minor GCs, excluding heap tracing.
+    pub gc_minor_root_slots_scanned: u64,
+    /// Largest number of root slots visited by one minor GC.
+    pub gc_minor_root_slots_peak: u64,
+    /// Cumulative minor-GC slot updates, including relocation and weak-slot clearing.
+    pub gc_minor_slot_updates: u64,
     /// Cumulative remembered-set entries scanned across all minor GCs.
     pub gc_minor_dirty_cards_scanned: u64,
     /// Cumulative old-space headers strided to re-derive edge owners; zero
@@ -1113,7 +1119,8 @@ pub struct RuntimeExecutionStats {
     pub gc_minor_old_headers_walked: u64,
     /// Cumulative remembered parents re-traced across all minor GCs.
     pub gc_minor_objects_retraced: u64,
-    /// Cumulative slots visited re-tracing remembered parents.
+    /// Cumulative slots visited while tracing remembered parents and the
+    /// children of freshly promoted bodies.
     pub gc_minor_slots_scanned: u64,
 }
 
@@ -4884,6 +4891,9 @@ impl Runtime {
             gc_full_pause_ns_total: gc.full_pause_ns_total,
             gc_minor_cycles: gc.minor_gc_cycles,
             gc_minor_pause_ns_total: gc.minor_pause_ns_total,
+            gc_minor_root_slots_scanned: gc.minor_root_slots_scanned,
+            gc_minor_root_slots_peak: gc.minor_root_slots_peak,
+            gc_minor_slot_updates: gc.minor_slot_updates,
             gc_minor_dirty_cards_scanned: gc.minor_dirty_cards_scanned,
             gc_minor_old_headers_walked: gc.minor_old_headers_walked,
             gc_minor_objects_retraced: gc.minor_objects_retraced,

@@ -4,6 +4,7 @@
 //! - [`emit`] — the target encoder boundary shared by the optimizing pipeline.
 //! - Allocation-driven frames, spill moves, scalar operations, control flow,
 //!   cooperative polling, and exact deoptimization exits.
+//! - Typed derived-constructor `this` binding and exact class-super loads.
 //!
 //! # Invariants
 //! - This encoder consumes the same verified Machine sequence, allocation,
@@ -17,8 +18,12 @@ use std::collections::BTreeMap;
 
 #[path = "x86_64/direct_call.rs"]
 mod direct_call;
+#[path = "x86_64/inline_calls.rs"]
+mod inline_calls;
 #[path = "x86_64/loose_equality.rs"]
 mod loose_equality;
+#[path = "x86_64/megamorphic_property.rs"]
+mod megamorphic_property;
 
 pub(crate) use direct_call::{emit_generated_receiver_allocation, emit_increment_runtime_counter};
 
@@ -62,14 +67,14 @@ use crate::{
         GLOBAL_THIS_OFFSET_PTR_OFFSET, MACHINE_ROOT_RECORD_BASE_OFFSET,
         MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET, MACHINE_ROOT_RECORD_COUNT_OFFSET,
         MACHINE_ROOT_RECORD_PREVIOUS_OFFSET, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET,
-        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NEW_FROM_SPACE_KIND,
-        NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, PAGE_ALLOCATED_BYTES_OFFSET,
-        PAGE_BUMP_CURSOR_OFFSET, PAGE_SPACE_OFFSET, PropertySourceCell,
-        RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
+        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
+        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
+        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
+        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
+        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET,
+        NATIVE_STACK_LIMIT_OFFSET, NEW_FROM_SPACE_KIND, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
+        PAGE_ALLOCATED_BYTES_OFFSET, PAGE_BUMP_CURSOR_OFFSET, PAGE_SPACE_OFFSET,
+        PropertySourceCell, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
         RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET,
         RECEIVER_ALLOC_PAGE_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
         RECEIVER_ALLOC_TRACKED_BYTES_OFFSET, RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
@@ -268,6 +273,42 @@ pub(super) fn emit(
                     ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
                     ; mov Rq(dst), [r11 + NATIVE_FRAME_THIS_OFFSET as i32]
                 );
+            }
+            MachineOpcode::TryBindDerivedThis { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let flags = otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS
+                    | otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
+                load_integer(&mut ops, frame, loc[0], 6)?;
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
+                    ; movzx r10d, BYTE [r11 + NATIVE_FRAME_FLAGS_OFFSET as i32]
+                    ; and r10d, flags as i32
+                    ; cmp r10d, flags as i32
+                    ; jne =>miss
+                    ; mov r10, [r11 + NATIVE_FRAME_THIS_OFFSET as i32]
+                );
+                load64(&mut ops, 8, Value::hole().to_bits());
+                dynasm!(ops
+                    ; .arch x64
+                    ; cmp r10, r8
+                    ; jne =>miss
+                    ; mov [r11 + NATIVE_FRAME_THIS_OFFSET as i32], rsi
+                    ; mov eax, 1
+                    ; jmp =>done
+                    ; =>miss
+                    ; xor eax, eax
+                    ; =>done
+                );
+                store_integer(&mut ops, frame, loc[1], 0)?;
+                structural_regions.push((
+                    "machineDerivedThisBindFast",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
             }
             MachineOpcode::StringConstantCellLoad { byte_pc, target } => {
                 let start = ops.offset().0;
@@ -764,6 +805,16 @@ pub(super) fn emit(
                 );
                 store_integer(&mut ops, frame, loc[0], 11)?;
             }
+            MachineOpcode::PropertyMegamorphicLoad { byte_pc, atom } => {
+                let start = ops.offset().0;
+                megamorphic_property::emit(&mut ops, &mut relocations, view, frame, loc, atom)?;
+                structural_regions.push((
+                    "machineMegamorphicPropertyLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrGuardShape { byte_pc, shape } => {
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
@@ -793,14 +844,15 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::CacheIrGuardAtomSlot { byte_pc, .. } => {
+            MachineOpcode::CacheIrGuardOrdinaryState { byte_pc }
+            | MachineOpcode::CacheIrGuardAtomSlot { byte_pc, .. } => {
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
-                fast_object_state_guard(&mut ops, view, miss);
+                ordinary_lookup_state_guard(&mut ops, view, miss);
                 dynasm!(ops
                     ; .arch x64
                     ; mov r10d, 1
@@ -811,7 +863,14 @@ pub(super) fn emit(
                 );
                 store_integer(&mut ops, frame, loc[2], 10)?;
                 structural_regions.push((
-                    "machineCacheIrGuardAtomSlot",
+                    if matches!(
+                        instruction.opcode,
+                        MachineOpcode::CacheIrGuardOrdinaryState { .. }
+                    ) {
+                        "machineCacheIrGuardOrdinaryState"
+                    } else {
+                        "machineCacheIrGuardAtomSlot"
+                    },
                     Some(byte_pc),
                     start,
                     ops.offset().0,
@@ -821,9 +880,9 @@ pub(super) fn emit(
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[1], 10)?;
                 load64(&mut ops, 8, VALUE_UNDEFINED);
                 dynasm!(ops ; .arch x64 ; xor r9d, r9d);
-                load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
                 dynasm!(ops
@@ -941,7 +1000,7 @@ pub(super) fn emit(
                 load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
-                fast_object_state_guard(&mut ops, view, miss);
+                ordinary_lookup_state_guard(&mut ops, view, miss);
                 dynasm!(ops
                     ; .arch x64
                     ; mov r10d, value_byte as i32
@@ -1111,8 +1170,12 @@ pub(super) fn emit(
                 store_integer(&mut ops, frame, loc[1], 11)?;
             }
             MachineOpcode::CacheIrJoin { store: false, .. } => {
-                load_integer(&mut ops, frame, loc[0], 10)?;
+                // Preserve the condition in the non-allocatable move scratch
+                // before loading the value: the value scratch may itself own
+                // the condition input, so the opposite order corrupts the
+                // parallel SSA copy.
                 load_integer(&mut ops, frame, loc[1], 11)?;
+                load_integer(&mut ops, frame, loc[0], 10)?;
                 store_integer(&mut ops, frame, loc[2], 10)?;
                 store_integer(&mut ops, frame, loc[3], 11)?;
             }
@@ -1368,6 +1431,68 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::Throw as i32);
                 epilogue(&mut ops, frame, saved);
             }
+            MachineOpcode::NativeLeafIdentity {
+                builtin_native_ref,
+                byte_pc,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[1], 9)?;
+                dynasm!(ops ; .arch x64 ; test r9d, r9d ; jz =>miss);
+                load_integer(&mut ops, frame, loc[0], 10)?;
+                super::super::native_leaf::x86_64::emit_guard(
+                    &mut ops,
+                    view,
+                    builtin_native_ref,
+                    miss,
+                );
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r9d, 1
+                    ; jmp =>done
+                    ; =>miss
+                    ; xor r9d, r9d
+                    ; =>done
+                );
+                store_integer(&mut ops, frame, loc[2], 9)?;
+                structural_regions.push((
+                    "machineNativeLeafIdentity",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::NativeInt32Math { stub, byte_pc } => {
+                let argument_count = otter_vm::jit_static_native::jit_leaf_builtin(stub)
+                    .ok_or(Unsupported::OperandShape("x86-64 Int32 math declaration"))?
+                    .argument_count as usize;
+                if loc.len() != argument_count + 3 {
+                    return Err(Unsupported::OperandShape("x86-64 Int32 math operands"));
+                }
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[argument_count], 9)?;
+                dynasm!(ops ; .arch x64 ; test r9d, r9d ; jz =>miss);
+                super::super::native_leaf::x86_64::emit_int32(&mut ops, stub, miss)?;
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r9d, 1
+                    ; jmp =>done
+                    ; =>miss
+                    ; xor eax, eax
+                    ; xor r9d, r9d
+                    ; =>done
+                );
+                store_integer(&mut ops, frame, loc[argument_count + 2], 9)?;
+                structural_regions.push((
+                    "machineMethodIntrinsic",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::Call(descriptor_index) => {
                 let descriptor = sequence
                     .call_descriptors()
@@ -1384,7 +1509,11 @@ pub(super) fn emit(
                     );
                     let int32 = descriptor.results == [MachineRepresentation::Int32];
                     if int32 {
-                        super::super::native_leaf::x86_64::emit_int32(&mut ops, target, exit)?;
+                        super::super::native_leaf::x86_64::emit_int32(
+                            &mut ops,
+                            target.leaf_stub_id,
+                            exit,
+                        )?;
                     } else {
                         super::super::native_leaf::x86_64::emit_tagged_call(
                             &mut ops,
@@ -1452,6 +1581,7 @@ pub(super) fn emit(
                         )?;
                     } else {
                         committed_pair_call(
+                            view,
                             &mut ops,
                             &mut relocations,
                             transitions,
@@ -1477,6 +1607,10 @@ pub(super) fn emit(
                             "machineElementLoadCold"
                         } else if target == otter_vm::native_abi::STUB_JIT_STORE_ELEMENT {
                             "machineElementStoreCold"
+                        } else if super::super::derived_this::cold_byte_pc(sequence, block_index)
+                            == Some(byte_pc)
+                        {
+                            "machineDerivedThisBindCold"
                         } else {
                             "machineCommittedValueEffect"
                         },
@@ -1520,7 +1654,33 @@ pub(super) fn emit(
                     let exit = deopt(instruction.deopt_id(), &deopts)?;
                     let direct_throw = ops.new_dynamic_label();
                     let direct_done = ops.new_dynamic_label();
+                    let publish_inline = *kind == super::super::DirectCallKind::Construct
+                        && candidates.len() == 1
+                        && !instruction.inline_frames.is_empty();
+                    let inline_throw = ops.new_dynamic_label();
+                    let inline_done = ops.new_dynamic_label();
+                    let inline_finish_error = ops.new_dynamic_label();
+                    let inline_fatal = ops.new_dynamic_label();
+                    let inline_publication_fail = ops.new_dynamic_label();
+                    let packet = super::value_packet_frame(sequence)?;
+                    let inline_start = packet.raw_start.checked_add(packet.raw_words).ok_or(
+                        Unsupported::OperandShape("x86-64 inline native frame start"),
+                    )?;
+                    if publish_inline {
+                        save_roots(&mut ops, frame, site)?;
+                        publish_roots(&mut ops, frame, site)?;
+                        inline_calls::enter(
+                            &mut ops,
+                            view,
+                            frame,
+                            instruction,
+                            site,
+                            inline_start,
+                            inline_publication_fail,
+                        )?;
+                    }
                     let start = ops.offset().0;
+                    let mut direct_regions = direct_call::DirectCallRegions::default();
                     direct_call::emit(
                         &mut ops,
                         &mut relocations,
@@ -1538,12 +1698,40 @@ pub(super) fn emit(
                         *caller_function_id,
                         *logical_pc,
                         *byte_pc,
+                        publish_inline,
                         exit,
-                        finish_error,
-                        fatal,
-                        direct_throw,
-                        direct_done,
+                        if publish_inline {
+                            inline_finish_error
+                        } else {
+                            finish_error
+                        },
+                        if publish_inline { inline_fatal } else { fatal },
+                        if publish_inline {
+                            inline_throw
+                        } else {
+                            direct_throw
+                        },
+                        if publish_inline {
+                            inline_done
+                        } else {
+                            direct_done
+                        },
+                        &mut direct_regions,
                     )?;
+                    if publish_inline {
+                        dynasm!(ops ; .arch x64 ; =>inline_throw);
+                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
+                        dynasm!(ops ; .arch x64 ; jmp =>direct_throw ; =>inline_done);
+                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
+                        dynasm!(ops ; .arch x64 ; jmp =>direct_done ; =>inline_finish_error);
+                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
+                        dynasm!(ops ; .arch x64 ; jmp =>finish_error ; =>inline_fatal);
+                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
+                        dynasm!(ops ; .arch x64 ; jmp =>fatal ; =>inline_publication_fail);
+                        clear_roots(&mut ops);
+                        reload_roots(&mut ops, frame, site)?;
+                        dynasm!(ops ; .arch x64 ; jmp =>exit);
+                    }
                     dynasm!(ops ; .arch x64 ; =>direct_throw);
                     match descriptor.exceptional {
                         super::super::ExceptionalEdge::Propagate => {
@@ -1575,7 +1763,11 @@ pub(super) fn emit(
                     }
                     dynasm!(ops ; .arch x64 ; =>direct_done);
                     structural_regions.push((
-                        "machineDirectCall",
+                        if *kind == super::super::DirectCallKind::Forward {
+                            "machineForwardCall"
+                        } else {
+                            "machineDirectCall"
+                        },
                         Some(*byte_pc),
                         start,
                         ops.offset().0,
@@ -1588,13 +1780,64 @@ pub(super) fn emit(
                             ops.offset().0,
                         ));
                     }
-                    if *kind == super::super::DirectCallKind::Method {
+                    for (guard_start, guard_end) in direct_regions.method_guards {
+                        structural_regions.push((
+                            "machineDirectMethodGuard",
+                            Some(*byte_pc),
+                            guard_start,
+                            guard_end,
+                        ));
+                    }
+                    for (candidate_start, candidate_end) in direct_regions.method_candidates {
                         structural_regions.push((
                             "machineDirectMethodCandidate",
                             Some(*byte_pc),
-                            start,
-                            ops.offset().0,
+                            candidate_start,
+                            candidate_end,
                         ));
+                    }
+                    for (generic_start, generic_end) in direct_regions.generic_methods {
+                        structural_regions.push((
+                            "machineGenericMethodCall",
+                            Some(*byte_pc),
+                            generic_start,
+                            generic_end,
+                        ));
+                    }
+                    for (region, ranges) in [
+                        (
+                            "directConstructPrepareFast",
+                            direct_regions.construct_prepare_fast,
+                        ),
+                        (
+                            "directConstructPrepareObservable",
+                            direct_regions.construct_prepare_observable,
+                        ),
+                        (
+                            "directConstructReceiverAllocFast",
+                            direct_regions.construct_receiver_alloc_fast,
+                        ),
+                        (
+                            "directConstructReceiverAllocCold",
+                            direct_regions.construct_receiver_alloc_cold,
+                        ),
+                        (
+                            "directConstructResultFast",
+                            direct_regions.construct_result_fast,
+                        ),
+                        (
+                            "directConstructResultThrow",
+                            direct_regions.construct_result_throw,
+                        ),
+                    ] {
+                        for (region_start, region_end) in ranges {
+                            structural_regions.push((
+                                region,
+                                Some(*byte_pc),
+                                region_start,
+                                region_end,
+                            ));
+                        }
                     }
                     if !terminal {
                         edits(
@@ -1646,6 +1889,48 @@ pub(super) fn emit(
                 let CallTarget::RuntimeStub(target) = descriptor.target else {
                     return Err(Unsupported::OperandShape("x86-64 scalar call target"));
                 };
+                if target == otter_vm::native_abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR {
+                    if loc.len() < 2 {
+                        return Err(Unsupported::OperandShape("x86-64 class-super load call"));
+                    }
+                    let exit = deopt(instruction.deopt_id(), &deopts)?;
+                    let start = ops.offset().0;
+                    load_integer(&mut ops, frame, loc[0], 6)?;
+                    load64(&mut ops, 10, NOT_CELL_MASK);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; test rsi, r10
+                        ; jnz =>exit
+                        ; mov r11d, esi
+                    );
+                    symbolic(
+                        &mut ops,
+                        &mut relocations,
+                        10,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add r11, r10
+                        ; cmp BYTE [r11], view.class_constructor_layout.type_tag as i8
+                        ; jne =>exit
+                        ; mov rax, [r11 + view.class_constructor_layout.super_constructor_byte as i32]
+                    );
+                    load64(&mut ops, 10, Value::hole().to_bits());
+                    dynasm!(ops ; .arch x64 ; cmp rax, r10 ; je =>exit);
+                    store_integer(&mut ops, frame, loc[1], 0)?;
+                    structural_regions.push(("machineClassSuperLoad", None, start, ops.offset().0));
+                    if !terminal {
+                        edits(
+                            &mut ops,
+                            allocation.edits(),
+                            AllocationPoint::After(id),
+                            frame,
+                        )?;
+                    }
+                    continue;
+                }
                 if target == otter_vm::native_abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW {
                     if !descriptor.arguments.is_empty()
                         || !descriptor.results.is_empty()
@@ -1731,11 +2016,6 @@ pub(super) fn emit(
                 bool_from_flags(&mut ops, 0, Cond::Eq);
             }
             MachineOpcode::Fatal => dynasm!(ops ; .arch x64 ; jmp =>fatal),
-            _ => {
-                return Err(Unsupported::OperandShape(
-                    "opcode outside the x86-64 scalar emitter",
-                ));
-            }
         }
         if !terminal {
             edits(
@@ -2857,6 +3137,7 @@ fn committed_value_call(
 
 #[allow(clippy::too_many_arguments)]
 fn committed_pair_call(
+    view: &JitCompileSnapshot,
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
@@ -2870,6 +3151,15 @@ fn committed_pair_call(
     logical_pc: u32,
     semantic_arity: u8,
 ) -> Result<(), Unsupported> {
+    let logical_pc = if let Some(parent) = instruction.inline_frames.first() {
+        super::frame_state::suspended_call_pc(view, parent.function_id, parent.byte_pc)
+            .ok_or(Unsupported::OperandShape(
+                "x86-64 inline caller publication PC",
+            ))?
+            .0
+    } else {
+        logical_pc
+    };
     let semantic_arity = usize::from(semantic_arity);
     let named_store = target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY;
     let named_property = target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY || named_store;
@@ -3862,25 +4152,11 @@ fn shape_state_guard(ops: &mut Assembler, view: &JitCompileSnapshot, miss: Dynam
     );
 }
 
-fn fast_object_state_guard(ops: &mut Assembler, view: &JitCompileSnapshot, miss: DynamicLabel) {
-    dynasm!(ops
-        ; .arch x64
-        ; movzx r10d, BYTE [r11 + view.object_shape_cache_mode_byte as i32]
-    );
-    if view.object_shape_cache_fast == 0 {
-        dynasm!(ops ; .arch x64 ; test r10d, r10d ; jnz =>miss);
-    } else {
-        dynasm!(ops
-            ; .arch x64
-            ; cmp r10d, view.object_shape_cache_fast as i32
-            ; jne =>miss
-        );
-    }
+fn ordinary_lookup_state_guard(ops: &mut Assembler, view: &JitCompileSnapshot, miss: DynamicLabel) {
+    shape_state_guard(ops, view, miss);
     dynasm!(ops
         ; .arch x64
         ; cmp BYTE [r11 + view.object_slot_attrs_overridden_byte as i32], 0
-        ; jne =>miss
-        ; cmp DWORD [r11 + view.object_exotic_handle_byte as i32], 0
         ; jne =>miss
     );
 }

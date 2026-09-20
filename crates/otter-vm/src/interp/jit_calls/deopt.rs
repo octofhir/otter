@@ -69,6 +69,10 @@ impl Interpreter {
         call_kind: jit::JitDirectCallKind,
         exit: SideExit,
     ) -> Result<Value, VmError> {
+        let context = context
+            .for_function(native.header.function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*context;
         if !native
             .header
             .flags

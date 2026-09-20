@@ -11,6 +11,13 @@ The current engine baseline does not install packages or bootstrap Node/Web API
 surfaces. ARES-6, Web Tooling, and yt-dlp/ejs remain useful compatibility and
 macro-performance suites, but they are outside the engine-only baseline.
 
+## Recorded investigations
+
+The [2026-09-20 GC/JIT investigation](measurements/2026-09-20-gc-jit.md)
+records the retained-allocation stress matrix, JIT kernel comparisons and
+validation scope. These are local development measurements, not a published
+clean-commit baseline.
+
 ## Current result contract
 
 Every engine benchmark command writes one machine-readable JSON record. There
@@ -74,6 +81,8 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
+| `math-intrinsics.js` | Guarded `Math.abs` / `max` / `min` methods with Int32 operands | `2200000` |
+| `math-explicit-calls.js` | Separate method lookup and Int32 argument evaluation through `CallWithThis` | `2200000` |
 | `derived-constructor.js` | Fixed-arity derived construction, `super()` linkage, initialized `this`, and result property reads | `10000200000` |
 | `spread-call-family.js` | Plain calls, base/derived/`super()` construction, and stack-owned default-Array spread collection | `15000750000` |
 | `typed-runtime-boundary.js` | Stack-owned scalar queries, static value loads, class heritage checks, and computed function naming | `10000400000` |
@@ -102,7 +111,7 @@ The pre-shaped constructor kernel additionally requires zero measured
 its bounded reentrant remainder is cold tier/class setup rather than a
 per-receiver transition.
 
-The same snapshot window reports `vm-reductions`, `vm-bytecode-calls`,
+The same snapshot window reports `vm-work-units`, `vm-bytecode-calls`,
 named-property load-IC hits, misses, and installs, plus retained ordinary-call
 observations. Final mono/poly/megamorphic call-site counts describe the bounded
 feedback state. One-time module diagnostics report bytecode compile time, exact
@@ -123,6 +132,53 @@ cargo run --release -p otter-benchmark --features engine \
   --function engineKernel --expected 500003500000 \
   --jit-tier production-tiered --samples 20 --warmup 3
 ```
+
+### Retained allocation during constructor preparation
+
+The fixed-argument and spread-constructor moving-GC fixtures also supply
+production kernels. Each kernel retains **200,000 objects and their strings**
+inside an observable prototype getter, checks the surviving argument, receiver
+prototype, and retained-object count, and returns exactly `200000`. Every kernel
+invocation includes the fixture's 5,000 constructor warmup calls. Emission wraps
+the shared correctness source directly, so there is no second fixture to keep
+in sync and results use the existing engine benchmark record format.
+
+Generate both kernels into the ignored local-results directory:
+
+```bash
+cargo build --release -p otter-benchmark --features engine \
+  --bin otter-allocation-probe --bin otter-engine-benchmark
+mkdir -p benchmarks/results/reentrant-allocations
+target/release/otter-allocation-probe emit-kernel construct \
+  > benchmarks/results/reentrant-allocations/construct.js
+target/release/otter-allocation-probe emit-kernel spread \
+  > benchmarks/results/reentrant-allocations/spread.js
+```
+
+Measure production performance with `OTTER_GC_STRESS` unset. Run each source
+through the standard kernel command; the default emission count stays 200,000
+even when a correctness run uses a smaller count:
+
+```bash
+target/release/otter-engine-benchmark kernel \
+  --source benchmarks/results/reentrant-allocations/construct.js \
+  --function engineKernel --expected 200000 \
+  --jit-tier production-tiered --samples 5 --warmup 1
+target/release/otter-engine-benchmark kernel \
+  --source benchmarks/results/reentrant-allocations/spread.js \
+  --function engineKernel --expected 200000 \
+  --jit-tier production-tiered --samples 5 --warmup 1
+```
+
+The diagnostic probe additionally runs one complete script per process:
+`otter-allocation-probe construct|spread
+interpreter|template|production [allocations]`. Use sizes `1000`, `10000`,
+`50000`, and `200000` with `OTTER_GC_STRESS` unset or set to `16`, `4`, or `1`.
+Its JSON contains elapsed script time, JIT compilation time, cumulative GC
+pause times, and before/after runtime counters. These diagnostic measurements
+include frontend compilation and are separate from the kernel ranking metric.
+The probe lives in the benchmark crate so its focused build does not compile
+the runtime integration-test dependency graph.
 
 ### Call execution
 

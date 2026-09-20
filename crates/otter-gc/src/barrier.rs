@@ -28,16 +28,14 @@
 //!   mutated slot. Traced slots routinely live outside the
 //!   parent's cell (boxed frames, `VecDeque` buffers, spilled
 //!   `SmallVec` storage are malloc-owned); there is no in-cage slot
-//!   address to record. The scavenger re-traces every remembered
-//!   parent in full — reaching every off-page/exotic slot through
-//!   the refreshed slab base — so object-granular recording loses
-//!   no edges. Dedup via `FLAG_REMEMBERED` keeps the buffer bounded
+//!   address to record. The scavenger re-traces each parent's young
+//!   edges through its current body. The default trace visits every
+//!   slot; bodies with complete mutation bookkeeping may restrict
+//!   it to dirty ranges. Dedup via `FLAG_REMEMBERED` keeps the buffer bounded
 //!   by the number of distinct mutated old parents, not write count.
-//! - The card table (`mark_card` / `card_bitmap`) is **not** touched
-//!   by the live minor-GC path anymore. It remains in `page.rs` only
-//!   as the frozen-JIT barrier ABI surface (`JitGcBarrierLayout`); the
-//!   JIT is off and will be re-pointed at the remembered-set insert
-//!   sequence when it re-enables.
+//! - The card table (`mark_card` / `card_bitmap`) is not consulted by
+//!   the minor collector. Runtime and generated stores share the
+//!   remembered-parent insertion boundary.
 
 use crate::compressed::{RawGc, cage_base};
 use crate::header::{GcHeader, MarkColor};

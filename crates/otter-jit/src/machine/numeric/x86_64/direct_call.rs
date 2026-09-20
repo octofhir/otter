@@ -1,10 +1,14 @@
-//! System V x86-64 linkage for fixed-arity generated calls and base constructors.
+//! System V x86-64 linkage for generated calls and constructors.
 //!
 //! # Contents
 //! - Exact callable and installed-generation guards.
 //! - Caller-owned `NativeFrame`, register window, and capture spine setup.
-//! - Ordinary call receiver binding plus base-receiver preparation, capture
-//!   initialization, publication, entry, result selection, and cleanup.
+//! - Exact actual-argument windows for callees that consume `arguments`.
+//! - Runtime-selected intrinsic-apply forwarding through generated entries,
+//!   with one committed value-span cold sibling.
+//! - Ordinary call receiver binding plus base/super receiver preparation,
+//!   derived-frame initialization, result validation, and cleanup.
+//! - Fixed and compiler-collected spread argument materialization.
 //!
 //! # Invariants
 //! - The caller's Machine roots remain published across every allocating or
@@ -13,6 +17,8 @@
 //!   is completed or stack-deoptimized and is never replayed.
 //! - Stable entry cells and runtime stubs are captured through the shared
 //!   relocation schema used by the AArch64 encoder.
+//! - Forwarding source admission is pre-effect; a native miss reaches one
+//!   committed cold sibling, and a started generated call is never replayed.
 //!
 //! # See also
 //! - `crate::arm64::direct_call` — peer target implementation.
@@ -33,10 +39,17 @@ pub(super) use receiver_allocation::{
 };
 
 const MAX_DIRECT_CALL_FRAME_BYTES: u32 = 4_080;
+const INCOMING_ARGUMENTS_HEADER_WORD: u32 =
+    (otter_vm::native_abi::NativeFrameFlags::INCOMING_ARGUMENTS as u32)
+        << (8
+            * (std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags)
+                - std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, register_count)));
 
 #[derive(Debug, Clone, Copy)]
 struct StackLayout {
     register_base: u32,
+    incoming_base: u32,
+    incoming_count: u32,
     upvalue_base: u32,
     result_word: u32,
     status_word: u32,
@@ -46,8 +59,21 @@ struct StackLayout {
     frame_bytes: u32,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct DirectCallRegions {
+    pub(super) method_guards: Vec<(usize, usize)>,
+    pub(super) method_candidates: Vec<(usize, usize)>,
+    pub(super) generic_methods: Vec<(usize, usize)>,
+    pub(super) construct_prepare_fast: Vec<(usize, usize)>,
+    pub(super) construct_prepare_observable: Vec<(usize, usize)>,
+    pub(super) construct_receiver_alloc_fast: Vec<(usize, usize)>,
+    pub(super) construct_receiver_alloc_cold: Vec<(usize, usize)>,
+    pub(super) construct_result_fast: Vec<(usize, usize)>,
+    pub(super) construct_result_throw: Vec<(usize, usize)>,
+}
+
 impl StackLayout {
-    fn for_target(target: &otter_vm::JitDirectCallee) -> Option<Self> {
+    fn for_target(target: &otter_vm::JitDirectCallee, argument_count: usize) -> Option<Self> {
         target
             .plan
             .generated_stack_frame_bytes
@@ -60,12 +86,21 @@ impl StackLayout {
             .checked_add(upvalue_count.checked_mul(4)?)?
             .checked_add(7)?
             & !7;
-        let frame_bytes = register_base
-            .checked_add(u32::from(target.plan.register_count).checked_mul(8)?)?
+        let incoming_count = if target.plan.needs_incoming_arguments {
+            u32::try_from(argument_count).ok()?
+        } else {
+            0
+        };
+        let incoming_base =
+            register_base.checked_add(u32::from(target.plan.register_count).checked_mul(8)?)?;
+        let frame_bytes = incoming_base
+            .checked_add(incoming_count.checked_mul(8)?)?
             .checked_add(15)?
             & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
             register_base,
+            incoming_base,
+            incoming_count,
             upvalue_base,
             result_word: control,
             status_word: control + 8,
@@ -95,18 +130,140 @@ pub(super) fn emit(
     caller_function_id: u32,
     logical_pc: u32,
     byte_pc: u32,
-    _deopt: DynamicLabel,
+    roots_published: bool,
+    deopt: DynamicLabel,
     finish_error: DynamicLabel,
     fatal: DynamicLabel,
     throw_value: DynamicLabel,
     done: DynamicLabel,
+    regions: &mut DirectCallRegions,
 ) -> Result<(), Unsupported> {
+    if kind == DirectCallKind::Forward {
+        if argument_mode != DirectCallArgumentMode::Fixed
+            || descriptor.exceptional == ExceptionalEdge::None
+            || descriptor.arguments.len() < 3
+            || descriptor.results != [MachineRepresentation::Tagged]
+        {
+            return Err(Unsupported::OperandShape(
+                "x86-64 generic forward-call form",
+            ));
+        }
+        let result_index = descriptor.arguments.len();
+        let result = *locations
+            .get(result_index)
+            .ok_or(Unsupported::OperandShape("x86-64 forward-call result"))?;
+        let canonical = ops.new_dynamic_label();
+        save_roots(ops, frame, site)?;
+        publish_roots(ops, frame, site)?;
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov DWORD [r10 + NATIVE_FRAME_PC_OFFSET as i32], logical_pc as i32
+        );
+        crate::x86_64::emit_runtime_forward(
+            ops,
+            relocations,
+            view,
+            transitions,
+            [
+                u16::try_from(result_index)
+                    .map_err(|_| Unsupported::OperandShape("x86-64 forward result index"))?,
+                0,
+                1,
+                2,
+            ],
+            logical_pc,
+            byte_pc,
+            None,
+            canonical,
+            finish_error,
+            throw_value,
+            fatal,
+            done,
+            |ops, source, target, bias| {
+                let value = instruction
+                    .operands
+                    .get(usize::from(source))
+                    .ok_or(Unsupported::OperandShape("x86-64 forward source operand"))?
+                    .value;
+                let root = site
+                    .roots
+                    .iter()
+                    .find(|root| root.value == value)
+                    .ok_or(Unsupported::OperandShape("x86-64 forward source root"))?;
+                let offset = bias
+                    .checked_add(MACHINE_ROOT_RECORD_SIZE)
+                    .and_then(|offset| offset.checked_add(root_offset(frame, root.save_slot).ok()?))
+                    .and_then(|offset| i32::try_from(offset).ok())
+                    .ok_or(Unsupported::OperandShape("x86-64 forward source offset"))?;
+                dynasm!(ops ; .arch x64 ; mov Rq(target), [rsp + offset]);
+                Ok(())
+            },
+            |ops, destination, source, _| {
+                let location = *locations
+                    .get(usize::from(destination))
+                    .ok_or(Unsupported::OperandShape("x86-64 forward result location"))?;
+                store_integer(ops, frame, location, source)
+            },
+            |ops| {
+                clear_roots_preserving_r11(ops);
+                reload_roots_preserving_r11(ops, frame, site)
+            },
+            |ops, register, base| {
+                let index = view
+                    .code_block
+                    .forwarded_argument_bindings()
+                    .filter_map(|(_, storage)| match storage {
+                        otter_bytecode::ArgumentBindingStorage::Register { reg } => Some(reg),
+                        _ => None,
+                    })
+                    .position(|reg| reg == register)
+                    .ok_or(Unsupported::OperandShape("x86-64 forward binding operand"))?
+                    + 3;
+                let value = instruction
+                    .operands
+                    .get(index)
+                    .ok_or(Unsupported::OperandShape("x86-64 forward binding input"))?
+                    .value;
+                let root = site
+                    .roots
+                    .iter()
+                    .find(|root| root.value == value)
+                    .ok_or(Unsupported::OperandShape("x86-64 forward binding root"))?;
+                let offset = MACHINE_ROOT_RECORD_SIZE
+                    .checked_add(root_offset(frame, root.save_slot)?)
+                    .and_then(|offset| i32::try_from(offset).ok())
+                    .ok_or(Unsupported::OperandShape("x86-64 forward binding offset"))?;
+                dynasm!(ops ; .arch x64 ; mov r11, [Rq(base) + offset]);
+                Ok(())
+            },
+        )?;
+        dynasm!(ops ; .arch x64 ; =>canonical);
+        save_roots(ops, frame, site)?;
+        publish_roots(ops, frame, site)?;
+        return emit_generic_value_call(
+            ops,
+            relocations,
+            transitions,
+            frame,
+            instruction,
+            descriptor,
+            result,
+            site,
+            kind,
+            logical_pc,
+            Some(deopt),
+            throw_value,
+            fatal,
+            done,
+        );
+    }
     if matches!(
         kind,
         DirectCallKind::Plain | DirectCallKind::CallWithThis | DirectCallKind::Method
     ) {
-        if argument_mode != DirectCallArgumentMode::Fixed
-            || descriptor.exceptional == ExceptionalEdge::None
+        if descriptor.exceptional == ExceptionalEdge::None
+            || (argument_mode == DirectCallArgumentMode::Spread && kind != DirectCallKind::Plain)
         {
             return Err(Unsupported::OperandShape("x86-64 generic direct-call form"));
         }
@@ -118,6 +275,65 @@ pub(super) fn emit(
             return Err(Unsupported::OperandShape(
                 "x86-64 generic direct-call operands",
             ));
+        }
+        if kind == DirectCallKind::Method && !candidates.is_empty() {
+            let final_miss = ops.new_dynamic_label();
+            for (index, candidate) in candidates.iter().enumerate() {
+                let next = if index + 1 == candidates.len() {
+                    final_miss
+                } else {
+                    ops.new_dynamic_label()
+                };
+                let start = ops.offset().0;
+                emit_generated_value_call(
+                    ops,
+                    relocations,
+                    view,
+                    transitions,
+                    frame,
+                    instruction,
+                    descriptor,
+                    locations,
+                    site,
+                    kind,
+                    argument_mode,
+                    candidate,
+                    caller_function_id,
+                    logical_pc,
+                    byte_pc,
+                    index != 0,
+                    Some(next),
+                    finish_error,
+                    fatal,
+                    throw_value,
+                    done,
+                    regions,
+                )?;
+                regions.method_candidates.push((start, ops.offset().0));
+                if index + 1 != candidates.len() {
+                    dynasm!(ops ; .arch x64 ; =>next);
+                }
+            }
+            dynasm!(ops ; .arch x64 ; =>final_miss);
+            let start = ops.offset().0;
+            emit_generic_value_call(
+                ops,
+                relocations,
+                transitions,
+                frame,
+                instruction,
+                descriptor,
+                locations[result_index],
+                site,
+                kind,
+                logical_pc,
+                None,
+                throw_value,
+                fatal,
+                done,
+            )?;
+            regions.generic_methods.push((start, ops.offset().0));
+            return Ok(());
         }
         if candidates.len() == 1 {
             return emit_generated_value_call(
@@ -131,19 +347,29 @@ pub(super) fn emit(
                 locations,
                 site,
                 kind,
+                argument_mode,
                 &candidates[0],
                 caller_function_id,
                 logical_pc,
                 byte_pc,
+                false,
+                None,
                 finish_error,
                 fatal,
                 throw_value,
                 done,
+                regions,
             );
+        }
+        if argument_mode == DirectCallArgumentMode::Spread {
+            return Err(Unsupported::OperandShape(
+                "x86-64 spread call without generated target",
+            ));
         }
         save_roots(ops, frame, site)?;
         publish_roots(ops, frame, site)?;
-        return emit_generic_value_call(
+        let start = ops.offset().0;
+        emit_generic_value_call(
             ops,
             relocations,
             transitions,
@@ -154,13 +380,22 @@ pub(super) fn emit(
             site,
             kind,
             logical_pc,
+            None,
             throw_value,
             fatal,
             done,
-        );
+        )?;
+        if kind == DirectCallKind::Method {
+            regions.generic_methods.push((start, ops.offset().0));
+        }
+        return Ok(());
     }
-    if kind != DirectCallKind::Construct
-        || argument_mode != DirectCallArgumentMode::Fixed
+    if !matches!(
+        kind,
+        DirectCallKind::Construct
+            | DirectCallKind::DerivedConstruct
+            | DirectCallKind::SuperConstruct
+    ) || argument_mode != DirectCallArgumentMode::Fixed
         || descriptor.exceptional == ExceptionalEdge::None
     {
         return Err(Unsupported::OperandShape(
@@ -172,6 +407,11 @@ pub(super) fn emit(
         return Err(Unsupported::OperandShape("x86-64 direct-call operands"));
     }
     let [candidate] = candidates else {
+        if kind != DirectCallKind::Construct {
+            return Err(Unsupported::OperandShape(
+                "x86-64 generated constructor target",
+            ));
+        }
         save_roots(ops, frame, site)?;
         publish_roots(ops, frame, site)?;
         return emit_generic_construct(
@@ -190,30 +430,42 @@ pub(super) fn emit(
         );
     };
     let target = &candidate.callee;
-    if target.plan.is_derived_constructor {
-        return Err(Unsupported::OperandShape(
-            "x86-64 derived direct constructor",
-        ));
+    let derived = kind == DirectCallKind::DerivedConstruct;
+    let super_construct = kind == DirectCallKind::SuperConstruct;
+    if target.plan.is_derived_constructor != derived {
+        return Err(Unsupported::OperandShape("x86-64 direct constructor kind"));
     }
-    let layout = StackLayout::for_target(target)
+    let layout = StackLayout::for_target(target, result_index - 1)
         .ok_or(Unsupported::OperandShape("x86-64 direct-call frame"))?;
-    let receiver_index = instruction
-        .operands
-        .iter()
-        .position(|operand| operand.purpose == OperandPurpose::RuntimeRoot)
-        .ok_or(Unsupported::OperandShape("x86-64 construct receiver root"))?;
-    let receiver_value = instruction.operands[receiver_index].value;
-    let receiver_root = site
-        .roots
-        .iter()
-        .find(|root| root.value == receiver_value)
-        .ok_or(Unsupported::OperandShape(
-            "x86-64 construct receiver save home",
-        ))?;
-    let artifact = direct_call_artifact(candidate, layout, DirectCallKind::Construct)?;
+    let receiver_root = if derived {
+        None
+    } else {
+        let receiver_index = instruction
+            .operands
+            .iter()
+            .position(|operand| operand.purpose == OperandPurpose::RuntimeRoot)
+            .ok_or(Unsupported::OperandShape("x86-64 construct receiver root"))?;
+        let receiver_value = instruction.operands[receiver_index].value;
+        Some(
+            site.roots
+                .iter()
+                .find(|root| root.value == receiver_value)
+                .ok_or(Unsupported::OperandShape(
+                    "x86-64 construct receiver save home",
+                ))?,
+        )
+    };
+    let artifact = direct_call_artifact(candidate, layout, kind, DirectCallArgumentMode::Fixed)?;
 
-    save_roots(ops, frame, site)?;
-    publish_roots(ops, frame, site)?;
+    if !roots_published {
+        save_roots(ops, frame, site)?;
+        publish_roots(ops, frame, site)?;
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov DWORD [r10 + NATIVE_FRAME_PC_OFFSET as i32], logical_pc as i32
+    );
 
     let guard_fail = ops.new_dynamic_label();
     let generation_ready = ops.new_dynamic_label();
@@ -288,111 +540,183 @@ pub(super) fn emit(
 
     initialize_frame(ops, target, layout);
 
-    // Try the no-safepoint nursery allocator first. Its misses are pre-effect,
-    // so the rooted canonical preparation remains the exact cold sibling.
-    load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 6)?;
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov rdx, rsi
-        ; mov ecx, target.plan.function_id as i32
-    );
-    let observable_prepare = ops.new_dynamic_label();
-    if let Some(allocation) = target.receiver_allocation {
-        let allocation_guard_miss = ops.new_dynamic_label();
-        let allocation_space_miss = ops.new_dynamic_label();
-        let cold_prepare = ops.new_dynamic_label();
-        emit_generated_receiver_allocation(
-            ops,
-            relocations,
-            view,
-            allocation,
-            allocation_guard_miss,
-            allocation_space_miss,
-            prepare_ready,
-        );
-        dynasm!(ops ; .arch x64 ; =>allocation_guard_miss);
-        receiver_allocation::emit_increment_runtime_counter(
-            ops,
-            RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
-        );
-        dynasm!(ops ; .arch x64 ; jmp =>cold_prepare ; =>allocation_space_miss);
-        receiver_allocation::emit_increment_runtime_counter(
-            ops,
-            RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
-        );
-        dynasm!(ops ; .arch x64 ; =>cold_prepare);
+    if !derived {
+        // Try the no-safepoint nursery allocator first. Its misses are
+        // pre-effect, so rooted canonical preparation is the exact cold
+        // sibling. Super calls inherit the enclosing new.target.
+        let fast_prepare_start = ops.offset().0;
         load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 6)?;
+        if super_construct {
+            dynasm!(ops
+                ; .arch x64
+                ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+                ; mov rdx, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+            );
+        } else {
+            dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+        }
         dynasm!(ops
             ; .arch x64
             ; mov rdi, r15
-            ; mov rdx, rsi
             ; mov ecx, target.plan.function_id as i32
-            ; mov r8d, 1
         );
-    } else {
-        dynasm!(ops ; .arch x64 ; xor r8d, r8d);
-    }
-    runtime(
-        ops,
-        relocations,
-        transitions.entry(otter_vm::native_abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
-        otter_vm::native_abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rdx, rdx
-        ; je =>prepare_ready
-        ; cmp edx, NativeResultStatus::SideExit as i32
-        ; je =>observable_prepare
-        ; cmp edx, NativeResultStatus::Throw as i32
-        ; je =>prepare_pending
-        ; jmp =>prepare_fatal
-        ; =>observable_prepare
-    );
-    load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 6)?;
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov rdx, rsi
-        ; mov ecx, target.plan.function_id as i32
-    );
-    runtime(
-        ops,
-        relocations,
-        transitions.entry(otter_vm::native_abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
-        otter_vm::native_abi::STUB_JIT_PREPARE_BASE_CONSTRUCT,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rdx, rdx
-        ; je =>prepare_ready
-        ; cmp edx, NativeResultStatus::Throw as i32
-        ; je =>prepare_throw
-        ; jmp =>prepare_fatal
-        ; =>prepare_ready
-    );
+        let observable_prepare = ops.new_dynamic_label();
+        if let Some(allocation) = target.receiver_allocation {
+            let allocation_guard_miss = ops.new_dynamic_label();
+            let allocation_space_miss = ops.new_dynamic_label();
+            let cold_prepare = ops.new_dynamic_label();
+            let allocation_fast_start = ops.offset().0;
+            emit_generated_receiver_allocation(
+                ops,
+                relocations,
+                view,
+                allocation,
+                allocation_guard_miss,
+                allocation_space_miss,
+                prepare_ready,
+            );
+            regions
+                .construct_receiver_alloc_fast
+                .push((allocation_fast_start, ops.offset().0));
+            let allocation_cold_start = ops.offset().0;
+            dynasm!(ops ; .arch x64 ; =>allocation_guard_miss);
+            receiver_allocation::emit_increment_runtime_counter(
+                ops,
+                RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
+            );
+            dynasm!(ops ; .arch x64 ; jmp =>cold_prepare ; =>allocation_space_miss);
+            receiver_allocation::emit_increment_runtime_counter(
+                ops,
+                RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
+            );
+            dynasm!(ops ; .arch x64 ; =>cold_prepare);
+            load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 6)?;
+            if super_construct {
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+                    ; mov rdx, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+                );
+            } else {
+                dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+            }
+            dynasm!(ops
+                ; .arch x64
+                ; mov rdi, r15
+                ; mov ecx, target.plan.function_id as i32
+                ; mov r8d, 1
+            );
+            regions
+                .construct_receiver_alloc_cold
+                .push((allocation_cold_start, ops.offset().0));
+        } else {
+            dynasm!(ops ; .arch x64 ; xor r8d, r8d);
+        }
+        runtime(
+            ops,
+            relocations,
+            transitions.entry(otter_vm::native_abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
+            otter_vm::native_abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+        );
+        dynasm!(ops
+            ; .arch x64
+            ; call r11
+            ; test rdx, rdx
+            ; je =>prepare_ready
+            ; cmp edx, NativeResultStatus::SideExit as i32
+            ; je =>observable_prepare
+            ; cmp edx, NativeResultStatus::Throw as i32
+            ; je =>prepare_pending
+            ; jmp =>prepare_fatal
+            ; =>observable_prepare
+        );
+        regions
+            .construct_prepare_fast
+            .push((fast_prepare_start, ops.offset().0));
+        let observable_prepare_start = ops.offset().0;
+        load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 6)?;
+        if super_construct {
+            dynasm!(ops
+                ; .arch x64
+                ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+                ; mov rdx, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+            );
+        } else {
+            dynasm!(ops ; .arch x64 ; mov rdx, rsi);
+        }
+        dynasm!(ops
+            ; .arch x64
+            ; mov rdi, r15
+            ; mov ecx, target.plan.function_id as i32
+        );
+        runtime(
+            ops,
+            relocations,
+            transitions.entry(otter_vm::native_abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
+            otter_vm::native_abi::STUB_JIT_PREPARE_BASE_CONSTRUCT,
+        );
+        dynasm!(ops
+            ; .arch x64
+            ; call r11
+            ; test rdx, rdx
+            ; je =>prepare_ready
+            ; cmp edx, NativeResultStatus::Throw as i32
+            ; je =>prepare_throw
+            ; jmp =>prepare_fatal
+            ; =>prepare_ready
+        );
+        regions
+            .construct_prepare_observable
+            .push((observable_prepare_start, ops.offset().0));
 
-    // Publish the receiver in both the caller's dedicated Machine root and
-    // the unpublished callee frame before capture allocation can collect.
-    store_root_with_linkage(ops, frame, receiver_root.save_slot, layout, 0)?;
-    dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_THIS_OFFSET as i32], rax);
+        let receiver_root = receiver_root.expect("base construct receiver root");
+        store_root_with_linkage(ops, frame, receiver_root.save_slot, layout, 0)?;
+        dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_THIS_OFFSET as i32], rax);
+    }
     load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 9)?;
     dynasm!(ops ; .arch x64 ; mov r14, r9);
     unwrap_constructor(ops, view, target, 9);
+    let direct_constructor = ops.new_dynamic_label();
+    let constructor_state_ready = ops.new_dynamic_label();
+    load64(
+        ops,
+        10,
+        otter_vm::value::tag::box_function_id(target.plan.function_id),
+    );
     dynasm!(ops
         ; .arch x64
-        ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
-        ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r14
+        ; cmp r9, r10
+        ; je =>direct_constructor
         ; mov r10, [r9 + view.closure_call_layout.upvalue_base_byte as i32]
+        ; mov r11d, [r9 + view.closure_call_layout.upvalue_count_byte as i32]
+        ; mov r8d, [r9 + view.closure_call_layout.eval_env_byte as i32]
+        ; jmp =>constructor_state_ready
+        ; =>direct_constructor
+        ; xor r10d, r10d
+        ; xor r11d, r11d
+        ; xor r8d, r8d
+        ; =>constructor_state_ready
+        ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
         ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-        ; mov r10d, [r9 + view.closure_call_layout.upvalue_count_byte as i32]
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r10d
-        ; mov r10d, [r9 + view.closure_call_layout.eval_env_byte as i32]
-        ; mov [rsp + otter_vm::native_abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], r10d
+        ; mov [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r11d
+        ; mov [rsp + otter_vm::native_abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], r8d
     );
+    if super_construct {
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov r14, [r10 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+        );
+    }
+    dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r14);
+    if derived {
+        load64(ops, 10, otter_vm::Value::hole().to_bits());
+        dynasm!(ops
+            ; .arch x64
+            ; mov [rsp + NATIVE_FRAME_THIS_OFFSET as i32], r10
+            ; or BYTE [rsp + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as i8
+        );
+    }
     if target.plan.own_upvalue_count != 0 {
         dynasm!(ops
             ; .arch x64
@@ -470,7 +794,67 @@ pub(super) fn emit(
         ; jmp =>started_fatal
         ; normal_return:
     );
-    select_base_construct_result(ops, view, result_ready);
+    let result_fast_start = ops.offset().0;
+    if derived {
+        let object = ops.new_dynamic_label();
+        let primitive = ops.new_dynamic_label();
+        let cold = ops.new_dynamic_label();
+        emit_construct_object_branch(ops, view, 0, object, primitive);
+        dynasm!(ops ; .arch x64 ; =>primitive);
+        load64(ops, 10, VALUE_UNDEFINED);
+        dynasm!(ops
+            ; .arch x64
+            ; cmp rax, r10
+            ; jne =>cold
+            ; mov rdx, [rsp + NATIVE_FRAME_THIS_OFFSET as i32]
+        );
+        load64(ops, 10, otter_vm::Value::hole().to_bits());
+        dynasm!(ops
+            ; .arch x64
+            ; cmp rdx, r10
+            ; je =>cold
+            ; mov rax, rdx
+            ; xor edx, edx
+            ; jmp =>result_ready
+            ; =>object
+            ; xor edx, edx
+            ; jmp =>result_ready
+            ; =>cold
+        );
+        regions
+            .construct_result_fast
+            .push((result_fast_start, ops.offset().0));
+        let result_throw_start = ops.offset().0;
+        dynasm!(ops
+            ; .arch x64
+            ; mov rsi, rax
+            ; mov rdx, [rsp + NATIVE_FRAME_THIS_OFFSET as i32]
+            ; mov rdi, r15
+        );
+        runtime(
+            ops,
+            relocations,
+            transitions.entry(otter_vm::native_abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
+            otter_vm::native_abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        );
+        dynasm!(ops
+            ; .arch x64
+            ; call r11
+            ; test rdx, rdx
+            ; je =>result_ready
+            ; cmp edx, NativeResultStatus::Throw as i32
+            ; je =>started_throw
+            ; jmp =>started_fatal
+        );
+        regions
+            .construct_result_throw
+            .push((result_throw_start, ops.offset().0));
+    } else {
+        select_base_construct_result(ops, view, result_ready);
+        regions
+            .construct_result_fast
+            .push((result_fast_start, ops.offset().0));
+    }
 
     dynasm!(ops
         ; .arch x64
@@ -531,14 +915,23 @@ pub(super) fn emit(
         done,
     )?;
 
-    dynasm!(ops
-        ; .arch x64
-        ; =>guard_fail
-        ; jmp =>generic_construct
-        ; =>unpublished_fail
-        ; add rsp, layout.frame_bytes as i32
-        ; =>generic_construct
-    );
+    dynasm!(ops ; .arch x64 ; =>guard_fail);
+    if derived || super_construct {
+        clear_roots(ops);
+        reload_roots(ops, frame, site)?;
+        dynasm!(ops ; .arch x64 ; jmp =>deopt ; =>unpublished_fail ; add rsp, layout.frame_bytes as i32);
+        clear_roots(ops);
+        reload_roots(ops, frame, site)?;
+        dynasm!(ops ; .arch x64 ; jmp =>deopt ; =>generic_construct);
+    } else {
+        dynasm!(ops
+            ; .arch x64
+            ; jmp =>generic_construct
+            ; =>unpublished_fail
+            ; add rsp, layout.frame_bytes as i32
+            ; =>generic_construct
+        );
+    }
     emit_generic_construct(
         ops,
         relocations,
@@ -589,6 +982,7 @@ fn emit_generic_construct(
         site,
         DirectCallKind::Construct,
         logical_pc,
+        None,
         throw_value,
         fatal,
         done,
@@ -607,18 +1001,20 @@ fn emit_generated_value_call(
     locations: &[AllocatedLocation],
     site: &MachineSafepointSite,
     kind: DirectCallKind,
+    argument_mode: DirectCallArgumentMode,
     candidate: &DirectCallCandidate,
     caller_function_id: u32,
     logical_pc: u32,
     byte_pc: u32,
+    roots_published: bool,
+    guard_miss: Option<DynamicLabel>,
     finish_error: DynamicLabel,
     fatal: DynamicLabel,
     throw_value: DynamicLabel,
     done: DynamicLabel,
+    regions: &mut DirectCallRegions,
 ) -> Result<(), Unsupported> {
     let target = &candidate.callee;
-    let layout = StackLayout::for_target(target)
-        .ok_or(Unsupported::OperandShape("x86-64 direct-call frame"))?;
     let result_index = descriptor.arguments.len();
     let result = *locations
         .get(result_index)
@@ -633,10 +1029,24 @@ fn emit_generated_value_call(
             "x86-64 generated value-call operands",
         ));
     }
-    let artifact = direct_call_artifact(candidate, layout, kind)?;
+    if argument_mode == DirectCallArgumentMode::Spread && target.plan.needs_incoming_arguments {
+        return Err(Unsupported::OperandShape(
+            "x86-64 spread call publishing incoming arguments",
+        ));
+    }
+    let argument_count = if argument_mode == DirectCallArgumentMode::Fixed {
+        result_index - argument_start
+    } else {
+        0
+    };
+    let layout = StackLayout::for_target(target, argument_count)
+        .ok_or(Unsupported::OperandShape("x86-64 direct-call frame"))?;
+    let artifact = direct_call_artifact(candidate, layout, kind, argument_mode)?;
 
-    save_roots(ops, frame, site)?;
-    publish_roots(ops, frame, site)?;
+    if !roots_published {
+        save_roots(ops, frame, site)?;
+        publish_roots(ops, frame, site)?;
+    }
 
     let guard_fail = ops.new_dynamic_label();
     let generation_ready = ops.new_dynamic_label();
@@ -764,7 +1174,9 @@ fn emit_generated_value_call(
         let guard = candidate.guard.as_ref().ok_or(Unsupported::OperandShape(
             "x86-64 generated method candidate guard",
         ))?;
+        let guard_start = ops.offset().0;
         super::emit_inline_method_guard(ops, relocations, view, guard, true, unpublished_fail)?;
+        regions.method_guards.push((guard_start, ops.offset().0));
     }
     dynasm!(ops
         ; .arch x64
@@ -776,7 +1188,7 @@ fn emit_generated_value_call(
     dynasm!(ops
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r11
-        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], (result_index - argument_start) as i32
+        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], argument_count as i32
     );
     let direct_callable = ops.new_dynamic_label();
     let inherited_ready = ops.new_dynamic_label();
@@ -802,16 +1214,38 @@ fn emit_generated_value_call(
         ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], 0
         ; =>inherited_ready
     );
-    copy_value_arguments(
-        ops,
-        frame,
-        site,
-        instruction,
-        argument_start,
-        result_index,
-        target,
-        layout,
-    )?;
+    if argument_mode == DirectCallArgumentMode::Fixed {
+        copy_value_arguments(
+            ops,
+            frame,
+            site,
+            instruction,
+            argument_start,
+            result_index,
+            target,
+            layout,
+        )?;
+    } else {
+        let spread = instruction
+            .operands
+            .get(1)
+            .ok_or(Unsupported::OperandShape("x86-64 spread call operand"))?
+            .value;
+        load_root_with_linkage(ops, frame, site, spread, layout, 6)?;
+        dynasm!(ops
+            ; .arch x64
+            ; mov rdi, r15
+            ; mov rdx, rsp
+            ; mov ecx, target.plan.param_count as i32
+        );
+        runtime(
+            ops,
+            relocations,
+            transitions.entry(otter_vm::native_abi::STUB_JIT_COPY_SPREAD_ARGUMENTS),
+            otter_vm::native_abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
+        );
+        dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
+    }
     if target.plan.own_upvalue_count != 0 {
         dynasm!(ops
             ; .arch x64
@@ -924,21 +1358,30 @@ fn emit_generated_value_call(
     finish_published_pair(ops, frame, site, layout, result, throw_value, fatal, done)?;
 
     dynasm!(ops ; .arch x64 ; =>unpublished_fail ; add rsp, layout.frame_bytes as i32 ; =>guard_fail);
-    emit_generic_value_call(
-        ops,
-        relocations,
-        transitions,
-        frame,
-        instruction,
-        descriptor,
-        result,
-        site,
-        kind,
-        logical_pc,
-        throw_value,
-        fatal,
-        done,
-    )?;
+    if let Some(guard_miss) = guard_miss {
+        dynasm!(ops ; .arch x64 ; jmp =>guard_miss);
+    } else {
+        let start = ops.offset().0;
+        emit_generic_value_call(
+            ops,
+            relocations,
+            transitions,
+            frame,
+            instruction,
+            descriptor,
+            result,
+            site,
+            kind,
+            logical_pc,
+            None,
+            throw_value,
+            fatal,
+            done,
+        )?;
+        if kind == DirectCallKind::Method {
+            regions.generic_methods.push((start, ops.offset().0));
+        }
+    }
     dynasm!(ops ; .arch x64 ; =>captures_pending);
     release_unpublished(ops, frame, site, layout)?;
     dynasm!(ops ; .arch x64 ; jmp =>finish_error ; =>captures_fatal);
@@ -959,6 +1402,7 @@ fn emit_generic_value_call(
     site: &MachineSafepointSite,
     kind: DirectCallKind,
     logical_pc: u32,
+    pre_effect_bail: Option<DynamicLabel>,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -966,7 +1410,7 @@ fn emit_generic_value_call(
     let source_count = descriptor.arguments.len();
     let inserts_receiver = kind == DirectCallKind::Plain;
     let packet_count = source_count + usize::from(inserts_receiver);
-    if source_count == 0 || packet_count > 9 || instruction.operands.len() < source_count {
+    if source_count == 0 || packet_count > 510 || instruction.operands.len() < source_count {
         return Err(Unsupported::OperandShape(
             "x86-64 generic direct-call value span",
         ));
@@ -979,6 +1423,25 @@ fn emit_generic_value_call(
         .ok_or(Unsupported::OperandShape(
             "x86-64 generic direct-call packet",
         ))?;
+    if kind == DirectCallKind::Forward {
+        let bail = pre_effect_bail.ok_or(Unsupported::OperandShape(
+            "x86-64 forward-call source admission",
+        ))?;
+        load_saved_root(ops, frame, site, instruction.operands[0].value, 6)?;
+        dynasm!(ops ; .arch x64 ; mov rdi, r15);
+        let source_ready = otter_vm::native_abi::STUB_JIT_FORWARD_SOURCE_READY;
+        runtime(
+            ops,
+            relocations,
+            transitions.entry(source_ready),
+            source_ready,
+        );
+        let admitted = ops.new_dynamic_label();
+        dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>admitted);
+        clear_roots(ops);
+        reload_roots(ops, frame, site)?;
+        dynasm!(ops ; .arch x64 ; jmp =>bail ; =>admitted);
+    }
     dynasm!(ops ; .arch x64 ; sub rsp, packet_bytes as i32);
     for index in 0..source_count {
         let value = instruction.operands[index].value;
@@ -1025,8 +1488,8 @@ fn emit_generic_value_call(
             otter_vm::native_abi::STUB_JIT_CALL_WITH_THIS_VALUE
         }
         DirectCallKind::Construct => otter_vm::native_abi::STUB_JIT_CONSTRUCT_VALUE,
-        DirectCallKind::Forward
-        | DirectCallKind::DerivedConstruct
+        DirectCallKind::Forward => otter_vm::native_abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
+        DirectCallKind::DerivedConstruct
         | DirectCallKind::SuperConstruct
         | DirectCallKind::DerivedSuperConstruct => {
             return Err(Unsupported::OperandShape("x86-64 generic direct-call kind"));
@@ -1066,6 +1529,7 @@ fn direct_call_artifact(
     candidate: &DirectCallCandidate,
     layout: StackLayout,
     kind: DirectCallKind,
+    argument_mode: DirectCallArgumentMode,
 ) -> Result<DirectCallArtifact, Unsupported> {
     let target = &candidate.callee.plan;
     let callee_native_frame_bytes = target
@@ -1082,7 +1546,10 @@ fn direct_call_artifact(
             DirectCallKind::SuperConstruct => DirectCallKindArtifact::SuperConstruct,
             DirectCallKind::DerivedSuperConstruct => DirectCallKindArtifact::DerivedSuperConstruct,
         },
-        argument_mode: DirectCallArgumentModeArtifact::Fixed,
+        argument_mode: match argument_mode {
+            DirectCallArgumentMode::Fixed => DirectCallArgumentModeArtifact::Fixed,
+            DirectCallArgumentMode::Spread => DirectCallArgumentModeArtifact::Spread,
+        },
         target_function_id: target.function_id,
         target_index: candidate.target_index,
         target_count: candidate.target_count,
@@ -1219,10 +1686,16 @@ fn initialize_frame(ops: &mut Assembler, target: &otter_vm::JitDirectCallee, lay
         ; mov rax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32]
         ; mov [rsp], rax
         ; mov eax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32 + 8]
+    );
+    if target.plan.needs_incoming_arguments {
+        dynasm!(ops ; .arch x64 ; or eax, INCOMING_ARGUMENTS_HEADER_WORD as i32);
+    }
+    dynasm!(ops
+        ; .arch x64
         ; mov [rsp + 8], eax
         ; lea rax, [rsp + layout.register_base as i32]
         ; mov [rsp + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], rax
-        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], 0
+        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32
     );
     load64(ops, 11, VALUE_UNDEFINED);
     for index in 0..u32::from(target.plan.register_count) {
@@ -1241,12 +1714,18 @@ fn copy_arguments(
     target: &otter_vm::JitDirectCallee,
     layout: StackLayout,
 ) -> Result<(), Unsupported> {
-    let count = (result_index - 1).min(usize::from(target.plan.param_count));
+    let count = result_index - 1;
     for argument in 0..count {
         let operand = &instruction.operands[argument + 1];
         load_root_with_linkage(ops, frame, site, operand.value, layout, 11)?;
-        let offset = layout.register_base + argument as u32 * 8;
-        dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+        if argument < usize::from(target.plan.param_count) {
+            let offset = layout.register_base + argument as u32 * 8;
+            dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+        }
+        if argument < layout.incoming_count as usize {
+            let offset = layout.incoming_base + argument as u32 * 8;
+            dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+        }
     }
     Ok(())
 }
@@ -1262,14 +1741,18 @@ fn copy_value_arguments(
     target: &otter_vm::JitDirectCallee,
     layout: StackLayout,
 ) -> Result<(), Unsupported> {
-    let count = result_index
-        .saturating_sub(argument_start)
-        .min(usize::from(target.plan.param_count));
+    let count = result_index.saturating_sub(argument_start);
     for argument in 0..count {
         let operand = &instruction.operands[argument_start + argument];
         load_root_with_linkage(ops, frame, site, operand.value, layout, 11)?;
-        let offset = layout.register_base + argument as u32 * 8;
-        dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+        if argument < usize::from(target.plan.param_count) {
+            let offset = layout.register_base + argument as u32 * 8;
+            dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+        }
+        if argument < layout.incoming_count as usize {
+            let offset = layout.incoming_base + argument as u32 * 8;
+            dynasm!(ops ; .arch x64 ; mov [rsp + offset as i32], r11);
+        }
     }
     Ok(())
 }
@@ -1321,31 +1804,9 @@ fn select_base_construct_result(
     view: &JitCompileSnapshot,
     ready: DynamicLabel,
 ) {
-    let cell = ops.new_dynamic_label();
     let object = ops.new_dynamic_label();
     let primitive = ops.new_dynamic_label();
-    load64(ops, 11, NOT_CELL_MASK);
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10, rax
-        ; and r10, r11
-        ; test r10, r10
-        ; jz =>cell
-        ; mov r10, rax
-        ; shr r10, 48
-        ; test r10, r10
-        ; jnz =>primitive
-        ; mov r10d, eax
-        ; and r10d, 0xffff
-        ; cmp r10d, otter_vm::value::tag::FUNCTION_ID_TAG as i32
-        ; je =>object
-        ; jmp =>primitive
-        ; =>cell
-        ; movzx r10d, BYTE [rax]
-    );
-    for tag in view.primitive_cell_type_tags {
-        dynasm!(ops ; .arch x64 ; cmp r10d, tag as i32 ; je =>primitive);
-    }
+    emit_construct_object_branch(ops, view, 0, object, primitive);
     dynasm!(ops
         ; .arch x64
         ; =>object
@@ -1356,6 +1817,39 @@ fn select_base_construct_result(
         ; xor edx, edx
         ; jmp =>ready
     );
+}
+
+fn emit_construct_object_branch(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    value: u8,
+    object: DynamicLabel,
+    primitive: DynamicLabel,
+) {
+    let cell = ops.new_dynamic_label();
+    load64(ops, 11, NOT_CELL_MASK);
+    dynasm!(ops
+        ; .arch x64
+        ; mov r10, Rq(value)
+        ; and r10, r11
+        ; test r10, r10
+        ; jz =>cell
+        ; mov r10, Rq(value)
+        ; shr r10, 48
+        ; test r10, r10
+        ; jnz =>primitive
+        ; mov r10d, Rd(value)
+        ; and r10d, 0xffff
+        ; cmp r10d, otter_vm::value::tag::FUNCTION_ID_TAG as i32
+        ; je =>object
+        ; jmp =>primitive
+        ; =>cell
+        ; movzx r10d, BYTE [Rq(value)]
+    );
+    for tag in view.primitive_cell_type_tags {
+        dynasm!(ops ; .arch x64 ; cmp r10d, tag as i32 ; je =>primitive);
+    }
+    dynasm!(ops ; .arch x64 ; jmp =>object);
 }
 
 #[allow(clippy::too_many_arguments)]

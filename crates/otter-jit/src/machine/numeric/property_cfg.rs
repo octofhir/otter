@@ -248,3 +248,64 @@ fn jump(instructions: &mut Vec<MachineInstruction>) {
     jump.control = ControlFlow::Branch;
     instructions.push(jump);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn megamorphic_load_keeps_one_pure_probe_and_the_existing_cold_call() {
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let mut hir = super::super::tests::property_selection_hir();
+            let site = hir.property_sites.get_mut(&hir::NumericValue(2)).unwrap();
+            site.program = Box::default();
+            site.megamorphic_atom = Some(17);
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+                .expect("megamorphic property selection");
+            let probes = sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction.opcode,
+                        MachineOpcode::PropertyMegamorphicLoad { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(probes.len(), 1);
+            let probe = probes[0];
+            assert!(matches!(
+                probe.opcode,
+                MachineOpcode::PropertyMegamorphicLoad {
+                    byte_pc: 24,
+                    atom: 17
+                }
+            ));
+            assert_eq!(probe.operands.len(), 3);
+            assert_eq!(
+                probe.clobbers,
+                target.clobbers(TargetClobberSet::PropertyLoad)
+            );
+            assert!(probe.safepoint.is_none() && probe.exits.is_empty());
+            let effects = probe.opcode.effects();
+            assert!(effects.writes.is_empty());
+            assert!(
+                !effects.allocates && !effects.reentrant && !effects.throws && !effects.safepoint
+            );
+            assert_eq!(
+                sequence
+                    .call_descriptors()
+                    .iter()
+                    .filter(|descriptor| {
+                        matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
+                    if target.id == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY.id)
+                    })
+                    .count(),
+                1
+            );
+            sequence
+                .allocate(&target)
+                .expect("megamorphic register allocation");
+        }
+    }
+}

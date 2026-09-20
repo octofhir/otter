@@ -9,6 +9,9 @@
 //!   the PC advance; `false` leaves the operation to the caller.
 //! - Store IC allocation failures propagate before fallback or PC advancement;
 //!   ordinary guard misses leave receiver and operands unchanged.
+//! - Ordinary named-load attachment prepares eligible dictionary receivers
+//!   through the same rooted shape migration as compiled cold loads, before
+//!   either tier snapshots the CodeBlock-owned feedback.
 //!
 //! # See also
 //! - `cache_ir` for guarded store completion and allocation-failure handling.
@@ -88,9 +91,20 @@ impl Interpreter {
             // key and scavenge, relocating the receiver; re-read it from its
             // rooted register before the stub install and the slow-path get
             // both read its shape.
-            let obj = read_register(&stack[top_idx], obj_reg)?
+            let mut obj = read_register(&stack[top_idx], obj_reg)?
                 .as_object()
                 .unwrap_or(obj);
+            // Prepare bootstrap namespaces before the first optimizing/OSR
+            // snapshot, just as the compiled cold load does. Otherwise the
+            // interpreter repeatedly resolves an unshaped receiver and the
+            // first native generation permanently snapshots an empty IC bank.
+            // Migration visits a bounded prototype chain, skips already-shaped
+            // or ineligible objects, and adopts each eligible dictionary only
+            // after its exact descriptor shape is ready. It roots and refreshes
+            // `obj` across allocation; the runtime turn's roots refresh
+            // the original register and every other live operand at the same
+            // collection. Failed optional preparation keeps the ordinary get.
+            self.migrate_slow_to_fast(&mut obj);
             // The shared table answers first, so a site re-learning after a
             // guard miss pays a probe instead of another chain walk, and a
             // saturated one — which will never build a program of its own —

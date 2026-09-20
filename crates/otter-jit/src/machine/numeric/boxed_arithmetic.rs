@@ -208,6 +208,24 @@ fn visit_inputs(
                 NumericDirectCallArguments::Spread(value) => visit(value, false),
             }
         }
+        NativeCall {
+            receiver,
+            target,
+            argument_start,
+            ..
+        } => {
+            visit(receiver, true);
+            if let super::hir::NumericNativeCallTarget::Resolved { callee, .. } = target {
+                visit(callee, true);
+            }
+            span(
+                function,
+                argument_start,
+                u32::from(target.declaration().argument_count),
+                false,
+                &mut visit,
+            )?;
+        }
         NativeLeaf {
             source,
             target,

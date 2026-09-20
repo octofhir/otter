@@ -79,7 +79,7 @@ impl RuntimeCall<'_> {
         let (callee, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let function_id = self.function_id();
         let call_pc = self.pc();
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -114,7 +114,7 @@ impl RuntimeCall<'_> {
         let (receiver, args) = rest.split_first().ok_or(VmError::InvalidOperand)?;
         let function_id = self.function_id();
         let call_pc = self.pc();
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -160,7 +160,7 @@ impl RuntimeCall<'_> {
         let (receiver, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let function_id = self.function_id();
         let call_pc = self.pc();
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -203,7 +203,7 @@ impl RuntimeCall<'_> {
     /// Load one realm builtin error constructor.
     pub fn load_builtin_error(&mut self, dst: u16, kind_index: u32) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns this validated descriptor.
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -220,7 +220,7 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall owns the canonical published descriptor.
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -238,7 +238,7 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns this validated descriptor.
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -255,7 +255,7 @@ impl RuntimeCall<'_> {
         parent_indices: &[u32],
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall validated and exclusively owns this descriptor
         // for the duration of the semantic operation.
@@ -280,7 +280,7 @@ impl RuntimeCall<'_> {
         function_index: u32,
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns the validated published
         // descriptor for this semantic operation.
@@ -295,7 +295,7 @@ impl RuntimeCall<'_> {
         // operation; neither reference is retained by the raw frame view.
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall construction validated and exclusively owns the
         // published descriptor; ActiveFrame stores no borrowed register slice.
@@ -323,7 +323,7 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -340,7 +340,7 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -358,7 +358,8 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         // SAFETY: immutable context is live for the branded call extent; the
         // returned token is consumed before any VM transition.
-        let token = unsafe { self.context.as_ref() }
+        let token = &self
+            .context
             .string_constant_str_for_function(self.function_id(), hint_index)
             .ok_or(VmError::InvalidOperand)?;
         let hint = UnaryPrimitiveHint::from_token(token).ok_or(VmError::InvalidOperand)?;
@@ -381,7 +382,7 @@ impl RuntimeCall<'_> {
     pub fn collect_arguments(&mut self, dst: u16) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -479,7 +480,7 @@ impl RuntimeCall<'_> {
         let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         vm.jit_runtime_load_element_value(
             stack,
             context,
@@ -498,7 +499,7 @@ impl RuntimeCall<'_> {
         name_index: u32,
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -510,7 +511,7 @@ impl RuntimeCall<'_> {
     /// Materialize a regular-expression literal.
     pub fn load_regexp(&mut self, dst: u16, index: u32) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
@@ -542,8 +543,11 @@ impl RuntimeCall<'_> {
     ) -> Result<Value, VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
-        vm.jit_runtime_load_property_value(stack, context, function_id, instruction_pc, receiver)
+        let ambient = &self.context;
+        let context = ambient
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_load_property_value(stack, &context, function_id, instruction_pc, receiver)
     }
 
     /// Complete the named-property write identified by its explicit source site.
@@ -558,10 +562,13 @@ impl RuntimeCall<'_> {
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let ambient = &self.context;
+        let context = ambient
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_store_property_value(
             stack,
-            context,
+            &context,
             function_id,
             instruction_pc,
             receiver,
@@ -584,7 +591,7 @@ impl RuntimeCall<'_> {
         let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         vm.jit_runtime_store_element_value(
             stack,
             context,

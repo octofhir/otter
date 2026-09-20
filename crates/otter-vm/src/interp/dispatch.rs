@@ -270,7 +270,10 @@ impl Interpreter {
                     }
                     continue;
                 }
-                Op::Call => {
+                Op::Call | Op::CallWithThis => {
+                    // Both forms already own the loaded callable. Record its
+                    // exact native identity before execution can collect;
+                    // bytecode dispatch still supplies the resolved frame id.
                     if jit_installed {
                         self.record_call_attempt_feedback(
                             function,
@@ -279,7 +282,7 @@ impl Interpreter {
                         );
                     }
                     let depth_before = stack.len();
-                    let callee_value =
+                    let static_native_target = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
                             .and_then(|register| {
@@ -287,9 +290,7 @@ impl Interpreter {
                                     .get(top_idx)
                                     .and_then(|frame| frame.registers.get(register as usize))
                                     .copied()
-                            });
-                    let static_native_target = if jit_installed {
-                        callee_value
+                            })
                             .and_then(Value::as_native_function)
                             .and_then(|native| {
                                 crate::jit_static_native::jit_static_call_target(
@@ -300,7 +301,23 @@ impl Interpreter {
                     } else {
                         None
                     };
-                    self.do_call_exec(stack, context, &mut function_owner_cache, function, instr)?;
+                    if op == Op::CallWithThis {
+                        self.do_call_with_this_exec(
+                            stack,
+                            context,
+                            &mut function_owner_cache,
+                            function,
+                            instr,
+                        )?;
+                    } else {
+                        self.do_call_exec(
+                            stack,
+                            context,
+                            &mut function_owner_cache,
+                            function,
+                            instr,
+                        )?;
+                    }
                     // Record the resolved typed target before a tier-up hook
                     // consumes a newly pushed bytecode frame. Static natives
                     // complete synchronously and therefore leave stack depth
@@ -354,50 +371,6 @@ impl Interpreter {
                         function,
                         instr,
                     )?;
-                    continue;
-                }
-                Op::CallWithThis => {
-                    // Same feedback shape as `Op::Call`: the callee already
-                    // sits in a register, so a monomorphic site here is
-                    // eligible for the generated direct-call edge. Without
-                    // this the whole shape — `obj[k](…)`, a private method
-                    // call, and every method call whose arguments are
-                    // observable — is stuck on the variadic runtime stub.
-                    if jit_installed {
-                        self.record_call_attempt_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                        );
-                    }
-                    let depth_before = stack.len();
-                    self.do_call_with_this_exec(
-                        stack,
-                        context,
-                        &mut function_owner_cache,
-                        function,
-                        instr,
-                    )?;
-                    let bytecode_pushed = stack.len() > depth_before;
-                    if jit_installed && bytecode_pushed {
-                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(
-                            stack[stack.len() - 1].function_id,
-                        );
-                        let transition = self.record_ordinary_call_feedback(
-                            function,
-                            instr.instruction_pc,
-                            target,
-                        );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
-                    }
-                    if jit_installed
-                        && bytecode_pushed
-                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
-                    {
-                        return Ok(value);
-                    }
                     continue;
                 }
                 Op::CallForwardArguments => {

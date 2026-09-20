@@ -7,7 +7,6 @@
 //! - The callee is actually spliced and coercion commits exactly once.
 //! - A hot factory and a fresh construct site retain moving argument values.
 
-#![cfg(target_arch = "aarch64")]
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]
@@ -26,17 +25,22 @@ function make(x){return new C(x,19);}
 var payload={value:37};
 for(var i=0;i<70000;i++)make(payload);
 "#),"construct-context-warm.js").unwrap();
+        let constructor_irs = warm
+            .jit_artifacts()
+            .unwrap()
+            .bundles()
+            .iter()
+            .filter(|bundle| bundle.manifest().function_name() == "C")
+            .filter_map(|bundle| bundle.file(JitArtifactFileName::OptimizedIr))
+            .map(|ir| String::from_utf8_lossy(ir.contents()).into_owned())
+            .collect::<Vec<_>>();
         let bundles = warm.jit_artifacts().unwrap().bundles();
         assert!(
-            bundles.iter().any(|bundle| {
-                bundle.manifest().function_name() == "C"
-                    && bundle
-                        .file(JitArtifactFileName::OptimizedIr)
-                        .is_some_and(|ir| {
-                            String::from_utf8_lossy(ir.contents()).contains("InlineCallGuard")
-                        })
-            }),
-            "constructor must contain an actual leaf splice"
+            constructor_irs
+                .iter()
+                .any(|ir| ir.contains("GuardCallTarget { guard: Plain")),
+            "constructor must contain an actual leaf splice: {constructor_irs:#?}; {:?}",
+            warm.jit_debug_report()
         );
         assert!(
             bundles.iter().any(|bundle| {

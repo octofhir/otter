@@ -81,7 +81,12 @@ verifier-gate:
     cargo test --release -p otter-vm --test snapshot_boundary
     cargo test --release -p otter-jit --test artifact_agreement
 
-# Iteration gate: fmt, clippy, vm/jit/bytecode tests, difftest across tiers,
+# Focused incremental checks: calls (default), gc, math, native, properties,
+# or all. Full gate/Test262 remain the closing evidence.
+quick *args:
+    bash scripts/gate.sh --quick {{args}}
+
+# Closing gate: fmt, clippy, vm/jit/bytecode tests, difftest across tiers,
 # kernel ledger. Deliberately excludes test262 — that is the closing gate,
 # compared as failing sets.
 gate *args:

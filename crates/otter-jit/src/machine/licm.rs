@@ -339,7 +339,7 @@ fn split_preheader_and_hoist(
         })
         .map(|operand| operand.value)
         .collect::<Vec<_>>();
-    let carried_outputs = hoisted_outputs
+    let carried_output_parameters = hoisted_outputs
         .iter()
         .map(|output| {
             let value = MachineValue(sequence.representations.len() as u32);
@@ -348,6 +348,10 @@ fn split_preheader_and_hoist(
                 .push(sequence.representations[output.0 as usize]);
             (*output, value)
         })
+        .collect::<Vec<_>>();
+    let carried_outputs = carried_output_parameters
+        .iter()
+        .copied()
         .collect::<BTreeMap<_, _>>();
     for &block in &natural_loop.blocks {
         for instruction in &mut block_instructions[block] {
@@ -372,7 +376,8 @@ fn split_preheader_and_hoist(
         for (edge, successor) in block.successors.iter_mut().enumerate() {
             if successor.0 as usize == header && natural_loop.blocks.contains(&predecessor) {
                 *successor = MachineBlock(body as u32);
-                block.successor_arguments[edge].extend(carried_outputs.values().copied());
+                block.successor_arguments[edge]
+                    .extend(carried_output_parameters.iter().map(|(_, value)| *value));
             }
         }
     }
@@ -382,7 +387,7 @@ fn split_preheader_and_hoist(
     sequence.blocks[header].successor_arguments =
         vec![new_parameters.into_iter().chain(hoisted_outputs).collect()];
     let mut body_parameters = old_parameters;
-    body_parameters.extend(carried_outputs.values().copied());
+    body_parameters.extend(carried_output_parameters.iter().map(|(_, value)| *value));
     sequence.blocks.push(MachineBlockData {
         first: MachineInstructionId(0),
         end: MachineInstructionId(0),
@@ -685,7 +690,7 @@ mod tests {
         branch.control = ControlFlow::Branch;
         let mut ret = MachineInstruction::plain(
             MachineOpcode::Return,
-            vec![MachineOperand::register_input(invariant)],
+            vec![MachineOperand::register_input(initial)],
         );
         ret.control = ControlFlow::Return;
         let sequence = InstructionSequence::new(
@@ -694,7 +699,7 @@ mod tests {
             vec![
                 MachineRepresentation::Int32,
                 MachineRepresentation::Int32,
-                MachineRepresentation::Tagged,
+                MachineRepresentation::Boolean,
                 MachineRepresentation::Boolean,
                 MachineRepresentation::Int32,
             ],
@@ -744,7 +749,7 @@ mod tests {
                     vec![MachineOperand::register_output(condition)],
                 ),
                 MachineInstruction::plain(
-                    MachineOpcode::TaggedConstant(otter_vm::Value::null().to_bits()),
+                    MachineOpcode::BooleanConstant(false),
                     vec![MachineOperand::register_output(invariant)],
                 ),
                 branch,
@@ -762,7 +767,7 @@ mod tests {
         let sequence = sequence.expect("valid LICM fixture");
         let (sequence, stats) = optimize(sequence, &target).expect("LICM");
         assert_eq!(stats.versioned_loops, 1);
-        assert_eq!(stats.hoisted_instructions, 1);
+        assert_eq!(stats.hoisted_instructions, 2);
         let preheader = &sequence.blocks[1];
         assert_eq!(preheader.successors, vec![MachineBlock(4)]);
         assert!(
@@ -771,6 +776,12 @@ mod tests {
                 .any(|opcode| matches!(opcode, MachineOpcode::BooleanConstant(true)))
         );
         assert_eq!(sequence.blocks[2].successors, vec![MachineBlock(4)]);
+        let body = &sequence.blocks[4];
+        let branch = (body.first.0..body.end.0)
+            .map(|index| &sequence.instructions[index as usize])
+            .find(|instruction| matches!(instruction.opcode, MachineOpcode::BranchIf(false)))
+            .expect("loop body branch");
+        assert_eq!(branch.operands[0].value, body.parameters[1]);
     }
 
     #[test]

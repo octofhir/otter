@@ -263,6 +263,16 @@ fn expression_key(
 
 fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
     match opcode {
+        MachineOpcode::NativeLeafIdentity {
+            builtin_native_ref, ..
+        } => MachineOpcode::NativeLeafIdentity {
+            byte_pc: 0,
+            builtin_native_ref: *builtin_native_ref,
+        },
+        MachineOpcode::NativeInt32Math { stub, .. } => MachineOpcode::NativeInt32Math {
+            byte_pc: 0,
+            stub: *stub,
+        },
         MachineOpcode::LooseEqualityProbe { equal, .. } => MachineOpcode::LooseEqualityProbe {
             byte_pc: 0,
             equal: *equal,
@@ -299,6 +309,9 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             shape: *shape,
         },
+        MachineOpcode::CacheIrGuardOrdinaryState { .. } => {
+            MachineOpcode::CacheIrGuardOrdinaryState { byte_pc: 0 }
+        }
         MachineOpcode::CacheIrGuardAtomSlot {
             atom,
             value_byte,
@@ -320,6 +333,12 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             value_byte: *value_byte,
         },
+        MachineOpcode::PropertyMegamorphicLoad { atom, .. } => {
+            MachineOpcode::PropertyMegamorphicLoad {
+                byte_pc: 0,
+                atom: *atom,
+            }
+        }
         MachineOpcode::CacheIrGuardExtensible { value_byte, .. } => {
             MachineOpcode::CacheIrGuardExtensible {
                 byte_pc: 0,

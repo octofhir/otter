@@ -15,7 +15,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::{
     JitCompileSnapshot, JitStaticNativeCall, Value,
-    native_abi::{STUB_MATH_ABS_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF},
+    native_abi::{RuntimeStubId, STUB_MATH_ABS_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF},
 };
 
 use crate::{
@@ -51,11 +51,11 @@ pub(crate) fn emit_guard(
 /// Emit the proven Int32 `Math.abs`, `Math.max`, or `Math.min` replacement.
 pub(crate) fn emit_int32(
     ops: &mut Assembler,
-    target: JitStaticNativeCall,
+    stub: RuntimeStubId,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
-    if target.leaf_stub_id == STUB_MATH_ABS_LEAF.id {
+    if stub == STUB_MATH_ABS_LEAF.id {
         dynasm!(ops
             ; .arch x64
             ; mov eax, esi
@@ -65,14 +65,14 @@ pub(crate) fn emit_int32(
             ; jo =>miss
             ; =>done
         );
-    } else if target.leaf_stub_id == STUB_MATH_MAX_LEAF.id {
+    } else if stub == STUB_MATH_MAX_LEAF.id {
         dynasm!(ops
             ; .arch x64
             ; mov eax, esi
             ; cmp esi, edx
             ; cmovl eax, edx
         );
-    } else if target.leaf_stub_id == STUB_MATH_MIN_LEAF.id {
+    } else if stub == STUB_MATH_MIN_LEAF.id {
         dynasm!(ops
             ; .arch x64
             ; mov eax, esi

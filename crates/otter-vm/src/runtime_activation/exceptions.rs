@@ -35,7 +35,7 @@ impl RuntimeCall<'_> {
             // SAFETY: the bound call owns exclusive mutator access; no native
             // frame view is retained across canonical unwind or allocation.
             return unsafe { &mut *self.vm.as_ptr() }.jit_runtime_exception_op(
-                unsafe { self.context.as_ref() },
+                &self.context,
                 unsafe { &mut *self.stack.as_ptr() },
                 index,
                 opcode,
@@ -49,10 +49,7 @@ impl RuntimeCall<'_> {
         unsafe { &mut *self.vm.as_ptr() }
             .record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let (function_id, pc) = (self.function_id(), self.pc());
-        let context = unsafe { self.context.as_ref() };
-        let context = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &self.context;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -107,7 +104,7 @@ impl RuntimeCall<'_> {
         if let RuntimeFrameIdentity::Materialized(index) = self.identity {
             // SAFETY: no frame/register borrow survives canonical unwind.
             return unsafe { &mut *self.vm.as_ptr() }.jit_route_throw(
-                unsafe { self.context.as_ref() },
+                &self.context,
                 unsafe { &mut *self.stack.as_ptr() },
                 index,
                 exception,
@@ -116,10 +113,7 @@ impl RuntimeCall<'_> {
         let handler = {
             // SAFETY: metadata inspection cannot collect or reenter JavaScript.
             let (function_id, pc) = (self.function_id(), self.pc());
-            let context = unsafe { self.context.as_ref() };
-            let context = context
-                .for_function(function_id)
-                .map_err(|_| VmError::InvalidOperand)?;
+            let context = &self.context;
             let function = context
                 .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;

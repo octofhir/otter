@@ -12,8 +12,6 @@
 //! - Sibling constructor closures preserve independent observable layouts.
 //! - Every tier returns the interpreter's completion.
 
-#![cfg(target_arch = "aarch64")]
-
 use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
 const SOURCE: &str = r#"

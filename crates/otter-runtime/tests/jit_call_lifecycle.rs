@@ -126,7 +126,6 @@ fn run_after_warmup(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
 fn assert_inline_method_probe(
     setup: &str,
     probe: &str,
@@ -319,7 +318,6 @@ globalThis.__jitInlineMethodFixture = (() => {
 })();
 "#;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn production_method_inline_eliminates_compiled_call_boundary() {
     assert_inline_method_probe(
@@ -356,7 +354,6 @@ globalThis.__jitPrototypeInlineMethodFixture = (() => {
 })();
 "#;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn prototype_method_inline_reuses_guarded_receiver_property() {
     assert_inline_method_probe(
@@ -392,7 +389,6 @@ globalThis.__jitUninitializedLocalInlineMethodFixture = (() => {
 })();
 "#;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn method_inline_initializes_only_read_before_write_locals() {
     assert_inline_method_probe(
@@ -428,7 +424,6 @@ globalThis.__jitCompactInlineMethodFixture = (() => {
 })();
 "#;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn method_inline_compacts_two_arguments_and_assigned_local() {
     assert_inline_method_probe(
@@ -463,7 +458,6 @@ globalThis.__jitSnapshotInlineMethodFixture = (() => {
 })();
 "#;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn method_inline_keeps_parameter_assignment_snapshot_live() {
     assert_inline_method_probe(
@@ -499,7 +493,6 @@ globalThis.__jitLateDeoptInlineMethodFixture = (() => {
 })();
 "#;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn method_inline_side_exits_after_late_guard_overwrites_scratch() {
     assert_inline_method_probe(
@@ -514,7 +507,6 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 3, "!"));
     );
 }
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn numeric_method_inline_side_exits_after_receiver_shape_change() {
     assert_inline_method_probe(
@@ -530,7 +522,6 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 11));
     );
 }
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn numeric_method_inline_side_exits_after_method_replacement() {
     assert_inline_method_probe(
@@ -548,7 +539,6 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 7));
     );
 }
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn numeric_method_inline_rejects_bound_closure_state() {
     assert_inline_method_probe(
@@ -564,7 +554,6 @@ JSON.stringify(fixture.callMethod(fixture.receiver, 6));
     );
 }
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn numeric_method_inline_side_exits_nonnumeric_operands() {
     assert_inline_method_probe(

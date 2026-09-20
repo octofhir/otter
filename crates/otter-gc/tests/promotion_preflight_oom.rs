@@ -1,9 +1,15 @@
 //! Promotion reservation must fail before a copying collection mutates roots.
 //!
+//! # Contents
+//! - A saturated cage with a full old-space tail exercises atomic preflight failure.
+//!
 //! # Invariants
 //! - cage exhaustion leaves root offsets and forwarding headers unchanged;
 //! - a partially acquired reservation is returned to the cage;
 //! - old space receives no partial reservation pages.
+//!
+//! # See also
+//! - `space::OldSpace::reserve_promotion_pages` for the existing-tail capacity proof.
 
 use otter_gc::header::HEADER_SIZE;
 use otter_gc::raw::{RawGc, SlotVisitor, TraceTable};
@@ -42,8 +48,8 @@ unsafe fn initialize_cell(offset: u32, young: bool, aligned: usize) {
 
 #[test]
 fn promotion_preflight_oom_leaves_heap_unmodified() {
-    // Page 0 is reserved. NewSpace consumes two pages and the old parent one,
-    // leaving no page for the two-page promotion reservation.
+    // Page 0 is reserved. NewSpace consumes two pages and the old parent fills
+    // one. Neither an existing tail nor fresh promotion pages are available.
     init_cage_with_size(PAGE_SIZE * 4).expect("small cage");
     let mut new_space = NewSpace::new(1).expect("new space");
     let mut old_space = OldSpace::new();
@@ -52,10 +58,11 @@ fn promotion_preflight_oom_leaves_heap_unmodified() {
 
     let aligned = align_alloc_size(HEADER_SIZE + std::mem::size_of::<Cell>());
     let young_offset = new_space.alloc(aligned).expect("young cell");
-    let old_offset = old_space.alloc(aligned).expect("old parent");
+    let old_size = otter_gc::page::PAGE_PAYLOAD_SIZE;
+    let old_offset = old_space.alloc(old_size).expect("old parent");
     unsafe {
         initialize_cell(young_offset, true, aligned);
-        initialize_cell(old_offset, false, aligned);
+        initialize_cell(old_offset, false, old_size);
     }
 
     let free_before = cage_stats().expect("cage stats").free_pages;

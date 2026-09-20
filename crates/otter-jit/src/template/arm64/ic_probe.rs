@@ -50,8 +50,10 @@
 //!   shape cannot stand in for it: the prototype lives in the object body, so
 //!   `setPrototypeOf` changes it while the shape stays put.
 //! - A matching shape is insufficient by itself. Receiver and data-holder
-//!   guards also prove live fast mode, no overridden slot metadata, and no
-//!   exotic sidecar. Missing-key chain links use their narrower absence proof.
+//!   guards also prove live fast mode and no overridden slot metadata.
+//!   Property and native-method probes admit benign symbol/native metadata
+//!   while rejecting opaque host-backed or virtual lookup. Missing-key chain
+//!   links use their narrower absence proof.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
@@ -77,43 +79,10 @@ use crate::entry::{
     VM_THREAD_GC_HEAP_OFFSET,
 };
 
-/// Prove that an ordinary-object body still has the semantic state required by
-/// shape-only generated property programs.
-///
-/// Shape identity survives deletion-compatible mode changes, in-place
-/// descriptor overrides, and exotic sidecar installation. Any of those makes
-/// the live object model — rather than the baked shape — authoritative.
-fn emit_fast_object_state_guard(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    header: u8,
-    miss: DynamicLabel,
-) {
-    let scratch = if header == 14 { 11 } else { 14 };
-    let mode_byte = view.object_shape_cache_mode_byte;
-    let fast_mode = u32::from(view.object_shape_cache_fast);
-    let attrs_byte = view.object_slot_attrs_overridden_byte;
-    let exotic_byte = view.object_exotic_handle_byte;
-    dynasm!(ops ; .arch aarch64 ; ldrb W(scratch), [X(header), mode_byte]);
-    if fast_mode == 0 {
-        dynasm!(ops ; .arch aarch64 ; cbnz W(scratch), =>miss);
-    } else {
-        emit_load_u64(ops, 10, u64::from(fast_mode));
-        dynasm!(ops ; .arch aarch64 ; cmp W(scratch), w10 ; b.ne =>miss);
-    }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldrb W(scratch), [X(header), attrs_byte]
-        ; cbnz W(scratch), =>miss
-        ; ldr W(scratch), [X(header), exotic_byte]
-        ; cbnz W(scratch), =>miss
-    );
-}
-
 /// Prove the live object can still participate in an immutable hidden-class
-/// proof. Descriptor overrides and ordinary exotic sidecars are guarded by a
-/// separate atom-slot node; this shape node rejects only dictionary-compatible
-/// history and opaque chain links.
+/// proof. A separate atom-slot node guards descriptor overrides; benign
+/// sidecars do not change named slots. This shape node rejects dictionary-
+/// compatible history and opaque chain links.
 pub(crate) fn emit_shape_state_guard(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
@@ -138,6 +107,24 @@ pub(crate) fn emit_shape_state_guard(
     );
 }
 
+/// Prove shape-derived named lookup remains authoritative without rejecting
+/// benign symbol or native-call sidecars. Clobbers `x10` and `x14` (`x11`
+/// instead of `x14` when that register holds the header).
+pub(crate) fn emit_ordinary_lookup_state_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    miss: DynamicLabel,
+) {
+    emit_shape_state_guard(ops, view, header, miss);
+    let scratch = if header == 14 { 11 } else { 14 };
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldrb W(scratch), [X(header), view.object_slot_attrs_overridden_byte]
+        ; cbnz W(scratch), =>miss
+    );
+}
+
 /// Prove that one prototype-chain link still supports the missing-key proof a
 /// generated add-transition carries.
 ///
@@ -149,6 +136,15 @@ pub(crate) fn emit_shape_state_guard(
 /// attributes, and extensibility do not affect whether a key is absent, so a
 /// prototype such as `Object.prototype` that carries a sidecar stays
 /// guardable.
+fn emit_chain_link_state_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    miss: DynamicLabel,
+) {
+    emit_shape_state_guard(ops, view, header, miss);
+}
+
 /// Resolve the object that owns the slot.
 ///
 /// A way with holder shape `0` owns its slot on the receiver and this is a
@@ -185,7 +181,7 @@ pub(crate) fn emit_resolve_holder(
         ; cmp w14, w7
         ; b.ne =>miss
     );
-    emit_fast_object_state_guard(ops, view, 13, miss);
+    emit_ordinary_lookup_state_guard(ops, view, 13, miss);
     dynasm!(ops ; .arch aarch64 ; =>resolved);
 }
 
@@ -212,7 +208,7 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
     emit_load_object_header(ops, relocations, view, load_receiver, header, miss)?;
-    emit_fast_object_state_guard(ops, view, header, miss);
+    emit_ordinary_lookup_state_guard(ops, view, header, miss);
     Ok(())
 }
 
@@ -265,7 +261,7 @@ pub(crate) fn emit_check_shape(
     shape: u32,
     miss: DynamicLabel,
 ) {
-    emit_fast_object_state_guard(ops, view, header, miss);
+    emit_ordinary_lookup_state_guard(ops, view, header, miss);
     emit_check_shape_identity(ops, view, header, shape, miss);
 }
 
@@ -390,7 +386,7 @@ where
                         RelocationTarget::GcCageBase,
                     );
                     dynasm!(ops ; .arch aarch64 ; add x15, x15, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
-                    emit_fast_object_state_guard(ops, view, 15, next);
+                    emit_ordinary_lookup_state_guard(ops, view, 15, next);
                 }
                 otter_vm::JitCacheIrOp::LoadPrototype { .. } => {
                     return Err(Unsupported::OperandShape("CacheIR prototype operands"));
@@ -462,6 +458,13 @@ where
     for program in programs {
         let next = ops.new_dynamic_label();
         let mut terminal = false;
+        let add_transition = program.ops.iter().any(|op| {
+            matches!(
+                op,
+                otter_vm::JitCacheIrOp::GuardExtensible { .. }
+                    | otter_vm::JitCacheIrOp::PublishShape { .. }
+            )
+        });
         for (index, op) in program.ops.iter().enumerate() {
             match *op {
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
@@ -470,7 +473,12 @@ where
                         1 => 15,
                         _ => return Err(Unsupported::OperandShape("store CacheIR shape object")),
                     };
-                    emit_check_shape(ops, view, header, shape, next);
+                    if add_transition && object == 1 {
+                        emit_chain_link_state_guard(ops, view, header, next);
+                        emit_check_shape_identity(ops, view, header, shape, next);
+                    } else {
+                        emit_check_shape(ops, view, header, shape, next);
+                    }
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     object,
@@ -502,7 +510,11 @@ where
                         RelocationTarget::GcCageBase,
                     );
                     dynasm!(ops ; .arch aarch64 ; add x15, x15, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
-                    emit_fast_object_state_guard(ops, view, 15, next);
+                    if add_transition {
+                        emit_chain_link_state_guard(ops, view, 15, next);
+                    } else {
+                        emit_ordinary_lookup_state_guard(ops, view, 15, next);
+                    }
                 }
                 otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
                     let header = match object {
@@ -1472,6 +1484,7 @@ fn emit_guarded_method_guard_impl(
                 OBJECT_BODY_TYPE_TAG,
                 miss,
             )?;
+            emit_ordinary_lookup_state_guard(ops, view, 13, miss);
             if preserve_receiver {
                 dynasm!(ops ; .arch aarch64 ; mov x8, x13);
             }

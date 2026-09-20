@@ -26,6 +26,9 @@
 //!   must visit every strong [`crate::compressed::RawGc`] / `Gc<T>`
 //!   slot. Ephemeron tracing must expose weak keys separately from
 //!   conditionally-strong values.
+//! - Remembered-parent tracing may restrict its walk to mutated slots, but
+//!   must visit every young edge and retain slots whose targets remain young
+//!   after the visitor returns. Full tracing never consumes that bookkeeping.
 //!
 //! # See also
 //!
@@ -96,6 +99,23 @@ pub trait Traceable: 'static {
     /// - not retain references to the visitor,
     /// - not read past the object's payload.
     unsafe fn trace_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>);
+
+    /// Walk the young edges of an old object recorded by the write barrier.
+    ///
+    /// The default walks every strong slot. Bodies with precise mutation
+    /// bookkeeping may restrict this walk, provided every old-to-young edge
+    /// is visited. A visitor can leave a target young when another root has
+    /// already copied it into to-space; such slots must remain dirty for the
+    /// next collection. This hook is never used for full marking, young-body
+    /// Cheney scans, or snapshot relocation.
+    ///
+    /// # Safety
+    ///
+    /// Same payload-validity and no-allocation contract as [`Self::trace_slots`].
+    unsafe fn trace_remembered_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>) {
+        // SAFETY: the caller supplies the same valid payload as ordinary tracing.
+        unsafe { Self::trace_slots(this, visitor) }
+    }
 
     /// Walk the outgoing references of a *pending* payload: the
     /// stack-resident value an allocation is about to copy into the
@@ -209,6 +229,13 @@ pub trait SafeTraceable: 'static {
     /// precondition).
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>);
 
+    /// Safe counterpart to [`Traceable::trace_remembered_slots`]. The default
+    /// visits every strong slot; specialized bodies must preserve every young
+    /// edge, including targets left young by the visitor.
+    fn trace_remembered_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.trace_slots_safe(visitor);
+    }
+
     /// Safe counterpart to [`Traceable::trace_pending_slots`]: what to
     /// trace when `self` is still the allocation's stack-resident
     /// payload and its trailing storage does not exist yet.
@@ -258,12 +285,18 @@ impl<T: SafeTraceable> Traceable for T {
             (*this).trace_ephemeron_slots_safe(visitor);
         }
     }
+
+    unsafe fn trace_remembered_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>) {
+        // SAFETY: same payload-validity contract as `trace_slots`.
+        unsafe { (*this).trace_remembered_slots_safe(visitor) }
+    }
 }
 
 /// A 256-entry array of [`TraceFn`] pointers, indexed by
 /// [`GcHeader::type_tag`]. Empty slots stay `None`.
 pub struct TraceTable {
     table: [Option<TraceFn>; 256],
+    remembered_table: [Option<TraceFn>; 256],
     ephemeron_table: [Option<EphemeronTraceFn>; 256],
     /// Drop functions used by the sweeper to invoke `T`'s `Drop`
     /// on dead objects (so e.g. boxed strings get their backing
@@ -293,6 +326,7 @@ impl TraceTable {
     pub const fn new() -> Self {
         Self {
             table: [None; 256],
+            remembered_table: [None; 256],
             ephemeron_table: [None; 256],
             drop_table: [None; 256],
             finalize_table: [None; 256],
@@ -332,6 +366,19 @@ impl TraceTable {
                 core::ptr::drop_in_place(payload);
             }
         }
+        unsafe fn remembered_wrapper<T: Traceable>(
+            header: *mut GcHeader,
+            visitor: &mut SlotVisitor<'_>,
+        ) {
+            // SAFETY: the registered header precedes a valid T payload.
+            unsafe {
+                let payload = header
+                    .cast::<u8>()
+                    .add(std::mem::size_of::<GcHeader>())
+                    .cast::<T>();
+                T::trace_remembered_slots(payload, visitor);
+            }
+        }
         unsafe fn ephemeron_wrapper<T: Traceable>(
             header: *mut GcHeader,
             visitor: &mut EphemeronVisitor<'_>,
@@ -353,6 +400,7 @@ impl TraceTable {
             );
         }
         self.table[tag] = Some(trace_wrapper::<T>);
+        self.remembered_table[tag] = Some(remembered_wrapper::<T>);
         self.ephemeron_table[tag] = Some(ephemeron_wrapper::<T>);
         self.name_table[tag] = Some(std::any::type_name::<T>());
         // Only set drop if needed — saves one indirect call per
@@ -529,6 +577,22 @@ impl TraceTable {
             let tag = (*header).type_tag();
             if let Some(f) = self.table[tag as usize] {
                 f(header, visitor);
+            }
+        }
+    }
+
+    /// Invoke the remembered-parent trace function for `header`.
+    ///
+    /// # Safety
+    ///
+    /// Same payload-validity contract as [`Self::trace`]. The caller must be
+    /// tracing an old remembered parent during a minor collection.
+    #[inline]
+    pub unsafe fn trace_remembered(&self, header: *mut GcHeader, visitor: &mut SlotVisitor<'_>) {
+        // SAFETY: the caller upholds the registered payload contract.
+        unsafe {
+            if let Some(trace) = self.remembered_table[(*header).type_tag() as usize] {
+                trace(header, visitor);
             }
         }
     }

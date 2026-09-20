@@ -16,7 +16,9 @@
 //! - [`crate::forward_arguments`] — source semantics and mapped bindings.
 
 use super::{RuntimeCall, RuntimeFrameIdentity};
-use crate::{ActiveFrameMut, ActiveFrameRef, native_abi::NativeFrame};
+use crate::{
+    ActiveFrameMut, ActiveFrameRef, feedback::OrdinaryCallTarget, native_abi::NativeFrame,
+};
 
 impl RuntimeCall<'_> {
     /// Count elided live actuals for an already-resolved intrinsic apply.
@@ -57,7 +59,7 @@ impl RuntimeCall<'_> {
     ) -> Result<crate::Value, crate::VmError> {
         // SAFETY: the bound activation owns the context and published frame;
         // the checked source borrows no managed slice across reentrant work.
-        let context = unsafe { self.context.as_ref() };
+        let context = &self.context;
         let function = context
             .exec_function(self.function_id())
             .ok_or(crate::VmError::InvalidOperand)?;
@@ -90,19 +92,23 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_forward_values(context, stack, &source, materialized, values)
     }
 
-    /// Resolve a runtime-selected ordinary bytecode target without allocation.
-    /// Function admission is shared with compile-time call baking. The result
-    /// contains stable engine metadata only; receiver binding and native-stack
-    /// reservation must still be proved before the callee is published.
+    /// Resolve a runtime-selected ordinary bytecode target.
+    ///
+    /// Function admission is shared with compile-time call baking and may
+    /// compile a fresh baseline generation while the published caller owns all
+    /// moving roots. The result contains stable engine metadata only; receiver
+    /// binding and native-stack reservation must still be proved before the
+    /// callee is published.
     pub fn forwarded_call_plan(
         &self,
         callee: crate::Value,
     ) -> Option<crate::jit::JitDirectCallPlan> {
-        // SAFETY: these services belong to the live bound activation. No
-        // allocation, compilation or JavaScript reentry occurs during lookup.
+        // SAFETY: these services belong to the live bound activation. The
+        // caller stays published across optional compilation, and no
+        // JavaScript reentry occurs during lookup.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = unsafe { self.context.as_ref() };
         let source = unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }.ok()?;
+        let context = &self.context;
         let caller = context.exec_function(source.function_id())?;
         let call_pc = unsafe { self.frame.as_ref() }.header.pc;
         vm.record_call_attempt_feedback(caller, call_pc, source.function_id());
@@ -116,7 +122,8 @@ impl RuntimeCall<'_> {
             }
             (header.function_id, header.upvalue_count, header.flags)
         };
-        let function = context.exec_function(function_id)?;
+        let callee_context = context.for_function(function_id).ok()?;
+        let function = callee_context.exec_function(function_id)?;
         if !function.admits_generated_call(crate::jit::JitDirectCallKind::Plain)
             || captures != u32::from(function.inherited_upvalue_count)
             || (!(function.is_strict || function.is_arrow)
@@ -124,8 +131,15 @@ impl RuntimeCall<'_> {
         {
             return None;
         }
-        vm.record_resolved_bytecode_call_feedback(caller, call_pc, source.function_id(), callee);
-        vm.current_direct_callee_plan(function)
+        let transition = vm.record_ordinary_call_feedback(
+            caller,
+            call_pc,
+            OrdinaryCallTarget::Bytecode(function_id),
+        );
+        if transition.evict_for_reopt() {
+            vm.recompile_active_caller_for_feedback(context, source.function_id());
+        }
+        vm.ensure_runtime_forward_callee_plan(&callee_context, function)
     }
 
     /// Copy incoming actuals and live captured aliases into a private callee.
@@ -145,10 +159,10 @@ impl RuntimeCall<'_> {
         // live and disjoint; checked views retain no Rust slice across VM work.
         let vm = unsafe { self.vm.as_ref() };
         let stack = unsafe { self.stack.as_ref() };
-        let context = unsafe { self.context.as_ref() };
         let Ok(source) = (unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }) else {
             return None;
         };
+        let context = &self.context;
         let Ok(mut destination) = (unsafe { ActiveFrameMut::from_native_ptr(destination) }) else {
             return None;
         };

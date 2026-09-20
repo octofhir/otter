@@ -65,6 +65,8 @@ use std::sync::Arc;
 use otter_bytecode::{Op, Operand};
 use serde::Serialize;
 
+pub use crate::property_cache::jit::JitPropertyLookupCache;
+
 /// Opaque collector-owned nursery window carried by the compiled-entry ABI.
 pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
 /// Machine allocation page-layout constants, derived on the VM side so the
@@ -288,6 +290,12 @@ pub struct JitCompileSnapshot {
     /// boundary and keyed by source byte PC. Every installed program must be
     /// representable or the site is absent and uses its committed cold edge.
     pub property_programs: rustc_hash::FxHashMap<u32, Vec<JitCacheIrProgram>>,
+    /// Stable layout of this isolate's existing shared property lookup table.
+    /// Generated load probes read its live entries without a runtime call.
+    pub property_lookup_cache: Option<JitPropertyLookupCache>,
+    /// Terminal megamorphic named loads: source byte PC to isolate-global atom.
+    /// Stores and negative table results keep their committed cold operation.
+    pub property_megamorphic_loads: rustc_hash::FxHashMap<u32, u32>,
     /// Direct physical hit proofs for schema-owned binding sites, keyed by
     /// byte-PC. See [`BindingHitProof`].
     pub binding_hit_proofs: rustc_hash::FxHashMap<u32, BindingHitProof>,
@@ -357,12 +365,13 @@ pub struct JitCompileSnapshot {
     /// appended slot index is below this capacity before it publishes; a slot
     /// at or beyond it needs the runtime's slab growth.
     pub object_slab_capacity_byte: u32,
-    /// Byte offset of the ordinary object's one-byte flag that it cannot be a
-    /// guarded prototype-chain link: its `[[Prototype]]` is a Proxy or
+    /// Byte offset of the ordinary object's one-byte flag that its shape cannot
+    /// authorize named lookup: its `[[Prototype]]` is a Proxy or
     /// non-object value (the flat mirror at [`Self::jit_proto_byte`] is then
     /// null without ending the chain) or it is a String wrapper whose keys
-    /// the shape does not describe. Chain guards require it clear on every
-    /// link.
+    /// the shape does not describe, or host data may override ordinary lookup
+    /// (including module namespaces and mapped arguments). Shape guards require
+    /// it clear on every receiver and prototype link.
     pub object_chain_link_opaque_byte: u32,
     /// Byte offset of the ordinary object's one-byte `[[Extensible]]` Boolean.
     pub object_extensible_byte: u32,
@@ -376,9 +385,9 @@ pub struct JitCompileSnapshot {
     /// such as `freeze` and `defineProperty`. Generated property programs
     /// require zero.
     pub object_slot_attrs_overridden_byte: u32,
-    /// Byte offset of the 4-byte rare-state GC handle. Generated property
-    /// programs require a zero handle on every receiver/prototype they inspect;
-    /// a sidecar may carry semantics the shape alone cannot prove.
+    /// Byte offset of the 4-byte rare-state GC handle. Conservative generated
+    /// property programs require a zero handle; programs that prove ordinary
+    /// named lookup separately can admit benign sidecars such as symbol keys.
     pub object_exotic_handle_byte: u32,
     /// Fixed aligned bytes in one ordinary object cell, header included.
     pub object_cell_bytes: u32,
@@ -577,7 +586,7 @@ impl JitBodyGuard {
 /// Both forms end the same way — a value slab holding the method slot — so one
 /// emitter lowers them; they differ only in what identifies the receiver and
 /// where the method lives.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitGuardedReceiver {
     /// An ordinary object named by its hidden class. The method is in the
     /// receiver's own slab, or in a prototype resolved at run time when
@@ -611,7 +620,7 @@ pub enum JitGuardedReceiver {
 /// the call, exactly as it does at an ordinary call site: the family the id
 /// resolves in is what decides the call protocol, so a read, an in-place
 /// mutation and an allocating write are one description.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitGuardedMethodCall {
     /// How the receiver is proven before the method slot is read.
     pub receiver: JitGuardedReceiver,
@@ -1445,6 +1454,8 @@ impl JitCompileSnapshot {
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_programs: rustc_hash::FxHashMap::default(),
+            property_lookup_cache: None,
+            property_megamorphic_loads: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),

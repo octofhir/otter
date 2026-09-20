@@ -5,7 +5,7 @@
 //!   execution feedback shared by plain and method calls.
 //! - [`Interpreter::record_ordinary_call_feedback`] — typed recording keyed by
 //!   the canonical instruction index in the supplied CodeBlock.
-//! - [`Interpreter::record_resolved_bytecode_call_feedback`] — generated-call
+//! - [`Interpreter::record_resolved_call_feedback`] — generated-call
 //!   target publication and caller invalidation before committed callee entry.
 //! - [`Interpreter::commit_method_call_feedback_transition`] — publication and
 //!   invalidation for isolate-owned method-target growth.
@@ -69,28 +69,36 @@ impl Interpreter {
         changed
     }
 
-    /// Publish an already-resolved bytecode callable at a generated call site.
+    /// Publish an already-resolved callable at a generated call site.
     /// This leaf observation never allocates in the GC heap or invokes user
-    /// code. Non-bytecode callables retain their canonical dispatch behavior.
-    pub(crate) fn record_resolved_bytecode_call_feedback(
+    /// code. Only exact declared bootstrap natives have a static-native target.
+    pub(crate) fn record_resolved_call_feedback(
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
         caller_function_id: u32,
         callee: crate::Value,
     ) {
-        let Some(target_function_id) = callee.as_function().or_else(|| {
-            callee
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.function_id())
-        }) else {
+        let target = callee
+            .as_function()
+            .or_else(|| {
+                callee
+                    .as_closure(&self.gc_heap)
+                    .map(|closure| closure.function_id())
+            })
+            .map(OrdinaryCallTarget::Bytecode)
+            .or_else(|| {
+                callee
+                    .as_native_function()
+                    .and_then(|native| {
+                        crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
+                    })
+                    .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
+            });
+        let Some(target) = target else {
             return;
         };
-        let transition = self.record_ordinary_call_feedback(
-            code_block,
-            instruction_pc,
-            OrdinaryCallTarget::Bytecode(target_function_id),
-        );
+        let transition = self.record_ordinary_call_feedback(code_block, instruction_pc, target);
         if transition.evict_for_reopt() {
             self.evict_compiled_for_reopt(caller_function_id);
         }

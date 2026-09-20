@@ -351,6 +351,29 @@ impl JitCodeRegistry {
             .map_or(0, |cell| cell.generated_entries.get())
     }
 
+    /// Whether this function has ever owned an entry-capable native generation.
+    ///
+    /// Function-entry cells are permanent registry identities: invalidation
+    /// clears their current generation but does not erase the fact that the
+    /// cost policy already admitted a generated-call target. A bounded eager
+    /// rebuild may use this history to replace an invalidated target without
+    /// charging the first-generation admission threshold again.
+    #[must_use]
+    pub(crate) fn has_entry_generation_history(&self, function_id: u32) -> bool {
+        self.function_entry_cells.contains_key(&function_id)
+    }
+
+    /// Resolve the bytecode function identity owned by one permanent entry cell.
+    #[must_use]
+    pub(crate) fn function_id_for_entry_addr(&self, function_entry_addr: u64) -> Option<u32> {
+        self.function_entry_cells
+            .iter()
+            .find_map(|(&function_id, cell)| {
+                (std::ptr::from_ref(cell.as_ref()) as u64 == function_entry_addr)
+                    .then_some(function_id)
+            })
+    }
+
     /// A cached compile outcome makes repeated requests from this generation
     /// redundant. A future replacement owns its own fresh eligibility bit.
     pub(crate) fn suppress_generated_tiering(&self, function_id: u32) {
@@ -429,11 +452,7 @@ impl JitCodeRegistry {
     /// cell, or zero when generated calls must side-exit.
     #[must_use]
     pub(crate) fn resolve_function_entry(&mut self, function_entry_addr: u64) -> u64 {
-        let Some((&function_id, _)) = self
-            .function_entry_cells
-            .iter()
-            .find(|(_, cell)| std::ptr::from_ref(cell.as_ref()) as u64 == function_entry_addr)
-        else {
+        let Some(function_id) = self.function_id_for_entry_addr(function_entry_addr) else {
             return 0;
         };
         self.refresh_function_entry(function_id);
@@ -1064,7 +1083,9 @@ mod tests {
         });
 
         assert!(registry.published_function_entry(7).is_none());
+        assert!(!registry.has_entry_generation_history(7));
         assert!(registry.register_generation(101, baseline, 2, 9, 1));
+        assert!(registry.has_entry_generation_history(7));
         assert_eq!(
             registry
                 .published_function_entry(7)
@@ -1075,6 +1096,8 @@ mod tests {
         );
         assert!(registry.register_generation(201, caller, 2, 12, 1));
         let stable_addr = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
+        assert_eq!(registry.function_id_for_entry_addr(stable_addr), Some(7));
+        assert_eq!(registry.function_id_for_entry_addr(stable_addr + 1), None);
         assert_eq!(
             registry.function_entry_cells[&7].current_generation(),
             registry.entry_cell_addr(101).unwrap()
@@ -1150,6 +1173,8 @@ mod tests {
         assert_eq!(registry.invalidate_function(7), vec![7]);
         registry.retire_unreferenced();
         assert!(registry.published_function_entry(7).is_none());
+        assert!(registry.has_entry_generation_history(7));
+        assert_eq!(registry.function_id_for_entry_addr(stable_addr), Some(7));
         assert!(
             registry.entry_cell_addr(103).is_some(),
             "retired cells remain owned tombstones"

@@ -5,7 +5,6 @@
 //!
 //! # Invariants
 //! - Deopt retains lexical new.target without treating an arrow as a constructor.
-#![cfg(target_arch = "aarch64")]
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 #[test]
 fn inline_exit_in_arrow_keeps_lexical_new_target_and_plain_return() {
@@ -19,17 +18,18 @@ function leaf(x){return x+1;}
 function Maker(){this.probe=1.25;this.run=()=>{var ignored=leaf(this.probe);this.seen=new.target;return 7;};}
 var owner=new Maker();for(var i=0;i<70000;i++)owner.run();
 "#),"inline-new-target-warm.js").unwrap();
+    let irs = warm
+        .jit_artifacts()
+        .unwrap()
+        .bundles()
+        .iter()
+        .filter_map(|bundle| bundle.file(JitArtifactFileName::OptimizedIr))
+        .map(|ir| String::from_utf8_lossy(ir.contents()).into_owned())
+        .collect::<Vec<_>>();
     assert!(
-        warm.jit_artifacts()
-            .unwrap()
-            .bundles()
-            .iter()
-            .any(|bundle| bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .is_some_and(
-                    |ir| String::from_utf8_lossy(ir.contents()).contains("InlineCallGuard")
-                )),
-        "must splice leaf into arrow: {:?}",
+        irs.iter()
+            .any(|ir| ir.contains("GuardCallTarget { guard: Plain")),
+        "must splice leaf into arrow: {irs:#?}; {:?}",
         warm.jit_debug_report()
     );
     let result = runtime

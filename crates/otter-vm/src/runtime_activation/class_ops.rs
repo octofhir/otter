@@ -155,11 +155,7 @@ impl RuntimeCall<'_> {
                 let value = self.read(register)?;
                 if kind == 0 {
                     if !value.is_null()
-                        && !abstract_ops::is_constructor(
-                            &value,
-                            unsafe { self.context.as_ref() },
-                            &vm.gc_heap,
-                        )
+                        && !abstract_ops::is_constructor(&value, &self.context, &vm.gc_heap)
                     {
                         return Err(vm.err_type(
                             "Class extends value is not a constructor or null"
@@ -186,7 +182,7 @@ impl RuntimeCall<'_> {
             } => {
                 let callee = self.read(function)?;
                 let key_value = self.read(key)?;
-                let context = unsafe { self.context.as_ref() };
+                let context = &self.context;
                 let prefix = context
                     .property_atom_for_function(self.function_id(), prefix_index)
                     .map(|atom| atom.name().to_string())

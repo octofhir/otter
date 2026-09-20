@@ -18,7 +18,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-BIN=target/release/otter-engine-benchmark
 TIERS="${TIERS:-interpreter template production-tiered}"
 SAMPLES="${SAMPLES:-20}"
 WARMUP="${WARMUP:-8}"
@@ -26,6 +25,8 @@ WARMUP="${WARMUP:-8}"
 KERNELS=(
   "method-call-monomorphic 500003500000"
   "numeric-leaf           -700000"
+  "math-intrinsics         2200000"
+  "math-explicit-calls     2200000"
   "typed-parameter-loop    300000"
   "branch-phi             -6000000"
   "string-concat             600000"
@@ -36,11 +37,21 @@ KERNELS=(
   "native-boundary       27000000"
 )
 
-if [[ ! -x "$BIN" ]]; then
-  echo "building $BIN" >&2
-  cargo build --release -q -p otter-benchmark --features engine \
-    --bin otter-engine-benchmark
-fi
+# Use Cargo's fresh artifact path, including configured target directories.
+BIN=$(cargo build --release -q -p otter-benchmark --features engine \
+  --bin otter-engine-benchmark --message-format=json-render-diagnostics |
+  python3 -c '
+import json, sys
+executable = None
+for line in sys.stdin:
+    message = json.loads(line)
+    if (message.get("reason") == "compiler-artifact"
+            and message["target"]["name"] == "otter-engine-benchmark"):
+        executable = message.get("executable")
+if executable is None:
+    sys.exit("Cargo did not produce the engine benchmark executable")
+print(executable)
+')
 
 filter="${1:-}"
 
@@ -53,8 +64,9 @@ record = json.load(open(sys.argv[1]))
 # warmup plus sampled invocations. Normalize to one invocation or the numbers
 # stop being comparable the moment SAMPLES changes.
 invocations = max(1, int(sys.argv[2]))
-if record.get("failure"):
-    print("FAIL " + json.dumps(record["failure"]), file=sys.stderr)
+outcome = record["outcome"]
+if outcome["status"] != "validated" or outcome.get("failure"):
+    print("FAIL " + json.dumps(outcome), file=sys.stderr)
     sys.exit(1)
 
 by_name = {}
@@ -83,15 +95,9 @@ axes = {
         "property-ic-load-disables",
         "property-ic-store-disables",
     ),
-    # jit-runtime-stub-transitions is the aggregate of the leaf/alloc/
-    # reentrant families, so summing it with its members would count the
-    # same transition several times.
-    "native": total(
-        "jit-runtime-stub-transitions",
-        "jit-to-rust-call-transitions",
-        "jit-runtime-calls",
-        "jit-runtime-constructs",
-    ),
+    # Classified generated-to-runtime crossings: leaf, allocation, reentrant.
+    # Call/construct counters overlap this aggregate and must not be added.
+    "jit_stub": total("jit-runtime-stub-transitions"),
     "alloc_ok": total("jit-alloc-value-stub-ok"),
     "alloc_miss": total("jit-alloc-value-stub-miss"),
     # Broken out because it is the metric Slice 1 must drive to zero: a
@@ -110,10 +116,11 @@ print(" ".join(f"{value:.0f}" if key != "wall_ms" else f"{value:.4f}"
 PY
 }
 
+failed=0
 for tier in $TIERS; do
   printf '\n=== tier: %s  samples=%s warmup=%s ===\n' "$tier" "$SAMPLES" "$WARMUP"
   printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %10s %10s %11s %6s\n' \
-    kernel retired wall_ms work_units instr/work ic_miss ic_inst ic_disa native alloc_ok alloc_miss prop_stub deopt
+    kernel retired wall_ms work_units instr/work ic_miss ic_inst ic_disa jit_stub alloc_ok alloc_miss prop_stub deopt
   for entry in "${KERNELS[@]}"; do
     read -r name expected <<<"$entry"
     if [[ -n "$filter" && "$name" != *"$filter"* ]]; then continue; fi
@@ -134,6 +141,7 @@ for tier in $TIERS; do
       printf '%-24s %14s\n' "$name" "RUN-FAILED"
       cat "$timing" >&2
       rm -f "$record" "$timing"
+      failed=1
       continue
     fi
 
@@ -141,16 +149,17 @@ for tier in $TIERS; do
     if ! axes=$(parse_record "$record" "$((SAMPLES + WARMUP))"); then
       printf '%-24s %14s\n' "$name" "PARSE-FAILED"
       rm -f "$record" "$timing"
+      failed=1
       continue
     fi
-    read -r wall work_units ic_miss ic_install ic_disable native alloc_ok alloc_miss prop_stub deopt gc <<<"$axes"
+    read -r wall work_units ic_miss ic_install ic_disable jit_stub alloc_ok alloc_miss prop_stub deopt gc <<<"$axes"
 
     per_work_unit=$(python3 -c \
-      "r=${retired:-0}; d=${work_units:-0}; print(f'{r/d:.1f}' if d else '-')")
+      "r=${retired:-0}; d=(${work_units:-0}) * ($SAMPLES + $WARMUP); print(f'{r/d:.1f}' if d else '-')")
 
     printf '%-24s %14s %9s %11s %9s %7s %7s %7s %9s %10s %10s %11s %6s\n' \
       "$name" "${retired:-?}" "$wall" "$work_units" "$per_work_unit" \
-      "$ic_miss" "$ic_install" "$ic_disable" "$native" "$alloc_ok" "$alloc_miss" \
+      "$ic_miss" "$ic_install" "$ic_disable" "$jit_stub" "$alloc_ok" "$alloc_miss" \
       "$prop_stub" "$deopt"
 
     if [[ "${gc:-0}" != "0" ]]; then
@@ -167,3 +176,4 @@ Axes are event counts, not time shares. Read them as "where the engine is
 doing work it should not have to", then take the top line into the next
 declaration.
 NOTE
+exit "$failed"

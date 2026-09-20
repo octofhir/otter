@@ -137,6 +137,32 @@ pub(super) enum NumericType {
     Boolean,
 }
 
+/// Lookup ownership for a native call's generated hit and committed miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericNativeCallTarget {
+    /// The call still owns its ordinary method lookup.
+    Method(otter_vm::JitGuardedMethodCall),
+    /// Lookup has already committed before argument evaluation. Both paths
+    /// consume this exact callee; neither may read the property again.
+    Resolved {
+        callee: NumericValue,
+        call: otter_vm::JitStaticNativeCall,
+    },
+}
+
+impl NumericNativeCallTarget {
+    pub(super) fn declaration(self) -> otter_vm::JitStaticNativeCall {
+        match self {
+            Self::Method(call) => otter_vm::JitStaticNativeCall {
+                builtin_native_ref: call.builtin_native_ref,
+                leaf_stub_id: call.entry_stub_id,
+                argument_count: call.argument_count,
+            },
+            Self::Resolved { call, .. } => call,
+        }
+    }
+}
+
 /// Value semantics selected by one immutable element-access snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericElementAccess {
@@ -276,6 +302,14 @@ pub(super) enum NumericNode {
         target: otter_vm::JitStaticNativeCall,
         value_type: NumericType,
         argument_start: u32,
+        byte_pc: u32,
+    },
+    /// Native call with a generated Int32 hit and its committed cold sibling.
+    NativeCall {
+        receiver: NumericValue,
+        target: NumericNativeCallTarget,
+        argument_start: u32,
+        logical_pc: u32,
         byte_pc: u32,
     },
     ColdCallExit {
@@ -560,6 +594,7 @@ impl NumericNode {
             | Self::LiteralAllocation { .. }
             | Self::TaggedStringConcat(..)
             | Self::DirectCall { .. }
+            | Self::NativeCall { .. }
             | Self::ColdCallExit { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
             Self::ElementLoad { .. } => NumericType::Tagged,
@@ -644,6 +679,7 @@ impl NumericNode {
             | Self::ConstructorFieldStore { .. }
             | Self::ArrayConstruct { .. }
             | Self::DirectCall { .. }
+            | Self::NativeCall { .. }
             | Self::NativeLeaf { .. }
             | Self::TaggedToBoolean(..)
             | Self::TaggedStrictEqual(..)
@@ -1393,6 +1429,7 @@ fn loop_is_versionable(function: &NumericFunction, natural_loop: &NumericNatural
                         node,
                         NumericNode::Binding { .. }
                             | NumericNode::DirectCall { .. }
+                            | NumericNode::NativeCall { .. }
                             | NumericNode::ColdCallExit { .. }
                             | NumericNode::ArrayConstruct { .. }
                             | NumericNode::LiteralAllocation { .. }
@@ -1685,6 +1722,31 @@ fn build_raw_blocks(
         let pc = u32::try_from(pc).ok()?;
         let op = instruction.op(code);
         let binding = opcode_schema(op).binding.is_some();
+        let native_call = match op {
+            Op::CallMethodValue => view
+                .guarded_method_calls
+                .get(&instruction.byte_pc)
+                .is_some_and(|&call| {
+                    instruction
+                        .const_index(code, 3)
+                        .and_then(|count| usize::try_from(count).ok())
+                        .is_some_and(|count| {
+                            super::native_call_cfg::supports_method(view, call, count)
+                        })
+                }),
+            Op::CallWithThis => view
+                .static_native_calls
+                .get(&instruction.byte_pc)
+                .is_some_and(|&call| {
+                    instruction
+                        .const_index(code, 3)
+                        .and_then(|count| usize::try_from(count).ok())
+                        .is_some_and(|count| {
+                            super::native_call_cfg::supports_resolved(view, call, count)
+                        })
+                }),
+            _ => false,
+        };
         let protected_throw = instruction_semantics
             .get(pc as usize)?
             .has_implicit_exception_side_exit(op)
@@ -1694,6 +1756,7 @@ fn build_raw_blocks(
                 .and_then(|region| region.catch_pc)
                 .is_some();
         if (binding
+            || native_call
             || matches!(
                 op,
                 Op::LoadProperty | Op::StoreProperty | Op::LoadElement | Op::StoreElement
@@ -2910,6 +2973,44 @@ fn lower_instruction(
                     )
                 })
                 .collect::<Option<Vec<_>>>()?;
+            if explicit_receiver
+                && exceptional_edge.is_none()
+                && let Some(call) = view.static_native_calls.get(&instruction.byte_pc).copied()
+                && super::native_call_cfg::supports_resolved(view, call, argument_count)
+                && arguments
+                    .iter()
+                    .all(|argument| nodes[argument.0].value_type() == NumericType::Int32)
+            {
+                let receiver = read_value(registers, register(instruction, code, 2)?)?;
+                let (argument_start, _) = append_operand_values(operand_values, arguments)?;
+                let value = push(
+                    nodes,
+                    NumericNode::NativeCall {
+                        receiver,
+                        target: NumericNativeCallTarget::Resolved {
+                            callee: source,
+                            call,
+                        },
+                        argument_start,
+                        logical_pc,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                );
+            }
             if !explicit_receiver
                 && exceptional_edge.is_none()
                 && let Some(target) = view.static_native_calls.get(&instruction.byte_pc).copied()
@@ -3176,6 +3277,39 @@ fn lower_instruction(
             let arguments = (0..argument_count)
                 .map(|index| read_value(registers, register(instruction, code, 4 + index)?))
                 .collect::<Option<Vec<_>>>()?;
+            if exceptional_edge.is_none()
+                && let Some(call) = view.guarded_method_calls.get(&instruction.byte_pc).copied()
+                && super::native_call_cfg::supports_method(view, call, argument_count)
+                && arguments
+                    .iter()
+                    .all(|argument| nodes[argument.0].value_type() == NumericType::Int32)
+            {
+                let (argument_start, _) = append_operand_values(operand_values, arguments)?;
+                let value = push(
+                    nodes,
+                    NumericNode::NativeCall {
+                        receiver: source,
+                        target: NumericNativeCallTarget::Method(call),
+                        argument_start,
+                        logical_pc,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                );
+            }
             let target = match direct_methods.get(&instruction.byte_pc) {
                 Some(methods) => method_direct_call_target(methods)?,
                 None if instruction.call_attempted => generic_method_call_target(),

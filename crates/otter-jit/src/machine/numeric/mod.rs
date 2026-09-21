@@ -3092,6 +3092,41 @@ fn select_cache_ir_property_programs(
         accumulated_hit = hit;
     }
 
+    if let Some(value) = stored
+        && let Some(atom) = source.megamorphic_atom
+    {
+        let owner = push_value(representations, MachineRepresentation::Int64);
+        let hit = push_value(representations, MachineRepresentation::Boolean);
+        let mut store = MachineInstruction::plain(
+            MachineOpcode::PropertyMegamorphicStore {
+                byte_pc: source.byte_pc,
+                atom,
+            },
+            vec![
+                MachineOperand::location_input(receiver),
+                MachineOperand::location_input(value),
+                MachineOperand::register_output(owner),
+                MachineOperand::register_output(hit),
+            ],
+        );
+        store.clobbers = property_store_clobbers(target_spec, value_is_non_cell);
+        instructions.push(store);
+        let mut barrier = MachineInstruction::plain(
+            MachineOpcode::CacheIrWriteBarrier {
+                byte_pc: source.byte_pc,
+                value_is_non_cell,
+            },
+            vec![
+                MachineOperand::location_input(owner),
+                MachineOperand::location_input(value),
+                MachineOperand::register_input(hit),
+            ],
+        );
+        barrier.clobbers = property_store_clobbers(target_spec, value_is_non_cell);
+        instructions.push(barrier);
+        accumulated_hit = hit;
+    }
+
     if stored.is_none() && exotic_length {
         let payload = push_value(representations, MachineRepresentation::Tagged);
         let hit = push_value(representations, MachineRepresentation::Boolean);

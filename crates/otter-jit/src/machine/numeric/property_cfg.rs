@@ -252,6 +252,7 @@ fn jump(instructions: &mut Vec<MachineInstruction>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::effects::{MachineAliasClass, MachineCommoning};
 
     #[test]
     fn megamorphic_load_keeps_one_pure_probe_and_the_existing_cold_call() {
@@ -299,6 +300,79 @@ mod tests {
                     .filter(|descriptor| {
                         matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
                     if target.id == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY.id)
+                    })
+                    .count(),
+                1
+            );
+            sequence
+                .allocate(&target)
+                .expect("megamorphic register allocation");
+        }
+    }
+
+    #[test]
+    fn megamorphic_store_commits_once_before_the_existing_cold_call() {
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let mut hir = super::super::tests::property_selection_hir();
+            let site = hir.property_sites.get_mut(&hir::NumericValue(3)).unwrap();
+            site.program = Box::default();
+            site.megamorphic_atom = Some(17);
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+                .expect("megamorphic property selection");
+            let stores = sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction.opcode,
+                        MachineOpcode::PropertyMegamorphicStore { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stores.len(), 1);
+            let store = stores[0];
+            assert!(matches!(
+                store.opcode,
+                MachineOpcode::PropertyMegamorphicStore {
+                    byte_pc: 40,
+                    atom: 17
+                }
+            ));
+            assert_eq!(store.operands.len(), 4);
+            assert_eq!(
+                store.clobbers,
+                target.clobbers(TargetClobberSet::PropertyStore)
+            );
+            assert!(store.safepoint.is_none() && store.exits.is_empty());
+            let effects = store.opcode.effects();
+            assert!(effects.reads.contains(MachineAliasClass::Shape));
+            assert!(effects.reads.contains(MachineAliasClass::PropertyMetadata));
+            assert!(effects.reads.contains(MachineAliasClass::PropertyField));
+            assert!(effects.writes.contains(MachineAliasClass::PropertyField));
+            assert_eq!(effects.commoning, MachineCommoning::Never);
+            assert!(
+                !effects.allocates && !effects.reentrant && !effects.throws && !effects.safepoint
+            );
+            assert_eq!(
+                sequence
+                    .instructions()
+                    .iter()
+                    .filter(|instruction| {
+                        matches!(
+                            instruction.opcode,
+                            MachineOpcode::CacheIrWriteBarrier { .. }
+                        )
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                sequence
+                    .call_descriptors()
+                    .iter()
+                    .filter(|descriptor| {
+                        matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
+                    if target.id == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY.id)
                     })
                     .count(),
                 1

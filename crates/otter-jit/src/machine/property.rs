@@ -9,8 +9,8 @@
 //! - Each operation owns its prepared program; the emitter uses the root view
 //!   only for isolate-wide physical layouts, never to look up property facts.
 //! - Programs contain stable shape tokens and offsets, not moving references.
-//! - Megamorphic loads carry only their source atom; the existing isolate table
-//!   remains the sole mutable lookup cache and is probed afresh at execution.
+//! - Megamorphic accesses carry only their source atom; the existing isolate
+//!   table remains the sole mutable lookup cache and is probed afresh at execution.
 //!
 //! # See also
 //! - `numeric::hir` retains these programs across graph transformations.
@@ -29,7 +29,7 @@ pub struct MachineCacheIrSite {
     pub byte_pc: u32,
     /// Prepared receiver-shape/slot alternatives from this compilation site.
     pub program: Box<[JitCacheIrProgram]>,
-    /// Atom for a load that consults the isolate's existing megamorphic table.
+    /// Atom for an access that consults the isolate's existing megamorphic table.
     pub megamorphic_atom: Option<u32>,
 }
 
@@ -45,8 +45,10 @@ impl MachineCacheIrSite {
             function_id: view.code_block.id,
             logical_pc: u32::try_from(logical_pc).ok()?,
             byte_pc,
-            megamorphic_atom: (op == Op::LoadProperty && view.property_lookup_cache.is_some())
-                .then(|| view.property_megamorphic_loads.get(&byte_pc).copied())
+            megamorphic_atom: view
+                .property_lookup_cache
+                .is_some()
+                .then(|| view.property_megamorphic_accesses.get(&byte_pc).copied())
                 .flatten(),
             program: view
                 .property_programs

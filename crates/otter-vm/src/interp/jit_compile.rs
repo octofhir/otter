@@ -821,13 +821,15 @@ impl Interpreter {
                     instr.byte_pc,
                     instr.instruction_pc(&view.code_block),
                     instr.op(&view.code_block),
-                    (instr.op(&view.code_block) == Op::LoadProperty)
-                        .then(|| instr.const_index(&view.code_block, 2))
-                        .flatten(),
+                    match instr.op(&view.code_block) {
+                        Op::LoadProperty => instr.const_index(&view.code_block, 2),
+                        Op::StoreProperty => instr.const_index(&view.code_block, 1),
+                        _ => None,
+                    },
                 )
             })
             .collect();
-        for (byte_pc, instruction_pc, op, load_name_index) in sites {
+        for (byte_pc, instruction_pc, op, name_index) in sites {
             let kind = if op == Op::LoadProperty {
                 crate::property_ic::PropertyIcKind::Load
             } else {
@@ -839,11 +841,11 @@ impl Interpreter {
             else {
                 continue;
             };
-            if op == Op::LoadProperty && slot.is_megamorphic() {
-                if let Some(key) = load_name_index.and_then(|name_index| {
+            if slot.is_megamorphic() {
+                if let Some(key) = name_index.and_then(|name_index| {
                     context.property_atom_for_function(view.code_block.id, name_index)
                 }) {
-                    view.property_megamorphic_loads
+                    view.property_megamorphic_accesses
                         .insert(byte_pc, key.atom().id().raw());
                 }
                 continue;

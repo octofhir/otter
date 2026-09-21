@@ -319,6 +319,15 @@ impl MachineOpcode {
                     .union(PROTOTYPE),
                 Value,
             ),
+            Self::PropertyMegamorphicStore { .. } => MachineEffects {
+                reads: SHAPE.union(PROPERTY_METADATA).union(PROPERTY_FIELD),
+                writes: PROPERTY_FIELD,
+                allocates: false,
+                reentrant: false,
+                throws: false,
+                safepoint: false,
+                commoning: Never,
+            },
             Self::CacheIrStoreField { .. } => MachineEffects::write(PROPERTY_FIELD),
             Self::CacheIrPublishShape { .. } => {
                 MachineEffects::write(SHAPE.union(PROPERTY_METADATA))

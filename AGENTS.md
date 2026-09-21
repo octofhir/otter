@@ -473,13 +473,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Named loads and stores expose their probe, hit edge,
     `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
     Success/Throw/Fatal control and join before register allocation.
-    Megamorphic loads expose `machineMegamorphicPropertyLoad` and a symbolic
+    Megamorphic accesses expose `machineMegamorphicPropertyLoad` /
+    `machineMegamorphicPropertyStore` and a symbolic
     `propertyLookupCacheTable` relocation to the isolate's existing fixed
     shape/atom table. Positive own/direct-prototype hits validate live ordinary
     state, the full key, holder shape and storage bounds before reading the
-    current slot. Entries hold pinned shape metadata, never moving object or
-    value pointers. Negative/deeper entries use the same rooted cold load;
-    stores retain their existing proofs. Table fills do not recompile the body.
+    current slot. Stores additionally require an own writable data slot, commit
+    once, and use the existing generated value barrier. Entries hold pinned
+    shape metadata, never moving object or value pointers. Negative, inherited,
+    read-only and exotic store entries use the same rooted cold store. Table
+    fills do not recompile the body.
     Local catches receive the pure exception payload through SSA landing edges
     without deopt or replay. The probe has no safepoint; only the cold call owns
     moving roots. Its stable untraced IC address must originate in a property

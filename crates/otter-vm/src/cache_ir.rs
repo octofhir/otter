@@ -485,6 +485,8 @@ pub(crate) struct ResolvedDataSlot {
     pub(crate) hit: AtomOwnPropertyHit,
     /// The value the slot holds right now.
     pub(crate) value: Value,
+    /// Whether the resolved data descriptor accepts an ordinary assignment.
+    pub(crate) is_writable: bool,
 }
 
 /// Resolve a named property to a plain data slot on the receiver or its direct
@@ -504,11 +506,12 @@ pub(crate) fn resolve_atom_data_slot(
         return None;
     }
     let own = object::lookup_own_atom(obj, heap, key);
-    if let (Some(hit), object::PropertyLookup::Data { value, .. }) = (own.hit, own.lookup) {
+    if let (Some(hit), object::PropertyLookup::Data { value, flags }) = (own.hit, own.lookup) {
         return Some(ResolvedDataSlot {
             hops: 0,
             hit,
             value,
+            is_writable: flags.writable(),
         });
     }
     if own.hit.is_some() {
@@ -519,13 +522,14 @@ pub(crate) fn resolve_atom_data_slot(
         return None;
     }
     let inherited = object::lookup_own_atom(proto, heap, key);
-    if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
+    if let (Some(hit), object::PropertyLookup::Data { value, flags }) =
         (inherited.hit, inherited.lookup)
     {
         return Some(ResolvedDataSlot {
             hops: 1,
             hit,
             value,
+            is_writable: flags.writable(),
         });
     }
     None

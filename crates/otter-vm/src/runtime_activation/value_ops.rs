@@ -566,6 +566,12 @@ impl RuntimeCall<'_> {
         let context = ambient
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)?;
+        // Template stores retain their per-site CacheIR behavior. Only an
+        // optimizing cold miss needs to seed the shared table used by the
+        // already-installed megamorphic generated sibling.
+        let fill_megamorphic_cache = unsafe {
+            self.frame.as_ref().header.kind == crate::native_abi::NativeFrameKind::Optimizing
+        };
         vm.jit_runtime_store_property_value(
             stack,
             &context,
@@ -573,6 +579,7 @@ impl RuntimeCall<'_> {
             instruction_pc,
             receiver,
             value,
+            fill_megamorphic_cache,
         )
     }
 

@@ -1037,6 +1037,16 @@ pub enum MachineOpcode {
         /// Exact interned property key, owned by the source operation.
         atom: u32,
     },
+    /// Probe the isolate's existing shape/atom table and commit one existing
+    /// own writable data-slot store. Every guard precedes the write; a miss
+    /// returns a false hit without effects. The owner output is consumed only
+    /// by the immediately following write barrier.
+    PropertyMegamorphicStore {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Exact interned property key, owned by the source operation.
+        atom: u32,
+    },
     /// Commit one existing own-data field store under a complete CacheIR guard
     /// chain. The parent address output is valid only for the immediately
     /// following write barrier and never crosses a safepoint.
@@ -2207,19 +2217,35 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::CacheIrStoreField { .. } => {
-                        let [object, value, active, owner, hit] = instruction.operands.as_slice()
-                        else {
-                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    MachineOpcode::CacheIrStoreField { .. }
+                    | MachineOpcode::PropertyMegamorphicStore { .. } => {
+                        let (object, value, active, owner, hit) = match instruction.opcode {
+                            MachineOpcode::CacheIrStoreField { .. } => {
+                                let [object, value, active, owner, hit] =
+                                    instruction.operands.as_slice()
+                                else {
+                                    return Err(VerificationError::OpcodeSignatureMismatch(id));
+                                };
+                                (object, value, Some(active), owner, hit)
+                            }
+                            MachineOpcode::PropertyMegamorphicStore { .. } => {
+                                let [object, value, owner, hit] = instruction.operands.as_slice()
+                                else {
+                                    return Err(VerificationError::OpcodeSignatureMismatch(id));
+                                };
+                                (object, value, None, owner, hit)
+                            }
+                            _ => unreachable!(),
                         };
                         if [object, value].iter().any(|operand| {
                             **operand != MachineOperand::location_input(operand.value)
                                 || self.representations[operand.value.0 as usize]
                                     != MachineRepresentation::Tagged
-                        }) || *active != MachineOperand::register_input(active.value)
-                            || self.representations[active.value.0 as usize]
-                                != MachineRepresentation::Boolean
-                            || *owner != MachineOperand::register_output(owner.value)
+                        }) || active.is_some_and(|active| {
+                            *active != MachineOperand::register_input(active.value)
+                                || self.representations[active.value.0 as usize]
+                                    != MachineRepresentation::Boolean
+                        }) || *owner != MachineOperand::register_output(owner.value)
                             || self.representations[owner.value.0 as usize]
                                 != MachineRepresentation::Int64
                             || *hit != MachineOperand::register_output(hit.value)

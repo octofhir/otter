@@ -310,6 +310,9 @@ impl MachineOpcode {
                 MachineEffects::read(SHAPE.union(PROPERTY_METADATA).union(PROTOTYPE), Guard)
             }
             Self::CacheIrLoadPrototype { .. } => MachineEffects::read(PROTOTYPE, Value),
+            Self::CacheIrLoadIntrinsicPrototype { .. } => {
+                MachineEffects::read(PROPERTY_METADATA.union(PROTOTYPE), Guard)
+            }
             Self::CacheIrGuardPrototypeNull { .. } => MachineEffects::read(PROTOTYPE, Guard),
             Self::CacheIrLoadField { .. } => MachineEffects::read(PROPERTY_FIELD, Value),
             Self::PropertyMegamorphicLoad { .. } => MachineEffects::read(

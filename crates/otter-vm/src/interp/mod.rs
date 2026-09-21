@@ -13,6 +13,7 @@ mod host;
 mod init;
 mod jit_call;
 mod jit_compile;
+mod jit_intrinsic_properties;
 mod modules;
 mod protos;
 mod restore;

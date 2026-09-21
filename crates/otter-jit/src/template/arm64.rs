@@ -731,6 +731,7 @@ pub(super) fn compile(
                     view,
                     dst,
                     object,
+                    instr.byte_pc,
                     name,
                     site,
                     array_length,

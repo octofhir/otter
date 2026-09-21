@@ -13,17 +13,21 @@
 //!   never from the builtin's identity.
 //! - Every field is re-validated by the emitted guard, so a stale snapshot can
 //!   only side-exit, never miscompile.
+//! - Collection prototypes are prepared before capturing their live own-name,
+//!   shape and slot proof; dictionary observations never become installed guards.
 
 use super::MethodCallIc;
 use crate::Interpreter;
-use crate::jit::{JitBodyGuard, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver};
+use crate::jit::{
+    JitBodyGuard, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver, JitIntrinsicPrototype,
+};
 
 fn value_slot_byte(slot: u16) -> u32 {
     u32::from(slot) * std::mem::size_of::<crate::Value>() as u32
 }
 
 /// The 32-bit no-expando/no-override word every `Map` and `Set` body carries.
-fn collection_guard() -> JitBodyGuard {
+pub(crate) fn collection_guard() -> JitBodyGuard {
     JitBodyGuard::clear(
         otter_gc::header::HEADER_SIZE as u32
             + crate::collections::MAP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
@@ -86,11 +90,11 @@ impl Interpreter {
             .as_native_function()
             .and_then(|native| native.native_ref(&self.gc_heap))?;
         Some(JitGuardedMethodCall {
-            receiver: JitGuardedReceiver::Exotic {
+            receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
                 guard: Some(dense_array_guard()),
                 proto_offset: proto.offset(),
-            },
+            }),
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: value_slot_byte(ic.proto_slot),
             builtin_native_ref,
@@ -142,11 +146,11 @@ impl Interpreter {
             .as_native_function()
             .and_then(|native| native.native_ref(&self.gc_heap))?;
         Some(JitGuardedMethodCall {
-            receiver: JitGuardedReceiver::Exotic {
+            receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
                 guard: None,
                 proto_offset: proto.offset(),
-            },
+            }),
             holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
             method_value_byte: value_slot_byte(hit.slot),
             builtin_native_ref,
@@ -167,7 +171,7 @@ impl Interpreter {
     /// are left to the normal fallback path because generated code only checks
     /// the collection body's no-override/no-expando guard flags.
     pub(crate) fn jit_collection_method_call(
-        &self,
+        &mut self,
         site: usize,
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
@@ -185,7 +189,7 @@ impl Interpreter {
             (None, Some(mutating)) => (mutating, crate::native_abi::NO_SAFEPOINT),
             (None, None) => (ic.alloc_stub_id?, alloc_safepoint_id),
         };
-        let (proto, receiver_type_tag) = if ic.op.is_map() {
+        let (mut proto, receiver_type_tag) = if ic.op.is_map() {
             (
                 self.realm_intrinsics.map_prototype()?,
                 crate::collections::MAP_BODY_TYPE_TAG,
@@ -196,10 +200,21 @@ impl Interpreter {
                 crate::collections::SET_BODY_TYPE_TAG,
             )
         };
-        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+        // Publish only stable hidden-class guards, including for method-only
+        // bodies compiled before any named collection property was observed.
+        self.migrate_slow_to_fast(&mut proto);
+        let holder_shape = crate::object::shape(proto, &self.gc_heap);
+        if holder_shape.is_null() {
             return None;
         }
-        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
+        // Shape preparation can replace dictionary metadata after this runtime
+        // IC was observed. Compile the live own-name proof, including its slot,
+        // rather than freezing the earlier dictionary identity into code.
+        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, ic.op.name());
+        let hit = hit?;
+        let crate::object::PropertyLookup::Data { value: method, .. } = lookup else {
+            return None;
+        };
         if !ic.op.matches_builtin(method, &self.gc_heap) {
             return None;
         }
@@ -207,13 +222,13 @@ impl Interpreter {
             .as_native_function()
             .and_then(|native| native.native_ref(&self.gc_heap))?;
         Some(JitGuardedMethodCall {
-            receiver: JitGuardedReceiver::Exotic {
+            receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: receiver_type_tag,
                 guard: Some(collection_guard()),
                 proto_offset: proto.offset(),
-            },
-            holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: value_slot_byte(ic.proto_slot),
+            }),
+            holder_shape: holder_shape.offset(),
+            method_value_byte: value_slot_byte(hit.slot),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,

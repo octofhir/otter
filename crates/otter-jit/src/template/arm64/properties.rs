@@ -48,6 +48,7 @@ pub(super) fn emit_load_property(
     view: &JitCompileSnapshot,
     dst: u16,
     object: u16,
+    byte_pc: u32,
     _name: u32,
     _site: u64,
     array_length: bool,
@@ -89,6 +90,7 @@ pub(super) fn emit_load_property(
             relocations,
             view,
             programs,
+            byte_pc,
             |ops, register| {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
                 Ok(())

@@ -312,6 +312,54 @@ pub(crate) fn emit_load_field(
     );
 }
 
+/// Prove the tagged receiver in `x9` and load its pinned realm prototype into
+/// `x15`. The following CacheIR nodes prove live shape/descriptor/slot state.
+/// Clobbers `x11..x15`; neither a miss nor a hit enters the runtime.
+pub(crate) fn emit_intrinsic_prototype_header(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    target: otter_vm::jit::JitIntrinsicPrototype,
+    byte_pc: u32,
+    miss: DynamicLabel,
+) {
+    if !target.is_property_receiver() {
+        dynasm!(ops ; .arch aarch64 ; b =>miss);
+        return;
+    }
+    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz x9, =>miss
+        ; mov x13, x9
+        ; ldrb w14, [x13]
+        ; cmp w14, u32::from(target.type_tag)
+        ; b.ne =>miss
+    );
+    if let Some(guard) = target.guard {
+        emit_body_guard(ops, guard, miss);
+    }
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        12,
+        u64::from(target.proto_offset),
+        RelocationTarget::GuardedHeapReference {
+            component: GuardedHeapComponent::Prototype,
+            byte_pc,
+            runtime_stub_id: otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY.id,
+        },
+    );
+    dynasm!(ops ; .arch aarch64 ; add x15, x15, x12);
+}
+
 /// Probe a named-property load site and leave the loaded `Value` in `x9`.
 ///
 /// The Template tier consumes the same immutable CacheIR DTO that Machine
@@ -327,25 +375,54 @@ pub(crate) fn emit_property_ic_load<R>(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     programs: Option<&[otter_vm::JitCacheIrProgram]>,
-    load_receiver: R,
+    byte_pc: u32,
+    mut load_receiver: R,
     _cell_addr: usize,
     _cell_ordinal: u32,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
-    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+    R: FnMut(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
     let Some(programs) = programs.filter(|programs| !programs.is_empty()) else {
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return Ok(());
     };
-    emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
+    let intrinsic = programs.iter().any(|program| {
+        matches!(
+            program.ops.first(),
+            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
+        )
+    });
+    if !intrinsic {
+        emit_load_header(ops, relocations, view, &mut load_receiver, 13, miss)?;
+    }
     let done = ops.new_dynamic_label();
     for program in programs {
         let next = ops.new_dynamic_label();
+        if matches!(
+            program.ops.first(),
+            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
+        ) {
+            load_receiver(ops, 9)?;
+        } else if intrinsic {
+            emit_load_header(ops, relocations, view, &mut load_receiver, 13, next)?;
+        }
         let mut terminal = false;
         for op in program.ops.iter() {
             match *op {
+                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype {
+                    object: 0,
+                    result: 1,
+                    target,
+                } => {
+                    emit_intrinsic_prototype_header(ops, relocations, view, target, byte_pc, next);
+                }
+                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. } => {
+                    return Err(Unsupported::OperandShape(
+                        "CacheIR intrinsic prototype operands",
+                    ));
+                }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = match object {
                         0 => 13,
@@ -572,6 +649,7 @@ where
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot { .. }
                 | otter_vm::JitCacheIrOp::LoadPrototype { .. }
+                | otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. }
                 | otter_vm::JitCacheIrOp::GuardExtensible { .. } => {
                     return Err(Unsupported::OperandShape("store CacheIR guard operands"));
                 }
@@ -1401,7 +1479,7 @@ where
 {
     // An exotic receiver is passed to the entry as its first operand, because
     // the operation is on that body; a shaped receiver only supplies arguments.
-    let receiver_is_operand = matches!(call.receiver, JitGuardedReceiver::Exotic { .. });
+    let receiver_is_operand = matches!(call.receiver, JitGuardedReceiver::Exotic(_));
     emit_guarded_method_guard(ops, relocations, view, call, receiver, byte_pc, miss)?;
     // An exotic receiver occupies the entry's first operand word, so the call's
     // own arguments shift one place along.
@@ -1518,11 +1596,11 @@ fn emit_guarded_method_guard_impl(
         // an expando, an overridden method or a custom descriptor makes the
         // prototype's slot the wrong answer even though the prototype itself is
         // unchanged.
-        JitGuardedReceiver::Exotic {
+        JitGuardedReceiver::Exotic(otter_vm::jit::JitIntrinsicPrototype {
             type_tag,
             guard,
             proto_offset,
-        } => {
+        }) => {
             emit_receiver_type_guard_impl(
                 ops,
                 relocations,

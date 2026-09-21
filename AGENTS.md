@@ -551,6 +551,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     Explicit calls guard the already-loaded callee after argument evaluation;
     their cold sibling retains that callee and receiver without another lookup.
     Map/string method calls currently retain the canonical Machine call boundary.
+    Separately evaluated Map/Set named property loads use
+    `machineCacheIrLoadIntrinsicPrototype`: exact type and the existing clean
+    instance latch select the pinned realm prototype, followed by ordinary
+    live shape/descriptor/slot guards. Template and Machine share the proof on
+    both backends. Same-slot replacements are read live; accessors, shadows
+    and prototype overrides use the committed cold load once. The generated
+    hit has no allocation, runtime call or safepoint, and preserves the loaded
+    callable across later argument evaluation. Collection `size` and primitive
+    String lookups retain their existing paths.
   - Optimizing plain/method scalar/named-load splices use the same HIR and allocator.
     The caller owns the identity/this guard; named accesses retain the callee's
     source program and cold activation recipes in `optimized-ir.txt`.

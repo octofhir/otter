@@ -19,6 +19,8 @@
 //!   through measurement but covers only actual tier-up invocations, while
 //!   layout diagnostics describe the prepared module and final native-code
 //!   residency once.
+//! - Kernel allocation and GC deltas use the same untimed snapshot window;
+//!   minor and full pause times stay separate because full GC includes a minor.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
 //! - Feedback seed calls stay interpreted so hot loops cannot OSR before every
@@ -1126,6 +1128,7 @@ fn run_kernel(
     let budget_before = interpreter.work_budget_stats();
     let property_before = interpreter.property_ic_stats();
     let call_before = context.call_feedback_stats();
+    let gc_before = interpreter.gc_stats_snapshot();
     for index in 0..warmup {
         let value = match run_kernel_invocation(&mut interpreter, &context, invocation_id) {
             Ok(value) => value,
@@ -1193,6 +1196,7 @@ fn run_kernel(
     let budget_after = interpreter.work_budget_stats();
     let property_after = interpreter.property_ic_stats();
     let call_after = context.call_feedback_stats();
+    let gc_after = interpreter.gc_stats_snapshot();
     measurements.diagnostics = vec![
         (
             "bytecode-compile-time",
@@ -1344,6 +1348,59 @@ fn run_kernel(
             call_after.megamorphic_sites,
         ),
     ];
+    // Cumulative counters cover warmup plus measurement, just like JIT counters.
+    // Do not add the pause totals: a full collection begins with a minor GC.
+    macro_rules! gc_deltas {
+        ($(($name:literal, $unit:ident, $field:ident)),+ $(,)?) => {
+            measurements.diagnostics.extend([$(
+                ($name, MetricUnit::$unit, gc_after.$field.saturating_sub(gc_before.$field)),
+            )+]);
+        };
+    }
+    gc_deltas![
+        ("gc-allocated-bytes", Bytes, alloc_bytes_total),
+        ("full-gc-cycles", Count, gc_cycles),
+        ("minor-gc-cycles", Count, minor_gc_cycles),
+        ("full-gc-pause-time-total", Nanoseconds, full_pause_ns_total),
+        (
+            "minor-gc-pause-time-total",
+            Nanoseconds,
+            minor_pause_ns_total
+        ),
+        (
+            "minor-gc-root-slots-scanned",
+            Count,
+            minor_root_slots_scanned
+        ),
+        ("minor-gc-slot-updates", Count, minor_slot_updates),
+        (
+            "minor-gc-dirty-cards-scanned",
+            Count,
+            minor_dirty_cards_scanned
+        ),
+        (
+            "minor-gc-old-headers-walked",
+            Count,
+            minor_old_headers_walked
+        ),
+        ("minor-gc-objects-retraced", Count, minor_objects_retraced),
+        ("minor-gc-slots-scanned", Count, minor_slots_scanned),
+    ];
+    let allocated_cells =
+        gc_after
+            .by_type
+            .iter()
+            .zip(&gc_before.by_type)
+            .fold(0u64, |total, (after, before)| {
+                total.saturating_add(
+                    after
+                        .alloc_count_total
+                        .saturating_sub(before.alloc_count_total),
+                )
+            });
+    measurements
+        .diagnostics
+        .push(("gc-allocated-cells", MetricUnit::Count, allocated_cells));
 
     RunRecord {
         name,
@@ -2687,6 +2744,72 @@ mod tests {
     }
 
     #[test]
+    fn kernel_gc_diagnostics_exclude_setup_and_include_warmup() {
+        let source_path = std::env::temp_dir().join(format!(
+            "otter-engine-kernel-gc-test-{}.js",
+            std::process::id()
+        ));
+        std::fs::write(
+            &source_path,
+            "const setup=[];for(let i=0;i<128;i++)setup.push({value:i});\
+             function engineKernel(){return 127;}",
+        )
+        .expect("write allocating setup fixture");
+        let run = || {
+            let record = run_kernel(
+                source_path.clone(),
+                "engineKernel".into(),
+                127.0,
+                EngineJitTier::Interpreter,
+                2,
+                1,
+            );
+            assert!(record.failure.is_none(), "{:?}", record.failure);
+            benchmark_result(record)
+        };
+        let diagnostic = |result: &BenchmarkResult, name: &str| {
+            let metric = result
+                .metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .unwrap_or_else(|| panic!("missing GC diagnostic {name}"));
+            assert_eq!(metric.role, MetricRole::Diagnostic);
+            assert_eq!(metric.direction, MetricDirection::Informational);
+            assert_eq!(metric.samples.len(), 1);
+            metric.samples[0].as_f64()
+        };
+        let setup_only = run();
+        assert_eq!(diagnostic(&setup_only, "gc-allocated-cells"), 0.0);
+        assert_eq!(diagnostic(&setup_only, "gc-allocated-bytes"), 0.0);
+        assert_eq!(diagnostic(&setup_only, "full-gc-cycles"), 0.0);
+        assert_eq!(diagnostic(&setup_only, "minor-gc-cycles"), 0.0);
+
+        std::fs::write(
+            &source_path,
+            "let first=true;function engineKernel(){if(first){first=false;\
+             const retained=[];for(let i=0;i<128;i++)retained.push({value:i});}\
+             return 127;}",
+        )
+        .expect("write allocating warmup fixture");
+        let warmup_allocation = run();
+        assert!(diagnostic(&warmup_allocation, "gc-allocated-cells") >= 128.0);
+        assert!(diagnostic(&warmup_allocation, "gc-allocated-bytes") > 0.0);
+        for name in [
+            "full-gc-pause-time-total",
+            "minor-gc-pause-time-total",
+            "minor-gc-root-slots-scanned",
+            "minor-gc-slot-updates",
+            "minor-gc-dirty-cards-scanned",
+            "minor-gc-old-headers-walked",
+            "minor-gc-objects-retraced",
+            "minor-gc-slots-scanned",
+        ] {
+            diagnostic(&warmup_allocation, name);
+        }
+        std::fs::remove_file(source_path).expect("remove GC kernel fixture");
+    }
+
+    #[test]
     fn kernel_reuses_one_interpreter_and_rejects_wrong_checksum() {
         let source_path = std::env::temp_dir().join(format!(
             "otter-engine-kernel-test-{}.js",
@@ -2766,6 +2889,112 @@ mod tests {
         let value = run_kernel_invocation(&mut interpreter, &context, invocation_id)
             .expect("invoke after full GC");
         assert_eq!(value.as_f64(), Some(42.0));
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn native_boundary_kernel_uses_generated_builtin_property_loads() {
+        let record = run_kernel(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/scripts/native-boundary.js"),
+            "engineKernel".into(),
+            27_000_000.0,
+            EngineJitTier::ProductionTiered,
+            1,
+            1,
+        );
+        assert!(record.failure.is_none(), "{:?}", record.failure);
+        let counter = |needle| {
+            record
+                .measurements
+                .jit_counters
+                .iter()
+                .find(|(name, _)| *name == needle)
+                .unwrap_or_else(|| panic!("missing kernel counter {needle}"))
+                .1
+        };
+        assert!(
+            record
+                .measurements
+                .diagnostics
+                .iter()
+                .find(|(name, _, _)| *name == "jit-installed-optimizing-bodies")
+                .is_some_and(|(_, _, value)| *value > 0),
+            "the native-boundary kernel must install an optimizing body"
+        );
+        let property_stubs = counter("jit-runtime-property-stubs");
+        assert!(
+            property_stubs < 500_000,
+            "Map method loads must stay generated across both invocations; got {property_stubs} property stubs"
+        );
+        assert_eq!(counter("jit-optimized-deopts"), 0);
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn kernel_keeps_installed_map_method_guards_after_property_preparation() {
+        let source_path = std::env::temp_dir().join(format!(
+            "otter-engine-kernel-map-preparation-test-{}.js",
+            std::process::id()
+        ));
+        std::fs::write(
+            &source_path,
+            r#"
+var table = new Map();
+table.set(0, 7);
+var sink;
+function methodOnly(receiver) { return receiver.get(0); }
+for (var warm = 0; warm < 4010; warm++) methodOnly(table);
+var iterations = 0;
+function engineKernel() {
+    var count = 0;
+    for (var index = 0; index < iterations; index++) {
+        sink = table.set;
+        count += 1;
+    }
+    var result = methodOnly(table);
+    return count + result + (typeof sink === 'function' ? 0 : 1);
+}
+engineKernel();
+iterations = 20000;
+"#,
+        )
+        .expect("write prototype preparation fixture");
+        for tier in [
+            EngineJitTier::Interpreter,
+            EngineJitTier::Template,
+            EngineJitTier::ProductionTiered,
+        ] {
+            let record = run_kernel(
+                source_path.clone(),
+                "engineKernel".into(),
+                20_007.0,
+                tier,
+                1,
+                1,
+            );
+            assert!(record.failure.is_none(), "{tier:?}: {:?}", record.failure);
+            let counter = |needle| {
+                record
+                    .measurements
+                    .jit_counters
+                    .iter()
+                    .find(|(name, _)| *name == needle)
+                    .unwrap_or_else(|| panic!("missing kernel counter {needle}"))
+                    .1
+            };
+            assert_eq!(counter("jit-optimized-deopts"), 0, "{tier:?}");
+            assert_eq!(counter("jit-generated-call-deopts"), 0, "{tier:?}");
+            // AArch64 Template already emits the Map method leaf. Its guard
+            // must remain valid when another compiled body prepares `.set`.
+            // Priming the caller before property preparation observes its call
+            // target; an invalidated Map leaf adds two generic transitions.
+            // x86 Template keeps its existing general native call boundary.
+            if cfg!(target_arch = "aarch64") && tier == EngineJitTier::Template {
+                assert_eq!(counter("jit-to-rust-call-transitions"), 0);
+            }
+        }
+        std::fs::remove_file(source_path).expect("remove prototype preparation fixture");
     }
 
     #[cfg(target_arch = "aarch64")]

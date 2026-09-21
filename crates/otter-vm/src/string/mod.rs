@@ -26,6 +26,8 @@
 //!   `&otter_gc::GcHeap` parameter; no thread-local heap.
 //! - Ordinary string bodies start in moving young space; callers keep values
 //!   live across allocation through scoped handles or traced slots.
+//! - In-place flattening reads contiguous bodies without constructing roots;
+//!   materialization retains the existing traced source and write barrier.
 //! - Concatenation preserves the exact `u32` UTF-16 length contract. A wider
 //!   sum returns [`StringConcatError::StringTooLong`] before allocation.
 //!
@@ -412,12 +414,16 @@ impl JsString {
 
     /// Flatten a rope / slice body **in place** so this handle (and every other
     /// handle to the same body) reads as a flat string thereafter. A no-op for
-    /// already-flat strings. Used before repeated scans (`indexOf`, `includes`,
+    /// contiguous strings, including collapsed slices, without constructing a
+    /// root scope. Used before repeated scans (`indexOf`, `includes`,
     /// `split`) so the body materializes once instead of on every call.
     ///
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn flatten_in_place(self, heap: &mut GcHeap) -> Result<(), OutOfMemory> {
+        if gc_body::is_contiguous(heap, self.handle) {
+            return Ok(());
+        }
         let mut source = self.handle;
         let mut scope = otter_gc::RootScope::new(heap);
         // SAFETY: `source` precedes the scope and remains stationary through

@@ -423,6 +423,25 @@ data. Generated add transitions prove their complete prototype contract,
 receiver extensibility, exact append position, and existing storage capacity
 before storing the value and publishing the child shape. Dictionary transitions
 and other allocation-requiring programs remain canonical.
+Named Map and Set loads use `machineCacheIrLoadIntrinsicPrototype` to prove
+the exact receiver type and its existing no-expando/no-prototype-override latch.
+The same CacheIR program then guards the pinned realm prototype's live shape,
+descriptor state and slot before reading the current value. Template and
+Machine share this receiver proof on AArch64 and x86-64. Replacing a data value
+in the same slot remains a generated hit; accessors, instance shadows and
+prototype overrides enter the existing committed load once. The hit has no
+runtime call, allocation, frame publication or safepoint. It returns the loaded
+callable before argument evaluation, preserving explicit-call ordering.
+Collection `size` and primitive String lookups retain their existing paths.
+Snapshot construction prepares collection prototype shapes before nested
+property or method proofs. Method-only snapshots also prepare their holder and
+resolve its live own slot, so later property compilation cannot invalidate an
+installed method guard by migrating a bootstrap dictionary.
+When profiling `native-boundary`, separate crossing counts from work inside
+each call. The optimizing kernel retains the canonical `indexOf` call boundary.
+Contiguous strings return from flattening before constructing a root scope;
+rope materialization keeps its traced source and existing write barrier.
+This changes the work inside the call without changing its crossing count.
 Megamorphic named accesses expose `machineMegamorphicPropertyLoad` and
 `machineMegamorphicPropertyStore`. These probes read the isolate's existing
 shared shape/atom table through a symbolic `propertyLookupCacheTable`

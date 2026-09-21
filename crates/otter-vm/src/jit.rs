@@ -601,15 +601,36 @@ pub enum JitGuardedReceiver {
     /// An exotic body named by its cell type tag, whose method always lives on
     /// a pinned realm prototype. The entry reads the receiver as its first
     /// argument, since the operation is *on* that body.
-    Exotic {
-        /// Expected receiver `GcHeader::type_tag`.
-        type_tag: u8,
-        /// Instance state that must hold before the prototype's method may be
-        /// trusted. `None` for a body that carries no such state.
-        guard: Option<JitBodyGuard>,
-        /// Compressed offset of the pinned realm prototype holding the builtin.
-        proto_offset: u32,
-    },
+    Exotic(JitIntrinsicPrototype),
+}
+
+/// Shared receiver proof for lookup through a pinned realm intrinsic prototype.
+///
+/// Primitive strings carry no own named fields except length and indices.
+/// Collection receivers additionally require the existing clean-instance latch.
+/// The prototype is pinned; its shape, descriptor state and fields stay live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitIntrinsicPrototype {
+    /// Exact receiver `GcHeader::type_tag`.
+    pub type_tag: u8,
+    /// Instance state required before the canonical prototype may be used.
+    pub guard: Option<JitBodyGuard>,
+    /// Compressed offset of the pinned realm prototype.
+    pub proto_offset: u32,
+}
+
+impl JitIntrinsicPrototype {
+    /// Whether this proof admits an ordinary named data load from the pinned
+    /// prototype. The collection latch excludes every instance override.
+    #[must_use]
+    pub fn is_property_receiver(self) -> bool {
+        matches!(
+            self.type_tag,
+            crate::collections::MAP_BODY_TYPE_TAG | crate::collections::SET_BODY_TYPE_TAG
+        ) && self.guard == Some(crate::method_ops::collection_guard())
+            && self.proto_offset != 0
+            && self.proto_offset.is_multiple_of(8)
+    }
 }
 
 /// One `Op::CallMethodValue` site whose callee is a declared native entry.
@@ -792,12 +813,13 @@ pub enum JitDirectCallThisMode {
     DerivedConstructor,
 }
 
-/// One target-neutral operation copied from a CodeBlock-owned CacheIR program.
+/// One target-neutral operation in an immutable CacheIR compilation program.
 ///
 /// Object operands are tiny CacheIR register ids: operand zero is the receiver
-/// and operand one is its direct prototype after `LoadPrototype`. Shape tokens
-/// are stable compressed offsets validated by the VM while the immutable
-/// compilation snapshot is built.
+/// and operand one is its direct or pinned intrinsic prototype. Ordinary
+/// programs come from CodeBlock feedback; intrinsic programs compose the same
+/// slot proof with a realm-owned receiver declaration. Shape tokens are stable
+/// compressed offsets validated by the VM while the snapshot is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitCacheIrOp {
     /// Continue only while the object has the expected fast hidden class.
@@ -825,6 +847,16 @@ pub enum JitCacheIrOp {
         object: u8,
         /// CacheIR object operand receiving the prototype.
         result: u8,
+    },
+    /// Prove an exotic receiver and read its pinned canonical prototype.
+    /// Subsequent ordinary guards validate the prototype's live data slot.
+    LoadIntrinsicPrototype {
+        /// CacheIR receiver operand to guard.
+        object: u8,
+        /// CacheIR operand receiving the prototype.
+        result: u8,
+        /// Existing receiver/type/latch proof shared with native methods.
+        target: JitIntrinsicPrototype,
     },
     /// Prove that an object's direct prototype is null.
     GuardPrototypeNull {
@@ -874,7 +906,7 @@ pub enum JitCacheIrOp {
 /// committed canonical cold edge; a tier never executes a partial program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JitCacheIrProgram {
-    /// Complete operation sequence in interpreter execution order.
+    /// Complete operation sequence proving one effect-once property hit.
     pub ops: Box<[JitCacheIrOp]>,
 }
 

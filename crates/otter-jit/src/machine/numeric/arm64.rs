@@ -1949,6 +1949,34 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::CacheIrLoadIntrinsicPrototype { byte_pc, target } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                crate::template::arm64::ic_probe::emit_intrinsic_prototype_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    target,
+                    byte_pc,
+                    miss,
+                );
+                dynasm!(ops ; .arch aarch64 ; mov x10, x15 ; movz w11, 1 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
+                emit_load_u64(&mut ops, 11, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 10, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[3], 11, 0)?;
+                structural_regions.push((
+                    "machineCacheIrLoadIntrinsicPrototype",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrLoadPrototype { byte_pc } => {
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();

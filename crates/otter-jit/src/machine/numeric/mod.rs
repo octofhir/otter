@@ -3207,13 +3207,27 @@ fn select_cache_ir_property_programs(
                     instructions.push(guard);
                     active = next;
                 }
-                otter_vm::JitCacheIrOp::LoadPrototype { object, result } => {
+                otter_vm::JitCacheIrOp::LoadPrototype { object, result }
+                | otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { object, result, .. } => {
+                    if stored.is_some()
+                        && matches!(op, otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
+                    {
+                        return Err(cache_ir_signature_error(instructions.len()));
+                    }
                     let object = cache_ir_object(&objects, object, instructions.len())?;
                     let prototype = push_value(representations, MachineRepresentation::Tagged);
                     let next = push_value(representations, MachineRepresentation::Boolean);
                     let mut load = MachineInstruction::plain(
-                        MachineOpcode::CacheIrLoadPrototype {
-                            byte_pc: source.byte_pc,
+                        match *op {
+                            otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { target, .. } => {
+                                MachineOpcode::CacheIrLoadIntrinsicPrototype {
+                                    byte_pc: source.byte_pc,
+                                    target,
+                                }
+                            }
+                            _ => MachineOpcode::CacheIrLoadPrototype {
+                                byte_pc: source.byte_pc,
+                            },
                         },
                         vec![
                             MachineOperand::location_input(object),

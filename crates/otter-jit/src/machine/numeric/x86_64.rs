@@ -5,6 +5,7 @@
 //! - Allocation-driven frames, spill moves, scalar operations, control flow,
 //!   cooperative polling, and exact deoptimization exits.
 //! - Typed derived-constructor `this` binding and exact class-super loads.
+//! - Shared pure receiver proofs for intrinsic-prototype CacheIR loads.
 //!
 //! # Invariants
 //! - This encoder consumes the same verified Machine sequence, allocation,
@@ -871,6 +872,39 @@ pub(super) fn emit(
                     } else {
                         "machineCacheIrGuardAtomSlot"
                     },
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrLoadIntrinsicPrototype { byte_pc, target } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[0], 11)?;
+                load_integer(&mut ops, frame, loc[1], 10)?;
+                dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
+                crate::template::x86_64::intrinsic_prototype::emit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    target,
+                    byte_pc,
+                    11,
+                    miss,
+                );
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r9d, 1
+                    ; jmp =>done
+                    ; =>miss
+                );
+                load64(&mut ops, 8, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; xor r9d, r9d ; =>done);
+                store_integer(&mut ops, frame, loc[2], 8)?;
+                store_integer(&mut ops, frame, loc[3], 9)?;
+                structural_regions.push((
+                    "machineCacheIrLoadIntrinsicPrototype",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

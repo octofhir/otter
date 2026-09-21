@@ -255,6 +255,105 @@ mod tests {
     use crate::machine::effects::{MachineAliasClass, MachineCommoning};
 
     #[test]
+    fn intrinsic_property_load_keeps_receiver_proof_and_committed_cold_edge() {
+        use otter_vm::jit::{JitCacheIrOp, JitCacheIrProgram, JitIntrinsicPrototype};
+        let proof = JitIntrinsicPrototype {
+            type_tag: otter_vm::collections::MAP_BODY_TYPE_TAG,
+            guard: Some(otter_vm::JitBodyGuard::clear(
+                // The repr(C) collection body's first field is the latch.
+                otter_gc::header::HEADER_SIZE as u32,
+                otter_vm::JitGuardWidth::Word32,
+            )),
+            proto_offset: 0x1000,
+        };
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let mut hir = super::super::tests::property_selection_hir();
+            let site = hir.property_sites.get_mut(&hir::NumericValue(2)).unwrap();
+            site.program = Box::new([JitCacheIrProgram {
+                ops: Box::new([
+                    JitCacheIrOp::LoadIntrinsicPrototype {
+                        object: 0,
+                        result: 1,
+                        target: proof,
+                    },
+                    JitCacheIrOp::GuardShape {
+                        object: 1,
+                        shape: 0x2000,
+                    },
+                    JitCacheIrOp::GuardAtomSlot {
+                        object: 1,
+                        atom: 17,
+                        value_byte: 8,
+                        writable: false,
+                    },
+                    JitCacheIrOp::LoadField {
+                        object: 1,
+                        value_byte: 8,
+                    },
+                ]),
+            }]);
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+                .expect("intrinsic property selection");
+            let probe = sequence
+                .instructions()
+                .iter()
+                .find(|instruction| {
+                    matches!(
+                        instruction.opcode,
+                        MachineOpcode::CacheIrLoadIntrinsicPrototype { .. }
+                    )
+                })
+                .expect("explicit receiver proof");
+            assert_eq!(probe.operands.len(), 4);
+            assert!(probe.safepoint.is_none() && probe.exits.is_empty());
+            let effects = probe.opcode.effects();
+            assert!(effects.writes.is_empty());
+            assert!(
+                !effects.allocates && !effects.reentrant && !effects.throws && !effects.safepoint
+            );
+            assert_eq!(effects.commoning, MachineCommoning::Guard);
+            assert!(effects.reads.contains(MachineAliasClass::PropertyMetadata));
+            assert_eq!(
+                sequence
+                    .call_descriptors()
+                    .iter()
+                    .filter(|descriptor| {
+                        matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }
+                    if target.id == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY.id)
+                    })
+                    .count(),
+                1
+            );
+            sequence
+                .allocate(&target)
+                .expect("intrinsic property allocation");
+
+            for invalid in [
+                JitIntrinsicPrototype {
+                    guard: None,
+                    ..proof
+                },
+                JitIntrinsicPrototype {
+                    proto_offset: 0,
+                    ..proof
+                },
+                JitIntrinsicPrototype {
+                    type_tag: otter_vm::string::JS_STRING_BODY_TYPE_TAG,
+                    ..proof
+                },
+            ] {
+                let site = hir.property_sites.get_mut(&hir::NumericValue(2)).unwrap();
+                site.program[0].ops[0] = JitCacheIrOp::LoadIntrinsicPrototype {
+                    object: 0,
+                    result: 1,
+                    target: invalid,
+                };
+                assert!(select_with_loop_entries(&target, &hir, &hir.plan_loop_entries()).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn megamorphic_load_keeps_one_pure_probe_and_the_existing_cold_call() {
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
             let mut hir = super::super::tests::property_selection_hir();

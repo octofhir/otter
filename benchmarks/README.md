@@ -125,6 +125,17 @@ the last sample. These values are diagnostic rather than ranking inputs:
 counter totals cover all warmup and measured invocations, while compile and
 layout values describe the prepared module or tiering lifetime once.
 
+Kernel GC diagnostics use the same warmup-plus-measurement window, with both
+snapshots outside timed samples. `gc-allocated-cells` and `gc-allocated-bytes`
+count managed allocations after fixture setup; `full-gc-cycles` and
+`minor-gc-cycles` count collections. `full-gc-pause-time-total` and
+`minor-gc-pause-time-total` retain separate cumulative nanosecond deltas: a full
+collection includes a minor collection, so these durations must not be added.
+Minor root scans, slot updates and remembered-set scanning counters explain
+collection work and moving-value activity. These diagnostics are totals, not
+per-sample durations, and do not include Rust allocator or external backing-store
+allocations.
+
 ```bash
 cargo run --release -p otter-benchmark --features engine \
   --bin otter-engine-benchmark -- \

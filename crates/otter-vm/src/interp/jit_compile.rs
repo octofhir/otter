@@ -23,6 +23,8 @@
 //! Eager direct-target compilation consumes an explicit depth budget, so a
 //! closure-backed target can bring in one nested hot edge without recursively
 //! compiling an unbounded observed call graph.
+//! Property shape preparation precedes nested body and method snapshots, so
+//! metadata migration cannot immediately stale a freshly captured method guard.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -474,6 +476,7 @@ impl Interpreter {
         self.bake_string_constant_cells(&mut snapshot, context, fid)?;
         self.bake_global_lexical_loads(&mut snapshot, context, fid);
         self.bake_binding_hit_proofs(&mut snapshot, context, fid);
+        self.bake_property_cache_ir(&mut snapshot, context);
         self.bake_inline_callees(
             &mut snapshot,
             context,
@@ -483,7 +486,6 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
-        self.bake_property_cache_ir(&mut snapshot, context);
         self.bake_constructor_field_transitions(&mut snapshot);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
@@ -689,6 +691,7 @@ impl Interpreter {
         }
         self.bake_global_lexical_loads(&mut view, context, fid);
         self.bake_binding_hit_proofs(&mut view, context, fid);
+        self.bake_property_cache_ir(&mut view, context);
         self.bake_inline_callees(
             &mut view,
             context,
@@ -698,7 +701,6 @@ impl Interpreter {
         );
         self.bake_guarded_method_calls(&mut view);
         self.bake_element_accesses(&mut view);
-        self.bake_property_cache_ir(&mut view, context);
         self.bake_constructor_field_transitions(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
@@ -850,12 +852,22 @@ impl Interpreter {
                 }
                 continue;
             }
-            if let Some(programs) = slot.jit_programs(|shape_id| {
-                self.shape_runtime
-                    .handle_for_id(shape_id)
-                    .map(|shape| shape.offset())
-                    .filter(|&offset| offset != 0)
-            }) {
+            let mut programs = slot
+                .jit_programs(|shape_id| {
+                    self.shape_runtime
+                        .handle_for_id(shape_id)
+                        .map(|shape| shape.offset())
+                        .filter(|&offset| offset != 0)
+                })
+                .unwrap_or_default();
+            if op == Op::LoadProperty
+                && let Some(key) = name_index.and_then(|name_index| {
+                    context.property_atom_for_function(view.code_block.id, name_index)
+                })
+            {
+                programs.extend(self.jit_intrinsic_property_programs(key));
+            }
+            if !programs.is_empty() {
                 view.property_programs.insert(byte_pc, programs);
             }
         }
@@ -1677,10 +1689,10 @@ impl Interpreter {
             Self::bake_string_layout(&mut body);
             self.bake_string_constant_cells(&mut body, context, fid)?;
             self.bake_global_lexical_loads(&mut body, context, fid);
+            self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
             self.bake_guarded_method_calls(&mut body);
             self.bake_element_accesses(&mut body);
-            self.bake_property_cache_ir(&mut body, context);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
         })();

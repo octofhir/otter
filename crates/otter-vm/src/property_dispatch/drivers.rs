@@ -12,6 +12,8 @@
 //! - Ordinary named-load attachment prepares eligible dictionary receivers
 //!   through the same rooted shape migration as compiled cold loads, before
 //!   either tier snapshots the CodeBlock-owned feedback.
+//! - Primitive receivers are reloaded from their traced register after boxing
+//!   or lookup can collect, before the original receiver reaches a getter.
 //!
 //! # See also
 //! - `cache_ir` for guarded store completion and allocation-failure handling.
@@ -188,6 +190,9 @@ impl Interpreter {
             || receiver.is_big_int()
         {
             let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])?;
+            // Boxing can move a string, symbol or BigInt receiver. Its source
+            // register is the existing root; the copied value is no longer live.
+            let receiver = *read_register(&stack[top_idx], obj_reg)?;
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx].advance_pc()?;
             match self.ordinary_get_value(stack, context, boxed, receiver, &key, 0)? {
@@ -195,6 +200,7 @@ impl Interpreter {
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        let receiver = *read_register(&stack[top_idx], obj_reg)?;
                         self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::undefined())?;

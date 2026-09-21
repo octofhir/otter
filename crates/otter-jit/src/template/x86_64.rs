@@ -15,7 +15,8 @@
 //!   shared activation-window descriptors.
 //! - Canonical indexed loads and stores through committed element descriptors.
 //! - Named-property CacheIR hits for existing slots and allocation-free shape
-//!   transitions, including receiver storage and write-barrier proofs.
+//!   transitions, including receiver storage and write-barrier proofs, plus
+//!   guarded lookup through pinned intrinsic prototypes.
 //! - Structured try/catch/finally operations through the VM-owned exception
 //!   transition protocol.
 //! - Cooperative interrupt/work-budget polling on every generated backedge.
@@ -48,6 +49,8 @@ use std::collections::{BTreeMap, BTreeSet};
 mod direct_call;
 #[path = "x86_64/exceptions.rs"]
 mod exceptions;
+#[path = "x86_64/intrinsic_prototype.rs"]
+pub(crate) mod intrinsic_prototype;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
@@ -636,6 +639,7 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     view,
+                    instruction.byte_pc,
                     dst,
                     object,
                     cell as *mut crate::entry::PropertySourceCell as u64,
@@ -2477,6 +2481,7 @@ fn emit_load_property(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    byte_pc: u32,
     dst: u16,
     object: u16,
     cell_addr: u64,
@@ -2487,7 +2492,16 @@ fn emit_load_property(
 ) {
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    emit_existing_property_load(ops, relocations, view, object, programs, miss, done);
+    emit_existing_property_load(
+        ops,
+        relocations,
+        view,
+        byte_pc,
+        object,
+        programs,
+        miss,
+        done,
+    );
     dynasm!(ops ; .arch x64 ; =>miss);
     emit_load_reg(ops, 6, object);
     emit_load_symbol_u64(
@@ -2521,10 +2535,12 @@ fn emit_load_property(
     emit_store_reg(ops, 0, dst);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_existing_property_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
+    byte_pc: u32,
     object: u16,
     programs: Option<&[otter_vm::JitCacheIrProgram]>,
     miss: DynamicLabel,
@@ -2535,7 +2551,15 @@ fn emit_existing_property_load(
         return;
     };
     emit_load_reg(ops, 0, object);
-    emit_template_object_header(ops, relocations, view, 0, 10, miss);
+    let has_intrinsic = programs.iter().any(|program| {
+        matches!(
+            program.ops.first(),
+            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
+        )
+    });
+    if !has_intrinsic {
+        emit_template_object_header(ops, relocations, view, 0, 10, miss);
+    }
     for program in programs {
         if !program
             .ops
@@ -2553,12 +2577,44 @@ fn emit_existing_property_load(
             continue;
         }
         let next = ops.new_dynamic_label();
+        let intrinsic = matches!(
+            program.ops.first(),
+            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
+        );
+        if has_intrinsic && !intrinsic {
+            emit_template_object_header(ops, relocations, view, 0, 10, next);
+        }
         let mut terminal = false;
         for op in &program.ops {
             match *op {
+                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype {
+                    object: 0,
+                    result: 1,
+                    target,
+                } => {
+                    intrinsic_prototype::emit(ops, relocations, view, target, byte_pc, 0, next);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
+                        ; jne =>next
+                    );
+                }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = if object == 0 { 10 } else { 8 };
-                    emit_template_shape_guard(ops, view, header, shape, next);
+                    if intrinsic {
+                        // Realm prototypes may have benign symbol sidecars.
+                        // The live ordinary lookup flags, not sidecar absence,
+                        // determine whether their shape slots remain valid.
+                        emit_template_shape_state_guard(ops, view, header, next);
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp BYTE [Rq(header) + view.object_slot_attrs_overridden_byte as i32], 0
+                            ; jne =>next
+                        );
+                        emit_template_shape_identity_guard(ops, view, header, shape, next);
+                    } else {
+                        emit_template_shape_guard(ops, view, header, shape, next);
+                    }
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     writable: false, ..

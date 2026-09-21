@@ -1016,6 +1016,14 @@ pub enum MachineOpcode {
         /// Source byte offset used by artifacts.
         byte_pc: u32,
     },
+    /// Prove an exotic receiver's type and clean-instance latch, then expose
+    /// its pinned realm prototype to ordinary CacheIR shape/slot guards.
+    CacheIrLoadIntrinsicPrototype {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Shared receiver proof and pinned prototype identity.
+        target: otter_vm::jit::JitIntrinsicPrototype,
+    },
     /// Prove that an object's direct prototype is null under a prior CacheIR
     /// condition.
     CacheIrGuardPrototypeNull {
@@ -2193,11 +2201,15 @@ impl InstructionSequence {
                         }
                     }
                     MachineOpcode::CacheIrLoadPrototype { .. }
+                    | MachineOpcode::CacheIrLoadIntrinsicPrototype { .. }
                     | MachineOpcode::CacheIrLoadField { .. } => {
                         let [object, active, payload, hit] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
-                        if *object != MachineOperand::location_input(object.value)
+                        if matches!(instruction.opcode,
+                            MachineOpcode::CacheIrLoadIntrinsicPrototype { target, .. }
+                                if !target.is_property_receiver())
+                            || *object != MachineOperand::location_input(object.value)
                             || self.representations[object.value.0 as usize]
                                 != MachineRepresentation::Tagged
                             || *active != MachineOperand::register_input(active.value)

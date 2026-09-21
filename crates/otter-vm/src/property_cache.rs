@@ -2,9 +2,9 @@
 //!
 //! One direct-mapped table shares resolved own/direct-prototype data slots
 //! across property sites. Runtime loads consult it when a per-site program
-//! misses; generated megamorphic loads probe the same entries before entering
-//! their committed cold sibling. Every hit validates the live receiver and
-//! holder, then reads the current value rather than caching a JavaScript value.
+//! misses; generated megamorphic accesses probe the same entries before
+//! entering their committed cold sibling. Every hit validates live state and
+//! reads or writes the current slot rather than caching a JavaScript value.
 //!
 //! # Contents
 //! - [`PropertyLookupCache`] — the direct-mapped table.
@@ -59,6 +59,8 @@ struct Entry {
     /// `0` when the receiver owns the slot, `1` when its direct prototype
     /// does, [`Entry::UNRESOLVABLE`] when no data slot describes this pair.
     hops: u8,
+    /// Whether the resolved data descriptor was writable.
+    is_writable: bool,
     /// The holder's own-slot hit, revalidated on every read.
     hit: AtomOwnPropertyHit,
 }
@@ -74,6 +76,7 @@ impl Entry {
         receiver_shape: ShapeId::UNASSIGNED,
         atom: AtomId::NONE,
         hops: 0,
+        is_writable: false,
         hit: AtomOwnPropertyHit::PLACEHOLDER,
     };
 }
@@ -168,6 +171,7 @@ impl PropertyLookupCache {
                 hops: entry.hops,
                 hit: entry.hit,
                 value,
+                is_writable: entry.is_writable,
             }),
             None => PropertyProbe::Unknown,
         }
@@ -193,6 +197,7 @@ impl PropertyLookupCache {
             receiver_shape,
             atom,
             hops: resolved.map_or(Entry::UNRESOLVABLE, |resolved| resolved.hops),
+            is_writable: resolved.is_some_and(|resolved| resolved.is_writable),
             hit: resolved.map_or(
                 AtomOwnPropertyHit {
                     shape_id: proto_shape_id(obj, heap),

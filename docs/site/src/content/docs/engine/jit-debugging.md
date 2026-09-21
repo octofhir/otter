@@ -423,16 +423,20 @@ data. Generated add transitions prove their complete prototype contract,
 receiver extensibility, exact append position, and existing storage capacity
 before storing the value and publishing the child shape. Dictionary transitions
 and other allocation-requiring programs remain canonical.
-Megamorphic named loads expose `machineMegamorphicPropertyLoad`. This pure probe
-reads the isolate's existing shared shape/atom table through a symbolic
-`propertyLookupCacheTable` relocation. Own and direct-prototype data hits validate
-the live object state, full key, holder shape and storage bounds, then load the
-current slot. Cache fills and collisions do not replace the compiled body.
+Megamorphic named accesses expose `machineMegamorphicPropertyLoad` and
+`machineMegamorphicPropertyStore`. These probes read the isolate's existing
+shared shape/atom table through a symbolic `propertyLookupCacheTable`
+relocation. Own and direct-prototype data loads validate the live object state,
+full key, holder shape and storage bounds, then load the current slot. Stores
+additionally require an own writable data slot, perform one write, and run the
+existing generated value barrier. Cache fills and collisions do not replace
+the compiled body.
 The table has a fixed address for the owning isolate's lifetime and contains
 pinned shape metadata, not moving receivers, prototypes or cached values. The
 non-reentrant probe retains no borrowed slot address across a collection.
-Negative, exotic and deeper-prototype entries use the same rooted cold load; stores
-retain their existing CacheIR or canonical path. Bootstrap dictionary receivers
+Negative, exotic and deeper-prototype loads use the same rooted cold load.
+Inherited, read-only, accessor and exotic stores use the rooted cold store.
+Bootstrap dictionary receivers
 are prepared while attaching interpreter feedback before the first OSR snapshot.
 Success or throw commits once; named-property misses do not exact-deopt and
 replay the source operation. Both named loads and stores split their generated

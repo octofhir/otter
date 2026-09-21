@@ -957,6 +957,23 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::PropertyMegamorphicStore { byte_pc, atom } => {
+                let start = ops.offset().0;
+                megamorphic_property::emit_store(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    frame,
+                    loc,
+                    atom,
+                )?;
+                structural_regions.push((
+                    "machineMegamorphicPropertyStore",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrStoreField {
                 byte_pc,
                 value_byte,

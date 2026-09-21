@@ -1,10 +1,12 @@
-//! Generated named loads through the isolate's shared property lookup cache.
+//! Generated named accesses through the isolate's shared property lookup cache.
 //!
 //! # Contents
 //! - Terminal megamorphic sites reuse own and direct-prototype data entries.
 //! - New shapes populate the same table without replacing compiled code.
 //! - Live payloads, prototype changes, accessors and proxies retain semantics.
 //! - Allocating cold getters preserve object identity under moving collection.
+//! - Megamorphic stores prove an own writable data slot before one write and
+//!   reuse the existing generational/incremental barrier.
 //!
 //! # Invariants
 //! - Successful probes load the current slot and never retain a cached Value.
@@ -45,6 +47,26 @@ for (let warm = 0; warm < 4010; warm++) {
 }
 "#;
 
+const STORE_SETUP: &str = r#"
+const megaStoreReceivers = [
+    { value: 1, a: 1 },
+    { b: 2, value: 2 },
+    { c: 3, d: 4, value: 3 },
+    { value: 4, e: 5, f: 6 },
+    { g: 7, value: 5, h: 8 },
+    { i: 9, j: 10, value: 6, k: 11 },
+];
+function sharedMegamorphicStore(receiver, value) {
+    for (let index = 0; index < 3; index++) {}
+    receiver.value = value;
+    return value;
+}
+for (let warm = 0; warm < 4010; warm++) {
+    const receiver = megaStoreReceivers[warm % megaStoreReceivers.length];
+    sharedMegamorphicStore(receiver, warm);
+}
+"#;
+
 fn warmed() -> Runtime {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
@@ -77,6 +99,48 @@ fn warmed() -> Runtime {
     );
     assert_eq!(
         regions.matches("machinePropertyLoadCold").count(),
+        1,
+        "{regions}"
+    );
+    runtime
+}
+
+fn warmed_store() -> Runtime {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .build()
+        .expect("megamorphic store runtime");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(STORE_SETUP),
+            "megamorphic-store-setup.js",
+        )
+        .expect("warm megamorphic named store");
+    let bundle = result
+        .jit_artifacts()
+        .expect("captured megamorphic store artifacts")
+        .bundles()
+        .iter()
+        .find(|bundle| {
+            bundle.manifest().function_name() == "sharedMegamorphicStore"
+                && bundle.manifest().tier() == JitDebugTier::Optimizing
+        })
+        .unwrap_or_else(|| panic!("missing Machine store: {:?}", result.jit_debug_report()));
+    let regions = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::CodeMap)
+            .expect("megamorphic store code map")
+            .contents(),
+    )
+    .expect("UTF-8 code map");
+    assert!(
+        regions.contains("machineMegamorphicPropertyStore"),
+        "{regions}"
+    );
+    assert!(regions.contains("machineCacheIrWriteBarrier"), "{regions}");
+    assert_eq!(
+        regions.matches("machinePropertyStoreCold").count(),
         1,
         "{regions}"
     );
@@ -279,4 +343,88 @@ megaArguments[0] = new Proxy({ value: 92 }, { get(target, key) {
         "[92,2]"
     );
     assert_probe(before, runtime.execution_stats(), 1);
+}
+
+#[test]
+fn megamorphic_store_hits_and_keeps_young_values_alive() {
+    let mut runtime = warmed_store();
+    let before = runtime.execution_stats();
+    assert_eq!(
+        run(
+            &mut runtime,
+            "sharedMegamorphicStore(megaStoreReceivers[2], 97);"
+        ),
+        "97",
+    );
+    assert_probe(before, runtime.execution_stats(), 0);
+
+    let before = runtime.execution_stats();
+    assert_eq!(
+        run(
+            &mut runtime,
+            r#"
+const megaStored = { marker: 97 };
+const megaStoreResult = sharedMegamorphicStore(megaStoreReceivers[2], megaStored);
+const megaStorePressure = [];
+for (let index = 0; index < 128; index++) megaStorePressure.push({ index });
+JSON.stringify([
+    megaStoreResult === megaStored,
+    megaStoreReceivers[2].value === megaStored,
+    megaStoreReceivers[2].value.marker,
+    megaStorePressure[127].index,
+]);
+"#,
+        ),
+        "[true,true,97,127]",
+    );
+    let after = runtime.execution_stats();
+    assert_no_replay(before, after);
+    if let Some(stride @ (1 | 4 | 16)) = std::env::var("OTTER_GC_STRESS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        assert!(after.gc_minor_cycles - before.gc_minor_cycles >= 128 / stride);
+        assert!(after.gc_minor_slot_updates > before.gc_minor_slot_updates);
+    }
+}
+
+#[test]
+fn non_writable_and_accessor_stores_use_the_committed_sibling_once() {
+    let mut runtime = warmed_store();
+    run(
+        &mut runtime,
+        r#"
+Object.defineProperty(megaStoreReceivers[0], 'value', {
+    configurable: true,
+    writable: false,
+    value: 41,
+});
+let megaStoreSetterCalls = 0;
+let megaStoreSetterValue = 0;
+Object.defineProperty(megaStoreReceivers[1], 'value', {
+    configurable: true,
+    get() { return megaStoreSetterValue; },
+    set(value) { megaStoreSetterCalls++; megaStoreSetterValue = value; },
+});
+"#,
+    );
+    let before = runtime.execution_stats();
+    assert_eq!(
+        run(
+            &mut runtime,
+            r#"
+JSON.stringify([
+    sharedMegamorphicStore(megaStoreReceivers[0], 99),
+    megaStoreReceivers[0].value,
+    sharedMegamorphicStore(megaStoreReceivers[1], 73),
+    megaStoreReceivers[1].value,
+    megaStoreSetterCalls,
+]);
+"#,
+        ),
+        "[99,41,73,73,1]",
+    );
+    let after = runtime.execution_stats();
+    assert_no_replay(before, after);
+    assert!(after.jit_runtime_property_stubs > before.jit_runtime_property_stubs);
 }

@@ -500,7 +500,7 @@ impl CodeBlock {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_programs: rustc_hash::FxHashMap::default(),
             property_lookup_cache: None,
-            property_megamorphic_loads: rustc_hash::FxHashMap::default(),
+            property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),

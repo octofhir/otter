@@ -293,9 +293,10 @@ pub struct JitCompileSnapshot {
     /// Stable layout of this isolate's existing shared property lookup table.
     /// Generated load probes read its live entries without a runtime call.
     pub property_lookup_cache: Option<JitPropertyLookupCache>,
-    /// Terminal megamorphic named loads: source byte PC to isolate-global atom.
-    /// Stores and negative table results keep their committed cold operation.
-    pub property_megamorphic_loads: rustc_hash::FxHashMap<u32, u32>,
+    /// Terminal megamorphic named accesses: source byte PC to isolate-global
+    /// atom. Generated stores admit only an own writable data-slot proof;
+    /// negative and unsupported table results keep the committed cold operation.
+    pub property_megamorphic_accesses: rustc_hash::FxHashMap<u32, u32>,
     /// Direct physical hit proofs for schema-owned binding sites, keyed by
     /// byte-PC. See [`BindingHitProof`].
     pub binding_hit_proofs: rustc_hash::FxHashMap<u32, BindingHitProof>,
@@ -1455,7 +1456,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_programs: rustc_hash::FxHashMap::default(),
             property_lookup_cache: None,
-            property_megamorphic_loads: rustc_hash::FxHashMap::default(),
+            property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),

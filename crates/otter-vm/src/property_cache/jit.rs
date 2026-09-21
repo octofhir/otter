@@ -14,9 +14,9 @@
 //! - Entries contain scalar keys and pinned, immortal shape handles, never a
 //!   moving receiver, prototype, JavaScript value or borrowed slab address.
 //! - Generated positive hits validate the live receiver/holder ordinary state,
-//!   exact key and holder shape, data kind and storage bounds. Negative entries
-//!   and unsupported prototype depths miss before effects. Only loads use this
-//!   layout; a data-load proof does not authorize a property store.
+//!   exact key and holder shape, descriptor kind and storage bounds. Loads may
+//!   use own/direct-prototype data slots. Stores additionally require an own
+//!   writable data slot before their single effect.
 //!
 //! # See also
 //! - `super` owns the only table and every producer/runtime consumer.
@@ -56,6 +56,8 @@ pub struct JitPropertyLookupCache {
     pub slot_byte: u32,
     /// Offset of the cached one-byte data-kind Boolean.
     pub is_data_byte: u32,
+    /// Offset of the cached one-byte writable-descriptor Boolean.
+    pub is_writable_byte: u32,
     /// Header-inclusive offset of the shape cell's immutable `u64` identity.
     pub shape_id_byte: u32,
     /// Multiplier of the receiver shape in the shared index calculation.
@@ -80,6 +82,7 @@ impl PropertyLookupCache {
             holder_shape_byte: (hit + offset_of!(AtomOwnPropertyHit, shape)) as u32,
             slot_byte: (hit + offset_of!(AtomOwnPropertyHit, slot)) as u32,
             is_data_byte: (hit + offset_of!(AtomOwnPropertyHit, is_data)) as u32,
+            is_writable_byte: offset_of!(Entry, is_writable) as u32,
             shape_id_byte: (otter_gc::header::HEADER_SIZE + crate::object::SHAPE_BODY_ID_OFFSET)
                 as u32,
             hash_shape_multiplier: HASH_SHAPE_MULTIPLIER,

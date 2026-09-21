@@ -168,6 +168,7 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
+        fill_megamorphic_cache: bool,
     ) -> Result<(), VmError> {
         if self.jit_debug_request().events_enabled() {
             self.complete_named_store::<true>(
@@ -177,6 +178,7 @@ impl Interpreter {
                 instruction_pc,
                 receiver,
                 value,
+                fill_megamorphic_cache,
             )
         } else {
             self.complete_named_store::<false>(
@@ -186,6 +188,7 @@ impl Interpreter {
                 instruction_pc,
                 receiver,
                 value,
+                fill_megamorphic_cache,
             )
         }
     }
@@ -200,6 +203,7 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
+        fill_megamorphic_cache: bool,
     ) -> Result<(), VmError> {
         let (atomized_key, slot) =
             named_property_site(context, function_id, instruction_pc, Op::StoreProperty)?;
@@ -248,7 +252,9 @@ impl Interpreter {
                     .escape_scoped(receiver_root)
                     .as_object()
                     .ok_or(VmError::InvalidOperand)?;
-                let _ = current_obj;
+                if fill_megamorphic_cache && slot.is_megamorphic() {
+                    let _ = self.resolve_property_data_slot(current_obj, atomized_key);
+                }
                 return Ok(());
             }
             if entries_len > 0 {
@@ -326,6 +332,16 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to property '{}'", atomized_key.name()),
                 )?;
+            } else if fill_megamorphic_cache && slot.is_megamorphic() {
+                // The committed store may have allocated a slab or published a
+                // child shape. Re-read the rooted receiver, then make that
+                // final own writable slot available to already-installed
+                // megamorphic code without recompiling it.
+                let current_obj = self
+                    .escape_scoped(receiver_root)
+                    .as_object()
+                    .ok_or(VmError::InvalidOperand)?;
+                let _ = self.resolve_property_data_slot(current_obj, atomized_key);
             }
             Ok(())
         })();

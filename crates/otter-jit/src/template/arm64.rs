@@ -810,14 +810,16 @@ pub(super) fn compile(
                 byte_pc,
             } => {
                 let argument_registers = plan.call_argument_registers(argc, packed_args);
-                // A monomorphic site takes the generated direct-call edge;
-                // everything else completes through the callee-carrying value
-                // transition, which never side-exits.
-                if view
-                    .direct_callees
-                    .get(&byte_pc)
-                    .and_then(|targets| targets.first())
-                    .is_some_and(crate::arm64::direct_call_target_is_supported)
+                // A monomorphic site takes the generated direct-call edge and a
+                // declared static native its leaf; everything else completes
+                // through the callee-carrying value transition, which never
+                // side-exits.
+                if view.static_native_calls.contains_key(&byte_pc)
+                    || view
+                        .direct_callees
+                        .get(&byte_pc)
+                        .and_then(|targets| targets.first())
+                        .is_some_and(crate::arm64::direct_call_target_is_supported)
                 {
                     calls::emit_call_with_receiver(
                         &mut ops,

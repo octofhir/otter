@@ -47,7 +47,10 @@ pub(crate) fn supports_site(
     else {
         return false;
     };
+    // A plain call passes no receiver word, so an entry reading `this` is
+    // lowered only by the explicit-receiver probe.
     view.native_ref_byte != 0
+        && !declaration.this_operand
         && argument_count == usize::from(declaration.argument_count)
         && target.argument_count == declaration.argument_count
         && otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)

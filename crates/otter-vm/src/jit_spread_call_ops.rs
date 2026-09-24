@@ -162,7 +162,11 @@ impl Interpreter {
                                 &interp.gc_heap,
                             )
                         })
-                        .filter(|declaration| usize::from(declaration.argument_count) == args_len)
+                        // Shaped method entries receive only arguments.
+                        .filter(|declaration| {
+                            usize::from(declaration.argument_count) == args_len
+                                && !declaration.this_operand
+                        })
                         .is_some_and(|declaration| {
                             interp.record_method_native_leaf_feedback(
                                 feedback_site,

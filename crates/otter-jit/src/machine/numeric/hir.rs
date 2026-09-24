@@ -1732,7 +1732,7 @@ fn build_raw_blocks(
                         .const_index(code, 3)
                         .and_then(|count| usize::try_from(count).ok())
                         .is_some_and(|count| {
-                            super::native_call_cfg::method_hit(view, call, count).is_some()
+                            super::native_call_cfg::method_hit(view, call, count, false).is_some()
                         })
                 }),
             Op::CallWithThis => view
@@ -1743,7 +1743,7 @@ fn build_raw_blocks(
                         .const_index(code, 3)
                         .and_then(|count| usize::try_from(count).ok())
                         .is_some_and(|count| {
-                            super::native_call_cfg::supports_resolved(view, call, count)
+                            super::native_call_cfg::resolved_hit(view, call, count, false).is_some()
                         })
                 }),
             _ => false,
@@ -2977,10 +2977,14 @@ fn lower_instruction(
             if explicit_receiver
                 && exceptional_edge.is_none()
                 && let Some(call) = view.static_native_calls.get(&instruction.byte_pc).copied()
-                && super::native_call_cfg::supports_resolved(view, call, argument_count)
-                && arguments
-                    .iter()
-                    .all(|argument| nodes[argument.0].value_type() == NumericType::Int32)
+                && let Some(hit) = super::native_call_cfg::resolved_hit(
+                    view,
+                    call,
+                    argument_count,
+                    arguments
+                        .iter()
+                        .all(|argument| nodes[argument.0].value_type() == NumericType::Int32),
+                )
             {
                 let receiver = read_value(registers, register(instruction, code, 2)?)?;
                 let (argument_start, _) = append_operand_values(operand_values, arguments)?;
@@ -2992,7 +2996,7 @@ fn lower_instruction(
                             callee: source,
                             call,
                         },
-                        hit: super::native_call_cfg::HitKind::Int32Math,
+                        hit,
                         argument_start,
                         logical_pc,
                         byte_pc: instruction.byte_pc,
@@ -3281,11 +3285,14 @@ fn lower_instruction(
                 .collect::<Option<Vec<_>>>()?;
             if exceptional_edge.is_none()
                 && let Some(call) = view.guarded_method_calls.get(&instruction.byte_pc).copied()
-                && let Some(hit) = super::native_call_cfg::method_hit(view, call, argument_count)
-                && (hit == super::native_call_cfg::HitKind::Leaf
-                    || arguments
+                && let Some(hit) = super::native_call_cfg::method_hit(
+                    view,
+                    call,
+                    argument_count,
+                    arguments
                         .iter()
-                        .all(|argument| nodes[argument.0].value_type() == NumericType::Int32))
+                        .all(|argument| nodes[argument.0].value_type() == NumericType::Int32),
+                )
             {
                 let (argument_start, _) = append_operand_values(operand_values, arguments)?;
                 let value = push(

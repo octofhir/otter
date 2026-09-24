@@ -4,8 +4,8 @@
 //! - Direct `Map.get(Int32)` and existing-key `Map.set(Int32, value)`.
 //! - Missing keys, tombstones, growth, SameValueZero fallback, and barriers.
 //! - Method replacement and own-method shadowing after tier-up.
-//! - Artifact proof that generated hits retain neither a Rust leaf ABI nor a
-//!   published transition-frame prelude.
+//! - Artifact proof that an explicit-receiver `Map.get` calls its declared
+//!   no-allocation leaf with no published transition frame.
 //!
 //! # Invariants
 //! - Optimizing results match the interpreter oracle exactly.
@@ -144,14 +144,10 @@ fn optimizing_map_artifacts_expose_frame_free_machine_hits() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !relocations.contains("collection_map_get_leaf"),
-        "Map.get must complete without the Rust leaf ABI: {relocations}"
+        relocations.contains("collection_map_get_leaf"),
+        "Map.get must call its declared no-allocation leaf: {relocations}"
     );
-    assert!(
-        !relocations.contains("collection_map_set_mutating"),
-        "existing-key Map.set must complete without the Rust leaf ABI: {relocations}"
-    );
-    let machine_intrinsics = optimizing
+    let leaf_probes = optimizing
         .iter()
         .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
         .map(|file| {
@@ -160,13 +156,14 @@ fn optimizing_map_artifacts_expose_frame_free_machine_hits() {
             map["regions"].as_array().map_or(0, |regions| {
                 regions
                     .iter()
-                    .filter(|region| region["kind"] == "machineMethodIntrinsic")
+                    .filter(|region| region["kind"] == "machineNativeLeafProbe")
                     .count()
             })
         })
         .sum::<usize>();
+    // `set` may insert and allocate, so it keeps the committed call.
     assert!(
-        machine_intrinsics >= 2,
-        "Map.get and Map.set must each expose a frame-free machine hit"
+        leaf_probes >= 1,
+        "the loaded Map.get callee must complete in a frame-free leaf probe"
     );
 }

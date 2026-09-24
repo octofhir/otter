@@ -1172,7 +1172,10 @@ impl Interpreter {
             method.as_native_function()?,
             &self.gc_heap,
         )?;
-        (argc == usize::from(declaration.argument_count)).then_some(declaration.leaf_stub_id)
+        // A shaped method site passes only its arguments, so an entry that
+        // reads `this` as an operand word is never recorded here.
+        (argc == usize::from(declaration.argument_count) && !declaration.this_operand)
+            .then_some(declaration.leaf_stub_id)
     }
 
     /// Bake every `Op::CallMethodValue` site whose callee is a declared native
@@ -1231,7 +1234,9 @@ impl Interpreter {
             if recv_shape_offset == 0 {
                 continue;
             }
-            let Some(declaration) = crate::jit_static_native::jit_leaf_builtin(stub_id) else {
+            let Some(declaration) = crate::jit_static_native::jit_leaf_builtin(stub_id)
+                .filter(|declaration| !declaration.this_operand)
+            else {
                 continue;
             };
             // A builtin this isolate never installed has no external-ref

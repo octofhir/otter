@@ -1,5 +1,3 @@
-#![cfg(target_arch = "aarch64")]
-
 //! Template-inlined numeric-leaf production-entry invariants.
 //!
 //! # Contents
@@ -9,14 +7,19 @@
 //!
 //! # Invariants
 //! - The template inliner keeps the monomorphic leaf in the caller activation.
-//! - A non-Number input runs coercion exactly once without a generated-call
-//!   deopt, so abrupt completion keeps its identity.
+//!   Once the caller reaches the optimizing tier, its protected call enters
+//!   the optimizing leaf through generated linkage and completes there.
+//! - A non-Number input runs coercion exactly once, so abrupt completion keeps
+//!   its identity. The inlined template leaf coerces in place; the optimizing
+//!   leaf takes one exact pre-coercion exit on the first such input.
 //! - The compiled caller, inlined leaf, globals, and retained results remain
 //!   reusable across full moving collections.
 //!
 //! # See also
 //! - `optimizing_leaf_deopt.rs` covers optimizing-tier guard exits.
 //! - `jit_call_lifecycle.rs` covers compiled direct-call ownership.
+
+#![cfg(target_arch = "aarch64")]
 
 use otter_runtime::{
     JitDebugEvent, JitDebugRequest, JitDebugTier, JitSelection, Runtime, RuntimeExecutionStats,
@@ -65,11 +68,13 @@ globalThis.__numericThrowing = {
 globalThis.__numericLeaf = numericLeaf;
 globalThis.__numericCaller = numericCaller;
 
-var warm = 0;
-for (var index = 0; index < 4300; index++) {
-  warm += numericCaller(2);
-}
-globalThis.__numericWarm = warm;
+// Native iteration drives every warm call through a whole-function entry: a
+// JavaScript warm loop would itself tier up through OSR and call the caller
+// through generated linkage.
+globalThis.__numericWarm = new Array(4300)
+  .fill(2)
+  .map(numericCaller)
+  .reduce((total, value) => total + value, 0);
 "#;
 
 const GUARD_MISSES: &str = r#"
@@ -173,8 +178,30 @@ fn production_inline_full_gc_and_nested_abrupt_exit_stay_reusable() {
         "production tiering must inline the hot monomorphic leaf: {:?}",
         compiled.stats
     );
-    assert_eq!(compiled.stats.jit_generated_calls, 0);
-    assert_eq!(compiled.stats.jit_generated_call_deopts, 0);
+    // The optimizing `numericCaller` keeps its call inside `try` as generated
+    // linkage to a native leaf entry; every such call completes there.
+    let stats = &compiled.stats;
+    assert_eq!(
+        stats.jit_generated_calls,
+        stats.jit_generated_optimizing_entries + stats.jit_generated_template_entries,
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.jit_generated_optimizing_entries,
+        stats.jit_generated_optimizing_returns
+            + stats.jit_generated_optimizing_throws
+            + stats.jit_generated_optimizing_deopts,
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.jit_generated_template_entries,
+        stats.jit_generated_template_returns + stats.jit_generated_template_throws,
+        "{stats:?}"
+    );
+    // The first non-Number input exits the optimizing leaf before coercion
+    // once; the recompiled leaf then completes every call in place.
+    assert_eq!(stats.jit_generated_optimizing_deopts, 1, "{stats:?}");
+    assert_eq!(compiled.stats.jit_generated_call_deopts, 1);
     assert_eq!(compiled.stats.jit_generated_template_deopts, 0);
     assert_eq!(compiled.stats.jit_to_rust_call_transitions, 0);
     assert_eq!(

@@ -7,6 +7,8 @@
 //! # Invariants
 //! - An inlining claim requires emitted body IR and real optimizing entries.
 //! - A cold property operation commits once and returns to the same Machine body.
+//! - A shape-proven spliced read whose receiver changes shape takes one exact
+//!   exit before any accessor effect.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
@@ -29,7 +31,10 @@ function caller(a, b, mark) {
     return value;
 }
 var a = {x:1.25,y:2,z:3}, b = {x:4,y:5,z:6}, mark = {before:0,after:0};
-for (var i=0;i<70000;i++) caller(a,b,mark);
+// Two shapes of `a` keep its reads CacheIR probes with committed cold
+// siblings, so a later getter reenters and returns to this Machine body.
+var a2 = {w:0,x:1.25,y:2,z:3};
+for (var i=0;i<70000;i++) caller((i&1)?a2:a,b,mark);
 "#,
             ),
             "inline-property-warm.js",
@@ -189,8 +194,22 @@ for(var i=0;i<70000;i++) caller(b);
             .unwrap()
             .contents(),
     );
+    // Both arrow reads are shape-proven, so the splice publishes no cold call;
+    // its exits reconstruct the arrow frame above the caller.
+    let deopt: serde_json::Value = serde_json::from_slice(
+        bundle
+            .file(JitArtifactFileName::Deopt)
+            .expect("arrow caller deopt metadata")
+            .contents(),
+    )
+    .expect("valid deopt JSON");
     assert!(
-        ir.contains("GuardCallTarget { guard: Plain") && ir.contains("inline-frames="),
+        ir.contains("GuardCallTarget { guard: Plain")
+            && deopt["frameStates"]
+                .as_array()
+                .is_some_and(|states| states.iter().any(|state| state["frames"]
+                    .as_array()
+                    .is_some_and(|frames| frames.len() == 2))),
         "arrow body must splice: {ir}"
     );
     assert!(!ir.contains("Direct {"));
@@ -215,5 +234,7 @@ JSON.stringify([value,reads]);
         after.jit_optimized_entries + after.jit_generated_optimizing_entries
             > before.jit_optimized_entries + before.jit_generated_optimizing_entries
     );
-    assert_eq!(after.jit_optimized_deopts - before.jit_optimized_deopts, 0);
+    // The accessor changes the captured receiver's shape: the spliced
+    // `this.x` read takes its one exact exit before the getter runs.
+    assert_eq!(after.jit_optimized_deopts - before.jit_optimized_deopts, 1);
 }

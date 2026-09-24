@@ -24,7 +24,10 @@ fn inline_initializer_stores_commit_once() {
 function initialize(o,x){"use strict";o.x=x;return o.bias+1;}
 function caller(o,x,mark){mark.before++;var value=initialize(o,x);mark.after++;return value;}
 var payload={value:37},o={x:null,bias:1.25},mark={before:0,after:0};
-for(var i=0;i<70000;i++)caller(o,payload,mark);
+// Two shapes of `o` keep the store and the `bias` read CacheIR probes with
+// committed cold siblings, so an installed setter returns to this body.
+var o2={w:0,x:null,bias:1.25};
+for(var i=0;i<70000;i++)caller((i&1)?o2:o,payload,mark);
 "#,
             ),
             "inline-store-warm.js",

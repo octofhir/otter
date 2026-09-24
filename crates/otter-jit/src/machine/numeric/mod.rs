@@ -127,6 +127,7 @@ mod inlining;
 mod native_call_cfg;
 mod partial_escape;
 mod property_cfg;
+mod property_speculation;
 mod semantics;
 
 use otter_vm::{
@@ -1006,6 +1007,41 @@ fn select_with_loop_entries(
                 )?;
                 continue;
             }
+            if let NumericNode::PropertyShapeLoad {
+                receiver,
+                byte_pc,
+                shape,
+                value_byte,
+                ordinary,
+            } = node
+            {
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                let point = NumericFramePoint::Node(node_value);
+                property_speculation::select(
+                    target_spec,
+                    hir,
+                    receiver,
+                    machine_value(&values, node_value),
+                    byte_pc,
+                    property_speculation::ShapeLoad {
+                        shape,
+                        value_byte,
+                        ordinary,
+                    },
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                );
+                continue;
+            }
             if let NumericNode::NativeCall { receiver, .. } = node {
                 if block.nodes.last().copied() != Some(node_value) {
                     return Err(super::VerificationError::OpcodeSignatureMismatch(first));
@@ -1820,6 +1856,9 @@ fn select_with_loop_entries(
                 }
                 NumericNode::ConstructorFieldStore { .. } => {
                     unreachable!("constructor effects select before ordinary nodes")
+                }
+                NumericNode::PropertyShapeLoad { .. } => {
+                    unreachable!("speculative property loads select before ordinary nodes")
                 }
                 NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. } => {
                     unreachable!("element nodes select their explicit CFG before ordinary nodes")
@@ -3854,7 +3893,7 @@ fn frame_state_exits(
             NumericNode::ConstructReceiver { .. } | NumericNode::ArrayConstruct { .. } => {
                 &[(ExitReason::AllocationMiss, ExitAction::Resume)]
             }
-            NumericNode::ConstructorFieldStore { .. } => {
+            NumericNode::ConstructorFieldStore { .. } | NumericNode::PropertyShapeLoad { .. } => {
                 &[(ExitReason::ShapeGuard, ExitAction::Recompile)]
             }
             NumericNode::TaggedToNumber(..)

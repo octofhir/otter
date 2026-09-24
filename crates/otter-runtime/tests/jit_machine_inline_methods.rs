@@ -32,7 +32,10 @@ function caller(a, b, mark) {
 }
 var a = {x:1.25,y:2,z:3}, b = {x:4,y:5,z:6}, mark = {before:0,after:0};
 Object.setPrototypeOf(a,proto);
-for (var i=0;i<70000;i++) caller(a,b,mark);
+// Two shapes of `b` keep its reads CacheIR probes with committed cold
+// siblings, so a later getter reenters and returns to this Machine body.
+var b2 = {w:0,x:4,y:5,z:6};
+for (var i=0;i<70000;i++) caller(a,(i&1)?b2:b,mark);
 "#,
             ),
             "inline-property-warm.js",

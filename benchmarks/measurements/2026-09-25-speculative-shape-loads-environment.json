@@ -1,0 +1,56 @@
+{
+  "baseEngineCommit": "1a6da666c012cf6230add3a7ae22633865ec5152",
+  "candidateEngine": "Speculative monomorphic own-data loads in Machine IR (PropertyShapeProof + GuardCondition shapeGuard/recompile exit + PropertySlotLoad); LICM no longer counts the header OsrEntry as a loop write.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "sources": {
+    "boxed-double-property": {
+      "path": "benchmarks/scripts/boxed-double-property.js",
+      "sha256": "f8438171e7928f97a2a0c8f53b3523203e6c37e2c807a83ec4d0385bb456361f",
+      "expected": 4000000
+    },
+    "method-call-monomorphic": {
+      "path": "benchmarks/scripts/method-call-monomorphic.js",
+      "sha256": "22b3ffbdec9ce88d5f05040ee8153a9d94d339d1150f1b71d2e1ba43370e95bf",
+      "expected": 500003500000
+    },
+    "math-explicit-calls": {
+      "path": "benchmarks/scripts/math-explicit-calls.js",
+      "sha256": "a5fcfe5295f5df656e775f2bae0ffb88be1a175c58b7485c01088520af38c3ec",
+      "expected": 2200000
+    }
+  },
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "dc3e1d78656108489de694d1fead36d89e2dceec16b86c6b149db349b42d4d12",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "c14fded05f29203f66b4ef90ef8aae6301839d13aff1118bcf64038a8bd6fc8b",
+    "afterIsFullGateBuild": true
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/<kernel>.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "<checksum>",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per kernel and tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series. Load average about 3.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "excludedFromResult": [
+    "development cost.sh comparisons against bin/before (same source, non-gate build)"
+  ]
+}

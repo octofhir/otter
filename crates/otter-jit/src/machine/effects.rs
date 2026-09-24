@@ -325,7 +325,8 @@ impl MachineOpcode {
             | Self::CacheIrGuardDictionaryLayout { .. }
             | Self::CacheIrGuardOrdinaryState { .. }
             | Self::CacheIrGuardAtomSlot { .. }
-            | Self::CacheIrGuardExtensible { .. } => {
+            | Self::CacheIrGuardExtensible { .. }
+            | Self::PropertyShapeProof { .. } => {
                 MachineEffects::read(SHAPE.union(PROPERTY_METADATA).union(PROTOTYPE), Guard)
             }
             Self::CacheIrLoadPrototype { .. } => MachineEffects::read(PROTOTYPE, Value),
@@ -333,7 +334,9 @@ impl MachineOpcode {
                 MachineEffects::read(PROPERTY_METADATA.union(PROTOTYPE), Guard)
             }
             Self::CacheIrGuardPrototypeNull { .. } => MachineEffects::read(PROTOTYPE, Guard),
-            Self::CacheIrLoadField { .. } => MachineEffects::read(PROPERTY_FIELD, Value),
+            Self::CacheIrLoadField { .. } | Self::PropertySlotLoad { .. } => {
+                MachineEffects::read(PROPERTY_FIELD, Value)
+            }
             Self::PropertyMegamorphicLoad { .. } => MachineEffects::read(
                 SHAPE
                     .union(PROPERTY_METADATA)

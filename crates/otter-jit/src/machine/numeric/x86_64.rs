@@ -1019,6 +1019,80 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::PropertyShapeProof {
+                byte_pc,
+                shape,
+                ordinary,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
+                if ordinary {
+                    ordinary_lookup_state_guard(&mut ops, view, miss);
+                } else {
+                    shape_state_guard(&mut ops, view, miss);
+                }
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r10d, [r11 + view.object_shape_byte as i32]
+                    ; test r10d, r10d
+                    ; jz =>miss
+                    ; cmp r10d, shape as i32
+                    ; jne =>miss
+                    ; mov r10d, 1
+                    ; jmp =>done
+                    ; =>miss
+                    ; xor r10d, r10d
+                    ; =>done
+                );
+                store_integer(&mut ops, frame, loc[1], 10)?;
+                structural_regions.push((
+                    "machinePropertyShapeProof",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::PropertySlotLoad {
+                byte_pc,
+                value_byte,
+            } => {
+                // The dominating shape proof established an ordinary object
+                // owning this slot, so only the moving-safe decode remains.
+                let start = ops.offset().0;
+                let spilled = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[0], 11)?;
+                dynasm!(ops ; .arch x64 ; mov r11d, r11d);
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    10,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch x64
+                    ; add r11, r10
+                    ; mov r10d, [r11 + view.object_slab_handle_byte as i32]
+                    ; test r10d, r10d
+                    ; jnz =>spilled
+                    ; lea r8, [r11 + view.object_inline_values_byte as i32]
+                    ; jmp =>done
+                    ; =>spilled
+                    ; mov r8, [r11 + view.object_values_ptr_byte as i32]
+                    ; =>done
+                    ; mov r8, [r8 + value_byte as i32]
+                );
+                store_integer(&mut ops, frame, loc[1], 8)?;
+                structural_regions.push((
+                    "machinePropertySlotLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::PropertyMegamorphicStore { byte_pc, atom } => {
                 let start = ops.offset().0;
                 megamorphic_property::emit_store(

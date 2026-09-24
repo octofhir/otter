@@ -354,10 +354,16 @@ for (let warm = 0; warm < 4010; warm++) explicitMathNamespaceLoop(16);
                 && bundle.manifest().tier() == JitDebugTier::Optimizing
         })
         .expect("namespace optimizing body");
+    // Each settled namespace method load is a shape-proven slot read.
     let code_map = artifact_text(bundle, JitArtifactFileName::CodeMap);
     assert_eq!(
-        code_map.matches("machineCacheIrLoadField").count(),
+        code_map.matches("\"machinePropertySlotLoad\"").count(),
         3,
+        "{code_map}"
+    );
+    assert_eq!(
+        code_map.matches("machineCacheIrLoadField").count(),
+        0,
         "{code_map}"
     );
     let before = runtime.execution_stats();

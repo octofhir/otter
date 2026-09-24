@@ -475,8 +475,14 @@ Negative, exotic and deeper-prototype loads use the same rooted cold load.
 Inherited, read-only, accessor and exotic stores use the rooted cold store.
 Bootstrap dictionary receivers
 are prepared while attaching interpreter feedback before the first OSR snapshot.
-Success or throw commits once; named-property misses do not exact-deopt and
-replay the source operation. Both named loads and stores split their generated
+Success or throw commits once; committed named-property misses do not
+exact-deopt and replay the source operation. A settled monomorphic own-data
+load is the exception: it lowers to `machinePropertyShapeProof` and
+`machinePropertySlotLoad` with one `shapeGuard` exit before the load, which the
+interpreter then performs once. A trace shows at most one such `bail` per site;
+the recompiled site keeps the committed probe below. Repeated `shapeGuard`
+bails at one `LoadProperty` indicate a missing exit record. Other named loads
+and stores split their generated
 probe/commit and rooted cold call before register allocation. Cold calls expose
 `machinePropertyLoadCold` or `machinePropertyStoreCold`, followed by explicit
 Success/Throw/Fatal control. Unprotected load/store helper bodies can inline;
@@ -612,6 +618,10 @@ Machine effect table for aliasing writes, safepoints, allocation, throws, and
 reentry. Hoisted values become explicit loop-header SSA arguments, so register
 allocation and OSR observe the same lifetime.
 
+A loop header's OSR entry is not a boundary: the split preheader starts with it,
+so an OSR entry runs every hoisted proof itself. A shape-proven load's
+`machinePropertyShapeProof` therefore leaves a loop whose body writes no shape,
+descriptor or prototype state, while its exit and slot read stay in the body.
 Method, global-object, property, and element accesses keep their ordinary
 explicit guards and live loads when a loop contains an invalidating boundary.
 There are no activation-local method/global raw-address caches or cache-clear

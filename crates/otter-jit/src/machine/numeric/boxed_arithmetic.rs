@@ -164,7 +164,9 @@ fn visit_inputs(
             visit(receiver, true);
             visit(value, true);
         }
-        PropertyLoad { receiver, .. } => visit(receiver, true),
+        PropertyLoad { receiver, .. } | PropertyShapeLoad { receiver, .. } => {
+            visit(receiver, true);
+        }
         BaseConstructResult { result, receiver } => {
             visit(result, true);
             visit(receiver, true);

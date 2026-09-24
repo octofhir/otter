@@ -179,12 +179,10 @@ impl Interpreter {
         // an entry like any other, so it charges the same bounded
         // reoptimization budget the interpreter's entry paths do.
         if state.tier == NativeFrameKind::Optimizing {
+            // The shared optimizing-exit owner also applies the one-way
+            // arithmetic widening, so a later generation cannot repeat an
+            // overflow or negative-zero speculation.
             self.note_jit_optimized_bail(context, callee_function_id, exit);
-            // Generated deoptimization resumes the already-started callee in
-            // the interpreter, but it does not revisit the OSR dispatcher.
-            // Apply the same one-way arithmetic widening here so a later
-            // profitable generation cannot repeat an overflow speculation.
-            self.reoptimize_arith_overflow_bail(context, callee_function_id, exit);
             return Ok(());
         }
 

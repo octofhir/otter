@@ -571,7 +571,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `has`) receives `this` as its first word and proves it itself; plain calls
     and shaped method sites pass no receiver word and never lower it. Int32
     Math with non-Int32 operands takes the tagged leaf instead of the generic
-    call. Misses enter the ordinary call once, never a bail. Leaf entries are
+    call. Misses enter the ordinary call once, never a bail.
+  - `Interpreter::note_jit_optimized_bail_at` is the one owner of optimizing
+    exits: an `Int32Overflow` / `NegativeZero` exit from `Add`, `Sub`, `Mul`,
+    `Neg`, `Increment`, `AddImm` or `SubImm` (the innermost site for inlined
+    deopts) widens that site's arithmetic feedback once and retires the
+    generation, for entry, OSR, generated-linkage and inlined exits alike.
+  - Leaf entries are
     described by `runtime_stubs::leaf_entry_shape`: the pure family (two
     words) and the in-place mutating families (two or three words, own write
     barrier), e.g. Map `set` overwriting an existing key; a mutating probe

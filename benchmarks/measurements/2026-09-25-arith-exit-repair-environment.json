@@ -1,0 +1,43 @@
+{
+  "baseEngineCommit": "0de92369e8c4e6a695ef255a1bcff561ec2b787e",
+  "candidateEngine": "One optimizing-exit owner (note_jit_optimized_bail_at) widens the exiting Add/Sub/Mul/Neg/Increment/AddImm/SubImm site on Int32Overflow/NegativeZero and retires the generation for entry, OSR, generated-linkage and inlined exits; inlined deopts widen the innermost site.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "source": "benchmarks/scripts/arith-exit-repair.js",
+  "sourceSha256": "947be0176ae0ff2c408df9bc1afa576487fff686af50cc49363b93a66007f102",
+  "expectedChecksum": 150000,
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "05da46b9ea9d194c55a27f564390bc496093e9d026c5e7164b26f2ae29d27b7a",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "dc3e1d78656108489de694d1fead36d89e2dceec16b86c6b149db349b42d4d12",
+    "afterIsFullGateBuild": true,
+    "pilotCandidate1": "6fb86fc5d4b2b91375f56e229b254242f299ffbf9732c58be309cd8ad0337484"
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/arith-exit-repair.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "150000",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series. Load average about 3.5.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "excludedFromResult": [
+    "pilot-before-*.log and pilot-cand1-*.log (pre-gate candidate, dirty tree)"
+  ]
+}

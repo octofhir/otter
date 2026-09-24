@@ -281,10 +281,15 @@ impl Interpreter {
                     .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
             })
             .transpose()?;
-        self.note_jit_optimized_bail(context, outermost.function_id, exit);
-        // The speculation that exited lives in the innermost spliced body; its
-        // own exit profile must learn the PC so the next bake of that body,
-        // inline or standalone, widens the site.
+        // The speculation that exited lives in the innermost spliced body, so
+        // its site is the one an arithmetic exit widens.
+        let (site_fid, site_pc) = match (frames.last(), resume_pcs.last()) {
+            (Some(innermost), Some(&pc)) => (innermost.function_id, pc),
+            _ => (outermost.function_id, exit.logical_pc()),
+        };
+        self.note_jit_optimized_bail_at(context, outermost.function_id, exit, site_fid, site_pc);
+        // Its own exit profile must also learn the PC so the next bake of that
+        // body, inline or standalone, sees the failed speculation.
         if let Some(innermost) = frames.last()
             && frames.len() > 1
         {

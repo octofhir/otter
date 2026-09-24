@@ -432,8 +432,15 @@ in the same slot remains a generated hit; accessors, instance shadows and
 prototype overrides enter the existing committed load once. The hit has no
 runtime call, allocation, frame publication or safepoint. It returns the loaded
 callable before argument evaluation, preserving explicit-call ordering.
-Collection `size` and primitive String property loads retain their existing
-paths; String method calls use the leaf probe described below.
+Named loads on primitive strings, such as `word.charCodeAt`, use the same
+receiver proof with the primitive-string tag and then
+`machineCacheIrGuardDictionaryLayout` on `%String.prototype%`, which never
+adopts a hidden class. A primitive string owns only `length` and its indices,
+so those names never produce a prototype program. Adding, deleting or
+redefining any `String.prototype` property (including turning a data slot into
+an accessor) assigns a fresh dictionary structural id and the load misses to
+the committed path; a same-slot value replacement stays a generated hit and is
+read live. Collection `size` retains its existing path.
 Snapshot construction prepares collection prototype shapes before nested
 property or method proofs. Method-only snapshots also prepare their holder and
 resolve its live own slot, so later property compilation cannot invalidate an

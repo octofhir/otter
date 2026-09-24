@@ -3190,6 +3190,24 @@ fn select_cache_ir_property_programs(
                     instructions.push(guard);
                     active = next;
                 }
+                otter_vm::JitCacheIrOp::GuardDictionaryLayout { object, layout } => {
+                    let object = cache_ir_object(&objects, object, instructions.len())?;
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::CacheIrGuardDictionaryLayout {
+                            byte_pc: source.byte_pc,
+                            layout,
+                        },
+                        vec![
+                            MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    guard.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(guard);
+                    active = next;
+                }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     object,
                     atom,

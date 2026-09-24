@@ -2617,6 +2617,16 @@ fn emit_existing_property_load(
                         emit_template_shape_guard(ops, view, header, shape, next);
                     }
                 }
+                otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
+                    dynasm!(ops
+                        ; .arch x64
+                        ; cmp DWORD [r8 + view.object_shape_byte as i32], 0
+                        ; jne =>next
+                        ; mov r11, QWORD layout as i64
+                        ; cmp [r8 + view.object_dictionary_shape_id_byte as i32], r11
+                        ; jne =>next
+                    );
+                }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     writable: false, ..
                 } => {}

@@ -1265,6 +1265,14 @@ impl NativeFunction {
 
     /// `true` when this callable is the exact static native function.
     #[must_use]
+    /// Static entry of a static-backed callable, read once.
+    pub(crate) fn static_fn(&self, heap: &otter_gc::GcHeap) -> Option<NativeFastFn> {
+        heap.read_payload(self.inner, |body| match body.call {
+            NativeCallSlot::Static(call) => Some(call),
+            _ => None,
+        })
+    }
+
     pub(crate) fn is_static_fn(&self, heap: &otter_gc::GcHeap, expected: NativeFastFn) -> bool {
         heap.read_payload(self.inner, |body| match body.call {
             NativeCallSlot::Static(call) => std::ptr::fn_addr_eq(call, expected),

@@ -270,9 +270,24 @@ impl MachineOpcode {
             // its active guard. Heap invalidation must also invalidate this
             // proof; method lookup itself remains an explicit CacheIR load.
             Self::NativeLeafIdentity { .. } => MachineEffects::read(MachineAliasSet::HEAP, Guard),
-            // A declared leaf reads its operands' bodies and nothing else; it
-            // neither writes, allocates, throws, reenters nor collects.
-            Self::NativeLeafProbe { .. } => MachineEffects::read(MachineAliasSet::HEAP, Value),
+            // A declared leaf reads its operands' bodies; an in-place entry
+            // also writes them behind its own barrier. Neither allocates,
+            // throws, reenters nor collects.
+            Self::NativeLeafProbe { stub, .. } => {
+                if super::native_leaf::leaf_probe_mutates(*stub) {
+                    MachineEffects {
+                        reads: MachineAliasSet::HEAP,
+                        writes: MachineAliasSet::HEAP,
+                        allocates: false,
+                        reentrant: false,
+                        throws: false,
+                        safepoint: false,
+                        commoning: Never,
+                    }
+                } else {
+                    MachineEffects::read(MachineAliasSet::HEAP, Value)
+                }
+            }
             Self::TruthinessProbe
             | Self::LooseEqualityProbe { .. }
             | Self::TaggedNullishEqual { .. } => MachineEffects::read(SHAPE, Guard),

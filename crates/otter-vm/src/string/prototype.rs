@@ -2988,7 +2988,7 @@ fn native_string_method(
 macro_rules! string_prototype_methods {
     ($($bridge:ident => $name:literal, $length:literal;)*) => {
         $(
-            fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            pub(crate) fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
                 native_string_method($name, ctx, args)
             }
         )*

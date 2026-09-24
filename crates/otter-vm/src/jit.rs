@@ -869,6 +869,16 @@ pub enum JitCacheIrOp {
         /// Stable compressed hidden-class token.
         shape: u32,
     },
+    /// Continue only while a dictionary-mode object keeps one key/slot
+    /// layout: a null shape and an unchanged dictionary structural id, which
+    /// every add, delete or descriptor change replaces. Emitted only for a
+    /// pinned intrinsic prototype whose captured key it cannot shadow.
+    GuardDictionaryLayout {
+        /// CacheIR object operand to inspect.
+        object: u8,
+        /// Captured dictionary structural id; never unassigned.
+        layout: u64,
+    },
     /// Prove that the immutable shape mapping still authorizes the atom's data
     /// slot and that no object-local descriptor or exotic state overrides it.
     GuardAtomSlot {

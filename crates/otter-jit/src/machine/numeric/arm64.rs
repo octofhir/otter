@@ -2592,7 +2592,7 @@ pub(super) fn emit(
                 let words = locations
                     .len()
                     .checked_sub(3)
-                    .filter(|words| (1..=2).contains(words))
+                    .filter(|&words| super::super::native_leaf::supports_leaf_probe(stub, words))
                     .ok_or(Unsupported::OperandShape("native leaf probe operands"))?;
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();

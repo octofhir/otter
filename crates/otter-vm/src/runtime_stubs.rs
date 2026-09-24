@@ -758,6 +758,47 @@ pub const ARRAY_UNSHIFT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(array_unshift_alloc),
 };
 
+/// Operand shape of a declared entry that can neither allocate, collect,
+/// throw nor reenter JavaScript: the pure `LeafNoAllocStub2` family and the
+/// in-place `MutatingLeafStub2` / `MutatingLeafStub3` families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeafEntryShape {
+    /// Operand words the entry reads after the heap pointer.
+    pub words: u8,
+    /// Whether the entry writes the heap (with its own write barrier).
+    pub mutates: bool,
+}
+
+/// Shape of a valid non-allocating leaf entry, or `None` for any other id.
+#[must_use]
+pub const fn leaf_entry_shape(id: RuntimeStubId) -> Option<LeafEntryShape> {
+    if let Some(stub) = leaf_no_alloc_stub2_by_id(id)
+        && stub.is_valid()
+    {
+        return Some(LeafEntryShape {
+            words: 2,
+            mutates: false,
+        });
+    }
+    if let Some(stub) = mutating_leaf_stub2_by_id(id)
+        && stub.is_valid()
+    {
+        return Some(LeafEntryShape {
+            words: 2,
+            mutates: true,
+        });
+    }
+    if let Some(stub) = mutating_leaf_stub3_by_id(id)
+        && stub.is_valid()
+    {
+        return Some(LeafEntryShape {
+            words: 3,
+            mutates: true,
+        });
+    }
+    None
+}
+
 /// Resolve a two-argument mutating leaf stub by ABI descriptor id.
 #[must_use]
 pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeafStub2> {

@@ -275,14 +275,15 @@ fn native_boundary_kernel_prepares_collection_prototypes_without_javascript_read
                     .contents(),
             )
             .expect("UTF-8 kernel code map");
-            // Two Map get/set property loads plus the String `indexOf` method
-            // proof, whose dictionary-mode prototype is pinned by layout id.
-            // `indexOf`, and the already-loaded `charCodeAt` and Map `get`
-            // callees, complete in declared leaves.
+            // Map get/set and String charCodeAt property loads plus the
+            // String `indexOf` method proof; both String holders are pinned by
+            // their dictionary layout id. `indexOf` and the already-loaded
+            // `charCodeAt`, Map `get` and Map `set` callees complete in
+            // declared leaves.
             for (region, count) in [
-                ("machineCacheIrLoadIntrinsicPrototype", 3),
-                ("machineCacheIrGuardDictionaryLayout", 1),
-                ("machineNativeLeafProbe", 3),
+                ("machineCacheIrLoadIntrinsicPrototype", 4),
+                ("machineCacheIrGuardDictionaryLayout", 2),
+                ("machineNativeLeafProbe", 4),
             ] {
                 assert_eq!(
                     code_map.matches(region).count(),
@@ -295,26 +296,27 @@ fn native_boundary_kernel_prepares_collection_prototypes_without_javascript_read
         assert_eq!(completion(&mut runtime, "engineKernel();"), "27000000");
         let after = runtime.execution_stats();
         // x86 Template retains its existing indexed load, String.length and
-        // Math slot cold paths. Its original kernel uses 1,600,000 property
-        // transitions; generated Map get/set loads remove exactly 400,000.
+        // Math slot cold paths. Its original kernel used 1,600,000 property
+        // transitions; generated Map get/set and String charCodeAt loads
+        // remove exactly 600,000.
         let expected_property_stubs =
             if cfg!(target_arch = "x86_64") && selection == JitSelection::Template {
-                1_200_000
+                1_000_000
             } else {
-                200_000
+                0
             };
         assert_eq!(
             after.jit_runtime_property_stubs - before.jit_runtime_property_stubs,
             expected_property_stubs,
-            "{selection:?}: only the existing non-Map property paths may remain cold"
+            "{selection:?}: only the x86 Template cold property paths may remain"
         );
         if selection == JitSelection::ProductionTiered {
-            // Only Map `set` (an allocating write) and `new Map()` cross;
-            // `indexOf`, `charCodeAt` and Map `get` complete in leaf hits.
+            // A fresh Map takes 64 inserting `set` calls, which may allocate,
+            // plus its construct; every other call completes in a leaf hit.
             assert_eq!(
                 after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions,
-                200_001,
-                "only Map set and the Map construct may cross"
+                65,
+                "only Map insertions and the Map construct may cross"
             );
         }
         assert_eq!(after.jit_optimized_deopts, before.jit_optimized_deopts);

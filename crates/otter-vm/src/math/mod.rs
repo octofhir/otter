@@ -26,7 +26,6 @@
 //! - <https://tc39.es/ecma262/#sec-math-object>
 //! - [`crate::jit_static_native`] for guarded static-native leaf declarations.
 
-use crate::native_function::NativeFastFn;
 use crate::number::{NumberValue, bitwise};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -207,47 +206,6 @@ fn call_numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberVal
     Value::number(value)
 }
 
-pub(crate) fn original_native_fn(method: otter_bytecode::method_id::MathMethod) -> NativeFastFn {
-    use otter_bytecode::method_id::MathMethod as M;
-    match method {
-        M::Abs => native_abs,
-        M::Acos => native_acos,
-        M::Acosh => native_acosh,
-        M::Asin => native_asin,
-        M::Asinh => native_asinh,
-        M::Atan => native_atan,
-        M::Atan2 => native_atan2,
-        M::Atanh => native_atanh,
-        M::Cbrt => native_cbrt,
-        M::Ceil => native_ceil,
-        M::Clz32 => native_clz32,
-        M::Cos => native_cos,
-        M::Cosh => native_cosh,
-        M::Exp => native_exp,
-        M::Expm1 => native_expm1,
-        M::Floor => native_floor,
-        M::Fround => native_fround,
-        M::Hypot => native_hypot,
-        M::Imul => native_imul,
-        M::Log => native_log,
-        M::Log10 => native_log10,
-        M::Log1p => native_log1p,
-        M::Log2 => native_log2,
-        M::Max => native_max,
-        M::Min => native_min,
-        M::Pow => native_pow,
-        M::Random => native_random,
-        M::Round => native_round,
-        M::Sign => native_sign,
-        M::Sin => native_sin,
-        M::Sinh => native_sinh,
-        M::Sqrt => native_sqrt,
-        M::Tan => native_tan,
-        M::Tanh => native_tanh,
-        M::Trunc => native_trunc,
-    }
-}
-
 fn native_call(
     ctx: &mut NativeCtx<'_>,
     method: otter_bytecode::method_id::MathMethod,
@@ -260,7 +218,10 @@ fn native_call(
 
 macro_rules! native_math {
     ($fn_name:ident, $variant:ident) => {
-        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        pub(crate) fn $fn_name(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
             native_call(ctx, otter_bytecode::method_id::MathMethod::$variant, args)
         }
     };

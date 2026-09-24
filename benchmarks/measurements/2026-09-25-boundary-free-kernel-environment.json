@@ -1,0 +1,50 @@
+{
+  "baseEngineCommit": "f9db70f7511f02ae4a6d362dbe129b430a0952a7",
+  "candidateEngine": "Direct fn-pointer static-native classifier; in-place mutating leaf probes (Map.set); String.prototype named loads behind a dictionary-layout CacheIR guard; dictionary id bump on in-place redefinition; string OOB index prototype lookup; rope-flatten rooting.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "source": "benchmarks/scripts/native-boundary.js",
+  "sourceSha256": "60bb4c98c42472fc2db9473646f6b54c9990479fc1870a5ded93e5706b54faf4",
+  "expectedChecksum": 27000000,
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "29b0cbd9740e4dea69a0ea161140dc88bc3bdad418b2bd9198d2c1cf2b861270",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "05da46b9ea9d194c55a27f564390bc496093e9d026c5e7164b26f2ae29d27b7a",
+    "afterIsFullGateBuild": true,
+    "pilotCandidate1": "c3e3c5c2fbf5275d086d7ce86753bfb70e14666d5053ff3f3a072e7b22faf945",
+    "pilotCandidate2": "6f17e6c2cb0000c011c09a8823059d6d5acf763ae5b5da0d00a18ff5bf93ce65"
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/native-boundary.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "27000000",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "acceptedSeries": "closed",
+  "runCount": 18,
+  "wallSampleCount": 360,
+  "interpreterControl": "An immediately following Interpreter-only three-pair control (interp-control/) measured +0.12% wall, +0.002% instructions, -0.006% cycles; the closed series' +2.00% Interpreter wall comes from one pair-2 outlier (362.5 ms) with identical instruction counts.",
+  "excludedSeries": {
+    "pilot": "cand1 (classifier + Map.set) and cand2 (+ String loads, before the dictionary-id and rope fixes) single runs; cand2 ran under load average 26 from external processes and its wall times are void. Instruction counts: Production 30.29G -> 19.42G -> 11.21G, Template 28.97G -> 18.28G -> 10.71G. Not scored."
+  },
+  "rawEvidence": "benchmarks/results/next-2026-09-25/ (ignored local artifacts)",
+  "measurementDate": "2026-09-25"
+}

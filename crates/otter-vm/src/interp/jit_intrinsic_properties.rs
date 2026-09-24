@@ -2,13 +2,16 @@
 //!
 //! # Contents
 //! - Collection receiver proofs composed with ordinary slot guards.
+//! - Primitive string receiver proofs composed with the `%String.prototype%`
+//!   dictionary-layout guard, for every name a primitive string cannot own.
 //!
 //! # Invariants
 //! - Only own data slots of pinned realm prototypes are captured.
 //! - Existing rooted shape preparation precedes every published shape guard;
 //!   an unprepared or allocation-failed holder never contributes a program.
 //! - Collection instance overrides cannot bypass their canonical lookup semantics.
-//! - The `size` property remains on its existing specialized path.
+//! - The `size` property remains on its existing specialized path; string
+//!   `length` and canonical numeric names never produce a prototype program.
 //! - The program reads the live slot; it never substitutes a builtin callable.
 //! - Every miss precedes effects and uses the existing committed property call.
 //!
@@ -27,71 +30,123 @@ impl Interpreter {
         if key.name() == "size" {
             return Vec::new();
         }
-        let candidates = [
+        let mut programs = [
             (
                 self.realm_intrinsics.map_prototype(),
                 crate::collections::MAP_BODY_TYPE_TAG,
-                Some(crate::method_ops::collection_guard()),
             ),
             (
                 self.realm_intrinsics.set_prototype(),
                 crate::collections::SET_BODY_TYPE_TAG,
-                Some(crate::method_ops::collection_guard()),
             ),
-        ];
-        candidates
-            .into_iter()
-            .filter_map(|(prototype, type_tag, guard)| {
-                let mut prototype = prototype?;
-                if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
-                    return None;
-                }
-                if !matches!(
-                    object::lookup_own_slot(prototype, &self.gc_heap, key.name()).1,
-                    object::PropertyLookup::Data { .. }
-                ) {
-                    return None;
-                }
-                self.migrate_slow_to_fast(&mut prototype);
-                let shape = object::shape(prototype, &self.gc_heap);
-                if shape.is_null() {
-                    return None;
-                }
-                let (hit, lookup) = object::lookup_own_slot(prototype, &self.gc_heap, key.name());
-                let hit = hit?;
-                if !matches!(lookup, object::PropertyLookup::Data { .. }) {
-                    return None;
-                }
-                let value_byte = u32::from(hit.slot) * std::mem::size_of::<crate::Value>() as u32;
-                Some(JitCacheIrProgram {
-                    ops: Box::new([
-                        JitCacheIrOp::LoadIntrinsicPrototype {
-                            object: 0,
-                            result: 1,
-                            target: JitIntrinsicPrototype {
-                                type_tag,
-                                guard,
-                                proto_offset: prototype.offset(),
-                            },
-                        },
-                        JitCacheIrOp::GuardShape {
-                            object: 1,
-                            shape: shape.offset(),
-                        },
-                        JitCacheIrOp::GuardAtomSlot {
-                            object: 1,
-                            atom: key.atom().id().raw(),
-                            value_byte,
-                            writable: false,
-                        },
-                        JitCacheIrOp::LoadField {
-                            object: 1,
-                            value_byte,
-                        },
-                    ]),
-                })
-            })
-            .collect()
+        ]
+        .into_iter()
+        .filter_map(|(prototype, type_tag)| {
+            self.collection_property_program(prototype?, type_tag, key)
+        })
+        .collect::<Vec<_>>();
+        programs.extend(self.string_property_program(key));
+        programs
+    }
+
+    /// Collection receivers: the latch proof, then the prepared prototype's
+    /// fast shape and immutable atom slot.
+    fn collection_property_program(
+        &mut self,
+        mut prototype: object::JsObject,
+        type_tag: u8,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<JitCacheIrProgram> {
+        if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
+            return None;
+        }
+        if !matches!(
+            object::lookup_own_slot(prototype, &self.gc_heap, key.name()).1,
+            object::PropertyLookup::Data { .. }
+        ) {
+            return None;
+        }
+        self.migrate_slow_to_fast(&mut prototype);
+        let shape = object::shape(prototype, &self.gc_heap);
+        if shape.is_null() {
+            return None;
+        }
+        let (hit, lookup) = object::lookup_own_slot(prototype, &self.gc_heap, key.name());
+        let hit = hit?;
+        if !matches!(lookup, object::PropertyLookup::Data { .. }) {
+            return None;
+        }
+        let value_byte = u32::from(hit.slot) * std::mem::size_of::<crate::Value>() as u32;
+        Some(JitCacheIrProgram {
+            ops: Box::new([
+                JitCacheIrOp::LoadIntrinsicPrototype {
+                    object: 0,
+                    result: 1,
+                    target: JitIntrinsicPrototype {
+                        type_tag,
+                        guard: Some(crate::method_ops::collection_guard()),
+                        proto_offset: prototype.offset(),
+                    },
+                },
+                JitCacheIrOp::GuardShape {
+                    object: 1,
+                    shape: shape.offset(),
+                },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 1,
+                    atom: key.atom().id().raw(),
+                    value_byte,
+                    writable: false,
+                },
+                JitCacheIrOp::LoadField {
+                    object: 1,
+                    value_byte,
+                },
+            ]),
+        })
+    }
+
+    /// Primitive string receivers own only `length` and their indices, so
+    /// every other name resolves on `%String.prototype%`. That String wrapper
+    /// never adopts a hidden class; its dictionary layout id pins the slot and
+    /// the load reads the slot's live data value.
+    fn string_property_program(&self, key: AtomizedPropertyKey<'_>) -> Option<JitCacheIrProgram> {
+        let name = key.name();
+        if name == "length"
+            || crate::property_dispatch::canonical_numeric_index_string(name).is_some()
+        {
+            return None;
+        }
+        let prototype = self.realm_intrinsics.string_prototype()?;
+        let crate::jit::JitMethodHolder::Dictionary(layout) =
+            crate::jit::JitMethodHolder::of(prototype, &self.gc_heap)?
+        else {
+            return None;
+        };
+        let (hit, lookup) = object::lookup_own_slot(prototype, &self.gc_heap, name);
+        let hit = hit?;
+        if !matches!(lookup, object::PropertyLookup::Data { .. }) {
+            return None;
+        }
+        let value_byte = u32::from(hit.slot) * std::mem::size_of::<crate::Value>() as u32;
+        Some(JitCacheIrProgram {
+            ops: Box::new([
+                JitCacheIrOp::LoadIntrinsicPrototype {
+                    object: 0,
+                    result: 1,
+                    target: JitIntrinsicPrototype {
+                        type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
+                        guard: None,
+                        proto_offset: prototype.offset(),
+                    },
+                },
+                JitCacheIrOp::GuardDictionaryLayout { object: 1, layout },
+                JitCacheIrOp::LoadField {
+                    object: 1,
+                    value_byte,
+                },
+            ]),
+        })
     }
 }
 

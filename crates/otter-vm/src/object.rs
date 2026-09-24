@@ -2280,7 +2280,16 @@ impl ObjectBody {
                     self.slots_materialized(),
                     "set_slot(None) needs materialized slots"
                 );
-                self.slots_mut().entries_mut()[i] = meta;
+                let entry = &mut self.slots_mut().entries_mut()[i];
+                let redefined = entry.flags != meta.flags || entry.is_accessor != meta.is_accessor;
+                *entry = meta;
+                // A dictionary object's structural id stands for its whole
+                // key/slot/attribute layout, as a hidden class does for a
+                // shaped object: changing a slot's kind or attributes in place
+                // must retire every guard captured under the old id.
+                if redefined && self.shape.is_null() {
+                    self.dictionary_shape_id = next_shape_id();
+                }
             }
         }
     }
@@ -6865,6 +6874,44 @@ mod tests {
         assert_eq!(keys.len(), MAX_FAST_PROPERTIES as usize + 1);
         assert_eq!(keys.first().map(String::as_str), Some("p0"));
         assert_eq!(keys.last().map(String::as_str), Some("overflow"));
+    }
+
+    #[test]
+    fn dictionary_redefinition_retires_its_structural_id() {
+        let mut interp = crate::Interpreter::new();
+        let mut prototype = interp
+            .realm_intrinsics
+            .string_prototype()
+            .expect("realm String.prototype");
+        assert!(
+            shape(prototype, interp.gc_heap()).is_null(),
+            "a String wrapper prototype stays in dictionary mode"
+        );
+        let original = shape_id(prototype, interp.gc_heap());
+
+        set(
+            &mut prototype,
+            interp.gc_heap_mut(),
+            "charCodeAt",
+            Value::number_i32(1),
+        );
+        assert_eq!(
+            shape_id(prototype, interp.gc_heap()),
+            original,
+            "a same-slot value write keeps the key/slot/attribute layout"
+        );
+
+        assert!(define_own_property(
+            prototype,
+            interp.gc_heap_mut(),
+            "charCodeAt",
+            PropertyDescriptor::data(Value::number_i32(2), false, false, true),
+        ));
+        assert_ne!(
+            shape_id(prototype, interp.gc_heap()),
+            original,
+            "an in-place attribute change must assign a fresh structural id"
+        );
     }
 
     #[test]

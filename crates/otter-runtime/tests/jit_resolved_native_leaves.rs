@@ -8,6 +8,9 @@
 //! - `this`-reading declarations are never lowered at plain calls or shaped
 //!   method sites, which pass no receiver word.
 //! - Moving collection between leaf hits preserves receivers and results.
+//! - `map.set` overwrites existing keys through the in-place leaf; inserts,
+//!   replaced callees and non-Map receivers take the ordinary call once, and
+//!   young values stored into an old Map stay reachable.
 //!
 //! # Invariants
 //! - The callee is guarded after argument evaluation; lookup never repeats.
@@ -57,8 +60,17 @@ function magnitudes(scale, count) {
     }
     return total;
 }
+function stores(map, count) {
+    let total = 0;
+    for (let index = 0; index < count; index++) {
+        total += map.set((index & 1) + 1, index).size;
+    }
+    return total;
+}
+const writable = new Map([[1, 0], [2, 0]]);
 function join(left, right) { return left + right; }
 for (let warm = 0; warm < 40; warm++) {
+    stores(writable, 200);
     codes("otter", 200);
     finds("otter engine", "e", 200);
     gets(table, 200);
@@ -112,6 +124,7 @@ fn warm_explicit_receiver_leaves_do_not_cross_the_native_boundary() {
             ("gets(table, 1000)", "15000"),
             ("hasMembers(members, 1000)", "250"),
             ("magnitudes(0.5, 1000)", "875"),
+            ("stores(writable, 1000) + writable.get(2)", "2999"),
         ] {
             let before = runtime.execution_stats();
             assert_eq!(
@@ -259,5 +272,37 @@ churn(512);
             assert!(after.gc_minor_cycles - before.gc_minor_cycles >= 128 / stride);
             assert!(after.gc_minor_slot_updates > before.gc_minor_slot_updates);
         }
+    }
+}
+
+#[test]
+fn in_place_map_set_misses_on_insert_and_keeps_young_values() {
+    const SETS: &str = r#"
+const log = [];
+const fresh = new Map([[1, 0]]);
+log.push(stores(fresh, 4), fresh.size, fresh.get(2));
+const originalMapSet = Map.prototype.set;
+let replacedSets = 0;
+Map.prototype.set = function (key, value) { replacedSets++; return this; };
+log.push(stores(writable, 3), replacedSets);
+Map.prototype.set = originalMapSet;
+try { log.push(Reflect.apply(stores, undefined, [new Set([1]), 1])); } catch (error) { log.push(error.constructor.name); }
+function youngValues(map, count) {
+    for (let index = 0; index < count; index++) {
+        map.set((index & 1) + 1, { word: "young-" + (index * 7919 + 100003) });
+    }
+    return map.get(1).word + map.get(2).word;
+}
+log.push(youngValues(writable, 257));
+JSON.stringify(log);
+"#;
+    let mut oracle = warmed(JitSelection::InterpreterOnly);
+    let expected = completion(&mut oracle, SETS);
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = warmed(selection);
+        runtime
+            .force_gc()
+            .expect("promote the warmed Map before young stores");
+        assert_eq!(completion(&mut runtime, SETS), expected, "{selection:?}");
     }
 }

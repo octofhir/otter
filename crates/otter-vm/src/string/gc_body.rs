@@ -515,14 +515,25 @@ pub fn concat_string_bodies(
 
     let projected_depth = left_depth.max(right_depth).saturating_add(1);
 
-    // Flatten deeper side eagerly if we'd exceed the depth budget.
+    // Flatten deeper side eagerly if we'd exceed the depth budget. The
+    // flattened copy allocates, so the other side stays in a rooted slot.
     let (left, right, left_depth, right_depth) = if projected_depth > MAX_ROPE_DEPTH {
-        if left_depth >= right_depth {
-            let flat = flatten_string_body(heap, left, external_visit)?;
-            (flat, right, 0u8, right_depth)
+        let flatten_left = left_depth >= right_depth;
+        let (deeper, mut other) = if flatten_left {
+            (left, right)
         } else {
-            let flat = flatten_string_body(heap, right, external_visit)?;
-            (left, flat, left_depth, 0u8)
+            (right, left)
+        };
+        let other_slot: *mut JsStringHandle = &mut other;
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(other_slot.cast::<RawGc>());
+            external_visit(visitor);
+        };
+        let flat = flatten_string_body(heap, deeper, &mut visit)?;
+        if flatten_left {
+            (flat, other, 0u8, right_depth)
+        } else {
+            (other, flat, left_depth, 0u8)
         }
     } else {
         (left, right, left_depth, right_depth)

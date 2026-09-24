@@ -67,13 +67,23 @@ pub(super) fn supports_int32(stub: otter_vm::native_abi::RuntimeStubId) -> bool 
     .contains(&stub)
 }
 
-/// Whether a guarded method's declared entry can be called as a leaf probe.
+/// Whether a declared entry can be called as a leaf probe filling `words`
+/// operand words.
 ///
-/// The entry comes from the method snapshot, not the static-call registry: an
-/// exotic receiver's builtin (a String or collection method) has no ordinary
-/// static-call identity, only the guarded prototype slot it occupies.
-pub(super) fn supports_leaf_probe(stub: otter_vm::native_abi::RuntimeStubId) -> bool {
-    otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(stub).is_some_and(|leaf| leaf.is_valid())
+/// Pure and in-place mutating families qualify: neither allocates, collects,
+/// throws nor reenters. The entry comes from the method snapshot or the
+/// static-call registry; this check needs only its runtime-stub shape.
+pub(crate) fn supports_leaf_probe(stub: otter_vm::native_abi::RuntimeStubId, words: usize) -> bool {
+    otter_vm::runtime_stubs::leaf_entry_shape(stub)
+        .is_some_and(|shape| (1..=usize::from(shape.words)).contains(&words))
+}
+
+/// Whether a leaf probe entry writes the heap.
+pub(super) const fn leaf_probe_mutates(stub: otter_vm::native_abi::RuntimeStubId) -> bool {
+    matches!(
+        otter_vm::runtime_stubs::leaf_entry_shape(stub),
+        Some(otter_vm::runtime_stubs::LeafEntryShape { mutates: true, .. })
+    )
 }
 
 /// A leaf probe is an ordinary scalar call except for its fixed boxed result.
@@ -160,8 +170,7 @@ pub(super) fn method_probe_is_valid(
                 return false;
             };
             if !target_spec.supports(TargetCapability::NativeLeaf)
-                || !supports_leaf_probe(stub)
-                || !(1..=2).contains(&words)
+                || !supports_leaf_probe(stub, words)
             {
                 return false;
             }

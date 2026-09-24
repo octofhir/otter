@@ -345,18 +345,20 @@ JSON.stringify([
 "#;
 
 const METHOD_ERROR_SOURCE: &str = r#"
+// The failing lookup comes long after the measured OSR payoff point, so it
+// resolves inside OSR-entered code.
 let getCalls = 0;
 let callCalls = 0;
 let receiver = new Proxy({}, {
   get(target, key) {
     getCalls++;
-    if (getCalls === 7) return 0;
+    if (getCalls === 3000) return 0;
     return function () { callCalls++; return 1; };
   }
 });
 function invokeUntilError(object) {
   let sum = 0;
-  for (let i = 0; i < 12; i++) sum += object.method();
+  for (let i = 0; i < 4000; i++) sum += object.method();
   return sum;
 }
 let errorName = "";
@@ -515,7 +517,7 @@ fn numeric_family_misses_complete_in_place_without_replay() {
 #[test]
 fn method_resolution_error_does_not_replay_observable_get() {
     let (oracle, _, _, _) = run(METHOD_ERROR_SOURCE, JitSelection::InterpreterOnly);
-    assert_eq!(oracle, "[7,6,\"TypeError\"]");
+    assert_eq!(oracle, "[3000,2999,\"TypeError\"]");
     let (compiled, osr, _, _) = run(METHOD_ERROR_SOURCE, JitSelection::Template);
     assert_eq!(compiled, oracle);
     assert!(osr > 0, "method matrix must enter through loop OSR");

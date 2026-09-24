@@ -28,7 +28,7 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 struct RunResult {
     completion: String,
-    compile_attempts: u64,
+    code_generations: u64,
 }
 
 fn run_after_full_gc(selection: JitSelection, setup: &str, probe: &str, name: &str) -> RunResult {
@@ -53,7 +53,7 @@ fn run_after_full_gc(selection: JitSelection, setup: &str, probe: &str, name: &s
         .to_owned();
     RunResult {
         completion,
-        compile_attempts: runtime.execution_stats().jit_compile_attempts,
+        code_generations: runtime.execution_stats().jit_code_generations,
     }
 }
 
@@ -63,8 +63,8 @@ fn assert_interpreter_and_template(setup: &str, probe: &str, name: &str, expecte
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, expected);
     assert!(
-        compiled.compile_attempts > 0,
-        "{name} must exercise template compilation"
+        compiled.code_generations > 0,
+        "{name} must install a template generation (entry or OSR)"
     );
 }
 

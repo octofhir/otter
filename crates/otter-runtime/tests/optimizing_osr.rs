@@ -39,16 +39,18 @@ const ARRAY_RMW: &str = r#"
 "#;
 
 const POST_OSR_DEOPT: &str = r#"
+    // The accumulator leaves Int32 after 3000 iterations, well past the
+    // measured OSR payoff point, so the overflow exits optimized OSR code.
     function onceOverflow(limit) {
       let index = 0;
-      let total = 2147483000;
+      let total = 2147480647;
       while (index < limit) {
-        total = total + 100;
+        total = total + 1;
         index = index + 1;
       }
       return total;
     }
-    String(onceOverflow(20));
+    String(onceOverflow(4000));
 "#;
 
 const HOISTED_INVARIANT_READ: &str = r#"
@@ -134,7 +136,7 @@ fn deopt_after_optimized_osr_reconstructs_loop_state() {
     );
 
     assert_eq!(tiered, oracle);
-    assert_eq!(oracle, "2147485000");
+    assert_eq!(oracle, "2147484647");
     assert!(stats.jit_optimized_osr_entries >= 1, "{stats:?}");
     assert!(
         stats.jit_optimized_deopts >= 1,

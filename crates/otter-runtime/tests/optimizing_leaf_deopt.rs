@@ -3,6 +3,8 @@
 //! # Contents
 //! - Hand-authored int32 and float64 arithmetic, max-diamond, and loop
 //!   functions matching the optimizer's deliberately narrow production subset.
+//!   Leaf bodies carry value-preserving identity pairs so they are large
+//!   enough for the measured function-entry policy to compile.
 //! - Hot optimized return and non-int32 guard-bail comparisons against
 //!   [`JitSelection::InterpreterOnly`].
 //! - Allocation-free cooperative cancellation after a hot loop has entered
@@ -22,6 +24,45 @@ use otter_runtime::JitSelection;
 use otter_vm::{Interpreter, JitRuntimeStats, Value};
 use smallvec::{SmallVec, smallvec};
 
+/// Identity pairs appended to each leaf body. Each pair adds and then
+/// subtracts the first parameter, so every result keeps its value while the
+/// body grows past the measured function-entry payoff: a two-instruction leaf
+/// never repays an entry compile under the tier cost model.
+const IDENTITY_PAIRS: u16 = 11;
+
+/// Append `value = (value + parameter) - parameter` pairs using scratch
+/// registers from `first_scratch`, returning the register holding the result.
+fn push_identity_chain(
+    code: &mut FunctionCodeBuilder,
+    value: u16,
+    parameter: u16,
+    first_scratch: u16,
+) -> u16 {
+    let mut current = value;
+    for pair in 0..IDENTITY_PAIRS {
+        let widened = first_scratch + 2 * pair;
+        let restored = widened + 1;
+        code.push(
+            Op::Add,
+            &[
+                Operand::Register(widened),
+                Operand::Register(current),
+                Operand::Register(parameter),
+            ],
+        );
+        code.push(
+            Op::Sub,
+            &[
+                Operand::Register(restored),
+                Operand::Register(widened),
+                Operand::Register(parameter),
+            ],
+        );
+        current = restored;
+    }
+    current
+}
+
 fn fixture_module() -> BytecodeModule {
     let mut main = FunctionCodeBuilder::new();
     main.push(Op::ReturnUndefined, &[]);
@@ -35,7 +76,8 @@ fn fixture_module() -> BytecodeModule {
             Operand::Register(1),
         ],
     );
-    leaf.push(Op::ReturnValue, &[Operand::Register(2)]);
+    let leaf_result = push_identity_chain(&mut leaf, 2, 0, 3);
+    leaf.push(Op::ReturnValue, &[Operand::Register(leaf_result)]);
 
     let mut max = FunctionCodeBuilder::new();
     max.push(Op::LoadInt32, &[Operand::Register(2), Operand::Imm32(0)]);
@@ -65,7 +107,8 @@ fn fixture_module() -> BytecodeModule {
             Operand::Register(2),
         ],
     );
-    max.push(Op::ReturnValue, &[Operand::Register(4)]);
+    let max_result = push_identity_chain(&mut max, 4, 0, 5);
+    max.push(Op::ReturnValue, &[Operand::Register(max_result)]);
 
     let mut sum = FunctionCodeBuilder::new();
     sum.push(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(0)]);
@@ -131,7 +174,8 @@ fn fixture_module() -> BytecodeModule {
             Operand::Register(1),
         ],
     );
-    float_add.push(Op::ReturnValue, &[Operand::Register(2)]);
+    let float_result = push_identity_chain(&mut float_add, 2, 0, 3);
+    float_add.push(Op::ReturnValue, &[Operand::Register(float_result)]);
 
     BytecodeModule {
         module: "optimizing-leaf-deopt.js".to_string(),
@@ -148,7 +192,7 @@ fn fixture_module() -> BytecodeModule {
                 id: 1,
                 name: "add".to_string(),
                 param_count: 2,
-                scratch: 1,
+                scratch: 1 + 2 * IDENTITY_PAIRS,
                 code: leaf.finish(),
                 ..Function::default()
             },
@@ -156,7 +200,7 @@ fn fixture_module() -> BytecodeModule {
                 id: 2,
                 name: "max".to_string(),
                 param_count: 2,
-                scratch: 3,
+                scratch: 3 + 2 * IDENTITY_PAIRS,
                 code: max.finish(),
                 ..Function::default()
             },
@@ -180,7 +224,7 @@ fn fixture_module() -> BytecodeModule {
                 id: 5,
                 name: "floatAdd".to_string(),
                 param_count: 2,
-                scratch: 1,
+                scratch: 1 + 2 * IDENTITY_PAIRS,
                 code: float_add.finish(),
                 ..Function::default()
             },

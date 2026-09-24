@@ -928,9 +928,8 @@ pub(super) fn emit_call_with_receiver(
             otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)
         && view.native_ref_byte != 0
         && usize::from(argc) == usize::from(declaration.argument_count)
-        && declaration.operand_words() <= 2
-        && otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)
-            .is_some_and(|stub| stub.is_valid())
+        && otter_vm::runtime_stubs::leaf_entry_shape(target.leaf_stub_id)
+            .is_some_and(|shape| declaration.operand_words() <= usize::from(shape.words))
     {
         // An explicit-receiver call owns its loaded callee and `this`, so the
         // declared leaf needs only the callee identity; the entry proves its

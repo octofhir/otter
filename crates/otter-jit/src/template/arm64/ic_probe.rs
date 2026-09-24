@@ -433,6 +433,14 @@ where
                     };
                     emit_check_shape(ops, view, header, shape, next);
                 }
+                otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
+                    emit_dictionary_layout_guard(ops, view, 15, layout, next);
+                }
+                otter_vm::JitCacheIrOp::GuardDictionaryLayout { .. } => {
+                    return Err(Unsupported::OperandShape(
+                        "CacheIR dictionary layout object",
+                    ));
+                }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     object,
                     writable: false,
@@ -558,6 +566,11 @@ where
                     } else {
                         emit_check_shape(ops, view, header, shape, next);
                     }
+                }
+                otter_vm::JitCacheIrOp::GuardDictionaryLayout { .. } => {
+                    return Err(Unsupported::OperandShape(
+                        "dictionary layout guard in store CacheIR",
+                    ));
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     object,

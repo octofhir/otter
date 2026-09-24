@@ -861,14 +861,14 @@ fn flatten_string_key(ctx: &mut NativeCtx<'_>, key: &Value) {
     }
 }
 
-fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.get")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     flatten_string_key(ctx, &key);
     Ok(collections::map_get(m, ctx.heap(), &key).unwrap_or(Value::undefined()))
 }
 
-fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut m = receiver_map(ctx, "Map.prototype.set")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -878,7 +878,7 @@ fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::map(m))
 }
 
-fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.has")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     flatten_string_key(ctx, &key);
@@ -1106,7 +1106,7 @@ fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::set(s))
 }
 
-fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.has")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
     flatten_string_key(ctx, &v);

@@ -3,14 +3,14 @@
 //! # Contents
 //! - [`emit_guard`] proves the exact bootstrap native-function identity.
 //! - [`emit_int32`] replaces proven `Math.abs` / `max` / `min` leaves.
-//! - [`emit_tagged_call`] enters the shared no-allocation leaf ABI for static
-//!   calls and guarded method leaf probes.
+//! - [`emit_tagged_call`] enters the shared non-allocating leaf ABI (pure and
+//!   in-place mutating families) for static calls and leaf probes.
 //!
 //! # Invariants
 //! - The identity guard completes before an intrinsic or native call has an
 //!   observable effect.
-//! - Tagged leaf calls receive `(heap, value0, value1)` in the System V
-//!   integer argument registers and return the shared two-register pair.
+//! - Tagged leaf calls receive `(heap, value0, value1[, value2])` in the
+//!   System V integer argument registers and return the shared pair.
 //! - No path allocates, collects, throws, or publishes a safepoint.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
@@ -88,10 +88,12 @@ pub(crate) fn emit_int32(
     Ok(())
 }
 
-/// Call the shared no-allocation leaf entry once its guards passed.
+/// Call a declared non-allocating leaf entry once its guards passed.
 ///
-/// `words` operand words are already in `rsi`/`rdx`; an unfilled word is
-/// `undefined`. The boxed result is left in `rax`; a miss branches to `miss`.
+/// `words` operand words are already in `rsi`/`rdx`/`rcx`; an unfilled word
+/// of the entry's family is `undefined`. Pure and in-place mutating families
+/// share `(heap, value0, value1[, value2]) -> pair`. The boxed result is left
+/// in `rax`; a miss branches to `miss`.
 pub(crate) fn emit_tagged_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -99,13 +101,33 @@ pub(crate) fn emit_tagged_call(
     words: u8,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let Some(stub) =
-        otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(stub).filter(|stub| stub.is_valid())
+    use otter_vm::runtime_stubs::{
+        leaf_no_alloc_stub2_by_id, mutating_leaf_stub2_by_id, mutating_leaf_stub3_by_id,
+    };
+    let Some((entry, descriptor, family_words)) = leaf_no_alloc_stub2_by_id(stub)
+        .filter(|stub| stub.is_valid())
+        .map(|stub| (stub.entry_addr(), stub.descriptor, 2))
+        .or_else(|| {
+            mutating_leaf_stub2_by_id(stub)
+                .filter(|stub| stub.is_valid())
+                .map(|stub| (stub.entry_addr(), stub.descriptor, 2))
+        })
+        .or_else(|| {
+            mutating_leaf_stub3_by_id(stub)
+                .filter(|stub| stub.is_valid())
+                .map(|stub| (stub.entry_addr(), stub.descriptor, 3))
+        })
+        .filter(|&(_, _, family_words)| words <= family_words)
     else {
         return Err(Unsupported::OperandShape("x86-64 native leaf entry"));
     };
-    if words < 2 {
-        load_u64(ops, 2, Value::undefined().to_bits());
+    // System V integer arguments after the heap pointer: rsi, rdx, rcx.
+    for register in [6_u8, 2, 1]
+        .into_iter()
+        .take(usize::from(family_words))
+        .skip(usize::from(words))
+    {
+        load_u64(ops, register, Value::undefined().to_bits());
     }
     dynasm!(ops
         ; .arch x64
@@ -113,12 +135,12 @@ pub(crate) fn emit_tagged_call(
         ; mov rdi, [rdi + VM_THREAD_GC_HEAP_OFFSET as i32]
     );
     let start = ops.offset().0;
-    load_u64(ops, 11, stub.entry_addr() as u64);
+    load_u64(ops, 11, entry as u64);
     relocations.record_x86_imm64(
         start,
         ops.offset().0,
         11,
-        RelocationTarget::runtime_stub(stub.descriptor),
+        RelocationTarget::runtime_stub(descriptor),
     );
     dynasm!(ops
         ; .arch x64

@@ -1576,7 +1576,7 @@ pub(super) fn emit(
                 let words = loc
                     .len()
                     .checked_sub(3)
-                    .filter(|words| (1..=2).contains(words))
+                    .filter(|&words| super::super::native_leaf::supports_leaf_probe(stub, words))
                     .ok_or(Unsupported::OperandShape(
                         "x86-64 native leaf probe operands",
                     ))?;

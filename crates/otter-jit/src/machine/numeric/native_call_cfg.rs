@@ -130,8 +130,10 @@ pub(super) fn method_hit(
     {
         return Some(HitKind::Int32Math);
     }
-    (receiver_word + argument_count <= 2
-        && super::super::native_leaf::supports_leaf_probe(call.entry_stub_id))
+    super::super::native_leaf::supports_leaf_probe(
+        call.entry_stub_id,
+        receiver_word + argument_count,
+    )
     .then_some(HitKind::Leaf)
 }
 
@@ -170,9 +172,8 @@ pub(super) fn resolved_hit(
     {
         return Some(HitKind::Int32Math);
     }
-    (declaration.operand_words() <= 2
-        && super::super::native_leaf::supports_leaf_probe(call.leaf_stub_id))
-    .then_some(HitKind::Leaf)
+    super::super::native_leaf::supports_leaf_probe(call.leaf_stub_id, declaration.operand_words())
+        .then_some(HitKind::Leaf)
 }
 
 pub(super) fn site(hir: &NumericFunction, block: usize) -> Option<NumericValue> {

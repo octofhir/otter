@@ -195,17 +195,20 @@ impl Interpreter {
         string: JsString,
         name: &str,
     ) -> Result<Value, VmError> {
-        match string_index_property_name(name) {
-            Some(index) => match string.char_code_at(index, &self.gc_heap) {
-                Some(unit) => Ok(Value::string(JsString::from_utf16_units(
-                    &[unit],
-                    &mut self.gc_heap,
-                )?)),
-                None => Ok(Value::undefined()),
-            },
-            None if name == "length" => Ok(Value::number_u32(string.len())),
-            None => self.load_from_constructor_prototype(stack, context, "String", receiver, name),
+        // §10.4.3.5 StringGetOwnProperty: only indices below the length are
+        // own; any other index continues to `%String.prototype%`.
+        if let Some(unit) = string_index_property_name(name)
+            .and_then(|index| string.char_code_at(index, &self.gc_heap))
+        {
+            return Ok(Value::string(JsString::from_utf16_units(
+                &[unit],
+                &mut self.gc_heap,
+            )?));
         }
+        if name == "length" {
+            return Ok(Value::number_u32(string.len()));
+        }
+        self.load_from_constructor_prototype(stack, context, "String", receiver, name)
     }
 
     fn function_user_bag_with_stack_roots(

@@ -571,7 +571,11 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `has`) receives `this` as its first word and proves it itself; plain calls
     and shaped method sites pass no receiver word and never lower it. Int32
     Math with non-Int32 operands takes the tagged leaf instead of the generic
-    call. Misses enter the ordinary call once, never a bail.
+    call. Misses enter the ordinary call once, never a bail. Leaf entries are
+    described by `runtime_stubs::leaf_entry_shape`: the pure family (two
+    words) and the in-place mutating families (two or three words, own write
+    barrier), e.g. Map `set` overwriting an existing key; a mutating probe
+    writes the heap and is never commoned or hoisted.
     Separately evaluated Map/Set named property loads use
     `machineCacheIrLoadIntrinsicPrototype`: exact type and the existing clean
     instance latch select the pinned realm prototype, followed by ordinary
@@ -579,8 +583,12 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     both backends. Same-slot replacements are read live; accessors, shadows
     and prototype overrides use the committed cold load once. The generated
     hit has no allocation, runtime call or safepoint, and preserves the loaded
-    callable across later argument evaluation. Collection `size` and primitive
-    String lookups retain their existing paths.
+    callable across later argument evaluation. Primitive String named loads use
+    the same proof plus `machineCacheIrGuardDictionaryLayout`
+    (`JitCacheIrOp::GuardDictionaryLayout`) on `%String.prototype%`; `length`
+    and index names never read the prototype. Every in-place descriptor change
+    of a dictionary-mode object assigns a fresh `dictionary_shape_id`.
+    Collection `size` retains its existing path.
   - Optimizing plain/method scalar/named-load splices use the same HIR and allocator.
     The caller owns the identity/this guard; named accesses retain the callee's
     source program and cold activation recipes in `optimized-ir.txt`.

@@ -410,7 +410,9 @@ impl Interpreter {
                     exit,
                 );
                 stack[top_idx].pc = pc;
-                if self.reoptimize_arith_overflow_bail(context, fid, exit) {
+                // An optimizing exit already ran its arithmetic repair in
+                // `note_jit_optimized_bail`; a template exit repairs here.
+                if !optimized && self.reoptimize_arith_overflow_bail(context, fid, exit) {
                     return Ok(None);
                 }
                 let tier_still_installed =
@@ -507,8 +509,8 @@ impl Interpreter {
     }
 
     /// Recompile after the first typed integer-overflow or negative-zero exit
-    /// from an `Add` / `Sub` / `Mul` site, widening that site's feedback to
-    /// float arithmetic. Other exit reasons at the same PC cannot trigger this
+    /// from an arithmetic site, widening that site's feedback to float
+    /// arithmetic. Other exit reasons at the same PC cannot trigger this
     /// policy. Widening once avoids permanently disabling an otherwise valid
     /// hot loop; a repeated exit follows the normal deopt/disable path.
     pub(crate) fn reoptimize_arith_overflow_bail(
@@ -517,31 +519,47 @@ impl Interpreter {
         fid: u32,
         exit: SideExit,
     ) -> bool {
+        if !self.widen_arith_exit_site(context, fid, exit.logical_pc(), exit.reason()) {
+            return false;
+        }
+        self.invalidate_jit_function(fid);
+        true
+    }
+
+    /// Widen the arithmetic feedback of the site `site_fid@site_pc` after an
+    /// `Int32Overflow` or `NegativeZero` exit. Every op whose Int32 lowering
+    /// can take such an exit reads the same arithmetic feedback: `Add`, `Sub`,
+    /// `Mul`, `Neg`, `Increment`, `AddImm` and `SubImm`. Returns `true` only
+    /// the first time the site widens.
+    fn widen_arith_exit_site(
+        &self,
+        context: &ExecutionContext,
+        site_fid: u32,
+        site_pc: u32,
+        reason: crate::native_abi::ExitReason,
+    ) -> bool {
         if !matches!(
-            exit.reason(),
+            reason,
             crate::native_abi::ExitReason::Int32Overflow
                 | crate::native_abi::ExitReason::NegativeZero
         ) {
             return false;
         }
-        let bail_pc = exit.logical_pc();
-        let Some(function) = context.exec_function(fid) else {
+        let Some(function) = context.exec_function(site_fid) else {
             return false;
         };
-        let Some(instr) = function.instr_at_index(bail_pc as usize) else {
+        let Some(instr) = function.instr_at_index(site_pc as usize) else {
             return false;
         };
-        if !matches!(function.op(instr), Op::Add | Op::Sub | Op::Mul) {
+        if !matches!(
+            function.op(instr),
+            Op::Add | Op::Sub | Op::Mul | Op::Neg | Op::Increment | Op::AddImm | Op::SubImm
+        ) {
             return false;
         }
-        let Some(feedback) = function.feedback_recorder_at(instr.instruction_pc as usize) else {
-            return false;
-        };
-        if !feedback.widen_arith_to_float() {
-            return false;
-        }
-        self.invalidate_jit_function(fid);
-        true
+        function
+            .feedback_recorder_at(instr.instruction_pc as usize)
+            .is_some_and(|feedback| feedback.widen_arith_to_float())
     }
 
     /// Charge one baseline entry exit and replace the generation only after
@@ -615,6 +633,25 @@ impl Interpreter {
         fid: u32,
         exit: native_abi::SideExit,
     ) {
+        self.note_jit_optimized_bail_at(context, fid, exit, fid, exit.logical_pc());
+    }
+
+    /// [`Self::note_jit_optimized_bail`] for an exit whose speculation lives at
+    /// `site_fid@site_pc`, the innermost spliced body of an inlined deopt.
+    ///
+    /// An `Int32Overflow` / `NegativeZero` exit first widens that arithmetic
+    /// site and retires the generation, so the next compile uses float
+    /// arithmetic there. Every entry kind reaches this one owner; without it
+    /// an entry exit would keep the same speculation and exit on every call.
+    /// A repeated exit at an already-widened site is charged like any other.
+    pub(crate) fn note_jit_optimized_bail_at(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        exit: native_abi::SideExit,
+        site_fid: u32,
+        site_pc: u32,
+    ) {
         let resume_pc = exit.logical_pc();
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
@@ -628,14 +665,8 @@ impl Interpreter {
         profile.action = profile.action.max(exit.action());
         profile.count = profile.count.saturating_add(1);
         let action = profile.action;
-        // The OSR dispatcher owns the one semantic arithmetic widening before
-        // it decides whether this header remains usable. Do not pre-empt that
-        // repair with the general generation action below.
-        if matches!(
-            exit.reason(),
-            crate::native_abi::ExitReason::Int32Overflow
-                | crate::native_abi::ExitReason::NegativeZero
-        ) {
+        if self.widen_arith_exit_site(context, site_fid, site_pc, exit.reason()) {
+            self.invalidate_jit_function(fid);
             return;
         }
         if action == native_abi::ExitAction::Resume {

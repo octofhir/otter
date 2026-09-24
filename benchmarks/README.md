@@ -90,6 +90,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `typed-parameter-loop.js` | Int32 parameter guards, loop phis, checked arithmetic, and OSR | `300000` |
 | `upvalue-call-families.js` | Closure-backed plain, method, and base-constructor linkage with stack-owned upvalues | `15000450000` |
 | `base-construct-receiver.js` | Pre-shaped fixed, spread, and derived/super receiver preparation with two own fields | `15001950000` |
+| `arith-exit-repair.js` | Int32 negation producing `-0` and an accumulator leaving Int32, repaired by one widening recompile | `150000` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the

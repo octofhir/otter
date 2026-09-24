@@ -35,6 +35,7 @@ KERNELS=(
   "derived-constructor 10000200000"
   "property-polymorphic   80011800000"
   "native-boundary       27000000"
+  "arith-exit-repair       150000"
 )
 
 # Use Cargo's fresh artifact path, including configured target directories.

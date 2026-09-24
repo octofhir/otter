@@ -257,6 +257,16 @@ backedge, allocation, moving collection, or JavaScript reentry. Effect-aware
 LICM moves such a proof only when the complete loop has invariant inputs and no
 overlapping write or invalidating boundary.
 
+Int32-specialized `Add`, `Sub`, `Mul`, `Neg`, `Increment`, `AddImm` and
+`SubImm` sites exit with `int32Overflow` or `negativeZero` when a result leaves
+Int32. Every optimizing exit kind (whole-function entry, OSR, generated
+linkage, and a deopt out of an inlined callee) widens the exiting site's
+arithmetic feedback to Number once and retires the generation, so a trace shows
+one such `bail` per site followed by a recompile. A repeated exit at an
+already-widened site is charged by the ordinary exit policy. Repeated identical
+`negativeZero` or `int32Overflow` bails on every call indicate a missing repair.
+The `arith-exit-repair` kernel pins this contract.
+
 Every `LoadString` site exposes a `stringConstantCell` relocation keyed by
 function id and byte PC. The process address is redacted. The cell is rooted,
 address-stable across cell-table growth, and rewritten in place by moving GC;

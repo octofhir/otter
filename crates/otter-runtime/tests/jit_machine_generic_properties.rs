@@ -1,8 +1,9 @@
 //! Machine IR miss-capable named-property coverage.
 //!
 //! # Contents
-//! - One mixed scalar function with immutable hot CacheIR programs and cold
-//!   named load/store sites backed by compiler-owned source-identity cells.
+//! - One mixed scalar function with a shape-proven hot load, an immutable hot
+//!   CacheIR store program, and cold named load/store sites backed by
+//!   compiler-owned source-identity cells.
 //! - Ordinary shape reuse, an add-property transition, accessors, proxies, and
 //!   allocating reentry under moving collection.
 //! - Non-extensible and inline-capacity overflow receivers that stay on the
@@ -10,7 +11,8 @@
 //! - Same-layout descriptor invalidation after snapshot: a data load becomes
 //!   an accessor and a writable store becomes non-writable.
 //! - A store followed by two loads keeps the first tagged payload live across
-//!   the second CacheIR probe's Boolean SSA plumbing.
+//!   the second CacheIR probe's Boolean SSA plumbing (two receiver shapes keep
+//!   those sites polymorphic CacheIR chains).
 //! - Adding benign symbol metadata keeps the same named load/store proof live
 //!   without runtime transitions or a replacement native generation.
 //! - A local `try`/`catch` fixture whose throwing getter reaches the Machine
@@ -52,21 +54,33 @@ const MIXED_FUNCTION: &str = "machineGenericPropertyBoundary";
 const CATCH_MODULE: &str = "jit-machine-generic-properties-catch-setup.js";
 const CATCH_FUNCTION: &str = "machineGenericPropertyCaught";
 
+// Two receiver shapes keep every site a CacheIR chain: a monomorphic own-data
+// load would lower to a shape proof without Boolean plumbing.
 const LIVE_PAYLOAD_WARM: &str = r#"
 globalThis.__machineCacheIrLiveObject = { a: 1, b: 2, c: 0 };
+globalThis.__machineCacheIrLiveOther = { pad: 0, a: 1, b: 2, c: 0 };
 function machineCacheIrLivePayload(target) {
   target.c = target.a + target.b;
   return target.c + target.a;
 }
 globalThis.__machineCacheIrLiveArguments = [__machineCacheIrLiveObject];
+globalThis.__machineCacheIrLiveOtherArguments = [__machineCacheIrLiveOther];
 for (let warm = 0; warm < 4010; warm++) {
-  Reflect.apply(machineCacheIrLivePayload, undefined, __machineCacheIrLiveArguments);
+  Reflect.apply(
+    machineCacheIrLivePayload,
+    undefined,
+    (warm & 1) === 0 ? __machineCacheIrLiveArguments : __machineCacheIrLiveOtherArguments
+  );
 }
 "#;
 
 const LIVE_PAYLOAD_SETTLE: &str = r#"
 for (let probeWarm = 0; probeWarm < 1000; probeWarm++) {
-  Reflect.apply(machineCacheIrLivePayload, undefined, __machineCacheIrLiveArguments);
+  Reflect.apply(
+    machineCacheIrLivePayload,
+    undefined,
+    (probeWarm & 1) === 0 ? __machineCacheIrLiveArguments : __machineCacheIrLiveOtherArguments
+  );
 }
 "#;
 
@@ -676,8 +690,11 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"].as_array().expect("code-map regions");
     let mut property_byte_pcs = BTreeSet::new();
+    // The settled monomorphic `hot.hot` load is shape-proven and owns no cold
+    // sibling; the unprofiled `source.payload` load keeps its committed call.
     for (kind, expected) in [
-        ("machinePropertyLoadCold", 2usize),
+        ("machinePropertyShapeProof", 1usize),
+        ("machinePropertyLoadCold", 1usize),
         ("machinePropertyStoreCold", 2usize),
     ] {
         let matching = regions
@@ -743,8 +760,8 @@ fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
     assert!(
         safepoints["safepoints"]
             .as_array()
-            .is_some_and(|safepoints| safepoints.len() >= 4),
-        "all four miss-capable property operations must publish precise roots: {safepoints}"
+            .is_some_and(|safepoints| safepoints.len() >= 3),
+        "all three committed property operations must publish precise roots: {safepoints}"
     );
 }
 

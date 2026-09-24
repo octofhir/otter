@@ -50,7 +50,10 @@
 //!   receive the cold exception payload through SSA, without replay. Source
 //!   frames publish roots at that cold call. Protected stores remain declined
 //!   until their exception operands are admitted. Named `.length` loads retain
-//!   the exotic fast-path marker.
+//!   the exotic fast-path marker. A load admitted by
+//!   `property_speculation::speculated_load` is instead one
+//!   `PropertyShapeLoad` node with an exact pre-operation state; it does not
+//!   end its block.
 //! - Every schema-owned binding read, write, and delete remains one typed HIR
 //!   family. Structurally proven global-this, upvalue, global lexical, and
 //!   global-object targets retain a generated sibling; dynamic/shadowed sites
@@ -249,6 +252,16 @@ pub(super) enum NumericNode {
         byte_pc: u32,
         exotic_length: bool,
         exceptional_edge: Option<u16>,
+    },
+    /// Monomorphic own-data load admitted by
+    /// `property_speculation::speculated_load`: a shape proof with an exact
+    /// pre-operation exit, then the slot. It does not end its block.
+    PropertyShapeLoad {
+        receiver: NumericValue,
+        byte_pc: u32,
+        shape: u32,
+        value_byte: u32,
+        ordinary: bool,
     },
     PropertyStore {
         receiver: NumericValue,
@@ -589,6 +602,7 @@ impl NumericNode {
             | Self::CommittedValue { .. }
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
+            | Self::PropertyShapeLoad { .. }
             | Self::PropertyStore { .. }
             | Self::ElementStore { .. }
             | Self::ArrayConstruct { .. }
@@ -678,6 +692,7 @@ impl NumericNode {
             | Self::TaggedToInt32(..)
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
+            | Self::PropertyShapeLoad { .. }
             | Self::ArrayConstruct { .. }
             | Self::DirectCall { .. }
             | Self::NativeCall { .. }
@@ -1756,12 +1771,14 @@ fn build_raw_blocks(
                 .enclosing_exception_region(pc)
                 .and_then(|region| region.catch_pc)
                 .is_some();
+        let speculated_load = op == Op::LoadProperty
+            && super::property_speculation::speculated_load(view, pc).is_some();
         if (binding
             || native_call
-            || matches!(
+            || (matches!(
                 op,
                 Op::LoadProperty | Op::StoreProperty | Op::LoadElement | Op::StoreElement
-            )
+            ) && !speculated_load)
             || protected_throw)
             && usize::try_from(pc + 1).ok()? < view.instructions.len()
         {
@@ -2651,6 +2668,36 @@ fn lower_instruction(
                 registers,
                 register(instruction, code, 3)?,
                 RegisterState::Unset,
+            )?;
+            return Some(());
+        }
+        Op::LoadProperty
+            if let Some(load) = super::property_speculation::speculated_load(view, logical_pc) =>
+        {
+            let _ = instruction.const_index(code, 2)?;
+            let value = push(
+                nodes,
+                NumericNode::PropertyShapeLoad {
+                    receiver: read_value(registers, register(instruction, code, 1)?)?,
+                    byte_pc: instruction.byte_pc,
+                    shape: load.shape,
+                    value_byte: load.value_byte,
+                    ordinary: load.ordinary,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
             )?;
             return Some(());
         }

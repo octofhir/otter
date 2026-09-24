@@ -36,7 +36,9 @@
 //!   Compiler completion derives the exact `TaggedRoot` set from completed CFG
 //!   liveness plus that state's tagged reconstruction recipes. Verification
 //!   rejects missing and surplus roots before allocation.
-//! - Named loads expose a no-call probe and a committed cold/status CFG.
+//! - Named loads expose a no-call probe and a committed cold/status CFG, except
+//!   a settled monomorphic own-data load: a `PropertyShapeProof`, one exact
+//!   `GuardCondition` exit, and an unchecked `PropertySlotLoad`.
 //!   Only the cold call roots tagged state; its raw IC pointer must come from
 //!   a property probe. Local catches consume the pure exception payload.
 //!   Inlined property/global-read cold sites publish descendants through the
@@ -1059,6 +1061,27 @@ pub enum MachineOpcode {
     },
     /// Read one own data field under a complete CacheIR guard chain.
     CacheIrLoadField {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Byte offset inside the object's value slab.
+        value_byte: u32,
+    },
+    /// Speculative receiver proof of a monomorphic own-data load: the value is
+    /// an ordinary fast object whose hidden class is `shape`, and (when
+    /// `ordinary`) no object-local descriptor override hides a shape slot.
+    /// Produces the Boolean a following `GuardCondition` exits on; it has no
+    /// incoming condition, so an identical dominating proof commons it.
+    PropertyShapeProof {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Stable compressed hidden-class token.
+        shape: u32,
+        /// Whether the proof also requires ordinary named-lookup state.
+        ordinary: bool,
+    },
+    /// Read one own data slot of a receiver whose `PropertyShapeProof` was
+    /// required by a dominating `GuardCondition`. Performs no check.
+    PropertySlotLoad {
         /// Source byte offset used by artifacts.
         byte_pc: u32,
         /// Byte offset inside the object's value slab.
@@ -2260,6 +2283,36 @@ impl InstructionSequence {
                             || instruction.clobbers
                                 != target_spec.clobbers(TargetClobberSet::PropertyLoad)
                             || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::PropertyShapeProof { .. }
+                    | MachineOpcode::PropertySlotLoad { .. } => {
+                        let [object, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let (named, output_representation) = match instruction.opcode {
+                            MachineOpcode::PropertyShapeProof { shape, .. } => {
+                                (shape != 0, MachineRepresentation::Boolean)
+                            }
+                            MachineOpcode::PropertySlotLoad { value_byte, .. } => {
+                                (value_byte % 8 == 0, MachineRepresentation::Tagged)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if !named
+                            || *object != MachineOperand::location_input(object.value)
+                            || self.representations[object.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != output_representation
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.frame_state.is_some()
                             || instruction.safepoint.is_some()
                         {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));

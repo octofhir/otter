@@ -11,6 +11,8 @@
 //!   overlapping write.
 //! - Loop parameters are variant. External entry and OSR execute the same
 //!   preheader; generated backedges target its split body.
+//! - The header's OSR entry leads the preheader, so it is not a loop boundary:
+//!   an OSR entry performs every hoisted read after its own frame mapping.
 //! - The transform owns no raw-pointer cache or alternate semantic lowering.
 //!
 //! # See also
@@ -130,6 +132,17 @@ fn invariant_instructions(
     for &block in &natural_loop.blocks {
         let data = &sequence.blocks[block];
         for index in data.first.0 as usize..data.end.0 as usize {
+            // The header's OSR entry moves to the front of the split
+            // preheader, ahead of every hoisted instruction, so an OSR entry
+            // performs the hoisted run itself and the loop no longer holds it.
+            if block == natural_loop.header
+                && matches!(
+                    sequence.instructions[index].opcode,
+                    MachineOpcode::OsrEntry { .. }
+                )
+            {
+                continue;
+            }
             let effects = effects_for_instruction(
                 &sequence.instructions[index].opcode,
                 &sequence.call_descriptors,
@@ -564,12 +577,20 @@ mod tests {
         MachineOperand, MachineOsrInput, MachineRepresentation, TargetClobberSet,
     };
 
-    fn shape_guard_loop(invalidating_entry: bool) -> InstructionSequence {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LoopBoundary {
+        None,
+        HeaderOsrEntry,
+        LatchShapeWrite,
+    }
+
+    fn shape_guard_loop(boundary: LoopBoundary) -> InstructionSequence {
         let target = TargetSpec::aarch64();
         let receiver = MachineValue(0);
         let active = MachineValue(1);
         let guarded = MachineValue(2);
         let loop_receiver = MachineValue(3);
+        let owner = MachineValue(4);
         let mut instructions = vec![
             MachineInstruction::plain(
                 MachineOpcode::EntryValue(0),
@@ -583,7 +604,7 @@ mod tests {
         let mut jump = MachineInstruction::plain(MachineOpcode::Jump, vec![]);
         jump.control = ControlFlow::Branch;
         instructions.push(jump.clone());
-        if invalidating_entry {
+        if boundary == LoopBoundary::HeaderOsrEntry {
             instructions.push(MachineInstruction::plain(
                 MachineOpcode::OsrEntry {
                     logical_pc: 1,
@@ -612,6 +633,26 @@ mod tests {
         branch.control = ControlFlow::Branch;
         instructions.push(branch);
         let header_end = MachineInstructionId(instructions.len() as u32);
+        if boundary == LoopBoundary::LatchShapeWrite {
+            instructions.push(MachineInstruction::plain(
+                MachineOpcode::IntegerConstant(0),
+                vec![MachineOperand::register_output(owner)],
+            ));
+            let mut publish = MachineInstruction::plain(
+                MachineOpcode::CacheIrPublishShape {
+                    byte_pc: 9,
+                    shape: 2,
+                    new_len: 1,
+                    initialize_inline: true,
+                },
+                vec![
+                    MachineOperand::location_input(owner),
+                    MachineOperand::register_input(active),
+                ],
+            );
+            publish.clobbers = target.clobbers(TargetClobberSet::PropertyStore).to_vec();
+            instructions.push(publish);
+        }
         instructions.push(jump.clone());
         let latch_end = MachineInstructionId(instructions.len() as u32);
         let mut ret = MachineInstruction::plain(
@@ -629,6 +670,7 @@ mod tests {
                 MachineRepresentation::Boolean,
                 MachineRepresentation::Boolean,
                 MachineRepresentation::Tagged,
+                MachineRepresentation::Int64,
             ],
             vec![],
             vec![
@@ -787,16 +829,53 @@ mod tests {
     #[test]
     fn memory_guard_hoists_only_without_an_invalidating_loop_boundary() {
         let target = TargetSpec::aarch64();
-        let (_, stats) = optimize(shape_guard_loop(false), &target).expect("pure guard LICM");
+        let (_, stats) =
+            optimize(shape_guard_loop(LoopBoundary::None), &target).expect("pure guard LICM");
         assert_eq!(stats.versioned_loops, 1);
         assert_eq!(stats.hoisted_instructions, 1);
 
-        let (sequence, stats) =
-            optimize(shape_guard_loop(true), &target).expect("invalidated guard LICM");
-        assert_eq!(stats, LicmStats::default());
+        // Only the latch's pure owner constant may move; the guard reads the
+        // shape the latch writes.
+        let (sequence, stats) = optimize(shape_guard_loop(LoopBoundary::LatchShapeWrite), &target)
+            .expect("invalidated guard LICM");
+        assert_eq!(stats.hoisted_instructions, 1);
+        let preheader = &sequence.blocks[1];
+        assert!((preheader.first.0..preheader.end.0).all(|index| !matches!(
+            sequence.instructions[index as usize].opcode,
+            MachineOpcode::CacheIrGuardShape { .. }
+        )));
         assert!(sequence.instructions().iter().any(|instruction| matches!(
             instruction.opcode,
             MachineOpcode::CacheIrGuardShape { .. }
         )));
+    }
+
+    #[test]
+    fn header_osr_entry_leads_the_preheader_ahead_of_a_hoisted_memory_guard() {
+        let target = TargetSpec::aarch64();
+        let (sequence, stats) = optimize(shape_guard_loop(LoopBoundary::HeaderOsrEntry), &target)
+            .expect("OSR-entered guard LICM");
+        assert_eq!(stats.versioned_loops, 1);
+        assert_eq!(stats.hoisted_instructions, 1);
+        let preheader = &sequence.blocks[1];
+        let opcodes = (preheader.first.0..preheader.end.0)
+            .map(|index| &sequence.instructions[index as usize].opcode)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            opcodes.as_slice(),
+            [
+                MachineOpcode::OsrEntry { .. },
+                MachineOpcode::CacheIrGuardShape { .. },
+                MachineOpcode::Jump
+            ]
+        ));
+        assert!(sequence.blocks[2..].iter().all(|block| {
+            (block.first.0..block.end.0).all(|index| {
+                !matches!(
+                    sequence.instructions[index as usize].opcode,
+                    MachineOpcode::OsrEntry { .. } | MachineOpcode::CacheIrGuardShape { .. }
+                )
+            })
+        }));
     }
 }

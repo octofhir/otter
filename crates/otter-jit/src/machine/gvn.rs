@@ -343,6 +343,17 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             value_byte: *value_byte,
         },
+        MachineOpcode::PropertyShapeProof {
+            shape, ordinary, ..
+        } => MachineOpcode::PropertyShapeProof {
+            byte_pc: 0,
+            shape: *shape,
+            ordinary: *ordinary,
+        },
+        MachineOpcode::PropertySlotLoad { value_byte, .. } => MachineOpcode::PropertySlotLoad {
+            byte_pc: 0,
+            value_byte: *value_byte,
+        },
         MachineOpcode::PropertyMegamorphicLoad { atom, .. } => {
             MachineOpcode::PropertyMegamorphicLoad {
                 byte_pc: 0,

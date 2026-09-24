@@ -2133,6 +2133,67 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::PropertyShapeProof {
+                byte_pc,
+                shape,
+                ordinary,
+            } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                if ordinary {
+                    emit_ordinary_lookup_state_guard(&mut ops, view, 13, miss);
+                } else {
+                    emit_shape_state_guard(&mut ops, view, 13, miss);
+                }
+                emit_check_shape_identity(&mut ops, view, 13, shape, miss);
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                structural_regions.push((
+                    "machinePropertyShapeProof",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::PropertySlotLoad {
+                byte_pc,
+                value_byte,
+            } => {
+                // The dominating shape proof established an ordinary object
+                // owning this slot, so only the moving-safe decode remains.
+                let start = ops.offset().0;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; mov w12, w9);
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    13,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops ; .arch aarch64 ; add x13, x13, x12);
+                emit_slab_base(&mut ops, view, 13, 14);
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, value_byte]);
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                structural_regions.push((
+                    "machinePropertySlotLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrStoreField {
                 byte_pc,
                 value_byte,

@@ -13,9 +13,11 @@
 //! # Invariants
 //! - Every hot function publishes through the scalar Machine IR backend and
 //!   attributes every property region to its source bytecode PC.
-//! - Every Machine property site lowers its immutable CacheIR snapshot to
-//!   ordinary guard, field, and barrier instructions. A miss completes once
-//!   through the canonical cold sibling.
+//! - A settled monomorphic own-data load lowers to a shape proof, one exact
+//!   pre-operation exit, and a slot read. Every other Machine property site
+//!   lowers its immutable CacheIR snapshot to ordinary guard, field, and
+//!   barrier instructions, and a miss completes once through the canonical
+//!   cold sibling.
 //! - Accessors fire once, and already committed earlier property effects are
 //!   never replayed through an exact-deopt transition.
 //! - Generated cell stores preserve the collector barrier contract across
@@ -124,9 +126,15 @@ function machineAccessorProperty(record, value) {
   return record.value;
 }
 
+// Two receiver shapes keep both sites CacheIR probes with committed cold
+// siblings; a monomorphic load would take one exact exit instead.
 globalThis.__machineAccessorWarmRecord = makeMachineAccessorWarmRecord(0);
+globalThis.__machineAccessorOtherRecord = { padding: 0, value: 0 };
 for (let warm = 0; warm < 5000; warm++) {
-  machineAccessorProperty(__machineAccessorWarmRecord, warm);
+  machineAccessorProperty(
+    (warm & 1) === 0 ? __machineAccessorWarmRecord : __machineAccessorOtherRecord,
+    warm
+  );
 }
 "#;
 
@@ -304,13 +312,31 @@ fn runtime(selection: JitSelection) -> Runtime {
     .expect("Machine property runtime")
 }
 
+/// Property sites a fixture's optimized body must expose.
+#[derive(Debug, Clone, Copy)]
+struct Sites {
+    /// Loads lowered to a CacheIR probe with a committed cold sibling.
+    cache_ir_loads: usize,
+    /// Settled monomorphic loads lowered to a shape proof and slot read.
+    shape_proven_loads: usize,
+    /// Loads that must keep a committed cold call (CacheIR or unprofiled).
+    cold_loads: usize,
+    /// Stores, each a CacheIR probe with a committed cold sibling.
+    stores: usize,
+}
+
 fn assert_machine_property_artifact(
     artifacts: &JitArtifactBatch,
     module: &str,
     function_name: &str,
-    minimum_loads: usize,
-    minimum_stores: usize,
+    sites: Sites,
 ) {
+    let Sites {
+        cache_ir_loads,
+        shape_proven_loads,
+        cold_loads,
+        stores,
+    } = sites;
     let bundle = artifacts
         .bundles()
         .iter()
@@ -359,16 +385,31 @@ fn assert_machine_property_artifact(
             .any(|region| region["kind"] == "machineScalarFunction"),
         "{function_name} must expose its Machine scalar body: {code_map}"
     );
-    for (kind, cold_kind, minimum) in [
+    let proven_pcs = regions
+        .iter()
+        .filter(|region| region["kind"] == "machinePropertySlotLoad")
+        .map(|region| {
+            region["bytePc"].as_u64().unwrap_or_else(|| {
+                panic!("{function_name} must attribute every slot load to bytecode: {code_map}")
+            })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        proven_pcs.len() >= shape_proven_loads,
+        "{function_name} must expose {shape_proven_loads} shape-proven loads: {code_map}"
+    );
+    for (kind, cold_kind, generated_minimum, minimum) in [
         (
             "machineCacheIrLoadField",
             "machinePropertyLoadCold",
-            minimum_loads,
+            cache_ir_loads,
+            cold_loads,
         ),
         (
             "machineCacheIrStoreField",
             "machinePropertyStoreCold",
-            minimum_stores,
+            stores,
+            stores,
         ),
     ] {
         let generated = regions
@@ -376,7 +417,7 @@ fn assert_machine_property_artifact(
             .filter(|region| region["kind"] == kind)
             .collect::<Vec<_>>();
         assert!(
-            minimum == 0 || !generated.is_empty(),
+            generated_minimum == 0 || !generated.is_empty(),
             "{function_name} must expose generated {kind} regions: {code_map}"
         );
         assert!(
@@ -410,7 +451,7 @@ fn assert_machine_property_artifact(
     let relocations = relocations["relocations"]
         .as_array()
         .expect("Machine property relocation entries");
-    for (access, minimum) in [("load", minimum_loads), ("store", minimum_stores)] {
+    for (access, minimum) in [("load", cold_loads), ("store", stores)] {
         let matching = relocations
             .iter()
             .filter(|relocation| {
@@ -427,16 +468,8 @@ fn assert_machine_property_artifact(
     // The stub is named by its symbol and signature: the numeric id is the
     // table's private ordering and moves whenever a stub is added or retired.
     for (minimum, stub, signature) in [
-        (
-            minimum_loads,
-            "jit_load_property_value",
-            "reentrantNamedLoad",
-        ),
-        (
-            minimum_stores,
-            "jit_store_property_value",
-            "reentrantNamedStore",
-        ),
+        (cold_loads, "jit_load_property_value", "reentrantNamedLoad"),
+        (stores, "jit_store_property_value", "reentrantNamedStore"),
     ] {
         if minimum > 0 {
             assert!(
@@ -461,7 +494,7 @@ fn assert_machine_property_artifact(
     assert!(
         safepoints["safepoints"]
             .as_array()
-            .is_some_and(|safepoints| safepoints.len() >= minimum_loads + minimum_stores),
+            .is_some_and(|safepoints| safepoints.len() >= cold_loads + stores),
         "{function_name} must publish roots for every miss-capable property site: {safepoints}"
     );
 }
@@ -472,8 +505,7 @@ fn run_fixture(
     setup: &'static str,
     setup_module: &'static str,
     function_name: &'static str,
-    minimum_loads: usize,
-    minimum_stores: usize,
+    sites: Sites,
     final_source: &'static str,
     final_module: &'static str,
 ) -> FinalRun {
@@ -488,8 +520,7 @@ fn run_fixture(
                 .expect("enabled Machine property artifact batch"),
             setup_module,
             function_name,
-            minimum_loads,
-            minimum_stores,
+            sites,
         );
     }
     drop(setup_result);
@@ -527,8 +558,12 @@ fn run_barrier_fixture(selection: JitSelection) -> BarrierRun {
                 .expect("enabled Machine property barrier artifacts"),
             "jit-machine-properties-barrier-setup.js",
             "machinePropertyBarrier",
-            1,
-            1,
+            Sites {
+                cache_ir_loads: 0,
+                shape_proven_loads: 1,
+                cold_loads: 0,
+                stores: 1,
+            },
         );
     }
     drop(setup);
@@ -593,8 +628,12 @@ fn monomorphic_numeric_rmw_uses_machine_properties_without_deopt() {
         MONOMORPHIC_SETUP,
         "jit-machine-properties-rmw-setup.js",
         "machinePropertyRmw",
-        1,
-        1,
+        Sites {
+            cache_ir_loads: 0,
+            shape_proven_loads: 1,
+            cold_loads: 0,
+            stores: 1,
+        },
         MONOMORPHIC_FINAL,
         "jit-machine-properties-rmw-final.js",
     );
@@ -603,8 +642,12 @@ fn monomorphic_numeric_rmw_uses_machine_properties_without_deopt() {
         MONOMORPHIC_SETUP,
         "jit-machine-properties-rmw-setup.js",
         "machinePropertyRmw",
-        1,
-        1,
+        Sites {
+            cache_ir_loads: 0,
+            shape_proven_loads: 1,
+            cold_loads: 0,
+            stores: 1,
+        },
         MONOMORPHIC_FINAL,
         "jit-machine-properties-rmw-final.js",
     );
@@ -636,8 +679,12 @@ fn two_shape_load_store_and_boolean_existing_slot_stay_generated() {
         POLYMORPHIC_SETUP,
         "jit-machine-properties-polymorphic-setup.js",
         "machinePolymorphicProperty",
-        1,
-        1,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 1,
+        },
         POLYMORPHIC_FINAL,
         "jit-machine-properties-polymorphic-final.js",
     );
@@ -646,8 +693,12 @@ fn two_shape_load_store_and_boolean_existing_slot_stay_generated() {
         POLYMORPHIC_SETUP,
         "jit-machine-properties-polymorphic-setup.js",
         "machinePolymorphicProperty",
-        1,
-        1,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 1,
+        },
         POLYMORPHIC_FINAL,
         "jit-machine-properties-polymorphic-final.js",
     );
@@ -679,8 +730,12 @@ fn accessor_miss_completes_in_place_and_runs_getter_and_setter_once() {
         ACCESSOR_SETUP,
         "jit-machine-properties-accessor-setup.js",
         "machineAccessorProperty",
-        1,
-        1,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 1,
+        },
         ACCESSOR_FINAL,
         "jit-machine-properties-accessor-final.js",
     );
@@ -689,8 +744,12 @@ fn accessor_miss_completes_in_place_and_runs_getter_and_setter_once() {
         ACCESSOR_SETUP,
         "jit-machine-properties-accessor-setup.js",
         "machineAccessorProperty",
-        1,
-        1,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 1,
+        },
         ACCESSOR_FINAL,
         "jit-machine-properties-accessor-final.js",
     );
@@ -722,8 +781,12 @@ fn never_taken_unprofiled_property_branch_completes_once_without_deopt() {
         COLD_BRANCH_SETUP,
         "jit-machine-properties-cold-setup.js",
         "machineColdPropertyBranch",
-        2,
-        2,
+        Sites {
+            cache_ir_loads: 0,
+            shape_proven_loads: 1,
+            cold_loads: 1,
+            stores: 2,
+        },
         COLD_BRANCH_FINAL,
         "jit-machine-properties-cold-final.js",
     );
@@ -732,8 +795,12 @@ fn never_taken_unprofiled_property_branch_completes_once_without_deopt() {
         COLD_BRANCH_SETUP,
         "jit-machine-properties-cold-setup.js",
         "machineColdPropertyBranch",
-        2,
-        2,
+        Sites {
+            cache_ir_loads: 0,
+            shape_proven_loads: 1,
+            cold_loads: 1,
+            stores: 2,
+        },
         COLD_BRANCH_FINAL,
         "jit-machine-properties-cold-final.js",
     );
@@ -765,8 +832,12 @@ fn array_string_and_ordinary_object_length_share_one_machine_site() {
         LENGTH_SETUP,
         "jit-machine-properties-length-setup.js",
         "machinePropertyLength",
-        1,
-        0,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 0,
+        },
         LENGTH_FINAL,
         "jit-machine-properties-length-final.js",
     );
@@ -775,8 +846,12 @@ fn array_string_and_ordinary_object_length_share_one_machine_site() {
         LENGTH_SETUP,
         "jit-machine-properties-length-setup.js",
         "machinePropertyLength",
-        1,
-        0,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 0,
+        },
         LENGTH_FINAL,
         "jit-machine-properties-length-final.js",
     );
@@ -808,8 +883,12 @@ fn string_length_beyond_int32_completes_in_place_without_wrapping() {
         LENGTH_SETUP,
         "jit-machine-properties-long-string-setup.js",
         "machinePropertyLength",
-        1,
-        0,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 0,
+        },
         LONG_STRING_LENGTH_FINAL,
         "jit-machine-properties-long-string-final.js",
     );
@@ -818,8 +897,12 @@ fn string_length_beyond_int32_completes_in_place_without_wrapping() {
         LENGTH_SETUP,
         "jit-machine-properties-long-string-setup.js",
         "machinePropertyLength",
-        1,
-        0,
+        Sites {
+            cache_ir_loads: 1,
+            shape_proven_loads: 0,
+            cold_loads: 1,
+            stores: 0,
+        },
         LONG_STRING_LENGTH_FINAL,
         "jit-machine-properties-long-string-final.js",
     );

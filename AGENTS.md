@@ -469,8 +469,19 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     append position, and existing storage capacity before storing the value and
     publishing the child shape. Dictionary and allocation-requiring transitions
     stay on the canonical store boundary. Runtime success or throw commits exactly
-    once; a property miss never deoptimizes and replays the source operation.
-    Named loads and stores expose their probe, hit edge,
+    once; a committed property miss never deoptimizes and replays the source
+    operation.
+    A settled monomorphic own-data load (one `GuardShape` [+ `GuardAtomSlot`] +
+    `LoadField` program, no local catch, not megamorphic or exotic `.length`)
+    instead lowers to `machinePropertyShapeProof`, one `GuardCondition`
+    `shapeGuard`/`recompile` exit at the `LoadProperty` itself, and
+    `machinePropertySlotLoad`; it does not end its HIR block. The exit precedes
+    every effect, so the interpreter performs the access once. A site whose
+    earlier generation exited with `shapeGuard` keeps the committed form
+    (`property_speculation::speculated_load`). GVN commons identical proofs and
+    LICM may hoist a proof; the header's OSR entry leads the split preheader,
+    so OSR performs the hoisted proof itself.
+    Other named loads and stores expose their probe, hit edge,
     `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
     Success/Throw/Fatal control and join before register allocation.
     Megamorphic accesses expose `machineMegamorphicPropertyLoad` /

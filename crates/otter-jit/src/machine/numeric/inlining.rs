@@ -743,6 +743,19 @@ fn map_body_node(
             exotic_length,
             exceptional_edge: None,
         },
+        PropertyShapeLoad {
+            receiver,
+            byte_pc,
+            shape,
+            value_byte,
+            ordinary,
+        } => PropertyShapeLoad {
+            receiver: map(receiver),
+            byte_pc,
+            shape,
+            value_byte,
+            ordinary,
+        },
         BlockParameter(_) | TaggedConstant(_) | IntegerConstant(_) | BooleanConstant(_)
         | Constant(_) => node,
         TaggedToNumber(value) => TaggedToNumber(map(value)),
